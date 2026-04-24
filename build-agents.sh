@@ -2,7 +2,7 @@
 # build-agents.sh — Build Docker images for all dynamic (on-demand) agents.
 #
 # Dynamic agents are NOT started by docker-compose; they are launched at
-# runtime by the orchestrator via the Docker API when a matching task arrives.
+# runtime by the Compass agent via the Docker API when a matching task arrives.
 # Their images must be built manually before starting the compose stack.
 #
 # Usage:

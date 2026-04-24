@@ -1,12 +1,12 @@
-# Multi-Agent MVP
+# Constellation — Multi-Agent System
 
 这个 MVP 现在按 agent 目录拆分，并覆盖了你提出的几项核心要求：
 
-1. 每个 agent 都有自己的目录：`orchestrator/`、`tracker/`、`scm/`、`android/`。
-2. `orchestrator` 是常驻 Web 应用，带浏览器 UI。
+1. 每个 agent 都有自己的目录：`compass/`、`tracker/`、`scm/`、`android/`。
+2. `compass`（Compass Agent）是常驻 Web 应用，带浏览器 UI，是整个 Constellation 系统的控制平面入口。
 3. `tracker` 和 `scm` 是常驻容器，使用各自 `.env`。
-4. `android` 是按任务临时拉起的容器，启动时由 orchestrator 透传 token、LLM base URL、LLM model。
-5. 制品统一由 orchestrator 写入挂载目录 `mvp/artifacts/`，但接口已经独立成 `common/artifact_store.py`，后续可平滑迁移到外部存储。
+4. `android` 是按任务临时拉起的容器，启动时由 Compass Agent 透传 token、LLM base URL、LLM model。
+5. 制品统一由 Compass Agent 写入挂载目录 `artifacts/`，但接口已经独立成 `common/artifact_store.py`，后续可平滑迁移到外部存储。
 6. `tests/agent_test_targets.json` 是唯一允许的 Tracker / SCM 共享环境测试目标配置，真实写操作只能落在这里定义的 ticket / repo 上；`agent_test_targets.py` 只负责读取配置并做运行时 write guard。
 
 ## 目录结构
@@ -19,9 +19,9 @@ mvp/
 ├── common/                      # 共享运行时库（Registry、Launcher、LLM、ArtifactStore 等）
 ├── registry/
 │   └── app.py                   # Capability Registry 服务
-├── orchestrator/
-│   ├── app.py                   # Orchestrator A2A + Web UI
-│   ├── .env                     # token / Copilot Connect / artifact / launcher 配置
+├── compass/
+│   ├── app.py                   # Compass Agent A2A + Web UI (Constellation control plane)
+│   ├── .env                     # token / LLM / artifact / launcher config
 │   └── ui/
 │       └── index.html
 ├── tracker/
@@ -49,7 +49,7 @@ mvp/
 Browser / curl
     |
     v
-Orchestrator :8080
+Compass Agent :8080  (Constellation control plane)
     |-- query --> Registry :9000
     |-- A2A ----> Tracker Agent :8010
     |-- A2A ----> SCM Agent :8020
@@ -60,14 +60,14 @@ Orchestrator :8080
 
 ## LLM 配置
 
-### Orchestrator `.env`
+### Compass Agent `.env`
 
-`orchestrator/.env` 里包含：
+`compass/.env` 里包含：
 
-如果是新环境，优先复制 `orchestrator/.env.example`，通常只需要补齐真实凭据。
+如果是新环境，优先复制 `compass/.env.example`，通常只需要补齐真实凭据。
 
 ```env
-OPENAI_BASE_URL=http://host.rancher-desktop.internal:1288/v1
+OPENAI_BASE_URL=http://host.docker.internal:1288/v1
 OPENAI_MODEL=gpt-5-mini
 SCM_TOKEN=replace-me
 TRACKER_TOKEN=replace-me
@@ -79,8 +79,8 @@ DYNAMIC_AGENT_NETWORK=mvp-network
 
 说明：
 
-1. 这里的 `OPENAI_BASE_URL` 就是 Copilot Connect / OpenAI-compatible endpoint。
-2. orchestrator 在拉起 `android` 按任务容器时，会透传 `OPENAI_BASE_URL`、`OPENAI_MODEL`、`SCM_TOKEN`、`TRACKER_TOKEN`。
+1. 这里的 `OPENAI_BASE_URL` 就是 Copilot Connect / OpenAI-compatible endpoint。在 Docker Desktop 环境下，使用 `host.docker.internal` 访问宿主机上的 LLM 服务。
+2. Compass Agent 在拉起 `android` 按任务容器时，会透传 `OPENAI_BASE_URL`、`OPENAI_MODEL`、`SCM_TOKEN`、`TRACKER_TOKEN`。
 3. 如果本地没有可达的 LLM endpoint，代码默认允许回退到 mock 响应，便于离线测试。真实连通后会优先用真实 LLM。
 
 ### Long-running Agent `.env`
@@ -96,7 +96,7 @@ TRACKER_CLOUD_ID=
 TRACKER_TOKEN=replace-me
 TRACKER_EMAIL=replace-me@example.com
 TRACKER_AUTH_MODE=basic
-OPENAI_BASE_URL=http://host.rancher-desktop.internal:1288/v1
+OPENAI_BASE_URL=http://host.docker.internal:1288/v1
 OPENAI_MODEL=gpt-5-mini
 ```
 
@@ -117,7 +117,7 @@ SCM_BASE_URL=https://scm.example.com/projects/CSM
 SCM_API_BASE_URL=
 SCM_TOKEN=replace-me
 INSTANCE_REPORTER_ENABLED=1
-OPENAI_BASE_URL=http://host.rancher-desktop.internal:1288/v1
+OPENAI_BASE_URL=http://host.docker.internal:1288/v1
 OPENAI_MODEL=gpt-5-mini
 ```
 
@@ -135,8 +135,8 @@ OPENAI_MODEL=gpt-5-mini
 
 ## 真实回归测试边界
 
-1. Tracker 回归只允许读取和修改 `tests/agent_test_targets.json` 中定义的 `DMPP-2647`，并且所有写操作都必须恢复原状态。
-2. SCM 回归只允许读取和修改 `tests/agent_test_targets.json` 中定义的 `EMF/android-test`，写入路径固定在 `agent-tests/` 下。
+1. Tracker 回归只允许读取和修改 `tests/agent_test_targets.json` 中定义的 `CSTL-1`，并且所有写操作都必须恢复原状态。
+2. SCM 回归只允许读取和修改 `tests/agent_test_targets.json` 中定义的 `fihtony/microservice-test`，写入路径固定在 `agent-tests/` 下。
 3. 测试脚本会在运行时显式校验 write target 是否命中 allowlist；任何不在 allowlist 中的目标都不能执行写操作。
 4. 默认分支删除、整库删除、Tracker ticket 删除都不在当前 agent 能力面里，也没有公开 REST 端点。
 
@@ -147,19 +147,19 @@ OPENAI_MODEL=gpt-5-mini
 Tracker agent 不会再从裸 ticket key 自动构造 browse URL。更安全的做法是把完整 Tracker ticket URL 直接放到用户请求里，例如：
 
 ```text
-https://tracker.example.com/browse/DMPP-2647
+https://tarch.atlassian.net/browse/CSTL-1
 ```
 
 agent 会从这个显式 URL 解析 ticket key，再访问对应 API，例如：
 
 ```text
-https://tracker.example.com/rest/api/3/issue/DMPP-2647
+https://tarch.atlassian.net/rest/api/3/issue/CSTL-1
 ```
 
 如果当前 token 是 scoped token，agent 仍会自动改走：
 
 ```text
-https://api.atlassian.com/ex/tracker/{cloudId}/rest/api/3/issue/DMPP-2647
+https://api.atlassian.com/ex/jira/{cloudId}/rest/api/3/issue/CSTL-1
 ```
 
 ### SCM
@@ -167,14 +167,14 @@ https://api.atlassian.com/ex/tracker/{cloudId}/rest/api/3/issue/DMPP-2647
 SCM agent 也不再从内置 repo 映射里替你选择目标仓库。更安全的做法是把完整 repo browse URL 放在 Tracker ticket 或用户请求里，例如：
 
 ```text
-https://scm.example.com/projects/EMF/repos/android-test/browse
+https://github.com/fihtony/microservice-test
 ```
 
-SCM agent 会从这个显式 URL 解析 project / repo，并把解析结果写回共享工作区供下游 agent 使用。
+SCM agent 会从这个显式 URL 解析 owner / repo，并把解析结果写回共享工作区供下游 agent 使用。
 
 ## Artifact Store 在哪里
 
-当前 MVP 中，artifact store 仍归 orchestrator 持有，但已经抽象成独立模块：
+当前 MVP 中，artifact store 仍归 Compass Agent 持有，但已经抽象成独立模块：
 
 ```text
 common/artifact_store.py
@@ -208,14 +208,14 @@ artifacts/
 
 所以当前实现满足：
 
-1. Artifact 先保存在 orchestrator 侧。
+1. Artifact 先保存在 Compass Agent 侧。
 2. 落本地文件，方便手工检查。
 3. 共享工作区也落在同一个 artifact 根目录，当前用来承载 Tracker summary / issue payload、SCM repo resolution、Android plan / workflow summary。
 4. 接口独立，后续迁移到 MinIO/S3/单独 artifact service 时不用改 agent 协议。
 
 ## 构建动态 Agent 镜像
 
-动态 Agent（如 Android Agent）由 orchestrator 按需拉起，镜像不会在 `docker compose up` 时自动构建，
+动态 Agent（如 Android Agent）由 Compass Agent 按需拉起，镜像不会在 `docker compose up` 时自动构建，
 需要手动执行一次：
 
 ```bash
@@ -248,9 +248,9 @@ docker compose up --build -d
 2. `init-register`
 3. `tracker`
 4. `scm`
-5. `orchestrator`
+5. `compass`
 
-不会预启动 `android`，它会在任务需要时由 orchestrator 通过 Docker socket 按需拉起。
+不会预启动 `android`，它会在任务需要时由 Compass Agent 通过 Docker socket 按需拉起。
 
 ### 2. 检查服务状态
 
@@ -263,7 +263,7 @@ docker compose ps
 1. `registry` healthy
 2. `tracker` healthy
 3. `scm` healthy
-4. `orchestrator` healthy
+4. `compass` healthy
 5. `init-register` exited (0)
 
 ### 3. 验证 Registry
@@ -280,7 +280,7 @@ curl -s http://localhost:9000/agents/android-agent/instances | python3 -m json.t
 1. Tracker / SCM Definition 已注册且有实例。
 2. Android Definition 已注册，但初始没有实例。
 
-## 如何和 orchestrator 通信
+## 如何和 Compass Agent 通信
 
 ### 浏览器方式
 
@@ -293,7 +293,7 @@ http://localhost:8080/
 页面里可以：
 
 1. 直接输入用户请求。
-2. 留空 `Requested Capability`，让 orchestrator 自动规划 workflow。
+2. 留空 `Requested Capability`，让 Compass Agent 自动规划 workflow。
 3. 强制指定 `tracker.ticket.fetch` / `scm.repo.inspect` / `android.task.execute`。
 4. 查询 task 和 artifacts。
 5. 点击内置场景按钮做手工验证。
@@ -310,7 +310,7 @@ curl -s -X POST http://localhost:8080/message:send \
     "message": {
       "messageId": "msg-tracker-001",
       "role": "ROLE_USER",
-      "parts": [{"text": "Please analyze https://tracker.example.com/browse/DMPP-2647"}]
+      "parts": [{"text": "Please analyze https://tarch.atlassian.net/browse/CSTL-1"}]
     }
   }' | python3 -m json.tool
 ```
@@ -339,12 +339,12 @@ curl -s -X POST http://localhost:8080/message:send \
     "message": {
       "messageId": "msg-workflow-001",
       "role": "ROLE_USER",
-      "parts": [{"text": "Analyze https://tracker.example.com/browse/DMPP-2647 and prepare the Android implementation plan for https://scm.example.com/projects/EMF/repos/android-test/browse."}]
+      "parts": [{"text": "Analyze https://tarch.atlassian.net/browse/CSTL-1 and prepare the implementation plan for https://github.com/fihtony/microservice-test."}]
     }
   }' | python3 -m json.tool
 ```
 
-这个请求会让 orchestrator 自动推导 workflow：
+这个请求会让 Compass Agent 自动推导 workflow：
 
 1. `tracker.ticket.fetch`
 2. `scm.repo.inspect`
@@ -364,15 +364,15 @@ curl -s http://localhost:8080/tasks/task-0001/artifacts | python3 -m json.tool
 建议按顺序测试：
 
 1. Tracker Ticket
-  输入：`Please analyze https://tracker.example.com/browse/DMPP-2647`
+  输入：`Please analyze https://tarch.atlassian.net/browse/CSTL-1`
    预期：最终 routed to `tracker-agent`
 
 2. SCM Repo
    输入：`Find the Android repository in SCM and summarize where to start.`
    预期：最终 routed to `scm-agent`
 
-3. Android Workflow
-  输入：`Analyze https://tracker.example.com/browse/DMPP-2647 and prepare the Android implementation plan for https://scm.example.com/projects/EMF/repos/android-test/browse.`
+3. Execution Workflow
+  输入：`Analyze https://tarch.atlassian.net/browse/CSTL-1 and prepare the implementation plan for https://github.com/fihtony/microservice-test.`
    预期：workflow 会串联 Tracker、SCM、Android，最终 state=`TASK_STATE_COMPLETED`
 
 4. Missing Capability
@@ -441,7 +441,7 @@ INSTANCE_REPORTER_ENABLED=0
 10. Tracker deregister / reregister
 11. busy-capacity 语义
 12. direct downstream agent communication
-13. orchestrator browser UI
+13. Compass Agent browser UI
 14. malformed request handling
 
 ## 设计对齐说明
@@ -451,10 +451,10 @@ INSTANCE_REPORTER_ENABLED=0
 1. `Capability Registry` 与 `Agent Instance` 两层状态。
 2. 每个 agent 一个目录。
 3. long-running agent 使用各自 `.env`。
-4. orchestrator 持有 token / Copilot Connect 配置并可在动态拉起 Android 时透传。
+4. Compass Agent 持有 token / Copilot Connect 配置并可在动态拉起 Android 时透传。
 5. Android agent 从“假 agent/硬编码”升级为真实 LLM 调用能力。
 6. ArtifactStore 从内存升级为本地挂载目录持久化。
-7. orchestrator 具备 browser UI 和手工验证场景。
+7. Compass Agent 具备 browser UI 和手工验证场景。
 
 仍然保留的 MVP 边界：
 
@@ -465,9 +465,9 @@ INSTANCE_REPORTER_ENABLED=0
 `mvp/.github/skills/` 下的 `SKILL.md` 与各 agent `agent-card.json` 里的 `skills` 不是同一层东西：
 
 1. `mvp/.github/skills/tracker-cloud-workflow/SKILL.md`、`mvp/.github/skills/scm-server-workflow/SKILL.md` 是 GitHub Copilot workspace skills，会在用户直接和 Copilot 对话、且描述匹配时被自动加载。
-2. `tracker/agent-card.json`、`scm/agent-card.json` 里的 `skills` 是 A2A capability 广告，用来告诉 orchestrator 或别的 agent 这些 HTTP agent 提供哪些机器可调用能力。
+2. `tracker/agent-card.json`、`scm/agent-card.json` 里的 `skills` 是 A2A capability 广告，用来告诉 Compass Agent 或别的 agent 这些 HTTP agent 提供哪些机器可调用能力。
 3. 当前实现里，这两层已经做了显式复用：`tracker/app.py` 和 `scm/app.py` 会在 `process_message()` 中读取对应 `SKILL.md`，再把 skill 内容注入 LLM prompt，作为本地操作指南。
 4. 这意味着 Python agent runtime 不会“执行” `SKILL.md`，但会把其中的知识作为提示上下文复用。
 5. 因为当前只分享 `mvp/` 这个 git repo，真正会随仓库一起共享和生效的 skill 应该放在 `mvp/.github/skills/`，而不是依赖同级未共享目录里的 skill。
 2. Android agent 当前生成的是实现计划和测试建议，不直接改代码仓库。
-3. ArtifactStore 仍由 orchestrator 持有，只是现在已经可单独迁移。
+3. ArtifactStore 仍由 Compass Agent 持有，只是现在已经可单独迁移。

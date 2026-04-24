@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "1.0",
+  "name": "Compass Agent",
+  "description": "User-facing control-plane agent that routes tasks across Tracker, SCM, Android, and other specialized agents within the Constellation system.",
+  "version": "1.1.0",
+  "supportedInterfaces": [
+    {
+      "url": "__ADVERTISED_URL__",
+      "protocolBinding": "HTTP+JSON",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "orchestrate",
+      "name": "Constellation Orchestrator",
+      "description": "Plans multi-step workflows and dispatches to Tracker, SCM, Android, Team Lead, and other agents in the Constellation system.",
+      "tags": ["compass", "orchestrator", "workflow", "routing", "constellation"]
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-"""Orchestrator agent with browser UI, workflow routing, and on-demand launcher support."""
+"""Compass agent with browser UI, workflow routing, and on-demand launcher support."""
 
 from __future__ import annotations
 
@@ -117,7 +117,7 @@ def _a2a_call(agent_url, message, context_id=None):
         headers={"Content-Type": "application/json; charset=utf-8"},
         method="POST",
     )
-    print(f"[orchestrator] Dispatching to {agent_url}/message:send")
+    print(f"[compass] Dispatching to {agent_url}/message:send")
     with urlopen(request, timeout=ACK_TIMEOUT) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -138,7 +138,7 @@ def _lookup_agents(requested_capability=None):
             return registry.find_by_capability(requested_capability)
         return registry.find_any_active()
     except (URLError, OSError) as error:
-        print(f"[orchestrator] Registry unreachable: {error}")
+        print(f"[compass] Registry unreachable: {error}")
         return None
 
 
@@ -586,7 +586,7 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
     task_store.add_progress_step(
         task.task_id,
         f"Created shared workspace: {task.workspace_path}",
-        agent_id="orchestrator-agent",
+        agent_id="compass-agent",
     )
     worker = threading.Thread(
         target=_run_workflow,
@@ -597,7 +597,7 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
     return task.to_dict()
 
 
-class OrchestratorHandler(BaseHTTPRequestHandler):
+class CompassHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def _send_json(self, code, payload):
@@ -634,7 +634,7 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
-            self._send_json(200, {"status": "ok", "service": "orchestrator"})
+            self._send_json(200, {"status": "ok", "service": "compass"})
             return
 
         if path == "/.well-known/agent-card.json":
@@ -687,7 +687,7 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             ts = body.get("ts")
             if step:
                 task_store.add_progress_step(task_id, step, agent_id=agent_id, ts=ts)
-                print(f"[orchestrator] Progress [{task_id}] <{agent_id}>: {step}")
+                print(f"[compass] Progress [{task_id}] <{agent_id}>: {step}")
             self._send_json(200, {"ok": True})
             return
 
@@ -740,12 +740,12 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 merged = deep_copy_json(message)
                 merged["parts"] = [{"text": combined_text}]
                 workflow = prior_task.pending_workflow
-                print(f"[orchestrator] Resuming INPUT_REQUIRED task {context_id} with merged message")
+                print(f"[compass] Resuming INPUT_REQUIRED task {context_id} with merged message")
                 task_dict = route_and_dispatch(merged, forced_workflow=workflow)
                 self._send_json(200, {"task": task_dict})
                 return
 
-        print(f"[orchestrator] Received message: {json.dumps(message, ensure_ascii=False)[:200]}")
+        print(f"[compass] Received message: {json.dumps(message, ensure_ascii=False)[:200]}")
         task_dict = route_and_dispatch(message, requested_capability=requested_capability)
         self._send_json(200, {"task": task_dict})
 
@@ -754,13 +754,13 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
         line = args[0] if args else ""
         if any(p in line for p in ("/health", "/.well-known/agent-card.json")):
             return
-        print(f"[orchestrator] {line} {args[1] if len(args) > 1 else ''} {args[2] if len(args) > 2 else ''}")
+        print(f"[compass] {line} {args[1] if len(args) > 1 else ''} {args[2] if len(args) > 2 else ''}")
 
 
 def main():
-    print(f"[orchestrator] Orchestrator starting on {HOST}:{PORT}")
-    print(f"[orchestrator] Artifact root: {artifact_store.root}")
-    server = ThreadingHTTPServer((HOST, PORT), OrchestratorHandler)
+    print(f"[compass] Compass agent starting on {HOST}:{PORT}")
+    print(f"[compass] Artifact root: {artifact_store.root}")
+    server = ThreadingHTTPServer((HOST, PORT), CompassHandler)
     server.serve_forever()
 
 

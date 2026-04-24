@@ -37,12 +37,12 @@ services:
       mvp.agent_name: "Registry Bootstrap"
       mvp.agent_role: "fundamental"
 
-  orchestrator:
-    image: mvp-orchestrator-agent:latest
+  compass:
+    image: mvp-compass-agent:latest
     build:
       context: .
-      dockerfile: orchestrator/Dockerfile
-    command: ["python3", "orchestrator/app.py"]
+      dockerfile: compass/Dockerfile
+    command: ["python3", "compass/app.py"]
     depends_on:
       registry:
         condition: service_healthy
@@ -53,11 +53,11 @@ services:
       scm:
         condition: service_healthy
     env_file:
-      - ./orchestrator/.env
+      - ./compass/.env
     environment:
       HOST: "0.0.0.0"
       PORT: "8080"
-      ADVERTISED_BASE_URL: "http://orchestrator:8080"
+      ADVERTISED_BASE_URL: "http://compass:8080"
       REGISTRY_URL: "http://registry:9000"
       A2A_ACK_TIMEOUT_SECONDS: "15"
       A2A_TASK_TIMEOUT_SECONDS: "3600"
@@ -67,15 +67,15 @@ services:
       # Agent URLs passed through to dynamically launched Android agent containers
       TRACKER_AGENT_URL: "http://tracker:8010"
       SCM_AGENT_URL: "http://scm:8020"
-      ORCHESTRATOR_URL: "http://orchestrator:8080"
+      COMPASS_URL: "http://compass:8080"
       ANDROID_DEFAULT_BRANCH: ""
       ARTIFACT_ROOT_HOST: "${ARTIFACT_ROOT_HOST:-}"
     volumes:
       - ./artifacts:/app/artifacts
       - /var/run/docker.sock:/var/run/docker.sock
     labels:
-      mvp.agent_id: "orchestrator-agent"
-      mvp.agent_name: "Orchestrator Agent"
+      mvp.agent_id: "compass-agent"
+      mvp.agent_name: "Compass Agent"
       mvp.agent_role: "fundamental"
     ports:
       - "8080:8080"

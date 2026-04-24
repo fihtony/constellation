@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
-ORCHESTRATOR_URL = "http://localhost:8080"
+COMPASS_URL = "http://localhost:8080"
 REGISTRY_URL = "http://localhost:9000"
 TRACKER_URL = "http://localhost:8010"
 SCM_URL = "http://localhost:8020"
@@ -114,7 +114,7 @@ def send_message(text, requested_capability=None, timeout=30):
     if requested_capability:
         payload["requestedCapability"] = requested_capability
     return http_json(
-        f"{ORCHESTRATOR_URL}/message:send",
+        f"{COMPASS_URL}/message:send",
         method="POST",
         payload=payload,
         timeout=timeout,
@@ -153,7 +153,7 @@ def test_0_prerequisites():
 
     for label, url in (
         ("Registry", f"{REGISTRY_URL}/health"),
-        ("Orchestrator", f"{ORCHESTRATOR_URL}/health"),
+        ("Compass", f"{COMPASS_URL}/health"),
         ("Tracker Agent", f"{TRACKER_URL}/health"),
         ("SCM Agent", f"{SCM_URL}/health"),
     ):
@@ -171,7 +171,7 @@ def test_0_prerequisites():
 def test_1_agent_card_discovery():
     section("Scenario 1: Agent Card Discovery")
     for label, url, expected_name in (
-        ("Orchestrator", f"{ORCHESTRATOR_URL}/.well-known/agent-card.json", "Orchestrator Agent"),
+        ("Compass", f"{COMPASS_URL}/.well-known/agent-card.json", "Compass Agent"),
         ("Tracker", f"{TRACKER_URL}/.well-known/agent-card.json", "Tracker Agent"),
         ("SCM", f"{SCM_URL}/.well-known/agent-card.json", "SCM Agent"),
     ):
@@ -295,8 +295,8 @@ def test_7_task_query_and_artifacts(task_identifier):
         fail("No workflow task id available for query")
         return
 
-    step("Query the orchestrator task")
-    status, body = http_json(f"{ORCHESTRATOR_URL}/tasks/{task_identifier}")
+    step("Query the Compass task")
+    status, body = http_json(f"{COMPASS_URL}/tasks/{task_identifier}")
     show_json("Task", body)
     if status == 200 and body.get("task", {}).get("id") == task_identifier:
         ok(f"Task {task_identifier} can be queried")
@@ -304,7 +304,7 @@ def test_7_task_query_and_artifacts(task_identifier):
         fail("Task query failed", f"status={status}")
 
     step("Query persisted artifacts")
-    status, body = http_json(f"{ORCHESTRATOR_URL}/tasks/{task_identifier}/artifacts")
+    status, body = http_json(f"{COMPASS_URL}/tasks/{task_identifier}/artifacts")
     show_json("Artifacts", body)
     artifacts = body.get("artifacts", []) if isinstance(body, dict) else []
     if status == 200 and len(artifacts) >= 3:
@@ -443,9 +443,9 @@ def test_11_direct_agent_communication():
 
 def test_12_browser_ui():
     section("Scenario 12: Browser UI")
-    step("Open the orchestrator console")
+    step("Open the Constellation Compass console")
     try:
-        request = Request(f"{ORCHESTRATOR_URL}/", method="GET")
+        request = Request(f"{COMPASS_URL}/", method="GET")
         with urlopen(request, timeout=10) as response:
             html = response.read().decode("utf-8")
             status = response.status
@@ -453,7 +453,7 @@ def test_12_browser_ui():
         status = 0
         html = str(error)
 
-    if status == 200 and "Orchestrator Console" in html:
+    if status == 200 and "Compass Agent" in html:
         ok("Browser UI is served successfully")
     else:
         fail("Browser UI is not available", f"status={status}")
@@ -461,12 +461,12 @@ def test_12_browser_ui():
 
 def test_13_malformed_request():
     section("Scenario 13: Malformed Request")
-    step("Send an empty body to the orchestrator")
-    status, body = http_json(f"{ORCHESTRATOR_URL}/message:send", method="POST", payload={})
+    step("Send an empty body to the Compass agent")
+    status, body = http_json(f"{COMPASS_URL}/message:send", method="POST", payload={})
     if status == 400:
-        ok("Malformed orchestrator request returns HTTP 400")
+        ok("Malformed Compass request returns HTTP 400")
     else:
-        fail("Malformed orchestrator request did not return 400", f"status={status}, body={body}")
+        fail("Malformed Compass request did not return 400", f"status={status}, body={body}")
 
 
 def run_all():
@@ -475,7 +475,7 @@ def run_all():
     print(f"\n{Colors.BOLD}{'═' * 60}{Colors.RESET}")
     print(f"{Colors.BOLD}  Multi-Agent MVP — End-to-End Test Suite{Colors.RESET}")
     print(f"{Colors.BOLD}{'═' * 60}{Colors.RESET}")
-    print(f"  Orchestrator:  {ORCHESTRATOR_URL}")
+    print(f"  Compass:       {COMPASS_URL}")
     print(f"  Registry:      {REGISTRY_URL}")
     print(f"  Tracker:          {TRACKER_URL}")
     print(f"  SCM:     {SCM_URL}")

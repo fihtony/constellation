@@ -10,7 +10,7 @@ COPY scripts/ /app/scripts/
 COPY android/     /app/android/
 COPY scm/   /app/scm/
 COPY tracker/        /app/tracker/
-COPY orchestrator/ /app/orchestrator/
+COPY compass/      /app/compass/
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app

@@ -1,6 +1,6 @@
 {
-  "agentId": "orchestrator-agent",
-  "cardUrl": "http://orchestrator:8080/.well-known/agent-card.json",
+  "agentId": "compass-agent",
+  "cardUrl": "http://compass:8080/.well-known/agent-card.json",
   "executionMode": "persistent",
   "scalingPolicy": {
     "maxInstances": 1,

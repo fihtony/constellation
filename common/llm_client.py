@@ -1,4 +1,4 @@
-"""OpenAI-compatible client shared by orchestrator and agent containers."""
+"""OpenAI-compatible client shared by the Compass agent and worker containers."""
 
 from __future__ import annotations
 

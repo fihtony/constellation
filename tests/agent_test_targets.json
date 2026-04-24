@@ -1,8 +1,8 @@
 {
   "tracker": {
     "primaryTicket": {
-      "ticketKey": "DMPP-2647",
-      "browseUrl": "https://tracker.example.com/browse/DMPP-2647",
+      "ticketKey": "CSTL-1",
+      "browseUrl": "https://tarch.atlassian.net/browse/CSTL-1",
       "readOnlyUse": ["fetch", "search", "myself"],
       "writeUse": ["comment_crud", "field_update_restore", "transition_restore", "assignee_restore"]
     },
@@ -10,15 +10,26 @@
   },
   "scm": {
     "primaryRepo": {
-      "project": "EMF",
-      "repo": "android-test",
-      "browseUrl": "https://scm.example.com/projects/EMF/repos/android-test/browse",
-      "cloneUrl": "https://scm.example.com/scm/emf/android-test.git",
-      "searchQuery": "android test",
+      "owner": "fihtony",
+      "repo": "microservice-test",
+      "browseUrl": "https://github.com/fihtony/microservice-test",
+      "cloneUrl": "https://github.com/fihtony/microservice-test.git",
+      "searchQuery": "microservice test",
       "writeRoot": "agent-tests/",
       "readOnlyUse": ["repo_search", "repo_resolve", "repo_list", "pr_inspect", "pr_comment_list"],
       "writeUse": ["branch_create", "git_push", "pr_create", "pr_comment"]
     },
     "additionalReadOnlyRepos": []
+  },
+  "stitch": {
+    "primaryProject": {
+      "projectId": "13629074018280446337",
+      "projectUrl": "https://stitch.withgoogle.com/projects/13629074018280446337",
+      "title": "Open English Study Hub",
+      "primaryScreen": {
+        "screenId": "52742f72311047aea731c97630d211de",
+        "name": "Landing Page"
+      }
+    }
   }
 }

@@ -12,9 +12,9 @@ RUN update-ca-certificates
 
 COPY common/       /app/common/
 COPY certs/        /app/certs/
-COPY orchestrator/ /app/orchestrator/
+COPY compass/       /app/compass/
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
-CMD ["python3", "orchestrator/app.py"]
+CMD ["python3", "compass/app.py"]
