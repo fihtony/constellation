@@ -1,0 +1,29 @@
+# Environment and secrets (NEVER commit)
+.env
+.env.local
+
+# Virtual environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+.Python
+
+# Session and temporary data (cleared after each run)
+tmp/
+reports/
+artifacts/
+docs/
+reference/
+certs/
+android/
+
+# Reports are committed for audit (do not ignore reports/)
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store

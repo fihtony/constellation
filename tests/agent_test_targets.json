@@ -1,0 +1,24 @@
+{
+  "tracker": {
+    "primaryTicket": {
+      "ticketKey": "DMPP-2647",
+      "browseUrl": "https://tracker.example.com/browse/DMPP-2647",
+      "readOnlyUse": ["fetch", "search", "myself"],
+      "writeUse": ["comment_crud", "field_update_restore", "transition_restore", "assignee_restore"]
+    },
+    "additionalReadOnlyTickets": []
+  },
+  "scm": {
+    "primaryRepo": {
+      "project": "EMF",
+      "repo": "android-test",
+      "browseUrl": "https://scm.example.com/projects/EMF/repos/android-test/browse",
+      "cloneUrl": "https://scm.example.com/scm/emf/android-test.git",
+      "searchQuery": "android test",
+      "writeRoot": "agent-tests/",
+      "readOnlyUse": ["repo_search", "repo_resolve", "repo_list", "pr_inspect", "pr_comment_list"],
+      "writeUse": ["branch_create", "git_push", "pr_create", "pr_comment"]
+    },
+    "additionalReadOnlyRepos": []
+  }
+}

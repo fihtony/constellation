@@ -1,0 +1,10 @@
+{
+  "agentId": "orchestrator-agent",
+  "cardUrl": "http://orchestrator:8080/.well-known/agent-card.json",
+  "executionMode": "persistent",
+  "scalingPolicy": {
+    "maxInstances": 1,
+    "perInstanceConcurrency": 4,
+    "idleTimeoutSeconds": 600
+  }
+}

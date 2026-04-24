@@ -1,0 +1,680 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Compass Agent</title>
+    <style>
+      :root {
+        --bg: #f0f4f8;
+        --panel: #ffffff;
+        --ink: #1a2633;
+        --muted: #5a6b7a;
+        --accent: #0b5e77;
+        --accent-light: #e6f3f7;
+        --accent-send: #0b7285;
+        --line: rgba(26, 38, 51, 0.12);
+        --bubble-user-bg: #0b7285;
+        --bubble-user-ink: #ffffff;
+        --bubble-agent-bg: #ffffff;
+        --bubble-agent-ink: #1a2633;
+        --bubble-step-bg: #f5f9fa;
+        --bubble-step-ink: #3d5563;
+        --ok: #157f3b;
+        --warn: #c2410c;
+        --radius: 20px;
+        --log-default-height: 220px;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+        color: var(--ink);
+        background: var(--bg);
+        display: flex;
+        flex-direction: column;
+      }
+
+      /* ── Header ────────────────────────────────────────────── */
+      header.topbar {
+        background: var(--panel);
+        border-bottom: 1px solid var(--line);
+        padding: 14px 24px;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        position: sticky;
+        top: 0;
+        z-index: 10;
+      }
+      .topbar-icon {
+        width: 38px; height: 38px;
+        border-radius: 10px;
+        background: linear-gradient(135deg, #0b7285, #1a9fb5);
+        display: flex; align-items: center; justify-content: center;
+        color: white; font-size: 18px; font-weight: 800;
+        flex-shrink: 0;
+      }
+      .topbar-name {
+        font-size: 18px; font-weight: 700; letter-spacing: -0.02em;
+      }
+      .topbar-subtitle {
+        font-size: 12px; color: var(--muted); margin-top: 1px;
+      }
+      .topbar-status {
+        margin-left: auto;
+        font-size: 12px; font-weight: 600; padding: 4px 12px;
+        border-radius: 999px; background: #e6f7ee; color: #157f3b;
+      }
+
+      /* ── Main layout ───────────────────────────────────────── */
+      .app-body {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        max-width: 900px;
+        width: 100%;
+        margin: 0 auto;
+        padding: 24px 16px 32px;
+        gap: 20px;
+      }
+
+      /* ── Chat window ───────────────────────────────────────── */
+      .chat-card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: 0 4px 20px rgba(0,0,0,0.07);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      .chat-window {
+        height: 60vh;
+        min-height: 320px;
+        overflow-y: auto;
+        padding: 20px 20px 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        scroll-behavior: smooth;
+      }
+      .chat-empty {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: var(--muted);
+        gap: 10px;
+        text-align: center;
+        padding: 40px 20px;
+      }
+      .chat-empty-icon {
+        font-size: 40px; opacity: 0.3;
+      }
+      .chat-empty p { margin: 0; font-size: 14px; line-height: 1.6; }
+
+      /* Bubbles */
+      .msg-row {
+        display: flex;
+        gap: 10px;
+        align-items: flex-end;
+      }
+      .msg-row.user { flex-direction: row-reverse; }
+
+      .avatar {
+        width: 32px; height: 32px; border-radius: 50%;
+        background: linear-gradient(135deg, #0b7285, #1a9fb5);
+        display: flex; align-items: center; justify-content: center;
+        color: white; font-size: 13px; font-weight: 800;
+        flex-shrink: 0;
+      }
+      .avatar.user-av {
+        background: linear-gradient(135deg, #6366f1, #8b5cf6);
+        font-size: 12px;
+      }
+
+      .bubble {
+        max-width: 72%;
+        padding: 12px 16px;
+        border-radius: 18px;
+        font-size: 14px;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      /* Markdown-rendered content inside agent bubbles */
+      .bubble.agent p { margin: 0 0 4px; }
+      .bubble.agent p:last-child { margin-bottom: 0; }
+      .bubble.agent ul, .bubble.agent ol { margin: 2px 0 6px; padding-left: 20px; }
+      .bubble.agent li { margin-bottom: 1px; }
+      .bubble.agent li > p { margin: 0; }
+      .bubble.agent strong { font-weight: 700; }
+      .bubble.agent em { font-style: italic; }
+      .bubble.agent code { font-family: "IBM Plex Mono", monospace; background: rgba(11,94,119,0.08); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+      .bubble.agent a { color: var(--accent); text-decoration: underline; word-break: break-all; }
+      .bubble.agent a:hover { color: var(--accent-send); }
+      .bubble.agent h1, .bubble.agent h2, .bubble.agent h3 { margin: 6px 0 4px; font-size: 1em; font-weight: 700; }
+      .steps-list li a { color: var(--accent); text-decoration: underline; }
+      .bubble.agent {
+        background: var(--bubble-agent-bg);
+        border: 1px solid var(--line);
+        border-bottom-left-radius: 4px;
+        color: var(--bubble-agent-ink);
+      }
+      .bubble.user {
+        background: var(--bubble-user-bg);
+        color: var(--bubble-user-ink);
+        border-bottom-right-radius: 4px;
+      }
+      .bubble.step {
+        background: var(--bubble-step-bg);
+        border: 1px solid var(--line);
+        border-bottom-left-radius: 4px;
+        color: var(--bubble-step-ink);
+        font-size: 13px;
+        padding: 8px 14px;
+        max-width: 80%;
+      }
+      .bubble.working {
+        display: flex; align-items: center; gap: 10px;
+      }
+
+      /* Steps list inside agent bubble */
+      .steps-list {
+        margin: 8px 0 0;
+        padding-left: 0;
+        list-style: none;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .steps-list li {
+        display: flex; align-items: flex-start; gap: 6px;
+        font-size: 13px; color: var(--muted);
+      }
+      .steps-list li::before { content: "›"; flex-shrink: 0; color: var(--accent); }
+      .steps-list li.done { color: var(--ok); }
+      .steps-list li.done::before { content: "✓"; }
+
+      /* Spinner */
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .spinner {
+        width: 14px; height: 14px; border-radius: 50%;
+        border: 2px solid var(--accent-light);
+        border-top-color: var(--accent);
+        animation: spin 0.8s linear infinite;
+        flex-shrink: 0;
+      }
+
+      /* ── Input bar ─────────────────────────────────────────── */
+      .input-bar {
+        border-top: 1px solid var(--line);
+        padding: 14px 16px;
+        display: flex;
+        gap: 10px;
+        align-items: flex-end;
+        background: #fafcfd;
+      }
+      .input-bar textarea {
+        flex: 1;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 10px 14px;
+        font: inherit;
+        font-size: 14px;
+        resize: none;
+        min-height: 42px;
+        max-height: 160px;
+        outline: none;
+        background: var(--panel);
+        color: var(--ink);
+        transition: border-color 0.15s;
+        overflow-y: auto;
+      }
+      .input-bar textarea:focus { border-color: var(--accent-send); }
+      .input-bar textarea::placeholder { color: var(--muted); }
+      .send-btn {
+        width: 42px; height: 42px; border-radius: 50%;
+        border: none; cursor: pointer;
+        background: var(--accent-send);
+        color: white;
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0;
+        transition: background 0.15s, opacity 0.15s;
+      }
+      .send-btn:hover { background: #095f70; }
+      .send-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+      .send-btn svg { width: 18px; height: 18px; }
+
+      /* ── Log section ───────────────────────────────────────── */
+      .logs-card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: 0 4px 20px rgba(0,0,0,0.07);
+        padding: 20px;
+      }
+      .logs-header {
+        display: flex; align-items: center; justify-content: space-between;
+        margin-bottom: 16px;
+      }
+      .logs-header h2 {
+        margin: 0; font-size: 15px; font-weight: 700;
+      }
+      .log-refresh-btn {
+        font: inherit; font-size: 12px; font-weight: 600;
+        border: 1px solid var(--line); border-radius: 999px;
+        padding: 5px 14px; cursor: pointer;
+        background: rgba(255,255,255,0.7); color: var(--ink);
+        transition: background 0.12s;
+      }
+      .log-refresh-btn:hover { background: #fff; }
+
+      .log-agents { display: flex; flex-direction: column; gap: 14px; }
+
+      .log-panel {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        overflow: hidden;
+      }
+      .log-panel-header {
+        padding: 10px 16px;
+        background: rgba(11, 114, 133, 0.07);
+        border-bottom: 1px solid var(--line);
+        display: flex; align-items: center; gap: 10px;
+      }
+      .log-panel-header h3 { margin: 0; font-size: 14px; font-weight: 700; }
+      .log-panel-meta { font-size: 11px; color: var(--muted); margin-left: auto; }
+      .log-panel pre {
+        margin: 0;
+        padding: 12px 16px;
+        font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+        font-size: 12px;
+        line-height: 1.5;
+        background: #172026;
+        color: #c8dce5;
+        overflow-y: auto;
+        resize: vertical;
+        height: var(--log-default-height);
+        min-height: 80px;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .log-placeholder {
+        padding: 16px;
+        font-size: 13px;
+        color: var(--muted);
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+
+    <header class="topbar">
+      <div class="topbar-icon">C</div>
+      <div>
+        <div class="topbar-name">Compass Agent</div>
+        <div class="topbar-subtitle">Multi-Agent Orchestrator</div>
+      </div>
+      <div class="topbar-status" id="agent-status">● Ready</div>
+    </header>
+
+    <div class="app-body">
+
+      <!-- Chat window -->
+      <div class="chat-card">
+        <div class="chat-window" id="chat-window">
+          <div class="chat-empty" id="chat-empty">
+            <div class="chat-empty-icon">🧭</div>
+            <p>Hello! I'm <strong>Compass Agent</strong>.<br>
+              Ask me to implement a Tracker ticket, analyse a repo, or start an Android workflow.</p>
+          </div>
+        </div>
+
+        <div class="input-bar">
+          <textarea id="msg-input" rows="1"
+            placeholder="Ask Compass Agent — e.g. please implement https://tracker.example.com/browse/DMPP-2647"
+          ></textarea>
+          <button class="send-btn" id="send-btn" title="Send">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"/>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Agent Logs -->
+      <div class="logs-card">
+        <div class="logs-header">
+          <h2>Agent Logs</h2>
+          <button class="log-refresh-btn" id="refresh-logs-btn">Refresh</button>
+        </div>
+        <div class="log-agents" id="log-agents">
+          <div class="log-placeholder" id="log-placeholder">Agent log panels will appear here.</div>
+        </div>
+      </div>
+
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+    <script>
+      // ── Markdown renderer ────────────────────────────────────────────────────
+      marked.setOptions({ breaks: true, gfm: true });
+      function renderMarkdown(text) {
+        try { return marked.parse(String(text || "")); }
+        catch (_) { return String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+      }
+
+      // ── DOM refs ──────────────────────────────────────────────────────────────
+      const chatWindow   = document.getElementById("chat-window");
+      const chatEmpty    = document.getElementById("chat-empty");
+      const msgInput     = document.getElementById("msg-input");
+      const sendBtn      = document.getElementById("send-btn");
+      const agentStatus  = document.getElementById("agent-status");
+      const logAgents    = document.getElementById("log-agents");
+
+      // ── Log state ─────────────────────────────────────────────────────────────
+      let logCursor = Math.floor(Date.now() / 1000) - 5;
+      const logPanels = new Map();
+      const seenLogEntries = new Set();
+
+      // ── Helpers ───────────────────────────────────────────────────────────────
+      function scrollChat() {
+        chatWindow.scrollTo({ top: chatWindow.scrollHeight, behavior: "smooth" });
+      }
+
+      function hideChatEmpty() {
+        if (chatEmpty) chatEmpty.style.display = "none";
+      }
+
+      function appendBubble(role, text, extraClass) {
+        hideChatEmpty();
+        const row = document.createElement("div");
+        row.className = `msg-row ${role}`;
+
+        const av = document.createElement("div");
+        av.className = role === "user" ? "avatar user-av" : "avatar";
+        av.textContent = role === "user" ? "U" : "CA";
+
+        const bubble = document.createElement("div");
+        bubble.className = `bubble ${role}${extraClass ? " " + extraClass : ""}`;
+        if (role === "agent") {
+          bubble.innerHTML = renderMarkdown(text);
+        } else {
+          bubble.textContent = text;
+        }
+
+        row.appendChild(av);
+        row.appendChild(bubble);
+        chatWindow.appendChild(row);
+        scrollChat();
+        return bubble;
+      }
+
+      // Working bubble with spinner + evolving steps list
+      function appendWorkingBubble() {
+        hideChatEmpty();
+        const row = document.createElement("div");
+        row.className = "msg-row agent";
+
+        const av = document.createElement("div");
+        av.className = "avatar";
+        av.textContent = "CA";
+
+        const bubble = document.createElement("div");
+        bubble.className = "bubble agent working";
+
+        const spinner = document.createElement("div");
+        spinner.className = "spinner";
+        bubble.appendChild(spinner);
+
+        const wrap = document.createElement("div");
+        const statusLine = document.createElement("div");
+        statusLine.textContent = "Working on your request…";
+        const stepsList = document.createElement("ul");
+        stepsList.className = "steps-list";
+        wrap.appendChild(statusLine);
+        wrap.appendChild(stepsList);
+        bubble.appendChild(wrap);
+
+        row.appendChild(av);
+        row.appendChild(bubble);
+        chatWindow.appendChild(row);
+        scrollChat();
+        return { bubble, spinner, statusLine, stepsList, row };
+      }
+
+      function finalizeWorkingBubble({ bubble, spinner, statusLine, row }, finalText, isError) {
+        spinner.remove();
+        bubble.classList.remove("working");
+        statusLine.textContent = finalText;
+        if (isError) statusLine.style.color = "var(--warn)";
+        scrollChat();
+      }
+
+      let renderedStepCount = 0;
+      let pendingInputTaskId = null;  // set when last task ended with INPUT_REQUIRED
+
+      function appendStep(stepsList, text) {
+        const li = document.createElement("li");
+        // render inline markdown (links, bold, code) but keep it inline
+        const tmp = document.createElement("div");
+        tmp.innerHTML = renderMarkdown(text);
+        // flatten to inline content
+        const inner = tmp.querySelector("p") || tmp;
+        li.innerHTML = inner.innerHTML || tmp.innerHTML;
+        stepsList.appendChild(li);
+        scrollChat();
+      }
+
+      // ── Send message ──────────────────────────────────────────────────────────
+      async function sendMessage() {
+        const text = msgInput.value.trim();
+        if (!text) return;
+
+        // Show user bubble
+        appendBubble("user", text);
+        msgInput.value = "";
+        autoResize();
+        sendBtn.disabled = true;
+        agentStatus.textContent = "● Working";
+        agentStatus.style.background = "#fef9c3";
+        agentStatus.style.color = "#92400e";
+
+        // Show agent working bubble
+        const working = appendWorkingBubble();
+        renderedStepCount = 0;
+
+        try {
+          const reqBody = {
+            message: {
+              messageId: `ui-${Date.now()}`,
+              role: "ROLE_USER",
+              parts: [{ text }],
+            },
+          };
+          if (pendingInputTaskId) {
+            reqBody.contextId = pendingInputTaskId;
+            pendingInputTaskId = null;
+          }
+          const { response, payload } = await requestJson("/message:send", {
+            method: "POST",
+            headers: { "Content-Type": "application/json; charset=utf-8" },
+            body: JSON.stringify(reqBody),
+          });
+
+          const taskId = payload?.task?.id;
+          if (taskId) {
+            working.statusLine.textContent = `Request received (${taskId}) — processing…`;
+            appendStep(working.stepsList, `Task created: ${taskId}`);
+            await pollUntilDone(taskId, working);
+          } else {
+            const errText = payload?.error || payload?.detail || `HTTP ${response.status}`;
+            finalizeWorkingBubble(working, `Failed: ${errText}`, true);
+          }
+        } catch (err) {
+          finalizeWorkingBubble(working, `Error: ${err.message}`, true);
+        }
+
+        sendBtn.disabled = false;
+        agentStatus.textContent = "● Ready";
+        agentStatus.style.background = "#e6f7ee";
+        agentStatus.style.color = "#157f3b";
+      }
+
+      // ── Poll until task terminal state ────────────────────────────────────────
+      async function pollUntilDone(taskId, working) {
+        const INTERVAL = 1500;
+        const MAX_WAIT = 3600_000;
+        const start = Date.now();
+
+        while (Date.now() - start < MAX_WAIT) {
+          await sleep(INTERVAL);
+          try {
+            const { payload } = await requestJson(`/tasks/${taskId}`, { method: "GET" });
+            const task = payload?.task;
+            if (!task) continue;
+
+            // Render new progress steps
+            const steps = task.progressSteps || [];
+            for (let i = renderedStepCount; i < steps.length; i++) {
+              appendStep(working.stepsList, steps[i].step || "");
+            }
+            renderedStepCount = steps.length;
+
+            const state = task.status?.state || "";
+            const terminalStates = [
+              "TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_INPUT_REQUIRED",
+              "NO_CAPABLE_AGENT", "CAPABILITY_TEMPORARILY_UNAVAILABLE",
+              "POLICY_DENIED", "FAILED", "CAPACITY_EXHAUSTED",
+            ];
+
+            if (terminalStates.includes(state)) {
+              const msgParts = task.status?.message?.parts || [];
+              const summaryText = msgParts.map(p => p.text || "").join("\n").trim();
+
+              // Mark all steps done
+              working.stepsList.querySelectorAll("li").forEach(li => li.classList.add("done"));
+
+              if (state === "TASK_STATE_COMPLETED") {
+                pendingInputTaskId = null;
+                finalizeWorkingBubble(working, "Completed ✓", false);
+              } else if (state === "TASK_STATE_INPUT_REQUIRED") {
+                pendingInputTaskId = taskId;
+                finalizeWorkingBubble(working, "Awaiting your input…", false);
+                working.statusLine.style.color = "var(--accent)";
+              } else {
+                pendingInputTaskId = null;
+                finalizeWorkingBubble(working, `${state}`, true);
+              }
+
+              if (summaryText) {
+                appendBubble("agent", summaryText);
+              }
+              return;
+            }
+          } catch (_) { /* retry */ }
+        }
+        finalizeWorkingBubble(working, "Timed out waiting for result.", true);
+      }
+
+      function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+      async function requestJson(url, options) {
+        const response = await fetch(url, options);
+        let payload;
+        try { payload = await response.json(); }
+        catch (e) { payload = { error: "invalid_json", detail: String(e) }; }
+        return { response, payload };
+      }
+
+      // ── Auto-resize textarea ──────────────────────────────────────────────────
+      function autoResize() {
+        msgInput.style.height = "auto";
+        msgInput.style.height = Math.min(msgInput.scrollHeight, 160) + "px";
+      }
+      msgInput.addEventListener("input", autoResize);
+      msgInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          if (!sendBtn.disabled) sendMessage();
+        }
+      });
+      sendBtn.addEventListener("click", sendMessage);
+
+      // ── Log panels ────────────────────────────────────────────────────────────
+      function ensureLogPanel(agent) {
+        const key = `${agent.agentId}:${agent.containerName}`;
+        if (logPanels.has(key)) {
+          const p = logPanels.get(key);
+          p.meta.textContent = `${agent.role} • ${agent.state} • ${agent.containerName}${agent.taskId ? ` • ${agent.taskId}` : ""}`;
+          return p.pre;
+        }
+        const placeholder = document.getElementById("log-placeholder");
+        if (placeholder) placeholder.remove();
+
+        const panel = document.createElement("div");
+        panel.className = "log-panel";
+
+        const hdr = document.createElement("div");
+        hdr.className = "log-panel-header";
+        const title = document.createElement("h3");
+        title.textContent = agent.displayName;
+        const meta = document.createElement("div");
+        meta.className = "log-panel-meta";
+        meta.textContent = `${agent.role} • ${agent.state} • ${agent.containerName}${agent.taskId ? ` • ${agent.taskId}` : ""}`;
+        hdr.appendChild(title);
+        hdr.appendChild(meta);
+
+        const pre = document.createElement("pre");
+
+        panel.appendChild(hdr);
+        panel.appendChild(pre);
+        logAgents.appendChild(panel);
+        logPanels.set(key, { pre, meta });
+        return pre;
+      }
+
+      function appendLogLines(agent, entries) {
+        const pre = ensureLogPanel(agent);
+        let added = false;
+        for (const entry of entries) {
+          const key = `${agent.containerName}:${entry.ts}:${entry.line}`;
+          if (seenLogEntries.has(key)) continue;
+          seenLogEntries.add(key);
+          const prefix = entry.ts ? `[${entry.ts}] ` : "";
+          pre.textContent += `${prefix}${entry.line}\n`;
+          added = true;
+        }
+        if (added) pre.scrollTop = pre.scrollHeight;
+      }
+
+      async function refreshLogs() {
+        try {
+          const { response, payload } = await requestJson(
+            `/debug/agent-logs?since=${encodeURIComponent(logCursor)}`, { method: "GET" }
+          );
+          if (!response.ok) return;
+          const agents = payload?.agents || [];
+          agents.forEach(a => appendLogLines(a, a.logs || []));
+          if (payload?.generatedAt) {
+            logCursor = Math.max(logCursor, Math.floor(payload.generatedAt) - 1);
+          }
+        } catch (_) { /* best-effort */ }
+      }
+
+      document.getElementById("refresh-logs-btn").addEventListener("click", refreshLogs);
+
+      // Start log polling
+      refreshLogs();
+      setInterval(refreshLogs, 2000);
+    </script>
+  </body>
+</html>
