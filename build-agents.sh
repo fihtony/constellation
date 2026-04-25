@@ -24,6 +24,15 @@ build_android() {
     echo "    Done: constellation-android-agent:latest"
 }
 
+build_web() {
+    echo "==> Building web agent image: constellation-web-agent:latest"
+    docker build \
+        -t constellation-web-agent:latest \
+        -f "${SCRIPT_DIR}/web/Dockerfile" \
+        "${SCRIPT_DIR}"
+    echo "    Done: constellation-web-agent:latest"
+}
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 TARGET="${1:-all}"
 
@@ -31,12 +40,16 @@ case "$TARGET" in
     android)
         build_android
         ;;
+    web)
+        build_web
+        ;;
     all)
         build_android
+        build_web
         ;;
     *)
         echo "Unknown target: $TARGET"
-        echo "Usage: $0 [android|all]"
+        echo "Usage: $0 [android|web|all]"
         exit 1
         ;;
 esac

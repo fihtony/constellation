@@ -1,0 +1,14 @@
+{
+  "agentId": "web-agent",
+  "cardUrl": "http://web-agent:8050/.well-known/agent-card.json",
+  "executionMode": "per-task",
+  "launchSpec": {
+    "image": "constellation-web-agent:latest",
+    "port": 8050
+  },
+  "scalingPolicy": {
+    "maxInstances": 3,
+    "perInstanceConcurrency": 1,
+    "idleTimeoutSeconds": 120
+  }
+}

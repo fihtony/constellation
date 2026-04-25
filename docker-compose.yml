@@ -199,6 +199,41 @@ services:
       retries: 20
       start_period: 2s
 
+  # web-agent is a per-task agent — built separately via build-agents.sh and
+  # launched on demand by Team Lead via Docker socket. It is NOT started here.
+  # The entry below is kept for reference; remove the comment to run it standalone.
+  #
+  # web-agent:
+  #   image: constellation-web-agent:latest
+  #   build:
+  #     context: .
+  #     dockerfile: web/Dockerfile
+  #   command: ["python3", "web/app.py"]
+  #   env_file:
+  #     - ./web/.env
+  #   environment:
+  #     HOST: "0.0.0.0"
+  #     PORT: "8050"
+  #     AGENT_ID: "web-agent"
+  #     ADVERTISED_BASE_URL: "http://web-agent:8050"
+  #     REGISTRY_URL: "http://registry:9000"
+  #     SCM_AGENT_URL: "http://scm:8020"
+  #     JIRA_AGENT_URL: "http://tracker:8010"
+  #     COMPASS_URL: "http://compass:8080"
+  #     HEARTBEAT_INTERVAL: "30"
+  #   labels:
+  #     constellation.agent_id: "web-agent"
+  #     constellation.agent_name: "Web Agent"
+  #     constellation.agent_role: "execution"
+  #   ports:
+  #     - "8050:8050"
+  #   healthcheck:
+  #     test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8050/health')"]
+  #     interval: 2s
+  #     timeout: 2s
+  #     retries: 20
+  #     start_period: 2s
+
 networks:
   default:
     name: constellation-network
