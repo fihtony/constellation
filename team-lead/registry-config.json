@@ -1,0 +1,14 @@
+{
+  "agentId": "team-lead-agent",
+  "cardUrl": "http://team-lead:8030/.well-known/agent-card.json",
+  "executionMode": "per-task",
+  "launchSpec": {
+    "image": "constellation-team-lead-agent:latest",
+    "port": 8030
+  },
+  "scalingPolicy": {
+    "maxInstances": 5,
+    "perInstanceConcurrency": 1,
+    "idleTimeoutSeconds": 120
+  }
+}

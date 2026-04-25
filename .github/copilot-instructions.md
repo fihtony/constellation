@@ -30,11 +30,12 @@ working together to complete complex engineering tasks.
 
 | Component | Directory | Role |
 |-----------|-----------|------|
-| **Compass Agent** | `compass/` | Control-plane entry point. Routes tasks, manages workflow, owns the Web UI. This is the "north star" that directs all other agents. |
+| **Compass Agent** | `compass/` | Control-plane entry point. Routes ALL tasks to Team Lead, manages workflow, owns the Web UI. |
+| **Team Lead Agent** | `team-lead/` | Intelligence layer. Analyzes tasks, gathers Jira/design context, plans, dispatches to dev agents, reviews output, and summarizes results. Runs on port 8030. |
 | **Capability Registry** | `registry/` | Agent discovery and instance tracking. All agents register here on startup. |
-| **Tracker Agent** | `tracker/` | Integrates with Jira-compatible systems. Fetches tickets, updates status, posts comments. |
-| **SCM Agent** | `scm/` | Integrates with Git SCM (Bitbucket/GitHub). Repo inspection, branch, PR operations. |
-| **Android Agent** | `android/` | On-demand execution agent. Launched per-task by the Compass Agent via Docker socket. |
+| **Tracker Agent** | `jira/` | Integrates with Jira-compatible systems. Fetches tickets, updates status, posts comments. Runs on port 8010 (Docker service name: `tracker`). |
+| **SCM Agent** | `scm/` | Integrates with Git SCM (Bitbucket/GitHub). Repo inspection, branch, PR operations. Runs on port 8020. |
+| **Android Agent** | `android/` | On-demand execution agent. Launched per-task by Team Lead via Docker socket. |
 | **UI Design Agent** | `ui-design/` | Design context agent. Fetches design data from Figma (REST API) and Google Stitch (MCP). Runs on port 8040. |
 | **Common Library** | `common/` | Shared modules: registry client, launcher, LLM client, artifact store, task store, etc. |
 
@@ -49,24 +50,20 @@ The system uses MCP (Model Context Protocol) servers instead of dedicated agents
 
 ```
 User
-  └─► Compass Agent (control plane, workflow routing)
-         └─► Team Lead Agent (task analysis, MCP coordination)
-                ├─► Jira MCP (fetch ticket details, update status)
-                ├─► GitHub MCP (repo inspection, PR operations)
-                ├─► Google Stitch MCP (design context)
-                ├─► Android Agent (per-task container)
+  └─► Compass Agent (control plane, thin router, UI)
+         └─► Team Lead Agent (intelligence layer — analysis, planning, coordination, review)
+                ├─► Jira Agent (A2A: jira.ticket.fetch, jira.comment.add, …)
+                ├─► UI Design Agent (A2A: figma.page.fetch, stitch.screen.fetch, …)
+                ├─► Android Agent (per-task container: android.task.execute)
                 ├─► iOS Agent (per-task container, future)
-                └─► Middleware Agent (per-task container, future)
+                └─► Web Agent (per-task container, future)
 ```
 
-**Design Rationale**: Compass Agent should NOT call Jira MCP directly.
-The Team Lead Agent is responsible for:
-1. Fetching and analyzing Jira tickets via Jira MCP
-2. Understanding the codebase via GitHub MCP
-3. Breaking down tasks and delegating to execution agents
-4. Aggregating results and reporting back to Compass
-
-This separation keeps Compass thin (routing only) and puts domain intelligence in Team Lead.
+**Design Rationale**:
+- Compass Agent routes ALL user tasks to Team Lead (`team-lead.task.analyze`). It does NOT infer workflow or call Jira/SCM/design agents directly.
+- Team Lead Agent is the intelligence layer responsible for: task analysis, info gathering (Jira, design), planning, dev agent dispatch, code review, and result summarization.
+- Team Lead handles INPUT_REQUIRED by pausing its workflow and waiting for user input forwarded by Compass. No new Team Lead instance is created for resume — the SAME instance resumes.
+- Dev agents (android, ios, web) are launched per-task by Team Lead via Docker socket + Registry + Launcher.
 
 ### Container Runtime
 
@@ -505,7 +502,44 @@ PORT=8080
 HEARTBEAT_INTERVAL=30
 ```
 
-### 14. Dockerfile Requirements
+### 14. LLM Prompt Files
+
+**MANDATORY**: Every agent that calls an LLM MUST keep all prompt strings in a dedicated
+`prompts.py` file in the agent's root directory (same level as `app.py`).
+
+**Rules:**
+- File name: `prompts.py` (fixed, no exceptions)
+- `app.py` MUST NOT contain any inline LLM prompt strings
+- Naming convention: `<PURPOSE>_SYSTEM` for system prompts, `<PURPOSE>_TEMPLATE` for user prompt templates
+- Template variables use Python f-string format: `{variable_name}`
+
+**Rationale:** Prompts are core business logic. Keeping them separate enables version tracking,
+A/B testing, and code review without mixing prompt changes with logic changes.
+
+```
+my-agent/
+├── app.py        ← logic only, no prompt strings
+├── prompts.py    ← ALL LLM prompt strings
+└── agent-card.json
+```
+
+**Example `prompts.py`:**
+```python
+ANALYZE_SYSTEM = "You are a ..."
+ANALYZE_TEMPLATE = "Given the request: {user_text}\nRespond with JSON: ..."
+```
+
+**Usage in `app.py`:**
+```python
+from my_agent import prompts
+response = generate_text(
+    prompts.ANALYZE_TEMPLATE.format(user_text=user_text),
+    "[my-agent] analyze",
+    system_prompt=prompts.ANALYZE_SYSTEM,
+)
+```
+
+### 15. Dockerfile Requirements
 
 ```dockerfile
 FROM python:3.12-slim
@@ -537,7 +571,7 @@ CMD ["python3", "my-agent/app.py"]
 - `constellation.agent_name` — human-readable display name
 - `constellation.agent_role` — one of: `fundamental`, `execution`, `integration`
 
-### 15. docker-compose.yml Entry
+### 16. docker-compose.yml Entry
 
 ```yaml
 my-agent:
@@ -637,6 +671,8 @@ Before submitting a new agent, verify:
 
 | Purpose | Path |
 |---------|------|
+| **Team Lead Agent** | `team-lead/` | Intelligence layer: analysis, planning, dispatch, review | port 8030 |
+| Team Lead prompts | `team-lead/prompts.py` | ALL LLM prompt strings for Team Lead |
 | UI Design Agent | `ui-design/` | Figma REST API + Google Stitch MCP | port 8040 |
 | UI Design client (Figma) | `ui-design/figma_client.py` | Agent-local, NOT in `common/` |
 | UI Design client (Stitch) | `ui-design/stitch_client.py` | Agent-local, NOT in `common/` |

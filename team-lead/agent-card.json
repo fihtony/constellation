@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "1.0",
+  "name": "Team Lead Agent",
+  "description": "Analyzes development tasks, coordinates Jira and design context gathering, dispatches work to development agents (android, ios, web), reviews output, and summarizes results back to Compass.",
+  "version": "1.0.0",
+  "supportedInterfaces": [
+    {
+      "url": "__ADVERTISED_URL__",
+      "protocolBinding": "HTTP+JSON",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": true
+  },
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "team-lead.task.analyze",
+      "name": "Team Lead Task Analysis",
+      "description": "Receives a raw task request, analyzes it, gathers Jira ticket and design context, plans the implementation, dispatches to the appropriate dev agent, reviews the output, and returns a final summary with artifacts.",
+      "executionMode": "async",
+      "asyncContract": {
+        "callbackField": "orchestratorCallbackUrl",
+        "taskIdField": "taskId",
+        "pollEndpoint": "GET /tasks/{taskId}",
+        "callbackPayloadSchema": {
+          "downstreamTaskId": "string",
+          "state": "TASK_STATE_COMPLETED | TASK_STATE_FAILED | TASK_STATE_INPUT_REQUIRED",
+          "statusMessage": "string",
+          "artifacts": "array",
+          "agentId": "string"
+        }
+      },
+      "tags": ["team-lead", "analysis", "planning", "review", "async"]
+    }
+  ]
+}

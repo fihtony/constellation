@@ -175,17 +175,9 @@ def _dedupe(items):
 
 
 def _infer_capability_workflow(user_text):
-    lowered = (user_text or "").lower()
-    workflow = []
-    if TICKET_RE.search(user_text or ""):
-        workflow.append("tracker.ticket.fetch")
-    if any(term in lowered for term in ("scm", "repo", "repository", "pull request", "branch", "ios", "middleware")):
-        workflow.append("scm.repo.inspect")
-    if any(term in lowered for term in ("android", "implement", "implementation", "fix", "bug", "patch", "code", "build")):
-        workflow.append("android.task.execute")
-    if not workflow:
-        workflow.append("scm.repo.inspect")
-    return _dedupe(workflow)
+    # All tasks are routed through Team Lead, which handles analysis,
+    # Jira/design context gathering, dev agent dispatch, and code review.
+    return ["team-lead.task.analyze"]
 
 
 def _wait_for_instance(agent_id, container_name, timeout_seconds=20):
@@ -274,6 +266,7 @@ def _build_step_message(task, original_message, task_id, capability, step_index,
         "requestedCapability": capability,
         "orchestratorTaskId": task_id,
         "orchestratorCallbackUrl": f"{ADVERTISED_URL.rstrip('/')}/tasks/{task_id}/callbacks",
+        "compassUrl": ADVERTISED_URL.rstrip("/"),
         "sharedWorkspacePath": task.workspace_path,
         "workflowStep": step_index,
         "workflowTotalSteps": total_steps,
@@ -338,6 +331,12 @@ def _cleanup_callback_waiter(key):
 
 
 def _wait_for_downstream_completion(task, agent_id, capability, service_url, downstream_task_id):
+    """Wait for a downstream agent task to reach a terminal state.
+
+    Handles TASK_STATE_INPUT_REQUIRED specially: stores the downstream task info on the
+    compass task (so the HTTP handler can forward the user's reply to Team Lead) and
+    continues waiting rather than returning immediately.
+    """
     key, event = _register_callback_waiter(task.task_id, downstream_task_id)
     deadline = time.time() + DOWNSTREAM_TASK_TIMEOUT
     next_poll_at = time.time()
@@ -346,10 +345,32 @@ def _wait_for_downstream_completion(task, agent_id, capability, service_url, dow
             if event.wait(timeout=1.0):
                 callback_result = _consume_callback_result(key)
                 if callback_result:
+                    if callback_result.get("state") == "TASK_STATE_INPUT_REQUIRED":
+                        # Store Team Lead task info for resume, propagate state to user,
+                        # then re-register the waiter and keep waiting for the final result.
+                        task.downstream_task_id = downstream_task_id
+                        task.downstream_service_url = service_url
+                        task_store.update_state(
+                            task.task_id,
+                            "TASK_STATE_INPUT_REQUIRED",
+                            callback_result.get("status_message", "Additional information required."),
+                        )
+                        audit_log(
+                            "TASK_INPUT_REQUIRED",
+                            task_id=task.task_id,
+                            downstream_task_id=downstream_task_id,
+                            question=callback_result.get("status_message", "")[:200],
+                        )
+                        # Re-register callback waiter for when Team Lead resumes
+                        key, event = _register_callback_waiter(task.task_id, downstream_task_id)
+                        continue
                     return callback_result
 
             if time.time() >= next_poll_at:
                 next_poll_at = time.time() + 5.0
+                # Skip polling while waiting for user input to reduce noise
+                if task.state == "TASK_STATE_INPUT_REQUIRED":
+                    continue
                 try:
                     response = _fetch_task(service_url, downstream_task_id)
                 except Exception:
@@ -359,6 +380,21 @@ def _wait_for_downstream_completion(task, agent_id, capability, service_url, dow
                     continue
                 polled_result = _extract_downstream_result(downstream_task)
                 if _is_terminal_state(polled_result["state"]):
+                    if polled_result["state"] == "TASK_STATE_INPUT_REQUIRED":
+                        if task.state != "TASK_STATE_INPUT_REQUIRED":
+                            task.downstream_task_id = downstream_task_id
+                            task.downstream_service_url = service_url
+                            task_store.update_state(
+                                task.task_id,
+                                "TASK_STATE_INPUT_REQUIRED",
+                                polled_result.get("status_message", "Additional information required."),
+                            )
+                            audit_log(
+                                "TASK_INPUT_REQUIRED",
+                                task_id=task.task_id,
+                                downstream_task_id=downstream_task_id,
+                            )
+                        continue
                     return polled_result
 
         task_store.update_state(
@@ -729,18 +765,52 @@ class CompassHandler(BaseHTTPRequestHandler):
             return
 
         # If the caller supplies a contextId pointing to a TASK_STATE_INPUT_REQUIRED task,
-        # merge the user's new text with the original message and re-run the same workflow.
+        # forward the user's additional info to the Team Lead instance that raised the question.
+        # The original compass task is retained — no new task is created.
         context_id = (body.get("contextId") or "").strip()
         if context_id:
             prior_task = task_store.get(context_id)
             if prior_task and prior_task.state == "TASK_STATE_INPUT_REQUIRED":
+                tl_task_id = prior_task.downstream_task_id or ""
+                tl_service_url = prior_task.downstream_service_url or ""
+
+                if tl_task_id and tl_service_url:
+                    # Forward additional info to Team Lead with the original TL task as context.
+                    # Team Lead will resume its paused workflow thread.
+                    print(
+                        f"[compass] Forwarding user reply to Team Lead "
+                        f"(tl_task={tl_task_id}, compass_task={context_id})"
+                    )
+                    try:
+                        _a2a_call(tl_service_url, message, context_id=tl_task_id)
+                        task_store.update_state(
+                            context_id,
+                            "TASK_STATE_WORKING",
+                            "User provided additional information. Resuming…",
+                        )
+                        audit_log(
+                            "TASK_RESUMED",
+                            task_id=context_id,
+                            tl_task_id=tl_task_id,
+                        )
+                    except Exception as err:
+                        print(f"[compass] Failed to forward resume to Team Lead: {err}")
+                        task_store.update_state(
+                            context_id,
+                            "TASK_STATE_INPUT_REQUIRED",
+                            prior_task.status_message,  # keep original question visible
+                        )
+                    self._send_json(200, {"task": prior_task.to_dict()})
+                    return
+
+                # Fallback: no Team Lead info stored — re-run the workflow with merged context
                 orig_text = extract_text(prior_task.original_message or {})
                 new_text = extract_text(message)
                 combined_text = (orig_text + "\n\n" + new_text).strip() if orig_text else new_text
                 merged = deep_copy_json(message)
                 merged["parts"] = [{"text": combined_text}]
                 workflow = prior_task.pending_workflow
-                print(f"[compass] Resuming INPUT_REQUIRED task {context_id} with merged message")
+                print(f"[compass] INPUT_REQUIRED fallback: re-running workflow for task {context_id}")
                 task_dict = route_and_dispatch(merged, forced_workflow=workflow)
                 self._send_json(200, {"task": task_dict})
                 return

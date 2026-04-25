@@ -32,6 +32,9 @@ class Task:
         "updated_at",
         "original_message",
         "pending_workflow",
+        # Used by Compass to resume an INPUT_REQUIRED task forwarded to Team Lead
+        "downstream_task_id",    # Team Lead task ID that raised INPUT_REQUIRED
+        "downstream_service_url",  # Team Lead service URL for sending the resume message
     )
 
     def __init__(self, context_id=None):
@@ -49,6 +52,8 @@ class Task:
         self.updated_at = time.time()
         self.original_message = None
         self.pending_workflow = None
+        self.downstream_task_id = ""
+        self.downstream_service_url = ""
 
     def to_dict(self):
         return {
@@ -64,6 +69,7 @@ class Task:
             "history": self.history,
             "progressSteps": self.progress_steps,
             "workspacePath": self.workspace_path,
+            "downstreamTaskId": self.downstream_task_id,
         }
 
 
