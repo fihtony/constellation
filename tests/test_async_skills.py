@@ -288,14 +288,39 @@ def test_android_clone_callback_endpoint(android_url, report):
 # Main
 # ---------------------------------------------------------------------------
 
+def _parse_github_repo_url(url: str) -> tuple:
+    """Parse 'https://github.com/owner/repo' → (owner, repo)."""
+    url = url.strip().rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    if "?" in url:
+        url = url.split("?")[0]
+    parts = [p for p in url.split("/") if p and ":" not in p]
+    if len(parts) >= 3:
+        return parts[-2], parts[-1]
+    return "", ""
+
+
+def _default_github_owner_repo():
+    """Return (owner, repo) from TEST_GITHUB_REPO_URL or individual env vars."""
+    repo_url = os.environ.get("TEST_GITHUB_REPO_URL", "")
+    if repo_url:
+        return _parse_github_repo_url(repo_url)
+    return (
+        os.environ.get("TEST_GITHUB_OWNER", "your-username"),
+        os.environ.get("TEST_GITHUB_REPO", "test-repo"),
+    )
+
+
 def parse_args(argv=None):
+    _default_owner, _default_repo = _default_github_owner_repo()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scm-url", default="")
     parser.add_argument("--android-url", default="")
     parser.add_argument("--container", action="store_true",
                         help="Use container URLs http://127.0.0.1:8020 and :8030")
-    parser.add_argument("--owner", default="fihtony")
-    parser.add_argument("--repo", default="microservice-test")
+    parser.add_argument("--owner", default=_default_owner)
+    parser.add_argument("--repo", default=_default_repo)
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--skip-clone", action="store_true",
                         help="Skip the actual git clone test (faster, no network needed)")

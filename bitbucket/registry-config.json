@@ -1,0 +1,10 @@
+{
+  "agentId": "bitbucket-agent",
+  "cardUrl": "http://bitbucket:8020/.well-known/agent-card.json",
+  "executionMode": "persistent",
+  "scalingPolicy": {
+    "maxInstances": 1,
+    "perInstanceConcurrency": 1,
+    "idleTimeoutSeconds": 300
+  }
+}

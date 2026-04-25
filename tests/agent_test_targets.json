@@ -1,8 +1,8 @@
 {
   "tracker": {
     "primaryTicket": {
-      "ticketKey": "CSTL-1",
-      "browseUrl": "https://tarch.atlassian.net/browse/CSTL-1",
+      "ticketKey": "PROJ-1",
+      "browseUrl": "https://your-org.atlassian.net/browse/PROJ-1",
       "readOnlyUse": ["fetch", "search", "myself"],
       "writeUse": ["comment_crud", "field_update_restore", "transition_restore", "assignee_restore"]
     },
@@ -10,11 +10,11 @@
   },
   "scm": {
     "primaryRepo": {
-      "owner": "fihtony",
-      "repo": "microservice-test",
-      "browseUrl": "https://github.com/fihtony/microservice-test",
-      "cloneUrl": "https://github.com/fihtony/microservice-test.git",
-      "searchQuery": "microservice test",
+      "owner": "your-username",
+      "repo": "test-repo",
+      "browseUrl": "https://github.com/your-username/test-repo",
+      "cloneUrl": "https://github.com/your-username/test-repo.git",
+      "searchQuery": "test repo",
       "writeRoot": "agent-tests/",
       "readOnlyUse": ["repo_search", "repo_resolve", "repo_list", "pr_inspect", "pr_comment_list"],
       "writeUse": ["branch_create", "git_push", "pr_create", "pr_comment"]
@@ -23,13 +23,25 @@
   },
   "stitch": {
     "primaryProject": {
-      "projectId": "13629074018280446337",
-      "projectUrl": "https://stitch.withgoogle.com/projects/13629074018280446337",
-      "title": "Open English Study Hub",
+      "projectId": "your-stitch-project-id",
+      "projectUrl": "https://stitch.withgoogle.com/projects/your-stitch-project-id",
+      "title": "Test Project",
       "primaryScreen": {
-        "screenId": "52742f72311047aea731c97630d211de",
-        "name": "Landing Page"
+        "screenId": "your-screen-id",
+        "name": "Test Screen"
       }
+    }
+  },
+  "uiDesign": {
+    "figma": {
+      "fileKey": "your-figma-file-key",
+      "fileUrl": "https://www.figma.com/design/your-figma-file-key/Test-File",
+      "nodeId": "1:1"
+    },
+    "stitch": {
+      "projectId": "your-stitch-project-id",
+      "screenId": "your-screen-id",
+      "screenName": "Test Screen"
     }
   }
 }

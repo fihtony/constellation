@@ -1,1 +1,1 @@
-"""Shared runtime helpers for the multi-agent MVP."""
+"""Shared runtime helpers for the Constellation multi-agent system."""

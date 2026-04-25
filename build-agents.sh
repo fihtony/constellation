@@ -16,12 +16,12 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 build_android() {
-    echo "==> Building android agent image: mvp-android-agent:latest"
+    echo "==> Building android agent image: constellation-android-agent:latest"
     docker build \
-        -t mvp-android-agent:latest \
+        -t constellation-android-agent:latest \
         -f "${SCRIPT_DIR}/android/Dockerfile" \
         "${SCRIPT_DIR}"
-    echo "    Done: mvp-android-agent:latest"
+    echo "    Done: constellation-android-agent:latest"
 }
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────

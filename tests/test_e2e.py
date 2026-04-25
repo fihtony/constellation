@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-Agent MVP end-to-end validation for the folder-based agent layout."""
+"""Constellation multi-agent end-to-end validation for the folder-based agent layout."""
 
 from __future__ import annotations
 
@@ -473,7 +473,7 @@ def run_all():
     global passed, failed, errors
 
     print(f"\n{Colors.BOLD}{'═' * 60}{Colors.RESET}")
-    print(f"{Colors.BOLD}  Multi-Agent MVP — End-to-End Test Suite{Colors.RESET}")
+    print(f"{Colors.BOLD}  Constellation — End-to-End Test Suite{Colors.RESET}")
     print(f"{Colors.BOLD}{'═' * 60}{Colors.RESET}")
     print(f"  Compass:       {COMPASS_URL}")
     print(f"  Registry:      {REGISTRY_URL}")
@@ -485,7 +485,7 @@ def run_all():
     if not test_0_prerequisites():
         print(f"\n{Colors.RED}ABORTED: Services are not running.{Colors.RESET}")
         print("\nStart them with:")
-        print("  cd mvp && docker compose up --build -d")
+        print("  docker compose up --build -d")
         sys.exit(1)
 
     test_1_agent_card_discovery()

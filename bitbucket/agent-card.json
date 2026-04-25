@@ -1,0 +1,159 @@
+{
+  "schemaVersion": "1.0",
+  "name": "Bitbucket Agent",
+  "description": "Inspects repositories, resolves repo URLs, lists project repos, creates branches, clones repos to shared workspace (async), reads repo file tree and file contents, pushes commits, parses pull request URLs, lists and inspects pull requests, lists pull request comments, checks duplicate pull request comments, merges approved pull requests, and adds PR comments on Bitbucket Server.",
+  "version": "1.5.0",
+  "supportedInterfaces": [
+    {
+      "url": "__ADVERTISED_URL__",
+      "protocolBinding": "HTTP+JSON",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "bitbucket.repo.inspect",
+      "name": "Bitbucket Repo Inspect",
+      "description": "Resolves Android, iOS, or middleware repository context inside the configured project.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "repo", "inspect", "llm"]
+    },
+    {
+      "id": "bitbucket.branch.create",
+      "name": "Bitbucket Branch Create",
+      "description": "Creates a new branch in a Bitbucket Server repository.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "branch", "create"]
+    },
+    {
+      "id": "bitbucket.branches.list",
+      "name": "Bitbucket Branches List",
+      "description": "Lists branches in a Bitbucket Server repository.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "branch", "list"]
+    },
+    {
+      "id": "bitbucket.git.clone",
+      "name": "Bitbucket Git Clone",
+      "description": "Clones a Bitbucket Server repository to a shared workspace path. Long-running operation: returns taskId immediately and fires callbackUrl when complete. Poll GET /tasks/{taskId} for status. Result includes clonePath in task extra field.",
+      "executionMode": "async",
+      "asyncContract": {
+        "callbackField": "callbackUrl",
+        "taskIdField": "taskId",
+        "pollEndpoint": "GET /tasks/{taskId}",
+        "callbackPayloadSchema": {
+          "taskId": "string",
+          "agentId": "string",
+          "state": "TASK_STATE_COMPLETED | TASK_STATE_FAILED",
+          "clonePath": "string",
+          "error": "string"
+        }
+      },
+      "tags": ["bitbucket", "git", "clone", "async"]
+    },
+    {
+      "id": "bitbucket.repo.tree",
+      "name": "Bitbucket Repo Tree",
+      "description": "Returns the directory tree of an already-cloned repository from the shared workspace. Use after bitbucket.git.clone completes.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "repo", "tree", "filesystem"]
+    },
+    {
+      "id": "bitbucket.repo.file",
+      "name": "Bitbucket Repo File Read",
+      "description": "Reads the content of a single file from an already-cloned repository in the shared workspace.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "repo", "file", "read", "filesystem"]
+    },
+    {
+      "id": "bitbucket.git.push",
+      "name": "Bitbucket Git Push",
+      "description": "Clones a repository over HTTPS, writes files, commits, and pushes a feature branch using the configured Bitbucket token.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "git", "push", "commit"]
+    },
+    {
+      "id": "bitbucket.pr.create",
+      "name": "Bitbucket Pull Request Create",
+      "description": "Creates a pull request from a feature branch to the target branch.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "pull-request", "pr", "create"]
+    },
+    {
+      "id": "bitbucket.pr.get",
+      "name": "Bitbucket Pull Request Get",
+      "description": "Fetches a Bitbucket Server pull request with source/target branches and linked Jira issue keys.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "pull-request", "pr", "get", "jira"]
+    },
+    {
+      "id": "bitbucket.pr.list",
+      "name": "Bitbucket Pull Request List",
+      "description": "Lists pull requests in a Bitbucket Server repository and surfaces linked Jira issue keys from titles, descriptions, and branch names.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "pull-request", "pr", "list", "jira"]
+    },
+    {
+      "id": "bitbucket.pr.merge",
+      "name": "Bitbucket Pull Request Merge",
+      "description": "Merges a Bitbucket Server pull request using its current version when merge checks pass.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "pull-request", "pr", "merge"]
+    },
+    {
+      "id": "bitbucket.repo.search",
+      "name": "Bitbucket Repo Search",
+      "description": "Searches repositories in a Bitbucket Server project from a natural-language query.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "repo", "search"]
+    },
+    {
+      "id": "bitbucket.repo.resolve",
+      "name": "Bitbucket Repo Resolve",
+      "description": "Normalizes a browse URL or natural-language query into a Bitbucket Server browse URL and Git clone URL.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "repo", "resolve", "url"]
+    },
+    {
+      "id": "bitbucket.repos.list",
+      "name": "Bitbucket Repo List",
+      "description": "Lists repositories in a Bitbucket Server project with browse and clone URLs.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "repo", "list"]
+    },
+    {
+      "id": "bitbucket.pr.comment",
+      "name": "Bitbucket Pull Request Comment",
+      "description": "Adds an inline or general comment to a Bitbucket Server pull request.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "pull-request", "comment", "inline-comment"]
+    },
+    {
+      "id": "bitbucket.pr.comments.list",
+      "name": "Bitbucket Pull Request Comments List",
+      "description": "Lists existing comments on a Bitbucket Server pull request, including inline anchors when present.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "pull-request", "comment", "list"]
+    },
+    {
+      "id": "bitbucket.pr.comment.duplicate-check",
+      "name": "Bitbucket Pull Request Comment Duplicate Check",
+      "description": "Checks whether a proposed PR comment already exists on the same general or inline location.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "pull-request", "comment", "duplicate-check"]
+    },
+    {
+      "id": "bitbucket.pr.url.parse",
+      "name": "Bitbucket Pull Request URL Parse",
+      "description": "Parses a Bitbucket Server pull request URL into structured fields.",
+      "executionMode": "sync",
+      "tags": ["bitbucket", "pull-request", "url", "parse"]
+    }
+  ]
+}

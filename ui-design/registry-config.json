@@ -1,0 +1,10 @@
+{
+  "agentId": "ui-design-agent",
+  "cardUrl": "http://ui-design:8040/.well-known/agent-card.json",
+  "executionMode": "persistent",
+  "scalingPolicy": {
+    "maxInstances": 1,
+    "perInstanceConcurrency": 1,
+    "idleTimeoutSeconds": 300
+  }
+}

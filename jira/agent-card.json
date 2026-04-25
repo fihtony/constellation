@@ -1,0 +1,81 @@
+{
+  "schemaVersion": "1.0",
+  "name": "Jira Agent",
+  "description": "Fetches, searches, validates create input, updates, transitions, comments, assignees, and current-user details on Jira tickets using the configured Jira Cloud base URL and classic or scoped Jira Cloud tokens.",
+  "version": "1.3.0",
+  "supportedInterfaces": [
+    {
+      "url": "__ADVERTISED_URL__",
+      "protocolBinding": "HTTP+JSON",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "jira.ticket.fetch",
+      "name": "Jira Ticket Fetch",
+      "description": "Looks up tickets such as DMPP-2647 and prepares a downstream summary.",
+      "tags": ["jira", "ticket", "fetch", "llm"]
+    },
+    {
+      "id": "jira.issue.search",
+      "name": "Jira Issue Search",
+      "description": "Searches Jira issues with JQL and returns matching issues with core fields.",
+      "tags": ["jira", "search", "jql", "issue"]
+    },
+    {
+      "id": "jira.issue.create",
+      "name": "Jira Issue Create",
+      "description": "Creates a new Jira issue with project, type, summary, description, and additional fields.",
+      "tags": ["jira", "issue", "create", "write"]
+    },
+    {
+      "id": "jira.issue.update",
+      "name": "Jira Issue Update",
+      "description": "Updates editable Jira issue fields such as summary, description, labels, or priority.",
+      "tags": ["jira", "issue", "update", "write"]
+    },
+    {
+      "id": "jira.user.myself",
+      "name": "Jira Current User",
+      "description": "Returns the authenticated Jira user profile for the current credentials.",
+      "tags": ["jira", "user", "identity", "auth"]
+    },
+    {
+      "id": "jira.ticket.transition",
+      "name": "Jira Ticket Transition",
+      "description": "Changes the status of a Jira ticket (e.g. In Progress, Ready for Sprint).",
+      "tags": ["jira", "ticket", "transition", "status"]
+    },
+    {
+      "id": "jira.ticket.assignee",
+      "name": "Jira Ticket Assignee",
+      "description": "Changes or restores the assignee of a Jira ticket.",
+      "tags": ["jira", "ticket", "assignee", "write"]
+    },
+    {
+      "id": "jira.comment.add",
+      "name": "Jira Comment Add",
+      "description": "Adds a comment to a Jira ticket.",
+      "tags": ["jira", "comment", "write"]
+    },
+    {
+      "id": "jira.comment.update",
+      "name": "Jira Comment Update",
+      "description": "Updates an existing comment on a Jira ticket.",
+      "tags": ["jira", "comment", "update"]
+    },
+    {
+      "id": "jira.comment.delete",
+      "name": "Jira Comment Delete",
+      "description": "Deletes a comment from a Jira ticket.",
+      "tags": ["jira", "comment", "delete"]
+    }
+  ]
+}

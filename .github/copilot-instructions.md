@@ -1,5 +1,25 @@
 # Constellation — GitHub Copilot Instructions
 
+## Language Policy
+
+| Content type | Language |
+|---|---|
+| Explanations, design discussions, answers to questions | **Chinese (中文)** |
+| Design documents (`docs/*.md`) | **Chinese (中文)** |
+| Source code, comments, tests, `README.md` | **English** |
+
+---
+
+## Change Workflow Checklist
+
+After **any** code change, always consider these three questions before closing the task:
+
+1. **Design document** — Does the change affect architecture, data flow, agent capabilities, or API contracts? If yes, update `docs/constellation-system-design-zh.md` in Chinese.
+2. **Skills** — Does the change introduce, modify, or remove an agent workflow, API pattern, or domain-specific procedure? If yes, create or update the relevant `.github/skills/<name>/SKILL.md` file.
+3. **Copilot instructions** — Does the change affect agent names, label conventions, network names, ports, directory structure, or shared patterns? If yes, update this file.
+
+---
+
 ## Project Overview
 
 **Constellation** is a multi-agent system built on the A2A (Agent-to-Agent) protocol.
@@ -15,6 +35,7 @@ working together to complete complex engineering tasks.
 | **Tracker Agent** | `tracker/` | Integrates with Jira-compatible systems. Fetches tickets, updates status, posts comments. |
 | **SCM Agent** | `scm/` | Integrates with Git SCM (Bitbucket/GitHub). Repo inspection, branch, PR operations. |
 | **Android Agent** | `android/` | On-demand execution agent. Launched per-task by the Compass Agent via Docker socket. |
+| **UI Design Agent** | `ui-design/` | Design context agent. Fetches design data from Figma (REST API) and Google Stitch (MCP). Runs on port 8040. |
 | **Common Library** | `common/` | Shared modules: registry client, launcher, LLM client, artifact store, task store, etc. |
 
 ### MCP Tool Integrations (replacing standalone agents)
@@ -52,7 +73,7 @@ This separation keeps Compass thin (routing only) and puts domain intelligence i
 This project uses **Docker Desktop**.
 - Host machine is accessible from containers at `host.docker.internal`
 - Docker socket: `/var/run/docker.sock`
-- Network name: `mvp-network`
+- Network name: `constellation-network`
 - LLM endpoint example: `http://host.docker.internal:1288/v1`
 
 ---
@@ -220,7 +241,7 @@ Returns the current state of a task. Used by the Compass Agent for polling fallb
   "agentId": "android-agent",
   "executionMode": "per-task",
   "launchSpec": {
-    "image": "mvp-android-agent:latest",
+    "image": "constellation-android-agent:latest",
     "port": 8000
   },
   "scalingPolicy": {
@@ -504,23 +525,23 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
 # Label for Docker API filtering (REQUIRED)
-LABEL mvp.agent_id="my-agent"
-LABEL mvp.agent_name="My Agent"
-LABEL mvp.agent_role="execution"
+LABEL constellation.agent_id="my-agent"
+LABEL constellation.agent_name="My Agent"
+LABEL constellation.agent_role="execution"
 
 CMD ["python3", "my-agent/app.py"]
 ```
 
 **Required Docker labels:**
-- `mvp.agent_id` — matches `agentId` in `registry-config.json`
-- `mvp.agent_name` — human-readable display name
-- `mvp.agent_role` — one of: `fundamental`, `execution`, `integration`
+- `constellation.agent_id` — matches `agentId` in `registry-config.json`
+- `constellation.agent_name` — human-readable display name
+- `constellation.agent_role` — one of: `fundamental`, `execution`, `integration`
 
 ### 15. docker-compose.yml Entry
 
 ```yaml
 my-agent:
-  image: mvp-my-agent:latest
+  image: constellation-my-agent:latest
   build:
     context: .
     dockerfile: my-agent/Dockerfile
@@ -540,9 +561,9 @@ my-agent:
     REGISTRY_URL: "http://registry:9000"
     HEARTBEAT_INTERVAL: "30"
   labels:
-    mvp.agent_id: "my-agent"
-    mvp.agent_name: "My Agent"
-    mvp.agent_role: "execution"
+    constellation.agent_id: "my-agent"
+    constellation.agent_name: "My Agent"
+    constellation.agent_role: "execution"
   ports:
     - "8030:8080"
   healthcheck:
@@ -606,8 +627,8 @@ Before submitting a new agent, verify:
 - [ ] Callback URL is called on task completion (if provided in metadata)
 - [ ] Logs include `[agent-id]` prefix on every line
 - [ ] Artifacts include `metadata.agentId` and `metadata.orchestratorTaskId`
-- [ ] Dockerfile labels include `mvp.agent_id`, `mvp.agent_name`, `mvp.agent_role`
-- [ ] `.env.example` is complete and has no real credentials
+- [ ] Dockerfile labels include `constellation.agent_id`, `constellation.agent_name`, `constellation.agent_role`
+- [ ] `.env.example` is complete with REQUIRED/OPTIONAL annotations and no real credentials
 - [ ] `registry-config.json` and `agent-card.json` are present
 
 ---
@@ -616,6 +637,9 @@ Before submitting a new agent, verify:
 
 | Purpose | Path |
 |---------|------|
+| UI Design Agent | `ui-design/` | Figma REST API + Google Stitch MCP | port 8040 |
+| UI Design client (Figma) | `ui-design/figma_client.py` | Agent-local, NOT in `common/` |
+| UI Design client (Stitch) | `ui-design/stitch_client.py` | Agent-local, NOT in `common/` |
 | Compass Agent (control plane) | `compass/app.py` |
 | Capability Registry | `registry/app.py` |
 | Shared LLM client | `common/llm_client.py` |

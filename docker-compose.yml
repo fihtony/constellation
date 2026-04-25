@@ -1,6 +1,6 @@
 services:
   registry:
-    image: mvp-registry-agent:latest
+    image: constellation-registry-agent:latest
     build:
       context: .
       dockerfile: registry/Dockerfile
@@ -9,9 +9,9 @@ services:
       REGISTRY_HOST: "0.0.0.0"
       REGISTRY_PORT: "9000"
     labels:
-      mvp.agent_id: "capability-registry"
-      mvp.agent_name: "Capability Registry"
-      mvp.agent_role: "fundamental"
+      constellation.agent_id: "capability-registry"
+      constellation.agent_name: "Capability Registry"
+      constellation.agent_role: "fundamental"
     ports:
       - "9000:9000"
     healthcheck:
@@ -22,7 +22,7 @@ services:
       start_period: 2s
 
   init-register:
-    image: mvp-init-register:latest
+    image: constellation-init-register:latest
     build:
       context: .
       dockerfile: scripts/init-register.Dockerfile
@@ -33,12 +33,12 @@ services:
     environment:
       REGISTRY_URL: "http://registry:9000"
     labels:
-      mvp.agent_id: "registry-bootstrap"
-      mvp.agent_name: "Registry Bootstrap"
-      mvp.agent_role: "fundamental"
+      constellation.agent_id: "registry-bootstrap"
+      constellation.agent_name: "Registry Bootstrap"
+      constellation.agent_role: "fundamental"
 
   compass:
-    image: mvp-compass-agent:latest
+    image: constellation-compass-agent:latest
     build:
       context: .
       dockerfile: compass/Dockerfile
@@ -62,8 +62,8 @@ services:
       A2A_ACK_TIMEOUT_SECONDS: "15"
       A2A_TASK_TIMEOUT_SECONDS: "3600"
       ARTIFACT_ROOT: "/app/artifacts"
-      DEFAULT_DYNAMIC_IMAGE: "mvp-android-agent:latest"
-      DYNAMIC_AGENT_NETWORK: "mvp-network"
+      DEFAULT_DYNAMIC_IMAGE: "constellation-android-agent:latest"
+      DYNAMIC_AGENT_NETWORK: "constellation-network"
       # Agent URLs passed through to dynamically launched Android agent containers
       TRACKER_AGENT_URL: "http://tracker:8010"
       SCM_AGENT_URL: "http://scm:8020"
@@ -74,9 +74,9 @@ services:
       - ./artifacts:/app/artifacts
       - /var/run/docker.sock:/var/run/docker.sock
     labels:
-      mvp.agent_id: "compass-agent"
-      mvp.agent_name: "Compass Agent"
-      mvp.agent_role: "fundamental"
+      constellation.agent_id: "compass-agent"
+      constellation.agent_name: "Compass Agent"
+      constellation.agent_role: "fundamental"
     ports:
       - "8080:8080"
     healthcheck:
@@ -105,11 +105,11 @@ services:
     build:
       context: .
       dockerfile: tracker/Dockerfile
-    image: mvp-tracker-agent:latest
+    image: constellation-tracker-agent:latest
     labels:
-      mvp.agent_id: "tracker-agent"
-      mvp.agent_name: "Tracker Agent"
-      mvp.agent_role: "fundamental"
+      constellation.agent_id: "tracker-agent"
+      constellation.agent_name: "Tracker Agent"
+      constellation.agent_role: "fundamental"
     ports:
       - "8010:8010"
     healthcheck:
@@ -120,7 +120,7 @@ services:
       start_period: 2s
 
   scm:
-    image: mvp-scm-agent:latest
+    image: constellation-scm-agent:latest
     build:
       context: .
       dockerfile: scm/Dockerfile
@@ -142,9 +142,9 @@ services:
     volumes:
       - ./artifacts:/app/artifacts
     labels:
-      mvp.agent_id: "scm-agent"
-      mvp.agent_name: "SCM Agent"
-      mvp.agent_role: "fundamental"
+      constellation.agent_id: "scm-agent"
+      constellation.agent_name: "SCM Agent"
+      constellation.agent_role: "fundamental"
     ports:
       - "8020:8020"
     healthcheck:
@@ -156,4 +156,4 @@ services:
 
 networks:
   default:
-    name: mvp-network
+    name: constellation-network

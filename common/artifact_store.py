@@ -1,4 +1,4 @@
-"""File-backed artifact storage owned by the Compass agent in MVP."""
+"""File-backed artifact storage owned by the Compass agent in the Constellation system."""
 
 from __future__ import annotations
 

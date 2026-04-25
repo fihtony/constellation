@@ -25,8 +25,8 @@ class UnixSocketHTTPConnection(http.client.HTTPConnection):
 class Launcher:
     def __init__(self):
         self.socket_path = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
-        self.runtime_image = os.environ.get("DEFAULT_DYNAMIC_IMAGE", "mvp-android-agent:latest")
-        self.runtime_network = os.environ.get("DYNAMIC_AGENT_NETWORK", "mvp-network")
+        self.runtime_image = os.environ.get("DEFAULT_DYNAMIC_IMAGE", "constellation-android-agent:latest")
+        self.runtime_network = os.environ.get("DYNAMIC_AGENT_NETWORK", "constellation-network")
         self.registry_url = os.environ.get("REGISTRY_URL", "http://registry:9000")
         self.default_port = int(os.environ.get("DYNAMIC_AGENT_PORT", "8000"))
 
@@ -57,7 +57,7 @@ class Launcher:
         return json.loads(raw)
 
     def list_agent_containers(self, include_stopped=True):
-        filters = quote(json.dumps({"label": ["mvp.agent_id"]}), safe="")
+        filters = quote(json.dumps({"label": ["constellation.agent_id"]}), safe="")
         path = f"/v1.43/containers/json?all={1 if include_stopped else 0}&filters={filters}"
         containers = self._request("GET", path) or []
         summarized = []
@@ -66,13 +66,13 @@ class Launcher:
             names = container.get("Names") or []
             summarized.append({
                 "container_id": container.get("Id", ""),
-                "container_name": (names[0].lstrip("/") if names else labels.get("mvp.agent_id", "unknown-container")),
-                "agent_id": labels.get("mvp.agent_id", "unknown-agent"),
-                "display_name": labels.get("mvp.agent_name", labels.get("mvp.agent_id", "Unknown Agent")),
-                "role": labels.get("mvp.agent_role", "unknown"),
+                "container_name": (names[0].lstrip("/") if names else labels.get("constellation.agent_id", "unknown-container")),
+                "agent_id": labels.get("constellation.agent_id", "unknown-agent"),
+                "display_name": labels.get("constellation.agent_name", labels.get("constellation.agent_id", "Unknown Agent")),
+                "role": labels.get("constellation.agent_role", "unknown"),
                 "state": container.get("State", "unknown"),
                 "status": container.get("Status", "unknown"),
-                "task_id": labels.get("mvp.task_id"),
+                "task_id": labels.get("constellation.task_id"),
             })
         return sorted(
             summarized,
@@ -144,10 +144,10 @@ class Launcher:
             "Cmd": command,
             "Env": [f"{key}={value}" for key, value in sorted(env.items())],
             "Labels": {
-                "mvp.agent_id": agent_definition["agent_id"],
-                "mvp.agent_name": agent_definition.get("display_name", agent_definition["agent_id"]),
-                "mvp.agent_role": agent_definition.get("execution_mode", "per-task"),
-                "mvp.task_id": task_id,
+                "constellation.agent_id": agent_definition["agent_id"],
+                "constellation.agent_name": agent_definition.get("display_name", agent_definition["agent_id"]),
+                "constellation.agent_role": agent_definition.get("execution_mode", "per-task"),
+                "constellation.task_id": task_id,
             },
             "HostConfig": {
                 "AutoRemove": True,

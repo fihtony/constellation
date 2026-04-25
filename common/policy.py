@@ -1,4 +1,4 @@
-"""MVP policy evaluator."""
+"""Constellation policy evaluator."""
 
 
 class PolicyEvaluator:
@@ -6,5 +6,5 @@ class PolicyEvaluator:
         return {
             "approved": True,
             "scopes": agent_definition.get("capabilities", []),
-            "reason": "MVP: all requests approved",
+            "reason": "Constellation: all requests approved",
         }
