@@ -29,6 +29,7 @@ class Reporter:
     verbose: bool = False
     passed: int = 0
     failed: int = 0
+    skipped: int = 0
     errors: list[str] = field(default_factory=list)
 
     def section(self, title):
@@ -52,6 +53,10 @@ class Reporter:
 
     def info(self, msg):
         print(f"  {Colors.YELLOW}ℹ{Colors.RESET}  {msg}")
+
+    def skip(self, msg, reason=""):
+        self.skipped += 1
+        print(f"  {Colors.YELLOW}⏭ SKIP{Colors.RESET} — {msg}" + (f" — {reason}" if reason else ""))
 
     def show(self, label, data):
         if self.verbose:

@@ -183,6 +183,9 @@ def run_figma_direct_tests(reporter: Reporter) -> None:
     if status == 200 and body.get("name"):
         file_name = body["name"]
         reporter.ok(f"Figma token is valid — file: '{file_name}'")
+    elif status == 429:
+        reporter.skip("Figma token validation", "Figma API rate limit (429) — wait and retry")
+        return
     elif status == 403:
         reporter.fail("Figma token rejected (403) — check FIGMA_TOKEN")
         return
@@ -203,6 +206,8 @@ def run_figma_direct_tests(reporter: Reporter) -> None:
     nodes = body.get("nodes", {}) if isinstance(body, dict) else {}
     if status == 200 and FIGMA_NODE_ID in nodes:
         reporter.ok(f"Node {FIGMA_NODE_ID} fetched successfully")
+    elif status == 429:
+        reporter.skip(f"Node {FIGMA_NODE_ID} fetch", "Figma API rate limit (429)")
     else:
         reporter.fail(f"Node {FIGMA_NODE_ID} fetch failed (status {status})", str(body)[:200])
 
@@ -217,6 +222,8 @@ def run_figma_direct_tests(reporter: Reporter) -> None:
     if page_status == "ok" and isinstance(pages, list) and pages:
         page_names = [p.get("name", "") for p in pages]
         reporter.ok(f"figma_client.fetch_pages: {len(pages)} pages — {page_names[:5]}")
+    elif page_status == "error_429":
+        reporter.skip("figma_client.fetch_pages", "Figma API rate limit (429)")
     else:
         reporter.fail(f"figma_client.fetch_pages failed: {page_status}", str(pages)[:200])
 
@@ -374,6 +381,10 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
     reporter.show("Health", body)
     if status == 200 and body.get("status") == "ok":
         reporter.ok(f"Agent healthy: {body.get('service')}")
+    elif status == 0:
+        reporter.skip("Agent health check", "agent not running — start with: PYTHONPATH=. python3 ui-design/app.py")
+        reporter.info("Start the agent with: cd constellation && PYTHONPATH=. FIGMA_TOKEN=... STITCH_API_KEY=... python3 ui-design/app.py")
+        return
     else:
         reporter.fail("Agent health check failed", f"status={status}, body={body}")
         reporter.info("Start the agent with: cd constellation && PYTHONPATH=. FIGMA_TOKEN=... STITCH_API_KEY=... python3 ui-design/app.py")
@@ -643,7 +654,7 @@ def main(argv=None):
         run_agent_tests(reporter, agent_url)
 
     print(f"\n{'=' * 60}")
-    print(f"  Passed: {reporter.passed}   Failed: {reporter.failed}")
+    print(f"  Passed: {reporter.passed}   Failed: {reporter.failed}   Skipped: {reporter.skipped}")
     print(f"{'=' * 60}")
     return 0 if reporter.failed == 0 else 1
 

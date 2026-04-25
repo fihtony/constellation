@@ -146,12 +146,18 @@ def _get_config(env_key: str, json_path: str, default: str = "") -> str:
 # Test targets — parsed from URL env vars; individual vars kept as fallback
 # ---------------------------------------------------------------------------
 
+def _env_only(key: str) -> str:
+    """Read from environment or .env only — skip agent_test_targets.json."""
+    return os.environ.get(key) or _TEST_ENV.get(key, "")
+
+
 # Jira: prefer TEST_JIRA_TICKET_URL (full URL), fall back to separate vars
-_jira_ticket_url = _get_config("TEST_JIRA_TICKET_URL", "tracker.primaryTicket.browseUrl", "")
+_jira_ticket_url = _env_only("TEST_JIRA_TICKET_URL") or \
+    _get_config("TEST_JIRA_TICKET_URL", "tracker.primaryTicket.browseUrl", "")
 if _jira_ticket_url:
     _jira_base, _jira_key = _parse_jira_ticket_url(_jira_ticket_url)
-    JIRA_BASE_URL = _get_config("TEST_JIRA_BASE_URL", "", "") or _jira_base
-    JIRA_TICKET_KEY = _get_config("TEST_JIRA_TICKET_KEY", "tracker.primaryTicket.ticketKey", "") or _jira_key
+    JIRA_BASE_URL = _env_only("TEST_JIRA_BASE_URL") or _jira_base
+    JIRA_TICKET_KEY = _env_only("TEST_JIRA_TICKET_KEY") or _jira_key
 else:
     JIRA_TICKET_KEY = _get_config("TEST_JIRA_TICKET_KEY", "tracker.primaryTicket.ticketKey", "PROJ-1")
     JIRA_BASE_URL = _get_config("TEST_JIRA_BASE_URL", "tracker.primaryTicket.browseUrl", "https://your-org.atlassian.net").split("/browse/")[0]
@@ -162,11 +168,12 @@ JIRA_TENANT_INFO_URL = f"https://{JIRA_CLOUD_HOST}/_edge/tenant_info"
 ATLASSIAN_MCP_URL = "https://mcp.atlassian.com/v1/mcp"
 
 # GitHub: prefer TEST_GITHUB_REPO_URL (full URL), fall back to separate vars
-_github_repo_url = _get_config("TEST_GITHUB_REPO_URL", "scm.primaryRepo.browseUrl", "")
+_github_repo_url = _env_only("TEST_GITHUB_REPO_URL") or \
+    _get_config("TEST_GITHUB_REPO_URL", "scm.primaryRepo.browseUrl", "")
 if _github_repo_url:
     _gh_owner, _gh_repo = _parse_github_repo_url(_github_repo_url)
-    GITHUB_OWNER = _get_config("TEST_GITHUB_OWNER", "scm.primaryRepo.owner", "") or _gh_owner
-    GITHUB_REPO = _get_config("TEST_GITHUB_REPO", "scm.primaryRepo.repo", "") or _gh_repo
+    GITHUB_OWNER = _env_only("TEST_GITHUB_OWNER") or _gh_owner
+    GITHUB_REPO = _env_only("TEST_GITHUB_REPO") or _gh_repo
 else:
     GITHUB_OWNER = _get_config("TEST_GITHUB_OWNER", "scm.primaryRepo.owner", "your-username")
     GITHUB_REPO = _get_config("TEST_GITHUB_REPO", "scm.primaryRepo.repo", "test-repo")
@@ -175,17 +182,20 @@ GITHUB_REPO_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
 GITHUB_API_BASE = "https://api.github.com"
 
 # Figma: prefer TEST_FIGMA_FILE_URL (full URL), fall back to separate var
-_figma_file_url = _get_config("TEST_FIGMA_FILE_URL", "uiDesign.figma.fileUrl", "")
+_figma_file_url = _env_only("TEST_FIGMA_FILE_URL") or \
+    _get_config("TEST_FIGMA_FILE_URL", "uiDesign.figma.fileUrl", "")
 FIGMA_FILE_KEY = _parse_figma_file_url(_figma_file_url) if _figma_file_url else \
     _get_config("TEST_FIGMA_FILE_KEY", "uiDesign.figma.fileKey", "your-figma-file-key")
 FIGMA_FILE_URL = _figma_file_url or f"https://www.figma.com/design/{FIGMA_FILE_KEY}/Test-File"
 
 # Stitch: prefer TEST_STITCH_PROJECT_URL (full URL), fall back to separate var
-_stitch_project_url = _get_config("TEST_STITCH_PROJECT_URL", "stitch.primaryProject.projectUrl", "")
+_stitch_project_url = _env_only("TEST_STITCH_PROJECT_URL") or \
+    _get_config("TEST_STITCH_PROJECT_URL", "stitch.primaryProject.projectUrl", "")
 STITCH_PROJECT_ID = _parse_stitch_project_url(_stitch_project_url) if _stitch_project_url else \
     _get_config("TEST_STITCH_PROJECT_ID", "stitch.primaryProject.projectId", "your-project-id")
 STITCH_PROJECT_URL = _stitch_project_url or f"https://stitch.withgoogle.com/projects/{STITCH_PROJECT_ID}"
-STITCH_SCREEN_ID = _get_config("TEST_STITCH_SCREEN_ID", "stitch.primaryProject.primaryScreen.screenId", "your-screen-id")
+STITCH_SCREEN_ID = _env_only("TEST_STITCH_SCREEN_ID") or \
+    _get_config("TEST_STITCH_SCREEN_ID", "stitch.primaryProject.primaryScreen.screenId", "your-screen-id")
 STITCH_SCREEN_NAME = _get_config("TEST_STITCH_SCREEN_NAME", "stitch.primaryProject.primaryScreen.name", "Test Screen")
 STITCH_MCP_URL = "https://stitch.googleapis.com/mcp"
 
@@ -1110,10 +1120,15 @@ def run_static_checks(report: Report):
     test_github_repo_url_parseable(report)
     test_stitch_url_parseable(report)
 
-    # Verify test target config file is consistent
+    # Verify test target config file is consistent (only when URL env vars are NOT set,
+    # so we're using json as the source rather than a placeholder template)
     import pathlib
     targets_path = pathlib.Path(__file__).parent / "agent_test_targets.json"
-    if targets_path.exists():
+    _using_url_vars = bool(_env_only("TEST_JIRA_TICKET_URL") or _env_only("TEST_GITHUB_REPO_URL"))
+    if _using_url_vars:
+        report.skip("agent_test_targets.json consistency check",
+                    "URL env vars active — json is a template, skipping cross-check")
+    elif targets_path.exists():
         with open(targets_path, encoding="utf-8") as fh:
             targets = json.load(fh)
         tracker_key = (targets.get("tracker") or {}).get("primaryTicket", {}).get("ticketKey", "")
