@@ -60,7 +60,7 @@ def _parse_github_repo_url(url: str) -> tuple[str, str]:
 CONFIG = _load_config()
 _TEST_ENV = _load_env_file()
 
-TRACKER_ALLOWED_TICKET = CONFIG["tracker"]["primaryTicket"]
+JIRA_ALLOWED_TICKET = CONFIG["jira"]["primaryTicket"]
 
 # SCM config: prefer TEST_GITHUB_REPO_URL from tests/.env over agent_test_targets.json
 # This way the json file can stay PII-free (generic placeholders only).
@@ -83,12 +83,12 @@ else:
     SCM_ALLOWED_REPO = CONFIG["scm"]["primaryRepo"]
 
 
-def tracker_ticket_key() -> str:
-    return TRACKER_ALLOWED_TICKET["ticketKey"]
+def jira_ticket_key() -> str:
+    return JIRA_ALLOWED_TICKET["ticketKey"]
 
 
-def tracker_ticket_url() -> str:
-    return TRACKER_ALLOWED_TICKET["browseUrl"]
+def jira_ticket_url() -> str:
+    return JIRA_ALLOWED_TICKET["browseUrl"]
 
 
 def scm_owner() -> str:
@@ -125,10 +125,10 @@ def scm_pr_url(pr_id: int) -> str:
     return f"https://github.com/{scm_owner()}/{scm_repo_slug()}/pull/{int(pr_id)}"
 
 
-def assert_tracker_write_allowed(ticket_key: str) -> None:
-    if str(ticket_key or "").strip() != tracker_ticket_key():
+def assert_jira_write_allowed(ticket_key: str) -> None:
+    if str(ticket_key or "").strip() != jira_ticket_key():
         raise ValueError(
-            f"WRITE to Tracker ticket '{ticket_key}' is forbidden. Allowed ticket: {tracker_ticket_key()}."
+            f"WRITE to Jira ticket '{ticket_key}' is forbidden. Allowed ticket: {jira_ticket_key()}."
         )
 
 

@@ -40,11 +40,24 @@ NON_TERMINAL_TASK_STATES = {
     "SUBMITTED",
     "ROUTING",
     "DISPATCHED",
+    "STEP_IN_PROGRESS",
     "TASK_STATE_ACCEPTED",
     "TASK_STATE_SUBMITTED",
     "TASK_STATE_WORKING",
     "TASK_STATE_RUNNING",
     "TASK_STATE_DISPATCHED",
+    # Team Lead intermediate states
+    "ANALYZING",
+    "GATHERING_INFO",
+    "PLANNING",
+    "EXECUTING",
+    "REVIEWING",
+    "COMPLETING",
+    # Web / Android agent intermediate states
+    "IMPLEMENTING",
+    "WRITING",
+    "BUILDING",
+    "PUSHING",
 }
 CALLBACK_LOCK = threading.Lock()
 CALLBACK_EVENTS = {}
@@ -767,12 +780,26 @@ class CompassHandler(BaseHTTPRequestHandler):
         # If the caller supplies a contextId pointing to a TASK_STATE_INPUT_REQUIRED task,
         # forward the user's additional info to the Team Lead instance that raised the question.
         # The original compass task is retained — no new task is created.
-        context_id = (body.get("contextId") or "").strip()
+        # contextId may appear at the top level or nested inside message.
+        context_id = (body.get("contextId") or message.get("contextId") or "").strip()
         if context_id:
             prior_task = task_store.get(context_id)
             if prior_task and prior_task.state == "TASK_STATE_INPUT_REQUIRED":
                 tl_task_id = prior_task.downstream_task_id or ""
                 tl_service_url = prior_task.downstream_service_url or ""
+
+                # Fallback: service URL may not have been stored; look it up from registry
+                if tl_task_id and not tl_service_url:
+                    try:
+                        instances = registry.list_instances("team-lead-agent")
+                        for inst in instances:
+                            if inst.get("current_task_id") == tl_task_id:
+                                tl_service_url = inst.get("service_url", "")
+                                break
+                        if tl_service_url:
+                            print(f"[compass] Recovered team-lead service URL from registry: {tl_service_url}")
+                    except Exception as _lookup_err:
+                        print(f"[compass] Could not look up team-lead service URL: {_lookup_err}")
 
                 if tl_task_id and tl_service_url:
                     # Forward additional info to Team Lead with the original TL task as context.
@@ -820,9 +847,9 @@ class CompassHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"task": task_dict})
 
     def log_message(self, fmt, *args):
-        # Suppress noisy health-check and agent-card polls
+        # Suppress noisy health-check, agent-card polls, and debug log polling
         line = args[0] if args else ""
-        if any(p in line for p in ("/health", "/.well-known/agent-card.json")):
+        if any(p in line for p in ("/health", "/.well-known/agent-card.json", "/debug/agent-logs")):
             return
         print(f"[compass] {line} {args[1] if len(args) > 1 else ''} {args[2] if len(args) > 2 else ''}")
 

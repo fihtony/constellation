@@ -8,7 +8,7 @@ A multi-agent system built on the [A2A (Agent-to-Agent) protocol](https://google
 Browser / API client
     └─► Compass Agent (control plane, :8080)
              ├─► Capability Registry (:9000)
-             ├─► Tracker Agent (:8010)   — Jira Cloud via Atlassian Rovo MCP
+             ├─► Jira Agent (:8010)      — Jira Cloud via Atlassian Rovo MCP
              ├─► SCM Agent (:8020)       — GitHub / Bitbucket
              ├─► UI Design Agent (:8040) — Figma REST + Google Stitch MCP
              └─► Android Agent           — launched on demand via Docker socket
@@ -19,7 +19,7 @@ Browser / API client
 ```bash
 # 1. Copy and fill in environment files for each agent
 cp compass/.env.example   compass/.env
-cp tracker/.env.example   tracker/.env
+cp jira/.env.example      jira/.env
 cp scm/.env.example       scm/.env
 cp ui-design/.env.example ui-design/.env
 
@@ -39,7 +39,7 @@ open http://localhost:8080
 |-------|-----------|------|------|
 | Compass | `compass/` | 8080 | Control plane, Web UI, workflow orchestration |
 | Registry | `registry/` | 9000 | Agent discovery and instance tracking |
-| Tracker | `tracker/` | 8010 | Jira Cloud integration (via Atlassian Rovo MCP) |
+| Jira Agent | `jira/` | 8010 | Jira Cloud integration (via Atlassian Rovo MCP) |
 | SCM | `scm/` | 8020 | GitHub / Bitbucket integration |
 | UI Design | `ui-design/` | 8040 | Figma REST API + Google Stitch MCP |
 | Android | `android/` | — | On-demand execution, launched per task |
@@ -52,8 +52,8 @@ Each agent reads from its own `.env` file. Copy the corresponding `.env.example`
 |----------|-------------|
 | `OPENAI_BASE_URL` | OpenAI-compatible LLM endpoint |
 | `OPENAI_MODEL` | Model name |
-| `TRACKER_TOKEN` | Jira API token |
-| `TRACKER_EMAIL` | Jira account email (Basic auth) |
+| `JIRA_TOKEN` | Jira API token |
+| `JIRA_EMAIL` | Jira account email (Basic auth) |
 | `SCM_TOKEN` | GitHub / Bitbucket personal access token |
 | `FIGMA_TOKEN` | Figma personal access token |
 | `STITCH_API_KEY` | Google Stitch / Gemini API key |

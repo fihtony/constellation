@@ -41,7 +41,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "team-lead-agent")
 INSTANCE_ID = os.environ.get("INSTANCE_ID", f"{AGENT_ID}-local")
 ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://team-lead:{PORT}")
 REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000")
-JIRA_AGENT_URL = os.environ.get("JIRA_AGENT_URL", "http://tracker:8010")
+JIRA_AGENT_URL = os.environ.get("JIRA_AGENT_URL", "http://jira:8010")
 UI_DESIGN_AGENT_URL = os.environ.get("UI_DESIGN_AGENT_URL", "http://ui-design:8040")
 COMPASS_URL = os.environ.get("COMPASS_URL", "http://compass:8080")
 
@@ -596,6 +596,43 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             except Exception as err:
                 log(f"Warning: could not fetch design from {design_url}: {err}")
                 ctx.design_info = {"url": design_url, "type": design_type, "content": "", "error": str(err)}
+
+        # ── Phase 2b: Re-analyze if Jira/design context was gathered ────────
+        # The initial analysis (Phase 1) ran before ticket/design data was available.
+        # Re-run analysis now so the LLM can clear question_for_user if the ticket
+        # already contains enough implementation detail.
+        gathered_ctx_parts = []
+        if ctx.jira_info and ctx.jira_info.get("content"):
+            gathered_ctx_parts.append(f"Jira ticket {ctx.jira_info['ticket_key']}:\n{ctx.jira_info['content']}")
+        if ctx.design_info and ctx.design_info.get("content"):
+            gathered_ctx_parts.append(f"Design context:\n{ctx.design_info['content']}")
+        if gathered_ctx_parts:
+            gathered_ctx = "\n\n".join(gathered_ctx_parts)
+            combined_additional = (
+                (gathered_ctx + "\n\n" + ctx.additional_info).strip()
+                if ctx.additional_info
+                else gathered_ctx
+            )
+            log("Re-analyzing with gathered context (Jira/design)")
+            analysis = _analyze_task(user_text, combined_additional)
+            ctx.analysis = analysis
+
+        # ── Phase 2c: If Jira content was successfully fetched, suppress any
+        #    question that merely asks for the Jira URL / ticket content —
+        #    we already have it.  This prevents the LLM from triggering an
+        #    unnecessary INPUT_REQUIRED round.
+        if ctx.jira_info and ctx.jira_info.get("content"):
+            question = analysis.get("question_for_user") or ""
+            jira_keywords = ("jira", "ticket", "url", "browse", "atlassian", "issue", "story", "key")
+            if any(kw in question.lower() for kw in jira_keywords):
+                log(f"Suppressing Jira-related question (ticket already fetched): {question}")
+                analysis = dict(analysis)
+                analysis["question_for_user"] = None
+                analysis["missing_info"] = [
+                    m for m in (analysis.get("missing_info") or [])
+                    if not any(kw in m.lower() for kw in jira_keywords)
+                ]
+                ctx.analysis = analysis
 
         # ── Phase 3: Check for missing info (up to 2 INPUT_REQUIRED rounds) ─
         for _input_round in range(2):

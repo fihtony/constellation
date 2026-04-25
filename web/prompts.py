@@ -241,3 +241,43 @@ Respond with a JSON object:
   "project_key": "PROJ-123 or null"
 }}
 """
+
+# ---------------------------------------------------------------------------
+# Build/Test error diagnosis and fix
+# ---------------------------------------------------------------------------
+
+BUILD_FIX_SYSTEM = """\
+You are a senior software engineer performing automated debugging.
+You are given a set of source files and a build/test failure output.
+Your job is to identify the root cause and produce fixed file contents.
+
+Rules:
+1. Only modify files that are actually broken.
+2. Produce complete file contents — never partial snippets.
+3. Keep the original logic intact; only fix what is broken.
+4. Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
+"""
+
+BUILD_FIX_TEMPLATE = """\
+A build or test run has failed. Diagnose the error and return fixed file contents.
+
+=== Failure Output ===
+{failure_output}
+
+=== Source Files ===
+{source_files_json}
+
+=== Task Context ===
+{task_instruction}
+
+Analyze the failure and return a JSON object listing only the files that need changes:
+{{
+  "diagnosis": "One-sentence explanation of the root cause",
+  "fixes": [
+    {{
+      "path": "relative/path/to/file.py",
+      "content": "<complete corrected file content>"
+    }}
+  ]
+}}
+"""

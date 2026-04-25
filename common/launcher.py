@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import time
+import uuid
 from urllib.parse import quote
 
 from common.env_utils import load_dotenv
@@ -114,7 +115,10 @@ class Launcher:
             )
 
         container_prefix = launch_spec.get("namePrefix", agent_definition["agent_id"].replace("_", "-"))
-        container_name = f"{container_prefix}-{task_id.lower()}"
+        # Add a short unique suffix to prevent name collisions when the same
+        # internal task_id is reused across successive per-task containers.
+        unique_suffix = uuid.uuid4().hex[:8]
+        container_name = f"{container_prefix}-{task_id.lower()}-{unique_suffix}"
         port = int(launch_spec.get("port", self.default_port))
         service_url = f"http://{container_name}:{port}"
         image = launch_spec.get("image", self.runtime_image)
@@ -128,6 +132,9 @@ class Launcher:
             value = os.environ.get(key)
             if value is not None:
                 env[key] = value
+        # Inline env vars defined directly in launchSpec (e.g. per-agent model selection)
+        for key, value in launch_spec.get("env", {}).items():
+            env[str(key)] = str(value)
 
         env.update({
             "HOST": "0.0.0.0",
@@ -162,10 +169,15 @@ class Launcher:
         # Mount the artifacts volume so the android agent can write workspace files
         artifact_root_host = os.environ.get("ARTIFACT_ROOT_HOST", "").strip()
         artifact_root_container = os.environ.get("ARTIFACT_ROOT", "/app/artifacts")
+        binds = []
         if artifact_root_host:
-            payload["HostConfig"]["Binds"] = [
-                f"{artifact_root_host}:{artifact_root_container}"
-            ]
+            binds.append(f"{artifact_root_host}:{artifact_root_container}")
+        # Always pass through the Docker socket so per-task agents (team-lead) can
+        # themselves launch nested per-task agents (web, android).
+        if launch_spec.get("mountDockerSocket", True) and os.path.exists(self.socket_path):
+            binds.append(f"{self.socket_path}:{self.socket_path}")
+        if binds:
+            payload["HostConfig"]["Binds"] = binds
 
         self._request(
             "POST",

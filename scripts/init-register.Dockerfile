@@ -2,15 +2,17 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY certs/   /app/certs/
 COPY scripts/ /app/scripts/
+COPY common/  /app/common/
 
 # Copy all agent folders so init_register.py can discover registry-config.json
 # and agent-card.json from each one at runtime.
-COPY android/     /app/android/
-COPY scm/   /app/scm/
-COPY tracker/        /app/tracker/
-COPY compass/      /app/compass/
+COPY jira/        /app/jira/
+COPY scm/         /app/scm/
+COPY compass/     /app/compass/
+COPY team-lead/   /app/team_lead/
+COPY ui-design/   /app/ui-design/
+COPY web/         /app/web/
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app

@@ -607,7 +607,7 @@ def process_message(message):
         or metadata.get("browseUrl")
         or extract_ticket_url(user_text)
     )
-    ticket_key = trusted_ticket_key or extract_ticket_key(browse_url)
+    ticket_key = trusted_ticket_key or extract_ticket_key(browse_url) or extract_ticket_key(user_text)
     browse_url, _ = _ticket_urls(ticket_key, browse_url=browse_url)
     skill_guide = _load_skill_guide()
     debug_log(
@@ -618,7 +618,7 @@ def process_message(message):
     )
     issue_payload = None
     fetch_status = "missing_explicit_ticket_url"
-    if ticket_key and (browse_url or trusted_ticket_key):
+    if ticket_key:
         issue_payload, fetch_status = _fetch_issue(ticket_key, browse_url=browse_url)
 
     prompt = f"""

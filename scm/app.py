@@ -52,7 +52,7 @@ _CORP_CA_BUNDLE = os.environ.get("CORP_CA_BUNDLE", "") or os.environ.get("SSL_CE
 _GIT_AUTHOR_NAME = os.environ.get("SCM_GIT_AUTHOR_NAME", "SCM Agent")
 _GIT_AUTHOR_EMAIL = (
     os.environ.get("SCM_GIT_AUTHOR_EMAIL")
-    or os.environ.get("TRACKER_EMAIL")
+    or os.environ.get("JIRA_EMAIL")
     or "scm-agent@local"
 )
 
@@ -662,8 +662,16 @@ def _dispatch_clone(task_id: str, message: dict):
 # ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):  # suppress default access log
-        pass
+    def log_message(self, fmt, *args):
+        # Suppress health-checks and agent-card polls; print everything else
+        line = args[0] if args else ""
+        if any(p in line for p in ("/health", "/.well-known/agent-card.json")):
+            return
+        print(
+            f"[{AGENT_ID}] {line} "
+            f"{args[1] if len(args) > 1 else ''} "
+            f"{args[2] if len(args) > 2 else ''}"
+        )
 
     def _send_json(self, code: int, body: dict):
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")

@@ -33,6 +33,15 @@ build_web() {
     echo "    Done: constellation-web-agent:latest"
 }
 
+build_team_lead() {
+    echo "==> Building team-lead agent image: constellation-team-lead-agent:latest"
+    docker build \
+        -t constellation-team-lead-agent:latest \
+        -f "${SCRIPT_DIR}/team-lead/Dockerfile" \
+        "${SCRIPT_DIR}"
+    echo "    Done: constellation-team-lead-agent:latest"
+}
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 TARGET="${1:-all}"
 
@@ -43,13 +52,17 @@ case "$TARGET" in
     web)
         build_web
         ;;
+    team-lead)
+        build_team_lead
+        ;;
     all)
         build_android
         build_web
+        build_team_lead
         ;;
     *)
         echo "Unknown target: $TARGET"
-        echo "Usage: $0 [android|web|all]"
+        echo "Usage: $0 [android|web|team-lead|all]"
         exit 1
         ;;
 esac

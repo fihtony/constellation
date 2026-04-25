@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 COMPASS_URL = "http://localhost:8080"
 REGISTRY_URL = "http://localhost:9000"
-TRACKER_URL = "http://localhost:8010"
+JIRA_URL = "http://localhost:8010"
 SCM_URL = "http://localhost:8020"
 
 VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
@@ -154,7 +154,7 @@ def test_0_prerequisites():
     for label, url in (
         ("Registry", f"{REGISTRY_URL}/health"),
         ("Compass", f"{COMPASS_URL}/health"),
-        ("Tracker Agent", f"{TRACKER_URL}/health"),
+        ("Jira Agent", f"{JIRA_URL}/health"),
         ("SCM Agent", f"{SCM_URL}/health"),
     ):
         step(f"Check {label} health")
@@ -172,7 +172,7 @@ def test_1_agent_card_discovery():
     section("Scenario 1: Agent Card Discovery")
     for label, url, expected_name in (
         ("Compass", f"{COMPASS_URL}/.well-known/agent-card.json", "Compass Agent"),
-        ("Tracker", f"{TRACKER_URL}/.well-known/agent-card.json", "Tracker Agent"),
+        ("Jira Agent", f"{JIRA_URL}/.well-known/agent-card.json", "Jira Agent"),
         ("SCM", f"{SCM_URL}/.well-known/agent-card.json", "SCM Agent"),
     ):
         step(f"Fetch {label} agent card")
@@ -194,13 +194,13 @@ def test_2_registry_state():
         return
 
     agent_ids = {item.get("agent_id") for item in body}
-    expected = {"tracker-agent", "scm-agent", "android-agent"}
+    expected = {"jira-agent", "scm-agent", "android-agent"}
     if expected.issubset(agent_ids):
         ok("All expected agent definitions are present")
     else:
         fail("Registry definitions are incomplete", f"found={sorted(agent_ids)}")
 
-    for agent_id in ("tracker-agent", "scm-agent"):
+    for agent_id in ("jira-agent", "scm-agent"):
         step(f"Check instances for {agent_id}")
         status, instances = http_json(f"{REGISTRY_URL}/agents/{agent_id}/instances")
         show_json(agent_id, instances)
@@ -217,13 +217,13 @@ def test_2_registry_state():
         fail("Android agent unexpectedly started before launch", f"instances={instances}")
 
 
-def test_3_tracker_capability():
-    section("Scenario 3: Tracker Capability Routing")
-    step("Route a Tracker ticket request explicitly")
-    status, body = send_message("Please analyze RIM-13175", requested_capability="tracker.ticket.fetch")
+def test_3_jira_capability():
+    section("Scenario 3: Jira Capability Routing")
+    step("Route a Jira ticket request explicitly")
+    status, body = send_message("Please analyze RIM-13175", requested_capability="jira.ticket.fetch")
     show_json("Response", body)
-    if status == 200 and task_state(body) == "TASK_STATE_COMPLETED" and task_agent(body) == "tracker-agent":
-        ok("Tracker capability request completed through tracker-agent")
+    if status == 200 and task_state(body) == "TASK_STATE_COMPLETED" and task_agent(body) == "jira-agent":
+        ok("Jira capability request completed through jira-agent")
     else:
         fail("Tracker capability request failed", f"status={status}, state={task_state(body)}, agent={task_agent(body)}")
 
@@ -330,34 +330,34 @@ def test_8_missing_capability():
         fail("Missing capability was not reported correctly", f"status={status}, state={task_state(body)}")
 
 
-def test_9_deregister_reregister_tracker():
-    section("Scenario 9: Deregister and Re-Register Tracker Agent")
-    step("Deregister tracker-agent")
-    status, body = http_json(f"{REGISTRY_URL}/agents/tracker-agent", method="DELETE")
+def test_9_deregister_reregister_jira():
+    section("Scenario 9: Deregister and Re-Register Jira Agent")
+    step("Deregister jira-agent")
+    status, body = http_json(f"{REGISTRY_URL}/agents/jira-agent", method="DELETE")
     if status == 200 and body.get("status") == "deregistered":
-        ok("tracker-agent definition deregistered")
+        ok("jira-agent definition deregistered")
     else:
-        fail("tracker-agent deregistration failed", f"status={status}")
+        fail("jira-agent deregistration failed", f"status={status}")
         return
 
-    step("Request tracker capability after deregistration")
-    status, body = send_message("Please analyze RIM-13175", requested_capability="tracker.ticket.fetch")
+    step("Request jira capability after deregistration")
+    status, body = send_message("Please analyze RIM-13175", requested_capability="jira.ticket.fetch")
     if status == 200 and task_state(body) == "NO_CAPABLE_AGENT":
-        ok("tracker capability is rejected after deregistration")
+        ok("jira capability is rejected after deregistration")
     else:
-        fail("tracker capability should have been unavailable", f"state={task_state(body)}")
+        fail("jira capability should have been unavailable", f"state={task_state(body)}")
 
-    step("Re-register tracker-agent")
+    step("Re-register jira-agent")
     status, body = http_json(
         f"{REGISTRY_URL}/agents",
         method="POST",
         payload={
-            "agentId": "tracker-agent",
+            "agentId": "jira-agent",
             "version": "1.0.0",
-            "displayName": "Tracker Agent",
+            "displayName": "Jira Agent",
             "description": "Long-running Tracker integration agent.",
-            "cardUrl": "http://tracker:8010/.well-known/agent-card.json",
-            "capabilities": ["tracker.ticket.fetch"],
+            "cardUrl": "http://jira:8010/.well-known/agent-card.json",
+            "capabilities": ["jira.ticket.fetch"],
             "executionMode": "persistent",
             "scalingPolicy": {
                 "maxInstances": 1,
@@ -368,31 +368,31 @@ def test_9_deregister_reregister_tracker():
         },
     )
     if status == 201 and body.get("status") == "active":
-        ok("tracker-agent definition re-registered")
+        ok("jira-agent definition re-registered")
     else:
-        fail("tracker-agent re-registration failed", f"status={status}")
+        fail("jira-agent re-registration failed", f"status={status}")
         return
 
-    step("Request tracker capability again")
-    status, body = send_message("Please analyze RIM-13175", requested_capability="tracker.ticket.fetch")
+    step("Request jira capability again")
+    status, body = send_message("Please analyze RIM-13175", requested_capability="jira.ticket.fetch")
     if status == 200 and task_state(body) == "TASK_STATE_COMPLETED":
-        ok("tracker capability works again after re-registration")
+        ok("jira capability works again after re-registration")
     else:
-        fail("tracker capability did not recover after re-registration", f"state={task_state(body)}")
+        fail("jira capability did not recover after re-registration", f"state={task_state(body)}")
 
 
 def test_10_busy_capacity():
     section("Scenario 10: Busy Capacity Handling")
-    step("Load tracker-agent instances")
-    status, instances = http_json(f"{REGISTRY_URL}/agents/tracker-agent/instances")
+    step("Load jira-agent instances")
+    status, instances = http_json(f"{REGISTRY_URL}/agents/jira-agent/instances")
     if status != 200 or not isinstance(instances, list) or not instances:
-        fail("Unable to load tracker-agent instances for busy-capacity test")
+        fail("Unable to load jira-agent instances for busy-capacity test")
         return
 
     instance_id = instances[0]["instance_id"]
-    step(f"Mark tracker-agent instance {instance_id} busy")
+    step(f"Mark jira-agent instance {instance_id} busy")
     status, _ = http_json(
-        f"{REGISTRY_URL}/agents/tracker-agent/instances/{instance_id}",
+        f"{REGISTRY_URL}/agents/jira-agent/instances/{instance_id}",
         method="PUT",
         payload={"status": "busy", "current_task_id": "manual-busy-simulation"},
     )
@@ -401,8 +401,8 @@ def test_10_busy_capacity():
         return
 
     try:
-        step("Request tracker capability while the only instance is busy")
-        status, body = send_message("Please analyze RIM-13175", requested_capability="tracker.ticket.fetch")
+        step("Request jira capability while the only instance is busy")
+        status, body = send_message("Please analyze RIM-13175", requested_capability="jira.ticket.fetch")
         show_json("Response", body)
         if status == 200 and task_state(body) == "CAPACITY_EXHAUSTED":
             ok("Busy persistent agent returns CAPACITY_EXHAUSTED")
@@ -410,7 +410,7 @@ def test_10_busy_capacity():
             fail("Busy persistent agent returned the wrong state", f"state={task_state(body)}")
     finally:
         http_json(
-            f"{REGISTRY_URL}/agents/tracker-agent/instances/{instance_id}",
+            f"{REGISTRY_URL}/agents/jira-agent/instances/{instance_id}",
             method="PUT",
             payload={"status": "idle", "current_task_id": None},
         )
@@ -419,7 +419,7 @@ def test_10_busy_capacity():
 def test_11_direct_agent_communication():
     section("Scenario 11: Direct Downstream Agent Communication")
     for label, url, text in (
-        ("Tracker", TRACKER_URL, "Please analyze RIM-13175"),
+        ("Jira Agent", JIRA_URL, "Please analyze RIM-13175"),
         ("SCM", SCM_URL, "Find the Android repository in SCM."),
     ):
         step(f"Send a direct message to {label} agent")
@@ -477,7 +477,7 @@ def run_all():
     print(f"{Colors.BOLD}{'═' * 60}{Colors.RESET}")
     print(f"  Compass:       {COMPASS_URL}")
     print(f"  Registry:      {REGISTRY_URL}")
-    print(f"  Tracker:          {TRACKER_URL}")
+    print(f"  Jira Agent:       {JIRA_URL}")
     print(f"  SCM:     {SCM_URL}")
     print(f"  Verbose:       {VERBOSE}")
     print(f"  Time:          {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -490,13 +490,13 @@ def run_all():
 
     test_1_agent_card_discovery()
     test_2_registry_state()
-    test_3_tracker_capability()
+    test_3_jira_capability()
     test_4_scm_capability()
     workflow_task_id = test_5_multi_agent_workflow()
     test_6_android_launch_lifecycle()
     test_7_task_query_and_artifacts(workflow_task_id)
     test_8_missing_capability()
-    test_9_deregister_reregister_tracker()
+    test_9_deregister_reregister_jira()
     test_10_busy_capacity()
     test_11_direct_agent_communication()
     test_12_browser_ui()

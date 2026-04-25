@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,7 +38,7 @@ INSTANCE_ID = os.environ.get("INSTANCE_ID", f"{AGENT_ID}-local")
 ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://web-agent:{PORT}")
 REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000")
 SCM_AGENT_URL = os.environ.get("SCM_AGENT_URL", "http://scm:8020")
-JIRA_AGENT_URL = os.environ.get("JIRA_AGENT_URL", "http://tracker:8010")
+JIRA_AGENT_URL = os.environ.get("JIRA_AGENT_URL", "http://jira:8010")
 COMPASS_URL = os.environ.get("COMPASS_URL", "http://compass:8080")
 
 ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", "15"))
@@ -325,7 +327,7 @@ def _generate_summary(
 # ---------------------------------------------------------------------------
 
 def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_task_id: str) -> str:
-    """Fetch Jira ticket content via Tracker Agent."""
+    """Fetch Jira ticket content via Jira Agent."""
     try:
         result = _call_sync_agent(
             JIRA_AGENT_URL,
@@ -552,6 +554,175 @@ def _write_files_to_workspace(workspace_path: str, files: list[dict]) -> list[st
 
 
 # ---------------------------------------------------------------------------
+# Build / test execution with LLM-guided error recovery
+# ---------------------------------------------------------------------------
+
+MAX_BUILD_RETRIES = 3
+
+
+def _detect_build_command(build_dir: str, language: str) -> list[str] | None:
+    """Return the command to run tests, or None if no test harness detected."""
+    # Python: pytest or unittest
+    if language in ("python", "mixed") or any(
+        os.path.isfile(os.path.join(build_dir, f))
+        for f in ("requirements.txt", "pyproject.toml", "setup.py")
+    ):
+        if any(
+            fname.startswith("test_") or fname.endswith("_test.py")
+            for _, _, files in os.walk(build_dir)
+            for fname in files
+        ):
+            return [sys.executable, "-m", "pytest", "--tb=short", "-q", build_dir]
+        # Fall back to running the main module if present
+        for candidate in ("main.py", "app.py", "run.py"):
+            if os.path.isfile(os.path.join(build_dir, candidate)):
+                return [sys.executable, "-c",
+                        f"import ast, sys; ast.parse(open('{os.path.join(build_dir, candidate)}').read());"
+                        f"print('Syntax OK: {candidate}')"]
+    return None
+
+
+def _run_build(build_dir: str, language: str) -> tuple[bool, str]:
+    """Run the build/test command in build_dir. Returns (success, output)."""
+    cmd = _detect_build_command(build_dir, language)
+    if cmd is None:
+        # No test harness — validate Python syntax of every .py file
+        errors = []
+        for root, _, files in os.walk(build_dir):
+            for fname in files:
+                if fname.endswith(".py"):
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, encoding="utf-8") as fh:
+                            import ast as _ast
+                            _ast.parse(fh.read())
+                    except SyntaxError as exc:
+                        errors.append(f"{fpath}: {exc}")
+        if errors:
+            return False, "\n".join(errors)
+        return True, "Syntax check passed (no test harness found)."
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=build_dir,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        output = (result.stdout + "\n" + result.stderr).strip()
+        # Self-heal: if pytest is missing, install it and retry once
+        if result.returncode != 0 and "No module named pytest" in output:
+            print(f"[{AGENT_ID}] pytest missing — installing...")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet", "pytest"],
+                timeout=60,
+            )
+            result = subprocess.run(
+                cmd,
+                cwd=build_dir,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            output = (result.stdout + "\n" + result.stderr).strip()
+        return result.returncode == 0, output
+    except subprocess.TimeoutExpired:
+        return False, "Build/test timed out after 120 seconds."
+    except Exception as exc:
+        return False, f"Could not run build command: {exc}"
+
+
+def _read_source_files(build_dir: str, max_files: int = 20) -> list[dict]:
+    """Read all source files from the build directory for LLM context."""
+    files = []
+    skip_dirs = {"__pycache__", ".pytest_cache", "node_modules", ".git", "venv", ".venv"}
+    source_exts = {".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".toml", ".cfg", ".ini", ".txt"}
+    for root, dirs, fnames in os.walk(build_dir):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for fname in sorted(fnames):
+            if len(files) >= max_files:
+                break
+            _, ext = os.path.splitext(fname)
+            if ext not in source_exts:
+                continue
+            fpath = os.path.join(root, fname)
+            rel = os.path.relpath(fpath, build_dir)
+            try:
+                with open(fpath, encoding="utf-8", errors="replace") as fh:
+                    content = fh.read(4000)
+                files.append({"path": rel, "content": content})
+            except Exception:
+                pass
+    return files
+
+
+def _apply_llm_fixes(build_dir: str, fixes: list[dict]):
+    """Apply LLM-suggested file fixes to the build directory."""
+    for fix in fixes:
+        rel_path = fix.get("path", "").lstrip("/")
+        content = fix.get("content", "")
+        if not rel_path or not content:
+            continue
+        full_path = os.path.join(build_dir, rel_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        try:
+            with open(full_path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            print(f"[{AGENT_ID}] Applied fix to {rel_path}")
+        except Exception as err:
+            print(f"[{AGENT_ID}] Could not apply fix to {rel_path}: {err}")
+
+
+def _build_and_test_with_recovery(
+    build_dir: str,
+    task_instruction: str,
+    language: str,
+    log_fn,
+) -> tuple[bool, str]:
+    """
+    Run build/tests in build_dir with up to MAX_BUILD_RETRIES LLM-guided fix cycles.
+    Returns (passed, final_output).
+    """
+    for attempt in range(1, MAX_BUILD_RETRIES + 1):
+        log_fn(f"Build/test attempt {attempt}/{MAX_BUILD_RETRIES}")
+        success, output = _run_build(build_dir, language)
+        if success:
+            log_fn(f"Build/test passed on attempt {attempt}")
+            return True, output
+
+        log_fn(f"Build/test failed (attempt {attempt}): {output[:200]}")
+        if attempt == MAX_BUILD_RETRIES:
+            break
+
+        # Ask LLM to diagnose and fix
+        source_files = _read_source_files(build_dir)
+        fix_prompt = prompts.BUILD_FIX_TEMPLATE.format(
+            failure_output=output[:3000],
+            source_files_json=json.dumps(source_files, ensure_ascii=False, indent=2)[:6000],
+            task_instruction=task_instruction[:1000],
+        )
+        fix_response = generate_text(
+            fix_prompt,
+            f"[{AGENT_ID}] build-fix-attempt-{attempt}",
+            system_prompt=prompts.BUILD_FIX_SYSTEM,
+        )
+        fix_data = _parse_json_from_llm(fix_response)
+        diagnosis = fix_data.get("diagnosis", "unknown")
+        fixes = fix_data.get("fixes") or []
+        log_fn(f"LLM diagnosis: {diagnosis} — {len(fixes)} fix(es) to apply")
+
+        if not fixes:
+            log_fn("LLM produced no fixes — stopping retry loop")
+            break
+
+        _apply_llm_fixes(build_dir, fixes)
+
+    return False, output
+
+
+
+# ---------------------------------------------------------------------------
 # Main workflow
 # ---------------------------------------------------------------------------
 
@@ -705,6 +876,32 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             task_store.update_state(task_id, "WRITING", "Writing files to workspace…")
             written_paths = _write_files_to_workspace(workspace, generated_files)
             log(f"Wrote {len(written_paths)} file(s) to workspace")
+
+        # ── Phase 5b: Build and test with LLM-guided recovery ───────────────
+        build_dir = os.path.join(workspace, AGENT_ID) if workspace else ""
+        if build_dir and os.path.isdir(build_dir):
+            task_store.update_state(task_id, "BUILDING", "Running build and tests…")
+            log("Running build/tests")
+            build_ok, build_output = _build_and_test_with_recovery(
+                build_dir,
+                task_instruction,
+                analysis.get("language", "python"),
+                log,
+            )
+            if build_ok:
+                log("Build/tests passed")
+            else:
+                log(f"Build/tests could not be fully resolved: {build_output[:200]}")
+            # Sync fixed files back to generated_files list
+            for gf in generated_files:
+                rel_path = gf["path"].lstrip("/")
+                candidate = os.path.join(build_dir, rel_path)
+                if os.path.isfile(candidate):
+                    try:
+                        with open(candidate, encoding="utf-8") as fh:
+                            gf["content"] = fh.read()
+                    except Exception:
+                        pass
 
         # ── Phase 6: Push files and create PR (if repo available) ────────────
         pr_url = ""

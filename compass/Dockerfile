@@ -11,8 +11,7 @@ RUN apt-get update \
 RUN update-ca-certificates
 
 COPY common/       /app/common/
-COPY certs/        /app/certs/
-COPY compass/       /app/compass/
+COPY compass/      /app/compass/
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app

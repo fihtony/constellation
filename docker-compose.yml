@@ -48,11 +48,9 @@ services:
         condition: service_healthy
       init-register:
         condition: service_completed_successfully
-      tracker:
+      jira:
         condition: service_healthy
       scm:
-        condition: service_healthy
-      team-lead:
         condition: service_healthy
     env_file:
       - ./compass/.env
@@ -66,11 +64,6 @@ services:
       ARTIFACT_ROOT: "/app/artifacts"
       DEFAULT_DYNAMIC_IMAGE: "constellation-android-agent:latest"
       DYNAMIC_AGENT_NETWORK: "constellation-network"
-      # Agent URLs passed through to dynamically launched Android agent containers
-      TRACKER_AGENT_URL: "http://tracker:8010"
-      SCM_AGENT_URL: "http://scm:8020"
-      COMPASS_URL: "http://compass:8080"
-      ANDROID_DEFAULT_BRANCH: ""
       ARTIFACT_ROOT_HOST: "${ARTIFACT_ROOT_HOST:-}"
     volumes:
       - ./artifacts:/app/artifacts
@@ -88,29 +81,32 @@ services:
       retries: 20
       start_period: 2s
 
-  tracker:
-    command: ["python3", "tracker/app.py"]
+  jira:
+    command: ["python3", "jira/app.py"]
     depends_on:
       registry:
         condition: service_healthy
       init-register:
         condition: service_completed_successfully
     env_file:
-      - ./tracker/.env
+      - ./jira/.env
     environment:
       HOST: "0.0.0.0"
       PORT: "8010"
-      AGENT_ID: "tracker-agent"
-      ADVERTISED_BASE_URL: "http://tracker:8010"
+      AGENT_ID: "jira-agent"
+      ADVERTISED_BASE_URL: "http://jira:8010"
       REGISTRY_URL: "http://registry:9000"
       HEARTBEAT_INTERVAL: "30"
+      OPENAI_BASE_URL: "http://host.docker.internal:1288/v1"
+      OPENAI_MODEL: "gpt-5-mini"
+      ALLOW_MOCK_FALLBACK: "1"
     build:
       context: .
-      dockerfile: tracker/Dockerfile
-    image: constellation-tracker-agent:latest
+      dockerfile: jira/Dockerfile
+    image: constellation-jira-agent:latest
     labels:
-      constellation.agent_id: "tracker-agent"
-      constellation.agent_name: "Tracker Agent"
+      constellation.agent_id: "jira-agent"
+      constellation.agent_name: "Jira Agent"
       constellation.agent_role: "fundamental"
     ports:
       - "8010:8010"
@@ -141,6 +137,9 @@ services:
       ADVERTISED_BASE_URL: "http://scm:8020"
       REGISTRY_URL: "http://registry:9000"
       HEARTBEAT_INTERVAL: "30"
+      OPENAI_BASE_URL: "http://host.docker.internal:1288/v1"
+      OPENAI_MODEL: "gpt-5-mini"
+      ALLOW_MOCK_FALLBACK: "1"
     volumes:
       - ./artifacts:/app/artifacts
     labels:
@@ -156,48 +155,13 @@ services:
       retries: 20
       start_period: 2s
 
-  team-lead:
-    image: constellation-team-lead-agent:latest
-    build:
-      context: .
-      dockerfile: team-lead/Dockerfile
-    command: ["python3", "team-lead/app.py"]
-    depends_on:
-      registry:
-        condition: service_healthy
-      init-register:
-        condition: service_completed_successfully
-    env_file:
-      - ./team-lead/.env
-    environment:
-      HOST: "0.0.0.0"
-      PORT: "8030"
-      AGENT_ID: "team-lead-agent"
-      ADVERTISED_BASE_URL: "http://team-lead:8030"
-      REGISTRY_URL: "http://registry:9000"
-      JIRA_AGENT_URL: "http://tracker:8010"
-      UI_DESIGN_AGENT_URL: "http://ui-design:8040"
-      COMPASS_URL: "http://compass:8080"
-      HEARTBEAT_INTERVAL: "30"
-      MAX_REVIEW_CYCLES: "2"
-      INPUT_WAIT_TIMEOUT_SECONDS: "7200"
-      A2A_ACK_TIMEOUT_SECONDS: "15"
-      A2A_TASK_TIMEOUT_SECONDS: "3600"
-    volumes:
-      - ./artifacts:/app/artifacts
-      - /var/run/docker.sock:/var/run/docker.sock
-    labels:
-      constellation.agent_id: "team-lead-agent"
-      constellation.agent_name: "Team Lead Agent"
-      constellation.agent_role: "fundamental"
-    ports:
-      - "8030:8030"
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8030/health')"]
-      interval: 2s
-      timeout: 2s
-      retries: 20
-      start_period: 2s
+  # team-lead is a per-task agent — built separately via build-agents.sh and
+  # launched on demand by Compass via Docker socket.  It is NOT started here.
+  # The entry below is kept for reference only.
+  #
+  # team-lead:
+  #   image: constellation-team-lead-agent:latest
+  #   ...
 
   # web-agent is a per-task agent — built separately via build-agents.sh and
   # launched on demand by Team Lead via Docker socket. It is NOT started here.
@@ -218,7 +182,7 @@ services:
   #     ADVERTISED_BASE_URL: "http://web-agent:8050"
   #     REGISTRY_URL: "http://registry:9000"
   #     SCM_AGENT_URL: "http://scm:8020"
-  #     JIRA_AGENT_URL: "http://tracker:8010"
+  #     JIRA_AGENT_URL: "http://jira:8010"
   #     COMPASS_URL: "http://compass:8080"
   #     HEARTBEAT_INTERVAL: "30"
   #   labels:

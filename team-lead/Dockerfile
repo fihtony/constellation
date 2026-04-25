@@ -7,7 +7,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY common/      /app/common/
-COPY team-lead/   /app/team-lead/
+COPY team-lead/   /app/team_lead/
+# Create hyphenated alias so docker-compose command path still works
+RUN ln -s /app/team_lead /app/team-lead
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app

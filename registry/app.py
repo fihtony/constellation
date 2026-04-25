@@ -171,9 +171,12 @@ class RegistryHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "unknown_path"})
 
     def log_message(self, fmt, *args):
-        # Suppress noisy health-check and agent-card polls
         line = args[0] if args else ""
+        # Suppress health-checks, agent-card polls, and heartbeat PUT requests
         if any(p in line for p in ("/health", "/.well-known/agent-card.json")):
+            return
+        # Suppress heartbeat PUT requests (PUT /agents/.../instances/...)
+        if line.startswith("PUT") and "/instances/" in line:
             return
         print(f"[registry] {line} {args[1] if len(args) > 1 else ''} {args[2] if len(args) > 2 else ''}")
 

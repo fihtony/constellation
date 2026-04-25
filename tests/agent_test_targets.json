@@ -1,5 +1,5 @@
 {
-  "tracker": {
+  "jira": {
     "primaryTicket": {
       "ticketKey": "PROJ-1",
       "browseUrl": "https://your-org.atlassian.net/browse/PROJ-1",
