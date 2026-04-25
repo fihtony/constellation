@@ -4,30 +4,32 @@
 Verifies that the three MCP servers used by the Constellation system are
 reachable and return valid responses:
 
-  - Jira MCP  — configured via TEST_JIRA_BASE_URL and TEST_JIRA_TICKET_KEY
-  - GitHub MCP — configured via TEST_GITHUB_OWNER and TEST_GITHUB_REPO
-  - Google Stitch MCP — configured via TEST_STITCH_PROJECT_ID and TEST_STITCH_SCREEN_ID
+  - Jira MCP    — Atlassian Rovo MCP server (https://mcp.atlassian.com/v1/mcp)
+  - GitHub MCP  — official Docker image (ghcr.io/github/github-mcp-server) via STDIO
+  - Stitch MCP  — Google Stitch MCP server (https://stitch.googleapis.com/mcp)
 
-Environment variables required to run integration tests:
-  TEST_JIRA_TOKEN        Jira API token
-  TEST_JIRA_EMAIL        Jira account email (for Basic auth)
-  TEST_GITHUB_TOKEN      GitHub personal access token
-  TEST_STITCH_API_KEY    Google Stitch / Gemini API key
+All configuration is loaded from tests/.env.  The agent_test_targets.json file
+contains only generic placeholders and is NOT a source of PII.
 
-Optional overrides (defaults loaded from tests/agent_test_targets.json):
-  TEST_JIRA_BASE_URL     Base URL of Jira Cloud tenant
-  TEST_JIRA_TICKET_KEY   Jira ticket key (PROJ-1, etc.)
-  TEST_GITHUB_OWNER      GitHub repository owner
-  TEST_GITHUB_REPO       GitHub repository name
-  TEST_STITCH_PROJECT_ID Google Stitch project ID
-  TEST_STITCH_SCREEN_ID  Google Stitch screen ID
+Required keys in tests/.env:
+  TEST_JIRA_TICKET_URL    Full Jira browse URL  (e.g. https://org.atlassian.net/browse/PROJ-1)
+  TEST_JIRA_TOKEN         Jira API token
+  TEST_JIRA_EMAIL         Jira account email
+  TEST_GITHUB_REPO_URL    Full GitHub repo URL  (e.g. https://github.com/owner/repo)
+  TEST_GITHUB_TOKEN       GitHub personal access token
+  TEST_STITCH_PROJECT_URL Full Stitch project URL
+  TEST_STITCH_SCREEN_ID   32-char Stitch screen ID
+  TEST_STITCH_API_KEY     Google / Gemini API key
 
 Usage:
     # Dry-run (no network calls — checks module imports and config parsing):
     python3 tests/test_mcp.py
 
-    # Full integration mode (requires environment variables):
-    TEST_JIRA_TOKEN=... TEST_JIRA_EMAIL=... TEST_GITHUB_TOKEN=... TEST_STITCH_API_KEY=... \\
+    # Full integration mode (requires tests/.env):
+    python3 tests/test_mcp.py --integration [-v]
+
+    # Run only a specific MCP:
+    python3 tests/test_mcp.py --integration --jira
         python3 tests/test_mcp.py --integration [-v]
 
     # Run only a specific MCP:
@@ -42,7 +44,11 @@ import argparse
 import base64
 import json
 import os
+import queue
+import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -294,8 +300,9 @@ def _post(url: str, payload: dict, headers: dict | None = None, timeout: int = 1
 # ---------------------------------------------------------------------------
 
 def _jira_auth_header() -> str | None:
-    token = os.environ.get("TRACKER_TOKEN", "")
-    email = os.environ.get("TRACKER_EMAIL", "")
+    # Prefer TEST_JIRA_TOKEN from tests/.env; fall back to TRACKER_TOKEN env var
+    token = _TEST_ENV.get("TEST_JIRA_TOKEN", "") or os.environ.get("TRACKER_TOKEN", "")
+    email = _TEST_ENV.get("TEST_JIRA_EMAIL", "") or os.environ.get("TRACKER_EMAIL", "")
     if not token:
         return None
     if token.startswith("Basic ") or token.startswith("Bearer "):
@@ -307,14 +314,21 @@ def _jira_auth_header() -> str | None:
 
 
 def _github_auth_header() -> str | None:
-    token = os.environ.get("SCM_TOKEN", "")
+    # Prefer TEST_GITHUB_TOKEN from tests/.env, fall back to SCM_TOKEN env var
+    token = _TEST_ENV.get("TEST_GITHUB_TOKEN", "") or os.environ.get("SCM_TOKEN", "")
     if not token:
         return None
     return f"Bearer {token}"
 
 
+def _github_token() -> str:
+    """Return the raw GitHub personal access token."""
+    return _TEST_ENV.get("TEST_GITHUB_TOKEN", "") or os.environ.get("SCM_TOKEN", "")
+
+
 def _stitch_api_key() -> str | None:
-    return os.environ.get("STITCH_API_KEY", "") or None
+    # Prefer TEST_STITCH_API_KEY from tests/.env; fall back to STITCH_API_KEY env var
+    return _TEST_ENV.get("TEST_STITCH_API_KEY", "") or os.environ.get("STITCH_API_KEY", "") or None
 
 
 # ---------------------------------------------------------------------------
@@ -470,9 +484,9 @@ def test_atlassian_mcp_tools_list(report: Report, session_id: str | None) -> Non
 def test_atlassian_mcp_user_info(report: Report, session_id: str | None) -> None:
     """Call lookupJiraAccountId for the token owner email to verify identity via Atlassian Rovo MCP."""
     auth = _jira_auth_header()
-    email = os.environ.get("TRACKER_EMAIL", "")
+    email = _TEST_ENV.get("TEST_JIRA_EMAIL", "") or os.environ.get("TRACKER_EMAIL", "")
     if not auth or not email:
-        report.skip("Atlassian MCP lookupJiraAccountId", "TRACKER_TOKEN or TRACKER_EMAIL not set")
+        report.skip("Atlassian MCP lookupJiraAccountId", "TEST_JIRA_TOKEN or TEST_JIRA_EMAIL not set in tests/.env")
         return
     if not session_id:
         report.skip("Atlassian MCP lookupJiraAccountId", "MCP session not initialized")
@@ -654,7 +668,7 @@ def test_atlassian_jira_change_assignee(
 ) -> None:
     """Assign the configured ticket to the token owner then clear assignee via editJiraIssue MCP tool."""
     auth = _jira_auth_header()
-    email = os.environ.get("TRACKER_EMAIL", "")
+    email = _TEST_ENV.get("TEST_JIRA_EMAIL", "") or os.environ.get("TRACKER_EMAIL", "")
     if not auth or not session_id or not cloud_id or not email:
         report.skip("editJiraIssue assignee", "missing auth / session / cloudId / email")
         return
@@ -837,7 +851,252 @@ def test_atlassian_jira_search_jql(report: Report, cloud_id: str | None, session
 
 
 # ---------------------------------------------------------------------------
-# GitHub MCP tests
+# GitHub MCP client — official Docker image (STDIO JSON-RPC protocol)
+# ---------------------------------------------------------------------------
+
+
+class GitHubMCPClient:
+    """Client for the official GitHub MCP server (ghcr.io/github/github-mcp-server).
+
+    Communicates over STDIO JSON-RPC 2.0 by launching the server as a Docker
+    subprocess.  Implements the MCP initialize handshake automatically.
+
+    Usage:
+        with GitHubMCPClient(token) as client:
+            tools = client.tools_list()
+            resp  = client.call_tool("get_file_contents", {...})
+    """
+
+    IMAGE = "ghcr.io/github/github-mcp-server"
+    MCP_PROTOCOL_VERSION = "2024-11-05"
+
+    def __init__(self, token: str, timeout: int = 30):
+        self.token = token
+        self.timeout = timeout
+        self._proc: subprocess.Popen | None = None
+        self._req_id = 0
+        self._reader_thread: threading.Thread | None = None
+        self._response_queue: queue.Queue = queue.Queue()
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop()
+
+    def start(self) -> None:
+        """Start the Docker container and perform the MCP initialize handshake."""
+        env = {**os.environ, "GITHUB_PERSONAL_ACCESS_TOKEN": self.token}
+        self._proc = subprocess.Popen(
+            [
+                "docker", "run", "-i", "--rm",
+                "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+                # Enable default toolsets: context, repos, issues, pull_requests, users
+                self.IMAGE,
+            ],
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # Background reader thread drains stdout into a queue
+        self._reader_thread = threading.Thread(target=self._drain_stdout, daemon=True)
+        self._reader_thread.start()
+
+        # MCP initialize handshake
+        resp = self._rpc("initialize", {
+            "protocolVersion": self.MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "constellation-test", "version": "1.0"},
+        })
+        if "error" in resp:
+            raise RuntimeError(f"GitHub MCP init failed: {resp['error']}")
+
+        # Acknowledge initialization
+        self._notify("notifications/initialized", {})
+
+    def _drain_stdout(self) -> None:
+        """Background thread: read stdout line-by-line and push to queue."""
+        assert self._proc is not None
+        try:
+            for raw in self._proc.stdout:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if line:
+                    self._response_queue.put(line)
+        except Exception:
+            pass
+        finally:
+            self._response_queue.put(None)  # sentinel: stream closed
+
+    def _rpc(self, method: str, params: dict, timeout: int | None = None) -> dict:
+        """Send a JSON-RPC request and return the matching response."""
+        self._req_id += 1
+        req_id = self._req_id
+        msg = json.dumps({
+            "jsonrpc": "2.0", "id": req_id,
+            "method": method, "params": params,
+        }) + "\n"
+        assert self._proc and self._proc.stdin
+        self._proc.stdin.write(msg.encode())
+        self._proc.stdin.flush()
+
+        deadline = time.time() + (timeout or self.timeout)
+        while time.time() < deadline:
+            try:
+                line = self._response_queue.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                break
+            if line is None:
+                break
+            try:
+                data = json.loads(line)
+                # Skip JSON-RPC notifications (they have no "id")
+                if "id" in data and data["id"] == req_id:
+                    return data
+                # Put back non-matching messages (other responses / notifications)
+                self._response_queue.put(line)
+            except json.JSONDecodeError:
+                pass
+        return {"error": {"code": -1, "message": f"timeout waiting for MCP response to {method!r}"}}
+
+    def _notify(self, method: str, params: dict) -> None:
+        """Send a JSON-RPC notification (fire-and-forget)."""
+        assert self._proc and self._proc.stdin
+        msg = json.dumps({"jsonrpc": "2.0", "method": method, "params": params}) + "\n"
+        self._proc.stdin.write(msg.encode())
+        self._proc.stdin.flush()
+
+    def tools_list(self) -> list:
+        """Return the list of tool descriptors exposed by this MCP server."""
+        resp = self._rpc("tools/list", {})
+        return (resp.get("result") or {}).get("tools", [])
+
+    def call_tool(self, name: str, arguments: dict, timeout: int = 30) -> dict:
+        """Call a named MCP tool and return the full JSON-RPC response."""
+        return self._rpc("tools/call", {"name": name, "arguments": arguments}, timeout=timeout)
+
+    def extract_text(self, tool_resp: dict) -> str:
+        """Concatenate all text content items from a tools/call result."""
+        result = tool_resp.get("result") or {}
+        if isinstance(result, dict):
+            parts = [
+                item.get("text", "")
+                for item in result.get("content", [])
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            return "\n".join(parts)
+        return str(result)
+
+    def is_error(self, tool_resp: dict) -> bool:
+        """Return True if the tool call resulted in an error."""
+        return bool((tool_resp.get("result") or {}).get("isError")) or "error" in tool_resp
+
+    def stop(self) -> None:
+        if self._proc:
+            try:
+                self._proc.stdin.close()
+                self._proc.wait(timeout=5)
+            except Exception:
+                self._proc.kill()
+            self._proc = None
+
+
+# ---------------------------------------------------------------------------
+# GitHub MCP tests (via official Docker image — STDIO JSON-RPC)
+# ---------------------------------------------------------------------------
+
+def test_github_mcp_tools_list(report: Report, client: GitHubMCPClient) -> None:
+    """Verify the GitHub MCP server exposes a non-empty tool list."""
+    tools = client.tools_list()
+    if not tools:
+        report.fail("GitHub MCP tools/list returned empty list")
+        return
+    tool_names = sorted(t.get("name", "") for t in tools)
+    report.ok(
+        f"GitHub MCP server ready — {len(tools)} tools available",
+        f"sample tools: {tool_names[:6]}",
+    )
+
+
+def test_github_mcp_get_repository(report: Report, client: GitHubMCPClient) -> None:
+    """Call search_repositories to verify the test repo is accessible and discoverable."""
+    resp = client.call_tool("search_repositories", {
+        "query": f"repo:{GITHUB_OWNER}/{GITHUB_REPO}",
+    })
+    if client.is_error(resp):
+        report.fail("search_repositories failed", client.extract_text(resp)[:200])
+        return
+    text = client.extract_text(resp)
+    if GITHUB_REPO in text or GITHUB_OWNER in text:
+        report.ok(f"search_repositories: {GITHUB_OWNER}/{GITHUB_REPO} found", text[:120])
+    else:
+        report.fail("search_repositories: expected repo data not in response", text[:200])
+
+
+def test_github_mcp_list_branches(report: Report, client: GitHubMCPClient) -> None:
+    """Call list_branches and verify at least one branch is returned."""
+    resp = client.call_tool("list_branches", {"owner": GITHUB_OWNER, "repo": GITHUB_REPO})
+    if client.is_error(resp):
+        report.fail("list_branches failed", client.extract_text(resp)[:200])
+        return
+    text = client.extract_text(resp)
+    if text.strip():
+        report.ok("list_branches: branch data returned", text[:120])
+    else:
+        report.fail("list_branches: empty response", text[:200])
+
+
+def test_github_mcp_get_file_contents(report: Report, client: GitHubMCPClient) -> None:
+    """Call get_file_contents to fetch README.md from the test repo."""
+    resp = client.call_tool("get_file_contents", {
+        "owner": GITHUB_OWNER,
+        "repo": GITHUB_REPO,
+        "path": "README.md",
+    })
+    if client.is_error(resp):
+        report.fail("get_file_contents (README.md) failed", client.extract_text(resp)[:200])
+        return
+    text = client.extract_text(resp)
+    if text.strip():
+        report.ok("get_file_contents: README.md retrieved", text[:80])
+    else:
+        report.fail("get_file_contents: empty content returned")
+
+
+def test_github_mcp_list_pull_requests(report: Report, client: GitHubMCPClient) -> None:
+    """Call list_pull_requests (open state) on the test repo."""
+    resp = client.call_tool("list_pull_requests", {
+        "owner": GITHUB_OWNER,
+        "repo": GITHUB_REPO,
+        "state": "open",
+    })
+    if client.is_error(resp):
+        report.fail("list_pull_requests failed", client.extract_text(resp)[:200])
+        return
+    text = client.extract_text(resp)
+    report.ok("list_pull_requests: call succeeded", text[:120] if text.strip() else "(no open PRs)")
+
+
+def test_github_mcp_search_code(report: Report, client: GitHubMCPClient) -> None:
+    """Call search_code to find files in the test repo."""
+    resp = client.call_tool("search_code", {
+        "query": f"repo:{GITHUB_OWNER}/{GITHUB_REPO} README",
+    })
+    if client.is_error(resp):
+        # search_code may not be in default toolset — treat as skip
+        err_text = client.extract_text(resp)
+        if "not found" in err_text.lower() or "unknown tool" in err_text.lower():
+            report.skip("search_code", "tool not in enabled toolsets")
+        else:
+            report.fail("search_code failed", err_text[:200])
+        return
+    text = client.extract_text(resp)
+    report.ok("search_code: call succeeded", text[:120])
+
+
+# ---------------------------------------------------------------------------
+# GitHub MCP tests (kept for reference — direct REST API calls)
 # ---------------------------------------------------------------------------
 
 def test_github_repo_url_parseable(report: Report):
@@ -1181,11 +1440,40 @@ def run_jira_tests(report: Report):
 
 
 def run_github_tests(report: Report):
-    report.section(f"GitHub MCP — {GITHUB_REPO_URL}")
-    test_github_repo_metadata(report)
-    test_github_repo_branches(report)
-    test_github_repo_contents(report)
-    test_github_pull_requests(report)
+    report.section(f"GitHub MCP (official Docker server) — {GITHUB_REPO_URL}")
+
+    # First do a quick static / REST check so failures are diagnosable
+    test_github_repo_url_parseable(report)
+
+    token = _github_token()
+    if not token:
+        report.skip("GitHub MCP server tests", "TEST_GITHUB_TOKEN not set in tests/.env")
+        return
+
+    # Check Docker is reachable
+    try:
+        result = subprocess.run(
+            ["docker", "info"], capture_output=True, timeout=10
+        )
+        if result.returncode != 0:
+            report.skip("GitHub MCP server tests", "Docker daemon not running")
+            return
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        report.skip("GitHub MCP server tests", f"Docker unavailable: {exc}")
+        return
+
+    report.section("Starting GitHub MCP server container …")
+    try:
+        with GitHubMCPClient(token, timeout=30) as client:
+            report.ok("GitHub MCP server container started and initialized")
+            test_github_mcp_tools_list(report, client)
+            test_github_mcp_get_repository(report, client)
+            test_github_mcp_list_branches(report, client)
+            test_github_mcp_get_file_contents(report, client)
+            test_github_mcp_list_pull_requests(report, client)
+            test_github_mcp_search_code(report, client)
+    except RuntimeError as exc:
+        report.fail("GitHub MCP server failed to start", str(exc))
 
 
 def run_stitch_tests(report: Report):

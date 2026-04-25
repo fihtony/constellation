@@ -1,0 +1,98 @@
+{
+  "schemaVersion": "1.0",
+  "name": "SCM Agent",
+  "description": "Multi-provider Source Code Manager. Supports GitHub and Bitbucket Server; extensible to GitLab and others.",
+  "version": "1.0.0",
+  "supportedInterfaces": [
+    {
+      "url": "__ADVERTISED_URL__",
+      "protocolBinding": "HTTP+JSON",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": true
+  },
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain", "application/json"],
+  "skills": [
+    {
+      "id": "scm.repo.search",
+      "name": "Repository Search",
+      "description": "Search for repositories by name or keyword across the configured SCM provider.",
+      "tags": ["scm", "repository", "search"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.repo.inspect",
+      "name": "Repository Inspect",
+      "description": "Fetch repository metadata, default branch, and branch list.",
+      "tags": ["scm", "repository", "inspect"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.branch.list",
+      "name": "List Branches",
+      "description": "List all branches in a repository.",
+      "tags": ["scm", "branch"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.branch.create",
+      "name": "Create Branch",
+      "description": "Create a new branch from a given ref.",
+      "tags": ["scm", "branch", "create"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.pr.list",
+      "name": "List Pull Requests",
+      "description": "List open (or filtered) pull requests in a repository.",
+      "tags": ["scm", "pull-request", "list"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.pr.get",
+      "name": "Get Pull Request",
+      "description": "Fetch details of a single PR, including linked Jira issues extracted from title/description/branch.",
+      "tags": ["scm", "pull-request", "inspect"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.pr.create",
+      "name": "Create Pull Request",
+      "description": "Create a pull request from one branch to another.",
+      "tags": ["scm", "pull-request", "create"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.pr.comment",
+      "name": "Add PR Comment",
+      "description": "Add a general or inline comment to a pull request.",
+      "tags": ["scm", "pull-request", "comment"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.pr.comment.list",
+      "name": "List PR Comments",
+      "description": "List all comments on a pull request.",
+      "tags": ["scm", "pull-request", "comment", "list"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.git.push",
+      "name": "Git Push Files",
+      "description": "Commit and push one or more files to a branch via HTTPS.",
+      "tags": ["scm", "git", "push"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.git.clone",
+      "name": "Git Clone (async)",
+      "description": "Clone a repository to a shared workspace path. Returns immediately; notifies via callback when done.",
+      "tags": ["scm", "git", "clone"],
+      "executionMode": "async"
+    }
+  ]
+}
