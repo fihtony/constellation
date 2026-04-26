@@ -757,6 +757,18 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 "teamLeadTaskId": team_lead_task_id,
                 "acceptanceCriteria": plan.get("acceptance_criteria") or [],
                 "requiresTests": plan.get("requires_tests", False),
+                "devWorkflowInstructions": (
+                    "MANDATORY development workflow — follow these steps in order:\n"
+                    "1. When you start development: transition the Jira ticket to 'In Progress', "
+                    "assign it to the service account, and add a comment saying you started.\n"
+                    "2. Implement the feature following the acceptance criteria.\n"
+                    "3. Write and run tests. Install any missing dependencies at runtime.\n"
+                    "4. Push your implementation to a feature branch and create a Pull Request "
+                    "targeting the default branch.\n"
+                    "5. After the PR is created: transition the Jira ticket to 'In Review' and "
+                    "add a comment that includes the PR URL, test status, and a brief summary.\n"
+                    "All steps are required. Skipping Jira/PR steps is not acceptable."
+                ),
             },
         }
 

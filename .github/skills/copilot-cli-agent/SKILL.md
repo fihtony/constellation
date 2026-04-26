@@ -1,0 +1,191 @@
+# Skill: GitHub Copilot CLI Agent in Docker Container
+
+## Summary
+
+This skill describes how to install and use **GitHub Copilot CLI** inside a Docker container in non-interactive (programmatic) mode, authenticated via a fine-grained Personal Access Token.
+
+Verified working: Copilot CLI v1.0.36, model `gpt-5-mini`, Node.js 22, Docker Desktop (macOS).
+
+---
+
+## Authentication
+
+Copilot CLI checks credentials in this priority order:
+
+1. `COPILOT_GITHUB_TOKEN` env var (highest priority — recommended for containers)
+2. `GH_TOKEN` env var
+3. `GITHUB_TOKEN` env var
+4. OAuth token from system keychain
+5. `gh auth token` fallback
+
+**For containers, always use `COPILOT_GITHUB_TOKEN`.**
+
+### Required PAT permissions
+
+Create a fine-grained PAT at https://github.com/settings/personal-access-tokens/new:
+- Under **Permissions → Account permissions** → select **Copilot Requests**
+
+Supported token prefixes: `github_pat_` (fine-grained), `gho_` (OAuth), `ghu_` (GitHub App)  
+Classic PAT (`ghp_`) is **NOT** supported.
+
+---
+
+## Dockerfile
+
+```dockerfile
+FROM node:22-slim
+
+WORKDIR /workspace
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install GitHub Copilot CLI globally
+RUN npm install -g @github/copilot
+
+# Your agent code
+COPY . /workspace/
+
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python3", "/workspace/your_agent.py"]
+```
+
+**Key points:**
+- Base image: `node:22-slim` (Node.js 22+ is required)
+- Install via npm: `npm install -g @github/copilot`
+- No keychain or `libsecret` needed — token is passed via environment variable
+
+---
+
+## Non-Interactive Usage
+
+Use `copilot -p` (prompt flag) and `-s` (silent/response-only flag):
+
+```bash
+# Simple question
+copilot -sp "What is 2+2?"
+
+# With explicit model selection
+copilot --model gpt-5-mini -sp "Write a hello_world() function in Python"
+```
+
+**Flags:**
+- `-p "PROMPT"` — pass prompt directly (non-interactive)
+- `-s` — silent mode: output only Copilot's response, no extra usage info
+- `--model MODEL` — select model (e.g. `gpt-5-mini`, `claude-sonnet-4.5`)
+
+---
+
+## Python Integration Pattern
+
+```python
+import os
+import subprocess
+
+COPILOT_TOKEN = os.environ.get("COPILOT_GITHUB_TOKEN", "")
+MODEL = os.environ.get("COPILOT_MODEL", "gpt-5-mini")
+
+def run_copilot(prompt: str, timeout: int = 60) -> tuple[bool, str]:
+    """Run Copilot CLI non-interactively. Returns (success, response_text)."""
+    if not COPILOT_TOKEN:
+        return False, "COPILOT_GITHUB_TOKEN is not set."
+
+    cmd = ["copilot", "--model", MODEL, "-sp", prompt]
+    env = dict(os.environ)
+    env["COPILOT_GITHUB_TOKEN"] = COPILOT_TOKEN
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        if result.returncode != 0:
+            return False, f"Exit {result.returncode}: {result.stderr[:300]}"
+        return True, result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return False, f"Copilot CLI timed out after {timeout}s"
+    except FileNotFoundError:
+        return False, "copilot binary not found"
+```
+
+---
+
+## Running the Test Container
+
+```bash
+docker build -f copilot-cli-test/Dockerfile -t constellation-copilot-cli-test:latest .
+
+docker run --rm \
+  -e COPILOT_GITHUB_TOKEN=<your-fine-grained-pat> \
+  -e COPILOT_MODEL=gpt-5-mini \
+  constellation-copilot-cli-test:latest \
+  python3 /workspace/test_agent.py
+```
+
+Expected output:
+```
+[copilot-cli-test] Test 1: Basic question — what is 2+2?
+[copilot-cli-test]   PASS — response: 4
+[copilot-cli-test] Test 2: Code generation — write hello world in Python
+[copilot-cli-test]   PASS — response preview: def hello_world(): ...
+[copilot-cli-test] Test 3: Model selection — using model 'gpt-5-mini'
+[copilot-cli-test]   PASS — response: READY
+[copilot-cli-test] Passed: 3/3
+[copilot-cli-test] All tests passed!
+```
+
+---
+
+## Building an Agent on Copilot CLI
+
+Instead of calling an LLM API directly, an agent can delegate all reasoning to Copilot CLI:
+
+```python
+from common.llm_client import generate_text  # standard LLM path
+
+# OR: use Copilot CLI for richer agentic reasoning
+ok, response = run_copilot(
+    f"Analyze this task and return a JSON plan:\n{task_instruction}",
+    timeout=120,
+)
+```
+
+**When to use Copilot CLI vs direct LLM API:**
+
+| Scenario | Use Copilot CLI | Use LLM API directly |
+|---|---|---|
+| Complex multi-step reasoning | ✅ | |
+| File-reading context needed | ✅ (`@file` refs) | |
+| Simple text generation | | ✅ (lower latency) |
+| Structured JSON output | | ✅ (more reliable) |
+| Cost-sensitive high-volume | | ✅ |
+
+---
+
+## Environment Variables
+
+```env
+# Required: Fine-grained PAT with "Copilot Requests" permission
+COPILOT_GITHUB_TOKEN=github_pat_...
+
+# Optional: override model (default: gpt-5-mini)
+COPILOT_MODEL=gpt-5-mini
+
+# Optional: set custom Copilot home dir (default: ~/.copilot)
+COPILOT_HOME=/workspace/.copilot
+```
+
+---
+
+## Known Limitations
+
+- Copilot CLI is **interactive by default** — always use `-p` flag in containers
+- The `--model` flag only works when authenticated; model names may change with CLI versions
+- `/delegate` command requires GitHub authentication AND network access to GitHub.com
+- Token expiry depends on PAT settings — rotate tokens regularly in production
+- Copilot CLI does NOT support stdin piping; use `-p` flag only

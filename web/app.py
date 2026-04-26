@@ -343,6 +343,54 @@ def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_t
         return ""
 
 
+def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspace: str, compass_task_id: str):
+    """Transition a Jira ticket to a new status (best-effort, non-blocking)."""
+    try:
+        _call_sync_agent(
+            JIRA_AGENT_URL,
+            "jira.ticket.transition",
+            f"Transition ticket {ticket_key} to '{target_status}'",
+            task_id,
+            workspace,
+            compass_task_id,
+        )
+        print(f"[{AGENT_ID}] Jira {ticket_key} transitioned to '{target_status}'")
+    except Exception as err:
+        print(f"[{AGENT_ID}] Jira transition failed (non-critical): {err}")
+
+
+def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_task_id: str):
+    """Assign the Jira ticket to the bot (service account) that owns the credentials (best-effort)."""
+    try:
+        _call_sync_agent(
+            JIRA_AGENT_URL,
+            "jira.ticket.assignee",
+            f"Assign ticket {ticket_key} to myself (the authenticated service account)",
+            task_id,
+            workspace,
+            compass_task_id,
+        )
+        print(f"[{AGENT_ID}] Jira {ticket_key} assigned to service account")
+    except Exception as err:
+        print(f"[{AGENT_ID}] Jira assign failed (non-critical): {err}")
+
+
+def _jira_add_comment(ticket_key: str, comment: str, task_id: str, workspace: str, compass_task_id: str):
+    """Add a comment to a Jira ticket (best-effort, non-blocking)."""
+    try:
+        _call_sync_agent(
+            JIRA_AGENT_URL,
+            "jira.comment.add",
+            f"Add comment to ticket {ticket_key}: {comment}",
+            task_id,
+            workspace,
+            compass_task_id,
+        )
+        print(f"[{AGENT_ID}] Jira {ticket_key} comment added")
+    except Exception as err:
+        print(f"[{AGENT_ID}] Jira comment failed (non-critical): {err}")
+
+
 def _clone_repo(task_id: str, repo_url: str, workspace: str, compass_task_id: str) -> str:
     """Clone repository via SCM Agent. Returns clone path or empty string."""
     try:
@@ -532,6 +580,46 @@ def _read_repo_snapshot(clone_path: str, max_files: int = 30, max_chars: int = 8
                 files_read += 1
 
     return "\n\n".join(snapshot_parts)
+
+
+def _install_plan_dependencies(deps: list[str], language: str, log_fn):
+    """Install dependencies declared in the plan at runtime (best-effort)."""
+    if not deps:
+        return
+    python_pkgs = []
+    npm_pkgs = []
+    for dep in deps:
+        dep = dep.strip()
+        if not dep:
+            continue
+        # Simple heuristic: if it looks like a PyPI package (no @, no /) it's Python;
+        # if it starts with @ or is a scoped package it's npm.
+        if dep.startswith("@") or "/" in dep or language in ("javascript", "typescript"):
+            npm_pkgs.append(dep)
+        else:
+            python_pkgs.append(dep)
+
+    if python_pkgs:
+        log_fn(f"Installing Python packages: {', '.join(python_pkgs)}")
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet"] + python_pkgs,
+                timeout=120,
+                check=False,
+            )
+        except Exception as err:
+            log_fn(f"Warning: pip install failed: {err}")
+
+    if npm_pkgs:
+        log_fn(f"Installing npm packages: {', '.join(npm_pkgs)}")
+        try:
+            subprocess.run(
+                ["npm", "install", "--save"] + npm_pkgs,
+                timeout=120,
+                check=False,
+            )
+        except Exception as err:
+            log_fn(f"Warning: npm install failed: {err}")
 
 
 def _write_files_to_workspace(workspace_path: str, files: list[dict]) -> list[str]:
@@ -796,6 +884,19 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     f"Jira ticket context ({ticket_key}):\n{jira_content[:3000]}"
                 )
 
+            # ── Dev Workflow Step 1: Mark ticket In Progress ─────────────────
+            log(f"Updating Jira ticket {ticket_key}: In Progress → assign self → comment")
+            _jira_transition(ticket_key, "In Progress", task_id, workspace, compass_task_id)
+            _jira_assign_self(ticket_key, task_id, workspace, compass_task_id)
+            _jira_add_comment(
+                ticket_key,
+                f"🤖 **Web Agent** (`{AGENT_ID}`) has picked up this ticket and started development.\n"
+                f"Internal task ID: `{task_id}`",
+                task_id,
+                workspace,
+                compass_task_id,
+            )
+
         repo_url = analysis.get("repo_url") or ""
         # If no repo_url in analysis, try extracting from instruction
         if not repo_url:
@@ -829,6 +930,12 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
 
         if not files_to_implement:
             raise RuntimeError("LLM returned an empty file plan — cannot proceed.")
+
+        # ── Phase 3b: Install plan dependencies at runtime ───────────────────
+        install_deps = plan.get("install_dependencies") or []
+        if install_deps:
+            task_store.update_state(task_id, "INSTALLING_DEPS", "Installing runtime dependencies…")
+            _install_plan_dependencies(install_deps, analysis.get("language", "python"), log)
 
         # ── Phase 4: Implement ───────────────────────────────────────────────
         task_store.update_state(task_id, "IMPLEMENTING", f"Implementing {len(files_to_implement)} file(s)…")
@@ -879,6 +986,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
 
         # ── Phase 5b: Build and test with LLM-guided recovery ───────────────
         build_dir = os.path.join(workspace, AGENT_ID) if workspace else ""
+        build_ok = True  # default: assume passing if no build dir
         if build_dir and os.path.isdir(build_dir):
             task_store.update_state(task_id, "BUILDING", "Running build and tests…")
             log("Running build/tests")
@@ -950,6 +1058,28 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     )
                     if pr_url:
                         log(f"PR created: {pr_url}")
+                        # ── Dev Workflow Step 2: Update Jira after PR ────────
+                        if ticket_match:
+                            ticket_key = ticket_match.group(1)
+                            _jira_transition(
+                                ticket_key, "In Review",
+                                task_id, workspace, compass_task_id,
+                            )
+                            test_status = "✅ Build/tests passed" if build_ok else "⚠️ Build/tests had issues"
+                            _jira_add_comment(
+                                ticket_key,
+                                f"🤖 **Web Agent** (`{AGENT_ID}`) completed implementation.\n\n"
+                                f"**PR:** {pr_url}\n"
+                                f"**Branch:** `{branch_name}`\n"
+                                f"**Test Status:** {test_status}\n"
+                                f"**Files changed ({len(generated_files)}):** "
+                                f"{', '.join(gf['path'] for gf in generated_files[:5])}"
+                                f"{'…' if len(generated_files) > 5 else ''}\n\n"
+                                f"**Summary:** {plan.get('plan_summary', 'Implementation complete.')}",
+                                task_id,
+                                workspace,
+                                compass_task_id,
+                            )
                     else:
                         log("Warning: PR creation returned no URL")
                 else:

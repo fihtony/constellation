@@ -113,6 +113,8 @@ Check:
 2. Test cases exist and cover the requirements (if required)
 3. No obvious bugs, edge cases, or security issues
 4. Code quality is acceptable
+5. Development workflow was followed: Jira ticket transitioned to In Progress and In Review,
+   PR was created, and a Jira comment with PR link was posted
 
 Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
 """
@@ -134,7 +136,8 @@ Development agent output:
 Artifacts produced:
 {artifacts_summary}
 
-Evaluate each acceptance criterion and provide a pass/fail verdict.
+Evaluate each acceptance criterion and check that the dev workflow was followed
+(Jira In Progress → implementation → PR → Jira In Review with PR link).
 
 Respond with a JSON object:
 {{
@@ -143,6 +146,8 @@ Respond with a JSON object:
   "criteria_results": [
     {{"criterion": "...", "passed": true|false, "notes": "..."}}
   ],
+  "workflow_followed": true|false,
+  "workflow_notes": "Brief note on Jira/PR workflow compliance",
   "issues": ["issue 1", "issue 2"],
   "missing_requirements": ["unmet requirement 1"],
   "feedback_for_dev": "Detailed actionable feedback for the dev agent to fix the issues. Be specific about what files to change and what is expected. Set to null if passed.",
