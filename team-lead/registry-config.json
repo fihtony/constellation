@@ -13,6 +13,8 @@
       "SCM_AGENT_URL": "http://scm:8020",
       "UI_DESIGN_AGENT_URL": "http://ui-design:8040",
       "COMPASS_URL": "http://compass:8080",
+      "AGENT_RUNTIME": "copilot-cli",
+      "AGENT_MODEL": "gpt-5-mini",
       "OPENAI_BASE_URL": "http://host.docker.internal:1288/v1",
       "OPENAI_MODEL": "gpt-5-mini",
       "ALLOW_MOCK_FALLBACK": "1",

@@ -42,6 +42,11 @@ Determine:
 - What files need to be created or modified
 - Whether you need the current state of the repository before proceeding
 
+Rules:
+- If the task instruction explicitly requires Python, Flask, or another named stack, treat that as a hard constraint.
+- Do NOT infer React, Next.js, or Node.js only because the target repository is sparse, references a design tool, or has a generic README.
+- If the repository is empty or nearly empty, choose the stack required by the task and scaffold it in-place.
+
 Respond with a JSON object:
 {{
   "task_summary": "One sentence description of what needs to be built",
@@ -70,6 +75,17 @@ must create a detailed implementation plan. The plan should enumerate every file
 that needs to be created or changed, with its purpose and the key logic it must contain.
 
 Be specific and actionable. The plan will be used to generate actual source code.
+
+Critical planning rules:
+- Choose exactly one frontend routing architecture that matches `analysis.frontend_framework`.
+- If `frontend_framework` is `nextjs`, do NOT include React SPA shell files such as
+  `src/App.*`, `src/main.*`, `src/routes.*`, `src/router.*`, or a duplicate `src/pages/*`
+  route tree when `pages/*` or `app/*` routes are already present.
+- If `frontend_framework` is `react`, do NOT include Next.js route files such as `pages/*`
+  or `app/*`.
+- The `files` list must contain only repository source/config/test files that should be
+  created or modified in git. Do NOT include workflow artifacts such as PR drafts,
+  Jira evidence notes, CI logs, or step-by-step scratch files.
 
 Important rules for Flask backends:
 - The Flask app must use: `app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))`

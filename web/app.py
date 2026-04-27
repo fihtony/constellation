@@ -19,15 +19,17 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
-from common.llm_client import generate_text
 from common.message_utils import artifact_text, build_text_artifact, extract_text
-from common.rules_loader import build_system_prompt
+from common.rules_loader import build_system_prompt, load_rules
+from common.runtime.adapter import get_runtime, summarize_runtime_configuration
 from common.task_store import TaskStore
+from common.time_utils import local_clock_time, local_iso_timestamp
 from web import prompts
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -61,7 +63,7 @@ reporter = InstanceReporter(
 # ---------------------------------------------------------------------------
 
 def audit_log(event: str, **kwargs):
-    entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": event, **kwargs}
+    entry = {"ts": local_iso_timestamp(), "event": event, **kwargs}
     print(f"[audit] {json.dumps(entry, ensure_ascii=False)}")
 
 
@@ -82,6 +84,175 @@ def _report_progress(compass_url: str, compass_task_id: str, step: str):
             pass
     except Exception as err:
         print(f"[{AGENT_ID}] Progress report failed (non-critical): {err}")
+
+
+def _save_workspace_file(workspace_path: str, relative_name: str, content: str) -> None:
+    """Write content to a file inside the shared workspace (best-effort)."""
+    if not workspace_path:
+        return
+    try:
+        full_path = os.path.join(workspace_path, relative_name)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    except OSError as exc:
+        print(f"[{AGENT_ID}] Warning: could not save workspace file {relative_name}: {exc}")
+
+
+def _append_workspace_file(workspace_path: str, relative_name: str, content: str) -> None:
+    """Append content to a file inside the shared workspace (best-effort)."""
+    if not workspace_path:
+        return
+    try:
+        full_path = os.path.join(workspace_path, relative_name)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "a", encoding="utf-8") as fh:
+            fh.write(content)
+    except OSError as exc:
+        print(f"[{AGENT_ID}] Warning: could not append workspace file {relative_name}: {exc}")
+
+
+def _read_workspace_json(workspace_path: str, relative_name: str) -> dict:
+    """Read a JSON file from the shared workspace (best-effort)."""
+    if not workspace_path:
+        return {}
+    full_path = os.path.join(workspace_path, relative_name)
+    if not os.path.isfile(full_path):
+        return {}
+    try:
+        with open(full_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[{AGENT_ID}] Warning: could not read workspace JSON {relative_name}: {exc}")
+        return {}
+
+
+def _append_workspace_event(workspace_path: str, relative_name: str, event: dict) -> None:
+    """Append an event object to a workspace JSON file under the `events` key."""
+    payload = _read_workspace_json(workspace_path, relative_name)
+    events = payload.get("events") if isinstance(payload.get("events"), list) else []
+    events.append(event)
+    payload["events"] = events
+    _save_workspace_file(
+        workspace_path,
+        relative_name,
+        json.dumps(payload, ensure_ascii=False, indent=2),
+    )
+
+
+def _record_jira_action(
+    workspace_path: str,
+    task_id: str,
+    ticket_key: str,
+    action: str,
+    status: str,
+    **details,
+) -> None:
+    """Persist Jira workflow evidence for later review."""
+    event = {
+        "ts": local_iso_timestamp(),
+        "taskId": task_id,
+        "agentId": AGENT_ID,
+        "ticketKey": ticket_key,
+        "action": action,
+        "status": status,
+    }
+    event.update({key: value for key, value in details.items() if value not in (None, "")})
+    _append_workspace_event(workspace_path, f"{AGENT_ID}/jira-actions.json", event)
+
+
+def _save_pr_evidence(workspace_path: str, **details) -> None:
+    """Persist PR metadata and description so review can verify SCM evidence locally."""
+    payload = _read_workspace_json(workspace_path, f"{AGENT_ID}/pr-evidence.json")
+    payload.update({key: value for key, value in details.items() if value is not None})
+    payload.setdefault("agentId", AGENT_ID)
+    payload.setdefault("ts", local_iso_timestamp())
+    _save_workspace_file(
+        workspace_path,
+        f"{AGENT_ID}/pr-evidence.json",
+        json.dumps(payload, ensure_ascii=False, indent=2),
+    )
+
+
+def _prepend_tech_stack_constraints(task_instruction: str, constraints: dict | None) -> str:
+    if not constraints:
+        return task_instruction
+    lines = ["HARD TECH STACK CONSTRAINTS:"]
+    if constraints.get("language") == "python":
+        version = constraints.get("python_version")
+        lines.append(f"- Use Python{f' {version}' if version else ''}.")
+    if constraints.get("backend_framework"):
+        lines.append(f"- Use {constraints['backend_framework']} for the backend/web server.")
+    if constraints.get("frontend_framework"):
+        lines.append(f"- Use {constraints['frontend_framework']} for the frontend.")
+    lines.append("- Do not switch to React, Next.js, or Node.js unless the user explicitly overrides these constraints.")
+    lines.append("- If the target repo is empty or sparse, scaffold the required stack in-place.")
+    block = "\n".join(lines)
+    if block in task_instruction:
+        return task_instruction
+    return f"{block}\n\n{task_instruction}".strip()
+
+
+def _apply_tech_stack_constraints(analysis: dict, constraints: dict | None) -> dict:
+    if not constraints:
+        return analysis
+    updated = dict(analysis or {})
+    if constraints.get("language"):
+        updated["language"] = constraints["language"]
+    if constraints.get("backend_framework"):
+        updated["backend_framework"] = constraints["backend_framework"]
+        if updated.get("scope") in (None, "", "frontend_only"):
+            updated["scope"] = "fullstack"
+    if constraints.get("frontend_framework"):
+        updated["frontend_framework"] = constraints["frontend_framework"]
+    elif constraints.get("backend_framework") == "flask":
+        updated["frontend_framework"] = "none"
+        updated.setdefault("ui_library", "none")
+    return updated
+
+
+def _jira_request_json(
+    method: str,
+    path: str,
+    *,
+    payload: dict | None = None,
+    workspace: str = "",
+    task_id: str = "",
+    timeout: int = 30,
+) -> dict:
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    if workspace:
+        headers["X-Shared-Workspace-Path"] = workspace
+    if task_id:
+        headers["X-Orchestrator-Task-Id"] = task_id
+    headers["X-Agent-Id"] = AGENT_ID
+    request = Request(
+        f"{JIRA_AGENT_URL.rstrip('/')}{path}",
+        data=(json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None),
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw.strip() else {}
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {body[:300]}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"network error: {exc.reason}") from exc
+
+
+def _get_jira_account_id(workspace: str, task_id: str) -> str:
+    response = _jira_request_json("GET", "/jira/myself", workspace=workspace, task_id=task_id)
+    user = response.get("user") or {}
+    account_id = user.get("accountId") or ""
+    if not account_id:
+        raise RuntimeError(f"jira.myself returned no accountId: {response}")
+    return account_id
 
 
 def _notify_callback(
@@ -222,6 +393,30 @@ def _parse_json_from_llm(text: str) -> dict:
     return {}
 
 
+def _run_agentic(
+    prompt: str,
+    actor: str,
+    *,
+    system_prompt: str | None = None,
+    context: dict | None = None,
+    model: str | None = None,
+    timeout: int = 120,
+    max_tokens: int = 4096,
+) -> str:
+    """Run the configured runtime and return raw output text."""
+    result = get_runtime().run(
+        prompt=prompt,
+        context=context,
+        system_prompt=system_prompt,
+        model=model,
+        timeout=timeout,
+        max_tokens=max_tokens,
+    )
+    for warning in result.get("warnings") or []:
+        print(f"[{AGENT_ID}] Runtime warning ({actor}): {warning}")
+    return result.get("raw_response") or result.get("summary") or ""
+
+
 def _analyze_task(task_instruction: str, acceptance_criteria: list, repo_context: str) -> dict:
     criteria_text = "\n".join(f"- {c}" for c in (acceptance_criteria or [])) or "Not specified."
     prompt = prompts.ANALYZE_TEMPLATE.format(
@@ -230,7 +425,7 @@ def _analyze_task(task_instruction: str, acceptance_criteria: list, repo_context
         repo_context=repo_context or "None provided.",
     )
     system = build_system_prompt(prompts.ANALYZE_SYSTEM, "web")
-    response = generate_text(prompt, f"[{AGENT_ID}] analyze", system_prompt=system)
+    response = _run_agentic(prompt, f"[{AGENT_ID}] analyze", system_prompt=system)
     return _parse_json_from_llm(response)
 
 
@@ -250,7 +445,7 @@ def _plan_implementation(
         design_context=design_context or "No design context provided.",
     )
     system = build_system_prompt(prompts.PLAN_SYSTEM, "web")
-    response = generate_text(prompt, f"[{AGENT_ID}] plan", system_prompt=system)
+    response = _run_agentic(prompt, f"[{AGENT_ID}] plan", system_prompt=system)
     return _parse_json_from_llm(response)
 
 
@@ -276,8 +471,130 @@ def _generate_file_code(
         existing_content=existing_content or "N/A (new file)",
         context_from_other_files=context_from_files or "No other files generated yet.",
     )
-    return generate_text(prompt, f"[{AGENT_ID}] codegen:{file_info.get('path', '')}",
-                          system_prompt=build_system_prompt(prompts.CODEGEN_SYSTEM, "web"))
+    return _run_agentic(
+        prompt,
+        f"[{AGENT_ID}] codegen:{file_info.get('path', '')}",
+        system_prompt=build_system_prompt(prompts.CODEGEN_SYSTEM, "web"),
+        timeout=180,
+        max_tokens=8192,
+    )
+
+
+def _normalize_plan_path(path: str) -> str:
+    return (path or "").strip().replace("\\", "/").lstrip("./")
+
+
+def _is_spa_router_file(path: str) -> bool:
+    path_lower = path.lower()
+    return bool(
+        re.match(r"^src/(app|main|routes|router)\.[^/]+$", path_lower)
+        or path_lower.startswith("src/routes/")
+        or path_lower.startswith("src/router/")
+    )
+
+
+def _is_top_level_next_route_file(path: str) -> bool:
+    path_lower = path.lower()
+    return path_lower.startswith("pages/") or path_lower.startswith("app/")
+
+
+def _is_operational_plan_artifact(file_info: dict) -> bool:
+    path_lower = _normalize_plan_path(str(file_info.get("path", ""))).lower()
+    purpose_lower = str(file_info.get("purpose", "")).lower()
+    logic_lower = str(file_info.get("key_logic", "")).lower()
+    text = " ".join(part for part in (path_lower, purpose_lower, logic_lower) if part)
+    if not path_lower:
+        return True
+    if "pull request body" in text or "pr description" in text or "jira evidence" in text:
+        return True
+    if path_lower.startswith("artifacts/"):
+        return True
+    base_name = os.path.basename(path_lower)
+    if re.match(r"^step-\d+.*\.md$", base_name):
+        return True
+    if re.match(r"^pr[_-]?template", base_name):
+        return True
+    return False
+
+
+def _sanitize_plan_files(files: list[dict], analysis: dict, review_issues: list[str]) -> tuple[list[dict], list[dict]]:
+    """Remove conflicting or non-repo plan entries before code generation."""
+    normalized_files: list[dict] = []
+    removed: list[dict] = []
+    seen_paths: set[str] = set()
+
+    for file_info in files or []:
+        normalized_path = _normalize_plan_path(str(file_info.get("path", "")))
+        if not normalized_path:
+            removed.append({"path": "", "reason": "empty plan path"})
+            continue
+        path_key = normalized_path.lower()
+        if path_key in seen_paths:
+            removed.append({"path": normalized_path, "reason": "duplicate plan path"})
+            continue
+        candidate = dict(file_info)
+        candidate["path"] = normalized_path
+        normalized_files.append(candidate)
+        seen_paths.add(path_key)
+
+    if not normalized_files:
+        return normalized_files, removed
+
+    frontend = str(analysis.get("frontend_framework", "")).strip().lower()
+    issue_text = "\n".join(str(issue) for issue in (review_issues or [])).lower()
+    prefer_nextjs = frontend == "nextjs" or ("next.js" in issue_text and "remove spa" in issue_text)
+    prefer_react = frontend == "react" or ("react router" in issue_text and "remove next" in issue_text)
+    has_top_level_next_routes = any(
+        _is_top_level_next_route_file(file_info["path"])
+        for file_info in normalized_files
+    )
+
+    kept: list[dict] = []
+    kept_paths: set[str] = set()
+    for file_info in normalized_files:
+        path = file_info["path"]
+        path_lower = path.lower()
+        reason = ""
+
+        if _is_operational_plan_artifact(file_info):
+            reason = "workflow evidence belongs in workspace artifacts, not repo file plan"
+        elif prefer_nextjs and _is_spa_router_file(path):
+            reason = "drop SPA router shell for Next.js implementation"
+        elif prefer_nextjs and has_top_level_next_routes and (
+            path_lower.startswith("src/pages/") or path_lower.startswith("src/app/")
+        ):
+            reason = "drop duplicate src route tree when top-level Next.js routes are present"
+        elif prefer_react and (
+            path_lower.startswith("pages/")
+            or path_lower.startswith("app/")
+            or re.search(r"\.next\.test\.[^.]+$", path_lower)
+        ):
+            reason = "drop Next.js-specific files for React SPA implementation"
+
+        if reason:
+            removed.append({"path": path, "reason": reason})
+            continue
+
+        kept.append(file_info)
+        kept_paths.add(path_lower)
+
+    if prefer_nextjs and has_top_level_next_routes and kept:
+        final_kept: list[dict] = []
+        for file_info in kept:
+            path_lower = file_info["path"].lower()
+            if path_lower.startswith("src/pages/__tests__/") and not any(
+                route in kept_paths for route in ("pages/index.tsx", "pages/index.jsx", "app/page.tsx", "app/page.jsx")
+            ):
+                removed.append({
+                    "path": file_info["path"],
+                    "reason": "drop orphaned SPA page test after Next.js route sanitization",
+                })
+                continue
+            final_kept.append(file_info)
+        if final_kept:
+            kept = final_kept
+
+    return kept or normalized_files, removed
 
 
 def _generate_pr_description(
@@ -295,8 +612,10 @@ def _generate_pr_description(
         files_changed=files_text,
         implementation_summary=implementation_summary,
     )
-    response = generate_text(
-        prompt, f"[{AGENT_ID}] pr-description", system_prompt=prompts.PR_DESCRIPTION_SYSTEM
+    response = _run_agentic(
+        prompt,
+        f"[{AGENT_ID}] pr-description",
+        system_prompt=build_system_prompt(prompts.PR_DESCRIPTION_SYSTEM, "web"),
     )
     lines = response.strip().splitlines()
     title = lines[0].strip() if lines else "Web Agent: implement task"
@@ -319,8 +638,10 @@ def _generate_summary(
         acceptance_criteria=criteria_text,
     )
     try:
-        return generate_text(
-            prompt, f"[{AGENT_ID}] summary", system_prompt=prompts.SUMMARY_SYSTEM
+        return _run_agentic(
+            prompt,
+            f"[{AGENT_ID}] summary",
+            system_prompt=build_system_prompt(prompts.SUMMARY_SYSTEM, "web"),
         )
     except Exception as err:
         return f"Web Agent completed. Summary unavailable: {err}"
@@ -333,99 +654,170 @@ def _generate_summary(
 def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_task_id: str) -> str:
     """Fetch Jira ticket content via Jira Agent."""
     try:
-        result = _call_sync_agent(
-            JIRA_AGENT_URL,
-            "jira.ticket.fetch",
-            f"Fetch ticket {ticket_key}",
-            task_id,
-            workspace,
-            compass_task_id,
+        result = _jira_request_json(
+            "GET",
+            f"/jira/tickets/{ticket_key}",
+            workspace=workspace,
+            task_id=task_id,
         )
-        return "\n".join(artifact_text(a) for a in result.get("artifacts", []))
+        issue = result.get("issue") or {}
+        content = json.dumps(issue, ensure_ascii=False, indent=2) if issue else ""
+        _record_jira_action(
+            workspace,
+            task_id,
+            ticket_key,
+            "fetch",
+            "completed",
+            contentLength=len(content),
+        )
+        return content
     except Exception as err:
         print(f"[{AGENT_ID}] Could not fetch Jira ticket {ticket_key}: {err}")
+        _record_jira_action(
+            workspace,
+            task_id,
+            ticket_key,
+            "fetch",
+            "failed",
+            error=str(err),
+        )
         return ""
 
 
 def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspace: str, compass_task_id: str):
     """Transition a Jira ticket to a new status (best-effort, non-blocking)."""
     try:
-        _call_sync_agent(
-            JIRA_AGENT_URL,
-            "jira.ticket.transition",
-            f"Transition ticket {ticket_key} to '{target_status}'",
-            task_id,
-            workspace,
-            compass_task_id,
+        result = _jira_request_json(
+            "POST",
+            f"/jira/transitions/{ticket_key}",
+            payload={"transition": target_status},
+            workspace=workspace,
+            task_id=task_id,
         )
         print(f"[{AGENT_ID}] Jira {ticket_key} transitioned to '{target_status}'")
+        _record_jira_action(
+            workspace,
+            task_id,
+            ticket_key,
+            "transition",
+            "completed",
+            targetStatus=target_status,
+            result=result.get("result"),
+        )
     except Exception as err:
         print(f"[{AGENT_ID}] Jira transition failed (non-critical): {err}")
+        _record_jira_action(
+            workspace,
+            task_id,
+            ticket_key,
+            "transition",
+            "failed",
+            targetStatus=target_status,
+            error=str(err),
+        )
 
 
 def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_task_id: str):
     """Assign the Jira ticket to the bot (service account) that owns the credentials (best-effort)."""
     try:
-        _call_sync_agent(
-            JIRA_AGENT_URL,
-            "jira.ticket.assignee",
-            f"Assign ticket {ticket_key} to myself (the authenticated service account)",
-            task_id,
-            workspace,
-            compass_task_id,
+        account_id = _get_jira_account_id(workspace, task_id)
+        result = _jira_request_json(
+            "PUT",
+            f"/jira/assignee/{ticket_key}",
+            payload={"accountId": account_id},
+            workspace=workspace,
+            task_id=task_id,
         )
         print(f"[{AGENT_ID}] Jira {ticket_key} assigned to service account")
+        _record_jira_action(
+            workspace,
+            task_id,
+            ticket_key,
+            "assign",
+            "completed",
+            accountId=account_id,
+            result=result.get("result"),
+        )
     except Exception as err:
         print(f"[{AGENT_ID}] Jira assign failed (non-critical): {err}")
+        _record_jira_action(
+            workspace,
+            task_id,
+            ticket_key,
+            "assign",
+            "failed",
+            error=str(err),
+        )
 
 
 def _jira_add_comment(ticket_key: str, comment: str, task_id: str, workspace: str, compass_task_id: str):
     """Add a comment to a Jira ticket (best-effort, non-blocking)."""
     try:
-        _call_sync_agent(
-            JIRA_AGENT_URL,
-            "jira.comment.add",
-            f"Add comment to ticket {ticket_key}: {comment}",
-            task_id,
-            workspace,
-            compass_task_id,
+        result = _jira_request_json(
+            "POST",
+            f"/jira/comments/{ticket_key}",
+            payload={"text": comment},
+            workspace=workspace,
+            task_id=task_id,
         )
         print(f"[{AGENT_ID}] Jira {ticket_key} comment added")
+        _record_jira_action(
+            workspace,
+            task_id,
+            ticket_key,
+            "comment",
+            "completed",
+            commentPreview=comment[:240],
+            commentId=result.get("commentId"),
+            result=result.get("result"),
+        )
     except Exception as err:
         print(f"[{AGENT_ID}] Jira comment failed (non-critical): {err}")
+        _record_jira_action(
+            workspace,
+            task_id,
+            ticket_key,
+            "comment",
+            "failed",
+            commentPreview=comment[:240],
+            error=str(err),
+        )
 
 
 def _clone_repo(task_id: str, repo_url: str, workspace: str, compass_task_id: str) -> str:
-    """Clone repository via SCM Agent. Returns clone path or empty string."""
-    try:
-        result = _call_sync_agent(
-            SCM_AGENT_URL,
-            "scm.git.clone",
-            f"Clone repository {repo_url} to {workspace}",
-            task_id,
-            workspace,
-            compass_task_id,
-        )
-        # Primary: extract clone path from artifacts (JSON)
-        for art in result.get("artifacts", []):
-            text = artifact_text(art)
-            if text:
-                try:
-                    data = json.loads(text)
-                    path = data.get("clone_path") or data.get("clonePath") or ""
-                    if path:
-                        return path
-                except Exception:
-                    if text.strip().startswith("/"):
-                        return text.strip()
-        # Fallback: check extra dict returned by SCM task payload
-        extra = result.get("extra", {})
-        if extra.get("clonePath"):
-            return extra["clonePath"]
-        return ""
-    except Exception as err:
-        print(f"[{AGENT_ID}] Could not clone repo {repo_url}: {err}")
-        return ""
+    """Clone repository via SCM Agent and return the clone path."""
+    result = _call_sync_agent(
+        SCM_AGENT_URL,
+        "scm.git.clone",
+        f"Clone repository {repo_url} to {workspace}",
+        task_id,
+        workspace,
+        compass_task_id,
+    )
+    # Primary: extract clone path from artifacts (JSON)
+    for art in result.get("artifacts", []):
+        text = artifact_text(art)
+        if text:
+            try:
+                data = json.loads(text)
+                path = data.get("clone_path") or data.get("clonePath") or ""
+                if path:
+                    return path
+            except Exception:
+                if text.strip().startswith("/"):
+                    return text.strip()
+    # Fallback: check extra dict returned by SCM task payload
+    extra = result.get("extra", {})
+    if extra.get("clonePath"):
+        return extra["clonePath"]
+
+    state = result.get("status", {}).get("state", "")
+    status_text = extract_text(result.get("status", {}).get("message", {})).strip()
+    if state in {"TASK_STATE_FAILED", "FAILED"}:
+        raise RuntimeError(status_text or f"SCM clone failed for {repo_url}")
+    if state in {"TASK_STATE_COMPLETED", "COMPLETED"}:
+        raise RuntimeError(f"SCM clone completed without a clone path for {repo_url}")
+    raise RuntimeError(f"SCM clone did not reach terminal success state for {repo_url} (state={state or 'unknown'})")
 
 
 def _create_branch(task_id: str, repo_url: str, branch_name: str, base_branch: str, workspace: str, compass_task_id: str) -> bool:
@@ -711,14 +1103,15 @@ def _install_plan_dependencies(deps: list[str], language: str, log_fn):
             log_fn(f"Warning: npm install failed: {err}")
 
 
-def _write_files_to_workspace(workspace_path: str, files: list[dict]) -> list[str]:
-    """Write generated code files to the shared workspace. Returns list of written paths."""
-    agent_workspace = os.path.join(workspace_path, AGENT_ID)
-    os.makedirs(agent_workspace, exist_ok=True)
+def _write_files_to_directory(base_dir: str, files: list[dict]) -> list[str]:
+    """Write generated code files into the specified directory."""
+    if not base_dir:
+        return []
+    os.makedirs(base_dir, exist_ok=True)
     written: list[str] = []
     for file_info in files:
         rel_path = file_info.get("path", "output.txt").lstrip("/")
-        full_path = os.path.join(agent_workspace, rel_path)
+        full_path = os.path.join(base_dir, rel_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         content = file_info.get("content", "")
         try:
@@ -856,17 +1249,26 @@ def _build_and_test_with_recovery(
     task_instruction: str,
     language: str,
     log_fn,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, list[dict]]:
     """
     Run build/tests in build_dir with up to MAX_BUILD_RETRIES LLM-guided fix cycles.
     Returns (passed, final_output).
     """
+    attempts: list[dict] = []
+    output = ""
     for attempt in range(1, MAX_BUILD_RETRIES + 1):
         log_fn(f"Build/test attempt {attempt}/{MAX_BUILD_RETRIES}")
         success, output = _run_build(build_dir, language)
+        attempts.append(
+            {
+                "attempt": attempt,
+                "success": success,
+                "output": output[:4000],
+            }
+        )
         if success:
             log_fn(f"Build/test passed on attempt {attempt}")
-            return True, output
+            return True, output, attempts
 
         log_fn(f"Build/test failed (attempt {attempt}): {output[:200]}")
         if attempt == MAX_BUILD_RETRIES:
@@ -879,10 +1281,12 @@ def _build_and_test_with_recovery(
             source_files_json=json.dumps(source_files, ensure_ascii=False, indent=2)[:6000],
             task_instruction=task_instruction[:1000],
         )
-        fix_response = generate_text(
+        fix_response = _run_agentic(
             fix_prompt,
             f"[{AGENT_ID}] build-fix-attempt-{attempt}",
-            system_prompt=prompts.BUILD_FIX_SYSTEM,
+            system_prompt=build_system_prompt(prompts.BUILD_FIX_SYSTEM, "web"),
+            timeout=180,
+            max_tokens=8192,
         )
         fix_data = _parse_json_from_llm(fix_response)
         diagnosis = fix_data.get("diagnosis", "unknown")
@@ -895,7 +1299,7 @@ def _build_and_test_with_recovery(
 
         _apply_llm_fixes(build_dir, fixes)
 
-    return False, output
+    return False, output, attempts
 
 
 
@@ -922,19 +1326,66 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
     acceptance_criteria: list = metadata.get("acceptanceCriteria") or []
     is_revision: bool = metadata.get("isRevision", False)
     review_issues: list = metadata.get("reviewIssues") or []
+    tech_stack_constraints: dict = metadata.get("techStackConstraints") or {}
     # Repo URL injected by Team Lead from Jira/analysis (preferred over text extraction)
     metadata_repo_url: str = metadata.get("targetRepoUrl", "")
 
-    task_instruction = extract_text(message) or ""
+    task_instruction = _prepend_tech_stack_constraints(extract_text(message) or "", tech_stack_constraints)
     final_artifacts: list = []
+    repo_url = metadata_repo_url or ""
+    clone_path = ""
+    branch_name = ""
+    pr_url = ""
+    build_dir = ""
+    build_ok: bool | None = None
+    agent_workspace = os.path.join(workspace, AGENT_ID) if workspace else ""
+    phases: list[str] = []
+    runtime_config = {
+        "runtime": summarize_runtime_configuration(),
+        "rulesLoaded": bool(load_rules("web")),
+        "workflowRulesLoaded": bool(load_rules("web", include_workflow=True)),
+        "workflowInstructionsPresent": bool(metadata.get("devWorkflowInstructions")),
+        "techStackConstraints": tech_stack_constraints,
+    }
 
     def log(phase: str):
-        ts = time.strftime("%H:%M:%S")
+        ts = local_clock_time()
         print(f"[{AGENT_ID}][{task_id}] [{ts}] {phase}")
+        entry = f"[{ts}] {phase}"
+        phases.append(phase)
+        _append_workspace_file(workspace, f"{AGENT_ID}/command-log.txt", entry + "\n")
+        _save_workspace_file(
+            workspace,
+            f"{AGENT_ID}/stage-summary.json",
+            json.dumps(
+                {
+                    "taskId": task_id,
+                    "agentId": AGENT_ID,
+                    "currentPhase": phase,
+                    "phases": phases,
+                    "repoUrl": repo_url,
+                    "clonePath": clone_path,
+                    "branch": branch_name,
+                    "prUrl": pr_url,
+                    "buildDir": build_dir,
+                    "buildPassed": build_ok,
+                    "acceptanceCriteria": acceptance_criteria,
+                    "reviewIssues": review_issues,
+                    "runtimeConfig": runtime_config,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
         _report_progress(compass_url, compass_task_id, f"[Web Agent] {phase}")
 
     try:
         audit_log("TASK_STARTED", task_id=task_id, compass_task_id=compass_task_id)
+        _save_workspace_file(
+            workspace,
+            f"{AGENT_ID}/runtime-config.json",
+            json.dumps(runtime_config, ensure_ascii=False, indent=2),
+        )
 
         # If this is a revision, append review issues to instruction
         if is_revision and review_issues:
@@ -947,7 +1398,10 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         # ── Phase 1: Analyze ────────────────────────────────────────────────
         task_store.update_state(task_id, "ANALYZING", "Analyzing the web development task…")
         log("Analyzing task")
-        analysis = _analyze_task(task_instruction, acceptance_criteria, repo_context="")
+        analysis = _apply_tech_stack_constraints(
+            _analyze_task(task_instruction, acceptance_criteria, repo_context=""),
+            tech_stack_constraints,
+        )
         log(
             f"Analysis: scope={analysis.get('scope')}, "
             f"frontend={analysis.get('frontend_framework')}, "
@@ -959,7 +1413,22 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         task_store.update_state(task_id, "GATHERING_INFO", "Gathering context…")
         jira_content = ""
         repo_snapshot = ""
-        clone_path = ""
+
+        if is_revision and review_issues:
+            _save_workspace_file(
+                workspace,
+                f"{AGENT_ID}/review-notes.json",
+                json.dumps(
+                    {
+                        "taskId": task_id,
+                        "agentId": AGENT_ID,
+                        "isRevision": True,
+                        "reviewIssues": review_issues,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
 
         # Extract Jira ticket key if present in instruction
         ticket_match = re.search(r"\b([A-Z][A-Z0-9]+-\d+)\b", task_instruction)
@@ -999,12 +1468,49 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
 
         if repo_url and workspace:
             log(f"Cloning repository: {repo_url}")
-            clone_path = _clone_repo(task_id, repo_url, workspace, compass_task_id)
+            try:
+                clone_path = _clone_repo(task_id, repo_url, workspace, compass_task_id)
+            except Exception as err:
+                _save_workspace_file(
+                    workspace,
+                    f"{AGENT_ID}/clone-info.json",
+                    json.dumps(
+                        {
+                            "taskId": task_id,
+                            "agentId": AGENT_ID,
+                            "repoUrl": repo_url,
+                            "clonePath": "",
+                            "status": "failed",
+                            "error": str(err),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                )
+                raise
             if clone_path:
                 log(f"Repository cloned to {clone_path}")
+                _save_workspace_file(
+                    workspace,
+                    f"{AGENT_ID}/clone-info.json",
+                    json.dumps(
+                        {
+                            "taskId": task_id,
+                            "agentId": AGENT_ID,
+                            "repoUrl": repo_url,
+                            "clonePath": clone_path,
+                            "status": "completed",
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                )
                 repo_snapshot = _read_repo_snapshot(clone_path)
                 # Re-analyze with repo context
-                analysis = _analyze_task(task_instruction, acceptance_criteria, repo_snapshot[:2000])
+                analysis = _apply_tech_stack_constraints(
+                    _analyze_task(task_instruction, acceptance_criteria, repo_snapshot[:2000]),
+                    tech_stack_constraints,
+                )
 
         # ── Phase 3: Plan ────────────────────────────────────────────────────
         task_store.update_state(task_id, "PLANNING", "Creating implementation plan…")
@@ -1016,7 +1522,34 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             repo_snapshot,
             design_context="",
         )
-        files_to_implement = plan.get("files") or []
+        files_to_implement, removed_plan_files = _sanitize_plan_files(
+            plan.get("files") or [],
+            analysis,
+            review_issues,
+        )
+        plan["files"] = files_to_implement
+        if removed_plan_files:
+            _save_workspace_file(
+                workspace,
+                f"{AGENT_ID}/plan-sanitization.json",
+                json.dumps(
+                    {
+                        "taskId": task_id,
+                        "agentId": AGENT_ID,
+                        "frontendFramework": analysis.get("frontend_framework"),
+                        "removedFiles": removed_plan_files,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+            removed_preview = ", ".join(item["path"] for item in removed_plan_files[:4])
+            if len(removed_plan_files) > 4:
+                removed_preview += ", ..."
+            log(
+                "Sanitized file plan — removed "
+                f"{len(removed_plan_files)} conflicting/non-source file(s): {removed_preview}"
+            )
         log(f"Plan ready — {len(files_to_implement)} file(s) to implement")
 
         if not files_to_implement:
@@ -1070,18 +1603,23 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         log(f"Code generation complete — {len(generated_files)} file(s) ready")
 
         # ── Phase 5: Write to shared workspace ──────────────────────────────
-        if workspace:
+        if clone_path:
+            task_store.update_state(task_id, "WRITING", "Writing files into cloned repository…")
+            written_clone_paths = _write_files_to_directory(clone_path, generated_files)
+            log(f"Wrote {len(written_clone_paths)} file(s) into cloned repository")
+
+        if agent_workspace:
             task_store.update_state(task_id, "WRITING", "Writing files to workspace…")
-            written_paths = _write_files_to_workspace(workspace, generated_files)
+            written_paths = _write_files_to_directory(agent_workspace, generated_files)
             log(f"Wrote {len(written_paths)} file(s) to workspace")
 
         # ── Phase 5b: Build and test with LLM-guided recovery ───────────────
-        build_dir = os.path.join(workspace, AGENT_ID) if workspace else ""
+        build_dir = clone_path or agent_workspace
         build_ok = True  # default: assume passing if no build dir
         if build_dir and os.path.isdir(build_dir):
             task_store.update_state(task_id, "BUILDING", "Running build and tests…")
             log("Running build/tests")
-            build_ok, build_output = _build_and_test_with_recovery(
+            build_ok, build_output, build_attempts = _build_and_test_with_recovery(
                 build_dir,
                 task_instruction,
                 analysis.get("language", "python"),
@@ -1101,11 +1639,26 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                             gf["content"] = fh.read()
                     except Exception:
                         pass
+            _save_workspace_file(
+                workspace,
+                f"{AGENT_ID}/test-results.json",
+                json.dumps(
+                    {
+                        "taskId": task_id,
+                        "agentId": AGENT_ID,
+                        "buildDir": build_dir,
+                        "passed": build_ok,
+                        "attempts": build_attempts,
+                        "finalOutput": build_output[:4000],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+            if clone_path and agent_workspace:
+                _write_files_to_directory(agent_workspace, generated_files)
 
         # ── Phase 6: Push files and create PR (if repo available) ────────────
-        pr_url = ""
-        branch_name = ""
-
         if repo_url and workspace:
             task_store.update_state(task_id, "PUSHING", "Creating branch and pushing code…")
 
@@ -1128,6 +1681,23 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
 
             branch_created = _create_branch(
                 task_id, repo_url, branch_name, base_branch, workspace, compass_task_id
+            )
+            _save_workspace_file(
+                workspace,
+                f"{AGENT_ID}/branch-info.json",
+                json.dumps(
+                    {
+                        "taskId": task_id,
+                        "agentId": AGENT_ID,
+                        "repoUrl": repo_url,
+                        "branch": branch_name,
+                        "baseBranch": base_branch,
+                        "branchCreated": branch_created,
+                        "prUrl": pr_url,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
             )
             if not branch_created:
                 log(f"Warning: could not create branch {branch_name} — files saved to workspace only")
@@ -1155,9 +1725,50 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                         files_changed,
                         plan.get("plan_summary") or "Web agent implementation",
                     )
+                    _save_pr_evidence(
+                        workspace,
+                        taskId=task_id,
+                        repoUrl=repo_url,
+                        branch=branch_name,
+                        baseBranch=base_branch,
+                        title=pr_title,
+                        body=pr_body,
+                        buildPassed=build_ok,
+                        generatedFiles=files_changed,
+                    )
                     pr_url = _create_pr(
                         task_id, repo_url, branch_name, base_branch,
                         pr_title, pr_body, workspace, compass_task_id
+                    )
+                    _save_pr_evidence(
+                        workspace,
+                        taskId=task_id,
+                        repoUrl=repo_url,
+                        branch=branch_name,
+                        baseBranch=base_branch,
+                        title=pr_title,
+                        body=pr_body,
+                        url=pr_url,
+                        buildPassed=build_ok,
+                        generatedFiles=files_changed,
+                    )
+                    _save_workspace_file(
+                        workspace,
+                        f"{AGENT_ID}/branch-info.json",
+                        json.dumps(
+                            {
+                                "taskId": task_id,
+                                "agentId": AGENT_ID,
+                                "repoUrl": repo_url,
+                                "branch": branch_name,
+                                "baseBranch": base_branch,
+                                "branchCreated": branch_created,
+                                "prUrl": pr_url,
+                                "buildPassed": build_ok,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
                     )
                     if pr_url:
                         log(f"PR created: {pr_url}")
@@ -1194,6 +1805,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         files_list = [gf["path"] for gf in generated_files]
         summary = _generate_summary(task_instruction, acceptance_criteria, files_list, pr_url)
         log(f"Summary: {summary[:120]}")
+        _save_workspace_file(workspace, f"{AGENT_ID}/final-summary.md", summary)
 
         # Create artifacts: one per generated file + summary
         summary_artifact = build_text_artifact(
@@ -1210,6 +1822,29 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             },
         )
         final_artifacts = [summary_artifact]
+
+        for artifact_name, artifact_path in (
+            ("web-agent-clone-info", f"{AGENT_ID}/clone-info.json"),
+            ("web-agent-branch-info", f"{AGENT_ID}/branch-info.json"),
+            ("web-agent-test-results", f"{AGENT_ID}/test-results.json"),
+            ("web-agent-jira-actions", f"{AGENT_ID}/jira-actions.json"),
+            ("web-agent-pr-evidence", f"{AGENT_ID}/pr-evidence.json"),
+        ):
+            payload = _read_workspace_json(workspace, artifact_path)
+            if payload:
+                final_artifacts.append(
+                    build_text_artifact(
+                        artifact_name,
+                        json.dumps(payload, ensure_ascii=False, indent=2)[:3000],
+                        artifact_type="application/json",
+                        metadata={
+                            "agentId": AGENT_ID,
+                            "capability": "web.task.execute",
+                            "orchestratorTaskId": compass_task_id,
+                            "path": artifact_path,
+                        },
+                    )
+                )
 
         # Add code file artifacts (truncated for artifact payload)
         for gf in generated_files[:10]:
@@ -1246,6 +1881,20 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         error_text = str(err)
         print(f"[{AGENT_ID}][{task_id}] FAILED: {error_text}")
         task_store.update_state(task_id, "TASK_STATE_FAILED", f"Web Agent failed: {error_text[:500]}")
+        _save_workspace_file(
+            workspace,
+            f"{AGENT_ID}/review-notes.json",
+            json.dumps(
+                {
+                    "taskId": task_id,
+                    "agentId": AGENT_ID,
+                    "error": error_text,
+                    "reviewIssues": review_issues,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
         audit_log("TASK_FAILED", task_id=task_id, error=error_text[:300])
         _notify_callback(
             callback_url, task_id, "TASK_STATE_FAILED",

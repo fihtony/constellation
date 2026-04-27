@@ -16,12 +16,15 @@ import os
 import sys
 import textwrap
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TESTS_ENV = PROJECT_ROOT / "tests" / ".env"
+COMMON_ENV = PROJECT_ROOT / "common" / ".env"
 
 COMPASS_URL = "http://localhost:8080"
 REGISTRY_URL = "http://localhost:9000"
@@ -56,6 +59,7 @@ def _load_env_file(path: Path) -> dict:
 
 
 _ENV = _load_env_file(TESTS_ENV)
+_COMMON_ENV = _load_env_file(COMMON_ENV)
 
 JIRA_TICKET_URL = _ENV.get("TEST_JIRA_TICKET_URL", "https://tarch.atlassian.net/browse/CSTL-1")
 JIRA_TICKET_KEY = JIRA_TICKET_URL.rstrip("/").split("/")[-1]
@@ -71,6 +75,11 @@ GITHUB_OWNER    = _gh[-2] if len(_gh) >= 2 else ""
 GITHUB_REPO     = _gh[-1] if _gh else ""
 
 ARTIFACT_ROOT_HOST = os.environ.get("ARTIFACT_ROOT_HOST", str(PROJECT_ROOT / "artifacts"))
+LOCAL_TIMEZONE = (
+    os.environ.get("LOCAL_TIMEZONE", "").strip()
+    or _ENV.get("LOCAL_TIMEZONE", "").strip()
+    or _COMMON_ENV.get("LOCAL_TIMEZONE", "").strip()
+)
 
 # ---------------------------------------------------------------------------
 # Counters
@@ -225,6 +234,78 @@ def container_to_host(container_path: str) -> str:
     if container_path.startswith(prefix):
         return ARTIFACT_ROOT_HOST + container_path[len(prefix):]
     return container_path
+
+
+def _read_json_file(path: str):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _normalize_text(value: str) -> str:
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+
+def _latest_completed_jira_event(events: list[dict], action: str) -> dict | None:
+    for event in reversed(events):
+        if event.get("action") == action and event.get("status") == "completed":
+            return event
+    return None
+
+
+def _assert_local_timestamp_value(raw_value: str, label: str) -> bool:
+    if not raw_value:
+        fail(f"{label} timestamp missing")
+        return False
+    try:
+        parsed = datetime.fromisoformat(raw_value)
+    except ValueError as exc:
+        fail(f"{label} timestamp is not ISO-8601", str(exc))
+        return False
+
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        fail(f"{label} timestamp missing timezone offset", raw_value)
+        return False
+
+    if not LOCAL_TIMEZONE:
+        ok(f"{label} timestamp includes timezone offset: {raw_value}")
+        return True
+
+    try:
+        local_dt = parsed.astimezone(ZoneInfo(LOCAL_TIMEZONE))
+    except ZoneInfoNotFoundError:
+        warn(f"Configured LOCAL_TIMEZONE {LOCAL_TIMEZONE!r} is invalid; only checking offset presence")
+        ok(f"{label} timestamp includes timezone offset: {raw_value}")
+        return True
+
+    if parsed.utcoffset() == local_dt.utcoffset():
+        ok(f"{label} timestamp uses {LOCAL_TIMEZONE}: {raw_value}")
+        return True
+
+    fail(
+        f"{label} timestamp not in {LOCAL_TIMEZONE}",
+        f"value={raw_value}, expected_offset={local_dt.utcoffset()}",
+    )
+    return False
+
+
+def _assert_local_timestamp_field(host_ws: str, rel: str, field: str, label: str) -> bool:
+    payload = _read_json_file(os.path.join(host_ws, rel))
+    if not isinstance(payload, dict):
+        fail(f"{label} JSON unreadable", rel)
+        return False
+    return _assert_local_timestamp_value(str(payload.get(field) or ""), label)
+
+
+def _assert_local_timestamp_from_events(host_ws: str, rel: str, label: str) -> bool:
+    payload = _read_json_file(os.path.join(host_ws, rel))
+    events = payload.get("events") if isinstance(payload, dict) else None
+    if not isinstance(events, list) or not events:
+        fail(f"{label} has no recorded events", rel)
+        return False
+    latest = events[-1] if isinstance(events[-1], dict) else {}
+    return _assert_local_timestamp_value(str(latest.get("ts") or ""), label)
 
 
 # ---------------------------------------------------------------------------
@@ -516,11 +597,18 @@ def test_cstl1_full_workflow():  # noqa: C901
     step("Record Jira state BEFORE test")
     j_before = jira_get_issue(JIRA_TICKET_KEY)
     j_status_before = ""
+    j_assignee_before = ""
     j_comments_before = 0
     if j_before:
         j_status_before = j_before.get("fields", {}).get("status", {}).get("name", "")
+        assignee_before = j_before.get("fields", {}).get("assignee") or {}
+        j_assignee_before = assignee_before.get("accountId", "")
         j_comments_before = j_before.get("fields", {}).get("comment", {}).get("total", 0)
-        info(f"Jira before: status={j_status_before!r}, comments={j_comments_before}")
+        info(
+            "Jira before: "
+            f"status={j_status_before!r}, assignee={j_assignee_before or assignee_before.get('displayName', '')!r}, "
+            f"comments={j_comments_before}"
+        )
     else:
         warn("Could not fetch Jira baseline (check TEST_JIRA_TOKEN in tests/.env)")
 
@@ -539,10 +627,9 @@ def test_cstl1_full_workflow():  # noqa: C901
     # can proceed without asking the user for clarification.
     _request_text = (
         f"implement jira ticket {JIRA_TICKET_URL}"
-        f" using repository {GITHUB_REPO_URL}"
-        f" (React TypeScript, Node.js/Express backend)."
-        f" A simple placeholder landing page at / is acceptable:"
-        f" header with app name, hero section with welcome message, CTA button to /quiz."
+        f" using repository {GITHUB_REPO_URL}."
+        f" Use the Jira ticket and linked design context as the source of truth."
+        f" If the repository is sparse, scaffold the required implementation in place instead of switching stacks."
     )
     step(f"a. Submit 'implement jira ticket {JIRA_TICKET_URL}'")
     s, body = send_message(_request_text, timeout=30)
@@ -628,6 +715,71 @@ def test_cstl1_full_workflow():  # noqa: C901
 
     # Team Lead plan
     _ws_file_ok(host_ws, "team-lead/plan.json", "Team Lead implementation plan")
+    _ws_file_ok(host_ws, "team-lead/stage-summary.json", "Team Lead stage summary")
+    _ws_file_ok(host_ws, "team-lead/command-log.txt", "Team Lead command log")
+    _ws_file_ok(host_ws, "team-lead/review-notes.json", "Team Lead review notes")
+
+    step("b2. Verify Jira-derived Python/Flask constraints propagated into the Team Lead plan")
+    plan_payload = _read_json_file(os.path.join(host_ws, "team-lead/plan.json"))
+    if isinstance(plan_payload, dict):
+        constraints = plan_payload.get("tech_stack_constraints") or {}
+        if constraints:
+            ok("Team Lead plan includes structured tech stack constraints")
+        else:
+            fail("Team Lead plan missing tech stack constraints")
+
+        if constraints.get("language") == "python":
+            ok("Team Lead plan captured Python as the required language")
+        else:
+            fail("Team Lead plan did not capture Python as the required language", str(constraints))
+
+        if str(constraints.get("python_version") or "") == "3.12":
+            ok("Team Lead plan captured Python 3.12 from Jira")
+        else:
+            fail("Team Lead plan did not capture Python 3.12", str(constraints))
+
+        if _normalize_text(constraints.get("backend_framework")) == "flask":
+            ok("Team Lead plan captured Flask as the backend framework")
+        else:
+            fail("Team Lead plan did not capture Flask as the backend framework", str(constraints))
+
+        frontend_framework = _normalize_text(constraints.get("frontend_framework"))
+        if frontend_framework in ("", "none"):
+            ok("Team Lead plan did not force an unrelated frontend framework")
+        elif frontend_framework in ("react", "nextjs"):
+            fail(
+                "Team Lead plan still forced a React/Next frontend",
+                str(constraints),
+            )
+        else:
+            warn(f"Team Lead plan captured an unexpected frontend framework: {constraints.get('frontend_framework')!r}")
+
+        acceptance_text = " ".join(plan_payload.get("acceptance_criteria") or []).lower()
+        if "python 3.12" in acceptance_text and "flask" in acceptance_text:
+            ok("Team Lead acceptance criteria reinforce Python 3.12 + Flask")
+        else:
+            fail(
+                "Team Lead acceptance criteria do not reinforce Python 3.12 + Flask",
+                acceptance_text[:240],
+            )
+
+        plan_text = json.dumps(plan_payload, ensure_ascii=False).lower()
+        legacy_markers = [
+            "react router",
+            "src/pages/landingpage.tsx",
+            "pages/index.tsx",
+            "node.js/express backend",
+        ]
+        found_legacy = next((marker for marker in legacy_markers if marker in plan_text), "")
+        if found_legacy:
+            fail(
+                "Team Lead plan still contains React/Next implementation steps",
+                f"legacy marker: {found_legacy}",
+            )
+        else:
+            ok("Team Lead plan no longer contains React/Next-specific implementation steps")
+    else:
+        fail("Team Lead plan JSON unreadable", os.path.join(host_ws, "team-lead/plan.json"))
 
     # ── d. Code/repo ──────────────────────────────────────────────────────
     step("d. Verify cloned repo exists in workspace")
@@ -658,27 +810,116 @@ def test_cstl1_full_workflow():  # noqa: C901
                  f"Expected: {host_ws}/{repo_name}/.git — "
                  "check SCM agent logs for clone errors")
 
+    step("d2. Verify Web Agent received Jira-derived Python/Flask constraints")
+    web_runtime_payload = _read_json_file(os.path.join(host_ws, "web-agent/runtime-config.json"))
+    if isinstance(web_runtime_payload, dict):
+        web_constraints = web_runtime_payload.get("techStackConstraints") or {}
+        if web_constraints:
+            ok("Web Agent runtime config includes tech stack constraints")
+        else:
+            fail("Web Agent runtime config missing tech stack constraints")
+
+        if web_constraints.get("language") == "python":
+            ok("Web Agent received Python as the required language")
+        else:
+            fail("Web Agent did not receive Python as the required language", str(web_constraints))
+
+        if str(web_constraints.get("python_version") or "") == "3.12":
+            ok("Web Agent received Python 3.12 from Team Lead")
+        else:
+            fail("Web Agent did not receive Python 3.12", str(web_constraints))
+
+        if _normalize_text(web_constraints.get("backend_framework")) == "flask":
+            ok("Web Agent received Flask as the backend framework")
+        else:
+            fail("Web Agent did not receive Flask as the backend framework", str(web_constraints))
+
+        web_frontend = _normalize_text(web_constraints.get("frontend_framework"))
+        if web_frontend in ("", "none"):
+            ok("Web Agent was not forced onto an unrelated frontend framework")
+        elif web_frontend in ("react", "nextjs"):
+            fail("Web Agent still received a React/Next frontend constraint", str(web_constraints))
+        else:
+            warn(f"Web Agent received an unexpected frontend framework: {web_constraints.get('frontend_framework')!r}")
+    else:
+        fail("Web Agent runtime config JSON unreadable", os.path.join(host_ws, "web-agent/runtime-config.json"))
+
     _verify_external(j_status_before, j_comments_before, prs_before,
-                     branches_before, host_ws, final_state, tid)
+                     branches_before, host_ws, final_state, tid, j_assignee_before)
 
 
 def _verify_external(j_status_before, j_comments_before, prs_before,
-                     branches_before, host_ws, final_state, tid):
+                     branches_before, host_ws, final_state, tid, j_assignee_before):
     # ── e. Jira state changes ─────────────────────────────────────────────
     step("e. Verify Jira ticket state changed and comments added")
+    jira_action_events: list[dict] = []
+    if host_ws:
+        jira_actions_payload = _read_json_file(os.path.join(host_ws, "web-agent/jira-actions.json"))
+        events = jira_actions_payload.get("events") if isinstance(jira_actions_payload, dict) else None
+        if isinstance(events, list) and events:
+            jira_action_events = [event for event in events if isinstance(event, dict)]
+            ok(f"Web Agent recorded {len(jira_action_events)} Jira action event(s)")
+        else:
+            fail("Web Agent Jira action evidence missing recorded events")
+
+    fetch_event = _latest_completed_jira_event(jira_action_events, "fetch")
+    assign_event = _latest_completed_jira_event(jira_action_events, "assign")
+    transition_event = _latest_completed_jira_event(jira_action_events, "transition")
+    comment_event = _latest_completed_jira_event(jira_action_events, "comment")
+
+    if fetch_event:
+        ok("Web Agent recorded a completed Jira fetch action")
+    else:
+        fail("Web Agent did not record a completed Jira fetch action")
+    if assign_event:
+        ok("Web Agent recorded a completed Jira assign action")
+    else:
+        fail("Web Agent did not record a completed Jira assign action")
+    if transition_event:
+        ok("Web Agent recorded a completed Jira transition action")
+    else:
+        fail("Web Agent did not record a completed Jira transition action")
+    if comment_event:
+        ok("Web Agent recorded a completed Jira comment action")
+    else:
+        fail("Web Agent did not record a completed Jira comment action")
+
     if not JIRA_TOKEN:
         warn("Jira credentials missing -- skipping")
     else:
         j_after = jira_get_issue(JIRA_TICKET_KEY)
         if j_after:
             j_status_after   = j_after.get("fields", {}).get("status", {}).get("name", "")
+            assignee_after = j_after.get("fields", {}).get("assignee") or {}
+            j_assignee_after = assignee_after.get("accountId", "")
             j_comments_after = j_after.get("fields", {}).get("comment", {}).get("total", 0)
-            info(f"Jira after: status={j_status_after!r}, comments={j_comments_after}")
+            info(
+                "Jira after: "
+                f"status={j_status_after!r}, assignee={j_assignee_after or assignee_after.get('displayName', '')!r}, "
+                f"comments={j_comments_after}"
+            )
 
-            if j_status_after != j_status_before:
+            normalized_after = _normalize_text(j_status_after)
+            normalized_before = _normalize_text(j_status_before)
+            transition_target = str((transition_event or {}).get("targetStatus") or "")
+            normalized_target = _normalize_text(transition_target)
+            if normalized_target and normalized_after == normalized_target:
+                ok(f"Jira status matches recorded transition target: {transition_target!r}")
+            elif normalized_after and normalized_after != normalized_before:
                 ok(f"Jira status changed: {j_status_before!r} -> {j_status_after!r}")
             else:
-                warn(f"Jira status unchanged: {j_status_after!r}")
+                fail(f"Jira status unchanged: {j_status_after!r}")
+
+            assigned_account = str((assign_event or {}).get("accountId") or "")
+            if assigned_account and j_assignee_after == assigned_account:
+                ok("Jira assignee matches the recorded assign action")
+            elif j_assignee_after and j_assignee_after != j_assignee_before:
+                ok("Jira assignee changed during the workflow")
+            else:
+                fail(
+                    "Jira assignee did not change to the recorded account",
+                    f"before={j_assignee_before!r}, after={j_assignee_after!r}, expected={assigned_account!r}",
+                )
 
             new_comments = j_comments_after - j_comments_before
             if new_comments > 0:
@@ -697,7 +938,7 @@ def _verify_external(j_status_before, j_comments_before, prs_before,
                         )
                     info(f"Last comment by {author}: {str(body_text)[:200]}")
             else:
-                warn("No new Jira comments added")
+                fail("No new Jira comments added")
 
             expected = {"in progress", "in review", "under review", "done"}
             if j_status_after.lower() in expected:
@@ -718,6 +959,61 @@ def _verify_external(j_status_before, j_comments_before, prs_before,
             warn("No web-agent directory in workspace")
     else:
         warn("No workspace path -- cannot check build/test output")
+
+    if host_ws:
+        _ws_file_ok(host_ws, "web-agent/stage-summary.json", "Web Agent stage summary")
+        _ws_file_ok(host_ws, "web-agent/command-log.txt", "Web Agent command log")
+        _ws_file_ok(host_ws, "web-agent/test-results.json", "Web Agent test results")
+        _ws_file_ok(host_ws, "web-agent/branch-info.json", "Web Agent branch info")
+        _ws_file_ok(host_ws, "web-agent/clone-info.json", "Web Agent clone info")
+        _ws_file_ok(host_ws, "web-agent/jira-actions.json", "Web Agent Jira action evidence")
+        _ws_file_ok(host_ws, "web-agent/pr-evidence.json", "Web Agent PR evidence")
+        _ws_file_ok(host_ws, "team-lead/runtime-config.json", "Team Lead runtime config")
+        _ws_file_ok(host_ws, "web-agent/runtime-config.json", "Web Agent runtime config")
+        _ws_file_ok(host_ws, "compass/command-log.txt", "Compass command log")
+        _ws_file_ok(host_ws, "compass/stage-summary.json", "Compass stage summary")
+        _ws_file_ok(host_ws, "jira/command-log.txt", "Jira Agent command log")
+        _ws_file_ok(host_ws, "jira/stage-summary.json", "Jira Agent stage summary")
+        _ws_file_ok(host_ws, "scm/command-log.txt", "SCM Agent command log")
+        _ws_file_ok(host_ws, "scm/stage-summary.json", "SCM Agent stage summary")
+        _ws_file_ok(host_ws, "ui-design/command-log.txt", "UI Design Agent command log")
+        _ws_file_ok(host_ws, "ui-design/stage-summary.json", "UI Design Agent stage summary")
+        branch_info_path = os.path.join(host_ws, "web-agent/branch-info.json")
+        test_results_path = os.path.join(host_ws, "web-agent/test-results.json")
+        if os.path.isfile(branch_info_path):
+            try:
+                branch_info = json.loads(Path(branch_info_path).read_text(encoding="utf-8"))
+                if branch_info.get("branch"):
+                    ok(f"Branch info recorded local branch: {branch_info['branch']}")
+                else:
+                    fail("Branch info missing branch name", str(branch_info)[:200])
+            except Exception as exc:
+                fail("Could not parse branch-info.json", str(exc))
+        if os.path.isfile(test_results_path):
+            try:
+                test_results = json.loads(Path(test_results_path).read_text(encoding="utf-8"))
+                attempts = test_results.get("attempts") or []
+                if attempts:
+                    ok(f"Web Agent recorded {len(attempts)} build/test attempt(s)")
+                else:
+                    fail("test-results.json has no attempts", str(test_results)[:200])
+            except Exception as exc:
+                fail("Could not parse test-results.json", str(exc))
+
+    # ── f2. Local timezone timestamps ────────────────────────────────────
+    step("f2. Verify workspace timestamps use the configured local timezone")
+    if LOCAL_TIMEZONE:
+        info(f"Expected local timezone: {LOCAL_TIMEZONE}")
+    else:
+        warn("LOCAL_TIMEZONE not configured; only checking for explicit timezone offsets")
+
+    if host_ws:
+        _assert_local_timestamp_field(host_ws, "compass/stage-summary.json", "updatedAt", "Compass stage summary")
+        _assert_local_timestamp_field(host_ws, "jira/stage-summary.json", "updatedAt", "Jira Agent stage summary")
+        _assert_local_timestamp_field(host_ws, "scm/stage-summary.json", "updatedAt", "SCM Agent stage summary")
+        _assert_local_timestamp_field(host_ws, "ui-design/stage-summary.json", "updatedAt", "UI Design Agent stage summary")
+        _assert_local_timestamp_from_events(host_ws, "web-agent/jira-actions.json", "Web Agent Jira action evidence")
+        _assert_local_timestamp_field(host_ws, "web-agent/pr-evidence.json", "ts", "Web Agent PR evidence")
 
     # ── g. Pull Request ───────────────────────────────────────────────────
     step("g. Verify GitHub Pull Request created")
@@ -773,6 +1069,7 @@ def run_all():
     print(f"  Ticket:    {JIRA_TICKET_URL}")
     print(f"  Repo:      {GITHUB_REPO_URL}")
     print(f"  Timeout:   {WORKFLOW_POLL_TIMEOUT}s")
+    print(f"  Local TZ:  {LOCAL_TIMEZONE or '(not configured)'}")
     print(f"  Verbose:   {VERBOSE}")
     print(f"  Time:      {time.strftime('%Y-%m-%d %H:%M:%S')}")
 

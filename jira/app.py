@@ -16,11 +16,14 @@ import time
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-from common.devlog import debug_log, preview_data
+from common.devlog import debug_log, preview_data, record_workspace_stage
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
-from common.llm_client import generate_text
 from common.message_utils import build_text_artifact, extract_text
+from common.rules_loader import build_system_prompt
+from common.runtime.adapter import get_runtime
+from common.time_utils import local_iso_timestamp
+from jira import prompts
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -116,6 +119,27 @@ def _load_skill_guide(limit=2200):
     return text[:limit].rstrip() + "\n...[truncated]"
 
 
+def _run_agentic(
+    prompt: str,
+    actor: str,
+    *,
+    system_prompt: str | None = None,
+    context: dict | None = None,
+    timeout: int = 120,
+    max_tokens: int = 4096,
+) -> str:
+    result = get_runtime().run(
+        prompt=prompt,
+        context=context,
+        system_prompt=system_prompt,
+        timeout=timeout,
+        max_tokens=max_tokens,
+    )
+    for warning in result.get("warnings") or []:
+        print(f"[{AGENT_ID}] Runtime warning ({actor}): {warning}")
+    return result.get("raw_response") or result.get("summary") or ""
+
+
 def _write_workspace_file(workspace_path, relative_name, content):
     if not workspace_path:
         return
@@ -124,6 +148,22 @@ def _write_workspace_file(workspace_path, relative_name, content):
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     with open(target_path, "w", encoding="utf-8") as handle:
         handle.write(content)
+
+
+def _workspace_headers(handler: BaseHTTPRequestHandler) -> tuple[str, str]:
+    workspace_path = (handler.headers.get("X-Shared-Workspace-Path") or "").strip()
+    task_id = (handler.headers.get("X-Orchestrator-Task-Id") or "").strip()
+    return workspace_path, task_id
+
+
+def _record_workspace_phase(workspace_path: str, task_id: str, phase: str, **extra):
+    record_workspace_stage(
+        workspace_path,
+        "jira",
+        phase,
+        task_id=task_id,
+        extra={"agentId": AGENT_ID, **extra},
+    )
 
 
 
@@ -290,6 +330,7 @@ def process_message(message):
     user_text = extract_text(message)
     metadata = message.get("metadata", {})
     workspace_path = (metadata.get("sharedWorkspacePath") or "").strip()
+    task_id = (metadata.get("orchestratorTaskId") or "").strip()
     trusted_ticket_key = (metadata.get("ticketKey") or "").strip()
     browse_url = (
         metadata.get("ticketUrl")
@@ -300,34 +341,36 @@ def process_message(message):
     browse_url = (browse_url or "").strip()
     skill_guide = _load_skill_guide()
     debug_log(AGENT_ID, "jira.message.received", ticketKey=ticket_key, userText=user_text)
+    _record_workspace_phase(workspace_path, task_id, "Received Jira request", ticketKey=ticket_key)
     issue_payload = None
     fetch_status = "missing_explicit_ticket_url"
     if ticket_key:
         issue_payload, fetch_status = PROVIDER.fetch_issue(ticket_key)
+        _record_workspace_phase(
+            workspace_path,
+            task_id,
+            f"Fetched Jira ticket {ticket_key}",
+            ticketKey=ticket_key,
+            fetchStatus=fetch_status,
+        )
 
-    prompt = f"""
-You are the Jira Agent in a Constellation multi-agent software delivery system.
-Summarize the Jira request for downstream engineering agents.
+    prompt = prompts.SUMMARY_TEMPLATE.format(
+        skill_guide=skill_guide or "No local skill guide loaded.",
+        user_text=user_text,
+        ticket_key=ticket_key or "none",
+        browse_url=browse_url or "n/a",
+        fetch_status=fetch_status,
+        issue_payload=(
+            json.dumps(issue_payload, ensure_ascii=False, indent=2)
+            if issue_payload else "No issue payload fetched."
+        ),
+    )
 
-Operational skill guide:
-{skill_guide or 'No local skill guide loaded.'}
-
-User request:
-{user_text}
-
-Detected ticket key: {ticket_key or 'none'}
-Ticket browse URL: {browse_url or 'n/a'}
-Fetch status: {fetch_status}
-Issue payload:
-{json.dumps(issue_payload, ensure_ascii=False, indent=2) if issue_payload else 'No issue payload fetched.'}
-
-Return a concise operator-facing summary with these sections:
-1. Ticket
-2. What matters
-3. Recommended next engineering step
-""".strip()
-
-    summary = generate_text(prompt, "Jira Agent")
+    summary = _run_agentic(
+        prompt,
+        "Jira Agent",
+        system_prompt=build_system_prompt(prompts.SUMMARY_SYSTEM, "jira"),
+    )
     if not ticket_key:
         summary = (
             "No explicit Jira browse URL was found in the request. "
@@ -388,6 +431,14 @@ Return a concise operator-facing summary with these sections:
                 )
 
     status_text = f"Jira analysis completed for {ticket_key or 'request without ticket key'}."
+    _record_workspace_phase(
+        workspace_path,
+        task_id,
+        "Completed Jira request",
+        ticketKey=ticket_key,
+        fetchStatus=fetch_status,
+        updatedAt=local_iso_timestamp(),
+    )
     debug_log(
         AGENT_ID, "jira.message.completed",
         ticketKey=ticket_key, fetchStatus=fetch_status, browseUrl=browse_url,
@@ -458,6 +509,8 @@ class JiraHandler(BaseHTTPRequestHandler):
         # GET /jira/myself
         if path == "/jira/myself":
             user, result = PROVIDER.get_myself()
+            workspace_path, task_id = _workspace_headers(self)
+            _record_workspace_phase(workspace_path, task_id, "Resolved Jira current user", result=result)
             self._send_json(
                 200 if result == "ok" else 502,
                 {"result": result, "user": user},
@@ -525,10 +578,18 @@ class JiraHandler(BaseHTTPRequestHandler):
             key = m.group(1)
             body = self._read_body()
             name = body.get("transition", "")
+            workspace_path, task_id = _workspace_headers(self)
             if not name:
                 self._send_json(400, {"error": "missing transition name"})
                 return
             tid, result = PROVIDER.transition_issue(key, name)
+            _record_workspace_phase(
+                workspace_path,
+                task_id,
+                f"Transitioned Jira ticket {key} to {name}",
+                ticketKey=key,
+                result=result,
+            )
             self._send_json(
                 200 if tid else 422,
                 {"ticketKey": key, "transitionId": tid, "result": result},
@@ -542,10 +603,19 @@ class JiraHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             adf = body.get("adf")
             text = body.get("text", "")
+            workspace_path, task_id = _workspace_headers(self)
             if not adf and not text:
                 self._send_json(400, {"error": "missing comment text or adf"})
                 return
             cid, result = PROVIDER.add_comment(key, text, adf_body=adf)
+            _record_workspace_phase(
+                workspace_path,
+                task_id,
+                f"Added Jira comment to {key}",
+                ticketKey=key,
+                commentId=cid,
+                result=result,
+            )
             self._send_json(
                 201 if cid else 502,
                 {"ticketKey": key, "commentId": cid, "result": result},
@@ -617,11 +687,20 @@ class JiraHandler(BaseHTTPRequestHandler):
         if m:
             key = m.group(1)
             body = self._read_body()
+            workspace_path, task_id = _workspace_headers(self)
             if "accountId" not in body:
                 self._send_json(400, {"error": "missing accountId"})
                 return
             account_id = body.get("accountId")
             aid, result = PROVIDER.change_assignee(key, account_id)
+            _record_workspace_phase(
+                workspace_path,
+                task_id,
+                f"Assigned Jira ticket {key}",
+                ticketKey=key,
+                accountId=aid,
+                result=result,
+            )
             self._send_json(
                 200 if result == "assigned" else 502,
                 {"ticketKey": key, "accountId": aid, "result": result},

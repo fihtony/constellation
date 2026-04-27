@@ -1,45 +1,7 @@
-"""Agentic runtime adapter — unified interface for LLM/CLI backends.
+"""Unified agentic runtime contract and backend factory.
 
-All agents that need agentic reasoning MUST use this adapter instead of
-calling llm_client.py directly.  The backend is selected via the
-AGENT_RUNTIME environment variable.
-
-Supported backends
-------------------
-copilot-connect (default)
-    The production backend.  Delegates to ``common/llm_client.py`` which
-    itself has a three-tier fallback chain:
-
-      1. ``MOCK_LLM=1`` env var → deterministic mock (fastest, no network)
-      2. GitHub Copilot CLI binary (when ``COPILOT_GITHUB_TOKEN`` is set
-         *and* the ``copilot`` binary is present in the container image)
-      3. OpenAI-compatible REST API at ``OPENAI_BASE_URL``
-
-    The name "copilot-connect" refers to the *agent runtime layer*, not
-    the Copilot CLI specifically.  Even when the CLI is unavailable, the
-    backend falls through to the OpenAI API automatically.
-
-mock
-    Returns deterministic fixed responses.  Use in unit tests only.
-
-Model priority (highest to lowest)
------------------------------------
-1. ``model`` parameter on ``adapter.run(...)``
-2. ``AGENT_MODEL`` environment variable
-3. Backend default (``OPENAI_MODEL`` / ``gpt-5-mini``)
-
-Output contract
----------------
-Every backend returns a dict with these keys::
-
-    {
-        "summary":           str,   # human-readable summary of what was done
-        "structured_output": dict,  # parsed JSON output from the model
-        "artifacts":         list,  # file artifacts produced [{path, type}]
-        "warnings":          list,  # non-fatal issues encountered
-        "next_actions":      list,  # suggested follow-up actions
-        "raw_response":      str,   # raw text from the model (debug)
-    }
+All agents that need agentic reasoning should call ``get_runtime().run(...)``
+instead of invoking a raw LLM or CLI command directly.
 """
 
 from __future__ import annotations
@@ -47,15 +9,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from abc import ABC, abstractmethod
 
+from common.env_utils import env_flag
 
-# ---------------------------------------------------------------------------
-# Abstract base
-# ---------------------------------------------------------------------------
 
 class AgentRuntimeAdapter(ABC):
-    """Abstract base class for all runtime backends."""
+    """Abstract base class for runtime backends."""
 
     @abstractmethod
     def run(
@@ -67,39 +28,37 @@ class AgentRuntimeAdapter(ABC):
         timeout: int = 120,
         max_tokens: int = 4096,
     ) -> dict:
-        """Execute a prompt and return a structured result.
-
-        Parameters
-        ----------
-        prompt:
-            The user-facing instruction / task description.
-        context:
-            Optional dict with additional context (injected into system prompt).
-        system_prompt:
-            Explicit system prompt.  When omitted, a sensible default is used.
-        model:
-            Override the default model for this call only.
-        timeout:
-            Maximum seconds to wait for a response.
-        max_tokens:
-            Maximum tokens in the response.
-
-        Returns
-        -------
-        dict
-            ``{summary, structured_output, artifacts, warnings, next_actions, raw_response}``
-        """
+        """Execute a prompt and return the standard runtime result contract."""
         raise NotImplementedError
 
-    # ------------------------------------------------------------------
-    # Shared helpers
-    # ------------------------------------------------------------------
+    @staticmethod
+    def resolve_model(*candidates: str | None, fallback: str) -> str:
+        for candidate in candidates:
+            if candidate and str(candidate).strip():
+                return str(candidate).strip()
+        return fallback
 
     @staticmethod
-    def _parse_structured_output(text: str) -> dict:
-        """Try to extract a JSON object from the model response."""
+    def build_prompt(
+        prompt: str,
+        *,
+        system_prompt: str | None = None,
+        context: dict | None = None,
+    ) -> str:
+        parts: list[str] = []
+        if system_prompt:
+            parts.append(system_prompt.strip())
+        if context:
+            parts.append("Context:\n" + json.dumps(context, ensure_ascii=False, indent=2))
+        if prompt and prompt.strip():
+            parts.append(prompt.strip())
+        return "\n\n".join(part for part in parts if part)
+
+    @staticmethod
+    def parse_structured_output(text: str) -> dict:
         text = (text or "").strip()
-        # Strip markdown fences
+        if not text:
+            return {}
         if text.startswith("```"):
             lines = text.splitlines()
             start = 1
@@ -108,178 +67,194 @@ class AgentRuntimeAdapter(ABC):
                 end -= 1
             text = "\n".join(lines[start:end]).strip()
         try:
-            return json.loads(text)
+            loaded = json.loads(text)
+            return loaded if isinstance(loaded, dict) else {}
         except json.JSONDecodeError:
             pass
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
             try:
-                return json.loads(m.group())
+                loaded = json.loads(match.group())
+                return loaded if isinstance(loaded, dict) else {}
             except json.JSONDecodeError:
                 pass
         return {}
 
-    @staticmethod
-    def _build_result(raw: str, structured: dict | None = None) -> dict:
-        """Build the standard result dict."""
-        if structured is None:
-            structured = AgentRuntimeAdapter._parse_structured_output(raw)
-        return {
-            "summary": structured.get("summary") or raw[:500],
+    @classmethod
+    def build_result(
+        cls,
+        raw: str,
+        *,
+        structured: dict | None = None,
+        warnings: list[str] | None = None,
+        backend_used: str | None = None,
+    ) -> dict:
+        structured = structured if structured is not None else cls.parse_structured_output(raw)
+        result = {
+            "summary": structured.get("summary") or (raw or "")[:500],
             "structured_output": structured,
             "artifacts": structured.get("artifacts") or [],
-            "warnings": structured.get("warnings") or [],
+            "warnings": list(structured.get("warnings") or []),
             "next_actions": structured.get("next_actions") or [],
-            "raw_response": raw,
+            "raw_response": raw or "",
         }
+        if warnings:
+            result["warnings"].extend(warnings)
+        if backend_used:
+            result["backend_used"] = backend_used
+        return result
 
-
-# ---------------------------------------------------------------------------
-# CopilotConnect backend (default)
-# ---------------------------------------------------------------------------
-
-class CopilotConnectAdapter(AgentRuntimeAdapter):
-    """Calls an OpenAI-compatible API endpoint via ``common/llm_client.py``.
-
-    This is the default production backend when running with Copilot Connect
-    (localhost:1288/v1) or any compatible proxy.  It is also the fallback when
-    the Copilot CLI is not available.
-    """
-
-    DEFAULT_SYSTEM = (
-        "You are an expert software engineering agent. "
-        "When asked to produce structured data, always respond with valid JSON. "
-        "Be concise and precise."
-    )
-
-    def run(
-        self,
-        prompt: str,
-        context: dict | None = None,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        timeout: int = 120,
-        max_tokens: int = 4096,
+    @classmethod
+    def build_failure_result(
+        cls,
+        message: str,
+        *,
+        warning: str | None = None,
+        backend_used: str | None = None,
     ) -> dict:
-        from common.llm_client import generate_text  # late import to avoid circular
-
-        effective_model = (
-            model
-            or os.environ.get("AGENT_MODEL")
-            or os.environ.get("OPENAI_MODEL")
-            or "gpt-5-mini"
+        warnings = [warning] if warning else []
+        return cls.build_result(
+            "",
+            structured={
+                "summary": message,
+                "artifacts": [],
+                "warnings": warnings,
+                "next_actions": [],
+            },
+            warnings=warnings,
+            backend_used=backend_used,
         )
-        effective_system = system_prompt or self.DEFAULT_SYSTEM
-
-        if context:
-            ctx_str = json.dumps(context, ensure_ascii=False, indent=2)
-            effective_system = f"{effective_system}\n\nContext:\n{ctx_str}"
-
-        try:
-            raw = generate_text(
-                prompt,
-                actor="[runtime:copilot-connect]",
-                system_prompt=effective_system,
-                model=effective_model,
-                max_tokens=max_tokens,
-            )
-        except Exception as exc:
-            return self._build_result(
-                "",
-                {
-                    "summary": f"LLM call failed: {exc}",
-                    "warnings": [str(exc)],
-                    "structured_output": {},
-                    "artifacts": [],
-                    "next_actions": [],
-                },
-            )
-
-        return self._build_result(raw)
 
 
-# ---------------------------------------------------------------------------
-# Mock backend (tests only)
-# ---------------------------------------------------------------------------
-
-class MockAdapter(AgentRuntimeAdapter):
-    """Returns a deterministic mock response for unit tests.
-
-    Set MOCK_RUNTIME_RESPONSE env var to override the default response JSON.
-    """
-
-    DEFAULT_RESPONSE = json.dumps({
-        "summary": "Mock response: task acknowledged.",
-        "structured_output": {},
-        "artifacts": [],
-        "warnings": [],
-        "next_actions": [],
-    })
-
-    def run(
-        self,
-        prompt: str,
-        context: dict | None = None,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        timeout: int = 120,
-        max_tokens: int = 4096,
-    ) -> dict:
-        raw = os.environ.get("MOCK_RUNTIME_RESPONSE", self.DEFAULT_RESPONSE)
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            data = {"summary": raw}
-        return self._build_result(raw, data)
-
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
-
-_BACKENDS: dict[str, type[AgentRuntimeAdapter]] = {
-    "copilot-connect": CopilotConnectAdapter,
-    "mock": MockAdapter,
+_ALIASES = {
+    "copilot": "copilot-cli",
+    "copilot-cli": "copilot-cli",
+    "copilot-connect": "copilot-connect",
+    "claude": "claude-code",
+    "claude-code": "claude-code",
+    "mock": "mock",
 }
 
-# Cached instances per backend name
 _INSTANCES: dict[str, AgentRuntimeAdapter] = {}
+
+
+def resolve_backend_name(backend: str | None = None) -> tuple[str, str]:
+    requested = (backend or os.environ.get("AGENT_RUNTIME") or "copilot-connect").strip().lower()
+    return requested, _ALIASES.get(requested, "copilot-connect")
+
+
+def summarize_runtime_configuration(backend: str | None = None) -> dict:
+    requested, effective = resolve_backend_name(backend)
+    summary = {
+        "requestedBackend": requested,
+        "effectiveBackend": effective,
+        "allowMockFallback": env_flag("ALLOW_MOCK_FALLBACK", default=True),
+    }
+
+    if effective == "copilot-cli":
+        binary = os.environ.get("COPILOT_CLI_BIN", "copilot").strip() or "copilot"
+        summary.update(
+            {
+                "binary": binary,
+                "binaryAvailable": shutil.which(binary) is not None,
+                "tokenConfigured": any(
+                    os.environ.get(name, "").strip()
+                    for name in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+                ),
+                "tokenSources": {
+                    "COPILOT_GITHUB_TOKEN": bool(os.environ.get("COPILOT_GITHUB_TOKEN", "").strip()),
+                    "GH_TOKEN": bool(os.environ.get("GH_TOKEN", "").strip()),
+                    "GITHUB_TOKEN": bool(os.environ.get("GITHUB_TOKEN", "").strip()),
+                },
+                "model": AgentRuntimeAdapter.resolve_model(
+                    os.environ.get("AGENT_MODEL"),
+                    os.environ.get("COPILOT_MODEL"),
+                    os.environ.get("OPENAI_MODEL"),
+                    fallback="gpt-5-mini",
+                ),
+            }
+        )
+    elif effective == "claude-code":
+        binary = os.environ.get("CLAUDE_CODE_BIN", "claude").strip() or "claude"
+        summary.update(
+            {
+                "binary": binary,
+                "binaryAvailable": shutil.which(binary) is not None,
+                "model": AgentRuntimeAdapter.resolve_model(
+                    os.environ.get("AGENT_MODEL"),
+                    os.environ.get("CLAUDE_CODE_MODEL"),
+                    fallback="claude-haiku-4-5",
+                ),
+            }
+        )
+    elif effective == "copilot-connect":
+        summary.update(
+            {
+                "baseUrlConfigured": bool(os.environ.get("OPENAI_BASE_URL", "").strip()),
+                "apiKeyConfigured": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
+                "model": AgentRuntimeAdapter.resolve_model(
+                    os.environ.get("AGENT_MODEL"),
+                    os.environ.get("OPENAI_MODEL"),
+                    fallback="gpt-5-mini",
+                ),
+            }
+        )
+    elif effective == "mock":
+        summary.update(
+            {
+                "model": AgentRuntimeAdapter.resolve_model(
+                    os.environ.get("AGENT_MODEL"),
+                    fallback="mock",
+                ),
+                "customResponseConfigured": bool(os.environ.get("MOCK_RUNTIME_RESPONSE", "").strip()),
+            }
+        )
+
+    return summary
+
+
+def _load_backend_class(backend: str) -> type[AgentRuntimeAdapter]:
+    if backend == "copilot-cli":
+        from common.runtime.copilot_cli import CopilotCliAdapter
+
+        return CopilotCliAdapter
+    if backend == "claude-code":
+        from common.runtime.claude_code import ClaudeCodeAdapter
+
+        return ClaudeCodeAdapter
+    if backend == "copilot-connect":
+        from common.runtime.copilot_connect import CopilotConnectAdapter
+
+        return CopilotConnectAdapter
+    if backend == "mock":
+        from common.runtime.mock import MockAdapter
+
+        return MockAdapter
+    raise KeyError(backend)
 
 
 def get_runtime(
     backend: str | None = None,
     model: str | None = None,
 ) -> AgentRuntimeAdapter:
-    """Return a runtime adapter instance.
+    """Return a cached runtime adapter instance.
 
-    Parameters
-    ----------
-    backend:
-        Backend name.  If omitted, reads ``AGENT_RUNTIME`` env var, then falls
-        back to ``"copilot-connect"``.
-    model:
-        Default model override.  Sets ``AGENT_MODEL`` env var for this process.
-
-    Returns
-    -------
-    AgentRuntimeAdapter
+    Backend resolution priority:
+    1. explicit ``backend`` argument
+    2. ``AGENT_RUNTIME`` environment variable
+    3. default ``copilot-connect``
     """
-    effective_backend = (
-        backend
-        or os.environ.get("AGENT_RUNTIME", "copilot-connect")
-    ).lower()
+    requested, effective_backend = resolve_backend_name(backend)
+
+    if requested not in _ALIASES:
+        print(
+            f"[runtime] Unknown backend '{requested}', falling back to '{effective_backend}'."
+        )
 
     if model:
         os.environ["AGENT_MODEL"] = model
 
-    if effective_backend not in _BACKENDS:
-        print(
-            f"[runtime] Unknown backend '{effective_backend}', "
-            f"falling back to 'copilot-connect'."
-        )
-        effective_backend = "copilot-connect"
-
     if effective_backend not in _INSTANCES:
-        _INSTANCES[effective_backend] = _BACKENDS[effective_backend]()
-
+        backend_class = _load_backend_class(effective_backend)
+        _INSTANCES[effective_backend] = backend_class()
     return _INSTANCES[effective_backend]

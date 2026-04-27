@@ -15,17 +15,20 @@ import subprocess
 import tempfile
 import threading
 import time
+import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-from common.devlog import debug_log
+from common.devlog import debug_log, record_workspace_stage
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
-from common.llm_client import generate_text
 from common.message_utils import build_text_artifact, extract_text
+from common.rules_loader import build_system_prompt, load_rules
+from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from scm import prompts
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -59,6 +62,27 @@ _GIT_AUTHOR_EMAIL = (
 CLONE_TIMEOUT_SECONDS = int(os.environ.get("CLONE_TIMEOUT_SECONDS", "600"))
 _REPO_TREE_MAX_FILES = int(os.environ.get("REPO_TREE_MAX_FILES", "500"))
 _REPO_FILE_MAX_BYTES = int(os.environ.get("REPO_FILE_MAX_BYTES", str(512 * 1024)))
+
+
+def _run_agentic(
+    prompt: str,
+    actor: str,
+    *,
+    system_prompt: str | None = None,
+    context: dict | None = None,
+    timeout: int = 120,
+    max_tokens: int = 4096,
+) -> str:
+    result = get_runtime().run(
+        prompt=prompt,
+        context=context,
+        system_prompt=system_prompt,
+        timeout=timeout,
+        max_tokens=max_tokens,
+    )
+    for warning in result.get("warnings") or []:
+        print(f"[{AGENT_ID}] Runtime warning ({actor}): {warning}")
+    return result.get("raw_response") or result.get("summary") or ""
 
 # Back-end selector (only applies when SCM_PROVIDER=github): "rest" (default) | "mcp"
 _SCM_BACKEND = os.environ.get("SCM_BACKEND", "rest").strip().lower()
@@ -251,20 +275,40 @@ def _read_skill_guide(limit: int = 2200) -> str:
 # Git clone to shared workspace (async)
 # ---------------------------------------------------------------------------
 
+def _resolve_clone_auth(owner: str, repo: str, clone_url: str) -> tuple[str, list[str]]:
+    git_config: list[str] = []
+    token = _SCM_TOKEN
+    if token and "github.com/" in clone_url:
+        clone_url = re.sub(r"https://[^@/]+@github\.com/", "https://github.com/", clone_url)
+        basic_auth = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+        git_config.extend(["-c", f"http.extraHeader=AUTHORIZATION: basic {basic_auth}"])
+        token = ""
+    if token and "x-access-token:" not in clone_url:
+        git_config.extend(["-c", f"http.extraHeader=Authorization: Bearer {token}"])
+    if _CORP_CA_BUNDLE and os.path.isfile(_CORP_CA_BUNDLE):
+        git_config.extend(["-c", f"http.sslCAInfo={_CORP_CA_BUNDLE}"])
+    return clone_url, git_config
+
+
+def _runtime_config_summary() -> dict:
+    return {
+        "runtime": summarize_runtime_configuration(),
+        "rulesLoaded": bool(load_rules("scm")),
+        "workflowRulesLoaded": bool(load_rules("scm", include_workflow=True)),
+        "provider": _provider.provider_name,
+        "backend": _SCM_BACKEND,
+    }
+
+
 def _clone_to_workspace(
     owner: str, repo: str, branch: str, target_path: str
 ) -> tuple[str | None, str]:
     clone_url = _provider.get_clone_url(owner, repo)
     clone_dir = os.path.join(target_path, repo)
     os.makedirs(target_path, exist_ok=True)
-    git_config = []
-    token = _SCM_TOKEN
-    if token:
-        git_config.extend(["-c", f"http.extraHeader=Authorization: Bearer {token}"])
-    if _CORP_CA_BUNDLE and os.path.isfile(_CORP_CA_BUNDLE):
-        git_config.extend(["-c", f"http.sslCAInfo={_CORP_CA_BUNDLE}"])
+    clone_url, git_config = _resolve_clone_auth(owner, repo, clone_url)
 
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
 
     if os.path.isdir(os.path.join(clone_dir, ".git")):
         r = subprocess.run(
@@ -343,6 +387,13 @@ def _clone_async_worker(task_id: str, owner: str, repo: str, branch: str, target
     try:
         _update_task(task_id, state="TASK_STATE_WORKING",
                      message=f"Cloning {owner}/{repo} branch={branch} …")
+        record_workspace_stage(
+            target_path,
+            "scm",
+            f"Cloning {owner}/{repo} ({branch})",
+            task_id=task_id,
+            extra={"owner": owner, "repo": repo, "branch": branch, **_runtime_config_summary()},
+        )
         clone_dir, result = _clone_to_workspace(owner, repo, branch, target_path)
         if clone_dir:
             clone_artifact = {
@@ -355,14 +406,35 @@ def _clone_async_worker(task_id: str, owner: str, repo: str, branch: str, target
                          message=f"Cloned {owner}/{repo} → {clone_dir} ({result})",
                          artifacts=[clone_artifact],
                          extra={"clonePath": clone_dir, "result": result})
+            record_workspace_stage(
+                target_path,
+                "scm",
+                f"Completed scm.git.clone for {owner}/{repo}",
+                task_id=task_id,
+                extra={"clonePath": clone_dir, "result": result, **_runtime_config_summary()},
+            )
             _fire_clone_callback(callback_url, task_id, "TASK_STATE_COMPLETED", clone_dir, "")
         else:
             _update_task(task_id, state="TASK_STATE_FAILED",
                          message=f"Clone failed: {result}",
                          extra={"clonePath": "", "result": result})
+            record_workspace_stage(
+                target_path,
+                "scm",
+                f"Failed scm.git.clone for {owner}/{repo}",
+                task_id=task_id,
+                extra={"clonePath": "", "result": result, **_runtime_config_summary()},
+            )
             _fire_clone_callback(callback_url, task_id, "TASK_STATE_FAILED", "", result)
     except Exception as exc:
         _update_task(task_id, state="TASK_STATE_FAILED", message=str(exc))
+        record_workspace_stage(
+            target_path,
+            "scm",
+            f"Failed scm.git.clone for {owner}/{repo}",
+            task_id=task_id,
+            extra={"error": str(exc), **_runtime_config_summary()},
+        )
         _fire_clone_callback(callback_url, task_id, "TASK_STATE_FAILED", "", str(exc))
 
 
@@ -633,9 +705,14 @@ def _handle_git_push(text: str, message: dict) -> tuple[str, list]:
 def _handle_llm_dispatch(text: str, message: dict, system_prompt: str) -> tuple[str, list]:
     """Use LLM to understand intent and call the appropriate provider method."""
     try:
-        llm_response = generate_text(
-            system=system_prompt,
-            prompt=text,
+        llm_response = _run_agentic(
+            prompts.DISPATCH_TEMPLATE.format(
+                provider_name=_provider.provider_name,
+                user_text=text,
+                metadata=json.dumps(message.get("metadata") or {}, ensure_ascii=False, indent=2),
+            ),
+            AGENT_ID,
+            system_prompt=(build_system_prompt(prompts.DISPATCH_SYSTEM, "scm") + "\n\n" + (system_prompt or "")).strip(),
             max_tokens=1024,
         )
     except Exception as exc:
@@ -654,11 +731,21 @@ def _handle_llm_dispatch(text: str, message: dict, system_prompt: str) -> tuple[
 # ---------------------------------------------------------------------------
 
 def _run_task_async(task_id: str, message: dict):
+    metadata = message.get("metadata") or {}
+    workspace_path = metadata.get("sharedWorkspacePath") or ""
+    capability = metadata.get("requestedCapability", "")
     try:
         _update_task(task_id, state="TASK_STATE_WORKING",
                      message="SCM agent is processing the task.")
+        if workspace_path:
+            record_workspace_stage(
+                workspace_path,
+                "scm",
+                f"Started {capability or 'scm request'}",
+                task_id=task_id,
+                extra=_runtime_config_summary(),
+            )
         # Special handling for async clone
-        capability = (message.get("metadata") or {}).get("requestedCapability", "")
         if capability == "scm.git.clone":
             _dispatch_clone(task_id, message)
             return
@@ -666,11 +753,27 @@ def _run_task_async(task_id: str, message: dict):
         status_text, artifacts = process_message(message)
         _update_task(task_id, state="TASK_STATE_COMPLETED",
                      message=status_text, artifacts=artifacts)
+        if workspace_path:
+            record_workspace_stage(
+                workspace_path,
+                "scm",
+                f"Completed {capability or 'scm request'}",
+                task_id=task_id,
+                extra={"statusText": status_text, **_runtime_config_summary()},
+            )
         _notify_completion(message, task_id, "TASK_STATE_COMPLETED", status_text, artifacts)
     except Exception as error:
         print(f"[{AGENT_ID}] Task {task_id} failed: {error}")
         failure_text = f"SCM agent failed: {error}"
         _update_task(task_id, state="TASK_STATE_FAILED", message=failure_text, artifacts=[])
+        if workspace_path:
+            record_workspace_stage(
+                workspace_path,
+                "scm",
+                f"Failed {capability or 'scm request'}",
+                task_id=task_id,
+                extra={"error": str(error), **_runtime_config_summary()},
+            )
         _notify_completion(message, task_id, "TASK_STATE_FAILED", failure_text, [])
 
 
@@ -686,6 +789,14 @@ def _dispatch_clone(task_id: str, message: dict):
     if not owner or not repo:
         _update_task(task_id, state="TASK_STATE_FAILED",
                      message="Could not parse owner/repo for clone.")
+        if metadata.get("sharedWorkspacePath"):
+            record_workspace_stage(
+                metadata.get("sharedWorkspacePath"),
+                "scm",
+                "Failed scm.git.clone",
+                task_id=task_id,
+                extra={"error": "Could not parse owner/repo for clone.", **_runtime_config_summary()},
+            )
         return
     # Run the actual clone in a background thread
     t = threading.Thread(

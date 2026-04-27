@@ -37,7 +37,7 @@ working together to complete complex engineering tasks.
 | **SCM Agent** | `scm/` | Integrates with Git SCM (Bitbucket/GitHub). Repo inspection, branch, PR operations. Runs on port 8020. |
 | **Android Agent** | `android/` | On-demand execution agent. Launched per-task by Team Lead via Docker socket. |
 | **UI Design Agent** | `ui-design/` | Design context agent. Fetches design data from Figma (REST API) and Google Stitch (MCP). Runs on port 8040. |
-| **Common Library** | `common/` | Shared modules: registry client, launcher, LLM client, artifact store, task store, etc. |
+| **Common Library** | `common/` | Shared modules: registry client, launcher, runtime adapters, rules loader, artifact store, task store, etc. |
 
 ### MCP Tool Integrations (replacing standalone agents)
 
@@ -459,23 +459,23 @@ artifacts = [
 
 ### 12. LLM Usage
 
-Use `common/llm_client.py` for all LLM calls. It handles:
-- OpenAI-compatible API
-- Mock fallback when no LLM is configured (`ALLOW_MOCK_FALLBACK=1`)
-- Proper timeout and error handling
+Use `common/runtime/adapter.py` for all agentic LLM/CLI calls. It handles:
+- `copilot-cli` as the primary production backend
+- `claude-code` as an optional compatible backend
+- `copilot-connect` as the OpenAI-compatible fallback / local integration backend
+- Mock fallback when no real backend is available (`ALLOW_MOCK_FALLBACK=1`)
+- Proper timeout and structured result handling
 
 ```python
-from common.llm_client import LLMClient
+from common.runtime.adapter import get_runtime
 
-llm = LLMClient()
-
-response = llm.chat(
-    messages=[
-        {"role": "system", "content": "You are a helpful agent."},
-        {"role": "user", "content": user_text},
-    ],
-    max_tokens=2048,
+runtime = get_runtime()
+result = runtime.run(
+  prompt=user_text,
+  system_prompt="You are a helpful agent.",
+  max_tokens=2048,
 )
+response_text = result["raw_response"] or result["summary"]
 ```
 
 ### 13. Environment Variables (Required in .env.example)
@@ -673,12 +673,22 @@ Before submitting a new agent, verify:
 |---------|------|
 | **Team Lead Agent** | `team-lead/` | Intelligence layer: analysis, planning, dispatch, review | port 8030 |
 | Team Lead prompts | `team-lead/prompts.py` | ALL LLM prompt strings for Team Lead |
+| Jira prompts | `jira/prompts.py` | ALL LLM prompt strings for Jira Agent |
+| SCM prompts | `scm/prompts.py` | ALL LLM prompt strings for SCM Agent |
+| UI Design prompts | `ui-design/prompts.py` | ALL LLM prompt strings for UI Design Agent |
 | UI Design Agent | `ui-design/` | Figma REST API + Google Stitch MCP | port 8040 |
 | UI Design client (Figma) | `ui-design/figma_client.py` | Agent-local, NOT in `common/` |
 | UI Design client (Stitch) | `ui-design/stitch_client.py` | Agent-local, NOT in `common/` |
 | Compass Agent (control plane) | `compass/app.py` |
+| Runtime adapter factory | `common/runtime/adapter.py` | Unified runtime contract + backend factory |
+| Shared runtime env template | `common/.env.example` | Shared default runtime/timezone config loaded before agent-local `.env` |
+| Local time helpers | `common/time_utils.py` | Shared local timestamp helpers for workspace and audit logs |
+| Workspace/debug log helpers | `common/devlog.py` | Shared debug log + workspace stage logging helpers |
+| Copilot CLI backend | `common/runtime/copilot_cli.py` | Primary agentic CLI backend |
+| Claude Code backend | `common/runtime/claude_code.py` | Optional compatible backend |
+| Copilot Connect backend | `common/runtime/copilot_connect.py` | OpenAI-compatible backend / fallback |
 | Capability Registry | `registry/app.py` |
-| Shared LLM client | `common/llm_client.py` |
+| Shared low-level LLM client | `common/llm_client.py` | Legacy OpenAI-compatible helper used by runtime internals |
 | Shared Registry client | `common/registry_client.py` |
 | Task state machine | `common/task_store.py` |
 | Artifact storage | `common/artifact_store.py` |
@@ -687,3 +697,10 @@ Before submitting a new agent, verify:
 | A2A message helpers | `common/message_utils.py` |
 | Registry bootstrap | `scripts/init_register.py` |
 | E2E tests | `tests/test_e2e.py` |
+
+## Shared Runtime Notes
+
+- LLM-enabled agents (`team-lead`, `web`, `jira`, `scm`, `ui-design`) should load shared defaults from `common/.env` first, then apply their local `.env` overrides.
+- `compass` and `registry` remain non-agentic control-plane services; do not add runtime-adapter reasoning loops there unless the architecture changes.
+- Task workspaces should keep `command-log.txt`, `stage-summary.json`, and when relevant `runtime-config.json` under each agent subdirectory for auditability.
+- Use `LOCAL_TIMEZONE` (preferred) or `TZ` to keep workspace timestamps aligned with the operator's local time.

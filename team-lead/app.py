@@ -27,11 +27,12 @@ from urllib.request import Request, urlopen
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.launcher import Launcher
-from common.llm_client import generate_text
 from common.message_utils import artifact_text, build_text_artifact, extract_text
 from common.registry_client import RegistryClient
-from common.rules_loader import build_system_prompt
+from common.rules_loader import build_system_prompt, load_rules
+from common.runtime.adapter import get_runtime, summarize_runtime_configuration
 from common.task_store import TaskStore
+from common.time_utils import local_clock_time, local_iso_timestamp
 from team_lead import prompts
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -146,13 +147,98 @@ def _save_workspace_file(workspace_path: str, relative_name: str, content: str) 
         print(f"[{AGENT_ID}] Warning: could not save workspace file {relative_name}: {exc}")
 
 
+def _append_workspace_file(workspace_path: str, relative_name: str, content: str) -> None:
+    """Append content to a file inside the shared workspace (best-effort)."""
+    if not workspace_path:
+        return
+    try:
+        full_path = os.path.join(workspace_path, relative_name)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "a", encoding="utf-8") as fh:
+            fh.write(content)
+    except OSError as exc:
+        print(f"[{AGENT_ID}] Warning: could not append workspace file {relative_name}: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
 def audit_log(event: str, **kwargs):
-    entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": event, **kwargs}
+    entry = {"ts": local_iso_timestamp(), "event": event, **kwargs}
     print(f"[audit] {json.dumps(entry, ensure_ascii=False)}")
+
+
+def _extract_tech_stack_constraints(*texts: str) -> dict:
+    combined = "\n".join(text for text in texts if text)
+    lower = combined.lower()
+    constraints: dict[str, str] = {}
+
+    python_version = re.search(r"python\s*(3(?:\.\d+)*)", lower)
+    if python_version:
+        constraints["language"] = "python"
+        constraints["python_version"] = python_version.group(1)
+    elif "python" in lower:
+        constraints["language"] = "python"
+
+    if "flask" in lower:
+        constraints["backend_framework"] = "flask"
+    elif "fastapi" in lower:
+        constraints["backend_framework"] = "fastapi"
+    elif "django" in lower:
+        constraints["backend_framework"] = "django"
+    elif "express" in lower:
+        constraints["backend_framework"] = "express"
+    elif "nestjs" in lower or "nest.js" in lower:
+        constraints["backend_framework"] = "nestjs"
+
+    if "next.js" in lower or "nextjs" in lower:
+        constraints["frontend_framework"] = "nextjs"
+    elif "react" in lower:
+        constraints["frontend_framework"] = "react"
+    elif "vue" in lower:
+        constraints["frontend_framework"] = "vue"
+
+    return constraints
+
+
+def _render_tech_stack_constraints(constraints: dict | None) -> str:
+    if not constraints:
+        return "None detected."
+    lines = []
+    if constraints.get("language") == "python":
+        version = constraints.get("python_version")
+        lines.append(f"- Language: Python{f' {version}' if version else ''}")
+    if constraints.get("backend_framework"):
+        lines.append(f"- Backend framework: {constraints['backend_framework']}")
+    if constraints.get("frontend_framework"):
+        lines.append(f"- Frontend framework: {constraints['frontend_framework']}")
+    lines.append("- These constraints override guesses derived from a sparse repo or design context.")
+    lines.append("- If the target repo is empty or nearly empty, scaffold the required stack in-place.")
+    return "\n".join(lines)
+
+
+def _enforce_plan_constraints(plan: dict, constraints: dict | None) -> dict:
+    if not constraints:
+        return plan
+
+    hard_rules = [line for line in _render_tech_stack_constraints(constraints).splitlines() if line.strip()]
+    hard_block = "HARD TECH STACK CONSTRAINTS:\n" + "\n".join(hard_rules)
+    dev_instruction = (plan.get("dev_instruction") or "").strip()
+    if hard_block not in dev_instruction:
+        plan["dev_instruction"] = f"{hard_block}\n\n{dev_instruction}".strip()
+
+    acceptance = list(plan.get("acceptance_criteria") or [])
+    if constraints.get("language") == "python" and constraints.get("backend_framework") == "flask":
+        required = (
+            "Implementation uses Python 3.12 and Flask as required by the Jira ticket unless the user explicitly overrides the stack."
+        )
+        if required not in acceptance:
+            acceptance.insert(0, required)
+    if acceptance:
+        plan["acceptance_criteria"] = acceptance
+    plan["tech_stack_constraints"] = constraints
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +517,30 @@ def _parse_json_from_llm(text: str) -> dict:
     return {}
 
 
+def _run_agentic(
+    prompt: str,
+    actor: str,
+    *,
+    system_prompt: str | None = None,
+    context: dict | None = None,
+    model: str | None = None,
+    timeout: int = 120,
+    max_tokens: int = 4096,
+) -> str:
+    """Run the configured agentic runtime and return raw text output."""
+    result = get_runtime().run(
+        prompt=prompt,
+        context=context,
+        system_prompt=system_prompt,
+        model=model,
+        timeout=timeout,
+        max_tokens=max_tokens,
+    )
+    for warning in result.get("warnings") or []:
+        print(f"[{AGENT_ID}] Runtime warning ({actor}): {warning}")
+    return result.get("raw_response") or result.get("summary") or ""
+
+
 def _analyze_task(user_text: str, additional_info: str = "") -> dict:
     additional_context = (
         f"Additional information provided by user:\n{additional_info}"
@@ -441,7 +551,7 @@ def _analyze_task(user_text: str, additional_info: str = "") -> dict:
         additional_context=additional_context,
     )
     system = build_system_prompt(prompts.ANALYZE_SYSTEM, "team-lead")
-    response = generate_text(prompt, f"[{AGENT_ID}] analyze", system_prompt=system)
+    response = _run_agentic(prompt, f"[{AGENT_ID}] analyze", system_prompt=system)
     return _parse_json_from_llm(response)
 
 
@@ -451,6 +561,7 @@ def _create_plan(
     design_info: dict | None,
     additional_info: str,
     target_repo_url: str = "",
+    tech_stack_constraints: dict | None = None,
 ) -> dict:
     jira_ctx = (
         f"Jira ticket details:\n{json.dumps(jira_info, ensure_ascii=False, indent=2)}"
@@ -466,13 +577,14 @@ def _create_plan(
     prompt = prompts.PLAN_TEMPLATE.format(
         user_text=user_text,
         target_repo_url=target_repo_url or "(not specified)",
+        tech_stack_constraints=_render_tech_stack_constraints(tech_stack_constraints),
         jira_context=jira_ctx,
         design_context=design_ctx,
         additional_context=extra_ctx,
     )
     system = build_system_prompt(prompts.PLAN_SYSTEM, "team-lead")
-    response = generate_text(prompt, f"[{AGENT_ID}] plan", system_prompt=system)
-    return _parse_json_from_llm(response)
+    response = _run_agentic(prompt, f"[{AGENT_ID}] plan", system_prompt=system)
+    return _enforce_plan_constraints(_parse_json_from_llm(response), tech_stack_constraints)
 
 
 def _review_output(
@@ -497,7 +609,7 @@ def _review_output(
         artifacts_summary=artifacts_summary,
     )
     system = build_system_prompt(prompts.REVIEW_SYSTEM, "team-lead", include_workflow=True)
-    response = generate_text(prompt, f"[{AGENT_ID}] review", system_prompt=system)
+    response = _run_agentic(prompt, f"[{AGENT_ID}] review", system_prompt=system)
     return _parse_json_from_llm(response)
 
 
@@ -520,8 +632,10 @@ def _generate_summary(
         artifacts=artifacts_text,
     )
     try:
-        return generate_text(
-            prompt, f"[{AGENT_ID}] summarize", system_prompt=prompts.SUMMARIZE_SYSTEM
+        return _run_agentic(
+            prompt,
+            f"[{AGENT_ID}] summarize",
+            system_prompt=build_system_prompt(prompts.SUMMARIZE_SYSTEM, "team-lead", include_workflow=True),
         )
     except Exception as err:
         return f"Task {final_state.lower()}. Summary unavailable: {err}"
@@ -549,15 +663,47 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
     workspace = ctx.shared_workspace_path
     user_text = ctx.user_text
     final_artifacts: list = []
+    runtime_config = {
+        "runtime": summarize_runtime_configuration(),
+        "rulesLoaded": bool(load_rules("team-lead")),
+        "workflowRulesLoaded": bool(load_rules("team-lead", include_workflow=True)),
+    }
 
     def log(phase: str):
-        ts = time.strftime("%H:%M:%S")
+        ts = local_clock_time()
         entry = f"[{ts}] {phase}"
         ctx.phases_log.append(entry)
         print(f"[{AGENT_ID}][{team_lead_task_id}] {phase}")
+        _append_workspace_file(workspace, "team-lead/command-log.txt", entry + "\n")
+        _save_workspace_file(
+            workspace,
+            "team-lead/stage-summary.json",
+            json.dumps(
+                {
+                    "taskId": team_lead_task_id,
+                    "agentId": AGENT_ID,
+                    "currentPhase": phase,
+                    "phases": [line.split("] ", 1)[1] for line in ctx.phases_log],
+                    "phasesLog": ctx.phases_log[-25:],
+                    "analysis": ctx.analysis,
+                    "hasPlan": bool(ctx.plan),
+                    "reviewCycles": ctx.review_cycles,
+                    "reviewPassed": (ctx.review_result or {}).get("passed") if ctx.review_result else None,
+                    "runtimeConfig": runtime_config,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
         _report_progress(compass_url, compass_task_id, phase)
 
     try:
+        _save_workspace_file(
+            workspace,
+            "team-lead/runtime-config.json",
+            json.dumps(runtime_config, ensure_ascii=False, indent=2),
+        )
+
         # ── Phase 1: Analyze ─────────────────────────────────────────────────
         task_store.update_state(team_lead_task_id, "ANALYZING", "Analyzing the request…")
         log("Analyzing request")
@@ -766,6 +912,17 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                         ctx.analysis = analysis
                         break
 
+        tech_stack_constraints = _extract_tech_stack_constraints(
+            user_text,
+            json.dumps(ctx.jira_info or {}, ensure_ascii=False),
+            ctx.additional_info,
+        )
+        if tech_stack_constraints:
+            log(
+                "Detected tech stack constraints: "
+                + ", ".join(f"{key}={value}" for key, value in tech_stack_constraints.items())
+            )
+
         # ── Phase 3: Check for missing info (up to 2 INPUT_REQUIRED rounds) ─
         for _input_round in range(2):
             missing = analysis.get("missing_info") or []
@@ -835,7 +992,14 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 target_repo_url = _repo_match.group().rstrip(".,;)")
                 log(f"Extracted repo URL from Jira ticket: {target_repo_url}")
 
-        plan = _create_plan(user_text, ctx.jira_info, ctx.design_info, ctx.additional_info, target_repo_url)
+        plan = _create_plan(
+            user_text,
+            ctx.jira_info,
+            ctx.design_info,
+            ctx.additional_info,
+            target_repo_url,
+            tech_stack_constraints=tech_stack_constraints,
+        )
         ctx.plan = plan
         dev_capability = plan.get("dev_capability") or "android.task.execute"
         log(
@@ -907,6 +1071,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 "sharedWorkspacePath": workspace,
                 "teamLeadTaskId": team_lead_task_id,
                 "targetRepoUrl": plan.get("target_repo_url") or target_repo_url or "",
+                "techStackConstraints": tech_stack_constraints,
                 "acceptanceCriteria": plan.get("acceptance_criteria") or [],
                 "requiresTests": plan.get("requires_tests", False),
                 "devWorkflowInstructions": (
@@ -960,6 +1125,20 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
 
             review = _review_output(user_text, plan, dev_output, final_artifacts)
             ctx.review_result = review
+            _save_workspace_file(
+                workspace,
+                "team-lead/review-notes.json",
+                json.dumps(
+                    {
+                        "taskId": team_lead_task_id,
+                        "agentId": AGENT_ID,
+                        "cycle": review_cycle + 1,
+                        "review": review,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
 
             passed = review.get("passed", True)
             score = review.get("score", "N/A")
@@ -1048,6 +1227,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
 
         log("Generating task summary")
         summary = _generate_summary(user_text, ctx.phases_log, "COMPLETED", final_artifacts)
+        _save_workspace_file(workspace, "team-lead/final-summary.md", summary)
 
         final_summary_artifact = build_text_artifact(
             "team-lead-summary",
@@ -1078,6 +1258,20 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         error_text = str(err)
         print(f"[{AGENT_ID}][{team_lead_task_id}] FAILED: {error_text}")
         log(f"FAILED: {error_text[:300]}")
+        _save_workspace_file(
+            workspace,
+            "team-lead/review-notes.json",
+            json.dumps(
+                {
+                    "taskId": team_lead_task_id,
+                    "agentId": AGENT_ID,
+                    "error": error_text,
+                    "reviewCycles": ctx.review_cycles,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
         try:
             failure_summary = _generate_summary(
                 user_text, ctx.phases_log, "FAILED", []

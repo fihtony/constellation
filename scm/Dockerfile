@@ -7,6 +7,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git curl \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @github/copilot \
     && rm -rf /var/lib/apt/lists/*
 
 COPY common/  /app/common/

@@ -88,6 +88,9 @@ User request:
 
 Target repository URL: {target_repo_url}
 
+Explicit tech stack constraints:
+{tech_stack_constraints}
+
 {jira_context}
 
 {design_context}
@@ -116,6 +119,9 @@ Rules:
 - acceptance_criteria must be measurable and verifiable.
 - If platform cannot be determined from context, default to "android".
 - Always include the target_repo_url in dev_instruction if it is known.
+- If the Jira ticket or user request explicitly specifies a tech stack, treat it as a hard requirement.
+- Do NOT infer React, Next.js, or Node.js from a sparse repo, a design-tool reference, or the word "web" alone.
+- If the target repo is empty or nearly empty, instruct the dev agent to scaffold the required stack in-place.
 """
 
 # ---------------------------------------------------------------------------

@@ -13,12 +13,14 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from common.artifact_store import ArtifactStore
+from common.devlog import record_workspace_stage
 from common.env_utils import load_dotenv
 from common.launcher import Launcher
 from common.message_utils import artifact_text, deep_copy_json, extract_text
 from common.policy import PolicyEvaluator
 from common.registry_client import RegistryClient
 from common.task_store import TaskStore
+from common.time_utils import local_file_timestamp, local_iso_timestamp
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -65,14 +67,14 @@ CALLBACK_RESULTS = {}
 
 
 def audit_log(event, **kwargs):
-    entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": event, **kwargs}
+    entry = {"ts": local_iso_timestamp(), "event": event, **kwargs}
     print(f"[audit] {json.dumps(entry, ensure_ascii=False)}")
 
 
 def _create_shared_workspace(task_id):
     workspace_root = os.path.join(artifact_store.root, "workspaces")
     os.makedirs(workspace_root, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    timestamp = local_file_timestamp()
     workspace_path = os.path.join(workspace_root, f"{task_id}-{timestamp}")
     os.makedirs(workspace_path, exist_ok=True)
     return workspace_path
@@ -631,6 +633,17 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
         user_text=user_text[:200],
         workflow=workflow,
     )
+    record_workspace_stage(
+        task.workspace_path,
+        "compass",
+        "Created task and workspace",
+        task_id=task.task_id,
+        extra={
+            "requestedCapability": requested_capability or "",
+            "workflow": workflow,
+            "userText": user_text[:1000],
+        },
+    )
     task_store.update_state(task.task_id, "ROUTING", f"Planned workflow: {', '.join(workflow)}")
     task_store.add_progress_step(
         task.task_id,
@@ -737,6 +750,15 @@ class CompassHandler(BaseHTTPRequestHandler):
             if step:
                 task_store.add_progress_step(task_id, step, agent_id=agent_id, ts=ts)
                 print(f"[compass] Progress [{task_id}] <{agent_id}>: {step}")
+                task = task_store.get(task_id)
+                if task and getattr(task, "workspace_path", ""):
+                    record_workspace_stage(
+                        task.workspace_path,
+                        "compass",
+                        step,
+                        task_id=task_id,
+                        extra={"sourceAgent": agent_id},
+                    )
             self._send_json(200, {"ok": True})
             return
 
@@ -815,6 +837,14 @@ class CompassHandler(BaseHTTPRequestHandler):
                             "TASK_STATE_WORKING",
                             "User provided additional information. Resuming…",
                         )
+                        if getattr(prior_task, "workspace_path", ""):
+                            record_workspace_stage(
+                                prior_task.workspace_path,
+                                "compass",
+                                "Received user input and resumed task",
+                                task_id=context_id,
+                                extra={"teamLeadTaskId": tl_task_id, "userText": extract_text(message)[:1000]},
+                            )
                         audit_log(
                             "TASK_RESUMED",
                             task_id=context_id,

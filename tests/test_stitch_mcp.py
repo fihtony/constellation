@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
@@ -55,6 +56,16 @@ STITCH_PROJECT_ID = (
 STITCH_PROJECT_URL = _stitch_project_url or f"https://stitch.withgoogle.com/projects/{STITCH_PROJECT_ID}"
 STITCH_SCREEN_ID = _env("TEST_STITCH_SCREEN_ID", "your-screen-id")
 STITCH_MCP_URL = "https://stitch.googleapis.com/mcp"
+STITCH_CLIENT_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ui-design", "stitch_client.py")
+
+
+def _load_stitch_client_module():
+    spec = importlib.util.spec_from_file_location("stitch_client_under_test", STITCH_CLIENT_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load stitch client from {STITCH_CLIENT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 # ---------------------------------------------------------------------------
@@ -345,18 +356,14 @@ def test_stitch_mcp_find_screen_by_name(reporter: Reporter) -> None:
         reporter.skip("Stitch find_screen_by_name", "TEST_STITCH_API_KEY not set in tests/.env")
         return
 
-    # Use stitch_client.list_screens directly so we test the client logic as well
-    # Import happens here to avoid hard dependency at module load
     try:
-        import sys, os
-        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
         os.environ.setdefault("STITCH_API_KEY", api_key)
-        from ui_design.stitch_client import list_screens, find_screen_by_name  # noqa: PLC0415
+        stitch_client = _load_stitch_client_module()
     except ImportError:
         reporter.skip("Stitch find_screen_by_name", "ui_design.stitch_client not importable")
         return
 
-    screens, status = list_screens(STITCH_PROJECT_ID)
+    screens, status = stitch_client.list_screens(STITCH_PROJECT_ID)
     if status != "ok":
         if "error_401" in status or "error_403" in status:
             reporter.skip("Stitch find_screen_by_name",
@@ -380,7 +387,7 @@ def test_stitch_mcp_find_screen_by_name(reporter: Reporter) -> None:
 
     # Search by a 4-char prefix (to test partial match)
     search_term = first_name[:max(4, len(first_name) // 2)]
-    found, find_status = find_screen_by_name(STITCH_PROJECT_ID, search_term)
+    found, find_status = stitch_client.find_screen_by_name(STITCH_PROJECT_ID, search_term)
     if found:
         reporter.ok(
             f"find_screen_by_name('{search_term}') → "

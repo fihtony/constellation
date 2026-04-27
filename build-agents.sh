@@ -6,8 +6,8 @@
 # Their images must be built manually before starting the compose stack.
 #
 # Usage:
-#   ./build-agents.sh            # build all dynamic agent images
-#   ./build-agents.sh android    # build only the android agent image
+#   ./build-agents.sh            # build all dynamic agent images present in this repo
+#   ./build-agents.sh web        # build only the web agent image
 #
 # After building, start the compose stack as usual:
 #   docker compose up --build -d
@@ -16,6 +16,10 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 build_android() {
+    if [[ ! -f "${SCRIPT_DIR}/android/Dockerfile" ]]; then
+        echo "android agent source not present in this repository"
+        return 1
+    fi
     echo "==> Building android agent image: constellation-android-agent:latest"
     docker build \
         -t constellation-android-agent:latest \
@@ -56,9 +60,13 @@ case "$TARGET" in
         build_team_lead
         ;;
     all)
-        build_android
         build_web
         build_team_lead
+        if [[ -f "${SCRIPT_DIR}/android/Dockerfile" ]]; then
+            build_android
+        else
+            echo "==> Skipping android agent image: ${SCRIPT_DIR}/android/Dockerfile not found"
+        fi
         ;;
     *)
         echo "Unknown target: $TARGET"
