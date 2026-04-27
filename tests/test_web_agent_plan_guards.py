@@ -323,14 +323,21 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         )
 
     def test_maybe_schedule_shutdown_after_task_only_when_enabled(self):
+        # _apply_task_exit_rule replaces _maybe_schedule_shutdown_after_task.
+        # With AUTO_STOP not set and rule type "immediate", shutdown is still skipped.
         with mock.patch.object(web_app, "_schedule_shutdown") as schedule_mock:
             with mock.patch.dict(os.environ, {"AUTO_STOP_AFTER_TASK": "0"}, clear=False):
-                self.assertFalse(web_app._maybe_schedule_shutdown_after_task())
+                # "auto_stop" rule type is only honoured when AUTO_STOP_AFTER_TASK=1
+                web_app._apply_task_exit_rule("task-x", {"type": "auto_stop"})
+                # The background thread runs immediately but shouldn't schedule shutdown
+            import time
+            time.sleep(0.1)  # allow the daemon thread to run
             schedule_mock.assert_not_called()
 
             with mock.patch.dict(os.environ, {"AUTO_STOP_AFTER_TASK": "1"}, clear=False):
-                self.assertTrue(web_app._maybe_schedule_shutdown_after_task())
-            schedule_mock.assert_called_once_with(delay_seconds=5)
+                web_app._apply_task_exit_rule("task-y", {"type": "auto_stop"})
+            time.sleep(0.1)
+            schedule_mock.assert_called_once()
 
     def test_pr_evidence_is_merged_across_updates(self):
         with tempfile.TemporaryDirectory(prefix="web_agent_pr_") as workspace:

@@ -718,7 +718,17 @@ Before submitting a new agent, verify:
 - In execution task workspaces, generated source files should live in the real cloned repository directory; `web-agent/` and similar agent subdirectories are for metadata and audit artifacts only.
 - Web Agent branches should use deterministic naming based on Jira key plus orchestrator task id when available; only docs/tests-only changes may use `chore/...` naming without a ticket key.
 - Boundary agents (Jira, SCM, UI Design, future Jenkins/Stitch-style integrations) must be discovered through Registry capabilities at runtime; do not hardcode their service URLs inside Team Lead or execution agents.
+- Always construct `RegistryClient(REGISTRY_URL)` explicitly and pass it to `AgentDirectory(owner_id, registry_client)`. Never rely on the module-level `REGISTRY_URL` default inside `RegistryClient` — `load_dotenv` may not have run yet at import time.
 - Registry now exposes topology metadata (`/topology`, `/events?sinceVersion=`); agents that call other agents should cache capability lookups and refresh on cache miss or topology change.
 - Compass applies a final completeness gate to Team Lead results using shared-workspace evidence (review result, PR evidence, Jira workflow evidence) and may trigger a same-workspace follow-up cycle before marking the user task complete.
-- Per-task agents should honor `AUTO_STOP_AFTER_TASK=1` and shut down gracefully after the callback/polling window so finished Team Lead/Web containers do not accumulate.
+- **Per-task agent exit rule** (implemented in `common/per_task_exit.py`):
+  - The parent agent embeds `"exitRule": {"type": "wait_for_parent_ack", "ack_timeout_seconds": 300}` in the child's message metadata.
+  - The child agent calls `PerTaskExitHandler.parse(metadata)` to read the rule, and calls `exit_handler.apply(task_id, rule, shutdown_fn=_schedule_shutdown)` in its workflow `finally` block.
+  - The parent sends `POST {child_service_url}/tasks/{task_id}/ack` when it is done with the child (all review cycles complete, callback processed).
+  - The child exposes `POST /tasks/{id}/ack` to receive the parent ACK.
+  - Supported rule types: `wait_for_parent_ack` (default), `immediate` (old AUTO_STOP behavior), `persistent` (no auto-stop).
+  - Default ACK timeout: 5 minutes. The child shuts down after the timeout even if no ACK arrives.
+  - For revisions: Team Lead reuses the **same** dev-agent container (same service URL, new task ID via `POST /message:send`). It does NOT launch a new container. The ACK is sent only after all review cycles are done.
+  - Compass ACKs Team Lead after the completeness gate passes (or max revisions reached).
+- Python virtual environments created by Web Agent are placed in `tempfile.gettempdir()/constellation-venv-{hash}`, NOT inside the cloned repo directory, to avoid Docker-path shebang issues when the workspace is accessed locally.
 - Use `LOCAL_TIMEZONE` (preferred) or `TZ` to keep workspace timestamps aligned with the operator's local time.
