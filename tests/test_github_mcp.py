@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""GitHub MCP integration tests — official Docker MCP server + GitHub REST API.
+"""GitHub MCP integration tests — GitHubMCPProvider + raw remote MCP server verification.
 
-Tests use the official GitHub MCP server image (ghcr.io/github/github-mcp-server)
-via STDIO JSON-RPC 2.0, and also validate the GitHub REST API directly.
+Tests the GitHubMCPProvider class (scm/providers/github_mcp.py) against every
+SCM capability required by the Constellation system.  Also validates the raw
+remote GitHub MCP server (https://api.githubcopilot.com/mcp/) independently.
+
+All configuration is read EXCLUSIVELY from tests/.env.  No agent .env files
+are consulted.  Fail-fast with a clear error if required keys are missing.
 
 Required keys in tests/.env:
   TEST_GITHUB_REPO_URL   Full repo URL (e.g. https://github.com/owner/repo)
@@ -11,8 +15,8 @@ Required keys in tests/.env:
 Usage:
     python3 tests/test_github_mcp.py              # dry-run (no network)
     python3 tests/test_github_mcp.py --integration [-v]
-    python3 tests/test_github_mcp.py --integration --rest   # REST API only
-    python3 tests/test_github_mcp.py --integration --mcp    # MCP Docker only
+    python3 tests/test_github_mcp.py --integration --raw      # raw HTTP MCP only
+    python3 tests/test_github_mcp.py --integration --provider # GitHubMCPProvider only
 """
 
 from __future__ import annotations
@@ -20,48 +24,35 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import queue
-import subprocess
 import sys
-import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+_HERE = os.path.dirname(__file__)
+_PROJECT_ROOT = os.path.dirname(_HERE)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-from tests.agent_test_support import Reporter, load_env_file
+from agent_test_support import Reporter, load_env_file, unique_suffix
+from agent_test_targets import scm_owner, scm_repo_slug
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-_ENV = load_env_file("tests/.env")
+def _load_token() -> str:
+    tests_env = load_env_file("tests/.env")
+    token = tests_env.get("TEST_GITHUB_TOKEN", "").strip()
+    if not token:
+        raise SystemExit("ERROR: TEST_GITHUB_TOKEN not set in tests/.env — cannot run tests")
+    return token
 
 
-def _env(key: str, fallback: str = "") -> str:
-    return os.environ.get(key) or _ENV.get(key, fallback)
-
-
-def _parse_github_repo_url(url: str) -> tuple[str, str]:
-    url = url.strip().rstrip("/")
-    if url.endswith(".git"):
-        url = url[:-4]
-    if "?" in url:
-        url = url.split("?")[0]
-    parts = [p for p in url.split("/") if p and ":" not in p]
-    if len(parts) >= 3:
-        return parts[-2], parts[-1]
-    return "", ""
-
-
-_github_url = _env("TEST_GITHUB_REPO_URL")
-if _github_url:
-    GITHUB_OWNER, GITHUB_REPO = _parse_github_repo_url(_github_url)
-else:
-    GITHUB_OWNER = "your-username"
-    GITHUB_REPO = "test-repo"
-
+GITHUB_OWNER = scm_owner()
+GITHUB_REPO = scm_repo_slug()
 GITHUB_REPO_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
 GITHUB_API_BASE = "https://api.github.com"
 
@@ -71,14 +62,11 @@ GITHUB_API_BASE = "https://api.github.com"
 # ---------------------------------------------------------------------------
 
 def _github_auth_header() -> str | None:
-    token = _env("TEST_GITHUB_TOKEN")
-    if not token:
-        return None
-    return f"Bearer {token}"
+    return f"Bearer {_load_token()}"
 
 
 def _github_token() -> str:
-    return _env("TEST_GITHUB_TOKEN")
+    return _load_token()
 
 
 # ---------------------------------------------------------------------------
@@ -102,14 +90,14 @@ def _http_get(url: str, headers: dict | None = None, timeout: int = 15):
 
 
 # ---------------------------------------------------------------------------
-# GitHub MCP client — official Docker image (STDIO JSON-RPC 2.0)
+# GitHub MCP client — remote HTTP server (https://api.githubcopilot.com/mcp/)
 # ---------------------------------------------------------------------------
 
 class GitHubMCPClient:
-    """Client for the official GitHub MCP server (ghcr.io/github/github-mcp-server).
+    """Client for the remote GitHub MCP server (Streamable HTTP transport).
 
-    Communicates over STDIO JSON-RPC 2.0 by launching the server as a Docker
-    subprocess. Implements the MCP initialize handshake automatically.
+    Connects to https://api.githubcopilot.com/mcp/ with PAT authentication.
+    Implements the MCP initialize handshake and session management.
 
     Usage:
         with GitHubMCPClient(token) as client:
@@ -117,16 +105,15 @@ class GitHubMCPClient:
             resp  = client.call_tool("get_file_contents", {...})
     """
 
-    IMAGE = "ghcr.io/github/github-mcp-server"
+    MCP_URL = "https://api.githubcopilot.com/mcp/"
     MCP_PROTOCOL_VERSION = "2024-11-05"
 
-    def __init__(self, token: str, timeout: int = 30):
+    def __init__(self, token: str, timeout: int = 60):
         self.token = token
         self.timeout = timeout
         self._proc: subprocess.Popen | None = None
         self._req_id = 0
-        self._reader_thread: threading.Thread | None = None
-        self._response_queue: queue.Queue = queue.Queue()
+        self._session_id: str | None = None
 
     def __enter__(self):
         self.start()
@@ -135,23 +122,71 @@ class GitHubMCPClient:
     def __exit__(self, *_):
         self.stop()
 
-    def start(self) -> None:
-        """Start the Docker container and perform the MCP initialize handshake."""
-        env = {**os.environ, "GITHUB_PERSONAL_ACCESS_TOKEN": self.token}
-        self._proc = subprocess.Popen(
-            [
-                "docker", "run", "-i", "--rm",
-                "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
-                self.IMAGE,
-            ],
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        self._reader_thread = threading.Thread(target=self._drain_stdout, daemon=True)
-        self._reader_thread.start()
+    def _headers(self) -> dict:
+        h = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self._session_id:
+            h["Mcp-Session-Id"] = self._session_id
+        return h
 
+    def _post(self, payload: dict, timeout: int | None = None) -> dict:
+        data = json.dumps(payload).encode("utf-8")
+        req = Request(self.MCP_URL, data=data, headers=self._headers(), method="POST")
+        try:
+            with urlopen(req, timeout=timeout or self.timeout) as resp:
+                sid = resp.getheader("Mcp-Session-Id")
+                if sid:
+                    self._session_id = sid
+                ct = resp.getheader("Content-Type", "")
+                raw = resp.read().decode("utf-8")
+                if not raw.strip():
+                    return {}
+                if "text/event-stream" in ct:
+                    return self._parse_sse(raw, payload.get("id"))
+                return json.loads(raw)
+        except HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {"error": {"code": exc.code, "message": raw[:300]}}
+        except URLError as exc:
+            return {"error": {"code": -1, "message": str(exc)}}
+
+    def _parse_sse(self, raw: str, expected_id: int | None) -> dict:
+        for line in raw.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
+            try:
+                data = json.loads(data_str)
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and (expected_id is None or item.get("id") == expected_id):
+                            return item
+                elif isinstance(data, dict):
+                    if expected_id is None or data.get("id") == expected_id:
+                        return data
+            except json.JSONDecodeError:
+                pass
+        return {"error": {"code": -1, "message": "no matching response in SSE stream"}}
+
+    def _rpc(self, method: str, params: dict, timeout: int | None = None) -> dict:
+        self._req_id += 1
+        return self._post({
+            "jsonrpc": "2.0",
+            "id": self._req_id,
+            "method": method,
+            "params": params,
+        }, timeout)
+
+    def start(self) -> None:
+        """Perform MCP initialize handshake with the remote server."""
         resp = self._rpc("initialize", {
             "protocolVersion": self.MCP_PROTOCOL_VERSION,
             "capabilities": {},
@@ -159,59 +194,21 @@ class GitHubMCPClient:
         })
         if "error" in resp:
             raise RuntimeError(f"GitHub MCP init failed: {resp['error']}")
-        self._notify("notifications/initialized", {})
-
-    def _drain_stdout(self) -> None:
-        assert self._proc is not None
+        # Send notifications/initialized (fire-and-forget)
         try:
-            for raw in self._proc.stdout:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if line:
-                    self._response_queue.put(line)
+            payload = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+            data = json.dumps(payload).encode("utf-8")
+            req = Request(self.MCP_URL, data=data, headers=self._headers(), method="POST")
+            with urlopen(req, timeout=10):
+                pass
         except Exception:
             pass
-        finally:
-            self._response_queue.put(None)
-
-    def _rpc(self, method: str, params: dict, timeout: int | None = None) -> dict:
-        self._req_id += 1
-        req_id = self._req_id
-        msg = json.dumps({
-            "jsonrpc": "2.0", "id": req_id,
-            "method": method, "params": params,
-        }) + "\n"
-        assert self._proc and self._proc.stdin
-        self._proc.stdin.write(msg.encode())
-        self._proc.stdin.flush()
-
-        deadline = time.time() + (timeout or self.timeout)
-        while time.time() < deadline:
-            try:
-                line = self._response_queue.get(timeout=max(0.1, deadline - time.time()))
-            except queue.Empty:
-                break
-            if line is None:
-                break
-            try:
-                data = json.loads(line)
-                if "id" in data and data["id"] == req_id:
-                    return data
-                self._response_queue.put(line)
-            except json.JSONDecodeError:
-                pass
-        return {"error": {"code": -1, "message": f"timeout waiting for MCP response to {method!r}"}}
-
-    def _notify(self, method: str, params: dict) -> None:
-        assert self._proc and self._proc.stdin
-        msg = json.dumps({"jsonrpc": "2.0", "method": method, "params": params}) + "\n"
-        self._proc.stdin.write(msg.encode())
-        self._proc.stdin.flush()
 
     def tools_list(self) -> list:
         resp = self._rpc("tools/list", {})
         return (resp.get("result") or {}).get("tools", [])
 
-    def call_tool(self, name: str, arguments: dict, timeout: int = 30) -> dict:
+    def call_tool(self, name: str, arguments: dict, timeout: int = 60) -> dict:
         return self._rpc("tools/call", {"name": name, "arguments": arguments}, timeout=timeout)
 
     def extract_text(self, tool_resp: dict) -> str:
@@ -229,91 +226,31 @@ class GitHubMCPClient:
         return bool((tool_resp.get("result") or {}).get("isError")) or "error" in tool_resp
 
     def stop(self) -> None:
-        if self._proc:
+        """Delete the remote session (best-effort)."""
+        if self._session_id:
             try:
-                self._proc.stdin.close()
-                self._proc.wait(timeout=5)
+                req = Request(self.MCP_URL, headers=self._headers(), method="DELETE")
+                with urlopen(req, timeout=5):
+                    pass
             except Exception:
-                self._proc.kill()
-            self._proc = None
+                pass
+            self._session_id = None
 
 
 # ---------------------------------------------------------------------------
-# GitHub REST API test functions (direct, no Docker)
+# Raw MCP server sanity-check functions
 # ---------------------------------------------------------------------------
 
-def test_github_url_parseable(reporter: Reporter) -> None:
-    assert GITHUB_OWNER in GITHUB_REPO_URL
-    assert GITHUB_REPO in GITHUB_REPO_URL
-    reporter.ok(f"GitHub repo URL is well-formed: {GITHUB_REPO_URL}")
-
-
-def test_github_repo_metadata(reporter: Reporter) -> None:
-    auth = _github_auth_header()
-    headers = {"X-GitHub-Api-Version": "2022-11-28"}
-    if auth:
-        headers["Authorization"] = auth
-    status, body = _http_get(f"{GITHUB_API_BASE}/repos/{GITHUB_OWNER}/{GITHUB_REPO}", headers=headers)
-    if status == 200:
-        reporter.ok(f"GitHub REST repo accessible: {body.get('full_name')} "
-                    f"(default branch: {body.get('default_branch')})")
-    elif status == 401:
-        reporter.fail("GitHub auth rejected (401)", str(body)[:150])
-    elif status == 403:
-        reporter.fail("GitHub forbidden (403) — check token scopes", str(body)[:150])
-    elif status == 404:
-        reporter.fail(f"GitHub repo {GITHUB_OWNER}/{GITHUB_REPO} not found (404)")
+def test_github_mcp_server_sanity(reporter: Reporter) -> None:
+    """Quick static check that target repo URL is well-formed."""
+    if GITHUB_OWNER and GITHUB_REPO and GITHUB_OWNER in GITHUB_REPO_URL:
+        reporter.ok(f"Target repo URL well-formed: {GITHUB_REPO_URL}")
     else:
-        reporter.fail(f"GitHub repo metadata returned HTTP {status}", str(body)[:150])
-
-
-def test_github_repo_branches(reporter: Reporter) -> None:
-    auth = _github_auth_header()
-    headers = {"X-GitHub-Api-Version": "2022-11-28"}
-    if auth:
-        headers["Authorization"] = auth
-    status, body = _http_get(
-        f"{GITHUB_API_BASE}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/branches", headers=headers
-    )
-    if status == 200 and isinstance(body, list):
-        branch_names = [b.get("name", "") for b in body[:5]]
-        reporter.ok(f"GitHub REST branches: {len(body)} total — {branch_names}")
-    else:
-        reporter.fail(f"GitHub REST branches returned HTTP {status}", str(body)[:150])
-
-
-def test_github_repo_contents(reporter: Reporter) -> None:
-    auth = _github_auth_header()
-    headers = {"X-GitHub-Api-Version": "2022-11-28"}
-    if auth:
-        headers["Authorization"] = auth
-    status, body = _http_get(
-        f"{GITHUB_API_BASE}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/", headers=headers
-    )
-    if status == 200 and isinstance(body, list):
-        names = [item.get("name", "") for item in body[:8]]
-        reporter.ok(f"GitHub REST root contents: {len(body)} items — {names}")
-    else:
-        reporter.fail(f"GitHub REST contents returned HTTP {status}", str(body)[:150])
-
-
-def test_github_pull_requests(reporter: Reporter) -> None:
-    auth = _github_auth_header()
-    headers = {"X-GitHub-Api-Version": "2022-11-28"}
-    if auth:
-        headers["Authorization"] = auth
-    status, body = _http_get(
-        f"{GITHUB_API_BASE}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/pulls?state=open&per_page=5",
-        headers=headers,
-    )
-    if status == 200 and isinstance(body, list):
-        reporter.ok(f"GitHub REST PRs: {len(body)} open")
-    else:
-        reporter.fail(f"GitHub REST PRs returned HTTP {status}", str(body)[:150])
+        reporter.fail("Target repo URL not set — add TEST_GITHUB_REPO_URL to tests/.env")
 
 
 # ---------------------------------------------------------------------------
-# GitHub MCP (Docker) test functions
+# Raw remote MCP server test functions
 # ---------------------------------------------------------------------------
 
 def test_github_mcp_tools_list(reporter: Reporter, client: GitHubMCPClient) -> None:
@@ -397,38 +334,137 @@ def test_github_mcp_search_code(reporter: Reporter, client: GitHubMCPClient) -> 
 
 
 # ---------------------------------------------------------------------------
-# Suite runners
+# GitHubMCPProvider end-to-end tests (full Constellation capability coverage)
 # ---------------------------------------------------------------------------
 
-def run_rest_tests(reporter: Reporter) -> None:
-    reporter.section(f"GitHub REST API — {GITHUB_REPO_URL}")
-    test_github_repo_metadata(reporter)
-    test_github_repo_branches(reporter)
-    test_github_repo_contents(reporter)
-    test_github_pull_requests(reporter)
-
-
-def run_mcp_tests(reporter: Reporter) -> None:
-    reporter.section(f"GitHub MCP (Docker) — {GITHUB_REPO_URL}")
+def run_provider_tests(reporter: Reporter) -> None:
+    """Test GitHubMCPProvider for all Constellation-required SCM capabilities."""
+    reporter.section(f"GitHubMCPProvider (remote HTTP) — {GITHUB_REPO_URL}")
 
     token = _github_token()
-    if not token:
-        reporter.skip("GitHub MCP server tests", "TEST_GITHUB_TOKEN not set in tests/.env")
-        return
+
+    from scm.providers.github_mcp import GitHubMCPProvider
+    p = GitHubMCPProvider(token=token)
+
+    suffix = unique_suffix()
+    branch = f"agent/mcp-test/{suffix}"
+    pr_id = None
+    default_branch = "main"
 
     try:
-        result = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
-        if result.returncode != 0:
-            reporter.skip("GitHub MCP server tests", "Docker daemon not running")
+        # TC-MCP-01: get_repo
+        reporter.step("TC-MCP-01  get_repo()")
+        repo_info, status = p.get_repo(GITHUB_OWNER, GITHUB_REPO)
+        if status == "ok" and repo_info.get("fullName"):
+            default_branch = repo_info.get("defaultBranch", "main")
+            reporter.ok(f"get_repo(): {repo_info['fullName']} — default: {default_branch}")
+        else:
+            reporter.fail(f"get_repo() status={status!r}", str(repo_info)[:100])
             return
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        reporter.skip("GitHub MCP server tests", f"Docker unavailable: {exc}")
-        return
 
-    reporter.step("Starting GitHub MCP server container …")
+        # TC-MCP-02: list_branches
+        reporter.step("TC-MCP-02  list_branches()")
+        branches, status = p.list_branches(GITHUB_OWNER, GITHUB_REPO)
+        if status == "ok" and branches:
+            reporter.ok(f"list_branches(): {len(branches)} branches — {[b['name'] for b in branches[:4]]}")
+        else:
+            reporter.fail(f"list_branches() status={status!r}", str(branches)[:100])
+
+        # TC-MCP-03: create_branch
+        reporter.step(f"TC-MCP-03  create_branch() → {branch}")
+        result, status = p.create_branch(GITHUB_OWNER, GITHUB_REPO, branch, default_branch)
+        if "created" in status:
+            reporter.ok(f"create_branch(): {result.get('htmlUrl', branch)}")
+        else:
+            reporter.fail(f"create_branch() status={status!r}", str(result)[:150])
+            return
+
+        # TC-MCP-04: push_files
+        reporter.step("TC-MCP-04  push_files()")
+        files = [{"path": f"agent-tests/{suffix}/mcp-provider.txt",
+                  "content": f"MCP provider test — {suffix}\nTimestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ')}"}]
+        result, status = p.push_files(GITHUB_OWNER, GITHUB_REPO, branch, default_branch,
+                                      files, f"chore: MCP provider test {suffix}")
+        if status == "pushed":
+            reporter.ok(f"push_files(): {result.get('htmlUrl', '')}")
+        else:
+            reporter.fail(f"push_files() status={status!r}", str(result)[:150])
+            return
+
+        # TC-MCP-05: create_pr
+        reporter.step("TC-MCP-05  create_pr()")
+        pr, status = p.create_pr(GITHUB_OWNER, GITHUB_REPO, branch, default_branch,
+                                  f"[MCP Test] {suffix}",
+                                  "Automated MCP provider test PR — safe to close.")
+        if "created" in status and pr.get("id"):
+            pr_id = pr["id"]
+            reporter.ok(f"create_pr(): PR #{pr_id} — {pr.get('htmlUrl', '')}")
+        else:
+            reporter.fail(f"create_pr() status={status!r}", str(pr)[:150])
+            return
+
+        # TC-MCP-06: get_pr
+        reporter.step(f"TC-MCP-06  get_pr({pr_id})")
+        pr_fetched, status = p.get_pr(GITHUB_OWNER, GITHUB_REPO, pr_id)
+        if status == "ok" and pr_fetched.get("id") == pr_id:
+            reporter.ok(f"get_pr(): state={pr_fetched.get('state')}, from={pr_fetched.get('fromBranch')}")
+        else:
+            reporter.fail(f"get_pr() status={status!r}", str(pr_fetched)[:100])
+
+        # TC-MCP-07: list_prs
+        reporter.step("TC-MCP-07  list_prs()")
+        prs, status = p.list_prs(GITHUB_OWNER, GITHUB_REPO, "open")
+        ids = [x["id"] for x in prs]
+        if status == "ok" and pr_id in ids:
+            reporter.ok(f"list_prs(): {len(prs)} open — #{pr_id} found")
+        else:
+            reporter.fail(f"list_prs() did not include #{pr_id}", f"ids={ids}")
+
+        # TC-MCP-08: add_pr_comment
+        reporter.step("TC-MCP-08  add_pr_comment()")
+        comment_body = f"[MCP Test] Automated comment from test_github_mcp.py — {suffix}"
+        comment, status = p.add_pr_comment(GITHUB_OWNER, GITHUB_REPO, pr_id, comment_body)
+        if "created" in status and comment.get("id"):
+            reporter.ok(f"add_pr_comment(): #{comment['id']} — {comment.get('htmlUrl','')}")
+        else:
+            reporter.fail(f"add_pr_comment() status={status!r}", str(comment)[:100])
+
+        # TC-MCP-09: list_pr_comments
+        reporter.step("TC-MCP-09  list_pr_comments()")
+        comments, status = p.list_pr_comments(GITHUB_OWNER, GITHUB_REPO, pr_id)
+        bodies = [c.get("body", "") for c in comments]
+        if status == "ok" and any(suffix in b for b in bodies):
+            reporter.ok(f"list_pr_comments(): {len(comments)} comment(s) — test comment found")
+        else:
+            reporter.fail("list_pr_comments() did not find test comment",
+                          f"status={status!r} bodies={bodies[:2]}")
+
+        # TC-MCP-10: search_repos
+        reporter.step("TC-MCP-10  search_repos()")
+        results, status = p.search_repos(f"repo:{GITHUB_OWNER}/{GITHUB_REPO}", limit=5)
+        if status == "ok" and any(r.get("repo") == GITHUB_REPO for r in results):
+            reporter.ok(f"search_repos(): found {GITHUB_OWNER}/{GITHUB_REPO}")
+        else:
+            reporter.fail(f"search_repos() did not find repo",
+                          f"status={status!r} results={[r.get('repo') for r in results]}")
+
+    finally:
+        p.close()
+
+
+# ---------------------------------------------------------------------------
+# Raw MCP server verification (tools/list + key tool calls)
+# ---------------------------------------------------------------------------
+
+def run_raw_mcp_tests(reporter: Reporter) -> None:
+    reporter.section(f"Raw GitHub MCP Server (remote HTTP) — {GITHUB_REPO_URL}")
+
+    token = _github_token()
+
+    reporter.step("Connecting to remote GitHub MCP server …")
     try:
-        with GitHubMCPClient(token, timeout=30) as client:
-            reporter.ok("GitHub MCP server container started and initialized")
+        with GitHubMCPClient(token, timeout=60) as client:
+            reporter.ok("Remote GitHub MCP server connected and initialized")
             test_github_mcp_tools_list(reporter, client)
             test_github_mcp_get_repository(reporter, client)
             test_github_mcp_list_branches(reporter, client)
@@ -436,7 +472,7 @@ def run_mcp_tests(reporter: Reporter) -> None:
             test_github_mcp_list_pull_requests(reporter, client)
             test_github_mcp_search_code(reporter, client)
     except RuntimeError as exc:
-        reporter.fail("GitHub MCP server failed to start", str(exc))
+        reporter.fail("Remote GitHub MCP server connection failed", str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -449,31 +485,33 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--integration", action="store_true",
-                        help="Run live integration tests (requires tests/.env credentials)")
-    parser.add_argument("--rest", action="store_true", help="Run GitHub REST API tests only")
-    parser.add_argument("--mcp", action="store_true", help="Run GitHub MCP Docker tests only")
+                        help="Run live integration tests (requires credentials)")
+    parser.add_argument("--raw", action="store_true",
+                        help="Run raw remote MCP server verification only")
+    parser.add_argument("--provider", action="store_true",
+                        help="Run GitHubMCPProvider tests only")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
     reporter = Reporter(verbose=args.verbose)
 
     print("\n" + "=" * 60)
-    print("  GitHub Integration Tests  (REST API + MCP Docker)")
+    print("  GitHub MCP Tests  (GitHubMCPProvider + remote HTTP server)")
     print("=" * 60)
-    print(f"  Repo : {GITHUB_REPO_URL}")
-    print(f"  MCP  : ghcr.io/github/github-mcp-server (STDIO)")
+    print(f"  Repo    : {GITHUB_REPO_URL}")
+    print(f"  MCP URL : https://api.githubcopilot.com/mcp/")
 
     reporter.section("Static / dry-run checks")
-    test_github_url_parseable(reporter)
+    test_github_mcp_server_sanity(reporter)
 
     if not args.integration:
         print("\n\033[93mIntegration tests skipped — pass --integration to run live checks.\033[0m")
     else:
-        any_selected = args.rest or args.mcp
-        if not any_selected or args.rest:
-            run_rest_tests(reporter)
-        if not any_selected or args.mcp:
-            run_mcp_tests(reporter)
+        any_selected = args.raw or args.provider
+        if not any_selected or args.provider:
+            run_provider_tests(reporter)
+        if not any_selected or args.raw:
+            run_raw_mcp_tests(reporter)
 
     print(f"\nPassed: {reporter.passed}  Failed: {reporter.failed}  Skipped: {reporter.skipped}")
     return 0 if reporter.failed == 0 else 1

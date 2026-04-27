@@ -141,12 +141,7 @@ def main(argv=None):
 
     # -- Load test config ---------------------------------------------------
     env_values = load_env_file("tests/.env")
-    # Prefer the SCM agent's own token (same one used by the running container).
-    # Fall back to the dedicated TEST_GITHUB_TOKEN when SCM_TOKEN is absent.
-    scm_env = load_env_file("scm/.env")
-    token = scm_env.get("SCM_TOKEN", "").strip()
-    if not token:
-        token = env_values.get("TEST_GITHUB_TOKEN", "").strip()
+    token = env_values.get("TEST_GITHUB_TOKEN", "").strip()
 
     # LLM endpoint: use localhost for local subprocess, host.docker.internal in containers
     openai_base_url = (

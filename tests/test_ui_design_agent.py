@@ -103,18 +103,18 @@ CONTAINER_AGENT_URL = "http://127.0.0.1:8040"
 # ---------------------------------------------------------------------------
 
 def _load_figma_token() -> str:
-    # Priority: TEST_FIGMA_TOKEN in tests/.env → FIGMA_TOKEN env var → ui-design/.env
+    # ONLY from tests/.env
     token = _env("TEST_FIGMA_TOKEN") or os.environ.get("FIGMA_TOKEN", "")
     if not token:
-        token = load_env_file("ui-design/.env").get("FIGMA_TOKEN", "").strip()
+        raise SystemExit("ERROR: TEST_FIGMA_TOKEN not set in tests/.env — cannot run tests")
     return token
 
 
 def _load_stitch_key() -> str:
-    # Priority: TEST_STITCH_API_KEY in tests/.env → STITCH_API_KEY env var → ui-design/.env
+    # ONLY from tests/.env
     key = _env("TEST_STITCH_API_KEY") or os.environ.get("STITCH_API_KEY", "")
     if not key:
-        key = load_env_file("ui-design/.env").get("STITCH_API_KEY", "").strip()
+        raise SystemExit("ERROR: TEST_STITCH_API_KEY not set in tests/.env — cannot run tests")
     return key
 
 

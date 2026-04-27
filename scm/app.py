@@ -60,12 +60,16 @@ CLONE_TIMEOUT_SECONDS = int(os.environ.get("CLONE_TIMEOUT_SECONDS", "600"))
 _REPO_TREE_MAX_FILES = int(os.environ.get("REPO_TREE_MAX_FILES", "500"))
 _REPO_FILE_MAX_BYTES = int(os.environ.get("REPO_FILE_MAX_BYTES", str(512 * 1024)))
 
+# Back-end selector (only applies when SCM_PROVIDER=github): "rest" (default) | "mcp"
+_SCM_BACKEND = os.environ.get("SCM_BACKEND", "rest").strip().lower()
+
 # ---------------------------------------------------------------------------
 # Provider factory
 # ---------------------------------------------------------------------------
 
 def _make_provider():
     from scm.providers.github import GitHubProvider
+    from scm.providers.github_mcp import GitHubMCPProvider
     from scm.providers.bitbucket import BitbucketProvider
 
     provider_name = _SCM_PROVIDER
@@ -78,6 +82,14 @@ def _make_provider():
             provider_name = "bitbucket"
 
     if provider_name == "github":
+        if _SCM_BACKEND == "mcp":
+            print(f"[{AGENT_ID}] GitHub back-end: MCP (remote HTTP)")
+            return GitHubMCPProvider(
+                token=_SCM_TOKEN,
+                author_name=_GIT_AUTHOR_NAME,
+                author_email=_GIT_AUTHOR_EMAIL,
+            )
+        print(f"[{AGENT_ID}] GitHub back-end: REST API")
         return GitHubProvider(
             token=_SCM_TOKEN,
             username=_SCM_USERNAME,
