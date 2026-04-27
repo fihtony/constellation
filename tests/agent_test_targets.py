@@ -60,7 +60,29 @@ def _parse_github_repo_url(url: str) -> tuple[str, str]:
 CONFIG = _load_config()
 _TEST_ENV = _load_env_file()
 
-JIRA_ALLOWED_TICKET = CONFIG["jira"]["primaryTicket"]
+
+def _parse_jira_ticket_url(url: str) -> tuple[str, str]:
+    """Parse 'https://org.atlassian.net/browse/PROJ-1' → (base_url, ticket_key)."""
+    url = url.strip()
+    if "/browse/" in url:
+        parts = url.split("/browse/")
+        base = parts[0].rstrip("/")
+        key = parts[1].split("/")[0].split("?")[0].strip()
+        return base, key
+    return url.rstrip("/"), ""
+
+
+# Prefer TEST_JIRA_TICKET_URL from tests/.env over agent_test_targets.json
+_jira_ticket_url_env = _TEST_ENV.get("TEST_JIRA_TICKET_URL", "").strip()
+if _jira_ticket_url_env and "/browse/" in _jira_ticket_url_env:
+    _jira_base_url, _jira_key = _parse_jira_ticket_url(_jira_ticket_url_env)
+    JIRA_ALLOWED_TICKET: dict = {
+        **CONFIG["jira"]["primaryTicket"],
+        "ticketKey": _jira_key,
+        "browseUrl": _jira_ticket_url_env,
+    }
+else:
+    JIRA_ALLOWED_TICKET = CONFIG["jira"]["primaryTicket"]
 
 # SCM config: prefer TEST_GITHUB_REPO_URL from tests/.env over agent_test_targets.json
 # This way the json file can stay PII-free (generic placeholders only).

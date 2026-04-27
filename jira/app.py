@@ -1,16 +1,18 @@
-"""Long-running Jira agent — ticket fetch, transitions, and comment CRUD."""
+"""Long-running Jira agent — ticket fetch, transitions, and comment CRUD.
+
+Supports two back-ends selected via JIRA_BACKEND:
+  rest (default) — Jira REST API v3
+  mcp            — Atlassian Rovo MCP server (https://mcp.atlassian.com/v1/mcp)
+"""
 
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import base64
 import json
 import os
 import re
-import ssl
 import threading
 import time
-from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
@@ -36,6 +38,8 @@ JIRA_CLOUD_ID = os.environ.get("JIRA_CLOUD_ID", "").strip()
 CORP_CA_BUNDLE = (
     os.environ.get("CORP_CA_BUNDLE", "") or os.environ.get("SSL_CERT_FILE", "")
 )
+# Back-end selector: "rest" (default) | "mcp"
+JIRA_BACKEND = os.environ.get("JIRA_BACKEND", "rest").strip().lower()
 
 TASK_SEQ = 0
 TASKS = {}
@@ -50,7 +54,33 @@ _SKILL_GUIDE_PATH = os.path.join(
     "jira-cloud-workflow",
     "SKILL.md",
 )
-_DISCOVERED_CLOUD_ID = JIRA_CLOUD_ID
+
+
+# ---------------------------------------------------------------------------
+# Provider factory
+# ---------------------------------------------------------------------------
+
+def _make_provider():
+    from jira.providers.rest import JiraRESTProvider
+    from jira.providers.mcp import JiraMCPProvider
+
+    kwargs = dict(
+        jira_base_url=JIRA_BASE_URL,
+        jira_token=JIRA_TOKEN,
+        jira_email=JIRA_EMAIL,
+        jira_auth_mode=JIRA_AUTH_MODE,
+        jira_cloud_id=JIRA_CLOUD_ID,
+        jira_api_base_url=JIRA_API_BASE_URL,
+        corp_ca_bundle=CORP_CA_BUNDLE,
+    )
+    if JIRA_BACKEND == "mcp":
+        print(f"[{AGENT_ID}] Jira back-end: MCP (Atlassian Rovo MCP)")
+        return JiraMCPProvider(**kwargs)
+    print(f"[{AGENT_ID}] Jira back-end: REST API")
+    return JiraRESTProvider(**kwargs)
+
+
+PROVIDER = _make_provider()
 
 
 def _load_agent_card():
@@ -96,110 +126,6 @@ def _write_workspace_file(workspace_path, relative_name, content):
         handle.write(content)
 
 
-def _ssl_ctx():
-    ctx = ssl.create_default_context()
-    if CORP_CA_BUNDLE and os.path.isfile(CORP_CA_BUNDLE):
-        ctx.load_verify_locations(CORP_CA_BUNDLE)
-    return ctx
-
-
-def _jira_auth_header():
-    """Build the Jira Authorization header from env configuration."""
-    token = (JIRA_TOKEN or "").strip()
-    if not token:
-        return None
-
-    if token.lower().startswith(("basic ", "bearer ")):
-        return token
-
-    use_basic = JIRA_AUTH_MODE == "basic" or (
-        JIRA_AUTH_MODE == "auto" and bool(JIRA_EMAIL.strip())
-    )
-    if use_basic:
-        user = JIRA_EMAIL.strip()
-        if not user:
-            return None
-        basic_token = base64.b64encode(f"{user}:{token}".encode("utf-8")).decode("ascii")
-        return f"Basic {basic_token}"
-
-    return f"Bearer {token}"
-
-
-def _looks_like_atlassian_cloud_site(url):
-    netloc = urlparse(url or "").netloc.lower()
-    return netloc.endswith(".atlassian.net")
-
-
-def _discover_cloud_id():
-    global _DISCOVERED_CLOUD_ID
-
-    if _DISCOVERED_CLOUD_ID:
-        return _DISCOVERED_CLOUD_ID
-    if not _looks_like_atlassian_cloud_site(JIRA_BASE_URL):
-        return ""
-
-    request = Request(
-        f"{JIRA_BASE_URL.rstrip('/')}/_edge/tenant_info",
-        headers={"Accept": "application/json"},
-        method="GET",
-    )
-    try:
-        with urlopen(request, timeout=10, context=_ssl_ctx()) as resp:
-            raw = resp.read().decode("utf-8")
-            body = json.loads(raw) if raw.strip() else {}
-    except (HTTPError, URLError, OSError, json.JSONDecodeError):
-        return ""
-
-    cloud_id = str(body.get("cloudId") or body.get("cloudid") or "").strip()
-    if cloud_id:
-        _DISCOVERED_CLOUD_ID = cloud_id
-    return _DISCOVERED_CLOUD_ID
-
-
-def _scoped_api_base_url():
-    cloud_id = _discover_cloud_id()
-    if not cloud_id:
-        return ""
-    return f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3"
-
-
-def _candidate_api_base_urls():
-    primary = JIRA_API_BASE_URL.rstrip("/")
-    candidates = []
-    if _looks_like_atlassian_cloud_site(primary):
-        scoped = _scoped_api_base_url()
-        if scoped:
-            candidates.append(scoped)
-    if primary and primary not in candidates:
-        candidates.append(primary)
-    return candidates
-
-
-def _jira_request_once(api_base_url, method, path, payload=None):
-    url = f"{api_base_url.rstrip('/')}/{path.lstrip('/')}"
-    headers = {"Accept": "application/json"}
-    auth_header = _jira_auth_header()
-    if auth_header:
-        headers["Authorization"] = auth_header
-    data = None
-    if payload is not None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = Request(url, data=data, headers=headers, method=method)
-    try:
-        with urlopen(request, timeout=20, context=_ssl_ctx()) as resp:
-            raw = resp.read().decode("utf-8")
-            body = json.loads(raw) if raw.strip() else {}
-            return resp.status, body
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        try:
-            body = json.loads(raw)
-        except Exception:
-            body = {"error": raw[:500]}
-        return exc.code, body
-    except URLError as exc:
-        return 0, {"error": str(exc.reason)}
 
 
 def next_task_id():
@@ -360,243 +286,6 @@ def extract_ticket_url(text):
     return match.group(1).split("?", 1)[0] if match else ""
 
 
-def _jira_request(method, path, payload=None):
-    """Generic Jira REST API call. Returns (http_status, body_dict)."""
-    last_status, last_body = 0, {}
-    candidates = _candidate_api_base_urls()
-    for index, api_base_url in enumerate(candidates):
-        status, body = _jira_request_once(api_base_url, method, path, payload)
-        last_status, last_body = status, body
-        should_retry_scoped = (
-            index == 0
-            and len(candidates) > 1
-            and status in (401, 403, 404)
-        )
-        if not should_retry_scoped:
-            return status, body
-        debug_log(
-            AGENT_ID,
-            "jira.auth.retry_scoped_gateway",
-            apiBaseUrl=api_base_url,
-            path=path,
-            status=status,
-        )
-    return last_status, last_body
-
-
-def _text_to_adf(text):
-    value = str(text or "").strip()
-    if not value:
-        return {"type": "doc", "version": 1, "content": []}
-    return {
-        "type": "doc",
-        "version": 1,
-        "content": [
-            {
-                "type": "paragraph",
-                "content": [{"type": "text", "text": value}],
-            }
-        ],
-    }
-
-
-def _normalize_issue_fields(fields):
-    normalized = dict(fields) if isinstance(fields, dict) else {}
-    if isinstance(normalized.get("description"), str):
-        normalized["description"] = _text_to_adf(normalized["description"])
-    return normalized
-
-
-def _ticket_urls(ticket_key, browse_url=""):
-    if not ticket_key:
-        return browse_url or "", ""
-    api_candidates = _candidate_api_base_urls()
-    api_base_url = api_candidates[-1] if api_candidates else JIRA_API_BASE_URL.rstrip("/")
-    return (
-        (browse_url or "").strip(),
-        f"{api_base_url}/issue/{ticket_key}",
-    )
-
-
-def _fetch_issue(ticket_key, browse_url=""):
-    if not ticket_key:
-        return None, "no_ticket_key"
-    browse_url, _ = _ticket_urls(ticket_key, browse_url=browse_url)
-    debug_log(AGENT_ID, "jira.ticket.fetch.start",
-              ticketKey=ticket_key, browseUrl=browse_url)
-    status, body = _jira_request("GET", f"issue/{ticket_key}")
-    if status == 200:
-        debug_log(AGENT_ID, "jira.ticket.fetch.success",
-                  ticketKey=ticket_key, body=preview_data(body))
-        return body, "fetched"
-    debug_log(AGENT_ID, "jira.ticket.fetch.error",
-              ticketKey=ticket_key, status=status, body=preview_data(body))
-    return body, "fetch_failed"
-
-
-def _get_transitions(ticket_key):
-    if not ticket_key:
-        return [], "no_ticket_key"
-    status, body = _jira_request("GET", f"issue/{ticket_key}/transitions")
-    if status == 200:
-        return body.get("transitions", []), "ok"
-    return [], f"error_{status}"
-
-
-def _transition_issue(ticket_key, transition_name):
-    transitions, result = _get_transitions(ticket_key)
-    if result != "ok":
-        return None, f"could_not_fetch_transitions: {result}"
-    target_lower = transition_name.strip().lower()
-    match = None
-    for t in transitions:
-        if not isinstance(t, dict):
-            continue
-        name = t.get("name", "")
-        if name.lower() == target_lower or name.lower().startswith(target_lower):
-            match = t
-            break
-    if not match:
-        available = [t.get("name") for t in transitions if isinstance(t, dict)]
-        debug_log(AGENT_ID, "jira.ticket.transition.not_found",
-                  ticketKey=ticket_key, target=transition_name, available=available)
-        return None, f"transition_not_found (available: {available})"
-    tid = match.get("id")
-    transition_label = match.get("name", transition_name)
-    if not tid:
-        return None, "transition_missing_id"
-    debug_log(AGENT_ID, "jira.ticket.transition.apply",
-              ticketKey=ticket_key, transitionId=tid, transitionName=transition_label)
-    status, body = _jira_request(
-        "POST", f"issue/{ticket_key}/transitions", {"transition": {"id": tid}}
-    )
-    if status in (200, 204):
-        debug_log(AGENT_ID, "jira.ticket.transition.success",
-                  ticketKey=ticket_key, transitionName=transition_label)
-        return tid, f"transitioned_to:{transition_label}"
-    debug_log(AGENT_ID, "jira.ticket.transition.error",
-              ticketKey=ticket_key, status=status, body=preview_data(body))
-    return None, f"transition_failed_{status}"
-
-
-def _add_comment(ticket_key, text, adf_body=None):
-    """Post a comment. If adf_body is provided, use it directly as ADF; otherwise wrap text in ADF."""
-    if adf_body and isinstance(adf_body, dict):
-        body_content = adf_body
-    else:
-        body_content = {
-            "type": "doc", "version": 1,
-            "content": [{"type": "paragraph",
-                         "content": [{"type": "text", "text": str(text or "")}]}],
-        }
-    payload = {"body": body_content}
-    status, body = _jira_request("POST", f"issue/{ticket_key}/comment", payload)
-    if status == 201:
-        comment_id = body.get("id", "")
-        debug_log(AGENT_ID, "jira.comment.added",
-                  ticketKey=ticket_key, commentId=comment_id)
-        return comment_id, "added"
-    debug_log(AGENT_ID, "jira.comment.add_error",
-              ticketKey=ticket_key, status=status, body=preview_data(body))
-    return None, f"add_failed_{status}"
-
-
-def _update_comment(ticket_key, comment_id, new_text, adf_body=None):
-    if adf_body and isinstance(adf_body, dict):
-        body_content = adf_body
-    else:
-        body_content = {
-            "type": "doc", "version": 1,
-            "content": [{"type": "paragraph",
-                         "content": [{"type": "text", "text": str(new_text or "")}]}],
-        }
-    payload = {"body": body_content}
-    status, body = _jira_request(
-        "PUT", f"issue/{ticket_key}/comment/{comment_id}", payload
-    )
-    if status == 200:
-        debug_log(AGENT_ID, "jira.comment.updated",
-                  ticketKey=ticket_key, commentId=comment_id)
-        return comment_id, "updated"
-    debug_log(AGENT_ID, "jira.comment.update_error",
-              ticketKey=ticket_key, commentId=comment_id,
-              status=status, body=preview_data(body))
-    return None, f"update_failed_{status}"
-
-
-def _delete_comment(ticket_key, comment_id):
-    status, body = _jira_request(
-        "DELETE", f"issue/{ticket_key}/comment/{comment_id}"
-    )
-    if status in (200, 204):
-        debug_log(AGENT_ID, "jira.comment.deleted",
-                  ticketKey=ticket_key, commentId=comment_id)
-        return comment_id, "deleted"
-    debug_log(AGENT_ID, "jira.comment.delete_error",
-              ticketKey=ticket_key, commentId=comment_id,
-              status=status, body=preview_data(body))
-    return None, f"delete_failed_{status}"
-
-
-def _get_myself():
-    """Return the authenticated user's account info."""
-    status, body = _jira_request("GET", "myself")
-    if status == 200:
-        return body, "ok"
-    return body, f"error_{status}"
-
-
-def _search_issues(jql, max_results=10, fields=None):
-    if not jql:
-        return {"error": "missing_jql"}, "missing_jql"
-    payload = {"jql": jql, "maxResults": max(1, min(int(max_results or 10), 100))}
-    if fields:
-        payload["fields"] = fields
-    status, body = _jira_request("POST", "search/jql", payload)
-    if status == 200:
-        return body, "ok"
-    return body, f"error_{status}"
-
-
-def _create_issue(project_key, summary, issue_type, description="", fields=None):
-    payload_fields = _normalize_issue_fields(fields)
-    payload_fields.setdefault("project", {"key": project_key})
-    payload_fields.setdefault("summary", summary)
-    payload_fields.setdefault("issuetype", {"name": issue_type})
-    if description and "description" not in payload_fields:
-        payload_fields["description"] = _text_to_adf(description)
-    status, body = _jira_request("POST", "issue", {"fields": payload_fields})
-    if status == 201:
-        return body, "created"
-    return body, f"create_failed_{status}"
-
-
-def _update_issue_fields(ticket_key, fields):
-    payload_fields = _normalize_issue_fields(fields)
-    if not payload_fields:
-        return None, "missing_fields"
-    status, body = _jira_request("PUT", f"issue/{ticket_key}", {"fields": payload_fields})
-    if status in (200, 204):
-        return {"ticketKey": ticket_key}, "updated"
-    return body, f"update_failed_{status}"
-
-
-def _change_assignee(ticket_key, account_id):
-    """Assign ticket to the given Atlassian account ID. Pass None to unassign."""
-    payload = {"accountId": account_id}
-    status, body = _jira_request(
-        "PUT", f"issue/{ticket_key}/assignee", payload
-    )
-    if status in (200, 204):
-        debug_log(AGENT_ID, "jira.assignee.changed",
-                  ticketKey=ticket_key, accountId=account_id)
-        return account_id, "assigned"
-    debug_log(AGENT_ID, "jira.assignee.change_error",
-              ticketKey=ticket_key, accountId=account_id,
-              status=status, body=preview_data(body))
-    return None, f"assignee_failed_{status}"
-
-
 def process_message(message):
     user_text = extract_text(message)
     metadata = message.get("metadata", {})
@@ -608,18 +297,13 @@ def process_message(message):
         or extract_ticket_url(user_text)
     )
     ticket_key = trusted_ticket_key or extract_ticket_key(browse_url) or extract_ticket_key(user_text)
-    browse_url, _ = _ticket_urls(ticket_key, browse_url=browse_url)
+    browse_url = (browse_url or "").strip()
     skill_guide = _load_skill_guide()
-    debug_log(
-        AGENT_ID,
-        "jira.message.received",
-        ticketKey=ticket_key,
-        userText=user_text,
-    )
+    debug_log(AGENT_ID, "jira.message.received", ticketKey=ticket_key, userText=user_text)
     issue_payload = None
     fetch_status = "missing_explicit_ticket_url"
     if ticket_key:
-        issue_payload, fetch_status = _fetch_issue(ticket_key, browse_url=browse_url)
+        issue_payload, fetch_status = PROVIDER.fetch_issue(ticket_key)
 
     prompt = f"""
 You are the Jira Agent in a Constellation multi-agent software delivery system.
@@ -652,8 +336,8 @@ Return a concise operator-facing summary with these sections:
         )
     elif not browse_url and not trusted_ticket_key:
         summary = (
-            "No explicit Jira browse URL was found in the request, so the Jira agent did not fabricate one from configuration. "
-            "Provide the full Jira ticket URL to continue safely.\n\n"
+            "No explicit Jira browse URL was found in the request, so the Jira agent did not fabricate "
+            "one from configuration. Provide the full Jira ticket URL to continue safely.\n\n"
             f"LLM summary:\n{summary}"
         )
 
@@ -705,11 +389,8 @@ Return a concise operator-facing summary with these sections:
 
     status_text = f"Jira analysis completed for {ticket_key or 'request without ticket key'}."
     debug_log(
-        AGENT_ID,
-        "jira.message.completed",
-        ticketKey=ticket_key,
-        fetchStatus=fetch_status,
-        browseUrl=browse_url,
+        AGENT_ID, "jira.message.completed",
+        ticketKey=ticket_key, fetchStatus=fetch_status, browseUrl=browse_url,
     )
     return status_text, artifacts
 
@@ -734,7 +415,11 @@ class JiraHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
-            self._send_json(200, {"status": "ok", "agent_id": AGENT_ID})
+            self._send_json(200, {
+                "status": "ok",
+                "agent_id": AGENT_ID,
+                "backend": PROVIDER.backend_name,
+            })
             return
         task_match = re.fullmatch(r"/tasks/([^/]+)", path)
         if task_match:
@@ -752,28 +437,34 @@ class JiraHandler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/jira/tickets/([A-Z][A-Z0-9]+-\d+)", path)
         if m:
             key = m.group(1)
-            payload, status = _fetch_issue(key)
-            self._send_json(200 if status == "fetched" else 502,
-                            {"ticketKey": key, "status": status, "issue": payload})
+            issue, status = PROVIDER.fetch_issue(key)
+            self._send_json(
+                200 if status == "fetched" else 502,
+                {"ticketKey": key, "status": status, "issue": issue},
+            )
             return
 
         # GET /jira/transitions/{key}
         m = re.fullmatch(r"/jira/transitions/([A-Z][A-Z0-9]+-\d+)", path)
         if m:
             key = m.group(1)
-            transitions, result = _get_transitions(key)
-            self._send_json(200 if result == "ok" else 502,
-                            {"ticketKey": key, "result": result, "transitions": transitions})
+            transitions, result = PROVIDER.get_transitions(key)
+            self._send_json(
+                200 if result == "ok" else 502,
+                {"ticketKey": key, "result": result, "transitions": transitions},
+            )
             return
 
         # GET /jira/myself
         if path == "/jira/myself":
-            body, result = _get_myself()
-            self._send_json(200 if result == "ok" else 502,
-                            {"result": result, "user": body})
+            user, result = PROVIDER.get_myself()
+            self._send_json(
+                200 if result == "ok" else 502,
+                {"result": result, "user": user},
+            )
             return
 
-        # GET /jira/search?jql=key=DMPP-2647&maxResults=10&fields=summary,status
+        # GET /jira/search?jql=...&maxResults=10&fields=summary,status
         if path == "/jira/search":
             qs = parse_qs(urlparse(self.path).query)
             jql = (qs.get("jql") or qs.get("q") or [""])[0]
@@ -783,7 +474,7 @@ class JiraHandler(BaseHTTPRequestHandler):
             except ValueError:
                 max_results = 10
             fields = [item.strip() for item in fields_param.split(",") if item.strip()]
-            body, result = _search_issues(jql, max_results=max_results, fields=fields or None)
+            body, result = PROVIDER.search_issues(jql, max_results=max_results, fields=fields or None)
             self._send_json(
                 200 if result == "ok" else 502,
                 {"result": result, "jql": jql, "search": body},
@@ -837,9 +528,11 @@ class JiraHandler(BaseHTTPRequestHandler):
             if not name:
                 self._send_json(400, {"error": "missing transition name"})
                 return
-            tid, result = _transition_issue(key, name)
-            self._send_json(200 if tid else 422,
-                            {"ticketKey": key, "transitionId": tid, "result": result})
+            tid, result = PROVIDER.transition_issue(key, name)
+            self._send_json(
+                200 if tid else 422,
+                {"ticketKey": key, "transitionId": tid, "result": result},
+            )
             return
 
         # POST /jira/comments/{key}  body: {"text": "..."} or {"adf": {...}}
@@ -852,12 +545,14 @@ class JiraHandler(BaseHTTPRequestHandler):
             if not adf and not text:
                 self._send_json(400, {"error": "missing comment text or adf"})
                 return
-            cid, result = _add_comment(key, text, adf_body=adf)
-            self._send_json(201 if cid else 502,
-                            {"ticketKey": key, "commentId": cid, "result": result})
+            cid, result = PROVIDER.add_comment(key, text, adf_body=adf)
+            self._send_json(
+                201 if cid else 502,
+                {"ticketKey": key, "commentId": cid, "result": result},
+            )
             return
 
-        # POST /jira/tickets  body: {"projectKey":"DMPP","summary":"...","issueType":"Task"}
+        # POST /jira/tickets
         if path == "/jira/tickets":
             body = self._read_body()
             project_key = body.get("projectKey", "")
@@ -871,7 +566,9 @@ class JiraHandler(BaseHTTPRequestHandler):
             if not summary:
                 self._send_json(400, {"error": "missing summary"})
                 return
-            issue_body, result = _create_issue(project_key, summary, issue_type, description, fields)
+            issue_body, result = PROVIDER.create_issue(
+                project_key, summary, issue_type, description, fields
+            )
             issue_key = issue_body.get("key") if isinstance(issue_body, dict) else None
             self._send_json(
                 201 if result == "created" else 502,
@@ -881,27 +578,25 @@ class JiraHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         path = urlparse(self.path).path
-        # PUT /jira/tickets/{key}  body: {"fields": {"summary": "..."}}
+        # PUT /jira/tickets/{key}
         m = re.fullmatch(r"/jira/tickets/([A-Z][A-Z0-9]+-\d+)", path)
         if m:
             key = m.group(1)
             body = self._read_body()
             fields = body.get("fields") if isinstance(body.get("fields"), dict) else {
-                field_name: value
-                for field_name, value in body.items()
-                if field_name not in {"ticketKey"}
+                k: v for k, v in body.items() if k not in {"ticketKey"}
             }
             if not fields:
                 self._send_json(400, {"error": "missing fields"})
                 return
-            result_body, result = _update_issue_fields(key, fields)
+            result_body, result = PROVIDER.update_issue_fields(key, fields)
             self._send_json(
                 200 if result == "updated" else 502,
                 {"ticketKey": key, "result": result, "detail": result_body},
             )
             return
 
-        # PUT /jira/comments/{key}/{comment_id}  body: {"text": "..."}
+        # PUT /jira/comments/{key}/{comment_id}
         m = re.fullmatch(r"/jira/comments/([A-Z][A-Z0-9]+-\d+)/(\w+)", path)
         if m:
             key, cid_in = m.group(1), m.group(2)
@@ -910,12 +605,14 @@ class JiraHandler(BaseHTTPRequestHandler):
             if not text:
                 self._send_json(400, {"error": "missing comment text"})
                 return
-            cid, result = _update_comment(key, cid_in, text)
-            self._send_json(200 if cid else 502,
-                            {"ticketKey": key, "commentId": cid, "result": result})
+            cid, result = PROVIDER.update_comment(key, cid_in, text)
+            self._send_json(
+                200 if cid else 502,
+                {"ticketKey": key, "commentId": cid, "result": result},
+            )
             return
 
-        # PUT /jira/assignee/{key}  body: {"accountId": "..."}
+        # PUT /jira/assignee/{key}
         m = re.fullmatch(r"/jira/assignee/([A-Z][A-Z0-9]+-\d+)", path)
         if m:
             key = m.group(1)
@@ -924,9 +621,11 @@ class JiraHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "missing accountId"})
                 return
             account_id = body.get("accountId")
-            aid, result = _change_assignee(key, account_id)
-            self._send_json(200 if result == "assigned" else 502,
-                            {"ticketKey": key, "accountId": aid, "result": result})
+            aid, result = PROVIDER.change_assignee(key, account_id)
+            self._send_json(
+                200 if result == "assigned" else 502,
+                {"ticketKey": key, "accountId": aid, "result": result},
+            )
             return
 
         self._send_json(404, {"error": "not_found"})
@@ -937,9 +636,11 @@ class JiraHandler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/jira/comments/([A-Z][A-Z0-9]+-\d+)/(\w+)", path)
         if m:
             key, cid_in = m.group(1), m.group(2)
-            cid, result = _delete_comment(key, cid_in)
-            self._send_json(200 if cid else 502,
-                            {"ticketKey": key, "commentId": cid, "result": result})
+            cid, result = PROVIDER.delete_comment(key, cid_in)
+            self._send_json(
+                200 if cid else 502,
+                {"ticketKey": key, "commentId": cid, "result": result},
+            )
             return
         self._send_json(404, {"error": "not_found"})
 
@@ -952,7 +653,7 @@ class JiraHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"[jira-agent] Jira Agent starting on {HOST}:{PORT}")
+    print(f"[jira-agent] Jira Agent starting on {HOST}:{PORT} (backend={JIRA_BACKEND})")
     reporter = InstanceReporter(agent_id=AGENT_ID, service_url=ADVERTISED_URL, port=PORT)
     reporter.start()
     server = ThreadingHTTPServer((HOST, PORT), JiraHandler)
