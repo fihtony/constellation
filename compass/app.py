@@ -39,6 +39,11 @@ launcher = get_launcher()
 policy = PolicyEvaluator()
 
 TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+FIGMA_URL_RE = re.compile(r"https?://[^\s\"'\}]*figma\.com/[^\s\"'\}]+", re.IGNORECASE)
+STITCH_URL_RE = re.compile(
+    r"https?://[^\s\"'\}]*(?:stitch\.withgoogle\.com|stitch\.googleapis\.com)/[^\s\"'\}]+",
+    re.IGNORECASE,
+)
 NON_TERMINAL_TASK_STATES = {
     "SUBMITTED",
     "ROUTING",
@@ -104,6 +109,206 @@ def _read_workspace_json(workspace_path, relative_path):
         return payload if isinstance(payload, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _truncate_text(value, limit=180):
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "..."
+
+
+def _extract_design_reference(text):
+    figma = FIGMA_URL_RE.search(text or "")
+    if figma:
+        return figma.group().rstrip(".,;)\"'"), "figma"
+    stitch = STITCH_URL_RE.search(text or "")
+    if stitch:
+        return stitch.group().rstrip(".,;)\"'"), "stitch"
+    return "", ""
+
+
+def _read_workspace_log_sections(workspace_path, max_lines=40, max_chars=12000):
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return []
+
+    sections = []
+    for entry in os.listdir(workspace_path):
+        agent_dir = os.path.join(workspace_path, entry)
+        if not os.path.isdir(agent_dir):
+            continue
+        log_path = os.path.join(agent_dir, "command-log.txt")
+        if not os.path.isfile(log_path):
+            continue
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+                lines = handle.readlines()
+        except OSError:
+            continue
+        content = "".join(lines[-max_lines:]).strip()
+        if not content:
+            continue
+        if len(content) > max_chars:
+            content = content[-max_chars:]
+        sections.append({
+            "agentId": entry,
+            "title": entry.replace("-", " ").title(),
+            "lineCount": len(lines),
+            "updatedAt": os.path.getmtime(log_path),
+            "content": content,
+        })
+
+    sections.sort(key=lambda section: section["updatedAt"], reverse=True)
+    return sections
+
+
+def _has_jira_transition(jira_actions, target_status):
+    events = jira_actions.get("events") if isinstance(jira_actions.get("events"), list) else []
+    return any(
+        event.get("action") == "transition"
+        and event.get("status") == "completed"
+        and event.get("targetStatus") == target_status
+        for event in events
+    )
+
+
+def _refresh_task_card_metadata(task):
+    workspace_path = getattr(task, "workspace_path", "")
+    original_text = extract_text(task.original_message or {})
+
+    if not getattr(task, "summary", ""):
+        task.summary = _truncate_text(original_text, 180)
+    if not getattr(task, "jira_ticket_id", ""):
+        ticket_match = TICKET_RE.search(original_text or "")
+        task.jira_ticket_id = ticket_match.group(0) if ticket_match else ""
+    if not getattr(task, "design_url", ""):
+        design_url, design_type = _extract_design_reference(original_text)
+        task.design_url = design_url
+        task.design_type = design_type
+
+    analysis = {}
+    current_phase = ""
+    design_context = {}
+    jira_context = {}
+    plan = {}
+    pr_evidence = {}
+    jira_actions = {}
+
+    if workspace_path:
+        stage_summary = _read_workspace_json(workspace_path, "team-lead/stage-summary.json")
+        analysis = stage_summary.get("analysis") if isinstance(stage_summary.get("analysis"), dict) else {}
+        current_phase = str(stage_summary.get("currentPhase") or "")
+        design_context = _read_workspace_json(workspace_path, "team-lead/design-context.json")
+        jira_context = _read_workspace_json(workspace_path, "team-lead/jira-context.json")
+        plan = _read_workspace_json(workspace_path, "team-lead/plan.json")
+        pr_evidence = _read_workspace_json(workspace_path, "web-agent/pr-evidence.json")
+        jira_actions = _read_workspace_json(workspace_path, "web-agent/jira-actions.json")
+
+        task.summary = _truncate_text(
+            analysis.get("summary")
+            or task.status_message
+            or task.summary
+            or original_text,
+            220,
+        )
+        task.jira_ticket_id = (
+            str(
+                analysis.get("jira_ticket_key")
+                or jira_context.get("ticket_key")
+                or task.jira_ticket_id
+                or ""
+            )
+            .strip()
+        )
+        task.design_url = str(
+            design_context.get("url") or analysis.get("design_url") or task.design_url or ""
+        ).strip()
+        task.design_type = str(
+            design_context.get("type") or analysis.get("design_type") or task.design_type or ""
+        ).strip()
+
+    current_major_step = ""
+    if task.progress_steps:
+        current_major_step = str(task.progress_steps[-1].get("step") or "")
+    if not current_major_step:
+        current_major_step = current_phase or task.status_message or ""
+
+    return {
+        "analysis": analysis,
+        "designContext": design_context,
+        "jiraContext": jira_context,
+        "plan": plan,
+        "prEvidence": pr_evidence,
+        "jiraActions": jira_actions,
+        "currentMajorStep": current_major_step,
+        "commandLogSections": _read_workspace_log_sections(workspace_path),
+    }
+
+
+def _task_card_status(task_state, pr_evidence, jira_actions):
+    failed_states = {
+        "TASK_STATE_FAILED",
+        "FAILED",
+        "NO_CAPABLE_AGENT",
+        "CAPABILITY_TEMPORARILY_UNAVAILABLE",
+        "POLICY_DENIED",
+        "CAPACITY_EXHAUSTED",
+    }
+    if task_state == "TASK_STATE_INPUT_REQUIRED":
+        return "waiting_for_info", "Waiting for Info"
+    if task_state in failed_states:
+        return "failed", "Failed"
+    if task_state == "TASK_STATE_COMPLETED":
+        if pr_evidence.get("url"):
+            if _has_jira_transition(jira_actions, "In Review"):
+                return "completed", "Completed / In Review"
+            return "completed", "Completed / PR Raised"
+        return "completed", "Completed"
+    return "in_progress", "In Progress"
+
+
+def _serialize_task_card(task):
+    metadata = _refresh_task_card_metadata(task)
+    pr_evidence = metadata["prEvidence"] if isinstance(metadata["prEvidence"], dict) else {}
+    jira_actions = metadata["jiraActions"] if isinstance(metadata["jiraActions"], dict) else {}
+    status_kind, status_label = _task_card_status(task.state, pr_evidence, jira_actions)
+    design_context = metadata["designContext"] if isinstance(metadata["designContext"], dict) else {}
+
+    steps = []
+    for item in task.progress_steps[-8:]:
+        steps.append({
+            "step": item.get("step") or "",
+            "agentId": item.get("agentId") or "",
+            "ts": item.get("ts"),
+        })
+
+    return {
+        "id": task.task_id,
+        "contextId": task.context_id,
+        "state": task.state,
+        "statusMessage": task.status_message,
+        "statusKind": status_kind,
+        "statusLabel": status_label,
+        "summary": task.summary or _truncate_text(extract_text(task.original_message or {}), 220),
+        "jiraTicketId": task.jira_ticket_id,
+        "design": {
+            "url": task.design_url,
+            "type": task.design_type,
+            "pageName": design_context.get("page_name") or "",
+        },
+        "workflow": list(task.pending_workflow or []),
+        "createdAt": task.created_at,
+        "updatedAt": task.updated_at,
+        "workspacePath": task.workspace_path,
+        "requiresInput": task.state == "TASK_STATE_INPUT_REQUIRED",
+        "currentMajorStep": metadata["currentMajorStep"],
+        "progressSteps": steps,
+        "commandLogSections": metadata["commandLogSections"],
+        "pr": {
+            "url": pr_evidence.get("url") or "",
+            "branch": pr_evidence.get("branch") or "",
+        },
+    }
 
 
 def _extract_team_lead_completeness_issues(task, artifacts):
@@ -505,6 +710,11 @@ def _wait_for_downstream_completion(task, agent_id, capability, service_url, dow
                             "TASK_STATE_INPUT_REQUIRED",
                             callback_result.get("status_message", "Additional information required."),
                         )
+                        task_store.add_progress_step(
+                            task.task_id,
+                            callback_result.get("status_message", "Waiting for additional user input."),
+                            agent_id=agent_id,
+                        )
                         audit_log(
                             "TASK_INPUT_REQUIRED",
                             task_id=task.task_id,
@@ -538,6 +748,11 @@ def _wait_for_downstream_completion(task, agent_id, capability, service_url, dow
                                 task.task_id,
                                 "TASK_STATE_INPUT_REQUIRED",
                                 polled_result.get("status_message", "Additional information required."),
+                            )
+                            task_store.add_progress_step(
+                                task.task_id,
+                                polled_result.get("status_message", "Waiting for additional user input."),
+                                agent_id=agent_id,
                             )
                             audit_log(
                                 "TASK_INPUT_REQUIRED",
@@ -838,6 +1053,12 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
     task.workspace_path = _create_shared_workspace(task.task_id)
     task.original_message = deep_copy_json(message)
     user_text = extract_text(message)
+    task.summary = _truncate_text(user_text, 180)
+    ticket_match = TICKET_RE.search(user_text or "")
+    task.jira_ticket_id = ticket_match.group(0) if ticket_match else ""
+    design_url, design_type = _extract_design_reference(user_text)
+    task.design_url = design_url
+    task.design_type = design_type
     workflow = (
         forced_workflow
         or ([requested_capability] if requested_capability else _infer_capability_workflow(user_text))
@@ -862,6 +1083,11 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
         },
     )
     task_store.update_state(task.task_id, "ROUTING", f"Planned workflow: {', '.join(workflow)}")
+    task_store.add_progress_step(
+        task.task_id,
+        "Task created and queued in Compass.",
+        agent_id="compass-agent",
+    )
     task_store.add_progress_step(
         task.task_id,
         f"Created shared workspace: {task.workspace_path}",
@@ -931,6 +1157,20 @@ class CompassHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 since = 0
             self._send_json(200, _read_agent_logs(since=since))
+            return
+
+        if path == "/api/tasks":
+            cards = [_serialize_task_card(task) for task in task_store.list_tasks()]
+            self._send_json(200, {"tasks": cards})
+            return
+
+        m = re.fullmatch(r"/api/tasks/([^/]+)/card", path)
+        if m:
+            task = task_store.get(m.group(1))
+            if not task:
+                self._send_json(404, {"error": "task_not_found"})
+                return
+            self._send_json(200, {"task": _serialize_task_card(task)})
             return
 
         if path.startswith("/tasks/"):
@@ -1054,6 +1294,11 @@ class CompassHandler(BaseHTTPRequestHandler):
                             "TASK_STATE_WORKING",
                             "User provided additional information. Resuming…",
                         )
+                        task_store.add_progress_step(
+                            context_id,
+                            "User provided additional information. Resuming task.",
+                            agent_id="compass-agent",
+                        )
                         if getattr(prior_task, "workspace_path", ""):
                             record_workspace_stage(
                                 prior_task.workspace_path,
@@ -1100,7 +1345,12 @@ class CompassHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # Suppress noisy health-check, agent-card polls, and debug log polling
         line = args[0] if args else ""
-        if any(p in line for p in ("/health", "/.well-known/agent-card.json", "/debug/agent-logs")):
+        if any(p in line for p in (
+            "/health",
+            "/.well-known/agent-card.json",
+            "/debug/agent-logs",
+            "/api/tasks",
+        )):
             return
         print(f"[compass] {line} {args[1] if len(args) > 1 else ''} {args[2] if len(args) > 2 else ''}")
 

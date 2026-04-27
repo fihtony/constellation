@@ -772,6 +772,8 @@ def _generate_pr_description(
             design_parts.append(f"Design URL: {design_context_meta['url']}")
         if design_context_meta.get("page_name"):
             design_parts.append(f"Screen: {design_context_meta['page_name']}")
+        if design_context_meta.get("thumbnailUrl"):
+            design_parts.append(f"thumbnail_url: {design_context_meta['thumbnailUrl']}")
     design_reference = "\n".join(design_parts) if design_parts else "No design reference provided."
 
     # Build test evidence block
@@ -1756,6 +1758,240 @@ def _build_and_test_with_recovery(
     return False, output, attempts
 
 
+# ---------------------------------------------------------------------------
+# .gitignore generation
+# ---------------------------------------------------------------------------
+
+def _generate_gitignore_content(analysis: dict) -> str:
+    """Generate a .gitignore appropriate for the project's tech stack."""
+    backend = str(analysis.get("backend_framework", "")).lower()
+    frontend = str(analysis.get("frontend_framework", "")).lower()
+    language = str(analysis.get("language", "")).lower()
+
+    lines = []
+    if language == "python" or backend in ("flask", "django", "fastapi"):
+        lines += [
+            "# Python",
+            "__pycache__/",
+            "*.py[cod]",
+            "*$py.class",
+            "*.so",
+            "venv/",
+            ".venv/",
+            "env/",
+            "ENV/",
+            "*.egg",
+            "*.egg-info/",
+            "dist/",
+            "build/",
+            ".eggs/",
+            "",
+            "# Testing",
+            ".pytest_cache/",
+            ".coverage",
+            "htmlcov/",
+            "*.log",
+            "",
+            "# Environment",
+            ".env",
+            ".env.local",
+        ]
+    if frontend not in ("none", "") or language in ("javascript", "typescript"):
+        lines += [
+            "",
+            "# Node.js",
+            "node_modules/",
+            ".npm",
+            "npm-debug.log*",
+            "yarn-error.log*",
+            "",
+            "# Build output",
+            ".next/",
+            "out/",
+        ]
+    lines += [
+        "",
+        "# IDE",
+        ".idea/",
+        ".vscode/",
+        "*.swp",
+        "*.swo",
+        "",
+        "# OS",
+        ".DS_Store",
+        "Thumbs.db",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# UI evidence: design reference download + implementation screenshot
+# ---------------------------------------------------------------------------
+
+def _get_design_thumbnail_url(workspace: str) -> str:
+    """Extract the design thumbnail URL from ui-design/stitch-design.json in the workspace."""
+    if not workspace:
+        return ""
+    stitch_path = os.path.join(workspace, "ui-design", "stitch-design.json")
+    if not os.path.isfile(stitch_path):
+        return ""
+    try:
+        with open(stitch_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        # Prefer screen-level imageUrls (present when a specific screen was fetched)
+        image_urls = data.get("imageUrls") or []
+        if image_urls and image_urls[0]:
+            return image_urls[0]
+        # Fallback: project-level thumbnailScreenshot from the JSON-encoded "text" field
+        for raw in [data.get("text", "")] + [
+            item.get("text", "") for item in (data.get("content") or []) if isinstance(item, dict)
+        ]:
+            if not raw:
+                continue
+            try:
+                inner = json.loads(raw)
+                url = (inner.get("thumbnailScreenshot") or {}).get("downloadUrl", "")
+                if url:
+                    return url
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ""
+
+
+def _download_url_to_file(url: str, dest_path: str) -> bool:
+    """Download a URL to a local file. Returns True on success."""
+    try:
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=15) as resp:
+            data = resp.read()
+        with open(dest_path, "wb") as fh:
+            fh.write(data)
+        return os.path.getsize(dest_path) > 0
+    except Exception as exc:
+        print(f"[{AGENT_ID}] download failed ({url[:60]}): {exc}")
+        return False
+
+
+def _take_ui_screenshot(
+    build_dir: str,
+    python_executable: str,
+    out_path: str,
+    log_fn,
+) -> bool:
+    """
+    Start the Flask app on a free port and take a headless chromium screenshot.
+    Returns True if a screenshot was successfully saved to out_path.
+    """
+    import shutil
+    import socket
+    import time
+
+    chromium_bin = (
+        shutil.which("chromium")
+        or shutil.which("chromium-browser")
+        or shutil.which("google-chrome")
+        or shutil.which("google-chrome-stable")
+    )
+    if not chromium_bin:
+        log_fn("chromium not found — skipping UI screenshot")
+        return False
+
+    # Find a free port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    # Auto-detect Flask app module for FLASK_APP env var
+    flask_app_module = "app"
+    for candidate_file, candidate_mod in [
+        ("app/__init__.py", "app"),
+        ("app.py", "app"),
+        ("wsgi.py", "wsgi"),
+    ]:
+        fp = os.path.join(build_dir, candidate_file)
+        if os.path.isfile(fp):
+            try:
+                with open(fp, encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                if "create_app" in content:
+                    flask_app_module = f"{candidate_mod}:create_app()"
+                elif "Flask(" in content:
+                    flask_app_module = candidate_mod
+                break
+            except Exception:
+                pass
+
+    env = {
+        **os.environ,
+        "FLASK_APP": flask_app_module,
+        "FLASK_ENV": "testing",
+        "FLASK_DEBUG": "0",
+        "PORT": str(port),
+    }
+    url = f"http://127.0.0.1:{port}/"
+
+    proc = None
+    try:
+        # Prefer `flask run` to avoid hard-coded ports in run.py
+        proc = subprocess.Popen(
+            [python_executable, "-m", "flask", "run",
+             "--host=127.0.0.1", f"--port={port}", "--no-debugger"],
+            cwd=build_dir,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # Wait up to 10 s for the app to respond
+        started = False
+        for _ in range(20):
+            time.sleep(0.5)
+            if proc.poll() is not None:
+                break
+            try:
+                urlopen(url, timeout=2).read()
+                started = True
+                break
+            except Exception:
+                pass
+
+        if not started:
+            log_fn(f"Flask app did not start on port {port} — skipping screenshot")
+            return False
+
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        result = subprocess.run(
+            [
+                chromium_bin,
+                "--headless", "--no-sandbox", "--disable-gpu",
+                "--disable-dev-shm-usage",
+                f"--screenshot={out_path}",
+                "--window-size=1280,900",
+                url,
+            ],
+            timeout=30,
+            capture_output=True,
+        )
+        if result.returncode == 0 and os.path.isfile(out_path):
+            log_fn(f"Implementation screenshot saved ({os.path.getsize(out_path) // 1024} KB)")
+            return True
+        stderr_text = (result.stderr or b"").decode(errors="replace")[:200]
+        log_fn(f"Screenshot failed: {stderr_text or 'unknown error'}")
+        return False
+    except Exception as exc:
+        log_fn(f"Screenshot error: {exc}")
+        return False
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+
 
 # ---------------------------------------------------------------------------
 # Main workflow
@@ -1839,7 +2075,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 indent=2,
             ),
         )
-        _report_progress(compass_url, compass_task_id, f"[Web Agent] {phase}")
+        _report_progress(compass_url, compass_task_id, phase)
 
     try:
         audit_log("TASK_STARTED", task_id=task_id, compass_task_id=compass_task_id)
@@ -2024,6 +2260,23 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             )
         log(f"Plan ready — {len(files_to_implement)} file(s) to implement")
 
+        # ── Auto-inject .gitignore if missing from plan and repo ─────────────
+        _planned_paths_lower = {fi.get("path", "").lower() for fi in files_to_implement}
+        if ".gitignore" not in _planned_paths_lower:
+            _existing_gitignore = clone_path and os.path.isfile(os.path.join(clone_path, ".gitignore"))
+            if not _existing_gitignore:
+                gitignore_content = _generate_gitignore_content(analysis)
+                files_to_implement.insert(0, {
+                    "path": ".gitignore",
+                    "action": "create",
+                    "purpose": "Standard .gitignore for the project tech stack",
+                    "key_logic": gitignore_content,
+                    "content": gitignore_content,  # pre-generated — no LLM call needed
+                    "dependencies": [],
+                })
+                plan["files"] = files_to_implement
+                log("Auto-added .gitignore to plan")
+
         if not files_to_implement:
             raise RuntimeError("LLM returned an empty file plan — cannot proceed.")
 
@@ -2091,15 +2344,19 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     except Exception:
                         pass
 
-            code = _generate_file_code(
-                file_info,
-                task_instruction,
-                analysis,
-                context_summary,
-                existing_content,
-            )
-            # Strip any residual markdown fences from LLM output
-            code = _strip_code_fences(code)
+            # Use pre-generated content if available (e.g. auto-injected .gitignore)
+            if file_info.get("content"):
+                code = file_info["content"]
+            else:
+                code = _generate_file_code(
+                    file_info,
+                    task_instruction,
+                    analysis,
+                    context_summary,
+                    existing_content,
+                )
+                # Strip any residual markdown fences from LLM output
+                code = _strip_code_fences(code)
 
             generated_files.append({"path": file_path, "content": code, "action": file_info.get("action", "create")})
 
@@ -2160,6 +2417,52 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     indent=2,
                 ),
             )
+
+        # ── Phase 5c: Capture UI evidence (design reference + screenshot) ────
+        _is_ui_task = (
+            analysis.get("frontend_framework", "none") not in ("none", "")
+            or any(fi.get("path", "").endswith(".html") for fi in generated_files)
+            or analysis.get("scope") in ("frontend_only", "fullstack")
+        )
+        if _is_ui_task and workspace:
+            evidence_dir = os.path.join(workspace, AGENT_ID)
+            os.makedirs(evidence_dir, exist_ok=True)
+            log("Capturing UI evidence (design reference + implementation screenshot)")
+
+            # 1. Design reference — download Stitch thumbnail if available
+            thumbnail_url = _get_design_thumbnail_url(workspace)
+            if thumbnail_url:
+                design_ref_path = os.path.join(evidence_dir, "design-reference.png")
+                if _download_url_to_file(thumbnail_url, design_ref_path):
+                    log("Design reference screenshot downloaded")
+                    _save_workspace_file(
+                        workspace,
+                        f"{AGENT_ID}/design-reference-url.txt",
+                        thumbnail_url,
+                    )
+                else:
+                    log(f"Could not download design reference — URL saved as text")
+                    _save_workspace_file(
+                        workspace,
+                        f"{AGENT_ID}/design-reference-url.txt",
+                        thumbnail_url,
+                    )
+
+            # 2. Implementation screenshot — headless chromium (best-effort)
+            if build_dir and build_ok:
+                py_exec = _ensure_local_python_env(
+                    build_dir, analysis.get("language", "python"), log
+                )
+                impl_screenshot_path = os.path.join(evidence_dir, "implementation-screenshot.png")
+                if _take_ui_screenshot(build_dir, py_exec, impl_screenshot_path, log):
+                    # Replace any LLM-generated placeholder with the real binary PNG
+                    import shutil as _shutil
+                    for _rel in ("work/screenshots/index.png", ".work/screenshots/index.png"):
+                        _placeholder = os.path.join(build_dir, _rel)
+                        if os.path.exists(_placeholder):
+                            os.makedirs(os.path.dirname(_placeholder), exist_ok=True)
+                            _shutil.copy2(impl_screenshot_path, _placeholder)
+                            log(f"Replaced placeholder screenshot at {_rel}")
 
         if clone_path and branch_name:
             if not branch_kind:

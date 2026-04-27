@@ -90,6 +90,14 @@ Critical planning rules:
 - NEVER include `scripts/` helper files whose sole purpose is running Jira updates,
   branch creation commands, or PR instructions — these are operational scaffolding,
   not source code deliverables.
+- Always include `.gitignore` if it is missing from the repository or does not cover the
+  project's tech stack. For Python/Flask include: `__pycache__/`, `*.pyc`, `venv/`, `.venv/`,
+  `.env`, `.pytest_cache/`, `*.egg-info/`, `dist/`, `build/`. For Node.js include:
+  `node_modules/`, `.next/`, `dist/`, `.env`.
+- Always include `README.md` (action: `modify` if the file already exists, `create` if missing).
+  The README must describe the project, list the tech stack, and include setup and run instructions.
+  For a Flask project, include: how to install dependencies (`pip install -r requirements.txt`),
+  how to run the dev server (`python run.py` or `flask run`), and how to run tests (`pytest`).
 
 Important rules for Flask backends:
 - The Flask app must use: `app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))`
@@ -206,7 +214,9 @@ for a single file as instructed. The code must:
 5. Follow OWASP security guidelines (no SQL injection, XSS, etc.)
 6. For Flask apps: use `app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))`
    so templates resolve correctly regardless of working directory.
-7. For pytest tests of Flask apps: import the app object, set `app.testing = True`, use `app.test_client()`.
+7. For Flask `run.py`: always read the port from `int(os.environ.get("PORT", 5000))` to support
+   dynamic port assignment during testing and screenshots.
+8. For pytest tests of Flask apps: import the app object, set `app.testing = True`, use `app.test_client()`.
    Never use subprocess or assume a specific cwd.
 
 CRITICAL: Output ONLY the raw source code. Do NOT wrap it in markdown code fences.
@@ -279,13 +289,19 @@ Format:
   ## Design Reference
     (If a design URL or Stitch/Figma screen was provided, include it here.
      List the design URL and the key design requirements that were implemented.
-     Add a note: "Screenshots: please verify the rendered page matches the design above.")
+     If a thumbnail_url is provided in the design reference, embed it as a Markdown image:
+     ![Design Reference](<thumbnail_url>)
+     Note: "Attach the implementation screenshot from the workspace artifacts for visual comparison.")
+  ## Screenshots
+    (If an implementation screenshot was captured, note it is saved as
+     `web-agent/implementation-screenshot.png` in the workspace artifacts.
+     Reviewers should compare it against the design reference above.)
   ## Testing
     (Describe what tests were written and/or the test results.
      If test output was provided, include a short summary of pass/fail counts.
      If this is a UI implementation, note how to run the app locally for visual verification.)
   ## Checklist
-    - [ ] UI matches the Stitch/Figma design (visual review required)
+    - [ ] UI matches the Stitch/Figma design (visual review required — see screenshots above)
     - [ ] All tests pass locally
     - [ ] No unnecessary files committed (no .work/, no scripts/ helpers)
 ]

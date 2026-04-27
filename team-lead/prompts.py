@@ -65,6 +65,10 @@ Rules:
 - Set needs_jira_fetch to true only if a Jira ticket key like PROJ-123 is mentioned.
 - Set needs_design_context to true if a Figma URL or Google Stitch URL is present.
 - Extract target_repo_url from anywhere in the context (user message, Jira ticket, additional context).
+- Extract design_page_name from anywhere in the context (user message, Jira ticket description,
+  additional_context). Look for mentions of a specific page, screen, or component name in the
+  design tool — for example "Landing Page (Bare-bones)", "Practice Quiz", "Home Screen", etc.
+  If the Jira ticket description or summary names a specific screen, use that as design_page_name.
 - If Jira raw payload or repository context already contains a repo URL, default branch,
   design URL, or framework detail, treat that as discovered information instead of
   asking the user again.
@@ -171,15 +175,21 @@ Check:
    - Reject if requires_tests is true but no test files are present
 3. No obvious bugs, edge cases, or security issues
 4. Code quality is acceptable
-5. Development workflow was followed: Jira ticket transitioned to In Progress and In Review,
+5. Best practices followed: .gitignore present, README.md present with setup/run instructions
+6. Development workflow was followed: Jira ticket transitioned to In Progress and In Review,
    PR was created, and a Jira comment with PR link was posted
-6. Design fidelity (if design context was provided):
+7. Design fidelity (if design context was provided):
    - The PR description references the design URL
+   - The PR description embeds the design thumbnail or references the design image
+   - `web-agent/design-reference.png` and `web-agent/implementation-screenshot.png` should be
+     noted as workspace artifacts for visual comparison
    - The implementation matches the design layout, colours, and component structure
    - Any deviations from the design are explicitly called out and justified
-7. No unnecessary files committed to the PR:
+8. No unnecessary files committed to the PR:
    - .work/ evidence directories must NOT be in the PR
    - scripts/ operational helpers (Jira update scripts, branch creation instructions) must NOT be in the PR
+
+The `score` field MUST always be a number 0-100. Never omit it or set it to null.
 
 Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
 """

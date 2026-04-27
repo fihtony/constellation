@@ -308,11 +308,34 @@ def _build_dev_task_metadata(
         ),
     }
     if design_context and (design_context.get("content") or design_context.get("url")):
+        # Try to read the Stitch thumbnail URL saved to the workspace
+        _thumbnail_url = ""
+        _stitch_path = os.path.join(workspace, "ui-design", "stitch-design.json") if workspace else ""
+        if _stitch_path and os.path.isfile(_stitch_path):
+            try:
+                with open(_stitch_path, encoding="utf-8") as _f:
+                    _stitch_data = json.load(_f)
+                for _raw in [_stitch_data.get("text", "")] + [
+                    _item.get("text", "") for _item in (_stitch_data.get("content") or [])
+                    if isinstance(_item, dict)
+                ]:
+                    if _raw:
+                        try:
+                            _inner = json.loads(_raw)
+                            _url = (_inner.get("thumbnailScreenshot") or {}).get("downloadUrl", "")
+                            if _url:
+                                _thumbnail_url = _url
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         metadata["designContext"] = {
             "url": design_context.get("url", ""),
             "type": design_context.get("type", ""),
             "content": (design_context.get("content") or "")[:4000],
             "page_name": design_context.get("page_name", ""),
+            "thumbnailUrl": _thumbnail_url,
         }
     if is_revision:
         metadata.update(
@@ -1373,7 +1396,9 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             )
 
             passed = review.get("passed", True)
-            score = review.get("score", "N/A")
+            score = review.get("score")
+            if score is None:
+                score = "N/A"
             review_summary = review.get("summary", "")
             log(f"Review result — passed={passed}, score={score}: {review_summary}")
 
@@ -1492,7 +1517,11 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         all_artifacts = [final_summary_artifact] + (final_artifacts or [])
 
         task_store.update_state(team_lead_task_id, "TASK_STATE_COMPLETED", summary)
-        log("Task completed successfully")
+        _final_review_passed = (ctx.review_result or {}).get("passed", True)
+        if _final_review_passed:
+            log("Task completed successfully")
+        else:
+            log("Task completed with review issues noted (max review cycles reached — proceeding with defects logged)")
         audit_log(
             "TASK_COMPLETED",
             task_id=team_lead_task_id,
