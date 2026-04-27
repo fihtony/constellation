@@ -20,6 +20,11 @@ Copilot CLI checks credentials in this priority order:
 
 **For containers, always use `COPILOT_GITHUB_TOKEN`.**
 
+Constellation policy override:
+- Even though Copilot CLI itself can fall back to `GH_TOKEN`, `GITHUB_TOKEN`, keychain, or `gh auth`, Constellation agents must not allow those fallback paths.
+- Inside Constellation, only the file-backed `COPILOT_GITHUB_TOKEN` from `.env` is valid. Agent runtimes must build an isolated home/config directory and scrub all generic GitHub credential variables before launching `copilot`.
+- If a launcher or test injects a file-backed `COPILOT_GITHUB_TOKEN` into a child process, it must also set `CONSTELLATION_TRUSTED_ENV=1` for that child after removing inherited host GitHub credentials.
+
 ### Required PAT permissions
 
 Create a fine-grained PAT at https://github.com/settings/personal-access-tokens/new:
@@ -84,6 +89,8 @@ copilot --model gpt-5-mini -sp "Write a hello_world() function in Python"
 import os
 import subprocess
 
+from common.env_utils import build_isolated_copilot_env
+
 COPILOT_TOKEN = os.environ.get("COPILOT_GITHUB_TOKEN", "")
 MODEL = os.environ.get("COPILOT_MODEL", "gpt-5-mini")
 
@@ -93,8 +100,7 @@ def run_copilot(prompt: str, timeout: int = 60) -> tuple[bool, str]:
         return False, "COPILOT_GITHUB_TOKEN is not set."
 
     cmd = ["copilot", "--model", MODEL, "-sp", prompt]
-    env = dict(os.environ)
-    env["COPILOT_GITHUB_TOKEN"] = COPILOT_TOKEN
+    env = build_isolated_copilot_env(COPILOT_TOKEN, os.environ)
 
     try:
         result = subprocess.run(
@@ -179,6 +185,8 @@ COPILOT_MODEL=gpt-5-mini
 # Optional: set custom Copilot home dir (default: ~/.copilot)
 COPILOT_HOME=/workspace/.copilot
 ```
+
+Do not set `GH_TOKEN` or `GITHUB_TOKEN` for Constellation agents. Those variables are intentionally ignored for runtime isolation.
 
 ---
 

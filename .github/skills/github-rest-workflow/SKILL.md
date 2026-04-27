@@ -36,6 +36,8 @@ Set `SCM_TOKEN=<token>` in `scm/.env`.
 Constellation runtime isolation rule:
 - SCM agent git subprocesses must use only `SCM_TOKEN`-derived auth (`http.extraHeader` or tokenized HTTPS URL).
 - Agent-side git commands are isolated from host credential helpers and host keychains; do not depend on macOS Keychain, `gh auth`, or user-level `~/.gitconfig` when validating container behavior.
+- `GH_TOKEN`, `GITHUB_TOKEN`, and other ambient host GitHub credentials are not valid inputs for Constellation agents. Use only the dedicated token stored in `scm/.env`.
+- Launchers or tests that intentionally inject file-backed credentials into child processes must mark them with `CONSTELLATION_TRUSTED_ENV=1`; this flag is only for values that already came from `scm/.env`, `common/.env`, or `tests/.env`.
 
 ## Provider Selection
 
@@ -138,6 +140,8 @@ python3 tests/test_scm_agent.py --agent-url http://localhost:8020
 # Container agent tests
 python3 tests/test_scm_agent.py --agent-url http://localhost:8020
 ```
+
+All GitHub REST tests must read credentials only from `tests/.env` (`TEST_GITHUB_TOKEN`). Do not rely on shell-exported `GH_TOKEN`, `GITHUB_TOKEN`, macOS Keychain entries, or `gh auth` state.
 
 ## Common Errors
 

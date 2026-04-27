@@ -12,6 +12,8 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from common.env_utils import sanitize_credential_env
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 
 
@@ -118,12 +120,23 @@ def run_command(args, cwd=None, env=None, timeout=120):
     completed = subprocess.run(
         args,
         cwd=cwd,
-        env=env,
+        env=env if env is not None else build_test_subprocess_env(),
         capture_output=True,
         text=True,
         timeout=timeout,
     )
     return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+
+
+def build_test_subprocess_env(overrides=None, *, trusted=False):
+    env = sanitize_credential_env(os.environ)
+    for key, value in (overrides or {}).items():
+        if value is None:
+            continue
+        env[str(key)] = str(value)
+    if trusted:
+        env["CONSTELLATION_TRUSTED_ENV"] = "1"
+    return env
 
 
 def agent_url_from_args(args, *, local_default, container_default):

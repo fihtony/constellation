@@ -22,6 +22,11 @@ user-invocable: true
 Same token as REST — set `SCM_TOKEN` in `scm/.env`.
 The remote MCP server authenticates via `Authorization: Bearer <token>` HTTP header.
 
+Constellation isolation rule:
+- Do not use host `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth`, or system keychain state as MCP credentials.
+- Agent execution may use only the dedicated token from `scm/.env`.
+- Tests may use only the dedicated token from `tests/.env`; any child process that receives a file-backed override must be started with `CONSTELLATION_TRUSTED_ENV=1` after inherited host GitHub credentials have been stripped.
+
 Required fine-grained repository permissions (same as REST):
 - **Contents** → Read and write
 - **Pull requests** → Read and write
@@ -202,6 +207,8 @@ python3 tests/test_github_mcp.py --integration -v
 All tests read config exclusively from `tests/.env`:
 - `TEST_GITHUB_TOKEN` — GitHub PAT
 - `TEST_GITHUB_REPO_URL` — target repo URL
+
+Treat `tests/.env` as the only valid source of GitHub credentials during MCP testing. Shell-exported GitHub tokens and host keychain state are out of policy.
 
 ## SCM Agent with MCP back-end
 

@@ -10,7 +10,7 @@ are consulted.  Fail-fast with a clear error if required keys are missing.
 
 Required keys in tests/.env:
   TEST_GITHUB_REPO_URL   Full repo URL (e.g. https://github.com/owner/repo)
-  TEST_GITHUB_TOKEN      GitHub personal access token (scope: repo)
+    TEST_GITHUB_TOKEN      Dedicated GitHub test token for Constellation integration runs
 
 Usage:
     python3 tests/test_github_mcp.py              # dry-run (no network)

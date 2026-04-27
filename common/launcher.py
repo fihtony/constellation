@@ -144,6 +144,7 @@ class Launcher:
             "ADVERTISED_BASE_URL": service_url,
             "CONTAINER_ID": container_name,
             "AUTO_STOP_AFTER_TASK": "1",
+            "CONSTELLATION_TRUSTED_ENV": "1",
         })
 
         payload = {

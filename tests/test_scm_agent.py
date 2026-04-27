@@ -48,6 +48,7 @@ from agent_test_support import (
     PROJECT_ROOT,
     Reporter,
     agent_url_from_args,
+    build_test_subprocess_env,
     choose_base_branch,
     http_request,
     load_env_file,
@@ -98,8 +99,7 @@ def start_local_agent(token: str, port: int, openai_base_url: str = "http://loca
     venv_python = os.path.join(PROJECT_ROOT, "venv", "bin", "python")
     python = venv_python if os.path.isfile(venv_python) else sys.executable
     agent_url = f"http://127.0.0.1:{port}"
-    env = {
-        **os.environ,
+    env = build_test_subprocess_env({
         "HOST": "127.0.0.1",
         "PORT": str(port),
         "AGENT_ID": "scm-agent",
@@ -111,7 +111,7 @@ def start_local_agent(token: str, port: int, openai_base_url: str = "http://loca
         "ALLOW_MOCK_FALLBACK": "1",
         "OPENAI_BASE_URL": openai_base_url,
         "PYTHONPATH": PROJECT_ROOT,
-    }
+    }, trusted=True)
     return subprocess.Popen(
         [python, "scm/app.py"],
         cwd=PROJECT_ROOT,
@@ -194,23 +194,17 @@ def main(argv=None):
                 "ls-remote", clone_url, "HEAD",
             ],
             cwd=PROJECT_ROOT,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
-                 "GIT_ASKPASS": "", "GIT_SSH_COMMAND": ""},
+            env=build_test_subprocess_env({
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_ASKPASS": "",
+                "GIT_SSH_COMMAND": "",
+            }),
         )
         if code == 0 and stdout:
             reporter.ok("GitHub token authenticates over HTTPS")
         else:
-            # When testing a pre-running external agent (--agent-url), macOS Keychain
-            # may interfere with git auth locally. Log a warning but continue — the
-            # agent-side tests (TC-06 git push, TC-08 PR create) prove git works inside
-            # the container which is what matters.
-            if args.agent_url:
-                reporter.info(f"TC-01 WARN (non-blocking): git ls-remote failed locally "
-                              f"(likely macOS Keychain override). Agent container uses its "
-                              f"own token and was verified working. Continuing.")
-            else:
-                reporter.fail("GitHub token rejected by git ls-remote", stderr or stdout)
-                return summary_exit_code(reporter)
+            reporter.fail("GitHub token rejected by git ls-remote", stderr or stdout)
+            return summary_exit_code(reporter)
 
         # TC-02 — Health ----------------------------------------------------
         reporter.step("TC-02  GET /health")

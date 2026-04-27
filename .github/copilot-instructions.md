@@ -713,8 +713,10 @@ Before submitting a new agent, verify:
 ## Shared Runtime Notes
 
 - LLM-enabled agents (`team-lead`, `web`, `jira`, `scm`, `ui-design`) should load shared defaults from `common/.env` first, then apply their local `.env` overrides.
+- Protected GitHub/SCM credential variables (`GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `SCM_TOKEN`, `SCM_USERNAME`, `SCM_PASSWORD`, `TEST_GITHUB_TOKEN`) are file-backed by default. Ambient host values must be ignored unless a launcher or test has already loaded its own `.env` and explicitly marks the child process with `CONSTELLATION_TRUSTED_ENV=1`.
 - Runtime Git commands must use the isolated helper environment from `common.env_utils.build_isolated_git_env()` so agent subprocesses never read host Git credential helpers, host keychains, or user-level `~/.gitconfig`.
 - `copilot-cli` runtime authentication is isolated as well: only `COPILOT_GITHUB_TOKEN` is supported for agent execution. Do not rely on `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth`, or system keychain fallbacks inside agents.
+- Launchers and integration tests must sanitize inherited host GitHub credentials before spawning subprocesses. Test scripts may use only file-backed values from `tests/.env` for GitHub auth.
 - `compass` and `registry` remain non-agentic control-plane services; do not add runtime-adapter reasoning loops there unless the architecture changes.
 - Task workspaces should keep `command-log.txt` and `stage-summary.json` under each agent subdirectory for auditability; runtime details belong inside `stage-summary.json` as `runtimeConfig`, not in a separate `runtime-config.json` file.
 - In execution task workspaces, generated source files should live in the real cloned repository directory; `web-agent/` and similar agent subdirectories are for metadata and audit artifacts only.

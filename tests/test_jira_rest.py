@@ -50,6 +50,7 @@ from agent_test_support import (
     PROJECT_ROOT,
     Reporter,
     agent_url_from_args,
+    build_test_subprocess_env,
     http_request,
     load_env_file,
     summary_exit_code,
@@ -98,8 +99,7 @@ def start_local_agent(port: int) -> subprocess.Popen | None:
     python = venv_python if os.path.isfile(venv_python) else sys.executable
     agent_url = f"http://127.0.0.1:{port}"
     openai_base_url = _env("OPENAI_BASE_URL", "http://localhost:1288/v1")
-    env = {
-        **os.environ,
+    env = build_test_subprocess_env({
         "HOST": "127.0.0.1",
         "PORT": str(port),
         "AGENT_ID": "jira-agent",
@@ -114,7 +114,7 @@ def start_local_agent(port: int) -> subprocess.Popen | None:
         "OPENAI_BASE_URL": openai_base_url,
         "OPENAI_MODEL": _env("OPENAI_MODEL", "gpt-5-mini"),
         "PYTHONPATH": PROJECT_ROOT,
-    }
+    }, trusted=True)
     return subprocess.Popen(
         [python, "jira/app.py"],
         cwd=PROJECT_ROOT,

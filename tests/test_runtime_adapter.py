@@ -15,6 +15,7 @@ from common.env_utils import (
     build_isolated_git_env,
     load_dotenv,
     resolve_openai_base_url,
+    sanitize_credential_env,
 )
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
 
@@ -274,9 +275,79 @@ class RuntimeAdapterTests(unittest.TestCase):
             self.assertEqual(merged["COPILOT_GITHUB_TOKEN"], "github_pat_from_common")
             self.assertEqual(os.environ["COPILOT_GITHUB_TOKEN"], "github_pat_from_common")
 
+    def test_load_dotenv_ignores_ambient_github_credentials_by_default(self):
+        os.environ["GH_TOKEN"] = "gho_host"
+        os.environ["GITHUB_TOKEN"] = "github_pat_host"
+        os.environ["COPILOT_GITHUB_TOKEN"] = "github_pat_host_copilot"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            common_dir = os.path.join(temp_dir, "common")
+            agent_dir = os.path.join(temp_dir, "agent")
+            os.makedirs(common_dir, exist_ok=True)
+            os.makedirs(agent_dir, exist_ok=True)
+
+            common_env = os.path.join(common_dir, ".env")
+            agent_env = os.path.join(agent_dir, ".env")
+
+            with open(common_env, "w", encoding="utf-8") as handle:
+                handle.write("COPILOT_GITHUB_TOKEN=github_pat_from_common\n")
+            with open(agent_env, "w", encoding="utf-8") as handle:
+                handle.write("OPENAI_MODEL=gpt-5-mini\n")
+
+            load_dotenv(agent_env)
+
+        self.assertEqual(os.environ["COPILOT_GITHUB_TOKEN"], "github_pat_from_common")
+        self.assertNotIn("GH_TOKEN", os.environ)
+        self.assertNotIn("GITHUB_TOKEN", os.environ)
+
+    def test_load_dotenv_keeps_trusted_credential_overrides(self):
+        os.environ["CONSTELLATION_TRUSTED_ENV"] = "1"
+        os.environ["SCM_TOKEN"] = "token_from_tests_env"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            common_dir = os.path.join(temp_dir, "common")
+            agent_dir = os.path.join(temp_dir, "agent")
+            os.makedirs(common_dir, exist_ok=True)
+            os.makedirs(agent_dir, exist_ok=True)
+
+            common_env = os.path.join(common_dir, ".env")
+            agent_env = os.path.join(agent_dir, ".env")
+
+            with open(common_env, "w", encoding="utf-8") as handle:
+                handle.write("SCM_TOKEN=token_from_common\n")
+            with open(agent_env, "w", encoding="utf-8") as handle:
+                handle.write("OPENAI_MODEL=gpt-5-mini\n")
+
+            load_dotenv(agent_env)
+
+        self.assertEqual(os.environ["SCM_TOKEN"], "token_from_tests_env")
+
+    def test_sanitize_credential_env_strips_ambient_tokens(self):
+        env = sanitize_credential_env(
+            {
+                "HOME": "/Users/personal",
+                "GH_TOKEN": "gho_host",
+                "GITHUB_TOKEN": "github_pat_host",
+                "SCM_TOKEN": "github_pat_scm",
+                "PATH": "/usr/bin",
+            },
+            keep={"COPILOT_GITHUB_TOKEN": "github_pat_runtime"},
+        )
+
+        self.assertEqual(env["COPILOT_GITHUB_TOKEN"], "github_pat_runtime")
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertNotIn("SCM_TOKEN", env)
+
     def test_build_isolated_git_env_uses_runtime_home(self):
         env = build_isolated_git_env(
-            {"HOME": "/Users/personal", "GH_TOKEN": "gho_host", "GITHUB_TOKEN": "ghp_host"},
+            {
+                "HOME": "/Users/personal",
+                "GH_TOKEN": "gho_host",
+                "GITHUB_TOKEN": "ghp_host",
+                "SCM_TOKEN": "github_pat_scm",
+            },
             scope="scm-test",
         )
 
@@ -287,17 +358,24 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(env["GCM_INTERACTIVE"], "never")
         self.assertNotIn("GH_TOKEN", env)
         self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertNotIn("SCM_TOKEN", env)
 
     def test_build_isolated_copilot_env_removes_generic_github_tokens(self):
         env = build_isolated_copilot_env(
             "github_pat_runtime",
-            {"HOME": "/Users/personal", "GH_TOKEN": "gho_personal", "GITHUB_TOKEN": "github_pat_personal"},
+            {
+                "HOME": "/Users/personal",
+                "GH_TOKEN": "gho_personal",
+                "GITHUB_TOKEN": "github_pat_personal",
+                "SCM_TOKEN": "github_pat_scm",
+            },
         )
 
         self.assertEqual(env["COPILOT_GITHUB_TOKEN"], "github_pat_runtime")
         self.assertNotEqual(env["HOME"], "/Users/personal")
         self.assertNotIn("GH_TOKEN", env)
         self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertNotIn("SCM_TOKEN", env)
         self.assertTrue(env["COPILOT_HOME"].startswith(env["HOME"]))
 
 
