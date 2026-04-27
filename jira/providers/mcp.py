@@ -466,6 +466,8 @@ class JiraMCPProvider(JiraProvider):
     def add_comment(
         self, ticket_key: str, text: str, adf_body: dict | None = None
     ) -> tuple[str | None, str]:
+        if adf_body and isinstance(adf_body, dict):
+            return self._rest.add_comment(ticket_key, text, adf_body)
         cloud_id = self.get_cloud_id()
         if not cloud_id:
             return self._rest.add_comment(ticket_key, text, adf_body)
@@ -506,6 +508,8 @@ class JiraMCPProvider(JiraProvider):
         new_text: str,
         adf_body: dict | None = None,
     ) -> tuple[str | None, str]:
+        if adf_body and isinstance(adf_body, dict):
+            return self._rest.update_comment(ticket_key, comment_id, new_text, adf_body)
         # Atlassian Rovo MCP does not expose a comment update tool;
         # fall back to REST.
         return self._rest.update_comment(ticket_key, comment_id, new_text, adf_body)

@@ -16,7 +16,7 @@ from common.runtime.adapter import get_runtime, summarize_runtime_configuration
 
 class RuntimeAdapterTests(unittest.TestCase):
     def setUp(self):
-        self.env_patcher = patch.dict(os.environ, {}, clear=False)
+        self.env_patcher = patch.dict(os.environ, {}, clear=True)
         self.env_patcher.start()
         from common.runtime import adapter as runtime_adapter
 

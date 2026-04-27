@@ -24,6 +24,11 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from common.agent_directory import (
+    AgentDirectory,
+    CapabilityUnavailableError,
+    RegistryUnavailableError,
+)
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.launcher import Launcher
@@ -43,9 +48,6 @@ AGENT_ID = os.environ.get("AGENT_ID", "team-lead-agent")
 INSTANCE_ID = os.environ.get("INSTANCE_ID", f"{AGENT_ID}-local")
 ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://team-lead:{PORT}")
 REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000")
-JIRA_AGENT_URL = os.environ.get("JIRA_AGENT_URL", "http://jira:8010")
-SCM_AGENT_URL = os.environ.get("SCM_AGENT_URL", "http://scm:8020")
-UI_DESIGN_AGENT_URL = os.environ.get("UI_DESIGN_AGENT_URL", "http://ui-design:8040")
 COMPASS_URL = os.environ.get("COMPASS_URL", "http://compass:8080")
 
 ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", "15"))
@@ -57,6 +59,7 @@ SYNC_AGENT_TIMEOUT = int(os.environ.get("SYNC_AGENT_TIMEOUT_SECONDS", "120"))
 _AGENT_CARD_PATH = os.path.join(os.path.dirname(__file__), "agent-card.json")
 
 registry = RegistryClient()
+agent_directory = AgentDirectory(AGENT_ID, registry)
 launcher = Launcher()
 task_store = TaskStore()
 reporter = InstanceReporter(
@@ -402,7 +405,6 @@ def _poll_agent_task(agent_url: str, task_id: str, timeout: int = 60) -> dict | 
 
 
 def _call_sync_agent(
-    agent_url: str,
     capability: str,
     message_text: str,
     team_lead_task_id: str,
@@ -410,6 +412,24 @@ def _call_sync_agent(
     compass_task_id: str,
 ) -> dict:
     """Call a sync agent (Jira, UI Design) and wait for its result."""
+    try:
+        _, instance = agent_directory.resolve_capability(capability)
+    except RegistryUnavailableError as err:
+        raise RuntimeError(
+            f"Registry unavailable while resolving required capability '{capability}': {err}"
+        ) from err
+    except CapabilityUnavailableError as err:
+        raise RuntimeError(
+            f"Required capability '{capability}' is unavailable. "
+            "Boundary systems must be accessed only through registered agents."
+        ) from err
+
+    agent_url = (instance or {}).get("service_url", "")
+    if not agent_url:
+        raise RuntimeError(
+            f"Capability '{capability}' is registered but has no routable service URL."
+        )
+
     message = {
         "messageId": f"tl-{team_lead_task_id}-{capability}-{int(time.time())}",
         "role": "ROLE_USER",
@@ -516,13 +536,16 @@ def _wait_for_dev_completion(
 def _find_agent_instance(capability: str) -> tuple[dict | None, dict | None]:
     """Look up the registry for an agent + idle instance for the capability."""
     try:
-        agents = registry.find_by_capability(capability)
-    except (URLError, OSError) as err:
+        agents = agent_directory.find_capability(capability, refresh_on_miss=True)
+    except RegistryUnavailableError as err:
         print(f"[{AGENT_ID}] Registry unreachable: {err}")
         return None, None
 
     if not agents:
         return None, None
+
+    if agents[0].get("execution_mode") == "per-task":
+        return agents[0], None
 
     for agent in agents:
         for instance in agent.get("instances", []):
@@ -545,6 +568,50 @@ def _wait_for_idle_instance(agent_id: str, container_name: str, timeout: int = 3
                 return inst
         time.sleep(0.5)
     return None
+
+
+def _acquire_dev_agent(capability: str, workflow_task_id: str, *, log_fn=None, role_label: str = "dev agent") -> tuple[dict, dict, str]:
+    agent_def, instance = _find_agent_instance(capability)
+    if agent_def is None:
+        raise RuntimeError(
+            f"No agent registered for capability '{capability}'. "
+            "Cannot proceed without a matching development agent."
+        )
+
+    if instance is None:
+        if agent_def.get("execution_mode") == "per-task":
+            if log_fn:
+                log_fn(f"Launching per-task {role_label} ({agent_def['agent_id']})")
+            try:
+                launch_info = launcher.launch_instance(agent_def, workflow_task_id)
+            except Exception as err:
+                raise RuntimeError(
+                    f"Failed to launch {role_label} '{agent_def['agent_id']}': {err}"
+                ) from err
+            instance = _wait_for_idle_instance(
+                agent_def["agent_id"],
+                launch_info.get("container_name", ""),
+                timeout=30,
+            )
+            if instance is None:
+                raise RuntimeError(
+                    f"{role_label.capitalize()} '{agent_def['agent_id']}' did not register within 30 s."
+                )
+        else:
+            raise RuntimeError(
+                f"Capability '{capability}' is registered but has no idle instances."
+            )
+
+    service_url = (instance.get("service_url") or "").rstrip("/")
+    if not service_url:
+        raise RuntimeError(
+            f"{role_label.capitalize()} '{agent_def['agent_id']}' is registered but has no service URL."
+        )
+
+    if log_fn:
+        log_fn(f"{role_label.capitalize()} ready: {agent_def['agent_id']} at {service_url}")
+
+    return agent_def, instance, service_url
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +733,6 @@ def _inspect_target_repo(
     compass_task_id: str,
 ) -> dict | None:
     repo_task = _call_sync_agent(
-        SCM_AGENT_URL,
         "scm.repo.inspect",
         f"Inspect repository {repo_url}",
         team_lead_task_id,
@@ -845,7 +911,6 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             log(f"Fetching Jira ticket: {ticket_key}")
             try:
                 jira_task = _call_sync_agent(
-                    JIRA_AGENT_URL,
                     "jira.ticket.fetch",
                     f"Fetch ticket {ticket_key}",
                     team_lead_task_id,
@@ -882,7 +947,6 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 if design_page_name:
                     design_msg += f" page: {design_page_name}"
                 design_task = _call_sync_agent(
-                    UI_DESIGN_AGENT_URL,
                     capability,
                     design_msg,
                     team_lead_task_id,
@@ -950,7 +1014,6 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 if design_page_name:
                     design_msg += f" page: {design_page_name}"
                 design_task = _call_sync_agent(
-                    UI_DESIGN_AGENT_URL,
                     capability,
                     design_msg,
                     team_lead_task_id,
@@ -1178,38 +1241,14 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         )
         log(f"Looking up dev agent for capability: {dev_capability}")
 
-        agent_def, instance = _find_agent_instance(dev_capability)
-        if agent_def is None:
-            raise RuntimeError(
-                f"No agent registered for capability '{dev_capability}'. "
-                "Cannot proceed without a matching development agent."
-            )
-
-        if instance is None:
-            if agent_def.get("execution_mode") == "per-task":
-                log(f"Launching per-task dev agent ({agent_def['agent_id']})")
-                try:
-                    launch_info = launcher.launch_instance(agent_def, team_lead_task_id)
-                except Exception as err:
-                    raise RuntimeError(
-                        f"Failed to launch dev agent '{agent_def['agent_id']}': {err}"
-                    ) from err
-                instance = _wait_for_idle_instance(
-                    agent_def["agent_id"], launch_info.get("container_name", ""), timeout=30
-                )
-                if instance is None:
-                    raise RuntimeError(
-                        f"Dev agent '{agent_def['agent_id']}' did not register within 30 s."
-                    )
-            else:
-                raise RuntimeError(
-                    f"Capability '{dev_capability}' is registered but has no idle instances."
-                )
-
-        dev_service_url = instance["service_url"]
+        agent_def, instance, dev_service_url = _acquire_dev_agent(
+            dev_capability,
+            team_lead_task_id,
+            log_fn=log,
+            role_label="dev agent",
+        )
         agent_id_str = agent_def["agent_id"]
         instance_id_str = instance["instance_id"]
-        log(f"Dev agent ready: {agent_id_str} at {dev_service_url}")
 
         try:
             registry.mark_instance_busy(agent_id_str, instance_id_str, team_lead_task_id)
@@ -1301,6 +1340,20 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             feedback = review.get("feedback_for_dev") or ""
             log(f"Review failed — sending revision request to dev agent: {feedback[:120]}")
 
+            revision_agent_def, revision_instance, revision_service_url = _acquire_dev_agent(
+                dev_capability,
+                team_lead_task_id,
+                log_fn=log,
+                role_label="revision agent",
+            )
+            revision_agent_id = revision_agent_def["agent_id"]
+            revision_instance_id = revision_instance["instance_id"]
+
+            try:
+                registry.mark_instance_busy(revision_agent_id, revision_instance_id, team_lead_task_id)
+            except Exception:
+                pass
+
             revision_message = {
                 "messageId": f"tl-{team_lead_task_id}-rev-{review_cycle + 1}",
                 "role": "ROLE_USER",
@@ -1326,13 +1379,17 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     review_issues=review.get("issues") or [],
                 ),
             }
-            rev_task = _a2a_send(dev_service_url, revision_message)
+            rev_task = _a2a_send(revision_service_url, revision_message)
             rev_task_id = rev_task.get("id", "")
             log(f"Revision task submitted: {rev_task_id}")
 
             rev_result = _wait_for_dev_completion(
-                team_lead_task_id, rev_task_id, dev_service_url
+                team_lead_task_id, rev_task_id, revision_service_url
             )
+            try:
+                registry.mark_instance_idle(revision_agent_id, revision_instance_id)
+            except Exception:
+                pass
             if rev_result:
                 dev_output = rev_result.get("status_message", dev_output)
                 final_artifacts = rev_result.get("artifacts") or final_artifacts
@@ -1358,7 +1415,6 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             )
             try:
                 _call_sync_agent(
-                    JIRA_AGENT_URL,
                     "jira.comment.add",
                     f"Add comment to ticket {ticket_key}: {comment}",
                     team_lead_task_id,
@@ -1622,6 +1678,7 @@ def main():
     global _SERVER
     print(f"[{AGENT_ID}] Team Lead Agent starting on {HOST}:{PORT}")
     reporter.start()
+    agent_directory.start()
     _SERVER = ThreadingHTTPServer((HOST, PORT), TeamLeadHandler)
     _SERVER.serve_forever()
 

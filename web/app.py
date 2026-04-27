@@ -23,6 +23,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from common.agent_directory import (
+    AgentDirectory,
+    CapabilityUnavailableError,
+    RegistryUnavailableError,
+)
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.message_utils import artifact_text, build_text_artifact, extract_text
@@ -40,8 +45,6 @@ AGENT_ID = os.environ.get("AGENT_ID", "web-agent")
 INSTANCE_ID = os.environ.get("INSTANCE_ID", f"{AGENT_ID}-local")
 ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://web-agent:{PORT}")
 REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000")
-SCM_AGENT_URL = os.environ.get("SCM_AGENT_URL", "http://scm:8020")
-JIRA_AGENT_URL = os.environ.get("JIRA_AGENT_URL", "http://jira:8010")
 COMPASS_URL = os.environ.get("COMPASS_URL", "http://compass:8080")
 
 ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", "15"))
@@ -50,6 +53,7 @@ SYNC_AGENT_TIMEOUT = int(os.environ.get("SYNC_AGENT_TIMEOUT_SECONDS", "120"))
 
 _AGENT_CARD_PATH = os.path.join(os.path.dirname(__file__), "agent-card.json")
 
+agent_directory = AgentDirectory(AGENT_ID)
 task_store = TaskStore()
 reporter = InstanceReporter(
     agent_id=AGENT_ID,
@@ -141,6 +145,88 @@ def _append_workspace_event(workspace_path: str, relative_name: str, event: dict
     )
 
 
+def _resolve_agent_service_url(capability: str) -> str:
+    try:
+        _, instance = agent_directory.resolve_capability(capability)
+    except RegistryUnavailableError as err:
+        raise RuntimeError(
+            f"Registry unavailable while resolving required capability '{capability}': {err}"
+        ) from err
+    except CapabilityUnavailableError as err:
+        raise RuntimeError(
+            f"Required capability '{capability}' is unavailable. "
+            "Boundary systems must be accessed only through registered agents."
+        ) from err
+
+    service_url = (instance or {}).get("service_url", "")
+    if not service_url:
+        raise RuntimeError(
+            f"Capability '{capability}' is registered but has no routable service URL."
+        )
+    return service_url.rstrip("/")
+
+
+def _adf_text_node(text: str, *, href: str = "") -> dict:
+    node = {"type": "text", "text": str(text or "")}
+    if href:
+        node["marks"] = [{"type": "link", "attrs": {"href": href}}]
+    return node
+
+
+def _adf_document(paragraphs: list[list[dict]]) -> dict:
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "paragraph",
+                "content": paragraph or [_adf_text_node("")],
+            }
+            for paragraph in paragraphs
+        ],
+    }
+
+
+def _adf_plain_text(adf_body: dict | None) -> str:
+    if not isinstance(adf_body, dict):
+        return ""
+    lines = []
+    for block in adf_body.get("content", []):
+        if not isinstance(block, dict):
+            continue
+        parts = []
+        for inline in block.get("content", []):
+            if isinstance(inline, dict) and inline.get("type") == "text":
+                parts.append(str(inline.get("text", "")))
+        line = "".join(parts).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _build_pr_jira_comment_adf(
+    pr_url: str,
+    branch_name: str,
+    test_status: str,
+    generated_files: list[dict],
+    summary: str,
+) -> dict:
+    file_paths = [item.get("path", "") for item in generated_files if item.get("path")]
+    preview = ", ".join(file_paths[:5])
+    if len(file_paths) > 5:
+        preview += "…"
+    return _adf_document(
+        [
+            [_adf_text_node("Web Agent completed implementation.")],
+            [_adf_text_node("PR: "), _adf_text_node(pr_url, href=pr_url)],
+            [_adf_text_node(f"Branch: {branch_name}")],
+            [_adf_text_node(f"Test Status: {test_status}")],
+            [_adf_text_node(f"Files changed ({len(file_paths)}): {preview}")],
+            [_adf_text_node(f"Summary: {summary}")],
+        ]
+    )
+
+
 def _record_jira_action(
     workspace_path: str,
     task_id: str,
@@ -215,6 +301,7 @@ def _apply_tech_stack_constraints(analysis: dict, constraints: dict | None) -> d
 
 
 def _jira_request_json(
+    capability: str,
     method: str,
     path: str,
     *,
@@ -231,8 +318,9 @@ def _jira_request_json(
     if task_id:
         headers["X-Orchestrator-Task-Id"] = task_id
     headers["X-Agent-Id"] = AGENT_ID
+    service_url = _resolve_agent_service_url(capability)
     request = Request(
-        f"{JIRA_AGENT_URL.rstrip('/')}{path}",
+        f"{service_url}{path}",
         data=(json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None),
         headers=headers,
         method=method,
@@ -249,7 +337,13 @@ def _jira_request_json(
 
 
 def _get_jira_account_id(workspace: str, task_id: str) -> str:
-    response = _jira_request_json("GET", "/jira/myself", workspace=workspace, task_id=task_id)
+    response = _jira_request_json(
+        "jira.user.myself",
+        "GET",
+        "/jira/myself",
+        workspace=workspace,
+        task_id=task_id,
+    )
     user = response.get("user") or {}
     account_id = user.get("accountId") or ""
     if not account_id:
@@ -287,6 +381,17 @@ def _notify_callback(
         print(f"[{AGENT_ID}] Callback sent: task={task_id} state={state}")
     except Exception as err:
         print(f"[{AGENT_ID}] Callback failed: {err}")
+
+
+def _auto_stop_after_task_enabled() -> bool:
+    return os.environ.get("AUTO_STOP_AFTER_TASK", "").strip() == "1"
+
+
+def _maybe_schedule_shutdown_after_task() -> bool:
+    if not _auto_stop_after_task_enabled():
+        return False
+    _schedule_shutdown(delay_seconds=5)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +438,6 @@ def _poll_task(agent_url: str, task_id: str, timeout: int = 60) -> dict | None:
 
 
 def _call_sync_agent(
-    agent_url: str,
     capability: str,
     message_text: str,
     task_id: str,
@@ -341,6 +445,7 @@ def _call_sync_agent(
     compass_task_id: str,
 ) -> dict:
     """Call a synchronous agent and wait for its result."""
+    agent_url = _resolve_agent_service_url(capability)
     message = {
         "messageId": f"web-{task_id}-{capability}-{int(time.time())}",
         "role": "ROLE_USER",
@@ -439,16 +544,38 @@ def _plan_implementation(
     design_context: str,
 ) -> dict:
     criteria_text = "\n".join(f"- {c}" for c in (acceptance_criteria or [])) or "Not specified."
+    analysis_json = json.dumps(analysis, ensure_ascii=False, indent=2)
+    repo_snapshot_text = repo_snapshot or "No existing codebase."
+    design_context_text = design_context or "No design context provided."
     prompt = prompts.PLAN_TEMPLATE.format(
         task_instruction=task_instruction,
         acceptance_criteria=criteria_text,
-        analysis_json=json.dumps(analysis, ensure_ascii=False, indent=2),
-        repo_snapshot=repo_snapshot or "No existing codebase.",
-        design_context=design_context or "No design context provided.",
+        analysis_json=analysis_json,
+        repo_snapshot=repo_snapshot_text,
+        design_context=design_context_text,
     )
     system = build_system_prompt(prompts.PLAN_SYSTEM, "web")
     response = _run_agentic(prompt, f"[{AGENT_ID}] plan", system_prompt=system)
-    return _parse_json_from_llm(response)
+    plan = _parse_json_from_llm(response)
+    if plan.get("files"):
+        return plan
+
+    repair_prompt = prompts.PLAN_REPAIR_TEMPLATE.format(
+        task_instruction=task_instruction,
+        acceptance_criteria=criteria_text,
+        analysis_json=analysis_json,
+        repo_snapshot=repo_snapshot_text,
+        design_context=design_context_text,
+        previous_response=response or "<empty response>",
+    )
+    repair_system = build_system_prompt(prompts.PLAN_REPAIR_SYSTEM, "web")
+    repaired_response = _run_agentic(
+        repair_prompt,
+        f"[{AGENT_ID}] plan-repair",
+        system_prompt=repair_system,
+    )
+    repaired_plan = _parse_json_from_llm(repaired_response)
+    return repaired_plan or plan
 
 
 def _generate_file_code(
@@ -658,6 +785,7 @@ def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_t
     workflow_task_id = compass_task_id or task_id
     try:
         result = _jira_request_json(
+            "jira.ticket.fetch",
             "GET",
             f"/jira/tickets/{ticket_key}",
             workspace=workspace,
@@ -694,6 +822,7 @@ def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspac
     workflow_task_id = compass_task_id or task_id
     try:
         result = _jira_request_json(
+            "jira.ticket.transition",
             "POST",
             f"/jira/transitions/{ticket_key}",
             payload={"transition": target_status},
@@ -731,6 +860,7 @@ def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_tas
     try:
         account_id = _get_jira_account_id(workspace, task_id)
         result = _jira_request_json(
+            "jira.ticket.assignee",
             "PUT",
             f"/jira/assignee/{ticket_key}",
             payload={"accountId": account_id},
@@ -761,17 +891,29 @@ def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_tas
         )
 
 
-def _jira_add_comment(ticket_key: str, comment: str, task_id: str, workspace: str, compass_task_id: str):
+def _jira_add_comment(
+    ticket_key: str,
+    comment: str,
+    task_id: str,
+    workspace: str,
+    compass_task_id: str,
+    *,
+    adf_body: dict | None = None,
+    comment_preview: str = "",
+):
     """Add a comment to a Jira ticket (best-effort, non-blocking)."""
     workflow_task_id = compass_task_id or task_id
     try:
+        payload = {"adf": adf_body} if adf_body else {"text": comment}
         result = _jira_request_json(
+            "jira.comment.add",
             "POST",
             f"/jira/comments/{ticket_key}",
-            payload={"text": comment},
+            payload=payload,
             workspace=workspace,
             task_id=task_id,
         )
+        preview = comment_preview or comment or _adf_plain_text(adf_body)
         print(f"[{AGENT_ID}] Jira {ticket_key} comment added")
         _record_jira_action(
             workspace,
@@ -780,11 +922,12 @@ def _jira_add_comment(ticket_key: str, comment: str, task_id: str, workspace: st
             "comment",
             "completed",
             agent_task_id=task_id,
-            commentPreview=comment[:240],
+            commentPreview=preview[:240],
             commentId=result.get("commentId"),
             result=result.get("result"),
         )
     except Exception as err:
+        preview = comment_preview or comment or _adf_plain_text(adf_body)
         print(f"[{AGENT_ID}] Jira comment failed (non-critical): {err}")
         _record_jira_action(
             workspace,
@@ -793,7 +936,7 @@ def _jira_add_comment(ticket_key: str, comment: str, task_id: str, workspace: st
             "comment",
             "failed",
             agent_task_id=task_id,
-            commentPreview=comment[:240],
+            commentPreview=preview[:240],
             error=str(err),
         )
 
@@ -801,7 +944,6 @@ def _jira_add_comment(ticket_key: str, comment: str, task_id: str, workspace: st
 def _clone_repo(task_id: str, repo_url: str, workspace: str, compass_task_id: str) -> str:
     """Clone repository via SCM Agent and return the clone path."""
     result = _call_sync_agent(
-        SCM_AGENT_URL,
         "scm.git.clone",
         f"Clone repository {repo_url} to {workspace}",
         task_id,
@@ -838,7 +980,6 @@ def _create_branch(task_id: str, repo_url: str, branch_name: str, base_branch: s
     """Create a feature branch via SCM Agent."""
     try:
         result = _call_sync_agent(
-            SCM_AGENT_URL,
             "scm.branch.create",
             f"Create branch {branch_name} from {base_branch} in {repo_url}",
             task_id,
@@ -874,6 +1015,7 @@ def _push_files(
         repo = m.group(2).rstrip(".git")
 
     try:
+        scm_service_url = _resolve_agent_service_url("scm.git.push")
         message = {
             "messageId": f"web-{task_id}-push-{int(time.time())}",
             "role": "ROLE_USER",
@@ -892,12 +1034,12 @@ def _push_files(
                 },
             },
         }
-        downstream = _a2a_send(SCM_AGENT_URL, message)
+        downstream = _a2a_send(scm_service_url, message)
         task_id_ds = downstream.get("id", "")
         state = downstream.get("status", {}).get("state", "")
         terminal = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED"}
         if state not in terminal and task_id_ds:
-            result = _poll_task(SCM_AGENT_URL, task_id_ds, timeout=SYNC_AGENT_TIMEOUT)
+            result = _poll_task(scm_service_url, task_id_ds, timeout=SYNC_AGENT_TIMEOUT)
             if result:
                 downstream = result
         state = downstream.get("status", {}).get("state", "")
@@ -950,6 +1092,7 @@ def _create_pr(
         repo = m.group(2).rstrip(".git")
 
     try:
+        scm_service_url = _resolve_agent_service_url("scm.pr.create")
         message = {
             "messageId": f"web-{task_id}-pr-{int(time.time())}",
             "role": "ROLE_USER",
@@ -973,12 +1116,12 @@ def _create_pr(
                 },
             },
         }
-        downstream = _a2a_send(SCM_AGENT_URL, message)
+        downstream = _a2a_send(scm_service_url, message)
         task_id_ds = downstream.get("id", "")
         state = downstream.get("status", {}).get("state", "")
         terminal = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED"}
         if state not in terminal and task_id_ds:
-            result = _poll_task(SCM_AGENT_URL, task_id_ds, timeout=SYNC_AGENT_TIMEOUT)
+            result = _poll_task(scm_service_url, task_id_ds, timeout=SYNC_AGENT_TIMEOUT)
             if result:
                 downstream = result
         for art in (downstream.get("artifacts") or []):
@@ -1284,7 +1427,6 @@ def _list_remote_branches(
 ) -> set[str]:
     try:
         result = _call_sync_agent(
-            SCM_AGENT_URL,
             "scm.branch.list",
             f"List branches in {repo_url}",
             task_id,
@@ -2083,17 +2225,22 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                             test_status = "✅ Build/tests passed" if build_ok else "⚠️ Build/tests had issues"
                             _jira_add_comment(
                                 ticket_key,
-                                f"🤖 **Web Agent** (`{AGENT_ID}`) completed implementation.\n\n"
-                                f"**PR:** {pr_url}\n"
-                                f"**Branch:** `{branch_name}`\n"
-                                f"**Test Status:** {test_status}\n"
-                                f"**Files changed ({len(generated_files)}):** "
-                                f"{', '.join(gf['path'] for gf in generated_files[:5])}"
-                                f"{'…' if len(generated_files) > 5 else ''}\n\n"
-                                f"**Summary:** {plan.get('plan_summary', 'Implementation complete.')}",
+                                "",
                                 task_id,
                                 workspace,
                                 compass_task_id,
+                                adf_body=_build_pr_jira_comment_adf(
+                                    pr_url,
+                                    branch_name,
+                                    test_status,
+                                    generated_files,
+                                    plan.get("plan_summary", "Implementation complete."),
+                                ),
+                                comment_preview=(
+                                    f"PR: {pr_url}\n"
+                                    f"Branch: {branch_name}\n"
+                                    f"Test Status: {test_status}"
+                                ),
                             )
                     else:
                         log("Warning: PR creation returned no URL")
@@ -2203,6 +2350,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             callback_url, task_id, "TASK_STATE_FAILED",
             f"Web Agent failed: {error_text[:500]}", []
         )
+    finally:
+        _maybe_schedule_shutdown_after_task()
 
 
 def _strip_code_fences(code: str) -> str:
@@ -2308,11 +2457,25 @@ class WebAgentHandler(BaseHTTPRequestHandler):
 # Entry point
 # ---------------------------------------------------------------------------
 
+_SERVER: ThreadingHTTPServer | None = None
+
+
+def _schedule_shutdown(delay_seconds: int = 5):
+    def _do_shutdown():
+        time.sleep(delay_seconds)
+        print(f"[{AGENT_ID}] Per-task shutdown triggered")
+        if _SERVER:
+            _SERVER.shutdown()
+
+    threading.Thread(target=_do_shutdown, daemon=True).start()
+
 def main():
+    global _SERVER
     print(f"[{AGENT_ID}] Web Agent starting on {HOST}:{PORT}")
     reporter.start()
-    server = ThreadingHTTPServer((HOST, PORT), WebAgentHandler)
-    server.serve_forever()
+    agent_directory.start()
+    _SERVER = ThreadingHTTPServer((HOST, PORT), WebAgentHandler)
+    _SERVER.serve_forever()
 
 
 if __name__ == "__main__":

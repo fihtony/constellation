@@ -133,6 +133,59 @@ Respond with a JSON object:
 }}
 """
 
+PLAN_REPAIR_SYSTEM = """\
+You are a senior full-stack web developer repairing a previously malformed implementation plan.
+
+Return ONLY a valid JSON object matching the required plan schema.
+Do NOT include markdown fences or explanatory text.
+
+Repair rules:
+- Preserve the intent of the previous response when it is usable.
+- If the previous response omitted or corrupted the `files` list, infer the minimal set of
+  repository source/config/test files needed to satisfy the task and acceptance criteria.
+- The `files` list must contain only repository files that belong in git.
+- Do NOT include workflow artifacts such as PR drafts, Jira evidence, CI logs, or scratch notes.
+"""
+
+PLAN_REPAIR_TEMPLATE = """\
+The previous planning response was invalid, malformed, or incomplete.
+
+Task:
+{task_instruction}
+
+Acceptance criteria:
+{acceptance_criteria}
+
+Tech stack analysis:
+{analysis_json}
+
+Existing codebase snapshot (if any):
+{repo_snapshot}
+
+Design context (if any):
+{design_context}
+
+Previous invalid response:
+{previous_response}
+
+Return a repaired JSON object with this exact shape:
+{{
+  "plan_summary": "Brief description of the overall approach",
+  "files": [
+    {{
+      "path": "relative/path/to/file.ext",
+      "action": "create|modify",
+      "purpose": "What this file does",
+      "key_logic": "What must be implemented in this file",
+      "dependencies": ["other files or packages this file depends on"]
+    }}
+  ],
+  "install_dependencies": ["package1", "package2"],
+  "setup_commands": ["command1", "command2"],
+  "notes": "Any important implementation notes"
+}}
+"""
+
 # ---------------------------------------------------------------------------
 # Code Generation — Single File
 # ---------------------------------------------------------------------------

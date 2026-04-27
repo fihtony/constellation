@@ -7,6 +7,7 @@ import types
 import tempfile
 import unittest
 from pathlib import Path
+import os
 from unittest import mock
 
 from web import app as web_app
@@ -171,6 +172,51 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 "task-0003",
             )
 
+    def test_team_lead_launches_fresh_instance_for_per_task_capability(self):
+        with mock.patch.object(
+            team_lead_app.agent_directory,
+            "find_capability",
+            return_value=[
+                {
+                    "agent_id": "web-agent",
+                    "execution_mode": "per-task",
+                    "instances": [{"instance_id": "old-1", "status": "idle", "service_url": "http://old"}],
+                }
+            ],
+        ):
+            agent_def, instance = team_lead_app._find_agent_instance("web.task.execute")
+
+        self.assertEqual(agent_def["agent_id"], "web-agent")
+        self.assertIsNone(instance)
+
+    def test_team_lead_acquire_dev_agent_launches_fresh_per_task_instance(self):
+        with mock.patch.object(
+            team_lead_app,
+            "_find_agent_instance",
+            return_value=({"agent_id": "web-agent", "execution_mode": "per-task"}, None),
+        ), mock.patch.object(
+            team_lead_app.launcher,
+            "launch_instance",
+            return_value={"container_name": "web-agent-task-1234-abcd"},
+        ) as launch_mock, mock.patch.object(
+            team_lead_app,
+            "_wait_for_idle_instance",
+            return_value={
+                "instance_id": "web-2",
+                "status": "idle",
+                "service_url": "http://web-agent-task-1234-abcd:8050",
+            },
+        ):
+            agent_def, instance, service_url = team_lead_app._acquire_dev_agent(
+                "web.task.execute",
+                "task-1234",
+            )
+
+        launch_mock.assert_called_once()
+        self.assertEqual(agent_def["agent_id"], "web-agent")
+        self.assertEqual(instance["instance_id"], "web-2")
+        self.assertEqual(service_url, "http://web-agent-task-1234-abcd:8050")
+
     def test_nextjs_plan_drops_spa_and_operational_files(self):
         files = [
             {"path": "pages/index.tsx", "action": "create"},
@@ -260,6 +306,32 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         self.assertEqual(payload["events"][1]["action"], "comment")
         self.assertEqual(payload["events"][1]["commentPreview"], "Implemented landing page")
 
+    def test_pr_jira_comment_adf_uses_clickable_link(self):
+        adf = web_app._build_pr_jira_comment_adf(
+            "https://github.com/example/repo/pull/13",
+            "feature/CSTL-1_task-0001_1",
+            "✅ Build/tests passed",
+            [{"path": "requirements.txt"}, {"path": "run.py"}],
+            "Landing page implemented.",
+        )
+
+        pr_line = adf["content"][1]["content"]
+        self.assertEqual(pr_line[1]["text"], "https://github.com/example/repo/pull/13")
+        self.assertEqual(
+            pr_line[1]["marks"][0]["attrs"]["href"],
+            "https://github.com/example/repo/pull/13",
+        )
+
+    def test_maybe_schedule_shutdown_after_task_only_when_enabled(self):
+        with mock.patch.object(web_app, "_schedule_shutdown") as schedule_mock:
+            with mock.patch.dict(os.environ, {"AUTO_STOP_AFTER_TASK": "0"}, clear=False):
+                self.assertFalse(web_app._maybe_schedule_shutdown_after_task())
+            schedule_mock.assert_not_called()
+
+            with mock.patch.dict(os.environ, {"AUTO_STOP_AFTER_TASK": "1"}, clear=False):
+                self.assertTrue(web_app._maybe_schedule_shutdown_after_task())
+            schedule_mock.assert_called_once_with(delay_seconds=5)
+
     def test_pr_evidence_is_merged_across_updates(self):
         with tempfile.TemporaryDirectory(prefix="web_agent_pr_") as workspace:
             web_app._save_pr_evidence(
@@ -285,6 +357,49 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         self.assertEqual(payload["url"], "https://github.com/example/repo/pull/123")
         self.assertEqual(payload["branch"], "feature/task-1")
         self.assertTrue(payload["buildPassed"])
+
+    def test_plan_implementation_repairs_invalid_or_empty_plan_response(self):
+        repaired_plan = {
+            "plan_summary": "Scaffold a minimal Flask landing page app.",
+            "files": [
+                {
+                    "path": "app.py",
+                    "action": "create",
+                    "purpose": "Expose the Flask application factory and root route.",
+                    "key_logic": "Define create_app and register GET /.",
+                    "dependencies": ["flask"],
+                },
+                {
+                    "path": "tests/test_app.py",
+                    "action": "create",
+                    "purpose": "Cover the Flask landing page behaviour.",
+                    "key_logic": "Assert create_app works and GET / returns English Study Hub.",
+                    "dependencies": ["pytest", "app.py"],
+                },
+            ],
+            "install_dependencies": ["flask", "pytest"],
+            "setup_commands": ["pip install -r requirements.txt"],
+            "notes": "Keep the stack on Python 3.12 + Flask.",
+        }
+
+        with mock.patch.object(
+            web_app,
+            "_run_agentic",
+            side_effect=[
+                '{"plan_summary": "Scaffold a minimal Flask app", "files": [',
+                json.dumps(repaired_plan),
+            ],
+        ) as run_mock:
+            plan = web_app._plan_implementation(
+                "Implement CSTL-1 in Flask.",
+                ["GET / returns English Study Hub."],
+                {"backend_framework": "flask", "frontend_framework": "none"},
+                "README.md exists",
+                "No design context provided.",
+            )
+
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertEqual([file_info["path"] for file_info in plan["files"]], ["app.py", "tests/test_app.py"])
 
 
 if __name__ == "__main__":

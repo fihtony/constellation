@@ -30,6 +30,7 @@ ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://localhost:{PORT}
 ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", os.environ.get("A2A_READ_TIMEOUT_SECONDS", "15")))
 DOWNSTREAM_TASK_TIMEOUT = int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "3600"))
 UI_PATH = os.path.join(os.path.dirname(__file__), "ui", "index.html")
+COMPASS_COMPLETENESS_MAX_REVISIONS = int(os.environ.get("COMPASS_COMPLETENESS_MAX_REVISIONS", "2"))
 
 registry = RegistryClient()
 task_store = TaskStore()
@@ -89,6 +90,107 @@ def _create_shared_workspace(task_id):
     workspace_path = os.path.join(workspace_root, f"{task_id}-{timestamp}")
     os.makedirs(workspace_path, exist_ok=True)
     return workspace_path
+
+
+def _read_workspace_json(workspace_path, relative_path):
+    if not workspace_path:
+        return {}
+    full_path = os.path.join(workspace_path, relative_path)
+    if not os.path.isfile(full_path):
+        return {}
+    try:
+        with open(full_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _extract_team_lead_completeness_issues(task, artifacts):
+    if not getattr(task, "workspace_path", ""):
+        return []
+
+    issues = []
+    summary_artifact = None
+    for artifact in artifacts or []:
+        metadata = artifact.get("metadata") or {}
+        if metadata.get("capability") == "team-lead.task.analyze":
+            summary_artifact = artifact
+            break
+    summary_meta = (summary_artifact or {}).get("metadata") or {}
+    if summary_meta.get("reviewPassed") is False:
+        issues.append("Team Lead review did not pass.")
+
+    team_lead_stage = _read_workspace_json(task.workspace_path, "team-lead/stage-summary.json")
+    team_lead_plan = _read_workspace_json(task.workspace_path, "team-lead/plan.json")
+    jira_context = _read_workspace_json(task.workspace_path, "team-lead/jira-context.json")
+    pr_evidence = _read_workspace_json(task.workspace_path, "web-agent/pr-evidence.json")
+    jira_actions = _read_workspace_json(task.workspace_path, "web-agent/jira-actions.json")
+    web_stage = _read_workspace_json(task.workspace_path, "web-agent/stage-summary.json")
+
+    analysis = team_lead_stage.get("analysis") if isinstance(team_lead_stage.get("analysis"), dict) else {}
+    target_repo_url = (team_lead_plan.get("target_repo_url") or analysis.get("target_repo_url") or "").strip()
+    jira_ticket_key = (
+        analysis.get("jira_ticket_key")
+        or jira_context.get("ticket_key")
+        or ""
+    )
+
+    if target_repo_url:
+        if not pr_evidence.get("url"):
+            issues.append("Pull request URL is missing from web-agent/pr-evidence.json.")
+        if not pr_evidence.get("branch"):
+            issues.append("Branch name is missing from web-agent/pr-evidence.json.")
+
+    if isinstance(web_stage, dict) and web_stage.get("buildPassed") is False:
+        issues.append("Web agent reported failing build or test status.")
+
+    jira_events = jira_actions.get("events") if isinstance(jira_actions.get("events"), list) else []
+    if jira_ticket_key:
+        has_in_progress = any(
+            event.get("action") == "transition"
+            and event.get("status") == "completed"
+            and event.get("targetStatus") == "In Progress"
+            for event in jira_events
+        )
+        if not has_in_progress:
+            issues.append("Jira transition to 'In Progress' is missing.")
+
+        if target_repo_url:
+            has_in_review = any(
+                event.get("action") == "transition"
+                and event.get("status") == "completed"
+                and event.get("targetStatus") == "In Review"
+                for event in jira_events
+            )
+            if not has_in_review:
+                issues.append("Jira transition to 'In Review' is missing.")
+
+            has_comment = any(
+                event.get("action") == "comment" and event.get("status") == "completed"
+                for event in jira_events
+            )
+            if not has_comment:
+                issues.append("Jira PR comment is missing.")
+
+    return issues
+
+
+def _build_completeness_follow_up_message(original_message, issues, revision_cycle):
+    message = deep_copy_json(original_message)
+    base_text = extract_text(message)
+    issue_lines = "\n".join(f"- {issue}" for issue in issues)
+    follow_up = (
+        f"Compass completeness check revision {revision_cycle} found unresolved gaps:\n"
+        f"{issue_lines}\n\n"
+        "Continue from the existing shared workspace, preserve prior work, and use only registered boundary agents."
+    )
+    message["parts"] = [{"text": (base_text + "\n\n" + follow_up).strip()}]
+    metadata = dict(message.get("metadata") or {})
+    metadata["compassCompletenessRevision"] = revision_cycle
+    metadata["completenessIssues"] = issues
+    message["metadata"] = metadata
+    return message
 
 
 def _read_agent_logs(since=0):
@@ -176,6 +278,10 @@ def _find_idle_agent_and_instance(agents, container_name=None):
             if instance.get("status") == "idle":
                 return agent, instance
     return None, None
+
+
+def _should_launch_fresh_instance(agent_definition):
+    return (agent_definition or {}).get("execution_mode") == "per-task"
 
 
 def _extract_requested_capability(body, message):
@@ -460,6 +566,9 @@ def _dispatch_step(task, original_message, capability, step_index, total_steps, 
     agent, instance = _find_idle_agent_and_instance(agents)
     candidate = agents[0]
 
+    if _should_launch_fresh_instance(candidate):
+        agent, instance = candidate, None
+
     if instance is None:
         if candidate.get("execution_mode") == "per-task":
             try:
@@ -530,57 +639,129 @@ def _dispatch_step(task, original_message, capability, step_index, total_steps, 
         pass
 
     try:
-        step_message = _build_step_message(
-            task,
-            original_message,
-            task.task_id,
-            capability,
-            step_index,
-            total_steps,
-            upstream_artifacts,
-        )
-        result = _a2a_call(service_url, step_message)
-        downstream_task = result.get("task", {})
-        downstream_task_id = downstream_task.get("id", "")
-        extracted = _extract_downstream_result(downstream_task)
-        state = extracted["state"]
-        status_message = extracted["status_message"]
-        artifacts = extracted["artifacts"]
-
-        if downstream_task_id and not _is_terminal_state(state):
-            task_store.update_state(
-                task.task_id,
-                "STEP_IN_PROGRESS",
-                f"Step {step_index}/{total_steps} running in {agent_id} ({capability}).",
-            )
-            extracted = _wait_for_downstream_completion(
+        current_message = original_message
+        revision_cycle = 0
+        aggregated_summaries = []
+        while True:
+            step_message = _build_step_message(
                 task,
-                agent_id,
+                current_message,
+                task.task_id,
                 capability,
-                service_url,
-                downstream_task_id,
+                step_index,
+                total_steps,
+                upstream_artifacts,
             )
+            result = _a2a_call(service_url, step_message)
+            downstream_task = result.get("task", {})
+            downstream_task_id = downstream_task.get("id", "")
+            extracted = _extract_downstream_result(downstream_task)
             state = extracted["state"]
             status_message = extracted["status_message"]
             artifacts = extracted["artifacts"]
 
-        summaries = _store_task_artifacts(task.task_id, agent_id, capability, artifacts)
-        _append_task_artifacts(task, summaries)
-        audit_log(
-            "STEP_COMPLETED",
-            task_id=task.task_id,
-            capability=capability,
-            agent_id=agent_id,
-            state=state,
-            artifact_count=len(summaries),
-        )
-        return {
-            "terminal": False,
-            "state": state,
-            "status_message": status_message,
-            "agent_id": agent_id,
-            "artifact_summaries": summaries,
-        }
+            if downstream_task_id and not _is_terminal_state(state):
+                task_store.update_state(
+                    task.task_id,
+                    "STEP_IN_PROGRESS",
+                    f"Step {step_index}/{total_steps} running in {agent_id} ({capability}).",
+                )
+                extracted = _wait_for_downstream_completion(
+                    task,
+                    agent_id,
+                    capability,
+                    service_url,
+                    downstream_task_id,
+                )
+                state = extracted["state"]
+                status_message = extracted["status_message"]
+                artifacts = extracted["artifacts"]
+
+            summaries = _store_task_artifacts(task.task_id, agent_id, capability, artifacts)
+            _append_task_artifacts(task, summaries)
+            aggregated_summaries.extend(summaries)
+
+            if capability != "team-lead.task.analyze" or state != "TASK_STATE_COMPLETED":
+                audit_log(
+                    "STEP_COMPLETED",
+                    task_id=task.task_id,
+                    capability=capability,
+                    agent_id=agent_id,
+                    state=state,
+                    artifact_count=len(aggregated_summaries),
+                )
+                return {
+                    "terminal": False,
+                    "state": state,
+                    "status_message": status_message,
+                    "agent_id": agent_id,
+                    "artifact_summaries": aggregated_summaries,
+                }
+
+            completeness_issues = _extract_team_lead_completeness_issues(task, artifacts)
+            if not completeness_issues:
+                audit_log(
+                    "STEP_COMPLETED",
+                    task_id=task.task_id,
+                    capability=capability,
+                    agent_id=agent_id,
+                    state=state,
+                    artifact_count=len(aggregated_summaries),
+                )
+                return {
+                    "terminal": False,
+                    "state": state,
+                    "status_message": status_message,
+                    "agent_id": agent_id,
+                    "artifact_summaries": aggregated_summaries,
+                }
+
+            if revision_cycle >= COMPASS_COMPLETENESS_MAX_REVISIONS:
+                failure_message = (
+                    "Compass completeness check failed after follow-up attempts: "
+                    + "; ".join(completeness_issues)
+                )
+                task_store.update_state(task.task_id, "TASK_STATE_FAILED", failure_message)
+                audit_log(
+                    "COMPASS_COMPLETENESS_FAILED",
+                    task_id=task.task_id,
+                    capability=capability,
+                    agent_id=agent_id,
+                    issues=completeness_issues,
+                )
+                return {"terminal": True}
+
+            revision_cycle += 1
+            task_store.update_state(
+                task.task_id,
+                "REVIEWING",
+                f"Compass completeness check requested follow-up {revision_cycle}/{COMPASS_COMPLETENESS_MAX_REVISIONS}.",
+            )
+            if getattr(task, "workspace_path", ""):
+                record_workspace_stage(
+                    task.workspace_path,
+                    "compass",
+                    f"Compass requested Team Lead follow-up #{revision_cycle}",
+                    task_id=task.task_id,
+                    extra={
+                        "sourceAgent": "compass-agent",
+                        "completenessIssues": completeness_issues,
+                        "runtimeConfig": _runtime_config_summary(),
+                    },
+                )
+            audit_log(
+                "COMPASS_COMPLETENESS_RETRY",
+                task_id=task.task_id,
+                capability=capability,
+                agent_id=agent_id,
+                revision_cycle=revision_cycle,
+                issues=completeness_issues,
+            )
+            current_message = _build_completeness_follow_up_message(
+                original_message,
+                completeness_issues,
+                revision_cycle,
+            )
     except Exception as error:
         task_store.update_state(task.task_id, "FAILED", f"Dispatch failed: {error}")
         audit_log("TASK_FAILED", task_id=task.task_id, capability=capability, error=str(error))

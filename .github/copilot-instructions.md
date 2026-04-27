@@ -705,4 +705,8 @@ Before submitting a new agent, verify:
 - Task workspaces should keep `command-log.txt` and `stage-summary.json` under each agent subdirectory for auditability; runtime details belong inside `stage-summary.json` as `runtimeConfig`, not in a separate `runtime-config.json` file.
 - In execution task workspaces, generated source files should live in the real cloned repository directory; `web-agent/` and similar agent subdirectories are for metadata and audit artifacts only.
 - Web Agent branches should use deterministic naming based on Jira key plus orchestrator task id when available; only docs/tests-only changes may use `chore/...` naming without a ticket key.
+- Boundary agents (Jira, SCM, UI Design, future Jenkins/Stitch-style integrations) must be discovered through Registry capabilities at runtime; do not hardcode their service URLs inside Team Lead or execution agents.
+- Registry now exposes topology metadata (`/topology`, `/events?sinceVersion=`); agents that call other agents should cache capability lookups and refresh on cache miss or topology change.
+- Compass applies a final completeness gate to Team Lead results using shared-workspace evidence (review result, PR evidence, Jira workflow evidence) and may trigger a same-workspace follow-up cycle before marking the user task complete.
+- Per-task agents should honor `AUTO_STOP_AFTER_TASK=1` and shut down gracefully after the callback/polling window so finished Team Lead/Web containers do not accumulate.
 - Use `LOCAL_TIMEZONE` (preferred) or `TZ` to keep workspace timestamps aligned with the operator's local time.
