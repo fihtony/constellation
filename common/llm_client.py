@@ -16,7 +16,7 @@ import subprocess
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from common.env_utils import env_flag, resolve_openai_base_url
+from common.env_utils import build_isolated_copilot_env, env_flag, resolve_openai_base_url
 
 DEFAULT_MODEL = "gpt-5-mini"
 
@@ -67,7 +67,7 @@ def _copilot_generate(prompt: str, actor_label: str, system_prompt: str | None =
     if system_prompt:
         full_prompt = f"{system_prompt}\n\n{prompt}"
     cmd = ["copilot", "--model", model, "-sp", full_prompt]
-    env = {**os.environ, "COPILOT_GITHUB_TOKEN": token}
+    env = build_isolated_copilot_env(token)
     print(f"[llm] {actor_label} invoking: copilot CLI model={model}")
     print(f"[llm] {actor_label} prompt:")
     print(_preview_text(full_prompt))

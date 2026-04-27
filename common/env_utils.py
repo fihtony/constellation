@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import re
+import tempfile
 
 
 _CONTAINER_RUNTIME_HOSTS = {
     "docker": "host.docker.internal",
     "rancher": "host.rancher-desktop.internal",
 }
+
+_ISOLATED_RUNTIME_ROOT = os.path.join(tempfile.gettempdir(), "constellation-runtime")
 
 
 def _parse_env_file(path):
@@ -96,6 +100,59 @@ def resolve_openai_base_url():
     if explicit:
         return explicit.rstrip("/")
     return default_openai_base_url()
+
+
+def isolated_runtime_home(scope="default"):
+    safe_scope = re.sub(r"[^A-Za-z0-9._-]+", "-", (scope or "default").strip())
+    safe_scope = safe_scope.strip(".-") or "default"
+    home = os.path.join(_ISOLATED_RUNTIME_ROOT, safe_scope)
+    os.makedirs(home, exist_ok=True)
+    return home
+
+
+def build_isolated_git_env(base_env=None, *, scope="git"):
+    env = dict(base_env or os.environ)
+    home = isolated_runtime_home(scope)
+    xdg_config_home = os.path.join(home, ".config")
+    os.makedirs(xdg_config_home, exist_ok=True)
+    env.update({
+        "HOME": home,
+        "XDG_CONFIG_HOME": xdg_config_home,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS": "",
+        "GCM_INTERACTIVE": "never",
+    })
+    # Git itself does not use these, but strip them so no credential helper or
+    # git hook can accidentally pick up host GitHub tokens.
+    env.pop("GH_TOKEN", None)
+    env.pop("GITHUB_TOKEN", None)
+    return env
+
+
+def build_isolated_copilot_env(token, base_env=None):
+    env = dict(base_env or os.environ)
+    home = isolated_runtime_home("copilot-cli")
+    xdg_config_home = os.path.join(home, ".config")
+    copilot_home = env.get("COPILOT_HOME", "").strip() or os.path.join(home, ".copilot")
+    gh_config_dir = os.path.join(xdg_config_home, "gh")
+    os.makedirs(xdg_config_home, exist_ok=True)
+    os.makedirs(copilot_home, exist_ok=True)
+    os.makedirs(gh_config_dir, exist_ok=True)
+    env.update({
+        "HOME": home,
+        "XDG_CONFIG_HOME": xdg_config_home,
+        "GH_CONFIG_DIR": gh_config_dir,
+        "COPILOT_HOME": copilot_home,
+        "COPILOT_GITHUB_TOKEN": token,
+        "GCM_INTERACTIVE": "never",
+    })
+    env.pop("GH_TOKEN", None)
+    env.pop("GITHUB_TOKEN", None)
+    return env
 
 
 def env_flag(name, default=False):

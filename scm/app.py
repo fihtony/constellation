@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from common.devlog import debug_log, record_workspace_stage
-from common.env_utils import load_dotenv
+from common.env_utils import build_isolated_git_env, load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.message_utils import build_text_artifact, extract_text
 from common.rules_loader import build_system_prompt, load_rules
@@ -276,7 +276,7 @@ def _read_skill_guide(limit: int = 2200) -> str:
 # ---------------------------------------------------------------------------
 
 def _resolve_clone_auth(owner: str, repo: str, clone_url: str) -> tuple[str, list[str]]:
-    git_config: list[str] = []
+    git_config: list[str] = ["-c", "credential.helper="]
     token = _SCM_TOKEN
     if token and "github.com/" in clone_url:
         clone_url = re.sub(r"https://[^@/]+@github\.com/", "https://github.com/", clone_url)
@@ -308,7 +308,7 @@ def _clone_to_workspace(
     os.makedirs(target_path, exist_ok=True)
     clone_url, git_config = _resolve_clone_auth(owner, repo, clone_url)
 
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
+    env = build_isolated_git_env(scope=f"{AGENT_ID}-workspace-clone")
 
     if os.path.isdir(os.path.join(clone_dir, ".git")):
         r = subprocess.run(

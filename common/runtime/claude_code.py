@@ -75,6 +75,11 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
             cmd = [binary, "-p", full_prompt]
         env = dict(os.environ)
         env.setdefault("ANTHROPIC_MODEL", effective_model)
+        # Strip generic GitHub tokens — Claude Code must not fall back to host GitHub
+        # credentials. All GitHub auth inside the system goes through SCM_TOKEN or
+        # COPILOT_GITHUB_TOKEN defined explicitly in .env files.
+        env.pop("GH_TOKEN", None)
+        env.pop("GITHUB_TOKEN", None)
 
         try:
             result = subprocess.run(

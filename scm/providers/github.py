@@ -14,6 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from common.env_utils import build_isolated_git_env
 from scm.providers.base import SCMProvider
 
 GITHUB_API_BASE = "https://api.github.com"
@@ -316,12 +317,11 @@ class GitHubProvider(SCMProvider):
         return f"https://github.com/{owner}/{repo}.git"
 
     def _git_env(self) -> dict:
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
-        return env
+        return build_isolated_git_env(scope="scm-github")
 
     def _git_config_args(self) -> list[str]:
         """Return git -c args for authentication via http.extraHeader."""
-        args = []
+        args = ["-c", "credential.helper="]
         auth = self._auth_header()
         if auth:
             args.extend(["-c", f"http.extraHeader=Authorization: {auth}"])
@@ -344,10 +344,9 @@ class GitHubProvider(SCMProvider):
         Basic + Bearer credentials, which GitHub rejects. Use this method whenever the
         clone URL already contains the token (e.g. from _authed_clone_url).
         """
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
-        command = ["git", *args]
+        command = ["git", "-c", "credential.helper=", *args]
         completed = subprocess.run(
-            command, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env
+            command, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=self._git_env()
         )
         output = (completed.stdout or completed.stderr or "").strip()
         if completed.returncode != 0:

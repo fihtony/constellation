@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 
+from common.env_utils import build_isolated_copilot_env
 from common.runtime.adapter import AgentRuntimeAdapter
 from common.runtime.copilot_connect import CopilotConnectAdapter
 
@@ -16,10 +17,6 @@ DEFAULT_MODEL = "gpt-5-mini"
 def _resolve_token() -> tuple[str, str | None]:
     if os.environ.get("COPILOT_GITHUB_TOKEN", "").strip():
         return os.environ["COPILOT_GITHUB_TOKEN"].strip(), None
-    if os.environ.get("GH_TOKEN", "").strip():
-        return os.environ["GH_TOKEN"].strip(), "GH_TOKEN"
-    if os.environ.get("GITHUB_TOKEN", "").strip():
-        return os.environ["GITHUB_TOKEN"].strip(), "GITHUB_TOKEN"
     return "", None
 
 
@@ -69,7 +66,7 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
                 model=model,
                 timeout=timeout,
                 max_tokens=max_tokens,
-                warning="COPILOT_GITHUB_TOKEN is not configured; falling back to copilot-connect.",
+                warning="COPILOT_GITHUB_TOKEN is not configured; generic GitHub credentials are ignored for runtime isolation, falling back to copilot-connect.",
             )
 
         if shutil.which(binary) is None:
@@ -95,14 +92,9 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
         extra_args = os.environ.get("COPILOT_CLI_ARGS", "").strip()
         if extra_args:
             cmd = [binary, *shlex.split(extra_args), "--model", effective_model, "-sp", full_prompt]
-        env = dict(os.environ)
-        env["COPILOT_GITHUB_TOKEN"] = token
+        env = build_isolated_copilot_env(token, os.environ)
 
         warnings: list[str] = []
-        if token_source:
-            warnings.append(
-                f"Using {token_source} for Copilot CLI authentication; prefer COPILOT_GITHUB_TOKEN."
-            )
 
         try:
             result = subprocess.run(

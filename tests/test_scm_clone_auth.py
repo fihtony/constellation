@@ -20,7 +20,7 @@ class SCMCloneAuthTests(unittest.TestCase):
         self.assertEqual(clone_url, "https://github.com/fihtony/english-study-hub.git")
         self.assertEqual(
             git_config,
-            ["-c", f"http.extraHeader=AUTHORIZATION: basic {expected_header}"],
+            ["-c", "credential.helper=", "-c", f"http.extraHeader=AUTHORIZATION: basic {expected_header}"],
         )
 
     def test_non_github_clone_keeps_bearer_header_auth(self):
@@ -32,7 +32,7 @@ class SCMCloneAuthTests(unittest.TestCase):
             )
 
         self.assertEqual(clone_url, "https://bitbucket.example.com/scm/proj/repo.git")
-        self.assertEqual(git_config, ["-c", "http.extraHeader=Authorization: Bearer secret-token"])
+        self.assertEqual(git_config, ["-c", "credential.helper=", "-c", "http.extraHeader=Authorization: Bearer secret-token"])
 
     def test_existing_tokenized_clone_url_is_sanitized_and_uses_header(self):
         authed_url = "https://x-access-token:secret-token@github.com/fihtony/english-study-hub.git"
@@ -47,7 +47,7 @@ class SCMCloneAuthTests(unittest.TestCase):
         self.assertEqual(clone_url, "https://github.com/fihtony/english-study-hub.git")
         self.assertEqual(
             git_config,
-            ["-c", f"http.extraHeader=AUTHORIZATION: basic {expected_header}"],
+            ["-c", "credential.helper=", "-c", f"http.extraHeader=AUTHORIZATION: basic {expected_header}"],
         )
 
 

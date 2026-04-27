@@ -33,6 +33,10 @@ user-invocable: true
 
 Set `SCM_TOKEN=<token>` in `scm/.env`.
 
+Constellation runtime isolation rule:
+- SCM agent git subprocesses must use only `SCM_TOKEN`-derived auth (`http.extraHeader` or tokenized HTTPS URL).
+- Agent-side git commands are isolated from host credential helpers and host keychains; do not depend on macOS Keychain, `gh auth`, or user-level `~/.gitconfig` when validating container behavior.
+
 ## Provider Selection
 
 ```env

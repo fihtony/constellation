@@ -28,7 +28,7 @@ from common.agent_directory import (
     CapabilityUnavailableError,
     RegistryUnavailableError,
 )
-from common.env_utils import load_dotenv
+from common.env_utils import build_isolated_git_env, load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.message_utils import artifact_text, build_text_artifact, extract_text
 from common.per_task_exit import PerTaskExitHandler
@@ -1352,9 +1352,9 @@ def _ensure_local_python_env(build_dir: str, language: str, log_fn) -> str:
 
 
 def _run_local_git(repo_dir: str, args: list[str], *, check: bool = True) -> tuple[bool, str]:
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
+    env = build_isolated_git_env(scope=f"{AGENT_ID}-local-git")
     result = subprocess.run(
-        ["git", *args],
+        ["git", "-c", "credential.helper=", *args],
         cwd=repo_dir,
         capture_output=True,
         text=True,

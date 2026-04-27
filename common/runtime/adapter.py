@@ -145,18 +145,21 @@ def resolve_backend_name(backend: str | None = None) -> tuple[str, str]:
 
 def _copilot_cli_status() -> dict:
     binary = os.environ.get("COPILOT_CLI_BIN", "copilot").strip() or "copilot"
-    token_sources = {
-        "COPILOT_GITHUB_TOKEN": bool(os.environ.get("COPILOT_GITHUB_TOKEN", "").strip()),
+    ignored_token_sources = {
         "GH_TOKEN": bool(os.environ.get("GH_TOKEN", "").strip()),
         "GITHUB_TOKEN": bool(os.environ.get("GITHUB_TOKEN", "").strip()),
     }
-    token_configured = any(token_sources.values())
+    token_sources = {
+        "COPILOT_GITHUB_TOKEN": bool(os.environ.get("COPILOT_GITHUB_TOKEN", "").strip()),
+    }
+    token_configured = token_sources["COPILOT_GITHUB_TOKEN"]
     binary_available = shutil.which(binary) is not None
     return {
         "binary": binary,
         "binaryAvailable": binary_available,
         "tokenConfigured": token_configured,
         "tokenSources": token_sources,
+        "ignoredTokenSources": ignored_token_sources,
         "ready": token_configured and binary_available,
     }
 

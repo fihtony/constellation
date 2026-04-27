@@ -10,7 +10,12 @@ import unittest
 from urllib.error import URLError
 from unittest.mock import Mock, patch
 
-from common.env_utils import load_dotenv, resolve_openai_base_url
+from common.env_utils import (
+    build_isolated_copilot_env,
+    build_isolated_git_env,
+    load_dotenv,
+    resolve_openai_base_url,
+)
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
 
 
@@ -84,6 +89,27 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(result["summary"], "fallback")
         self.assertIn("COPILOT_GITHUB_TOKEN is not configured", result["warnings"][0])
 
+    def test_copilot_cli_ignores_generic_github_tokens(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+        os.environ["GH_TOKEN"] = "gho_personal"
+        os.environ["GITHUB_TOKEN"] = "github_pat_personal"
+
+        fallback_result = {
+            "summary": "fallback",
+            "structured_output": {},
+            "artifacts": [],
+            "warnings": [],
+            "next_actions": [],
+            "raw_response": "fallback",
+            "backend_used": "copilot-connect",
+        }
+
+        with patch("common.runtime.copilot_connect.CopilotConnectAdapter.run", return_value=dict(fallback_result)):
+            result = get_runtime().run("hello")
+
+        self.assertEqual(result["summary"], "fallback")
+        self.assertIn("generic GitHub credentials are ignored", result["warnings"][0])
+
     def test_copilot_cli_uses_cli_when_binary_and_token_are_configured(self):
         os.environ["AGENT_RUNTIME"] = "copilot-cli"
         os.environ["COPILOT_GITHUB_TOKEN"] = "github_pat_test"
@@ -99,6 +125,26 @@ class RuntimeAdapterTests(unittest.TestCase):
         command = completed.call_args.args[0]
         self.assertEqual(command[0], "copilot")
         self.assertIn("--model", command)
+
+    def test_copilot_cli_executes_in_isolated_home(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+        os.environ["COPILOT_GITHUB_TOKEN"] = "github_pat_test"
+        os.environ["GH_TOKEN"] = "gho_personal"
+        os.environ["GITHUB_TOKEN"] = "github_pat_personal"
+        os.environ["HOME"] = "/Users/personal"
+
+        completed = Mock(return_value=Mock(returncode=0, stdout='{"summary":"cli ok"}', stderr=""))
+        with patch("common.runtime.copilot_cli.shutil.which", return_value="/usr/bin/copilot"), \
+             patch("common.runtime.copilot_cli.subprocess.run", completed):
+            get_runtime().run("hello from cli")
+
+        env = completed.call_args.kwargs["env"]
+        self.assertEqual(env["COPILOT_GITHUB_TOKEN"], "github_pat_test")
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertNotEqual(env["HOME"], "/Users/personal")
+        self.assertTrue(env["COPILOT_HOME"].startswith(env["HOME"]))
+        self.assertTrue(env["GH_CONFIG_DIR"].startswith(env["XDG_CONFIG_HOME"]))
 
     def test_copilot_connect_falls_back_to_mock_when_endpoint_is_unreachable(self):
         os.environ["AGENT_RUNTIME"] = "copilot-connect"
@@ -227,6 +273,32 @@ class RuntimeAdapterTests(unittest.TestCase):
 
             self.assertEqual(merged["COPILOT_GITHUB_TOKEN"], "github_pat_from_common")
             self.assertEqual(os.environ["COPILOT_GITHUB_TOKEN"], "github_pat_from_common")
+
+    def test_build_isolated_git_env_uses_runtime_home(self):
+        env = build_isolated_git_env(
+            {"HOME": "/Users/personal", "GH_TOKEN": "gho_host", "GITHUB_TOKEN": "ghp_host"},
+            scope="scm-test",
+        )
+
+        self.assertNotEqual(env["HOME"], "/Users/personal")
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(env["GCM_INTERACTIVE"], "never")
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertNotIn("GITHUB_TOKEN", env)
+
+    def test_build_isolated_copilot_env_removes_generic_github_tokens(self):
+        env = build_isolated_copilot_env(
+            "github_pat_runtime",
+            {"HOME": "/Users/personal", "GH_TOKEN": "gho_personal", "GITHUB_TOKEN": "github_pat_personal"},
+        )
+
+        self.assertEqual(env["COPILOT_GITHUB_TOKEN"], "github_pat_runtime")
+        self.assertNotEqual(env["HOME"], "/Users/personal")
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertTrue(env["COPILOT_HOME"].startswith(env["HOME"]))
 
 
 if __name__ == "__main__":
