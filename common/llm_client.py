@@ -16,14 +16,13 @@ import subprocess
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from common.env_utils import env_flag
+from common.env_utils import env_flag, resolve_openai_base_url
 
-DEFAULT_BASE_URL = "http://localhost:1288/v1"
 DEFAULT_MODEL = "gpt-5-mini"
 
 
 def _base_url():
-    return os.environ.get("OPENAI_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    return resolve_openai_base_url()
 
 
 def _model():

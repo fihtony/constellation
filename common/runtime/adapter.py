@@ -12,7 +12,7 @@ import re
 import shutil
 from abc import ABC, abstractmethod
 
-from common.env_utils import env_flag
+from common.env_utils import env_flag, resolve_openai_base_url
 
 
 class AgentRuntimeAdapter(ABC):
@@ -216,6 +216,7 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
         summary.update(
             {
                 "baseUrlConfigured": bool(os.environ.get("OPENAI_BASE_URL", "").strip()),
+                "resolvedBaseUrl": resolve_openai_base_url(),
                 "apiKeyConfigured": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
                 "model": AgentRuntimeAdapter.resolve_model(
                     os.environ.get("AGENT_MODEL"),

@@ -67,11 +67,19 @@ User
 
 ### Container Runtime
 
-This project uses **Docker Desktop**.
-- Host machine is accessible from containers at `host.docker.internal`
-- Docker socket: `/var/run/docker.sock`
+This project uses **Docker Desktop by default**, and also supports **Rancher Desktop**.
+- `CONTAINER_RUNTIME=docker` is the default; set `CONTAINER_RUNTIME=rancher` to use Rancher Desktop.
+- Host machine alias from containers:
+  - Docker Desktop: `host.docker.internal`
+  - Rancher Desktop: `host.rancher-desktop.internal`
+- Container socket default:
+  - Docker Desktop: `/var/run/docker.sock`
+  - Rancher Desktop: `~/.rd/docker.sock` (or override with `DOCKER_SOCKET`)
 - Network name: `constellation-network`
-- LLM endpoint example: `http://host.docker.internal:1288/v1`
+- If `OPENAI_BASE_URL` is unset, Copilot Connect resolves automatically:
+  - host process: `http://localhost:1288/v1`
+  - Docker container: `http://host.docker.internal:1288/v1`
+  - Rancher container: `http://host.rancher-desktop.internal:1288/v1`
 
 ---
 
@@ -490,8 +498,11 @@ ADVERTISED_BASE_URL=http://my-agent:8080
 # Registry
 REGISTRY_URL=http://registry:9000
 
-# LLM (use host.docker.internal for Docker Desktop environments)
-OPENAI_BASE_URL=http://host.docker.internal:1288/v1
+# LLM
+# Leave OPENAI_BASE_URL unset to use runtime-aware defaults:
+#   localhost on host, host.docker.internal in Docker,
+#   host.rancher-desktop.internal in Rancher
+# OPENAI_BASE_URL=
 OPENAI_MODEL=gpt-5-mini
 OPENAI_API_KEY=
 ALLOW_MOCK_FALLBACK=1
@@ -693,6 +704,7 @@ Before submitting a new agent, verify:
 | Task state machine | `common/task_store.py` |
 | Artifact storage | `common/artifact_store.py` |
 | Docker launcher | `common/launcher.py` |
+| Rancher launcher | `common/launcher_rancher.py` |
 | Instance heartbeat | `common/instance_reporter.py` |
 | A2A message helpers | `common/message_utils.py` |
 | Registry bootstrap | `scripts/init_register.py` |

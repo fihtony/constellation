@@ -10,7 +10,7 @@ import unittest
 from urllib.error import URLError
 from unittest.mock import Mock, patch
 
-from common.env_utils import load_dotenv
+from common.env_utils import load_dotenv, resolve_openai_base_url
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
 
 
@@ -159,6 +159,31 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(summary["effectiveBackend"], "copilot-connect")
         self.assertFalse(summary["tokenConfigured"])
         self.assertEqual(summary["fallbackReason"], "Copilot CLI token is not configured.")
+
+    def test_resolve_openai_base_url_uses_rancher_host_inside_container(self):
+        os.environ["CONTAINER_RUNTIME"] = "rancher"
+
+        with patch("common.env_utils._is_containerized_process", return_value=True):
+            self.assertEqual(
+                resolve_openai_base_url(),
+                "http://host.rancher-desktop.internal:1288/v1",
+            )
+
+    def test_resolve_openai_base_url_uses_localhost_for_host_process(self):
+        os.environ["CONTAINER_RUNTIME"] = "rancher"
+
+        with patch("common.env_utils._is_containerized_process", return_value=False):
+            self.assertEqual(resolve_openai_base_url(), "http://localhost:1288/v1")
+
+    def test_runtime_configuration_summary_reports_resolved_connect_url(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-connect"
+
+        with patch("common.runtime.adapter.resolve_openai_base_url", return_value="http://host.rancher-desktop.internal:1288/v1"):
+            summary = summarize_runtime_configuration()
+
+        self.assertEqual(summary["effectiveBackend"], "copilot-connect")
+        self.assertEqual(summary["resolvedBaseUrl"], "http://host.rancher-desktop.internal:1288/v1")
+        self.assertFalse(summary["baseUrlConfigured"])
 
     def test_load_dotenv_applies_shared_defaults_and_local_overrides(self):
         with tempfile.TemporaryDirectory() as temp_dir:

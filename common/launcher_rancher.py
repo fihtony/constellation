@@ -1,4 +1,4 @@
-"""Launch per-task agent containers through the Docker socket."""
+"""Launch per-task agent containers through the Rancher Desktop socket."""
 
 from __future__ import annotations
 
@@ -23,9 +23,17 @@ class UnixSocketHTTPConnection(http.client.HTTPConnection):
         self.sock.connect(self.socket_path)
 
 
-class Launcher:
+class RancherLauncher:
+    """Launcher that targets Rancher Desktop's Docker-compatible API socket.
+
+    Rancher Desktop exposes the same Docker Engine API as Docker Desktop, but
+    the socket is located at a different path (``~/.rd/docker.sock`` on macOS).
+    Set ``DOCKER_SOCKET`` to override if your Rancher installation differs.
+    """
+
     def __init__(self):
-        self.socket_path = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
+        default_socket = os.path.expanduser("~/.rd/docker.sock")
+        self.socket_path = os.environ.get("DOCKER_SOCKET", default_socket)
         self.runtime_image = os.environ.get("DEFAULT_DYNAMIC_IMAGE", "constellation-android-agent:latest")
         self.runtime_network = os.environ.get("DYNAMIC_AGENT_NETWORK", "constellation-network")
         self.registry_url = os.environ.get("REGISTRY_URL", "http://registry:9000")
@@ -33,7 +41,7 @@ class Launcher:
 
     def _request_raw(self, method, path, payload=None):
         if not os.path.exists(self.socket_path):
-            raise RuntimeError(f"Docker socket not available at {self.socket_path}")
+            raise RuntimeError(f"Rancher socket not available at {self.socket_path}")
         body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {}
         if body is not None:
@@ -115,8 +123,6 @@ class Launcher:
             )
 
         container_prefix = launch_spec.get("namePrefix", agent_definition["agent_id"].replace("_", "-"))
-        # Add a short unique suffix to prevent name collisions when the same
-        # internal task_id is reused across successive per-task containers.
         unique_suffix = uuid.uuid4().hex[:8]
         container_name = f"{container_prefix}-{task_id.lower()}-{unique_suffix}"
         port = int(launch_spec.get("port", self.default_port))
@@ -166,14 +172,13 @@ class Launcher:
             },
         }
 
-        # Mount the artifacts volume so the android agent can write workspace files
         artifact_root_host = os.environ.get("ARTIFACT_ROOT_HOST", "").strip()
         artifact_root_container = os.environ.get("ARTIFACT_ROOT", "/app/artifacts")
         binds = []
         if artifact_root_host:
             binds.append(f"{artifact_root_host}:{artifact_root_container}")
-        # Always pass through the Docker socket so per-task agents (team-lead) can
-        # themselves launch nested per-task agents (web, android).
+        # Pass through the Rancher socket so per-task agents can launch nested agents.
+        # Rancher exposes its socket at the same path used by this launcher.
         if launch_spec.get("mountDockerSocket", True) and os.path.exists(self.socket_path):
             binds.append(f"{self.socket_path}:{self.socket_path}")
         if binds:
@@ -194,16 +199,3 @@ class Launcher:
 
     def destroy_instance(self, agent_id, container_name):
         self._request("DELETE", f"/v1.43/containers/{quote(container_name, safe='')}?force=1")
-
-
-def get_launcher():
-    """Return a launcher instance for the configured container runtime.
-
-    Set ``CONTAINER_RUNTIME=rancher`` to use Rancher Desktop.
-    Defaults to Docker Desktop when the variable is unset or set to ``docker``.
-    """
-    runtime = os.environ.get("CONTAINER_RUNTIME", "docker").strip().lower()
-    if runtime == "rancher":
-        from common.launcher_rancher import RancherLauncher
-        return RancherLauncher()
-    return Launcher()

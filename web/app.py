@@ -31,6 +31,8 @@ from common.agent_directory import (
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.message_utils import artifact_text, build_text_artifact, extract_text
+from common.per_task_exit import PerTaskExitHandler
+from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt, load_rules
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
 from common.task_store import TaskStore
@@ -53,7 +55,9 @@ SYNC_AGENT_TIMEOUT = int(os.environ.get("SYNC_AGENT_TIMEOUT_SECONDS", "120"))
 
 _AGENT_CARD_PATH = os.path.join(os.path.dirname(__file__), "agent-card.json")
 
-agent_directory = AgentDirectory(AGENT_ID)
+registry_client = RegistryClient(REGISTRY_URL)
+agent_directory = AgentDirectory(AGENT_ID, registry_client)
+exit_handler = PerTaskExitHandler()
 task_store = TaskStore()
 reporter = InstanceReporter(
     agent_id=AGENT_ID,
@@ -387,11 +391,23 @@ def _auto_stop_after_task_enabled() -> bool:
     return os.environ.get("AUTO_STOP_AFTER_TASK", "").strip() == "1"
 
 
-def _maybe_schedule_shutdown_after_task() -> bool:
-    if not _auto_stop_after_task_enabled():
-        return False
-    _schedule_shutdown(delay_seconds=5)
-    return True
+def _apply_task_exit_rule(task_id: str, exit_rule: dict) -> None:
+    """Apply the exit rule for a completed task in a background thread."""
+    def _run():
+        rule_type = (exit_rule or {}).get("type", "wait_for_parent_ack")
+        # If AUTO_STOP env is not set and rule is "auto_stop", treat as persistent
+        if rule_type == "auto_stop":
+            if not _auto_stop_after_task_enabled():
+                print(f"[{AGENT_ID}] AUTO_STOP_AFTER_TASK not set — keeping agent alive")
+                return
+            rule_type = "immediate"
+        exit_handler.apply(
+            task_id,
+            {**exit_rule, "type": rule_type},
+            shutdown_fn=_schedule_shutdown,
+            agent_id=AGENT_ID,
+        )
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -1291,17 +1307,23 @@ def _ensure_local_python_env(build_dir: str, language: str, log_fn) -> str:
     if not _project_uses_python(build_dir, language):
         return sys.executable
 
-    venv_dir = os.path.join(build_dir, ".venv")
+    # Create the venv OUTSIDE the repo directory so that:
+    # 1. Its shebangs use a short, absolute path (avoids OS shebang-length limits)
+    # 2. It is not accidentally committed to the repo
+    # 3. It remains usable if only the repo directory is shared between Docker and host
+    import hashlib
+    import tempfile
+    build_hash = hashlib.md5(build_dir.encode()).hexdigest()[:12]
+    venv_dir = os.path.join(tempfile.gettempdir(), f"constellation-venv-{build_hash}")
     venv_python = os.path.join(venv_dir, "bin", "python")
     requirements_path = os.path.join(build_dir, "requirements.txt")
     install_stamp = os.path.join(venv_dir, ".requirements-installed")
 
     try:
         if not os.path.isfile(venv_python):
-            log_fn("Creating local Python virtual environment (.venv)")
+            log_fn(f"Creating Python virtual environment at {venv_dir}")
             subprocess.run(
-                [sys.executable, "-m", "venv", ".venv"],
-                cwd=build_dir,
+                [sys.executable, "-m", "venv", venv_dir],
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -1731,6 +1753,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
     tech_stack_constraints: dict = metadata.get("techStackConstraints") or {}
     # Repo URL injected by Team Lead from Jira/analysis (preferred over text extraction)
     metadata_repo_url: str = metadata.get("targetRepoUrl", "")
+    # Exit rule: how to shut down after task completion (defined by parent)
+    exit_rule = PerTaskExitHandler.parse(metadata)
 
     task_instruction = _prepend_tech_stack_constraints(extract_text(message) or "", tech_stack_constraints)
     final_artifacts: list = []
@@ -2351,7 +2375,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             f"Web Agent failed: {error_text[:500]}", []
         )
     finally:
-        _maybe_schedule_shutdown_after_task()
+        _apply_task_exit_rule(task_id, exit_rule)
 
 
 def _strip_code_fences(code: str) -> str:
@@ -2415,6 +2439,15 @@ class WebAgentHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+
+        # POST /tasks/{id}/ack — parent confirms it received our callback
+        m_ack = re.fullmatch(r"/tasks/([^/]+)/ack", path)
+        if m_ack:
+            task_id = m_ack.group(1)
+            acked = exit_handler.acknowledge(task_id)
+            print(f"[{AGENT_ID}] Received ACK for task {task_id} (registered={acked})")
+            self._send_json(200, {"ok": True, "task_id": task_id})
+            return
 
         if path != "/message:send":
             self._send_json(404, {"error": "not_found"})

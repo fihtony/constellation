@@ -31,8 +31,9 @@ from common.agent_directory import (
 )
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
-from common.launcher import Launcher
+from common.launcher import get_launcher
 from common.message_utils import artifact_text, build_text_artifact, extract_text
+from common.per_task_exit import PerTaskExitHandler
 from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt, load_rules
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
@@ -55,12 +56,15 @@ TASK_TIMEOUT = int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "3600"))
 INPUT_WAIT_TIMEOUT = int(os.environ.get("INPUT_WAIT_TIMEOUT_SECONDS", "7200"))  # 2 hours
 MAX_REVIEW_CYCLES = int(os.environ.get("MAX_REVIEW_CYCLES", "2"))
 SYNC_AGENT_TIMEOUT = int(os.environ.get("SYNC_AGENT_TIMEOUT_SECONDS", "120"))
+DEV_AGENT_ACK_TIMEOUT = int(os.environ.get("DEV_AGENT_ACK_TIMEOUT_SECONDS", "300"))
+COMPASS_ACK_TIMEOUT = int(os.environ.get("COMPASS_ACK_TIMEOUT_SECONDS", "300"))
 
 _AGENT_CARD_PATH = os.path.join(os.path.dirname(__file__), "agent-card.json")
 
 registry = RegistryClient()
 agent_directory = AgentDirectory(AGENT_ID, registry)
-launcher = Launcher()
+launcher = get_launcher()
+exit_handler = PerTaskExitHandler()
 task_store = TaskStore()
 reporter = InstanceReporter(
     agent_id=AGENT_ID,
@@ -115,6 +119,8 @@ class _TaskContext:
         "additional_info",
         "plan",
         "dev_result",
+        "dev_service_url",
+        "dev_task_id",
         "review_result",
         "review_cycles",
         "phases_log",
@@ -134,6 +140,8 @@ class _TaskContext:
         self.additional_info: str = ""
         self.plan: dict = {}
         self.dev_result: dict | None = None
+        self.dev_service_url: str = ""   # service URL of the active dev agent
+        self.dev_task_id: str = ""       # latest task ID on the dev agent
         self.review_result: dict | None = None
         self.review_cycles: int = 0
         self.phases_log: list[str] = []
@@ -292,6 +300,11 @@ def _build_dev_task_metadata(
         "acceptanceCriteria": acceptance_criteria or [],
         "requiresTests": requires_tests,
         "devWorkflowInstructions": _DEV_WORKFLOW_INSTRUCTIONS,
+        # Exit rule: dev agent must wait for our ACK before shutting down
+        "exitRule": PerTaskExitHandler.build(
+            rule_type="wait_for_parent_ack",
+            ack_timeout_seconds=DEV_AGENT_ACK_TIMEOUT,
+        ),
     }
     if is_revision:
         metadata.update(
@@ -302,6 +315,24 @@ def _build_dev_task_metadata(
             }
         )
     return metadata
+
+
+def _ack_agent(service_url: str, task_id: str) -> None:
+    """Send ACK to a per-task agent so it can shut down (best-effort)."""
+    if not service_url or not task_id:
+        return
+    request = Request(
+        f"{service_url.rstrip('/')}/tasks/{task_id}/ack",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10):
+            pass
+        print(f"[{AGENT_ID}] ACK sent to {service_url} for task {task_id}")
+    except Exception as err:
+        print(f"[{AGENT_ID}] Could not ACK agent at {service_url} task {task_id}: {err}")
 
 
 # ---------------------------------------------------------------------------
@@ -1273,6 +1304,9 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
 
         dev_task = _a2a_send(dev_service_url, dev_message)
         dev_task_id = dev_task.get("id", "")
+        # Remember service URL and task ID so we can reuse the same container for revisions
+        ctx.dev_service_url = dev_service_url
+        ctx.dev_task_id = dev_task_id
         log(f"Dev task submitted: {dev_task_id}")
 
         # Wait for dev agent completion (callback + polling fallback)
@@ -1340,19 +1374,13 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             feedback = review.get("feedback_for_dev") or ""
             log(f"Review failed — sending revision request to dev agent: {feedback[:120]}")
 
-            revision_agent_def, revision_instance, revision_service_url = _acquire_dev_agent(
-                dev_capability,
-                team_lead_task_id,
-                log_fn=log,
-                role_label="revision agent",
-            )
-            revision_agent_id = revision_agent_def["agent_id"]
-            revision_instance_id = revision_instance["instance_id"]
-
-            try:
-                registry.mark_instance_busy(revision_agent_id, revision_instance_id, team_lead_task_id)
-            except Exception:
-                pass
+            # Reuse the SAME dev agent container (it is still running, waiting for our ACK).
+            # Do NOT call _acquire_dev_agent again — that would try to launch a new container
+            # which may cause DNS / timing issues while the first container is still alive.
+            revision_service_url = ctx.dev_service_url
+            if not revision_service_url:
+                log("Warning: no dev agent service URL stored; cannot send revision")
+                break
 
             revision_message = {
                 "messageId": f"tl-{team_lead_task_id}-rev-{review_cycle + 1}",
@@ -1381,21 +1409,23 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             }
             rev_task = _a2a_send(revision_service_url, revision_message)
             rev_task_id = rev_task.get("id", "")
-            log(f"Revision task submitted: {rev_task_id}")
+            ctx.dev_task_id = rev_task_id  # track latest task ID for final ACK
+            log(f"Revision task submitted to same dev agent: {rev_task_id}")
 
             rev_result = _wait_for_dev_completion(
                 team_lead_task_id, rev_task_id, revision_service_url
             )
-            try:
-                registry.mark_instance_idle(revision_agent_id, revision_instance_id)
-            except Exception:
-                pass
             if rev_result:
                 dev_output = rev_result.get("status_message", dev_output)
                 final_artifacts = rev_result.get("artifacts") or final_artifacts
                 ctx.dev_result = rev_result
             else:
                 log("Warning: revision task timed out, keeping previous output.")
+
+        # After all review cycles are done, ACK the dev agent so it can shut down.
+        if ctx.dev_service_url and ctx.dev_task_id:
+            log(f"ACK-ing dev agent (task={ctx.dev_task_id}) — releasing it to shut down")
+            _ack_agent(ctx.dev_service_url, ctx.dev_task_id)
 
         # ── Phase 7: Update Jira and finalise ───────────────────────────────
         task_store.update_state(team_lead_task_id, "COMPLETING", "Finalizing and summarizing…")
@@ -1452,12 +1482,19 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             compass_task_id=compass_task_id,
             review_cycles=ctx.review_cycles,
         )
+        # Register for Compass ACK BEFORE sending callback (to avoid missing an immediate ACK)
+        exit_handler.register(team_lead_task_id)
         _notify_compass(callback_url, team_lead_task_id, "TASK_STATE_COMPLETED", summary, all_artifacts)
 
     except Exception as err:
         error_text = str(err)
         print(f"[{AGENT_ID}][{team_lead_task_id}] FAILED: {error_text}")
         log(f"FAILED: {error_text[:300]}")
+
+        # ACK dev agent if we failed mid-way (so it doesn't wait forever)
+        if ctx.dev_service_url and ctx.dev_task_id:
+            _ack_agent(ctx.dev_service_url, ctx.dev_task_id)
+
         _save_workspace_file(
             workspace,
             "team-lead/review-notes.json",
@@ -1486,18 +1523,28 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             compass_task_id=compass_task_id,
             error=error_text[:300],
         )
+        # Register for Compass ACK BEFORE sending callback
+        exit_handler.register(team_lead_task_id)
         _notify_compass(callback_url, team_lead_task_id, "TASK_STATE_FAILED", failure_summary)
 
     finally:
-        # Keep context in memory briefly, then trigger shutdown in per-task mode
+        # Wait for Compass ACK (or timeout), then shut down in per-task mode.
         def _delayed_cleanup():
-            # Allow time for the callback to be delivered and any polling requests
-            time.sleep(60)
+            # Give Compass a short window to poll task state before cleanup
+            time.sleep(5)
             with _TASK_CONTEXTS_LOCK:
                 _TASK_CONTEXTS.pop(team_lead_task_id, None)
-            # In per-task mode, shut down after task completes
+            # Wait for Compass ACK or timeout
+            acked = exit_handler.wait(team_lead_task_id, timeout=COMPASS_ACK_TIMEOUT)
+            if acked:
+                print(f"[{AGENT_ID}] Compass ACK received for task {team_lead_task_id} — shutting down")
+            else:
+                print(
+                    f"[{AGENT_ID}] Compass ACK timeout ({COMPASS_ACK_TIMEOUT}s) "
+                    f"for task {team_lead_task_id} — shutting down"
+                )
             if os.environ.get("AUTO_STOP_AFTER_TASK", "").strip() == "1":
-                _schedule_shutdown(delay_seconds=5)
+                _schedule_shutdown(delay_seconds=2)
 
         threading.Thread(target=_delayed_cleanup, daemon=True).start()
 
@@ -1554,6 +1601,15 @@ class TeamLeadHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+
+        # POST /tasks/{id}/ack — Compass confirms it received our callback
+        m_ack = re.fullmatch(r"/tasks/([^/]+)/ack", path)
+        if m_ack:
+            task_id = m_ack.group(1)
+            acked = exit_handler.acknowledge(task_id)
+            print(f"[{AGENT_ID}] Received ACK from Compass for task {task_id} (registered={acked})")
+            self._send_json(200, {"ok": True, "task_id": task_id})
+            return
 
         # POST /tasks/{id}/callbacks — dev agent notifies completion
         m = re.fullmatch(r"/tasks/([^/]+)/callbacks", path)

@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 from common.artifact_store import ArtifactStore
 from common.devlog import record_workspace_stage
 from common.env_utils import load_dotenv
-from common.launcher import Launcher
+from common.launcher import get_launcher
 from common.message_utils import artifact_text, deep_copy_json, extract_text
 from common.policy import PolicyEvaluator
 from common.registry_client import RegistryClient
@@ -35,7 +35,7 @@ COMPASS_COMPLETENESS_MAX_REVISIONS = int(os.environ.get("COMPASS_COMPLETENESS_MA
 registry = RegistryClient()
 task_store = TaskStore()
 artifact_store = ArtifactStore()
-launcher = Launcher()
+launcher = get_launcher()
 policy = PolicyEvaluator()
 
 TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
@@ -258,6 +258,24 @@ def _fetch_task(agent_url, task_id):
     )
     with urlopen(request, timeout=ACK_TIMEOUT) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _send_agent_ack(service_url: str, task_id: str) -> None:
+    """ACK a per-task agent so it can proceed with its exit rule (best-effort)."""
+    if not service_url or not task_id:
+        return
+    request = Request(
+        f"{service_url.rstrip('/')}/tasks/{task_id}/ack",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10):
+            pass
+        print(f"[compass] ACK sent to {service_url} for task {task_id}")
+    except Exception as err:
+        print(f"[compass] Could not ACK agent at {service_url} task {task_id}: {err}")
 
 
 def _lookup_agents(requested_capability=None):
@@ -690,6 +708,8 @@ def _dispatch_step(task, original_message, capability, step_index, total_steps, 
                     state=state,
                     artifact_count=len(aggregated_summaries),
                 )
+                # ACK the downstream agent so it can apply its exit rule and shut down
+                _send_agent_ack(service_url, downstream_task_id)
                 return {
                     "terminal": False,
                     "state": state,
@@ -708,6 +728,8 @@ def _dispatch_step(task, original_message, capability, step_index, total_steps, 
                     state=state,
                     artifact_count=len(aggregated_summaries),
                 )
+                # Completeness check passed — ACK Team Lead so it can shut down
+                _send_agent_ack(service_url, downstream_task_id)
                 return {
                     "terminal": False,
                     "state": state,
@@ -729,6 +751,8 @@ def _dispatch_step(task, original_message, capability, step_index, total_steps, 
                     agent_id=agent_id,
                     issues=completeness_issues,
                 )
+                # Max revisions reached — ACK Team Lead so it can shut down
+                _send_agent_ack(service_url, downstream_task_id)
                 return {"terminal": True}
 
             revision_cycle += 1

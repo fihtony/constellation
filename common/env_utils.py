@@ -5,6 +5,12 @@ from __future__ import annotations
 import os
 
 
+_CONTAINER_RUNTIME_HOSTS = {
+    "docker": "host.docker.internal",
+    "rancher": "host.rancher-desktop.internal",
+}
+
+
 def _parse_env_file(path):
     values = {}
     if not path or not os.path.exists(path):
@@ -61,6 +67,35 @@ def load_dotenv(path):
         os.environ[key] = value
 
     return merged
+
+
+def resolve_container_runtime(default="docker"):
+    runtime = (os.environ.get("CONTAINER_RUNTIME") or default).strip().lower()
+    if runtime == "rancher":
+        return "rancher"
+    return "docker"
+
+
+def _is_containerized_process():
+    return any((
+        bool(os.environ.get("CONTAINER_ID", "").strip()),
+        os.path.exists("/.dockerenv"),
+        os.path.exists("/run/.containerenv"),
+    ))
+
+
+def default_openai_base_url():
+    host = "localhost"
+    if _is_containerized_process():
+        host = _CONTAINER_RUNTIME_HOSTS[resolve_container_runtime()]
+    return f"http://{host}:1288/v1"
+
+
+def resolve_openai_base_url():
+    explicit = os.environ.get("OPENAI_BASE_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    return default_openai_base_url()
 
 
 def env_flag(name, default=False):

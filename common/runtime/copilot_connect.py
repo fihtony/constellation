@@ -7,10 +7,9 @@ import os
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from common.env_utils import env_flag
+from common.env_utils import env_flag, resolve_openai_base_url
 from common.runtime.adapter import AgentRuntimeAdapter
 
-DEFAULT_BASE_URL = "http://localhost:1288/v1"
 DEFAULT_MODEL = "gpt-5-mini"
 
 
@@ -48,7 +47,7 @@ class CopilotConnectAdapter(AgentRuntimeAdapter):
             system_prompt=system_prompt or self.DEFAULT_SYSTEM,
             context=context,
         ).strip()
-        endpoint = f"{os.environ.get('OPENAI_BASE_URL', DEFAULT_BASE_URL).rstrip('/')}/chat/completions"
+        endpoint = f"{resolve_openai_base_url()}/chat/completions"
         payload = {
             "model": effective_model,
             "messages": [
