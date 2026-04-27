@@ -71,6 +71,11 @@ that needs to be created or changed, with its purpose and the key logic it must 
 
 Be specific and actionable. The plan will be used to generate actual source code.
 
+Important rules for Flask backends:
+- The Flask app must use: `app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))`
+  so templates resolve correctly no matter from which directory the app or its tests are run.
+- Tests must import the Flask app object and use `app.test_client()` — never use subprocess or curl.
+
 Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
 """
 
@@ -125,6 +130,10 @@ for a single file as instructed. The code must:
 3. Include proper error handling
 4. Be self-contained or clearly import its dependencies
 5. Follow OWASP security guidelines (no SQL injection, XSS, etc.)
+6. For Flask apps: use `app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))`
+   so templates resolve correctly regardless of working directory.
+7. For pytest tests of Flask apps: import the app object, set `app.testing = True`, use `app.test_client()`.
+   Never use subprocess or assume a specific cwd.
 
 CRITICAL: Output ONLY the raw source code. Do NOT wrap it in markdown code fences.
 Do NOT include any explanation before or after the code.
@@ -255,7 +264,12 @@ Rules:
 1. Only modify files that are actually broken.
 2. Produce complete file contents — never partial snippets.
 3. Keep the original logic intact; only fix what is broken.
-4. Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
+4. For Flask apps: always use `template_folder=os.path.join(os.path.dirname(__file__), 'templates')`
+   in the Flask() constructor so templates resolve correctly regardless of working directory.
+5. For pytest: when testing a Flask app, import the app module directly (do NOT use subprocess);
+   set `app.testing = True` and use `app.test_client()`. Do NOT rely on filesystem paths from cwd.
+6. File paths in the `fixes` array must be relative to the build directory (e.g. `app.py`, `templates/index.html`).
+7. Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
 """
 
 BUILD_FIX_TEMPLATE = """\

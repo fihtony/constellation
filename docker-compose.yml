@@ -52,6 +52,8 @@ services:
         condition: service_healthy
       scm:
         condition: service_healthy
+      ui-design:
+        condition: service_healthy
     env_file:
       - ./compass/.env
     environment:
@@ -64,7 +66,8 @@ services:
       ARTIFACT_ROOT: "/app/artifacts"
       DEFAULT_DYNAMIC_IMAGE: "constellation-android-agent:latest"
       DYNAMIC_AGENT_NETWORK: "constellation-network"
-      ARTIFACT_ROOT_HOST: "${ARTIFACT_ROOT_HOST:-}"
+      # ARTIFACT_ROOT_HOST is loaded from compass/.env — do NOT override here with an empty
+      # variable expansion or it will blank out the value from env_file.
     volumes:
       - ./artifacts:/app/artifacts
       - /var/run/docker.sock:/var/run/docker.sock
@@ -140,6 +143,7 @@ services:
       OPENAI_BASE_URL: "http://host.docker.internal:1288/v1"
       OPENAI_MODEL: "gpt-5-mini"
       ALLOW_MOCK_FALLBACK: "1"
+      SCM_PROVIDER: "github"
     volumes:
       - ./artifacts:/app/artifacts
     labels:
@@ -150,6 +154,42 @@ services:
       - "8020:8020"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8020/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+
+  ui-design:
+    image: constellation-ui-design-agent:latest
+    build:
+      context: .
+      dockerfile: ui-design/Dockerfile
+    command: ["python3", "ui-design/app.py"]
+    depends_on:
+      registry:
+        condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
+    env_file:
+      - ./ui-design/.env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8040"
+      AGENT_ID: "ui-design-agent"
+      ADVERTISED_BASE_URL: "http://ui-design:8040"
+      REGISTRY_URL: "http://registry:9000"
+      HEARTBEAT_INTERVAL: "30"
+      OPENAI_BASE_URL: "http://host.docker.internal:1288/v1"
+      OPENAI_MODEL: "gpt-5-mini"
+      ALLOW_MOCK_FALLBACK: "1"
+    labels:
+      constellation.agent_id: "ui-design-agent"
+      constellation.agent_name: "UI Design Agent"
+      constellation.agent_role: "integration"
+    ports:
+      - "8040:8040"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8040/health')"]
       interval: 2s
       timeout: 2s
       retries: 20

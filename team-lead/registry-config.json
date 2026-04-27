@@ -6,7 +6,7 @@
     "image": "constellation-team-lead-agent:latest",
     "port": 8030,
     "command": ["python3", "team-lead/app.py"],
-    "passThroughEnv": ["ARTIFACT_ROOT_HOST", "ARTIFACT_ROOT", "DYNAMIC_AGENT_NETWORK"],
+    "passThroughEnv": ["ARTIFACT_ROOT_HOST", "ARTIFACT_ROOT", "DYNAMIC_AGENT_NETWORK", "COPILOT_GITHUB_TOKEN"],
     "env": {
       "OPENAI_BASE_URL": "http://host.docker.internal:1288/v1",
       "OPENAI_MODEL": "gpt-5-mini",

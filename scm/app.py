@@ -511,16 +511,31 @@ def _handle_pr_get(text: str) -> tuple[str, list]:
 
 
 def _handle_pr_create(text: str, message: dict) -> tuple[str, list]:
-    owner, repo = _parse_owner_repo(text)
-    from_m = re.search(r"from[:\s]+([^\s,]+)", text, re.IGNORECASE)
-    to_m = re.search(r"(?:to|into|target)[:\s]+([^\s,]+)", text, re.IGNORECASE)
-    title_m = re.search(r"title[:\s]+(.+)", text, re.IGNORECASE)
-    from_branch = from_m.group(1) if from_m else ""
-    to_branch = to_m.group(1) if to_m else "main"
-    title = title_m.group(1).strip() if title_m else f"PR from {from_branch}"
+    # Prefer structured prPayload from metadata (avoids brittle text parsing)
+    pr_payload = (message.get("metadata") or {}).get("prPayload") or {}
+    if pr_payload:
+        owner = pr_payload.get("owner", "")
+        repo = pr_payload.get("repo", "")
+        from_branch = pr_payload.get("fromBranch", "")
+        to_branch = pr_payload.get("toBranch", "main")
+        title = pr_payload.get("title", f"PR from {from_branch}")
+        description = pr_payload.get("description", "")
+    else:
+        # Fall back to text parsing
+        owner, repo = _parse_owner_repo(text)
+        from_m = re.search(r"from[:\s]+([^\s,]+)", text, re.IGNORECASE)
+        to_m = re.search(r"(?:to|into|target)[:\s]+([^\s,]+)", text, re.IGNORECASE)
+        title_m = re.search(r"title[:\s]+(.+)", text, re.IGNORECASE)
+        from_branch = from_m.group(1) if from_m else ""
+        to_branch = to_m.group(1) if to_m else "main"
+        title = title_m.group(1).strip() if title_m else f"PR from {from_branch}"
+        description = ""
+        # Reject to_branch values that look like Jira keys (e.g. CSTL-1/feature)
+        if re.match(r"^[A-Z][A-Z0-9]+-\d+", to_branch or ""):
+            to_branch = "main"
     if not owner or not repo or not from_branch:
         return "Could not parse owner/repo/from_branch from request.", []
-    pr, status = _provider.create_pr(owner, repo, from_branch, to_branch, title)
+    pr, status = _provider.create_pr(owner, repo, from_branch, to_branch, title, description)
     if status not in ("created",):
         return f"PR creation failed: {status} — {pr}", []
     artifact = build_text_artifact(
@@ -570,8 +585,13 @@ def _handle_pr_comment_list(text: str) -> tuple[str, list]:
 
 
 def _handle_git_push(text: str, message: dict) -> tuple[str, list]:
-    owner, repo = _parse_owner_repo(text)
+    # Prefer structured pushPayload from metadata over text parsing
     payload = (message.get("metadata") or {}).get("pushPayload") or {}
+    if payload:
+        owner = payload.get("owner", "")
+        repo = payload.get("repo", "")
+    else:
+        owner, repo = _parse_owner_repo(text)
     branch = payload.get("branch", "")
     base_branch = payload.get("baseBranch", "main")
     files = payload.get("files", [])

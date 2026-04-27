@@ -30,6 +30,7 @@ from common.launcher import Launcher
 from common.llm_client import generate_text
 from common.message_utils import artifact_text, build_text_artifact, extract_text
 from common.registry_client import RegistryClient
+from common.rules_loader import build_system_prompt
 from common.task_store import TaskStore
 from team_lead import prompts
 
@@ -421,7 +422,8 @@ def _analyze_task(user_text: str, additional_info: str = "") -> dict:
         user_text=user_text,
         additional_context=additional_context,
     )
-    response = generate_text(prompt, f"[{AGENT_ID}] analyze", system_prompt=prompts.ANALYZE_SYSTEM)
+    system = build_system_prompt(prompts.ANALYZE_SYSTEM, "team-lead")
+    response = generate_text(prompt, f"[{AGENT_ID}] analyze", system_prompt=system)
     return _parse_json_from_llm(response)
 
 
@@ -448,7 +450,8 @@ def _create_plan(
         design_context=design_ctx,
         additional_context=extra_ctx,
     )
-    response = generate_text(prompt, f"[{AGENT_ID}] plan", system_prompt=prompts.PLAN_SYSTEM)
+    system = build_system_prompt(prompts.PLAN_SYSTEM, "team-lead")
+    response = generate_text(prompt, f"[{AGENT_ID}] plan", system_prompt=system)
     return _parse_json_from_llm(response)
 
 
@@ -473,7 +476,8 @@ def _review_output(
         dev_output=(dev_output or "No output text.")[:3000],
         artifacts_summary=artifacts_summary,
     )
-    response = generate_text(prompt, f"[{AGENT_ID}] review", system_prompt=prompts.REVIEW_SYSTEM)
+    system = build_system_prompt(prompts.REVIEW_SYSTEM, "team-lead", include_workflow=True)
+    response = generate_text(prompt, f"[{AGENT_ID}] review", system_prompt=system)
     return _parse_json_from_llm(response)
 
 
@@ -617,6 +621,42 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             analysis = _analyze_task(user_text, combined_additional)
             ctx.analysis = analysis
 
+        # ── Phase 2b2: Fetch design context if re-analysis discovered a URL ──
+        # The initial analysis may not have detected the design URL because it
+        # was only present inside the Jira ticket content (not the user message).
+        if (
+            not ctx.design_info
+            and analysis.get("needs_design_context")
+            and analysis.get("design_url")
+        ):
+            design_url = analysis["design_url"]
+            design_type = analysis.get("design_type") or "figma"
+            capability = (
+                "stitch.screen.fetch" if design_type == "stitch" else "figma.page.fetch"
+            )
+            log(f"Fetching design context discovered in re-analysis ({design_type}): {design_url}")
+            try:
+                design_task = _call_sync_agent(
+                    UI_DESIGN_AGENT_URL,
+                    capability,
+                    f"Fetch design from {design_url}",
+                    team_lead_task_id,
+                    workspace,
+                    compass_task_id,
+                )
+                content = "\n".join(
+                    artifact_text(art) for art in design_task.get("artifacts", [])
+                )
+                ctx.design_info = {
+                    "url": design_url,
+                    "type": design_type,
+                    "content": content,
+                }
+                log(f"Design context fetched ({len(content)} chars)")
+            except Exception as err:
+                log(f"Warning: could not fetch design from {design_url}: {err}")
+                ctx.design_info = {"url": design_url, "type": design_type, "content": "", "error": str(err)}
+
         # ── Phase 2c: If Jira content was successfully fetched, suppress any
         #    question that merely asks for the Jira URL / ticket content —
         #    we already have it.  This prevents the LLM from triggering an
@@ -633,6 +673,36 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     if not any(kw in m.lower() for kw in jira_keywords)
                 ]
                 ctx.analysis = analysis
+
+        # ── Phase 2d: If design context was fetched, suppress design questions.
+        #    Also suppress "preferred framework" questions when the ticket already
+        #    specifies the tech stack — the LLM should use what was given.
+        if ctx.design_info and ctx.design_info.get("content"):
+            question = analysis.get("question_for_user") or ""
+            design_keywords = ("design", "stitch", "figma", "mockup", "wireframe", "screen")
+            if any(kw in question.lower() for kw in design_keywords):
+                log(f"Suppressing design-related question (context already fetched): {question}")
+                analysis = dict(analysis)
+                analysis["question_for_user"] = None
+                ctx.analysis = analysis
+
+        if ctx.jira_info and ctx.jira_info.get("content"):
+            question = analysis.get("question_for_user") or ""
+            preference_keywords = ("framework", "prefer", "flask", "fastapi", "react", "vue", "which")
+            jira_lower = ctx.jira_info["content"].lower()
+            # If the ticket mentions the framework, suppress the preference question
+            if any(kw in question.lower() for kw in preference_keywords):
+                for fw in ("flask", "fastapi", "react", "next.js", "vue", "django", "express"):
+                    if fw in jira_lower:
+                        log(f"Suppressing framework question ('{fw}' found in ticket): {question}")
+                        analysis = dict(analysis)
+                        analysis["question_for_user"] = None
+                        analysis["missing_info"] = [
+                            m for m in (analysis.get("missing_info") or [])
+                            if not any(kw in m.lower() for kw in preference_keywords)
+                        ]
+                        ctx.analysis = analysis
+                        break
 
         # ── Phase 3: Check for missing info (up to 2 INPUT_REQUIRED rounds) ─
         for _input_round in range(2):

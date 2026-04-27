@@ -26,6 +26,7 @@ from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.llm_client import generate_text
 from common.message_utils import artifact_text, build_text_artifact, extract_text
+from common.rules_loader import build_system_prompt
 from common.task_store import TaskStore
 from web import prompts
 
@@ -228,7 +229,8 @@ def _analyze_task(task_instruction: str, acceptance_criteria: list, repo_context
         acceptance_criteria=criteria_text,
         repo_context=repo_context or "None provided.",
     )
-    response = generate_text(prompt, f"[{AGENT_ID}] analyze", system_prompt=prompts.ANALYZE_SYSTEM)
+    system = build_system_prompt(prompts.ANALYZE_SYSTEM, "web")
+    response = generate_text(prompt, f"[{AGENT_ID}] analyze", system_prompt=system)
     return _parse_json_from_llm(response)
 
 
@@ -247,7 +249,8 @@ def _plan_implementation(
         repo_snapshot=repo_snapshot or "No existing codebase.",
         design_context=design_context or "No design context provided.",
     )
-    response = generate_text(prompt, f"[{AGENT_ID}] plan", system_prompt=prompts.PLAN_SYSTEM)
+    system = build_system_prompt(prompts.PLAN_SYSTEM, "web")
+    response = generate_text(prompt, f"[{AGENT_ID}] plan", system_prompt=system)
     return _parse_json_from_llm(response)
 
 
@@ -273,7 +276,8 @@ def _generate_file_code(
         existing_content=existing_content or "N/A (new file)",
         context_from_other_files=context_from_files or "No other files generated yet.",
     )
-    return generate_text(prompt, f"[{AGENT_ID}] codegen:{file_info.get('path', '')}", system_prompt=prompts.CODEGEN_SYSTEM)
+    return generate_text(prompt, f"[{AGENT_ID}] codegen:{file_info.get('path', '')}",
+                          system_prompt=build_system_prompt(prompts.CODEGEN_SYSTEM, "web"))
 
 
 def _generate_pr_description(
@@ -446,28 +450,70 @@ def _push_files(
     commit_message: str,
     workspace: str,
     compass_task_id: str,
+    base_branch: str = "main",
 ) -> bool:
-    """Push generated files to feature branch via SCM Agent."""
+    """Push generated files to feature branch via SCM Agent.
+    Passes structured pushPayload in metadata so the SCM agent does not need
+    to parse owner/repo/branch from free-form text.
+    """
+    # Extract owner/repo from repo_url for structured payload
+    owner, repo = "", ""
+    m = re.search(r"github\.com/([^/\s]+)/([^/\s?#]+)", repo_url or "")
+    if m:
+        owner = m.group(1)
+        repo = m.group(2).rstrip(".git")
+
     try:
-        files_payload = json.dumps(files, ensure_ascii=False)
-        message_text = (
-            f"Push files to branch {branch_name} in {repo_url}.\n"
-            f"Commit message: {commit_message}\n"
-            f"Files: {files_payload}"
-        )
-        result = _call_sync_agent(
-            SCM_AGENT_URL,
-            "scm.git.push",
-            message_text,
-            task_id,
-            workspace,
-            compass_task_id,
-        )
-        state = result.get("status", {}).get("state", "")
-        return state in ("TASK_STATE_COMPLETED", "COMPLETED")
+        message = {
+            "messageId": f"web-{task_id}-push-{int(time.time())}",
+            "role": "ROLE_USER",
+            "parts": [{"text": f"Push files to branch {branch_name} in {repo_url}"}],
+            "metadata": {
+                "requestedCapability": "scm.git.push",
+                "orchestratorTaskId": compass_task_id,
+                "sharedWorkspacePath": workspace,
+                "pushPayload": {
+                    "owner": owner,
+                    "repo": repo,
+                    "branch": branch_name,
+                    "baseBranch": base_branch,
+                    "files": files,
+                    "commitMessage": commit_message,
+                },
+            },
+        }
+        downstream = _a2a_send(SCM_AGENT_URL, message)
+        task_id_ds = downstream.get("id", "")
+        state = downstream.get("status", {}).get("state", "")
+        terminal = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED"}
+        if state not in terminal and task_id_ds:
+            result = _poll_task(SCM_AGENT_URL, task_id_ds, timeout=SYNC_AGENT_TIMEOUT)
+            if result:
+                downstream = result
+        state = downstream.get("status", {}).get("state", "")
+        if state not in ("TASK_STATE_COMPLETED", "COMPLETED"):
+            msg = downstream.get("status", {}).get("message", {})
+            txt = (msg.get("parts") or [{}])[0].get("text", "")
+            print(f"[{AGENT_ID}] Push failed: {txt[:200]}")
+            return False
+        return True
     except Exception as err:
         print(f"[{AGENT_ID}] Could not push files to {branch_name}: {err}")
         return False
+
+
+def _sanitize_base_branch(branch: str) -> str:
+    """Return a safe base branch name. Fall back to 'main' if the value looks
+    like a Jira ticket key or other non-branch string."""
+    if not branch:
+        return "main"
+    # Reject patterns like PROJ-123, CSTL-1/landing-page, jira-key/foo
+    if re.match(r"^[A-Z][A-Z0-9]+-\d+", branch):
+        return "main"
+    # Also reject if it contains characters not valid in branch names
+    if re.search(r"[\s~^:?*\[\\]", branch):
+        return "main"
+    return branch
 
 
 def _create_pr(
@@ -480,38 +526,77 @@ def _create_pr(
     workspace: str,
     compass_task_id: str,
 ) -> str:
-    """Create a pull request via SCM Agent. Returns PR URL."""
+    """Create a pull request via SCM Agent. Returns PR URL.
+    Passes structured prPayload in metadata to avoid unreliable text parsing.
+    """
+    # Sanitize base branch — LLM may return Jira-key-style strings
+    safe_base = _sanitize_base_branch(base_branch)
+
+    # Extract owner/repo from URL for structured payload
+    owner, repo = "", ""
+    m = re.search(r"github\.com/([^/\s]+)/([^/\s?#]+)", repo_url or "")
+    if m:
+        owner = m.group(1)
+        repo = m.group(2).rstrip(".git")
+
     try:
-        message_text = (
-            f"Create pull request from {branch_name} to {base_branch} in {repo_url}.\n"
-            f"Title: {pr_title}\n"
-            f"Body: {pr_body}"
-        )
-        result = _call_sync_agent(
-            SCM_AGENT_URL,
-            "scm.pr.create",
-            message_text,
-            task_id,
-            workspace,
-            compass_task_id,
-        )
-        for art in result.get("artifacts", []):
+        message = {
+            "messageId": f"web-{task_id}-pr-{int(time.time())}",
+            "role": "ROLE_USER",
+            "parts": [{
+                "text": (
+                    f"Create pull request from {branch_name} to {safe_base} in {repo_url}.\n"
+                    f"Title: {pr_title}"
+                )
+            }],
+            "metadata": {
+                "requestedCapability": "scm.pr.create",
+                "orchestratorTaskId": compass_task_id,
+                "sharedWorkspacePath": workspace,
+                "prPayload": {
+                    "owner": owner,
+                    "repo": repo,
+                    "fromBranch": branch_name,
+                    "toBranch": safe_base,
+                    "title": pr_title,
+                    "description": pr_body,
+                },
+            },
+        }
+        downstream = _a2a_send(SCM_AGENT_URL, message)
+        task_id_ds = downstream.get("id", "")
+        state = downstream.get("status", {}).get("state", "")
+        terminal = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED"}
+        if state not in terminal and task_id_ds:
+            result = _poll_task(SCM_AGENT_URL, task_id_ds, timeout=SYNC_AGENT_TIMEOUT)
+            if result:
+                downstream = result
+        for art in (downstream.get("artifacts") or []):
             text = artifact_text(art)
             if text:
                 try:
                     data = json.loads(text)
-                    return (
-                        data.get("pr_url") or data.get("prUrl")
-                        or data.get("html_url") or data.get("url") or ""
+                    url = (
+                        data.get("htmlUrl") or data.get("html_url")
+                        or data.get("pr_url") or data.get("prUrl")
+                        or data.get("url") or ""
                     )
+                    if url:
+                        return url
                 except Exception:
                     url_match = re.search(r"https?://\S+", text)
                     if url_match:
                         return url_match.group()
+        # Also check error message from status
+        msg = downstream.get("status", {}).get("message", {})
+        err_txt = (msg.get("parts") or [{}])[0].get("text", "")
+        if err_txt:
+            print(f"[{AGENT_ID}] PR create status: {err_txt[:200]}")
         return ""
     except Exception as err:
         print(f"[{AGENT_ID}] Could not create PR: {err}")
         return ""
+
 
 
 def _read_repo_snapshot(clone_path: str, max_files: int = 30, max_chars: int = 8000) -> str:
@@ -1018,11 +1103,11 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         if repo_url and workspace:
             task_store.update_state(task_id, "PUSHING", "Creating branch and pushing code…")
 
-            # Determine branch name
-            base_branch = analysis.get("target_branch") or "main"
+            # Determine branch name — sanitize base_branch from LLM analysis
+            base_branch = _sanitize_base_branch(analysis.get("target_branch") or "main")
             safe_task_id = re.sub(r"[^a-z0-9-]", "-", task_id.lower())
             branch_name = f"feature/web-agent-{safe_task_id}"
-            log(f"Creating branch: {branch_name}")
+            log(f"Creating branch: {branch_name} from base: {base_branch}")
 
             branch_created = _create_branch(
                 task_id, repo_url, branch_name, base_branch, workspace, compass_task_id
@@ -1040,7 +1125,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     commit_msg = f"feat({ticket_match.group(1)}): web agent implementation"
 
                 pushed = _push_files(
-                    task_id, repo_url, branch_name, push_files, commit_msg, workspace, compass_task_id
+                    task_id, repo_url, branch_name, push_files, commit_msg, workspace, compass_task_id,
+                    base_branch=base_branch,
                 )
                 if pushed:
                     log("Files pushed to branch")

@@ -129,15 +129,16 @@ class GitHubProvider(SCMProvider):
         return [], f"error_{status}"
 
     def create_branch(self, owner: str, repo: str, branch: str, from_ref: str) -> tuple[dict, str]:
-        # Resolve sha of from_ref
+        # Resolve sha of from_ref via API
         ref_status, ref_body = self._request("GET", f"repos/{owner}/{repo}/git/ref/heads/{from_ref}")
         if ref_status != 200:
-            # try as sha directly
             sha = from_ref
         else:
             sha = (ref_body.get("object") or {}).get("sha", "")
         if not sha:
             return {"error": "could not resolve from_ref sha"}, "error_ref_not_found"
+
+        # Try the REST API first
         status, body = self._request(
             "POST",
             f"repos/{owner}/{repo}/git/refs",
@@ -149,6 +150,31 @@ class GitHubProvider(SCMProvider):
                 "sha": sha,
                 "htmlUrl": f"https://github.com/{owner}/{repo}/tree/{branch}",
             }, "created"
+
+        # Fine-grained PATs may not be allowed to use the refs API (403).
+        # Fall back: create the branch via git push using _run_git (http.extraHeader auth).
+        if status == 403 or status == 422:
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="scm-branch-") as tmpdir:
+                clone_url = self.get_clone_url(owner, repo)
+                ok, _ = self._run_git(
+                    ["clone", "--depth=1", "--branch", from_ref, clone_url, tmpdir]
+                )
+                if not ok:
+                    return body, f"create_failed_{status}"
+                self._run_git(["config", "user.email", self._author_email], cwd=tmpdir)
+                self._run_git(["config", "user.name", self._author_name], cwd=tmpdir)
+                ok2, res2 = self._run_git(
+                    ["push", "origin", f"HEAD:refs/heads/{branch}"], cwd=tmpdir
+                )
+                if ok2:
+                    return {
+                        "name": branch,
+                        "sha": sha,
+                        "htmlUrl": f"https://github.com/{owner}/{repo}/tree/{branch}",
+                    }, "created"
+                return res2, "create_failed_git_push"
+
         return body, f"create_failed_{status}"
 
     # ------------------------------------------------------------------
@@ -276,10 +302,11 @@ class GitHubProvider(SCMProvider):
         return f"https://github.com/{owner}/{repo}.git"
 
     def _git_env(self) -> dict:
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
         return env
 
     def _git_config_args(self) -> list[str]:
+        """Return git -c args for authentication via http.extraHeader."""
         args = []
         auth = self._auth_header()
         if auth:
@@ -296,6 +323,16 @@ class GitHubProvider(SCMProvider):
             return False, {"command": command, "returncode": completed.returncode, "output": output}
         return True, {"command": command, "output": output}
 
+    def _authed_clone_url(self, owner: str, repo: str) -> str:
+        """Return clone URL with embedded token for reliable git auth.
+
+        Token is embedded as x-access-token (GitHub fine-grained PAT compatible).
+        This runs only inside the agent container and is never exposed externally.
+        """
+        if self._token:
+            return f"https://x-access-token:{self._token}@github.com/{owner}/{repo}.git"
+        return f"https://github.com/{owner}/{repo}.git"
+
     def push_files(
         self,
         owner: str,
@@ -306,7 +343,8 @@ class GitHubProvider(SCMProvider):
         commit_message: str,
         files_to_delete: list[str] | None = None,
     ) -> tuple[dict, str]:
-        clone_url = self.get_clone_url(owner, repo)
+        clone_url = self._authed_clone_url(owner, repo)
+        env = self._git_env()
         with tempfile.TemporaryDirectory(prefix="scm-push-") as tmpdir:
             ok, result = self._run_git(
                 ["clone", "--depth=1", "--branch", base_branch, clone_url, tmpdir]
