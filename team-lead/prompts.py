@@ -84,6 +84,21 @@ You are a Team Lead Agent creating an implementation plan for a development task
 Based on the gathered context (Jira ticket, design specs, user request), create a
 concrete plan that tells the development agent exactly what to implement.
 
+Test requirements are MANDATORY for every plan:
+- UI pages/components → write end-to-end or integration tests that verify the page
+  renders correctly and all interactive elements work (e.g., pytest + Flask test client,
+  Playwright, or Cypress depending on the stack).
+- API endpoints → write unit tests or integration tests that cover all response codes,
+  inputs, and edge cases.
+- Business logic → write unit tests covering all branches and edge cases.
+- Minimum coverage: every acceptance criterion must have at least one corresponding test.
+
+Design fidelity is MANDATORY when design context (Stitch/Figma) is provided:
+- The implementation must faithfully reproduce the layout, colours, typography, and
+  component structure shown in the design.
+- The dev agent must include the design URL in the PR description and note any intentional
+  deviations with justification.
+
 Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
 """
 
@@ -114,13 +129,14 @@ Respond with a JSON object:
   "platform": "android|ios|web",
   "dev_capability": "android.task.execute|ios.task.execute|web.task.execute",
   "target_repo_url": "full repo URL from context, or null",
-  "dev_instruction": "Detailed step-by-step instruction for the development agent. Include: what to implement, key files to change, expected behaviour, and any constraints from the design or ticket. MUST include the target_repo_url if available.",
+  "dev_instruction": "Detailed step-by-step instruction for the development agent. Include: what to implement, key files to change, expected behaviour, any constraints from the design or ticket, and what tests to write. MUST include the target_repo_url if available.",
   "acceptance_criteria": [
     "Criterion 1: describe the observable outcome",
     "Criterion 2: ..."
   ],
   "requires_tests": true|false,
-  "test_requirements": "Description of required test coverage, or null"
+  "test_requirements": "Explicit description of required test coverage: what type of tests (unit/integration/e2e), what to test, minimum pass threshold. Never null when requires_tests is true.",
+  "screenshot_requirements": "For UI tasks: describe what screenshots or visual evidence should be included in the PR (e.g., Stitch design URL reference + screenshot of rendered page). For non-UI tasks: null."
 }}
 
 Rules:
@@ -131,6 +147,11 @@ Rules:
 - If the Jira ticket or user request explicitly specifies a tech stack, treat it as a hard requirement.
 - Do NOT infer React, Next.js, or Node.js from a sparse repo, a design-tool reference, or the word "web" alone.
 - If the target repo is empty or nearly empty, instruct the dev agent to scaffold the required stack in-place.
+- requires_tests must be true for any feature or UI implementation.
+- test_requirements must describe the exact test coverage needed; never leave it as "Not specified" for a feature task.
+- If design context is provided, dev_instruction MUST instruct the dev agent to implement the UI
+  exactly as shown in the design (matching layout, colours, typography, components) and include
+  the design URL as a reference in the PR description.
 """
 
 # ---------------------------------------------------------------------------
@@ -143,11 +164,22 @@ Your job is to verify the output meets the requirements and is production-ready.
 
 Check:
 1. All acceptance criteria are met
-2. Test cases exist and cover the requirements (if required)
+2. Test cases exist and cover the requirements (if required):
+   - For UI pages: tests that verify the page renders and all elements are present
+   - For APIs: tests covering all endpoints, response codes, and edge cases
+   - For business logic: unit tests covering all branches
+   - Reject if requires_tests is true but no test files are present
 3. No obvious bugs, edge cases, or security issues
 4. Code quality is acceptable
 5. Development workflow was followed: Jira ticket transitioned to In Progress and In Review,
    PR was created, and a Jira comment with PR link was posted
+6. Design fidelity (if design context was provided):
+   - The PR description references the design URL
+   - The implementation matches the design layout, colours, and component structure
+   - Any deviations from the design are explicitly called out and justified
+7. No unnecessary files committed to the PR:
+   - .work/ evidence directories must NOT be in the PR
+   - scripts/ operational helpers (Jira update scripts, branch creation instructions) must NOT be in the PR
 
 Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
 """
@@ -163,6 +195,8 @@ Acceptance criteria:
 
 Test requirements: {test_requirements}
 
+Design context provided: {design_context_provided}
+
 Development agent output:
 {dev_output}
 
@@ -171,6 +205,8 @@ Artifacts produced:
 
 Evaluate each acceptance criterion and check that the dev workflow was followed
 (Jira In Progress → implementation → PR → Jira In Review with PR link).
+If design context was provided, verify the implementation visually matches the design.
+If tests were required, verify they are present and meaningful.
 
 Respond with a JSON object:
 {{
@@ -181,9 +217,14 @@ Respond with a JSON object:
   ],
   "workflow_followed": true|false,
   "workflow_notes": "Brief note on Jira/PR workflow compliance",
+  "design_fidelity_checked": true|false,
+  "design_fidelity_notes": "Notes on whether the implementation matches the design, or 'N/A' if no design was provided",
+  "test_coverage_adequate": true|false,
+  "test_coverage_notes": "Notes on test coverage quality and completeness",
+  "unnecessary_files_in_pr": ["list any .work/ or scripts/ files that should not be in the PR"],
   "issues": ["issue 1", "issue 2"],
   "missing_requirements": ["unmet requirement 1"],
-  "feedback_for_dev": "Detailed actionable feedback for the dev agent to fix the issues. Be specific about what files to change and what is expected. Set to null if passed.",
+  "feedback_for_dev": "Detailed actionable feedback for the dev agent to fix the issues. Be specific about what files to change and what is expected. If tests are missing, list exactly what test cases are needed. If design fidelity is off, describe what elements need to change. Set to null if passed.",
   "summary": "Brief review verdict in one sentence"
 }}
 """

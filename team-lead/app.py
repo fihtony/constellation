@@ -286,6 +286,7 @@ def _build_dev_task_metadata(
     is_revision: bool = False,
     revision_cycle: int = 0,
     review_issues: list | None = None,
+    design_context: dict | None = None,
 ) -> dict:
     metadata = {
         "requestedCapability": dev_capability,
@@ -306,6 +307,13 @@ def _build_dev_task_metadata(
             ack_timeout_seconds=DEV_AGENT_ACK_TIMEOUT,
         ),
     }
+    if design_context and (design_context.get("content") or design_context.get("url")):
+        metadata["designContext"] = {
+            "url": design_context.get("url", ""),
+            "type": design_context.get("type", ""),
+            "content": (design_context.get("content") or "")[:4000],
+            "page_name": design_context.get("page_name", ""),
+        }
     if is_revision:
         metadata.update(
             {
@@ -819,6 +827,7 @@ def _review_output(
     plan: dict,
     dev_output: str,
     artifacts: list,
+    design_info: dict | None = None,
 ) -> dict:
     criteria_lines = "\n".join(
         f"- {c}" for c in (plan.get("acceptance_criteria") or [])
@@ -828,10 +837,16 @@ def _review_output(
         for art in (artifacts or [])[:5]
     ) or "No artifacts produced."
 
+    design_context_provided = "No"
+    if design_info and design_info.get("content"):
+        design_url = design_info.get("url", "")
+        design_context_provided = f"Yes — {design_url}" if design_url else "Yes (no URL)"
+
     prompt = prompts.REVIEW_TEMPLATE.format(
         user_text=user_text,
         acceptance_criteria=criteria_lines,
         test_requirements=plan.get("test_requirements") or "Not specified.",
+        design_context_provided=design_context_provided,
         dev_output=(dev_output or "No output text.")[:3000],
         artifacts_summary=artifacts_summary,
     )
@@ -1299,6 +1314,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 tech_stack_constraints=tech_stack_constraints,
                 acceptance_criteria=plan.get("acceptance_criteria") or [],
                 requires_tests=plan.get("requires_tests", False),
+                design_context=ctx.design_info,
             ),
         }
 
@@ -1339,7 +1355,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             )
             log(f"Reviewing dev output (cycle {review_cycle + 1}/{MAX_REVIEW_CYCLES})")
 
-            review = _review_output(user_text, plan, dev_output, final_artifacts)
+            review = _review_output(user_text, plan, dev_output, final_artifacts, design_info=ctx.design_info)
             ctx.review_result = review
             _save_workspace_file(
                 workspace,
@@ -1405,6 +1421,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     is_revision=True,
                     revision_cycle=review_cycle + 1,
                     review_issues=review.get("issues") or [],
+                    design_context=ctx.design_info,
                 ),
             }
             rev_task = _a2a_send(revision_service_url, revision_message)

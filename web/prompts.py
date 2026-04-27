@@ -86,6 +86,10 @@ Critical planning rules:
 - The `files` list must contain only repository source/config/test files that should be
   created or modified in git. Do NOT include workflow artifacts such as PR drafts,
   Jira evidence notes, CI logs, or step-by-step scratch files.
+- NEVER include `.work/` files (evidence logs, curl outputs, Jira API responses).
+- NEVER include `scripts/` helper files whose sole purpose is running Jira updates,
+  branch creation commands, or PR instructions — these are operational scaffolding,
+  not source code deliverables.
 
 Important rules for Flask backends:
 - The Flask app must use: `app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))`
@@ -145,6 +149,7 @@ Repair rules:
   repository source/config/test files needed to satisfy the task and acceptance criteria.
 - The `files` list must contain only repository files that belong in git.
 - Do NOT include workflow artifacts such as PR drafts, Jira evidence, CI logs, or scratch notes.
+- Do NOT include `.work/` evidence files or `scripts/` operational helpers.
 """
 
 PLAN_REPAIR_TEMPLATE = """\
@@ -258,11 +263,32 @@ Files changed:
 Implementation summary:
 {implementation_summary}
 
+Design reference:
+{design_reference}
+
+Test evidence:
+{test_evidence}
+
 Write the PR title on the first line, then a blank line, then the PR body.
 Format:
 [title]
 
-[body with ## sections: Summary, Changes, Testing]
+[body with these ## sections:
+  ## Summary
+  ## Changes
+  ## Design Reference
+    (If a design URL or Stitch/Figma screen was provided, include it here.
+     List the design URL and the key design requirements that were implemented.
+     Add a note: "Screenshots: please verify the rendered page matches the design above.")
+  ## Testing
+    (Describe what tests were written and/or the test results.
+     If test output was provided, include a short summary of pass/fail counts.
+     If this is a UI implementation, note how to run the app locally for visual verification.)
+  ## Checklist
+    - [ ] UI matches the Stitch/Figma design (visual review required)
+    - [ ] All tests pass locally
+    - [ ] No unnecessary files committed (no .work/, no scripts/ helpers)
+]
 """
 
 # ---------------------------------------------------------------------------

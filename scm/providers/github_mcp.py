@@ -285,15 +285,48 @@ class GitHubMCPProvider(SCMProvider):
         return {}, "not_found"
 
     def _normalize_repo(self, r: dict) -> dict:
+        owner_value = r.get("owner")
+        owner_login = ""
+        if isinstance(owner_value, dict):
+            owner_login = str(owner_value.get("login", "")).strip()
+        elif isinstance(owner_value, str):
+            owner_login = owner_value.strip()
+
+        full_name = str(r.get("full_name", "")).strip()
+        repo_name = str(r.get("name", "")).strip()
+        if full_name and "/" in full_name:
+            full_owner, full_repo = full_name.split("/", 1)
+            if not owner_login:
+                owner_login = full_owner.strip()
+            if not repo_name:
+                repo_name = full_repo.strip()
+
+        html_url = str(r.get("html_url", "")).strip()
+        clone_url = str(r.get("clone_url", "")).strip()
+        if not owner_login:
+            source_url = html_url or clone_url
+            match = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", source_url)
+            if match:
+                owner_login = match.group(1).strip()
+                if not repo_name:
+                    repo_name = match.group(2).strip()
+
+        if not full_name and owner_login and repo_name:
+            full_name = f"{owner_login}/{repo_name}"
+        if not html_url and full_name:
+            html_url = f"https://github.com/{full_name}"
+        if not clone_url and full_name:
+            clone_url = f"https://github.com/{full_name}.git"
+
         return {
             "provider": "github",
-            "owner": (r.get("owner") or {}).get("login", ""),
-            "repo": r.get("name", ""),
-            "fullName": r.get("full_name", ""),
+            "owner": owner_login,
+            "repo": repo_name,
+            "fullName": full_name,
             "description": r.get("description", ""),
             "defaultBranch": r.get("default_branch", "main"),
-            "cloneUrl": r.get("clone_url", ""),
-            "htmlUrl": r.get("html_url", ""),
+            "cloneUrl": clone_url,
+            "htmlUrl": html_url,
             "private": r.get("private", False),
             "language": r.get("language", ""),
         }

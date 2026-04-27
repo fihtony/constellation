@@ -26,6 +26,7 @@ Run
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import re
 import socket
@@ -74,6 +75,11 @@ CONTAINER_AGENT_URL = "http://127.0.0.1:8020"
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--integration",
+        action="store_true",
+        help="Compatibility flag; this script always runs live integration checks.",
+    )
     parser.add_argument("--agent-url", default="")
     parser.add_argument("--container", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -186,10 +192,11 @@ def main(argv=None):
     try:
         # TC-01 — Git auth --------------------------------------------------
         reporter.step("TC-01  Validate GitHub token via git ls-remote")
+        basic_auth = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
         code, stdout, stderr = run_command(
             [
                 "git",
-                "-c", f"http.extraHeader=Authorization: Bearer {token}",
+                "-c", f"http.extraHeader=AUTHORIZATION: basic {basic_auth}",
                 "-c", "credential.helper=",
                 "ls-remote", clone_url, "HEAD",
             ],

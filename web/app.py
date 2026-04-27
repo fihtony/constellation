@@ -654,10 +654,21 @@ def _is_operational_plan_artifact(file_info: dict) -> bool:
         return True
     if path_lower.startswith("artifacts/"):
         return True
+    # Reject .work/ evidence files (CI evidence, Jira API responses, test output logs)
+    if path_lower.startswith(".work/") or "/.work/" in path_lower:
+        return True
+    # Reject scripts/ helper folders (branch/PR scripts, Jira update scripts, etc.)
+    if path_lower.startswith("scripts/") and any(
+        kw in text for kw in ("jira", "branch", "pr", "update", "instructions", "helper", "script")
+    ):
+        return True
     base_name = os.path.basename(path_lower)
     if re.match(r"^step-\d+.*\.md$", base_name):
         return True
     if re.match(r"^pr[_-]?template", base_name):
+        return True
+    # Reject common evidence/scratch file names regardless of directory
+    if re.match(r"^(jira[_-]update|branch[_-]and[_-]pr|server[_-]curl|pytest[_-]output)\.(sh|txt|json|md)$", base_name):
         return True
     return False
 
@@ -747,15 +758,35 @@ def _generate_pr_description(
     acceptance_criteria: list,
     files_changed: list,
     implementation_summary: str,
+    design_context_meta: dict | None = None,
+    test_output: str = "",
 ) -> tuple[str, str]:
     """Return (pr_title, pr_body)."""
     criteria_text = "\n".join(f"- {c}" for c in (acceptance_criteria or [])) or "Not specified."
     files_text = "\n".join(f"- {f}" for f in files_changed) or "No files listed."
+
+    # Build design reference block
+    design_parts = []
+    if design_context_meta:
+        if design_context_meta.get("url"):
+            design_parts.append(f"Design URL: {design_context_meta['url']}")
+        if design_context_meta.get("page_name"):
+            design_parts.append(f"Screen: {design_context_meta['page_name']}")
+    design_reference = "\n".join(design_parts) if design_parts else "No design reference provided."
+
+    # Build test evidence block
+    if test_output:
+        test_evidence = test_output[:800]
+    else:
+        test_evidence = "No test output captured."
+
     prompt = prompts.PR_DESCRIPTION_TEMPLATE.format(
         task_instruction=task_instruction,
         acceptance_criteria=criteria_text,
         files_changed=files_text,
         implementation_summary=implementation_summary,
+        design_reference=design_reference,
+        test_evidence=test_evidence,
     )
     response = _run_agentic(
         prompt,
@@ -1751,6 +1782,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
     is_revision: bool = metadata.get("isRevision", False)
     review_issues: list = metadata.get("reviewIssues") or []
     tech_stack_constraints: dict = metadata.get("techStackConstraints") or {}
+    # Design context passed from Team Lead (Stitch/Figma content + URL)
+    design_context_meta: dict = metadata.get("designContext") or {}
     # Repo URL injected by Team Lead from Jira/analysis (preferred over text extraction)
     metadata_repo_url: str = metadata.get("targetRepoUrl", "")
     # Exit rule: how to shut down after task completion (defined by parent)
@@ -1941,12 +1974,24 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         # ── Phase 3: Plan ────────────────────────────────────────────────────
         task_store.update_state(task_id, "PLANNING", "Creating implementation plan…")
         log("Planning implementation")
+        # Build design context string from metadata (passed by Team Lead)
+        design_context_str = ""
+        if design_context_meta:
+            parts = []
+            if design_context_meta.get("url"):
+                parts.append(f"Design reference: {design_context_meta['url']}")
+            if design_context_meta.get("page_name"):
+                parts.append(f"Screen/Page: {design_context_meta['page_name']}")
+            if design_context_meta.get("content"):
+                parts.append(design_context_meta["content"])
+            design_context_str = "\n".join(parts)
+            log(f"Using design context from Team Lead ({len(design_context_str)} chars)")
         plan = _plan_implementation(
             task_instruction,
             acceptance_criteria,
             analysis,
             repo_snapshot,
-            design_context="",
+            design_context=design_context_str,
         )
         files_to_implement, removed_plan_files = _sanitize_plan_files(
             plan.get("files") or [],
@@ -2074,6 +2119,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         # ── Phase 5b: Build and test with LLM-guided recovery ───────────────
         build_dir = clone_path or agent_workspace
         build_ok = True  # default: assume passing if no build dir
+        build_output = ""  # populated below if build/tests are actually run
         if build_dir and os.path.isdir(build_dir):
             task_store.update_state(task_id, "BUILDING", "Running build and tests…")
             log("Running build/tests")
@@ -2179,6 +2225,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                         acceptance_criteria,
                         files_changed,
                         plan.get("plan_summary") or "Web agent implementation",
+                        design_context_meta=design_context_meta,
+                        test_output=build_output if build_dir else "",
                     )
                     _save_pr_evidence(
                         workspace,
