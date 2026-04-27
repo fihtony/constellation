@@ -70,6 +70,23 @@ def _looks_like_stitch_request(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Workspace file helper
+# ---------------------------------------------------------------------------
+
+def _save_workspace_file(workspace_path: str, relative_name: str, content: str) -> None:
+    """Write content to a file inside the shared workspace (best-effort)."""
+    if not workspace_path:
+        return
+    try:
+        full_path = os.path.join(workspace_path, relative_name)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    except OSError as exc:
+        print(f"[{AGENT_ID}] Warning: could not save workspace file {relative_name}: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Figma handler
 # ---------------------------------------------------------------------------
 
@@ -150,7 +167,7 @@ def _handle_figma_message(user_text: str, capability: str) -> tuple[str, list]:
 # Stitch handler
 # ---------------------------------------------------------------------------
 
-def _handle_stitch_message(user_text: str, capability: str) -> tuple[str, list]:
+def _handle_stitch_message(user_text: str, capability: str, workspace_path: str = "") -> tuple[str, list]:
     import re
 
     proj_match = re.search(r"\b(\d{15,20})\b", user_text)
@@ -159,7 +176,22 @@ def _handle_stitch_message(user_text: str, capability: str) -> tuple[str, list]:
     screen_match = re.search(r"\b([0-9a-f]{32})\b", user_text, re.IGNORECASE)
     screen_id = screen_match.group(1) if screen_match else ""
 
+    # Extract page/screen name from text:
+    #   "page: Landing Page (Bare-bones)"  or  "screen name: Foo Bar"  or  "page name 'Foo'"
+    page_name = ""
+    page_name_patterns = [
+        r'(?:page|screen)[_\s-]*name[:\s]+["\']?([^"\'\\n,]+?)["\']?(?:\s|$)',
+        r'(?:page|screen)[:\s]+["\']([^"\']+)["\']',
+        r'(?:page|screen)[:\s]+([A-Z][^\n,]{3,60}?)(?:\s*$|\s*,)',
+    ]
+    for pat in page_name_patterns:
+        m = re.search(pat, user_text, re.IGNORECASE)
+        if m:
+            page_name = m.group(1).strip().rstrip(".")
+            break
+
     summary_parts: list[str] = []
+    design_result: dict = {}
 
     if project_id and screen_id:
         result, status = stitch_client.get_screen(project_id, screen_id)
@@ -169,20 +201,62 @@ def _handle_stitch_message(user_text: str, capability: str) -> tuple[str, list]:
             )
             if result.get("imageUrls"):
                 summary_parts.append(f"Image URLs: {result['imageUrls'][:2]}")
+            design_result = result
         else:
             summary_parts.append(f"Stitch screen fetch failed: {status}")
+    elif project_id and page_name:
+        # Try to resolve page name → screen ID using list_screens
+        found_screen, find_status = stitch_client.find_screen_by_name(project_id, page_name)
+        if found_screen:
+            resolved_id = found_screen.get("id", "") or found_screen.get("screenId", "")
+            resolved_name = found_screen.get("name", page_name)
+            summary_parts.append(
+                f"Resolved page '{page_name}' → screen '{resolved_name}' (id={resolved_id})"
+            )
+            if resolved_id:
+                result, status = stitch_client.get_screen(project_id, resolved_id)
+                if status == "ok":
+                    summary_parts.append(
+                        f"Stitch screen fetched: project={project_id}, screen={resolved_id}"
+                    )
+                    if result.get("imageUrls"):
+                        summary_parts.append(f"Image URLs: {result['imageUrls'][:2]}")
+                    design_result = result
+                    screen_id = resolved_id
+                else:
+                    summary_parts.append(f"Stitch screen fetch failed after name resolution: {status}")
+            else:
+                summary_parts.append(f"Found screen by name but no ID available: {found_screen}")
+        else:
+            summary_parts.append(f"Page '{page_name}' not found in project {project_id}: {find_status}")
+            # Still fetch project metadata as fallback
+            result, status = stitch_client.get_project(project_id)
+            if status == "ok":
+                summary_parts.append(f"Stitch project fetched (fallback): {project_id}")
+                design_result = result
     elif project_id:
         result, status = stitch_client.get_project(project_id)
         if status == "ok":
             summary_parts.append(f"Stitch project fetched: {project_id}")
+            design_result = result
         else:
             summary_parts.append(f"Stitch project fetch failed: {status}")
+
+    # Save design content to shared workspace
+    if workspace_path and design_result:
+        _save_workspace_file(
+            workspace_path,
+            "ui-design/stitch-design.json",
+            json.dumps(design_result, ensure_ascii=False, indent=2),
+        )
+        debug_log(AGENT_ID, "stitch.workspace.saved", path=workspace_path)
 
     prompt = (
         "You are the UI Design Agent. The user requested Google Stitch design data.\n\n"
         f"User request: {user_text}\n"
         f"Project ID found: {project_id or 'none'}\n"
         f"Screen ID found: {screen_id or 'none'}\n"
+        f"Page name requested: {page_name or 'none'}\n"
         f"Fetch summary: {'; '.join(summary_parts) or 'no data fetched'}\n\n"
         "Respond concisely with what was fetched and how it can be used."
     )
@@ -198,10 +272,11 @@ def _handle_stitch_message(user_text: str, capability: str) -> tuple[str, list]:
                 "capability": capability or "stitch.screen.fetch",
                 "projectId": project_id,
                 "screenId": screen_id,
+                "pageName": page_name,
             },
         )
     ]
-    debug_log(AGENT_ID, "stitch.message.completed", projectId=project_id, screenId=screen_id)
+    debug_log(AGENT_ID, "stitch.message.completed", projectId=project_id, screenId=screen_id, pageName=page_name)
     return "; ".join(summary_parts) or "Stitch request processed.", artifacts
 
 
@@ -237,6 +312,7 @@ def _dispatch_message(message: dict) -> tuple[str, list]:
     user_text = extract_text(message)
     metadata = message.get("metadata", {}) if isinstance(message, dict) else {}
     capability = metadata.get("requestedCapability", "")
+    workspace_path = metadata.get("sharedWorkspacePath", "")
 
     debug_log(AGENT_ID, "ui-design.message.received",
               userText=user_text, capability=capability)
@@ -245,7 +321,7 @@ def _dispatch_message(message: dict) -> tuple[str, list]:
         return _handle_figma_message(user_text, capability)
 
     if capability.startswith("stitch.") or _looks_like_stitch_request(user_text):
-        return _handle_stitch_message(user_text, capability)
+        return _handle_stitch_message(user_text, capability, workspace_path=workspace_path)
 
     return _handle_generic_message(user_text)
 

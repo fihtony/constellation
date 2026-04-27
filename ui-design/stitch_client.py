@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -128,6 +129,85 @@ def get_screen(project_id: str, screen_id: str) -> tuple[dict, str]:
     if status == 200 and "error" in body:
         return body, "rpc_error"
     return body, f"error_{status}"
+
+
+def list_screens(project_id: str) -> tuple[list, str]:
+    """List all screens in a Stitch project.
+
+    Returns (screens_list, status).
+    Each screen in the list is a dict with at least ``id`` and ``name`` keys.
+    """
+    status, body = _stitch_post(
+        "tools/call",
+        {"name": "list_screens", "arguments": {"project_id": project_id}},
+    )
+    if status == 200 and "result" in body:
+        result = body["result"]
+        if isinstance(result, dict) and result.get("isError"):
+            text = _extract_text_content(body)
+            return [], f"stitch_error: {text}"
+        content = result.get("content", []) if isinstance(result, dict) else []
+        screens: list[dict] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
+                raw = (item.get("text") or "").strip()
+                # Try structured JSON parse first
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        screens = parsed
+                        break
+                    if isinstance(parsed, dict) and "screens" in parsed:
+                        screens = parsed["screens"]
+                        break
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                # Fallback: scan for id/name pairs in plain text
+                # e.g.  "id: abc123  name: Landing Page"
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    id_m = re.search(r'"?id"?\s*[=:]\s*"?([0-9a-f]{32})"?', line, re.IGNORECASE)
+                    nm_m = re.search(r'"?name"?\s*[=:]\s*"?([^",\n]+)"?', line, re.IGNORECASE)
+                    if id_m and nm_m:
+                        screens.append({"id": id_m.group(1), "name": nm_m.group(1).strip()})
+        return screens, "ok"
+    if status == 200 and "error" in body:
+        err = body["error"]
+        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        return [], f"rpc_error: {msg}"
+    return [], f"error_{status}"
+
+
+def find_screen_by_name(project_id: str, page_name: str) -> tuple[dict | None, str]:
+    """Find a screen in a Stitch project by name (case-insensitive, partial match).
+
+    Returns (screen_dict | None, status).
+    """
+    screens, status = list_screens(project_id)
+    if status != "ok":
+        return None, status
+    if not screens:
+        return None, "no_screens"
+
+    target = page_name.lower().strip()
+    # Exact match first
+    for screen in screens:
+        if screen.get("name", "").lower().strip() == target:
+            return screen, "ok"
+    # Partial match (target is a substring of screen name)
+    for screen in screens:
+        if target in screen.get("name", "").lower():
+            return screen, "ok"
+    # Partial match (screen name is a substring of target)
+    for screen in screens:
+        if screen.get("name", "").lower() in target:
+            return screen, "ok"
+
+    return None, f"not_found (available: {[s.get('name') for s in screens[:5]]})"
 
 
 def get_screen_image(project_id: str, screen_id: str) -> tuple[dict, str]:

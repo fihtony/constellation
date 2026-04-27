@@ -429,8 +429,8 @@ def _handle_repo_search(text: str) -> tuple[str, list]:
         for r in repos
     )
     artifact = build_text_artifact(
+        "repo-search-results",
         summary or "No repositories found.",
-        name="repo-search-results",
         metadata={"agentId": AGENT_ID, "capability": "scm.repo.search"},
     )
     return f"Found {len(repos)} repositories.", [artifact]
@@ -446,8 +446,8 @@ def _handle_repo_inspect(text: str) -> tuple[str, list]:
     branches, _ = _provider.list_branches(owner, repo)
     result = {**info, "branches": branches[:20]}
     artifact = build_text_artifact(
+        "repo-info",
         json.dumps(result, ensure_ascii=False, indent=2),
-        name="repo-info",
         metadata={"agentId": AGENT_ID, "capability": "scm.repo.inspect"},
     )
     return f"Repository {owner}/{repo} fetched ({len(branches)} branches).", [artifact]
@@ -461,8 +461,8 @@ def _handle_branch_list(text: str) -> tuple[str, list]:
     if status != "ok":
         return f"Branch list failed: {status}", []
     artifact = build_text_artifact(
+        "branches",
         json.dumps(branches, ensure_ascii=False, indent=2),
-        name="branches",
         metadata={"agentId": AGENT_ID, "capability": "scm.branch.list"},
     )
     return f"Listed {len(branches)} branches for {owner}/{repo}.", [artifact]
@@ -480,8 +480,8 @@ def _handle_branch_create(text: str, message: dict) -> tuple[str, list]:
     if status not in ("created",):
         return f"Branch creation failed: {status} — {result}", []
     artifact = build_text_artifact(
+        "branch-created",
         json.dumps(result, ensure_ascii=False, indent=2),
-        name="branch-created",
         metadata={"agentId": AGENT_ID, "capability": "scm.branch.create"},
     )
     return f"Branch '{branch}' created in {owner}/{repo} from '{from_ref}'.", [artifact]
@@ -497,8 +497,8 @@ def _handle_pr_list(text: str) -> tuple[str, list]:
     if status != "ok":
         return f"PR list failed: {status}", []
     artifact = build_text_artifact(
+        "pull-requests",
         json.dumps(prs, ensure_ascii=False, indent=2),
-        name="pull-requests",
         metadata={"agentId": AGENT_ID, "capability": "scm.pr.list"},
     )
     return f"Listed {len(prs)} {state} PRs for {owner}/{repo}.", [artifact]
@@ -514,8 +514,8 @@ def _handle_pr_get(text: str) -> tuple[str, list]:
     if status != "ok":
         return f"PR fetch failed: {status}", []
     artifact = build_text_artifact(
+        f"pr-{pr_id}",
         json.dumps(pr, ensure_ascii=False, indent=2),
-        name=f"pr-{pr_id}",
         metadata={"agentId": AGENT_ID, "capability": "scm.pr.get",
                   "linkedJiraIssues": pr.get("linkedJiraIssues", [])},
     )
@@ -551,8 +551,8 @@ def _handle_pr_create(text: str, message: dict) -> tuple[str, list]:
     if status not in ("created",):
         return f"PR creation failed: {status} — {pr}", []
     artifact = build_text_artifact(
+        "pr-created",
         json.dumps(pr, ensure_ascii=False, indent=2),
-        name="pr-created",
         metadata={"agentId": AGENT_ID, "capability": "scm.pr.create"},
     )
     return f"PR created: '{title}' ({pr.get('htmlUrl', '')})", [artifact]
@@ -571,8 +571,8 @@ def _handle_pr_comment(text: str, message: dict) -> tuple[str, list]:
         return f"PR comment failed: {status} — {result}", []
     return f"Comment added to PR #{pr_id} in {owner}/{repo}.", [
         build_text_artifact(
+            "pr-comment",
             json.dumps(result, ensure_ascii=False, indent=2),
-            name="pr-comment",
             metadata={"agentId": AGENT_ID, "capability": "scm.pr.comment"},
         )
     ]
@@ -589,8 +589,8 @@ def _handle_pr_comment_list(text: str) -> tuple[str, list]:
         return f"PR comment list failed: {status}", []
     return f"Listed {len(comments)} comments on PR #{pr_id}.", [
         build_text_artifact(
+            "pr-comments",
             json.dumps(comments, ensure_ascii=False, indent=2),
-            name="pr-comments",
             metadata={"agentId": AGENT_ID, "capability": "scm.pr.comment.list"},
         )
     ]
@@ -616,8 +616,8 @@ def _handle_git_push(text: str, message: dict) -> tuple[str, list]:
         return f"Git push failed: {status} — {result}", []
     return f"Pushed {len(files)} file(s) to {owner}/{repo}:{branch}.", [
         build_text_artifact(
+            "git-push",
             json.dumps(result, ensure_ascii=False, indent=2),
-            name="git-push",
             metadata={"agentId": AGENT_ID, "capability": "scm.git.push"},
         )
     ]
@@ -635,8 +635,8 @@ def _handle_llm_dispatch(text: str, message: dict, system_prompt: str) -> tuple[
         llm_response = f"LLM error: {exc}"
 
     artifact = build_text_artifact(
+        "scm-analysis",
         llm_response,
-        name="scm-analysis",
         metadata={"agentId": AGENT_ID, "provider": _provider.provider_name},
     )
     return llm_response[:200], [artifact]

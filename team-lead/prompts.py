@@ -42,6 +42,7 @@ Respond with a JSON object using this exact structure:
   "needs_design_context": true|false,
   "design_url": "url or null",
   "design_type": "figma|stitch|null",
+  "design_page_name": "exact page or screen name from the request, or null",
   "missing_info": ["item 1", "item 2"],
   "question_for_user": "A single clear question if critical info is missing, or null",
   "summary": "One sentence summary of the task"

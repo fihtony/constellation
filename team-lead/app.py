@@ -129,6 +129,24 @@ class _TaskContext:
 
 
 # ---------------------------------------------------------------------------
+# Workspace helpers
+# ---------------------------------------------------------------------------
+
+def _save_workspace_file(workspace_path: str, relative_name: str, content: str) -> None:
+    """Write content to a file inside the shared workspace (best-effort)."""
+    if not workspace_path:
+        return
+    try:
+        full_path = os.path.join(workspace_path, relative_name)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        print(f"[{AGENT_ID}] Saved workspace file: {relative_name}")
+    except OSError as exc:
+        print(f"[{AGENT_ID}] Warning: could not save workspace file {relative_name}: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -568,6 +586,12 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 )
                 ctx.jira_info = {"ticket_key": ticket_key, "content": content}
                 log(f"Jira ticket {ticket_key} fetched ({len(content)} chars)")
+                # Save Jira info to shared workspace
+                _save_workspace_file(
+                    workspace,
+                    "team-lead/jira-context.json",
+                    json.dumps(ctx.jira_info, ensure_ascii=False, indent=2),
+                )
             except Exception as err:
                 log(f"Warning: could not fetch Jira ticket {ticket_key}: {err}")
                 ctx.jira_info = {"ticket_key": ticket_key, "content": "", "error": str(err)}
@@ -575,15 +599,19 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         if analysis.get("needs_design_context") and analysis.get("design_url"):
             design_url = analysis["design_url"]
             design_type = analysis.get("design_type") or "figma"
+            design_page_name = analysis.get("design_page_name") or ""
             capability = (
                 "stitch.screen.fetch" if design_type == "stitch" else "figma.page.fetch"
             )
-            log(f"Fetching design context ({design_type}): {design_url}")
+            log(f"Fetching design context ({design_type}): {design_url} page='{design_page_name}'")
             try:
+                design_msg = f"Fetch design from {design_url}"
+                if design_page_name:
+                    design_msg += f" page: {design_page_name}"
                 design_task = _call_sync_agent(
                     UI_DESIGN_AGENT_URL,
                     capability,
-                    f"Fetch design from {design_url}",
+                    design_msg,
                     team_lead_task_id,
                     workspace,
                     compass_task_id,
@@ -595,8 +623,15 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     "url": design_url,
                     "type": design_type,
                     "content": content,
+                    "page_name": design_page_name,
                 }
                 log(f"Design context fetched ({len(content)} chars)")
+                # Save design info to shared workspace
+                _save_workspace_file(
+                    workspace,
+                    "team-lead/design-context.json",
+                    json.dumps(ctx.design_info, ensure_ascii=False, indent=2),
+                )
             except Exception as err:
                 log(f"Warning: could not fetch design from {design_url}: {err}")
                 ctx.design_info = {"url": design_url, "type": design_type, "content": "", "error": str(err)}
@@ -636,10 +671,14 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             )
             log(f"Fetching design context discovered in re-analysis ({design_type}): {design_url}")
             try:
+                design_page_name = analysis.get("design_page_name") or ""
+                design_msg = f"Fetch design from {design_url}"
+                if design_page_name:
+                    design_msg += f" page: {design_page_name}"
                 design_task = _call_sync_agent(
                     UI_DESIGN_AGENT_URL,
                     capability,
-                    f"Fetch design from {design_url}",
+                    design_msg,
                     team_lead_task_id,
                     workspace,
                     compass_task_id,
@@ -651,8 +690,14 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     "url": design_url,
                     "type": design_type,
                     "content": content,
+                    "page_name": design_page_name,
                 }
                 log(f"Design context fetched ({len(content)} chars)")
+                _save_workspace_file(
+                    workspace,
+                    "team-lead/design-context.json",
+                    json.dumps(ctx.design_info, ensure_ascii=False, indent=2),
+                )
             except Exception as err:
                 log(f"Warning: could not fetch design from {design_url}: {err}")
                 ctx.design_info = {"url": design_url, "type": design_type, "content": "", "error": str(err)}
@@ -766,6 +811,12 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         log(
             f"Plan ready — platform={plan.get('platform')}, "
             f"capability={dev_capability}"
+        )
+        # Save plan to shared workspace
+        _save_workspace_file(
+            workspace,
+            "team-lead/plan.json",
+            json.dumps(plan, ensure_ascii=False, indent=2),
         )
 
         # ── Phase 5: Execute ─────────────────────────────────────────────────
@@ -1013,11 +1064,15 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         _notify_compass(callback_url, team_lead_task_id, "TASK_STATE_FAILED", failure_summary)
 
     finally:
-        # Keep context in memory for 1 hour to allow inspection, then clean up
+        # Keep context in memory briefly, then trigger shutdown in per-task mode
         def _delayed_cleanup():
-            time.sleep(3600)
+            # Allow time for the callback to be delivered and any polling requests
+            time.sleep(60)
             with _TASK_CONTEXTS_LOCK:
                 _TASK_CONTEXTS.pop(team_lead_task_id, None)
+            # In per-task mode, shut down after task completes
+            if os.environ.get("AUTO_STOP_AFTER_TASK", "").strip() == "1":
+                _schedule_shutdown(delay_seconds=5)
 
         threading.Thread(target=_delayed_cleanup, daemon=True).start()
 
@@ -1180,11 +1235,26 @@ class TeamLeadHandler(BaseHTTPRequestHandler):
 # Entry point
 # ---------------------------------------------------------------------------
 
+_SERVER: ThreadingHTTPServer | None = None
+
+
+def _schedule_shutdown(delay_seconds: int = 5):
+    """Gracefully stop the HTTP server after a short delay (per-task mode)."""
+    def _do_shutdown():
+        time.sleep(delay_seconds)
+        print(f"[{AGENT_ID}] Per-task shutdown triggered")
+        if _SERVER:
+            _SERVER.shutdown()
+
+    threading.Thread(target=_do_shutdown, daemon=True).start()
+
+
 def main():
+    global _SERVER
     print(f"[{AGENT_ID}] Team Lead Agent starting on {HOST}:{PORT}")
     reporter.start()
-    server = ThreadingHTTPServer((HOST, PORT), TeamLeadHandler)
-    server.serve_forever()
+    _SERVER = ThreadingHTTPServer((HOST, PORT), TeamLeadHandler)
+    _SERVER.serve_forever()
 
 
 if __name__ == "__main__":
