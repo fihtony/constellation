@@ -630,17 +630,33 @@ def test_cstl1_full_workflow():  # noqa: C901
     _ws_file_ok(host_ws, "team-lead/plan.json", "Team Lead implementation plan")
 
     # ── d. Code/repo ──────────────────────────────────────────────────────
-    step("d. Verify code files or cloned repo in workspace")
+    step("d. Verify cloned repo exists in workspace")
     ws_path = Path(host_ws)
-    code_files = (list(ws_path.rglob("*.py")) + list(ws_path.rglob("*.js")) +
-                  list(ws_path.rglob("*.ts")) + list(ws_path.rglob("*.kt")))
+    # Primary check: cloned repo directory contains .git
+    repo_name = GITHUB_REPO_URL.rstrip("/").split("/")[-1].rstrip(".git") if GITHUB_REPO_URL else ""
+    clone_dir = ws_path / repo_name if repo_name else None
     git_dirs = list(ws_path.rglob(".git"))
-    if code_files:
-        ok(f"Code files in workspace: {len(code_files)} (e.g. {code_files[0].name})")
+    if clone_dir and (clone_dir / ".git").is_dir():
+        ok(f"Cloned repo found: {clone_dir.name}/.git exists")
+        # Verify common repo files are present
+        repo_files = list(clone_dir.rglob("*"))
+        src_files = [f for f in repo_files if f.suffix in (".py", ".js", ".ts", ".kt", ".java", ".md")]
+        if src_files:
+            ok(f"Repo contains {len(src_files)} source/doc file(s) (e.g. {src_files[0].name})")
+        else:
+            warn("Cloned repo appears empty (no recognizable source files found)")
     elif git_dirs:
-        ok(f"Cloned repo (.git) in workspace")
+        ok(f"Git repo found in workspace: {git_dirs[0].parent.name}")
     else:
-        warn("No code files or .git in workspace (web agent may still be running)")
+        code_files = (list(ws_path.rglob("*.py")) + list(ws_path.rglob("*.js")) +
+                      list(ws_path.rglob("*.ts")) + list(ws_path.rglob("*.kt")))
+        if code_files:
+            warn(f"No .git found but {len(code_files)} code file(s) present "
+                 f"(repo clone may have failed; web agent generated code directly)")
+        else:
+            fail("Cloned repo NOT found in workspace",
+                 f"Expected: {host_ws}/{repo_name}/.git — "
+                 "check SCM agent logs for clone errors")
 
     _verify_external(j_status_before, j_comments_before, prs_before,
                      branches_before, host_ws, final_state, tid)

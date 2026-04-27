@@ -450,6 +450,7 @@ def _create_plan(
     jira_info: dict | None,
     design_info: dict | None,
     additional_info: str,
+    target_repo_url: str = "",
 ) -> dict:
     jira_ctx = (
         f"Jira ticket details:\n{json.dumps(jira_info, ensure_ascii=False, indent=2)}"
@@ -464,6 +465,7 @@ def _create_plan(
 
     prompt = prompts.PLAN_TEMPLATE.format(
         user_text=user_text,
+        target_repo_url=target_repo_url or "(not specified)",
         jira_context=jira_ctx,
         design_context=design_ctx,
         additional_context=extra_ctx,
@@ -704,8 +706,8 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
 
         # ── Phase 2c: If Jira content was successfully fetched, suppress any
         #    question that merely asks for the Jira URL / ticket content —
-        #    we already have it.  This prevents the LLM from triggering an
-        #    unnecessary INPUT_REQUIRED round.
+        #    we already have it.  Also suppress repo URL questions when the
+        #    Jira ticket already contains a GitHub/Bitbucket URL.
         if ctx.jira_info and ctx.jira_info.get("content"):
             question = analysis.get("question_for_user") or ""
             jira_keywords = ("jira", "ticket", "url", "browse", "atlassian", "issue", "story", "key")
@@ -718,6 +720,21 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     if not any(kw in m.lower() for kw in jira_keywords)
                 ]
                 ctx.analysis = analysis
+
+            # Suppress repo URL question if the Jira ticket content contains a GitHub URL
+            jira_lower = ctx.jira_info["content"].lower()
+            question = analysis.get("question_for_user") or ""
+            repo_keywords = ("repo", "repository", "github", "bitbucket", "clone", "git url", "codebase")
+            if any(kw in question.lower() for kw in repo_keywords):
+                if any(host in jira_lower for host in ("github.com", "bitbucket")):
+                    log(f"Suppressing repo URL question (URL found in Jira ticket): {question}")
+                    analysis = dict(analysis)
+                    analysis["question_for_user"] = None
+                    analysis["missing_info"] = [
+                        m for m in (analysis.get("missing_info") or [])
+                        if not any(kw in m.lower() for kw in repo_keywords)
+                    ]
+                    ctx.analysis = analysis
 
         # ── Phase 2d: If design context was fetched, suppress design questions.
         #    Also suppress "preferred framework" questions when the ticket already
@@ -805,7 +822,20 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         # ── Phase 4: Plan ────────────────────────────────────────────────────
         task_store.update_state(team_lead_task_id, "PLANNING", "Creating implementation plan…")
         log("Creating implementation plan")
-        plan = _create_plan(user_text, ctx.jira_info, ctx.design_info, ctx.additional_info)
+
+        # Extract repo URL from analysis (may have been pulled from Jira ticket content)
+        target_repo_url = (ctx.analysis or {}).get("target_repo_url") or ""
+        if not target_repo_url and ctx.jira_info and ctx.jira_info.get("content"):
+            # Fall back to regex scan of the Jira ticket body
+            _repo_match = re.search(
+                r"https?://(?:github\.com|bitbucket\.org)/[^\s/]+/[^\s/\])\"']+",
+                ctx.jira_info["content"],
+            )
+            if _repo_match:
+                target_repo_url = _repo_match.group().rstrip(".,;)")
+                log(f"Extracted repo URL from Jira ticket: {target_repo_url}")
+
+        plan = _create_plan(user_text, ctx.jira_info, ctx.design_info, ctx.additional_info, target_repo_url)
         ctx.plan = plan
         dev_capability = plan.get("dev_capability") or "android.task.execute"
         log(
@@ -876,6 +906,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 ),
                 "sharedWorkspacePath": workspace,
                 "teamLeadTaskId": team_lead_task_id,
+                "targetRepoUrl": plan.get("target_repo_url") or target_repo_url or "",
                 "acceptanceCriteria": plan.get("acceptance_criteria") or [],
                 "requiresTests": plan.get("requires_tests", False),
                 "devWorkflowInstructions": (

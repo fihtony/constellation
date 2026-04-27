@@ -345,8 +345,15 @@ def _clone_async_worker(task_id: str, owner: str, repo: str, branch: str, target
                      message=f"Cloning {owner}/{repo} branch={branch} …")
         clone_dir, result = _clone_to_workspace(owner, repo, branch, target_path)
         if clone_dir:
+            clone_artifact = {
+                "name": "clone-result",
+                "artifactType": "application/json",
+                "parts": [{"text": json.dumps({"clonePath": clone_dir, "result": result})}],
+                "metadata": {"agentId": AGENT_ID, "capability": "scm.git.clone"},
+            }
             _update_task(task_id, state="TASK_STATE_COMPLETED",
                          message=f"Cloned {owner}/{repo} → {clone_dir} ({result})",
+                         artifacts=[clone_artifact],
                          extra={"clonePath": clone_dir, "result": result})
             _fire_clone_callback(callback_url, task_id, "TASK_STATE_COMPLETED", clone_dir, "")
         else:

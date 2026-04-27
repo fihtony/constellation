@@ -8,6 +8,7 @@ services:
     environment:
       REGISTRY_HOST: "0.0.0.0"
       REGISTRY_PORT: "9000"
+      TZ: "${TZ:-UTC}"
     labels:
       constellation.agent_id: "capability-registry"
       constellation.agent_name: "Capability Registry"
@@ -66,6 +67,7 @@ services:
       ARTIFACT_ROOT: "/app/artifacts"
       DEFAULT_DYNAMIC_IMAGE: "constellation-android-agent:latest"
       DYNAMIC_AGENT_NETWORK: "constellation-network"
+      TZ: "${TZ:-UTC}"
       # ARTIFACT_ROOT_HOST is loaded from compass/.env — do NOT override here with an empty
       # variable expansion or it will blank out the value from env_file.
     volumes:
@@ -103,6 +105,7 @@ services:
       OPENAI_BASE_URL: "http://host.docker.internal:1288/v1"
       OPENAI_MODEL: "gpt-5-mini"
       ALLOW_MOCK_FALLBACK: "1"
+      TZ: "${TZ:-UTC}"
     build:
       context: .
       dockerfile: jira/Dockerfile
@@ -146,6 +149,7 @@ services:
       OPENAI_MODEL: "gpt-5-mini"
       ALLOW_MOCK_FALLBACK: "1"
       SCM_PROVIDER: "github"
+      TZ: "${TZ:-UTC}"
     volumes:
       - ./artifacts:/app/artifacts
     labels:
@@ -184,6 +188,7 @@ services:
       OPENAI_BASE_URL: "http://host.docker.internal:1288/v1"
       OPENAI_MODEL: "gpt-5-mini"
       ALLOW_MOCK_FALLBACK: "1"
+      TZ: "${TZ:-UTC}"
     labels:
       constellation.agent_id: "ui-design-agent"
       constellation.agent_name: "UI Design Agent"

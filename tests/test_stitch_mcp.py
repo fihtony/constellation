@@ -274,6 +274,123 @@ def run_stitch_tests(reporter: Reporter) -> None:
     test_stitch_mcp_get_project(reporter)
     test_stitch_mcp_get_screen(reporter)
     test_stitch_mcp_get_screen_image(reporter)
+    test_stitch_mcp_list_screens(reporter)
+    test_stitch_mcp_find_screen_by_name(reporter)
+
+
+# ---------------------------------------------------------------------------
+# list_screens / find_screen_by_name tests
+# ---------------------------------------------------------------------------
+
+def test_stitch_mcp_list_screens(reporter: Reporter) -> None:
+    """Verify list_screens returns a list of screens for the project."""
+    api_key = _stitch_api_key()
+    if not api_key:
+        reporter.skip("Stitch list_screens", "TEST_STITCH_API_KEY not set in tests/.env")
+        return
+
+    status, body = _stitch_post(
+        "tools/call",
+        {"name": "list_screens", "arguments": {"project_id": STITCH_PROJECT_ID}},
+        api_key,
+    )
+    if status == 200 and "result" in body:
+        result = body["result"]
+        if isinstance(result, dict) and result.get("isError"):
+            reporter.fail("Stitch list_screens returned isError=true", str(result)[:200])
+            return
+        content = result.get("content", []) if isinstance(result, dict) else []
+        # Try to parse the JSON list of screens from text content
+        screens: list = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                raw = (item.get("text") or "").strip()
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        screens = parsed
+                        break
+                    if isinstance(parsed, dict) and "screens" in parsed:
+                        screens = parsed["screens"]
+                        break
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        if screens:
+            names = [s.get("name", "?") for s in screens[:5]]
+            reporter.ok(f"list_screens returned {len(screens)} screen(s): {names}")
+        else:
+            reporter.ok(f"list_screens call succeeded ({len(content)} content item(s); "
+                        "no structured screen list parsed — tool may return raw text)")
+    elif status == 200 and "error" in body:
+        err = body["error"]
+        if "not found" in str(err).lower() or "unknown" in str(err).lower():
+            reporter.skip("Stitch list_screens", "tool not available in this MCP version")
+        else:
+            reporter.fail(f"Stitch list_screens error: {err.get('message', str(err))[:150]}")
+    elif status in (401, 403):
+        reporter.skip(
+            "Stitch list_screens",
+            f"HTTP {status} — tool calls require OAuth2; API key is only valid for tools/list",
+        )
+    elif status == 0:
+        reporter.fail("Stitch MCP unreachable", str(body)[:150])
+    else:
+        reporter.fail(f"Stitch list_screens returned HTTP {status}", str(body)[:150])
+
+
+def test_stitch_mcp_find_screen_by_name(reporter: Reporter) -> None:
+    """Verify find_screen_by_name (via list_screens) can locate a screen by partial name."""
+    api_key = _stitch_api_key()
+    if not api_key:
+        reporter.skip("Stitch find_screen_by_name", "TEST_STITCH_API_KEY not set in tests/.env")
+        return
+
+    # Use stitch_client.list_screens directly so we test the client logic as well
+    # Import happens here to avoid hard dependency at module load
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        os.environ.setdefault("STITCH_API_KEY", api_key)
+        from ui_design.stitch_client import list_screens, find_screen_by_name  # noqa: PLC0415
+    except ImportError:
+        reporter.skip("Stitch find_screen_by_name", "ui_design.stitch_client not importable")
+        return
+
+    screens, status = list_screens(STITCH_PROJECT_ID)
+    if status != "ok":
+        if "error_401" in status or "error_403" in status:
+            reporter.skip("Stitch find_screen_by_name",
+                          "OAuth2 required for tool calls (API key insufficient)")
+        elif "tool_not_found" in status or "not found" in status.lower():
+            reporter.skip("Stitch find_screen_by_name",
+                          "list_screens tool not available in this MCP version")
+        else:
+            reporter.fail(f"list_screens failed: {status}")
+        return
+
+    if not screens:
+        reporter.skip("Stitch find_screen_by_name", "Project has no screens — nothing to search")
+        return
+
+    # Pick the first screen name and verify find_screen_by_name can locate it
+    first_name = screens[0].get("name", "")
+    if not first_name:
+        reporter.skip("Stitch find_screen_by_name", "First screen has no name")
+        return
+
+    # Search by a 4-char prefix (to test partial match)
+    search_term = first_name[:max(4, len(first_name) // 2)]
+    found, find_status = find_screen_by_name(STITCH_PROJECT_ID, search_term)
+    if found:
+        reporter.ok(
+            f"find_screen_by_name('{search_term}') → "
+            f"id={found.get('id', '?')!r} name={found.get('name', '?')!r}"
+        )
+    else:
+        reporter.fail(
+            f"find_screen_by_name('{search_term}') returned None",
+            f"status={find_status}  available screens: {[s.get('name') for s in screens[:5]]}",
+        )
 
 
 # ---------------------------------------------------------------------------

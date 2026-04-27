@@ -7,7 +7,7 @@
     "port": 8030,
     "command": ["python3", "team-lead/app.py"],
     "mountDockerSocket": true,
-    "passThroughEnv": ["ARTIFACT_ROOT_HOST", "ARTIFACT_ROOT", "COPILOT_GITHUB_TOKEN"],
+    "passThroughEnv": ["ARTIFACT_ROOT_HOST", "ARTIFACT_ROOT", "COPILOT_GITHUB_TOKEN", "TZ"],
     "env": {
       "JIRA_AGENT_URL": "http://jira:8010",
       "SCM_AGENT_URL": "http://scm:8020",

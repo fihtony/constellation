@@ -406,18 +406,22 @@ def _clone_repo(task_id: str, repo_url: str, workspace: str, compass_task_id: st
             workspace,
             compass_task_id,
         )
-        # Extract clone path from artifacts
+        # Primary: extract clone path from artifacts (JSON)
         for art in result.get("artifacts", []):
             text = artifact_text(art)
             if text:
-                # Try to parse JSON clone result
                 try:
                     data = json.loads(text)
-                    return data.get("clone_path") or data.get("clonePath") or ""
+                    path = data.get("clone_path") or data.get("clonePath") or ""
+                    if path:
+                        return path
                 except Exception:
-                    # Return text directly if it looks like a path
                     if text.strip().startswith("/"):
                         return text.strip()
+        # Fallback: check extra dict returned by SCM task payload
+        extra = result.get("extra", {})
+        if extra.get("clonePath"):
+            return extra["clonePath"]
         return ""
     except Exception as err:
         print(f"[{AGENT_ID}] Could not clone repo {repo_url}: {err}")
@@ -918,6 +922,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
     acceptance_criteria: list = metadata.get("acceptanceCriteria") or []
     is_revision: bool = metadata.get("isRevision", False)
     review_issues: list = metadata.get("reviewIssues") or []
+    # Repo URL injected by Team Lead from Jira/analysis (preferred over text extraction)
+    metadata_repo_url: str = metadata.get("targetRepoUrl", "")
 
     task_instruction = extract_text(message) or ""
     final_artifacts: list = []
@@ -982,8 +988,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 compass_task_id,
             )
 
-        repo_url = analysis.get("repo_url") or ""
-        # If no repo_url in analysis, try extracting from instruction
+        repo_url = metadata_repo_url or analysis.get("repo_url") or ""
+        # Fall back to extracting from instruction text
         if not repo_url:
             url_match = re.search(r"https?://[^\s]+\.git", task_instruction) or \
                         re.search(r"https?://github\.com/[^\s]+", task_instruction) or \
@@ -991,7 +997,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             if url_match:
                 repo_url = url_match.group().rstrip("/.,;)")
 
-        if repo_url and analysis.get("needs_repo_clone") and workspace:
+        if repo_url and workspace:
             log(f"Cloning repository: {repo_url}")
             clone_path = _clone_repo(task_id, repo_url, workspace, compass_task_id)
             if clone_path:
@@ -1103,10 +1109,21 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         if repo_url and workspace:
             task_store.update_state(task_id, "PUSHING", "Creating branch and pushing code…")
 
-            # Determine branch name — sanitize base_branch from LLM analysis
-            base_branch = _sanitize_base_branch(analysis.get("target_branch") or "main")
+            # Determine branch name:
+            # target_branch from the plan is the FEATURE branch to create (not the base).
+            # The PR always merges into 'main' (the default base branch).
             safe_task_id = re.sub(r"[^a-z0-9-]", "-", task_id.lower())
-            branch_name = f"feature/web-agent-{safe_task_id}"
+            raw_target = (analysis.get("target_branch") or "").strip()
+            # Sanitize: reject if empty, looks like a bare Jira key, or has invalid chars
+            if (
+                raw_target
+                and not re.match(r"^[A-Z][A-Z0-9]+-\d+$", raw_target)
+                and not re.search(r"[\s~^:?*\[\\]", raw_target)
+            ):
+                branch_name = raw_target
+            else:
+                branch_name = f"feature/web-agent-{safe_task_id}"
+            base_branch = "main"  # PRs always target the default branch
             log(f"Creating branch: {branch_name} from base: {base_branch}")
 
             branch_created = _create_branch(

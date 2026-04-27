@@ -18,7 +18,14 @@ When analyzing, extract:
 - Target platform (android, ios, web, unknown)
 - Jira ticket key if mentioned (e.g. PROJ-123)
 - Figma or Google Stitch design URL if mentioned
-- Any missing information needed to proceed
+- Target repository URL if mentioned (GitHub, Bitbucket, etc.)
+- Acceptance criteria if described
+- Any STILL-MISSING information needed to proceed
+
+Critical rule: if a Jira ticket, design URL, or repository URL is already present
+in the provided context ("additional_context" section), do NOT ask the user for
+that information again.  Set question_for_user to null when all critical
+implementation details are available.
 
 Respond ONLY with a valid JSON object. Do NOT include markdown code fences or
 any text outside the JSON.
@@ -43,16 +50,22 @@ Respond with a JSON object using this exact structure:
   "design_url": "url or null",
   "design_type": "figma|stitch|null",
   "design_page_name": "exact page or screen name from the request, or null",
+  "target_repo_url": "full GitHub/Bitbucket repo URL if present anywhere in context, or null",
+  "acceptance_criteria": ["criterion 1", "criterion 2"],
   "missing_info": ["item 1", "item 2"],
-  "question_for_user": "A single clear question if critical info is missing, or null",
+  "question_for_user": "A single clear question if critical info is STILL missing after reading all context, or null",
   "summary": "One sentence summary of the task"
 }}
 
 Rules:
 - Set needs_jira_fetch to true only if a Jira ticket key like PROJ-123 is mentioned.
 - Set needs_design_context to true if a Figma URL or Google Stitch URL is present.
-- Set question_for_user to null if there is enough information to proceed.
-- Only ask ONE question — the most critical missing piece.
+- Extract target_repo_url from anywhere in the context (user message, Jira ticket, additional context).
+- Extract acceptance_criteria from the user message or Jira ticket when available.
+- Set question_for_user to null when: Jira ticket was already fetched, design context is present,
+  and a repo URL is available (either from the user message or the Jira ticket content).
+- Only ask ONE question — the single most critical piece that is GENUINELY still missing.
+- Do NOT ask for info that is already present anywhere in the context above.
 """
 
 # ---------------------------------------------------------------------------
@@ -73,6 +86,8 @@ Create an implementation plan based on the following gathered context.
 User request:
 {user_text}
 
+Target repository URL: {target_repo_url}
+
 {jira_context}
 
 {design_context}
@@ -86,7 +101,8 @@ Respond with a JSON object:
 {{
   "platform": "android|ios|web",
   "dev_capability": "android.task.execute|ios.task.execute|web.task.execute",
-  "dev_instruction": "Detailed step-by-step instruction for the development agent. Include: what to implement, key files to change, expected behaviour, and any constraints from the design or ticket.",
+  "target_repo_url": "full repo URL from context, or null",
+  "dev_instruction": "Detailed step-by-step instruction for the development agent. Include: what to implement, key files to change, expected behaviour, and any constraints from the design or ticket. MUST include the target_repo_url if available.",
   "acceptance_criteria": [
     "Criterion 1: describe the observable outcome",
     "Criterion 2: ..."
@@ -99,6 +115,7 @@ Rules:
 - dev_instruction must be detailed enough for the dev agent to act without further clarification.
 - acceptance_criteria must be measurable and verifiable.
 - If platform cannot be determined from context, default to "android".
+- Always include the target_repo_url in dev_instruction if it is known.
 """
 
 # ---------------------------------------------------------------------------
