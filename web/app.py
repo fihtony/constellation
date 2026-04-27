@@ -147,12 +147,14 @@ def _record_jira_action(
     ticket_key: str,
     action: str,
     status: str,
+    agent_task_id: str = "",
     **details,
 ) -> None:
     """Persist Jira workflow evidence for later review."""
     event = {
         "ts": local_iso_timestamp(),
         "taskId": task_id,
+        "agentTaskId": agent_task_id or task_id,
         "agentId": AGENT_ID,
         "ticketKey": ticket_key,
         "action": action,
@@ -653,6 +655,7 @@ def _generate_summary(
 
 def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_task_id: str) -> str:
     """Fetch Jira ticket content via Jira Agent."""
+    workflow_task_id = compass_task_id or task_id
     try:
         result = _jira_request_json(
             "GET",
@@ -664,10 +667,11 @@ def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_t
         content = json.dumps(issue, ensure_ascii=False, indent=2) if issue else ""
         _record_jira_action(
             workspace,
-            task_id,
+            workflow_task_id,
             ticket_key,
             "fetch",
             "completed",
+            agent_task_id=task_id,
             contentLength=len(content),
         )
         return content
@@ -675,10 +679,11 @@ def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_t
         print(f"[{AGENT_ID}] Could not fetch Jira ticket {ticket_key}: {err}")
         _record_jira_action(
             workspace,
-            task_id,
+            workflow_task_id,
             ticket_key,
             "fetch",
             "failed",
+            agent_task_id=task_id,
             error=str(err),
         )
         return ""
@@ -686,6 +691,7 @@ def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_t
 
 def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspace: str, compass_task_id: str):
     """Transition a Jira ticket to a new status (best-effort, non-blocking)."""
+    workflow_task_id = compass_task_id or task_id
     try:
         result = _jira_request_json(
             "POST",
@@ -697,10 +703,11 @@ def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspac
         print(f"[{AGENT_ID}] Jira {ticket_key} transitioned to '{target_status}'")
         _record_jira_action(
             workspace,
-            task_id,
+            workflow_task_id,
             ticket_key,
             "transition",
             "completed",
+            agent_task_id=task_id,
             targetStatus=target_status,
             result=result.get("result"),
         )
@@ -708,10 +715,11 @@ def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspac
         print(f"[{AGENT_ID}] Jira transition failed (non-critical): {err}")
         _record_jira_action(
             workspace,
-            task_id,
+            workflow_task_id,
             ticket_key,
             "transition",
             "failed",
+            agent_task_id=task_id,
             targetStatus=target_status,
             error=str(err),
         )
@@ -719,6 +727,7 @@ def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspac
 
 def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_task_id: str):
     """Assign the Jira ticket to the bot (service account) that owns the credentials (best-effort)."""
+    workflow_task_id = compass_task_id or task_id
     try:
         account_id = _get_jira_account_id(workspace, task_id)
         result = _jira_request_json(
@@ -731,10 +740,11 @@ def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_tas
         print(f"[{AGENT_ID}] Jira {ticket_key} assigned to service account")
         _record_jira_action(
             workspace,
-            task_id,
+            workflow_task_id,
             ticket_key,
             "assign",
             "completed",
+            agent_task_id=task_id,
             accountId=account_id,
             result=result.get("result"),
         )
@@ -742,16 +752,18 @@ def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_tas
         print(f"[{AGENT_ID}] Jira assign failed (non-critical): {err}")
         _record_jira_action(
             workspace,
-            task_id,
+            workflow_task_id,
             ticket_key,
             "assign",
             "failed",
+            agent_task_id=task_id,
             error=str(err),
         )
 
 
 def _jira_add_comment(ticket_key: str, comment: str, task_id: str, workspace: str, compass_task_id: str):
     """Add a comment to a Jira ticket (best-effort, non-blocking)."""
+    workflow_task_id = compass_task_id or task_id
     try:
         result = _jira_request_json(
             "POST",
@@ -763,10 +775,11 @@ def _jira_add_comment(ticket_key: str, comment: str, task_id: str, workspace: st
         print(f"[{AGENT_ID}] Jira {ticket_key} comment added")
         _record_jira_action(
             workspace,
-            task_id,
+            workflow_task_id,
             ticket_key,
             "comment",
             "completed",
+            agent_task_id=task_id,
             commentPreview=comment[:240],
             commentId=result.get("commentId"),
             result=result.get("result"),
@@ -775,10 +788,11 @@ def _jira_add_comment(ticket_key: str, comment: str, task_id: str, workspace: st
         print(f"[{AGENT_ID}] Jira comment failed (non-critical): {err}")
         _record_jira_action(
             workspace,
-            task_id,
+            workflow_task_id,
             ticket_key,
             "comment",
             "failed",
+            agent_task_id=task_id,
             commentPreview=comment[:240],
             error=str(err),
         )
@@ -1123,6 +1137,244 @@ def _write_files_to_directory(base_dir: str, files: list[dict]) -> list[str]:
     return written
 
 
+def _project_uses_python(build_dir: str, language: str) -> bool:
+    return language in ("python", "mixed") or any(
+        os.path.isfile(os.path.join(build_dir, candidate))
+        for candidate in ("requirements.txt", "pyproject.toml", "setup.py")
+    )
+
+
+def _ensure_local_python_env(build_dir: str, language: str, log_fn) -> str:
+    if not _project_uses_python(build_dir, language):
+        return sys.executable
+
+    venv_dir = os.path.join(build_dir, ".venv")
+    venv_python = os.path.join(venv_dir, "bin", "python")
+    requirements_path = os.path.join(build_dir, "requirements.txt")
+    install_stamp = os.path.join(venv_dir, ".requirements-installed")
+
+    try:
+        if not os.path.isfile(venv_python):
+            log_fn("Creating local Python virtual environment (.venv)")
+            subprocess.run(
+                [sys.executable, "-m", "venv", ".venv"],
+                cwd=build_dir,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+            )
+
+        if os.path.isfile(requirements_path):
+            requirements_mtime = os.path.getmtime(requirements_path)
+            stamp_mtime = os.path.getmtime(install_stamp) if os.path.isfile(install_stamp) else 0
+            if requirements_mtime > stamp_mtime:
+                log_fn("Installing local Python dependencies from requirements.txt")
+                subprocess.run(
+                    [venv_python, "-m", "pip", "install", "--quiet", "-r", requirements_path],
+                    cwd=build_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    check=True,
+                )
+                with open(install_stamp, "w", encoding="utf-8") as handle:
+                    handle.write(local_iso_timestamp())
+        return venv_python
+    except Exception as err:
+        log_fn(f"Warning: could not prepare local Python environment: {err}")
+        return sys.executable
+
+
+def _run_local_git(repo_dir: str, args: list[str], *, check: bool = True) -> tuple[bool, str]:
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    output = (result.stdout or result.stderr or "").strip()
+    if check and result.returncode != 0:
+        raise RuntimeError(output or f"git {' '.join(args)} failed")
+    return result.returncode == 0, output
+
+
+def _local_branch_exists(repo_dir: str, branch_name: str) -> bool:
+    ok, _ = _run_local_git(
+        repo_dir,
+        ["show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+        check=False,
+    )
+    return ok
+
+
+def _checkout_local_branch(repo_dir: str, branch_name: str, base_branch: str, log_fn) -> None:
+    if _local_branch_exists(repo_dir, branch_name):
+        _run_local_git(repo_dir, ["checkout", branch_name])
+        log_fn(f"Checked out existing local branch: {branch_name}")
+        return
+
+    ok, output = _run_local_git(repo_dir, ["checkout", "-B", branch_name, base_branch], check=False)
+    if not ok:
+        ok, output = _run_local_git(repo_dir, ["checkout", "-b", branch_name], check=False)
+    if not ok:
+        raise RuntimeError(output or f"Could not create local branch {branch_name}")
+    log_fn(f"Created local branch: {branch_name}")
+
+
+def _delete_local_branch(repo_dir: str, branch_name: str, base_branch: str) -> None:
+    _run_local_git(repo_dir, ["checkout", base_branch], check=False)
+    _run_local_git(repo_dir, ["branch", "-D", branch_name], check=False)
+
+
+def _sanitize_branch_component(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", value or "")
+    sanitized = sanitized.strip("-._")
+    return sanitized or "task"
+
+
+def _is_docs_or_tests_only(paths: list[str]) -> bool:
+    if not paths:
+        return False
+    for raw_path in paths:
+        path = (raw_path or "").strip().lstrip("/").lower()
+        if not path:
+            continue
+        if path.startswith("docs/") or path.startswith("tests/"):
+            continue
+        if "/tests/" in path or path.endswith(("_test.py", ".spec.ts", ".spec.js", ".test.ts", ".test.js", ".test.tsx", ".test.jsx")):
+            continue
+        if path.endswith((".md", ".rst", ".txt")) or os.path.basename(path) in {"readme.md", "running.md"}:
+            continue
+        return False
+    return True
+
+
+def _classify_branch_kind(
+    task_instruction: str,
+    analysis: dict,
+    planned_paths: list[str],
+    ticket_key: str,
+) -> str:
+    if not ticket_key:
+        if _is_docs_or_tests_only(planned_paths):
+            return "chore"
+        raise RuntimeError("Feature implementation and issue fixes require a Jira ticket.")
+
+    summary_text = " ".join(
+        part for part in [task_instruction, analysis.get("task_summary", "")] if part
+    ).lower()
+    hotfix_markers = ("bug", "fix", "hotfix", "regression", "error", "defect")
+    feature_markers = ("feature", "implement", "build", "create", "add", "develop")
+    if any(marker in summary_text for marker in hotfix_markers) and not any(
+        marker in summary_text for marker in feature_markers
+    ):
+        return "hotfix"
+    return "feature"
+
+
+def _list_remote_branches(
+    task_id: str,
+    repo_url: str,
+    workspace: str,
+    compass_task_id: str,
+) -> set[str]:
+    try:
+        result = _call_sync_agent(
+            SCM_AGENT_URL,
+            "scm.branch.list",
+            f"List branches in {repo_url}",
+            task_id,
+            workspace,
+            compass_task_id,
+        )
+    except Exception:
+        return set()
+
+    for art in result.get("artifacts", []):
+        text = artifact_text(art)
+        if not text:
+            continue
+        try:
+            branches = json.loads(text)
+        except Exception:
+            continue
+        if isinstance(branches, list):
+            return {
+                str(branch.get("name", "")).strip()
+                for branch in branches
+                if isinstance(branch, dict) and str(branch.get("name", "")).strip()
+            }
+    return set()
+
+
+def _select_branch_name(
+    task_instruction: str,
+    analysis: dict,
+    planned_paths: list[str],
+    ticket_key: str,
+    task_id: str,
+    repo_url: str,
+    clone_path: str,
+    workspace: str,
+    compass_task_id: str,
+) -> tuple[str, str]:
+    branch_kind = _classify_branch_kind(task_instruction, analysis, planned_paths, ticket_key)
+    workflow_task_id = _sanitize_branch_component(compass_task_id or task_id)
+    remote_branches = _list_remote_branches(task_id, repo_url, workspace, compass_task_id)
+
+    if branch_kind == "chore":
+        branch_base = f"chore/{workflow_task_id}"
+    else:
+        branch_base = f"{branch_kind}/{_sanitize_branch_component(ticket_key)}_{workflow_task_id}"
+
+    for sequence in range(1, 100):
+        candidate = f"{branch_base}_{sequence}"
+        if candidate in remote_branches:
+            continue
+        if clone_path and _local_branch_exists(clone_path, candidate):
+            continue
+        return candidate, branch_kind
+
+    raise RuntimeError(f"Could not allocate a unique branch name for {branch_base}")
+
+
+def _commit_local_changes(
+    repo_dir: str,
+    branch_name: str,
+    files: list[dict],
+    commit_message: str,
+    log_fn,
+) -> str:
+    _run_local_git(repo_dir, ["config", "user.email", "web-agent@local"], check=False)
+    _run_local_git(repo_dir, ["config", "user.name", "Web Agent"], check=False)
+
+    staged_any = False
+    for file_info in files:
+        rel_path = file_info.get("path", "").lstrip("/")
+        if not rel_path:
+            continue
+        _run_local_git(repo_dir, ["add", "--", rel_path], check=False)
+        staged_any = True
+
+    if not staged_any:
+        return ""
+
+    ok, status_output = _run_local_git(repo_dir, ["status", "--porcelain"], check=False)
+    if not ok or not status_output.strip():
+        ok, head_output = _run_local_git(repo_dir, ["rev-parse", "HEAD"], check=False)
+        return head_output.strip() if ok else ""
+
+    _run_local_git(repo_dir, ["commit", "-m", commit_message])
+    _, head_output = _run_local_git(repo_dir, ["rev-parse", "HEAD"])
+    commit_sha = head_output.strip()
+    log_fn(f"Committed local changes on {branch_name}: {commit_sha[:12]}")
+    return commit_sha
+
+
 # ---------------------------------------------------------------------------
 # Build / test execution with LLM-guided error recovery
 # ---------------------------------------------------------------------------
@@ -1130,8 +1382,13 @@ def _write_files_to_directory(base_dir: str, files: list[dict]) -> list[str]:
 MAX_BUILD_RETRIES = 3
 
 
-def _detect_build_command(build_dir: str, language: str) -> list[str] | None:
+def _detect_build_command(
+    build_dir: str,
+    language: str,
+    python_executable: str | None = None,
+) -> list[str] | None:
     """Return the command to run tests, or None if no test harness detected."""
+    python_cmd = python_executable or sys.executable
     # Python: pytest or unittest
     if language in ("python", "mixed") or any(
         os.path.isfile(os.path.join(build_dir, f))
@@ -1142,19 +1399,20 @@ def _detect_build_command(build_dir: str, language: str) -> list[str] | None:
             for _, _, files in os.walk(build_dir)
             for fname in files
         ):
-            return [sys.executable, "-m", "pytest", "--tb=short", "-q", build_dir]
+            return [python_cmd, "-m", "pytest", "--tb=short", "-q", build_dir]
         # Fall back to running the main module if present
         for candidate in ("main.py", "app.py", "run.py"):
             if os.path.isfile(os.path.join(build_dir, candidate)):
-                return [sys.executable, "-c",
+                return [python_cmd, "-c",
                         f"import ast, sys; ast.parse(open('{os.path.join(build_dir, candidate)}').read());"
                         f"print('Syntax OK: {candidate}')"]
     return None
 
 
-def _run_build(build_dir: str, language: str) -> tuple[bool, str]:
+def _run_build(build_dir: str, language: str, python_executable: str | None = None) -> tuple[bool, str]:
     """Run the build/test command in build_dir. Returns (success, output)."""
-    cmd = _detect_build_command(build_dir, language)
+    python_cmd = python_executable or sys.executable
+    cmd = _detect_build_command(build_dir, language, python_executable=python_cmd)
     if cmd is None:
         # No test harness — validate Python syntax of every .py file
         errors = []
@@ -1185,7 +1443,7 @@ def _run_build(build_dir: str, language: str) -> tuple[bool, str]:
         if result.returncode != 0 and "No module named pytest" in output:
             print(f"[{AGENT_ID}] pytest missing — installing...")
             subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet", "pytest"],
+                [python_cmd, "-m", "pip", "install", "--quiet", "pytest"],
                 timeout=60,
             )
             result = subprocess.run(
@@ -1256,9 +1514,10 @@ def _build_and_test_with_recovery(
     """
     attempts: list[dict] = []
     output = ""
+    python_executable = _ensure_local_python_env(build_dir, language, log_fn)
     for attempt in range(1, MAX_BUILD_RETRIES + 1):
         log_fn(f"Build/test attempt {attempt}/{MAX_BUILD_RETRIES}")
-        success, output = _run_build(build_dir, language)
+        success, output = _run_build(build_dir, language, python_executable=python_executable)
         attempts.append(
             {
                 "attempt": attempt,
@@ -1320,6 +1579,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
 
     metadata = message.get("metadata", {})
     compass_task_id = metadata.get("orchestratorTaskId", "")
+    workflow_task_id = compass_task_id or task_id
     callback_url = metadata.get("orchestratorCallbackUrl", "")
     compass_url = metadata.get("compassUrl") or COMPASS_URL
     workspace = metadata.get("sharedWorkspacePath", "")
@@ -1335,11 +1595,12 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
     repo_url = metadata_repo_url or ""
     clone_path = ""
     branch_name = ""
+    branch_kind = ""
+    local_commit_sha = ""
     pr_url = ""
     build_dir = ""
     build_ok: bool | None = None
     agent_workspace = os.path.join(workspace, AGENT_ID) if workspace else ""
-    phases: list[str] = []
     runtime_config = {
         "runtime": summarize_runtime_configuration(),
         "rulesLoaded": bool(load_rules("web")),
@@ -1352,26 +1613,28 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         ts = local_clock_time()
         print(f"[{AGENT_ID}][{task_id}] [{ts}] {phase}")
         entry = f"[{ts}] {phase}"
-        phases.append(phase)
         _append_workspace_file(workspace, f"{AGENT_ID}/command-log.txt", entry + "\n")
         _save_workspace_file(
             workspace,
             f"{AGENT_ID}/stage-summary.json",
             json.dumps(
                 {
-                    "taskId": task_id,
+                    "taskId": workflow_task_id,
+                    "agentTaskId": task_id,
                     "agentId": AGENT_ID,
                     "currentPhase": phase,
-                    "phases": phases,
                     "repoUrl": repo_url,
                     "clonePath": clone_path,
                     "branch": branch_name,
+                    "branchKind": branch_kind,
+                    "localCommit": local_commit_sha,
                     "prUrl": pr_url,
                     "buildDir": build_dir,
                     "buildPassed": build_ok,
                     "acceptanceCriteria": acceptance_criteria,
                     "reviewIssues": review_issues,
                     "runtimeConfig": runtime_config,
+                    "updatedAt": local_iso_timestamp(),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -1381,12 +1644,6 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
 
     try:
         audit_log("TASK_STARTED", task_id=task_id, compass_task_id=compass_task_id)
-        _save_workspace_file(
-            workspace,
-            f"{AGENT_ID}/runtime-config.json",
-            json.dumps(runtime_config, ensure_ascii=False, indent=2),
-        )
-
         # If this is a revision, append review issues to instruction
         if is_revision and review_issues:
             issues_text = "\n".join(f"- {issue}" for issue in review_issues)
@@ -1420,7 +1677,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 f"{AGENT_ID}/review-notes.json",
                 json.dumps(
                     {
-                        "taskId": task_id,
+                        "taskId": workflow_task_id,
+                        "agentTaskId": task_id,
                         "agentId": AGENT_ID,
                         "isRevision": True,
                         "reviewIssues": review_issues,
@@ -1451,7 +1709,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             _jira_add_comment(
                 ticket_key,
                 f"🤖 **Web Agent** (`{AGENT_ID}`) has picked up this ticket and started development.\n"
-                f"Internal task ID: `{task_id}`",
+                f"Internal task ID: `{workflow_task_id}`",
                 task_id,
                 workspace,
                 compass_task_id,
@@ -1476,7 +1734,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     f"{AGENT_ID}/clone-info.json",
                     json.dumps(
                         {
-                            "taskId": task_id,
+                            "taskId": workflow_task_id,
+                            "agentTaskId": task_id,
                             "agentId": AGENT_ID,
                             "repoUrl": repo_url,
                             "clonePath": "",
@@ -1495,7 +1754,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     f"{AGENT_ID}/clone-info.json",
                     json.dumps(
                         {
-                            "taskId": task_id,
+                            "taskId": workflow_task_id,
+                            "agentTaskId": task_id,
                             "agentId": AGENT_ID,
                             "repoUrl": repo_url,
                             "clonePath": clone_path,
@@ -1534,7 +1794,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 f"{AGENT_ID}/plan-sanitization.json",
                 json.dumps(
                     {
-                        "taskId": task_id,
+                        "taskId": workflow_task_id,
+                        "agentTaskId": task_id,
                         "agentId": AGENT_ID,
                         "frontendFramework": analysis.get("frontend_framework"),
                         "removedFiles": removed_plan_files,
@@ -1554,6 +1815,42 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
 
         if not files_to_implement:
             raise RuntimeError("LLM returned an empty file plan — cannot proceed.")
+
+        planned_paths = [file_info.get("path", "") for file_info in files_to_implement]
+        ticket_key = ticket_match.group(1) if ticket_match else ""
+        if repo_url and clone_path:
+            branch_name, branch_kind = _select_branch_name(
+                task_instruction,
+                analysis,
+                planned_paths,
+                ticket_key,
+                task_id,
+                repo_url,
+                clone_path,
+                workspace,
+                compass_task_id,
+            )
+            _checkout_local_branch(clone_path, branch_name, "main", log)
+            _save_workspace_file(
+                workspace,
+                f"{AGENT_ID}/branch-info.json",
+                json.dumps(
+                    {
+                        "taskId": workflow_task_id,
+                        "agentTaskId": task_id,
+                        "agentId": AGENT_ID,
+                        "repoUrl": repo_url,
+                        "clonePath": clone_path,
+                        "branch": branch_name,
+                        "branchKind": branch_kind,
+                        "baseBranch": "main",
+                        "localBranchPrepared": True,
+                        "prUrl": pr_url,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
 
         # ── Phase 3b: Install plan dependencies at runtime ───────────────────
         install_deps = plan.get("install_dependencies") or []
@@ -1608,11 +1905,6 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             written_clone_paths = _write_files_to_directory(clone_path, generated_files)
             log(f"Wrote {len(written_clone_paths)} file(s) into cloned repository")
 
-        if agent_workspace:
-            task_store.update_state(task_id, "WRITING", "Writing files to workspace…")
-            written_paths = _write_files_to_directory(agent_workspace, generated_files)
-            log(f"Wrote {len(written_paths)} file(s) to workspace")
-
         # ── Phase 5b: Build and test with LLM-guided recovery ───────────────
         build_dir = clone_path or agent_workspace
         build_ok = True  # default: assume passing if no build dir
@@ -1644,7 +1936,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 f"{AGENT_ID}/test-results.json",
                 json.dumps(
                     {
-                        "taskId": task_id,
+                        "taskId": workflow_task_id,
+                        "agentTaskId": task_id,
                         "agentId": AGENT_ID,
                         "buildDir": build_dir,
                         "passed": build_ok,
@@ -1655,44 +1948,44 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     indent=2,
                 ),
             )
-            if clone_path and agent_workspace:
-                _write_files_to_directory(agent_workspace, generated_files)
+
+        if clone_path and branch_name:
+            if not branch_kind:
+                branch_kind = "feature"
+            if branch_kind == "hotfix":
+                commit_msg = f"fix({ticket_key}): web agent implementation"
+            elif branch_kind == "chore":
+                commit_msg = f"chore({workflow_task_id}): docs and tests update"
+            else:
+                commit_msg = f"feat({ticket_key}): web agent implementation" if ticket_key else f"feat({workflow_task_id}): web agent implementation"
+            local_commit_sha = _commit_local_changes(
+                clone_path,
+                branch_name,
+                generated_files,
+                commit_msg,
+                log,
+            )
 
         # ── Phase 6: Push files and create PR (if repo available) ────────────
         if repo_url and workspace:
             task_store.update_state(task_id, "PUSHING", "Creating branch and pushing code…")
-
-            # Determine branch name:
-            # target_branch from the plan is the FEATURE branch to create (not the base).
-            # The PR always merges into 'main' (the default base branch).
-            safe_task_id = re.sub(r"[^a-z0-9-]", "-", task_id.lower())
-            raw_target = (analysis.get("target_branch") or "").strip()
-            # Sanitize: reject if empty, looks like a bare Jira key, or has invalid chars
-            if (
-                raw_target
-                and not re.match(r"^[A-Z][A-Z0-9]+-\d+$", raw_target)
-                and not re.search(r"[\s~^:?*\[\\]", raw_target)
-            ):
-                branch_name = raw_target
-            else:
-                branch_name = f"feature/web-agent-{safe_task_id}"
             base_branch = "main"  # PRs always target the default branch
-            log(f"Creating branch: {branch_name} from base: {base_branch}")
-
-            branch_created = _create_branch(
-                task_id, repo_url, branch_name, base_branch, workspace, compass_task_id
-            )
+            branch_created = bool(branch_name)
             _save_workspace_file(
                 workspace,
                 f"{AGENT_ID}/branch-info.json",
                 json.dumps(
                     {
-                        "taskId": task_id,
+                        "taskId": workflow_task_id,
+                        "agentTaskId": task_id,
                         "agentId": AGENT_ID,
                         "repoUrl": repo_url,
+                        "clonePath": clone_path,
                         "branch": branch_name,
+                        "branchKind": branch_kind,
                         "baseBranch": base_branch,
-                        "branchCreated": branch_created,
+                        "localBranchPrepared": branch_created,
+                        "localCommit": local_commit_sha,
                         "prUrl": pr_url,
                     },
                     ensure_ascii=False,
@@ -1700,17 +1993,13 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 ),
             )
             if not branch_created:
-                log(f"Warning: could not create branch {branch_name} — files saved to workspace only")
+                log("Warning: could not prepare a local branch — files saved to cloned repo only")
             else:
                 # Push generated files
                 push_files = [
                     {"path": gf["path"], "content": gf["content"]}
                     for gf in generated_files
                 ]
-                commit_msg = f"feat: web agent implementation for task {task_id}"
-                if ticket_match:
-                    commit_msg = f"feat({ticket_match.group(1)}): web agent implementation"
-
                 pushed = _push_files(
                     task_id, repo_url, branch_name, push_files, commit_msg, workspace, compass_task_id,
                     base_branch=base_branch,
@@ -1727,9 +2016,13 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     )
                     _save_pr_evidence(
                         workspace,
-                        taskId=task_id,
+                        taskId=workflow_task_id,
+                        agentTaskId=task_id,
                         repoUrl=repo_url,
+                        clonePath=clone_path,
                         branch=branch_name,
+                        branchKind=branch_kind,
+                        localCommit=local_commit_sha,
                         baseBranch=base_branch,
                         title=pr_title,
                         body=pr_body,
@@ -1742,9 +2035,13 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     )
                     _save_pr_evidence(
                         workspace,
-                        taskId=task_id,
+                        taskId=workflow_task_id,
+                        agentTaskId=task_id,
                         repoUrl=repo_url,
+                        clonePath=clone_path,
                         branch=branch_name,
+                        branchKind=branch_kind,
+                        localCommit=local_commit_sha,
                         baseBranch=base_branch,
                         title=pr_title,
                         body=pr_body,
@@ -1757,12 +2054,16 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                         f"{AGENT_ID}/branch-info.json",
                         json.dumps(
                             {
-                                "taskId": task_id,
+                                "taskId": workflow_task_id,
+                                "agentTaskId": task_id,
                                 "agentId": AGENT_ID,
                                 "repoUrl": repo_url,
+                                "clonePath": clone_path,
                                 "branch": branch_name,
+                                "branchKind": branch_kind,
                                 "baseBranch": base_branch,
-                                "branchCreated": branch_created,
+                                "localBranchPrepared": branch_created,
+                                "localCommit": local_commit_sha,
                                 "prUrl": pr_url,
                                 "buildPassed": build_ok,
                             },
@@ -1815,7 +2116,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 "agentId": AGENT_ID,
                 "capability": "web.task.execute",
                 "orchestratorTaskId": compass_task_id,
-                "taskId": task_id,
+                "taskId": workflow_task_id,
+                "agentTaskId": task_id,
                 "prUrl": pr_url,
                 "branch": branch_name,
                 "filesCount": len(generated_files),
@@ -1886,7 +2188,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             f"{AGENT_ID}/review-notes.json",
             json.dumps(
                 {
-                    "taskId": task_id,
+                    "taskId": workflow_task_id,
+                    "agentTaskId": task_id,
                     "agentId": AGENT_ID,
                     "error": error_text,
                     "reviewIssues": review_issues,

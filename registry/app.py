@@ -17,6 +17,10 @@ store = RegistryStore()
 
 
 def _parse_path(path):
+    if path == "/topology":
+        return "topology", None, None, None
+    if path == "/events":
+        return "events", None, None, None
     match = re.match(r"^/agents/([^/]+)/instances/([^/]+)$", path)
     if match:
         return "instance", match.group(1), "instances", match.group(2)
@@ -87,6 +91,25 @@ class RegistryHandler(BaseHTTPRequestHandler):
                 payload["instances"] = [instance.to_dict() for instance in store.list_instances(definition.agent_id)]
                 response.append(payload)
             self._send_json(200, response)
+            return
+
+        if resource == "topology":
+            self._send_json(200, store.topology_state())
+            return
+
+        if resource == "events":
+            try:
+                since_version = int(parse_qs(parsed.query).get("sinceVersion", ["0"])[0])
+            except (TypeError, ValueError):
+                since_version = 0
+            topology = store.topology_state()
+            self._send_json(
+                200,
+                {
+                    **topology,
+                    "events": store.list_events(since_version=since_version),
+                },
+            )
             return
 
         self._send_json(404, {"error": "unknown_path"})

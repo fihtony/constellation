@@ -77,7 +77,7 @@ class CopilotConnectAdapter(AgentRuntimeAdapter):
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             warning = f"copilot-connect HTTP {exc.code}: {body[:300]}"
-            if env_flag("ALLOW_MOCK_FALLBACK", default=True):
+            if env_flag("ALLOW_MOCK_FALLBACK", default=False):
                 raw = _mock_response(prompt, effective_model)
                 return self.build_result(raw, warnings=[warning, "Fell back to mock response."], backend_used="copilot-connect")
             return self.build_failure_result(
@@ -87,7 +87,7 @@ class CopilotConnectAdapter(AgentRuntimeAdapter):
             )
         except URLError as exc:
             warning = f"copilot-connect network error: {exc.reason}"
-            if env_flag("ALLOW_MOCK_FALLBACK", default=True):
+            if env_flag("ALLOW_MOCK_FALLBACK", default=False):
                 raw = _mock_response(prompt, effective_model)
                 return self.build_result(raw, warnings=[warning, "Fell back to mock response."], backend_used="copilot-connect")
             return self.build_failure_result(

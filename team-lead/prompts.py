@@ -27,6 +27,10 @@ in the provided context ("additional_context" section), do NOT ask the user for
 that information again.  Set question_for_user to null when all critical
 implementation details are available.
 
+Before asking the user for missing implementation details, exhaust the fetched
+context first: Jira raw payload/custom fields, repository metadata, and design
+context already supplied in additional_context.
+
 Respond ONLY with a valid JSON object. Do NOT include markdown code fences or
 any text outside the JSON.
 """
@@ -61,6 +65,9 @@ Rules:
 - Set needs_jira_fetch to true only if a Jira ticket key like PROJ-123 is mentioned.
 - Set needs_design_context to true if a Figma URL or Google Stitch URL is present.
 - Extract target_repo_url from anywhere in the context (user message, Jira ticket, additional context).
+- If Jira raw payload or repository context already contains a repo URL, default branch,
+  design URL, or framework detail, treat that as discovered information instead of
+  asking the user again.
 - Extract acceptance_criteria from the user message or Jira ticket when available.
 - Set question_for_user to null when: Jira ticket was already fetched, design context is present,
   and a repo URL is available (either from the user message or the Jira ticket content).
@@ -92,6 +99,8 @@ Explicit tech stack constraints:
 {tech_stack_constraints}
 
 {jira_context}
+
+{repo_context}
 
 {design_context}
 

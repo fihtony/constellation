@@ -7,6 +7,7 @@ import types
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from web import app as web_app
 
@@ -49,6 +50,28 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         self.assertEqual(constraints["backend_framework"], "flask")
         self.assertIn("HARD TECH STACK CONSTRAINTS", plan["dev_instruction"])
         self.assertIn("Python 3.12 and Flask", plan["acceptance_criteria"][0])
+
+    def test_team_lead_enriches_analysis_from_jira_raw_payload(self):
+        analysis = {"target_repo_url": "", "design_url": None, "needs_design_context": False}
+        jira_info = {
+            "ticket_key": "CSTL-1",
+            "content": json.dumps(
+                {
+                    "fields": {
+                        "customfield_repo": "https://github.com/example/english-study-hub",
+                        "customfield_design": "https://www.figma.com/file/abc123/landing-page",
+                    }
+                },
+                ensure_ascii=False,
+            ),
+        }
+
+        enriched = team_lead_app._enrich_analysis_from_context(analysis, jira_info, None, "")
+
+        self.assertEqual(enriched["target_repo_url"], "https://github.com/example/english-study-hub")
+        self.assertEqual(enriched["design_url"], "https://www.figma.com/file/abc123/landing-page")
+        self.assertEqual(enriched["design_type"], "figma")
+        self.assertTrue(enriched["needs_design_context"])
 
     def test_revision_metadata_preserves_constraints_and_workflow_requirements(self):
         metadata = team_lead_app._build_dev_task_metadata(
@@ -95,6 +118,58 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         self.assertEqual(updated["backend_framework"], "flask")
         self.assertEqual(updated["frontend_framework"], "none")
         self.assertEqual(updated["scope"], "fullstack")
+
+    def test_branch_selection_uses_jira_key_orchestrator_task_id_and_increment(self):
+        with mock.patch.object(
+            web_app,
+            "_list_remote_branches",
+            return_value={"feature/CSTL-1_task-0003_1"},
+        ):
+            branch_name, branch_kind = web_app._select_branch_name(
+                "Implement the landing page",
+                {"task_summary": "Build the first landing page"},
+                ["app/routes.py", "tests/test_landing.py"],
+                "CSTL-1",
+                "task-0006",
+                "https://github.com/example/repo",
+                "",
+                "/tmp/workspace",
+                "task-0003",
+            )
+
+        self.assertEqual(branch_kind, "feature")
+        self.assertEqual(branch_name, "feature/CSTL-1_task-0003_2")
+
+    def test_docs_and_tests_only_tasks_can_use_chore_branch_without_ticket(self):
+        with mock.patch.object(web_app, "_list_remote_branches", return_value=set()):
+            branch_name, branch_kind = web_app._select_branch_name(
+                "Update the README and add regression tests",
+                {"task_summary": "Refresh docs and tests"},
+                ["README.md", "tests/test_landing.py"],
+                "",
+                "task-0006",
+                "https://github.com/example/repo",
+                "",
+                "/tmp/workspace",
+                "task-0003",
+            )
+
+        self.assertEqual(branch_kind, "chore")
+        self.assertEqual(branch_name, "chore/task-0003_1")
+
+    def test_feature_tasks_without_ticket_are_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "require a Jira ticket"):
+            web_app._select_branch_name(
+                "Implement a new dashboard",
+                {"task_summary": "Build a dashboard"},
+                ["app/dashboard.py"],
+                "",
+                "task-0006",
+                "https://github.com/example/repo",
+                "",
+                "/tmp/workspace",
+                "task-0003",
+            )
 
     def test_nextjs_plan_drops_spa_and_operational_files(self):
         files = [
@@ -161,6 +236,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 "CSTL-1",
                 "transition",
                 "completed",
+                agent_task_id="web-task-9",
                 targetStatus="In Progress",
             )
             web_app._record_jira_action(
@@ -169,6 +245,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 "CSTL-1",
                 "comment",
                 "completed",
+                agent_task_id="web-task-9",
                 commentPreview="Implemented landing page",
             )
 
@@ -178,6 +255,8 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
 
         self.assertEqual(len(payload["events"]), 2)
         self.assertEqual(payload["events"][0]["action"], "transition")
+        self.assertEqual(payload["events"][0]["taskId"], "task-1")
+        self.assertEqual(payload["events"][0]["agentTaskId"], "web-task-9")
         self.assertEqual(payload["events"][1]["action"], "comment")
         self.assertEqual(payload["events"][1]["commentPreview"], "Implemented landing page")
 

@@ -44,6 +44,7 @@ INSTANCE_ID = os.environ.get("INSTANCE_ID", f"{AGENT_ID}-local")
 ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://team-lead:{PORT}")
 REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000")
 JIRA_AGENT_URL = os.environ.get("JIRA_AGENT_URL", "http://jira:8010")
+SCM_AGENT_URL = os.environ.get("SCM_AGENT_URL", "http://scm:8020")
 UI_DESIGN_AGENT_URL = os.environ.get("UI_DESIGN_AGENT_URL", "http://ui-design:8040")
 COMPASS_URL = os.environ.get("COMPASS_URL", "http://compass:8080")
 
@@ -77,6 +78,10 @@ _CALLBACK_LOCK = threading.Lock()
 _CALLBACK_EVENTS: dict[str, threading.Event] = {}
 _CALLBACK_RESULTS: dict[str, dict] = {}
 
+_REPO_URL_RE = re.compile(r"https?://[^\s\"'\}]*?(?:github\.com|bitbucket)[^\s\"'\}]*", re.IGNORECASE)
+_FIGMA_URL_RE = re.compile(r"https?://[^\s\"'\}]*figma\.com/[^\s\"'\}]+", re.IGNORECASE)
+_STITCH_URL_RE = re.compile(r"https?://[^\s\"'\}]*(?:stitch\.withgoogle\.com|stitch\.googleapis\.com)/[^\s\"'\}]+", re.IGNORECASE)
+
 NON_TERMINAL_STATES = {
     "SUBMITTED",
     "ANALYZING",
@@ -102,6 +107,7 @@ class _TaskContext:
         "user_text",
         "analysis",
         "jira_info",
+        "repo_info",
         "design_info",
         "additional_info",
         "plan",
@@ -120,6 +126,7 @@ class _TaskContext:
         self.user_text: str = ""
         self.analysis: dict = {}
         self.jira_info: dict | None = None
+        self.repo_info: dict | None = None
         self.design_info: dict | None = None
         self.additional_info: str = ""
         self.plan: dict = {}
@@ -608,9 +615,74 @@ def _analyze_task(user_text: str, additional_info: str = "") -> dict:
     return _parse_json_from_llm(response)
 
 
+def _extract_repo_url(text: str) -> str:
+    match = _REPO_URL_RE.search(text or "")
+    return match.group().rstrip(".,;)\"'") if match else ""
+
+
+def _extract_design_reference(text: str) -> tuple[str, str]:
+    figma = _FIGMA_URL_RE.search(text or "")
+    if figma:
+        return figma.group().rstrip(".,;)\"'"), "figma"
+    stitch = _STITCH_URL_RE.search(text or "")
+    if stitch:
+        return stitch.group().rstrip(".,;)\"'"), "stitch"
+    return "", ""
+
+
+def _enrich_analysis_from_context(
+    analysis: dict,
+    jira_info: dict | None,
+    design_info: dict | None,
+    additional_info: str = "",
+) -> dict:
+    updated = dict(analysis or {})
+    context_parts = []
+    if jira_info and jira_info.get("content"):
+        context_parts.append(str(jira_info.get("content") or ""))
+    if additional_info:
+        context_parts.append(additional_info)
+    context_blob = "\n\n".join(part for part in context_parts if part)
+
+    if not updated.get("target_repo_url"):
+        repo_url = _extract_repo_url(context_blob)
+        if repo_url:
+            updated["target_repo_url"] = repo_url
+
+    if not design_info and not updated.get("design_url"):
+        design_url, design_type = _extract_design_reference(context_blob)
+        if design_url:
+            updated["design_url"] = design_url
+            updated["design_type"] = design_type or updated.get("design_type") or None
+            updated["needs_design_context"] = True
+
+    return updated
+
+
+def _inspect_target_repo(
+    team_lead_task_id: str,
+    repo_url: str,
+    workspace_path: str,
+    compass_task_id: str,
+) -> dict | None:
+    repo_task = _call_sync_agent(
+        SCM_AGENT_URL,
+        "scm.repo.inspect",
+        f"Inspect repository {repo_url}",
+        team_lead_task_id,
+        workspace_path,
+        compass_task_id,
+    )
+    content = "\n".join(artifact_text(art) for art in repo_task.get("artifacts", []))
+    if not content:
+        return None
+    return {"repo_url": repo_url, "content": content}
+
+
 def _create_plan(
     user_text: str,
     jira_info: dict | None,
+    repo_info: dict | None,
     design_info: dict | None,
     additional_info: str,
     target_repo_url: str = "",
@@ -625,6 +697,10 @@ def _create_plan(
         f"{(design_info.get('content', '') or '')[:2000]}"
         if design_info else ""
     )
+    repo_ctx = (
+        f"Repository context:\n{(repo_info.get('content', '') or '')[:2000]}"
+        if repo_info else ""
+    )
     extra_ctx = f"Additional information from user:\n{additional_info}" if additional_info else ""
 
     prompt = prompts.PLAN_TEMPLATE.format(
@@ -632,6 +708,7 @@ def _create_plan(
         target_repo_url=target_repo_url or "(not specified)",
         tech_stack_constraints=_render_tech_stack_constraints(tech_stack_constraints),
         jira_context=jira_ctx,
+        repo_context=repo_ctx,
         design_context=design_ctx,
         additional_context=extra_ctx,
     )
@@ -736,13 +813,12 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     "taskId": team_lead_task_id,
                     "agentId": AGENT_ID,
                     "currentPhase": phase,
-                    "phases": [line.split("] ", 1)[1] for line in ctx.phases_log],
-                    "phasesLog": ctx.phases_log[-25:],
                     "analysis": ctx.analysis,
                     "hasPlan": bool(ctx.plan),
                     "reviewCycles": ctx.review_cycles,
                     "reviewPassed": (ctx.review_result or {}).get("passed") if ctx.review_result else None,
                     "runtimeConfig": runtime_config,
+                    "updatedAt": local_iso_timestamp(),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -751,12 +827,6 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         _report_progress(compass_url, compass_task_id, phase)
 
     try:
-        _save_workspace_file(
-            workspace,
-            "team-lead/runtime-config.json",
-            json.dumps(runtime_config, ensure_ascii=False, indent=2),
-        )
-
         # ── Phase 1: Analyze ─────────────────────────────────────────────────
         task_store.update_state(team_lead_task_id, "ANALYZING", "Analyzing the request…")
         log("Analyzing request")
@@ -786,6 +856,8 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     artifact_text(art) for art in jira_task.get("artifacts", [])
                 )
                 ctx.jira_info = {"ticket_key": ticket_key, "content": content}
+                analysis = _enrich_analysis_from_context(analysis, ctx.jira_info, ctx.design_info, ctx.additional_info)
+                ctx.analysis = analysis
                 log(f"Jira ticket {ticket_key} fetched ({len(content)} chars)")
                 # Save Jira info to shared workspace
                 _save_workspace_file(
@@ -855,6 +927,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             )
             log("Re-analyzing with gathered context (Jira/design)")
             analysis = _analyze_task(user_text, combined_additional)
+            analysis = _enrich_analysis_from_context(analysis, ctx.jira_info, ctx.design_info, ctx.additional_info)
             ctx.analysis = analysis
 
         # ── Phase 2b2: Fetch design context if re-analysis discovered a URL ──
@@ -902,6 +975,37 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             except Exception as err:
                 log(f"Warning: could not fetch design from {design_url}: {err}")
                 ctx.design_info = {"url": design_url, "type": design_type, "content": "", "error": str(err)}
+
+        analysis = _enrich_analysis_from_context(analysis, ctx.jira_info, ctx.design_info, ctx.additional_info)
+        ctx.analysis = analysis
+
+        target_repo_url = (analysis.get("target_repo_url") or "").strip()
+        if target_repo_url and not ctx.repo_info:
+            log(f"Inspecting target repository: {target_repo_url}")
+            try:
+                ctx.repo_info = _inspect_target_repo(
+                    team_lead_task_id,
+                    target_repo_url,
+                    workspace,
+                    compass_task_id,
+                )
+                if ctx.repo_info:
+                    log(f"Repository context fetched ({len(ctx.repo_info.get('content', ''))} chars)")
+                    _save_workspace_file(
+                        workspace,
+                        "team-lead/repo-context.json",
+                        json.dumps(ctx.repo_info, ensure_ascii=False, indent=2),
+                    )
+                    repo_additional = (
+                        f"Repository context:\n{ctx.repo_info['content']}\n\n{ctx.additional_info}".strip()
+                        if ctx.additional_info
+                        else f"Repository context:\n{ctx.repo_info['content']}"
+                    )
+                    analysis = _analyze_task(user_text, repo_additional)
+                    analysis = _enrich_analysis_from_context(analysis, ctx.jira_info, ctx.design_info, ctx.additional_info)
+                    ctx.analysis = analysis
+            except Exception as err:
+                log(f"Warning: could not inspect target repository {target_repo_url}: {err}")
 
         # ── Phase 2c: If Jira content was successfully fetched, suppress any
         #    question that merely asks for the Jira URL / ticket content —
@@ -1048,6 +1152,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         plan = _create_plan(
             user_text,
             ctx.jira_info,
+            ctx.repo_info,
             ctx.design_info,
             ctx.additional_info,
             target_repo_url,

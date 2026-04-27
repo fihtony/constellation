@@ -94,6 +94,38 @@ class RegistryStore:
         self._lock = threading.Lock()
         self._definitions = {}
         self._instances = {}
+        self._topology_version = 0
+        self._topology_updated_at = time.time()
+        self._events = []
+
+    def _record_topology_event(self, event_type, *, agent_id="", instance_id="", details=None):
+        self._topology_version += 1
+        self._topology_updated_at = time.time()
+        event = {
+            "version": self._topology_version,
+            "ts": self._topology_updated_at,
+            "event": event_type,
+        }
+        if agent_id:
+            event["agentId"] = agent_id
+        if instance_id:
+            event["instanceId"] = instance_id
+        if details:
+            event["details"] = details
+        self._events.append(event)
+        if len(self._events) > 200:
+            self._events = self._events[-200:]
+
+    def topology_state(self):
+        with self._lock:
+            return {
+                "version": self._topology_version,
+                "updatedAt": self._topology_updated_at,
+            }
+
+    def list_events(self, since_version=0):
+        with self._lock:
+            return [event.copy() for event in self._events if event["version"] > since_version]
 
     def register(
         self,
@@ -123,6 +155,14 @@ class RegistryStore:
             )
             self._definitions[agent_id] = definition
             self._instances.setdefault(agent_id, {})
+            self._record_topology_event(
+                "agent.registered",
+                agent_id=agent_id,
+                details={
+                    "executionMode": definition.execution_mode,
+                    "capabilities": list(definition.capabilities or []),
+                },
+            )
             return definition
 
     def deregister(self, agent_id, deregistered_by="system"):
@@ -133,6 +173,7 @@ class RegistryStore:
             definition.status = "deregistered"
             definition.deregistered_at = time.time()
             definition.deregistered_by = deregistered_by
+            self._record_topology_event("agent.deregistered", agent_id=agent_id)
             return definition
 
     def get_definition(self, agent_id):
@@ -163,22 +204,53 @@ class RegistryStore:
             self._instances.setdefault(agent_id, {})
             instance = AgentInstance(agent_id, service_url, port, container_id)
             self._instances[agent_id][instance.instance_id] = instance
+            self._record_topology_event(
+                "instance.added",
+                agent_id=agent_id,
+                instance_id=instance.instance_id,
+                details={
+                    "serviceUrl": service_url,
+                    "port": port,
+                    "status": instance.status,
+                },
+            )
             return instance
 
     def remove_instance(self, agent_id, instance_id):
         with self._lock:
-            return self._instances.get(agent_id, {}).pop(instance_id, None)
+            instance = self._instances.get(agent_id, {}).pop(instance_id, None)
+            if instance is not None:
+                self._record_topology_event(
+                    "instance.removed",
+                    agent_id=agent_id,
+                    instance_id=instance_id,
+                    details={"status": instance.status},
+                )
+            return instance
 
     def update_instance(self, agent_id, instance_id, **fields):
         with self._lock:
             instance = self._instances.get(agent_id, {}).get(instance_id)
             if instance is None:
                 return None
+            changed = {}
             for key, value in fields.items():
-                if hasattr(instance, key):
+                if hasattr(instance, key) and getattr(instance, key) != value:
                     setattr(instance, key, value)
+                    changed[key] = value
             if fields.get("status") == "idle":
                 instance.idle_since = time.time()
+                changed["idle_since"] = instance.idle_since
+            emitted_changes = {
+                key: value for key, value in changed.items() if key != "last_heartbeat_at"
+            }
+            if emitted_changes:
+                self._record_topology_event(
+                    "instance.updated",
+                    agent_id=agent_id,
+                    instance_id=instance_id,
+                    details=emitted_changes,
+                )
             return instance
 
     def heartbeat(self, agent_id, instance_id):

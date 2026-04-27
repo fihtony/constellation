@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import unittest
 from urllib.error import URLError
 from unittest.mock import Mock, patch
 
+from common.env_utils import load_dotenv
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
 
 
@@ -139,12 +141,67 @@ class RuntimeAdapterTests(unittest.TestCase):
         os.environ["AGENT_RUNTIME"] = "copilot-cli"
         os.environ["COPILOT_GITHUB_TOKEN"] = "github_pat_secret"
 
-        summary = summarize_runtime_configuration()
+        with patch("common.runtime.adapter.shutil.which", return_value="/usr/bin/copilot"):
+            summary = summarize_runtime_configuration()
 
         self.assertEqual(summary["effectiveBackend"], "copilot-cli")
         self.assertTrue(summary["tokenConfigured"])
         self.assertTrue(summary["tokenSources"]["COPILOT_GITHUB_TOKEN"])
         self.assertNotIn("github_pat_secret", json.dumps(summary))
+
+    def test_runtime_configuration_summary_falls_back_when_copilot_cli_is_not_ready(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+
+        with patch("common.runtime.adapter.shutil.which", return_value="/usr/bin/copilot"):
+            summary = summarize_runtime_configuration()
+
+        self.assertEqual(summary["requestedBackend"], "copilot-cli")
+        self.assertEqual(summary["effectiveBackend"], "copilot-connect")
+        self.assertFalse(summary["tokenConfigured"])
+        self.assertEqual(summary["fallbackReason"], "Copilot CLI token is not configured.")
+
+    def test_load_dotenv_applies_shared_defaults_and_local_overrides(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            common_dir = os.path.join(temp_dir, "common")
+            agent_dir = os.path.join(temp_dir, "agent")
+            os.makedirs(common_dir, exist_ok=True)
+            os.makedirs(agent_dir, exist_ok=True)
+
+            common_env = os.path.join(common_dir, ".env")
+            agent_env = os.path.join(agent_dir, ".env")
+
+            with open(common_env, "w", encoding="utf-8") as handle:
+                handle.write("AGENT_RUNTIME=copilot-cli\nCOPILOT_MODEL=gpt-5-mini\n")
+            with open(agent_env, "w", encoding="utf-8") as handle:
+                handle.write("AGENT_RUNTIME=claude-code\n")
+
+            merged = load_dotenv(agent_env)
+
+            self.assertEqual(merged["AGENT_RUNTIME"], "claude-code")
+            self.assertEqual(merged["COPILOT_MODEL"], "gpt-5-mini")
+            self.assertEqual(os.environ["AGENT_RUNTIME"], "claude-code")
+
+    def test_load_dotenv_treats_blank_process_env_as_missing(self):
+        os.environ["COPILOT_GITHUB_TOKEN"] = ""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            common_dir = os.path.join(temp_dir, "common")
+            agent_dir = os.path.join(temp_dir, "agent")
+            os.makedirs(common_dir, exist_ok=True)
+            os.makedirs(agent_dir, exist_ok=True)
+
+            common_env = os.path.join(common_dir, ".env")
+            agent_env = os.path.join(agent_dir, ".env")
+
+            with open(common_env, "w", encoding="utf-8") as handle:
+                handle.write("COPILOT_GITHUB_TOKEN=github_pat_from_common\n")
+            with open(agent_env, "w", encoding="utf-8") as handle:
+                handle.write("OPENAI_MODEL=gpt-5-mini\n")
+
+            merged = load_dotenv(agent_env)
+
+            self.assertEqual(merged["COPILOT_GITHUB_TOKEN"], "github_pat_from_common")
+            self.assertEqual(os.environ["COPILOT_GITHUB_TOKEN"], "github_pat_from_common")
 
 
 if __name__ == "__main__":

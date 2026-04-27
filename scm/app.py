@@ -392,7 +392,12 @@ def _clone_async_worker(task_id: str, owner: str, repo: str, branch: str, target
             "scm",
             f"Cloning {owner}/{repo} ({branch})",
             task_id=task_id,
-            extra={"owner": owner, "repo": repo, "branch": branch, **_runtime_config_summary()},
+            extra={
+                "owner": owner,
+                "repo": repo,
+                "branch": branch,
+                "runtimeConfig": _runtime_config_summary(),
+            },
         )
         clone_dir, result = _clone_to_workspace(owner, repo, branch, target_path)
         if clone_dir:
@@ -411,7 +416,11 @@ def _clone_async_worker(task_id: str, owner: str, repo: str, branch: str, target
                 "scm",
                 f"Completed scm.git.clone for {owner}/{repo}",
                 task_id=task_id,
-                extra={"clonePath": clone_dir, "result": result, **_runtime_config_summary()},
+                extra={
+                    "clonePath": clone_dir,
+                    "result": result,
+                    "runtimeConfig": _runtime_config_summary(),
+                },
             )
             _fire_clone_callback(callback_url, task_id, "TASK_STATE_COMPLETED", clone_dir, "")
         else:
@@ -423,7 +432,11 @@ def _clone_async_worker(task_id: str, owner: str, repo: str, branch: str, target
                 "scm",
                 f"Failed scm.git.clone for {owner}/{repo}",
                 task_id=task_id,
-                extra={"clonePath": "", "result": result, **_runtime_config_summary()},
+                extra={
+                    "clonePath": "",
+                    "result": result,
+                    "runtimeConfig": _runtime_config_summary(),
+                },
             )
             _fire_clone_callback(callback_url, task_id, "TASK_STATE_FAILED", "", result)
     except Exception as exc:
@@ -433,7 +446,7 @@ def _clone_async_worker(task_id: str, owner: str, repo: str, branch: str, target
             "scm",
             f"Failed scm.git.clone for {owner}/{repo}",
             task_id=task_id,
-            extra={"error": str(exc), **_runtime_config_summary()},
+            extra={"error": str(exc), "runtimeConfig": _runtime_config_summary()},
         )
         _fire_clone_callback(callback_url, task_id, "TASK_STATE_FAILED", "", str(exc))
 
@@ -745,7 +758,7 @@ def _run_task_async(task_id: str, message: dict):
                 "scm",
                 f"Started {capability or 'scm request'}",
                 task_id=task_id,
-                extra=_runtime_config_summary(),
+                extra={"runtimeConfig": _runtime_config_summary()},
             )
         # Special handling for async clone
         if capability == "scm.git.clone":
@@ -761,7 +774,7 @@ def _run_task_async(task_id: str, message: dict):
                 "scm",
                 f"Completed {capability or 'scm request'}",
                 task_id=task_id,
-                extra={"statusText": status_text, **_runtime_config_summary()},
+                extra={"statusText": status_text, "runtimeConfig": _runtime_config_summary()},
             )
         _notify_completion(message, task_id, "TASK_STATE_COMPLETED", status_text, artifacts)
     except Exception as error:
@@ -774,7 +787,7 @@ def _run_task_async(task_id: str, message: dict):
                 "scm",
                 f"Failed {capability or 'scm request'}",
                 task_id=task_id,
-                extra={"error": str(error), **_runtime_config_summary()},
+                extra={"error": str(error), "runtimeConfig": _runtime_config_summary()},
             )
         _notify_completion(message, task_id, "TASK_STATE_FAILED", failure_text, [])
 
@@ -797,7 +810,10 @@ def _dispatch_clone(task_id: str, message: dict):
                 "scm",
                 "Failed scm.git.clone",
                 task_id=task_id,
-                extra={"error": "Could not parse owner/repo for clone.", **_runtime_config_summary()},
+                extra={
+                    "error": "Could not parse owner/repo for clone.",
+                    "runtimeConfig": _runtime_config_summary(),
+                },
             )
         return
     # Run the actual clone in a background thread

@@ -151,7 +151,7 @@ def generate_text(prompt, actor_label, *, system_prompt=None, temperature=0):
             response_payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")
-        if env_flag("ALLOW_MOCK_FALLBACK", default=True):
+        if env_flag("ALLOW_MOCK_FALLBACK", default=False):
             print(f"[llm] {actor_label} falling back to mock after HTTP {error.code}: {body}")
             return _mock_response(prompt)
         raise RuntimeError(
@@ -159,7 +159,7 @@ def generate_text(prompt, actor_label, *, system_prompt=None, temperature=0):
             f"HTTP {error.code}: {body}"
         ) from error
     except URLError as error:
-        if env_flag("ALLOW_MOCK_FALLBACK", default=True):
+        if env_flag("ALLOW_MOCK_FALLBACK", default=False):
             print(f"[llm] {actor_label} falling back to mock after network error: {error.reason}")
             return _mock_response(prompt)
         raise RuntimeError(

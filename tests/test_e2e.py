@@ -832,7 +832,8 @@ def test_cstl1_full_workflow():  # noqa: C901
                  "check SCM agent logs for clone errors")
 
     step("d2. Verify Web Agent received Jira-derived Python/Flask constraints")
-    web_runtime_payload = _read_json_file(os.path.join(host_ws, "web-agent/runtime-config.json"))
+    web_stage_payload = _read_json_file(os.path.join(host_ws, "web-agent/stage-summary.json"))
+    web_runtime_payload = web_stage_payload.get("runtimeConfig") if isinstance(web_stage_payload, dict) else None
     if isinstance(web_runtime_payload, dict):
         web_constraints = web_runtime_payload.get("techStackConstraints") or {}
         if web_constraints:
@@ -863,7 +864,7 @@ def test_cstl1_full_workflow():  # noqa: C901
         else:
             warn(f"Web Agent received an unexpected frontend framework: {web_constraints.get('frontend_framework')!r}")
     else:
-        fail("Web Agent runtime config JSON unreadable", os.path.join(host_ws, "web-agent/runtime-config.json"))
+        fail("Web Agent runtime config unreadable", os.path.join(host_ws, "web-agent/stage-summary.json"))
 
     _verify_external(j_status_before, j_comments_before, prs_before,
                      branches_before, host_ws, final_state, tid, j_assignee_before)
@@ -989,8 +990,6 @@ def _verify_external(j_status_before, j_comments_before, prs_before,
         _ws_file_ok(host_ws, "web-agent/clone-info.json", "Web Agent clone info")
         _ws_file_ok(host_ws, "web-agent/jira-actions.json", "Web Agent Jira action evidence")
         _ws_file_ok(host_ws, "web-agent/pr-evidence.json", "Web Agent PR evidence")
-        _ws_file_ok(host_ws, "team-lead/runtime-config.json", "Team Lead runtime config")
-        _ws_file_ok(host_ws, "web-agent/runtime-config.json", "Web Agent runtime config")
         _ws_file_ok(host_ws, "compass/command-log.txt", "Compass command log")
         _ws_file_ok(host_ws, "compass/stage-summary.json", "Compass stage summary")
         _ws_file_ok(host_ws, "jira/command-log.txt", "Jira Agent command log")

@@ -21,7 +21,7 @@ from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.message_utils import build_text_artifact, extract_text
 from common.rules_loader import build_system_prompt
-from common.runtime.adapter import get_runtime
+from common.runtime.adapter import get_runtime, summarize_runtime_configuration
 from common.time_utils import local_iso_timestamp
 from jira import prompts
 
@@ -162,7 +162,14 @@ def _record_workspace_phase(workspace_path: str, task_id: str, phase: str, **ext
         "jira",
         phase,
         task_id=task_id,
-        extra={"agentId": AGENT_ID, **extra},
+        extra={
+            "agentId": AGENT_ID,
+            "runtimeConfig": {
+                "runtime": summarize_runtime_configuration(),
+                "backend": JIRA_BACKEND,
+            },
+            **extra,
+        },
     )
 
 

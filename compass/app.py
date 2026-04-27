@@ -71,6 +71,17 @@ def audit_log(event, **kwargs):
     print(f"[audit] {json.dumps(entry, ensure_ascii=False)}")
 
 
+def _runtime_config_summary():
+    return {
+        "service": "compass",
+        "registryUrl": os.environ.get("REGISTRY_URL", "http://registry:9000"),
+        "artifactRoot": os.environ.get("ARTIFACT_ROOT", "/app/artifacts"),
+        "dynamicAgentNetwork": os.environ.get("DYNAMIC_AGENT_NETWORK", "constellation-network"),
+        "ackTimeoutSeconds": ACK_TIMEOUT,
+        "taskTimeoutSeconds": DOWNSTREAM_TASK_TIMEOUT,
+    }
+
+
 def _create_shared_workspace(task_id):
     workspace_root = os.path.join(artifact_store.root, "workspaces")
     os.makedirs(workspace_root, exist_ok=True)
@@ -642,6 +653,7 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
             "requestedCapability": requested_capability or "",
             "workflow": workflow,
             "userText": user_text[:1000],
+            "runtimeConfig": _runtime_config_summary(),
         },
     )
     task_store.update_state(task.task_id, "ROUTING", f"Planned workflow: {', '.join(workflow)}")
@@ -757,7 +769,7 @@ class CompassHandler(BaseHTTPRequestHandler):
                         "compass",
                         step,
                         task_id=task_id,
-                        extra={"sourceAgent": agent_id},
+                        extra={"sourceAgent": agent_id, "runtimeConfig": _runtime_config_summary()},
                     )
             self._send_json(200, {"ok": True})
             return
@@ -843,7 +855,11 @@ class CompassHandler(BaseHTTPRequestHandler):
                                 "compass",
                                 "Received user input and resumed task",
                                 task_id=context_id,
-                                extra={"teamLeadTaskId": tl_task_id, "userText": extract_text(message)[:1000]},
+                                extra={
+                                    "teamLeadTaskId": tl_task_id,
+                                    "userText": extract_text(message)[:1000],
+                                    "runtimeConfig": _runtime_config_summary(),
+                                },
                             )
                         audit_log(
                             "TASK_RESUMED",

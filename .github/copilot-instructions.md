@@ -702,5 +702,7 @@ Before submitting a new agent, verify:
 
 - LLM-enabled agents (`team-lead`, `web`, `jira`, `scm`, `ui-design`) should load shared defaults from `common/.env` first, then apply their local `.env` overrides.
 - `compass` and `registry` remain non-agentic control-plane services; do not add runtime-adapter reasoning loops there unless the architecture changes.
-- Task workspaces should keep `command-log.txt`, `stage-summary.json`, and when relevant `runtime-config.json` under each agent subdirectory for auditability.
+- Task workspaces should keep `command-log.txt` and `stage-summary.json` under each agent subdirectory for auditability; runtime details belong inside `stage-summary.json` as `runtimeConfig`, not in a separate `runtime-config.json` file.
+- In execution task workspaces, generated source files should live in the real cloned repository directory; `web-agent/` and similar agent subdirectories are for metadata and audit artifacts only.
+- Web Agent branches should use deterministic naming based on Jira key plus orchestrator task id when available; only docs/tests-only changes may use `chore/...` naming without a ticket key.
 - Use `LOCAL_TIMEZONE` (preferred) or `TZ` to keep workspace timestamps aligned with the operator's local time.

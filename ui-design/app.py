@@ -354,7 +354,7 @@ def _dispatch_message(message: dict) -> tuple[str, list]:
             "ui-design",
             f"Started {capability or 'ui-design request'}",
             task_id=(metadata.get("orchestratorTaskId") or ""),
-            extra=_runtime_config_summary(),
+                extra={"runtimeConfig": _runtime_config_summary()},
         )
 
     if capability.startswith("figma.") or _looks_like_figma_request(user_text):
@@ -410,7 +410,7 @@ def _run_task_background(
                 "ui-design",
                 f"Completed {capability or 'ui-design request'}",
                 task_id=task_id,
-                extra={"statusText": status_text, **_runtime_config_summary()},
+                    extra={"statusText": status_text, "runtimeConfig": _runtime_config_summary()},
             )
         _TASKS[task_id] = {
             "id": task_id,
@@ -437,7 +437,7 @@ def _run_task_background(
                 "ui-design",
                 f"Failed {capability or 'ui-design request'}",
                 task_id=task_id,
-                extra={"error": str(exc), **_runtime_config_summary()},
+                    extra={"error": str(exc), "runtimeConfig": _runtime_config_summary()},
             )
         _TASKS[task_id] = {
             "id": task_id,

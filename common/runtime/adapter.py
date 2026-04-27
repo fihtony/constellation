@@ -143,29 +143,48 @@ def resolve_backend_name(backend: str | None = None) -> tuple[str, str]:
     return requested, _ALIASES.get(requested, "copilot-connect")
 
 
+def _copilot_cli_status() -> dict:
+    binary = os.environ.get("COPILOT_CLI_BIN", "copilot").strip() or "copilot"
+    token_sources = {
+        "COPILOT_GITHUB_TOKEN": bool(os.environ.get("COPILOT_GITHUB_TOKEN", "").strip()),
+        "GH_TOKEN": bool(os.environ.get("GH_TOKEN", "").strip()),
+        "GITHUB_TOKEN": bool(os.environ.get("GITHUB_TOKEN", "").strip()),
+    }
+    token_configured = any(token_sources.values())
+    binary_available = shutil.which(binary) is not None
+    return {
+        "binary": binary,
+        "binaryAvailable": binary_available,
+        "tokenConfigured": token_configured,
+        "tokenSources": token_sources,
+        "ready": token_configured and binary_available,
+    }
+
+
+def _claude_code_status() -> dict:
+    binary = os.environ.get("CLAUDE_CODE_BIN", "claude").strip() or "claude"
+    binary_available = shutil.which(binary) is not None
+    return {
+        "binary": binary,
+        "binaryAvailable": binary_available,
+        "ready": binary_available,
+    }
+
+
 def summarize_runtime_configuration(backend: str | None = None) -> dict:
     requested, effective = resolve_backend_name(backend)
     summary = {
         "requestedBackend": requested,
         "effectiveBackend": effective,
-        "allowMockFallback": env_flag("ALLOW_MOCK_FALLBACK", default=True),
+        "allowMockFallback": env_flag("ALLOW_MOCK_FALLBACK", default=False),
     }
 
     if effective == "copilot-cli":
-        binary = os.environ.get("COPILOT_CLI_BIN", "copilot").strip() or "copilot"
+        cli_status = _copilot_cli_status()
+        summary["effectiveBackend"] = "copilot-cli" if cli_status["ready"] else "copilot-connect"
         summary.update(
             {
-                "binary": binary,
-                "binaryAvailable": shutil.which(binary) is not None,
-                "tokenConfigured": any(
-                    os.environ.get(name, "").strip()
-                    for name in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
-                ),
-                "tokenSources": {
-                    "COPILOT_GITHUB_TOKEN": bool(os.environ.get("COPILOT_GITHUB_TOKEN", "").strip()),
-                    "GH_TOKEN": bool(os.environ.get("GH_TOKEN", "").strip()),
-                    "GITHUB_TOKEN": bool(os.environ.get("GITHUB_TOKEN", "").strip()),
-                },
+                **cli_status,
                 "model": AgentRuntimeAdapter.resolve_model(
                     os.environ.get("AGENT_MODEL"),
                     os.environ.get("COPILOT_MODEL"),
@@ -174,12 +193,16 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 ),
             }
         )
+        if not cli_status["tokenConfigured"]:
+            summary["fallbackReason"] = "Copilot CLI token is not configured."
+        elif not cli_status["binaryAvailable"]:
+            summary["fallbackReason"] = f"Copilot CLI binary '{cli_status['binary']}' is not available."
     elif effective == "claude-code":
-        binary = os.environ.get("CLAUDE_CODE_BIN", "claude").strip() or "claude"
+        claude_status = _claude_code_status()
+        summary["effectiveBackend"] = "claude-code" if claude_status["ready"] else "copilot-connect"
         summary.update(
             {
-                "binary": binary,
-                "binaryAvailable": shutil.which(binary) is not None,
+                **claude_status,
                 "model": AgentRuntimeAdapter.resolve_model(
                     os.environ.get("AGENT_MODEL"),
                     os.environ.get("CLAUDE_CODE_MODEL"),
@@ -187,6 +210,8 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 ),
             }
         )
+        if not claude_status["binaryAvailable"]:
+            summary["fallbackReason"] = f"Claude Code binary '{claude_status['binary']}' is not available."
     elif effective == "copilot-connect":
         summary.update(
             {
