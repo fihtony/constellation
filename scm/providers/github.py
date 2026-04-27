@@ -197,6 +197,15 @@ class GitHubProvider(SCMProvider):
             return self._normalize_pr(body), "ok"
         return body, f"error_{status}"
 
+    def _find_existing_open_pr(self, owner: str, repo: str, from_branch: str, to_branch: str) -> dict:
+        prs, status = self.list_prs(owner, repo, "open")
+        if status != "ok":
+            return {}
+        for pr in prs:
+            if pr.get("fromBranch") == from_branch and pr.get("toBranch") == to_branch:
+                return pr
+        return {}
+
     def create_pr(
         self,
         owner: str,
@@ -213,6 +222,10 @@ class GitHubProvider(SCMProvider):
         )
         if status in (200, 201):
             return self._normalize_pr(body), "created"
+        if status == 422:
+            existing_pr = self._find_existing_open_pr(owner, repo, from_branch, to_branch)
+            if existing_pr:
+                return existing_pr, "already_exists"
         return body, f"create_failed_{status}"
 
     def _normalize_pr(self, pr: dict) -> dict:

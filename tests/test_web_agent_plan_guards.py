@@ -50,6 +50,34 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         self.assertIn("HARD TECH STACK CONSTRAINTS", plan["dev_instruction"])
         self.assertIn("Python 3.12 and Flask", plan["acceptance_criteria"][0])
 
+    def test_revision_metadata_preserves_constraints_and_workflow_requirements(self):
+        metadata = team_lead_app._build_dev_task_metadata(
+            dev_capability="web.task.execute",
+            compass_task_id="task-1",
+            team_lead_task_id="task-1",
+            workspace="/tmp/workspace",
+            target_repo_url="https://github.com/example/repo",
+            tech_stack_constraints={
+                "language": "python",
+                "python_version": "3.12",
+                "backend_framework": "flask",
+            },
+            acceptance_criteria=["Tests pass."],
+            requires_tests=True,
+            is_revision=True,
+            revision_cycle=2,
+            review_issues=["Re-run pytest and attach evidence."],
+        )
+
+        self.assertEqual(metadata["targetRepoUrl"], "https://github.com/example/repo")
+        self.assertEqual(metadata["techStackConstraints"]["backend_framework"], "flask")
+        self.assertEqual(metadata["acceptanceCriteria"], ["Tests pass."])
+        self.assertTrue(metadata["requiresTests"])
+        self.assertTrue(metadata["isRevision"])
+        self.assertEqual(metadata["revisionCycle"], 2)
+        self.assertEqual(metadata["reviewIssues"], ["Re-run pytest and attach evidence."])
+        self.assertIn("transition the Jira ticket to 'In Progress'", metadata["devWorkflowInstructions"])
+
     def test_web_analysis_constraints_override_frontend_guess(self):
         analysis = {
             "scope": "frontend_only",

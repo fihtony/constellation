@@ -241,6 +241,59 @@ def _enforce_plan_constraints(plan: dict, constraints: dict | None) -> dict:
     return plan
 
 
+_DEV_WORKFLOW_INSTRUCTIONS = (
+    "MANDATORY development workflow — follow these steps in order:\n"
+    "1. When you start development: transition the Jira ticket to 'In Progress', "
+    "assign it to the service account, and add a comment saying you started.\n"
+    "2. Implement the feature following the acceptance criteria.\n"
+    "3. Write and run tests. Install any missing dependencies at runtime.\n"
+    "4. Push your implementation to a feature branch and create a Pull Request "
+    "targeting the default branch.\n"
+    "5. After the PR is created: transition the Jira ticket to 'In Review' and "
+    "add a comment that includes the PR URL, test status, and a brief summary.\n"
+    "All steps are required. Skipping Jira/PR steps is not acceptable."
+)
+
+
+def _build_dev_task_metadata(
+    *,
+    dev_capability: str,
+    compass_task_id: str,
+    team_lead_task_id: str,
+    workspace: str,
+    target_repo_url: str,
+    tech_stack_constraints: dict | None,
+    acceptance_criteria: list | None,
+    requires_tests: bool,
+    is_revision: bool = False,
+    revision_cycle: int = 0,
+    review_issues: list | None = None,
+) -> dict:
+    metadata = {
+        "requestedCapability": dev_capability,
+        "orchestratorTaskId": compass_task_id,
+        "orchestratorCallbackUrl": (
+            f"{ADVERTISED_URL.rstrip('/')}/tasks/{team_lead_task_id}/callbacks"
+        ),
+        "sharedWorkspacePath": workspace,
+        "teamLeadTaskId": team_lead_task_id,
+        "targetRepoUrl": target_repo_url,
+        "techStackConstraints": tech_stack_constraints or {},
+        "acceptanceCriteria": acceptance_criteria or [],
+        "requiresTests": requires_tests,
+        "devWorkflowInstructions": _DEV_WORKFLOW_INSTRUCTIONS,
+    }
+    if is_revision:
+        metadata.update(
+            {
+                "isRevision": True,
+                "revisionCycle": revision_cycle,
+                "reviewIssues": review_issues or [],
+            }
+        )
+    return metadata
+
+
 # ---------------------------------------------------------------------------
 # Progress / Callback helpers
 # ---------------------------------------------------------------------------
@@ -1062,31 +1115,16 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             "messageId": f"tl-{team_lead_task_id}-dev-{int(time.time())}",
             "role": "ROLE_USER",
             "parts": [{"text": plan.get("dev_instruction") or user_text}],
-            "metadata": {
-                "requestedCapability": dev_capability,
-                "orchestratorTaskId": compass_task_id,
-                "orchestratorCallbackUrl": (
-                    f"{ADVERTISED_URL.rstrip('/')}/tasks/{team_lead_task_id}/callbacks"
-                ),
-                "sharedWorkspacePath": workspace,
-                "teamLeadTaskId": team_lead_task_id,
-                "targetRepoUrl": plan.get("target_repo_url") or target_repo_url or "",
-                "techStackConstraints": tech_stack_constraints,
-                "acceptanceCriteria": plan.get("acceptance_criteria") or [],
-                "requiresTests": plan.get("requires_tests", False),
-                "devWorkflowInstructions": (
-                    "MANDATORY development workflow — follow these steps in order:\n"
-                    "1. When you start development: transition the Jira ticket to 'In Progress', "
-                    "assign it to the service account, and add a comment saying you started.\n"
-                    "2. Implement the feature following the acceptance criteria.\n"
-                    "3. Write and run tests. Install any missing dependencies at runtime.\n"
-                    "4. Push your implementation to a feature branch and create a Pull Request "
-                    "targeting the default branch.\n"
-                    "5. After the PR is created: transition the Jira ticket to 'In Review' and "
-                    "add a comment that includes the PR URL, test status, and a brief summary.\n"
-                    "All steps are required. Skipping Jira/PR steps is not acceptable."
-                ),
-            },
+            "metadata": _build_dev_task_metadata(
+                dev_capability=dev_capability,
+                compass_task_id=compass_task_id,
+                team_lead_task_id=team_lead_task_id,
+                workspace=workspace,
+                target_repo_url=plan.get("target_repo_url") or target_repo_url or "",
+                tech_stack_constraints=tech_stack_constraints,
+                acceptance_criteria=plan.get("acceptance_criteria") or [],
+                requires_tests=plan.get("requires_tests", False),
+            ),
         }
 
         dev_task = _a2a_send(dev_service_url, dev_message)
@@ -1169,18 +1207,19 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                         )
                     }
                 ],
-                "metadata": {
-                    "requestedCapability": dev_capability,
-                    "orchestratorTaskId": compass_task_id,
-                    "orchestratorCallbackUrl": (
-                        f"{ADVERTISED_URL.rstrip('/')}/tasks/{team_lead_task_id}/callbacks"
-                    ),
-                    "sharedWorkspacePath": workspace,
-                    "teamLeadTaskId": team_lead_task_id,
-                    "isRevision": True,
-                    "revisionCycle": review_cycle + 1,
-                    "reviewIssues": review.get("issues") or [],
-                },
+                "metadata": _build_dev_task_metadata(
+                    dev_capability=dev_capability,
+                    compass_task_id=compass_task_id,
+                    team_lead_task_id=team_lead_task_id,
+                    workspace=workspace,
+                    target_repo_url=plan.get("target_repo_url") or target_repo_url or "",
+                    tech_stack_constraints=tech_stack_constraints,
+                    acceptance_criteria=plan.get("acceptance_criteria") or [],
+                    requires_tests=plan.get("requires_tests", False),
+                    is_revision=True,
+                    revision_cycle=review_cycle + 1,
+                    review_issues=review.get("issues") or [],
+                ),
             }
             rev_task = _a2a_send(dev_service_url, revision_message)
             rev_task_id = rev_task.get("id", "")

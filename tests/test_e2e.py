@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sys
 import textwrap
 import time
@@ -191,9 +192,11 @@ def poll_task(tid: str, timeout: int = TASK_POLL_TIMEOUT,
     deadline = time.time() + timeout
     last_state = ""
     last_prog = 0
+    last_body = None
     while time.time() < deadline:
         status, body = http_json(f"{COMPASS_URL}/tasks/{tid}", timeout=10)
         if status == 200:
+            last_body = body
             task = body.get("task", {})
             state = task.get("status", {}).get("state", "")
             if print_progress:
@@ -208,7 +211,10 @@ def poll_task(tid: str, timeout: int = TASK_POLL_TIMEOUT,
             if state in terminal:
                 return body
         time.sleep(3)
-    return None
+    status, body = http_json(f"{COMPASS_URL}/tasks/{tid}", timeout=10)
+    if status == 200:
+        return body
+    return last_body
 
 
 def t_state(body: dict | None) -> str:
@@ -220,7 +226,15 @@ def t_id(body: dict | None) -> str:
 
 
 def t_workspace(body: dict | None) -> str:
-    return (body or {}).get("task", {}).get("workspacePath", "")
+    workspace = (body or {}).get("task", {}).get("workspacePath", "")
+    if workspace:
+        return workspace
+    for step in reversed((body or {}).get("task", {}).get("progressSteps", [])):
+        step_text = step.get("step", "") if isinstance(step, dict) else ""
+        match = re.search(r"(/app/artifacts/workspaces/[A-Za-z0-9._-]+)", step_text)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def t_agent(body: dict | None) -> str:
@@ -320,14 +334,21 @@ def _jira_h() -> dict:
 
 
 def jira_get_issue(key: str) -> dict | None:
-    s, b = http_json(f"{JIRA_API_BASE}/issue/{key}?fields=status,assignee,comment",
-                     headers=_jira_h())
-    return b if s == 200 else None
+    if JIRA_TOKEN and JIRA_EMAIL:
+        s, b = http_json(f"{JIRA_API_BASE}/issue/{key}?fields=status,assignee,comment",
+                         headers=_jira_h())
+        if s == 200:
+            return b
+    s, b = http_json(f"{JIRA_URL}/jira/tickets/{key}")
+    issue = b.get("issue") if isinstance(b, dict) else None
+    return issue if s == 200 and isinstance(issue, dict) else None
 
 
 def jira_get_comments(key: str) -> list:
-    s, b = http_json(f"{JIRA_API_BASE}/issue/{key}/comment", headers=_jira_h())
-    return b.get("comments", []) if s == 200 else []
+    issue = jira_get_issue(key) or {}
+    comment_block = issue.get("fields", {}).get("comment") or {}
+    comments = comment_block.get("comments")
+    return comments if isinstance(comments, list) else []
 
 
 # ---------------------------------------------------------------------------

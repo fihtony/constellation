@@ -370,6 +370,15 @@ class GitHubMCPProvider(SCMProvider):
             return self._normalize_pr(data), "ok"
         return {}, "error_parse"
 
+    def _find_existing_open_pr(self, owner: str, repo: str, from_branch: str, to_branch: str) -> dict:
+        prs, status = self.list_prs(owner, repo, "open")
+        if status != "ok":
+            return {}
+        for pr in prs:
+            if pr.get("fromBranch") == from_branch and pr.get("toBranch") == to_branch:
+                return pr
+        return {}
+
     def create_pr(
         self,
         owner: str,
@@ -388,6 +397,9 @@ class GitHubMCPProvider(SCMProvider):
             "base": to_branch,
         })
         if _is_error(resp):
+            existing_pr = self._find_existing_open_pr(owner, repo, from_branch, to_branch)
+            if existing_pr:
+                return existing_pr, "already_exists"
             return {}, f"create_failed: {_extract_text(resp)[:150]}"
         data = _parse_json(_extract_text(resp)) or {}
         # Remote MCP returns {"id": "...", "url": "https://.../pull/5"}

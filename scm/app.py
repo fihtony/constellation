@@ -627,13 +627,15 @@ def _handle_pr_create(text: str, message: dict) -> tuple[str, list]:
     if not owner or not repo or not from_branch:
         return "Could not parse owner/repo/from_branch from request.", []
     pr, status = _provider.create_pr(owner, repo, from_branch, to_branch, title, description)
-    if status not in ("created",):
+    if status not in ("created", "already_exists"):
         return f"PR creation failed: {status} — {pr}", []
     artifact = build_text_artifact(
         "pr-created",
         json.dumps(pr, ensure_ascii=False, indent=2),
         metadata={"agentId": AGENT_ID, "capability": "scm.pr.create"},
     )
+    if status == "already_exists":
+        return f"PR already exists: '{title}' ({pr.get('htmlUrl', '')})", [artifact]
     return f"PR created: '{title}' ({pr.get('htmlUrl', '')})", [artifact]
 
 

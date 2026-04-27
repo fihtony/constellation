@@ -198,6 +198,8 @@ services:
       ALLOW_MOCK_FALLBACK: "1"
       COPILOT_GITHUB_TOKEN: "${COPILOT_GITHUB_TOKEN:-}"
       TZ: "${TZ:-UTC}"
+    volumes:
+      - ./artifacts:/app/artifacts
     labels:
       constellation.agent_id: "ui-design-agent"
       constellation.agent_name: "UI Design Agent"
