@@ -156,6 +156,6 @@ Build the Office Agent image when validating container wiring:
 - Office launch fails because `OFFICE_ALLOWED_BASE_PATHS` rejects the selected path.
 - Office organize fails because runtime returned an unsafe destination such as `../...`.
 - Office organize unexpectedly produces `grouped/`, `by-student/`, or `originals/` at the output root because destination normalization regressed.
-- Workspace output is missing because `ARTIFACT_ROOT_HOST` was not configured for Compass.
+- Workspace output is missing because the Docker volume mount for `/app/artifacts` could not be auto-discovered (check Docker socket access for Compass).
 - In-place mode was requested but the user denied write permission.
 - In-place final outputs are missing from the user folder because the test looked for the Compass task id instead of the Office child-task file name or glob pattern.

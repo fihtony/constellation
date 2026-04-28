@@ -67,12 +67,11 @@ services:
       ARTIFACT_ROOT: "/app/artifacts"
       DEFAULT_DYNAMIC_IMAGE: "constellation-android-agent:latest"
       DYNAMIC_AGENT_NETWORK: "constellation-network"
+      DOCKER_SOCKET: "/var/run/docker.sock"
       TZ: "${TZ:-UTC}"
-      # ARTIFACT_ROOT_HOST is loaded from compass/.env — do NOT override here with an empty
-      # variable expansion or it will blank out the value from env_file.
     volumes:
       - ./artifacts:/app/artifacts
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
     group_add:
       - "0"
     labels:
@@ -230,9 +229,10 @@ services:
   #     ALLOW_MOCK_FALLBACK: "0"
   #     DYNAMIC_AGENT_NETWORK: "constellation-network"
   #     ARTIFACT_ROOT: "/app/artifacts"
+  #     DOCKER_SOCKET: "/var/run/docker.sock"
   #   volumes:
   #     - ./artifacts:/app/artifacts
-  #     - /var/run/docker.sock:/var/run/docker.sock
+  #     - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
   #   labels:
   #     constellation.agent_id: "team-lead-agent"
   #     constellation.agent_name: "Team Lead Agent"

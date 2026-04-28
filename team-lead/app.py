@@ -1940,6 +1940,9 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                         "TASK_STATE_FAILED",
                         "Timed out waiting for user input.",
                     )
+                    # Register so the finally block's _delayed_cleanup can wait for
+                    # Compass ACK (or its timeout) before the container shuts down.
+                    exit_handler.register(team_lead_task_id)
                     _notify_compass(
                         callback_url,
                         team_lead_task_id,
@@ -2001,6 +2004,21 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 item for item in unresolved_missing
                 if not any(kw in item.lower() for kw in _repo_kws)
             ]
+        # Suppress CI/workflow questions — the web agent generates CI config itself
+        _ci_kws = {"ci ", "ci/", "ci config", "continuous", "workflow", "pipeline",
+                   "github actions", "gitlab", "jenkins", "circleci", "travis",
+                   "build system", "build tool", "build config", "target ci"}
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in _ci_kws)
+        ]
+        # Suppress canonical PR/branch questions — the web agent creates a new branch
+        _pr_kws = {"canonical pr", "canonical branch", "authoritative pr", "which pr",
+                   "which branch", "pr url", "branch name", "merge target"}
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in _pr_kws)
+        ]
         if unresolved_missing and not _should_stop_before_dev_dispatch(ctx):
             raise RuntimeError(
                 "Cannot create implementation plan with unresolved missing information: "
@@ -2381,7 +2399,9 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         _notify_compass(callback_url, team_lead_task_id, "TASK_STATE_FAILED", failure_summary)
 
     finally:
-        # Wait for Compass ACK (or timeout), then shut down in per-task mode.
+        # Wait for Compass ACK (or timeout), then shut down.
+        # Team Lead is always a per-task agent — it must always exit after its
+        # task completes so stale containers do not accumulate.
         def _delayed_cleanup():
             # Give Compass a short window to poll task state before cleanup
             time.sleep(5)
@@ -2396,8 +2416,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     f"[{AGENT_ID}] Compass ACK timeout ({COMPASS_ACK_TIMEOUT}s) "
                     f"for task {team_lead_task_id} — shutting down"
                 )
-            if os.environ.get("AUTO_STOP_AFTER_TASK", "").strip() == "1":
-                _schedule_shutdown(delay_seconds=2)
+            _schedule_shutdown(delay_seconds=2)
 
         threading.Thread(target=_delayed_cleanup, daemon=True).start()
 

@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -128,8 +129,57 @@ class TestDockerLauncherEnvIsolation(unittest.TestCase):
         self.assertIn("/Users/test/Documents:/app/userdata:ro", binds)
         self.assertIn("/tmp/workspace:/app/workspace:rw", binds)
 
+    def test_launcher_uses_host_socket_source_for_nested_agents(self):
+        agent_definition = {
+            "agent_id": "team-lead-agent",
+            "display_name": "Team Lead Agent",
+            "execution_mode": "per-task",
+            "launch_spec": {
+                "image": "constellation-team-lead-agent:latest",
+                "port": 8030,
+                "mountDockerSocket": True,
+                "startupDelaySeconds": 0,
+            },
+        }
+        requests: list[tuple[str, str, dict | None]] = []
+
+        def fake_request(method, path, payload=None):
+            requests.append((method, path, payload))
+            return {}
+
+        def fake_discover(path):
+            if path == "/app/artifacts":
+                return "/host/artifacts"
+            if path == "/var/run/docker.sock":
+                return "/host/docker.sock"
+            return path
+
+        with patch.dict(os.environ, {}, clear=True):
+            launcher = Launcher()
+            with patch.object(launcher, "_discover_host_source", side_effect=fake_discover), \
+                 patch.object(launcher, "_request", side_effect=fake_request), \
+                 patch("common.launcher.os.path.exists", side_effect=lambda value: value == "/var/run/docker.sock"), \
+                 patch("common.launcher.os.stat", return_value=SimpleNamespace(st_gid=777)), \
+                 patch("common.launcher.time.sleep", return_value=None):
+                launcher.launch_instance(agent_definition, "task-123")
+
+        payload = requests[0][2]
+        env_list = payload["Env"]
+        binds = payload["HostConfig"]["Binds"]
+        self.assertIn("DOCKER_SOCKET=/var/run/docker.sock", env_list)
+        self.assertIn("/host/artifacts:/app/artifacts", binds)
+        self.assertIn("/host/docker.sock:/var/run/docker.sock", binds)
+        self.assertEqual(payload["HostConfig"]["GroupAdd"], ["777"])
+
 
 class TestRancherLauncherEnvIsolation(unittest.TestCase):
+    def test_rancher_launcher_uses_container_socket_path_inside_containers(self):
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("common.launcher_rancher.os.path.exists", side_effect=lambda value: value == "/.dockerenv"):
+            launcher = RancherLauncher()
+
+        self.assertEqual(launcher.socket_path, "/var/run/docker.sock")
+
     def test_launcher_marks_child_env_trusted_and_uses_file_backed_token(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             common_dir = os.path.join(temp_dir, "common")
@@ -205,6 +255,48 @@ class TestRancherLauncherEnvIsolation(unittest.TestCase):
         binds = requests[0][2]["HostConfig"]["Binds"]
         self.assertIn("/Users/test/Documents:/app/userdata:ro", binds)
         self.assertIn("/tmp/workspace:/app/workspace:rw", binds)
+
+    def test_rancher_launcher_uses_host_socket_source_for_nested_agents(self):
+        agent_definition = {
+            "agent_id": "team-lead-agent",
+            "display_name": "Team Lead Agent",
+            "execution_mode": "per-task",
+            "launch_spec": {
+                "image": "constellation-team-lead-agent:latest",
+                "port": 8030,
+                "mountDockerSocket": True,
+                "startupDelaySeconds": 0,
+            },
+        }
+        requests: list[tuple[str, str, dict | None]] = []
+
+        def fake_request(method, path, payload=None):
+            requests.append((method, path, payload))
+            return {}
+
+        def fake_discover(path):
+            if path == "/app/artifacts":
+                return "/host/artifacts"
+            if path == "/var/run/docker.sock":
+                return "/host/rancher.sock"
+            return path
+
+        with patch.dict(os.environ, {"DOCKER_SOCKET": "/var/run/docker.sock"}, clear=True):
+            launcher = RancherLauncher()
+            with patch.object(launcher, "_discover_host_source", side_effect=fake_discover), \
+                 patch.object(launcher, "_request", side_effect=fake_request), \
+                 patch("common.launcher_rancher.os.path.exists", side_effect=lambda value: value == "/var/run/docker.sock"), \
+                 patch("common.launcher_rancher.os.stat", return_value=SimpleNamespace(st_gid=888)), \
+                 patch("common.launcher_rancher.time.sleep", return_value=None):
+                launcher.launch_instance(agent_definition, "task-123")
+
+        payload = requests[0][2]
+        env_list = payload["Env"]
+        binds = payload["HostConfig"]["Binds"]
+        self.assertIn("DOCKER_SOCKET=/var/run/docker.sock", env_list)
+        self.assertIn("/host/artifacts:/app/artifacts", binds)
+        self.assertIn("/host/rancher.sock:/var/run/docker.sock", binds)
+        self.assertEqual(payload["HostConfig"]["GroupAdd"], ["888"])
 
 
 if __name__ == "__main__":

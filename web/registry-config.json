@@ -6,8 +6,8 @@
     "image": "constellation-web-agent:latest",
     "port": 8050,
     "command": ["python3", "web/app.py"],
-    "passThroughEnv": ["ARTIFACT_ROOT_HOST", "ARTIFACT_ROOT", "DYNAMIC_AGENT_NETWORK", "COPILOT_GITHUB_TOKEN", "TZ"],
-    "env": {}
+    "passThroughEnv": ["ARTIFACT_ROOT", "DYNAMIC_AGENT_NETWORK", "COPILOT_GITHUB_TOKEN", "TZ"],
+    "mountDockerSocket": false
   },
   "scalingPolicy": {
     "maxInstances": 3,

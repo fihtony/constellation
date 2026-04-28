@@ -239,9 +239,13 @@ class CompassDispatchTests(unittest.TestCase):
 
     def test_validate_office_target_paths_defers_missing_host_path_when_containerized(self):
         host_path = "/Users/tony/projects/constellation/tests/data/csv/sales_data.csv"
-        with mock.patch.dict(os.environ, {"ARTIFACT_ROOT_HOST": "/Users/tony/projects/constellation/artifacts"}, clear=False), \
+        # Simulate running inside a container by patching the helper directly.
+        with mock.patch.object(compass_app, "_is_containerized", return_value=True), \
              mock.patch.object(compass_app.os.path, "exists", return_value=False):
             paths, error = compass_app._validate_office_target_paths([host_path])
+
+        self.assertEqual(paths, [host_path])
+        self.assertEqual(error, "")
 
         self.assertEqual(paths, [host_path])
         self.assertEqual(error, "")
@@ -290,7 +294,7 @@ class CompassDispatchTests(unittest.TestCase):
 
             with mock.patch.object(compass_app, "_interpret_office_reply", return_value={"action": "workspace", "clarification_question": None}), \
                  mock.patch.object(compass_app, "_start_task_worker", side_effect=fake_start), \
-                 mock.patch.dict(os.environ, {"ARTIFACT_ROOT_HOST": "/tmp/artifacts-host", "ARTIFACT_ROOT": "/app/artifacts"}, clear=False):
+                 mock.patch.object(compass_app.launcher, "resolve_host_path", return_value="/tmp/artifacts-host/workspaces/task-0001"):
                 resumed = compass_app._resume_input_required_task(
                     {"contextId": task.task_id},
                     {"parts": [{"text": "Use workspace output."}]},

@@ -75,7 +75,7 @@ _gh = GITHUB_REPO_URL.rstrip("/").split("/")
 GITHUB_OWNER    = _gh[-2] if len(_gh) >= 2 else ""
 GITHUB_REPO     = _gh[-1] if _gh else ""
 
-ARTIFACT_ROOT_HOST = os.environ.get("ARTIFACT_ROOT_HOST", str(PROJECT_ROOT / "artifacts"))
+HOST_ARTIFACT_ROOT = str(PROJECT_ROOT / "artifacts")
 LOCAL_TIMEZONE = (
     os.environ.get("LOCAL_TIMEZONE", "").strip()
     or _ENV.get("LOCAL_TIMEZONE", "").strip()
@@ -246,7 +246,7 @@ def container_to_host(container_path: str) -> str:
         return ""
     prefix = "/app/artifacts"
     if container_path.startswith(prefix):
-        return ARTIFACT_ROOT_HOST + container_path[len(prefix):]
+        return HOST_ARTIFACT_ROOT + container_path[len(prefix):]
     return container_path
 
 
@@ -692,14 +692,14 @@ def test_cstl1_full_workflow():  # noqa: C901
     if host_ws and os.path.isdir(host_ws):
         ok(f"Workspace exists: {host_ws}")
     else:
-        ws_root = Path(ARTIFACT_ROOT_HOST) / "workspaces"
+        ws_root = Path(HOST_ARTIFACT_ROOT) / "workspaces"
         candidates = sorted(ws_root.glob(f"{tid}*"), reverse=True) if ws_root.is_dir() else []
         if candidates:
             host_ws = str(candidates[0])
             ok(f"Workspace found by task ID: {host_ws}")
         else:
             fail("Workspace not found under artifacts/workspaces/",
-                 f"Searched: {ARTIFACT_ROOT_HOST}/workspaces/{tid}*")
+                 f"Searched: {HOST_ARTIFACT_ROOT}/workspaces/{tid}*")
 
     if not host_ws:
         warn("Skipping workspace content checks")
@@ -1085,7 +1085,7 @@ def run_all():
     print(f"{Colors.BOLD}{'=' * 64}{Colors.RESET}")
     print(f"  Compass:   {COMPASS_URL}")
     print(f"  Registry:  {REGISTRY_URL}")
-    print(f"  Artifacts: {ARTIFACT_ROOT_HOST}")
+    print(f"  Artifacts: {HOST_ARTIFACT_ROOT}")
     print(f"  Ticket:    {JIRA_TICKET_URL}")
     print(f"  Repo:      {GITHUB_REPO_URL}")
     print(f"  Timeout:   {WORKFLOW_POLL_TIMEOUT}s")

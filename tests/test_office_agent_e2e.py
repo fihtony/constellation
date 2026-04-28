@@ -43,20 +43,14 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _artifact_root_host() -> Path:
-    compass_env = load_env_file("compass/.env")
-    configured = (
-        os.environ.get("ARTIFACT_ROOT_HOST", "").strip()
-        or compass_env.get("ARTIFACT_ROOT_HOST", "").strip()
-        or str(PROJECT_ROOT / "artifacts")
-    )
-    return Path(configured).resolve()
+def _host_artifact_root() -> Path:
+    return (PROJECT_ROOT / "artifacts").resolve()
 
 
 def _container_to_host(path: str) -> Path:
     if not path:
         return Path()
-    artifact_root = _artifact_root_host()
+    artifact_root = _host_artifact_root()
     if path.startswith(CONTAINER_ARTIFACT_ROOT):
         suffix = path[len(CONTAINER_ARTIFACT_ROOT):].lstrip("/")
         return (artifact_root / suffix).resolve()

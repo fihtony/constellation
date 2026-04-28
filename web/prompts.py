@@ -100,8 +100,9 @@ Critical planning rules:
   how to run the dev server (`python run.py` or `flask run`), and how to run tests (`pytest`).
 
 Important rules for Flask backends:
-- The Flask app must use: `app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))`
-  so templates resolve correctly no matter from which directory the app or its tests are run.
+- The Flask app must use: `app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'), static_folder=os.path.join(os.path.dirname(__file__), '..', 'static'))`
+  so templates AND static files resolve correctly no matter from which directory the app or its tests are run.
+  The `static_folder` must point to the project-root `static/` directory (one level up from `app/`), NOT to `app/static/`.
 - Tests must import the Flask app object and use `app.test_client()` — never use subprocess or curl.
 
 Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
@@ -212,8 +213,7 @@ for a single file as instructed. The code must:
 3. Include proper error handling
 4. Be self-contained or clearly import its dependencies
 5. Follow OWASP security guidelines (no SQL injection, XSS, etc.)
-6. For Flask apps: use `app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))`
-   so templates resolve correctly regardless of working directory.
+6. For Flask apps: use `app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'), static_folder=os.path.join(os.path.dirname(__file__), '..', 'static'))` — static_folder MUST point to the project-root `static/` (one level above `app/`) so `/static/css/styles.css` resolves correctly regardless of working directory.
 7. For Flask `run.py`: always read the port from `int(os.environ.get("PORT", 5000))` to support
    dynamic port assignment during testing and screenshots.
 8. For pytest tests of Flask apps: import the app object, set `app.testing = True`, use `app.test_client()`.
@@ -375,8 +375,11 @@ Rules:
 1. Only modify files that are actually broken.
 2. Produce complete file contents — never partial snippets.
 3. Keep the original logic intact; only fix what is broken.
-4. For Flask apps: always use `template_folder=os.path.join(os.path.dirname(__file__), 'templates')`
-   in the Flask() constructor so templates resolve correctly regardless of working directory.
+4. For Flask apps: always use `template_folder=os.path.join(os.path.dirname(__file__), 'templates'), static_folder=os.path.join(os.path.dirname(__file__), '..', 'static')`
+   in the Flask() constructor so templates AND static files resolve correctly regardless of working directory.
+   The static_folder MUST point to the project-root `static/` directory (one level above `app/`), NOT `app/static/`.
+   This is REQUIRED — the test `test_static_css_is_served_` calls `client.get('/static/css/styles.css')` and expects HTTP 200.
+   If the test is failing with a 404 for /static/css/styles.css, fix app/__init__.py to set static_folder correctly.
 5. For pytest: when testing a Flask app, import the app module directly (do NOT use subprocess);
    set `app.testing = True` and use `app.test_client()`. Do NOT rely on filesystem paths from cwd.
 6. File paths in the `fixes` array must be relative to the build directory (e.g. `app.py`, `templates/index.html`).

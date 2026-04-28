@@ -13,6 +13,17 @@ from urllib.parse import quote
 from common.env_utils import load_dotenv
 
 
+_CHILD_SOCKET_PATH = "/var/run/docker.sock"
+
+
+def _is_containerized_process():
+    return any((
+        bool(os.environ.get("CONTAINER_ID", "").strip()),
+        os.path.exists("/.dockerenv"),
+        os.path.exists("/run/.containerenv"),
+    ))
+
+
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
     def __init__(self, socket_path):
         super().__init__("localhost")
@@ -32,7 +43,7 @@ class RancherLauncher:
     """
 
     def __init__(self):
-        default_socket = os.path.expanduser("~/.rd/docker.sock")
+        default_socket = _CHILD_SOCKET_PATH if _is_containerized_process() else os.path.expanduser("~/.rd/docker.sock")
         self.socket_path = os.environ.get("DOCKER_SOCKET", default_socket)
         self.runtime_image = os.environ.get("DEFAULT_DYNAMIC_IMAGE", "constellation-android-agent:latest")
         self.runtime_network = os.environ.get("DYNAMIC_AGENT_NETWORK", "constellation-network")
@@ -153,6 +164,11 @@ class RancherLauncher:
             "CONSTELLATION_TRUSTED_ENV": "1",
         })
 
+        host_socket_path = ""
+        if launch_spec.get("mountDockerSocket", False) and os.path.exists(self.socket_path):
+            host_socket_path = self._discover_host_source(self.socket_path)
+            env["DOCKER_SOCKET"] = _CHILD_SOCKET_PATH
+
         payload = {
             "Image": image,
             "Cmd": command,
@@ -173,15 +189,18 @@ class RancherLauncher:
             },
         }
 
-        artifact_root_host = os.environ.get("ARTIFACT_ROOT_HOST", "").strip()
         artifact_root_container = os.environ.get("ARTIFACT_ROOT", "/app/artifacts")
+        artifact_root_host = self._discover_host_source(artifact_root_container)
         binds = []
         if artifact_root_host:
             binds.append(f"{artifact_root_host}:{artifact_root_container}")
-        # Pass through the Rancher socket so per-task agents can launch nested agents.
-        # Rancher exposes its socket at the same path used by this launcher.
-        if launch_spec.get("mountDockerSocket", True) and os.path.exists(self.socket_path):
-            binds.append(f"{self.socket_path}:{self.socket_path}")
+        # Only mount the Docker socket when explicitly requested in the launch spec
+        # (mountDockerSocket: true).  Default is false — principle of least privilege.
+        if host_socket_path:
+            binds.append(f"{host_socket_path}:{_CHILD_SOCKET_PATH}")
+            group_add = self._socket_group_add(self.socket_path)
+            if group_add:
+                payload["HostConfig"]["GroupAdd"] = group_add
         for bind in launch_spec.get("extraBinds", []) or []:
             bind_text = str(bind or "").strip()
             if bind_text:
@@ -201,6 +220,64 @@ class RancherLauncher:
             "service_url": service_url,
             "port": port,
         }
+
+    def _discover_host_source(self, container_path):
+        """Return the host-side source path for *container_path* by inspecting
+        this container's volume mounts via the Docker API.
+
+        Falls back to *container_path* when not running inside a container or
+        when the Docker API call fails.
+        """
+        container_id = (
+            os.environ.get("CONTAINER_ID", "").strip()
+            or os.environ.get("HOSTNAME", "").strip()
+        )
+        if not container_id:
+            return container_path
+        try:
+            safe_id = quote(container_id, safe="")
+            status, raw = self._request_raw("GET", f"/v1.43/containers/{safe_id}/json")
+            if status >= 400 or not raw:
+                return container_path
+            data = json.loads(raw)
+            target_real = os.path.realpath(container_path)
+            for mount in data.get("Mounts", []):
+                dest = mount.get("Destination", "")
+                if dest and os.path.realpath(dest) == target_real:
+                    src = mount.get("Source", "")
+                    if src:
+                        return src
+        except Exception:
+            pass
+        return container_path
+
+    def _socket_group_add(self, socket_path):
+        try:
+            socket_gid = os.stat(socket_path).st_gid
+        except OSError:
+            return []
+        return [str(socket_gid)]
+
+    def resolve_host_path(self, container_path):
+        """Convert a container-side absolute path to its host-side equivalent.
+
+        Returns an empty string if the path cannot be mapped.
+        """
+        if not container_path:
+            return ""
+        artifact_root_container = os.environ.get("ARTIFACT_ROOT", "/app/artifacts")
+        artifact_root_host = self._discover_host_source(artifact_root_container)
+        if not artifact_root_host:
+            return ""
+        container_real = os.path.realpath(container_path)
+        base_real = os.path.realpath(artifact_root_container)
+        try:
+            relative = os.path.relpath(container_real, base_real)
+            if relative.startswith(".."):
+                return ""
+        except ValueError:
+            return ""
+        return os.path.realpath(os.path.join(artifact_root_host, relative))
 
     def destroy_instance(self, agent_id, container_name):
         self._request("DELETE", f"/v1.43/containers/{quote(container_name, safe='')}?force=1")

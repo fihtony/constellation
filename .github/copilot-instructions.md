@@ -75,9 +75,12 @@ This project uses **Docker Desktop by default**, and also supports **Rancher Des
 - Host machine alias from containers:
   - Docker Desktop: `host.docker.internal`
   - Rancher Desktop: `host.rancher-desktop.internal`
-- Container socket default:
-  - Docker Desktop: `/var/run/docker.sock`
-  - Rancher Desktop: `~/.rd/docker.sock` (or override with `DOCKER_SOCKET`)
+- Socket path visible to the current process:
+  - Host process + Docker Desktop: `/var/run/docker.sock`
+  - Host process + Rancher Desktop: `~/.rd/docker.sock` (or override with `DOCKER_SOCKET`)
+  - Inside launcher containers: always `/var/run/docker.sock`
+- Persistent launcher services must mount the host socket to `/var/run/docker.sock` inside the container.
+- Nested per-task launchers must re-bind the socket using the host-side mount source discovered from the current container, not by reusing the current container path as a host source.
 - Network name: `constellation-network`
 - If `OPENAI_BASE_URL` is unset, Copilot Connect resolves automatically:
   - host process: `http://localhost:1288/v1`
@@ -733,6 +736,7 @@ Before submitting a new agent, verify:
 - Runtime Git commands must use the isolated helper environment from `common.env_utils.build_isolated_git_env()` so agent subprocesses never read host Git credential helpers, host keychains, or user-level `~/.gitconfig`.
 - `copilot-cli` runtime authentication is isolated as well: only `COPILOT_GITHUB_TOKEN` is supported for agent execution. Do not rely on `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth`, or system keychain fallbacks inside agents.
 - Launchers and integration tests must sanitize inherited host GitHub credentials before spawning subprocesses. Test scripts may use only file-backed values from `tests/.env` for GitHub auth.
+- `ARTIFACT_ROOT` is the only artifact-root config now. Launchers must discover the host-side bind source for `/app/artifacts` by inspecting the current container's mounts through the Docker-compatible API; do not re-introduce `ARTIFACT_ROOT_HOST`.
 - `registry` remains a non-agentic control-plane service. `compass` is now an agentic control-plane service for routing, clarification interpretation, and user-facing final summaries, but it must still avoid unbounded external-system reasoning loops and must not bypass registered boundary agents.
 - Task workspaces should keep `command-log.txt` and `stage-summary.json` under each agent subdirectory for auditability; runtime details belong inside `stage-summary.json` as `runtimeConfig`, not in a separate `runtime-config.json` file.
 - In execution task workspaces, generated source files should live in the real cloned repository directory; `web-agent/` and similar agent subdirectories are for metadata and audit artifacts only.

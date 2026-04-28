@@ -8,7 +8,6 @@
     "command": ["python3", "office/app.py"],
     "mountDockerSocket": false,
     "passThroughEnv": [
-      "ARTIFACT_ROOT_HOST",
       "ARTIFACT_ROOT",
       "COPILOT_GITHUB_TOKEN",
       "AGENT_RUNTIME",

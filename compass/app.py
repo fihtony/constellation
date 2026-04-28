@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
@@ -31,6 +32,9 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://localhost:{PORT}")
+# Unique ID for this Compass process instance.  Scopes artifact folders and
+# lets agents detect stale callbacks from a previous Compass instance.
+COMPASS_INSTANCE_ID = os.environ.get("COMPASS_INSTANCE_ID") or str(uuid.uuid4())[:8]
 ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", os.environ.get("A2A_READ_TIMEOUT_SECONDS", "15")))
 DOWNSTREAM_TASK_TIMEOUT = int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "3600"))
 UI_PATH = os.path.join(os.path.dirname(__file__), "ui", "index.html")
@@ -46,7 +50,11 @@ OFFICE_CONTAINER_WORKSPACE_PATH = "/app/workspace"
 
 registry = RegistryClient()
 task_store = TaskStore()
-artifact_store = ArtifactStore()
+# Each Compass instance stores artifacts under its own subdirectory so that
+# a restart with a reset task counter cannot mix files with previous runs.
+_artifact_root_base = os.environ.get("ARTIFACT_ROOT", "/app/artifacts")
+_artifact_root_instance = os.path.join(_artifact_root_base, f"compass-{COMPASS_INSTANCE_ID}")
+artifact_store = ArtifactStore(root=_artifact_root_instance)
 launcher = get_launcher()
 policy = PolicyEvaluator()
 
@@ -92,8 +100,9 @@ def audit_log(event, **kwargs):
 def _runtime_config_summary():
     summary = {
         "service": "compass",
+        "instanceId": COMPASS_INSTANCE_ID,
         "registryUrl": os.environ.get("REGISTRY_URL", "http://registry:9000"),
-        "artifactRoot": os.environ.get("ARTIFACT_ROOT", "/app/artifacts"),
+        "artifactRoot": artifact_store.root,
         "dynamicAgentNetwork": os.environ.get("DYNAMIC_AGENT_NETWORK", "constellation-network"),
         "ackTimeoutSeconds": ACK_TIMEOUT,
         "taskTimeoutSeconds": DOWNSTREAM_TASK_TIMEOUT,
@@ -162,8 +171,30 @@ def _path_within_base(path, base):
     return common == os.path.realpath(base)
 
 
+def _is_containerized():
+    """Return True when running inside a container (Docker Desktop, Rancher Desktop, etc.).
+
+    Checks two independent signals so that both Docker (/.dockerenv) and
+    Rancher Desktop in containerd mode (/proc/1/cgroup) are covered.
+    """
+    # Docker Desktop and Rancher Desktop (dockerd mode) create this marker file.
+    if os.path.exists("/.dockerenv"):
+        return True
+    # Fallback for Rancher Desktop containerd mode and other OCI runtimes.
+    try:
+        with open("/proc/1/cgroup", "rb") as fh:
+            content = fh.read(4096).decode("ascii", errors="replace")
+            if any(m in content for m in ("docker", "containerd", "/lxc/")):
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def _can_defer_office_path_existence_check(path):
-    return bool(os.environ.get("ARTIFACT_ROOT_HOST", "").strip()) and os.path.isabs(path)
+    # Inside a container, host-side paths (e.g. /Users/…) are not accessible,
+    # so skip the existence check and defer validation to the Office agent.
+    return _is_containerized() and os.path.isabs(path)
 
 
 def _validate_office_target_paths(target_paths):
@@ -215,16 +246,12 @@ def _route_input_required(task, question, router_context):
 
 
 def _resolve_workspace_host_path(workspace_path):
-    artifact_root_host = os.environ.get("ARTIFACT_ROOT_HOST", "").strip()
-    artifact_root_container = os.environ.get("ARTIFACT_ROOT", "/app/artifacts").strip() or "/app/artifacts"
-    if not artifact_root_host or not workspace_path:
+    if not workspace_path:
         return ""
-    workspace_real = os.path.realpath(workspace_path)
-    artifact_real = os.path.realpath(artifact_root_container)
-    if not _path_within_base(workspace_real, artifact_real):
+    try:
+        return launcher.resolve_host_path(workspace_path)
+    except Exception:
         return ""
-    relative = os.path.relpath(workspace_real, artifact_real)
-    return os.path.realpath(os.path.join(artifact_root_host, relative))
 
 
 def _build_office_dispatch_context(task):
@@ -401,6 +428,18 @@ def _resume_compass_routed_task(prior_task, message):
 
 
 def _route_with_runtime(user_text, requested_capability=""):
+    # If caller explicitly provides a capability, honor it directly without LLM routing.
+    # The LLM sometimes overrides to team-lead even when capability is already known.
+    if requested_capability and requested_capability != "null":
+        return {
+            "workflow": [requested_capability],
+            "summary": _truncate_text(user_text or requested_capability, 220),
+            "task_type": "dev",
+            "office_subtype": None,
+            "target_paths": [],
+            "needs_input": False,
+            "input_question": None,
+        }
     system = build_system_prompt(prompts.ROUTE_SYSTEM, "compass", include_workflow=True)
     prompt = prompts.ROUTE_TEMPLATE.format(
         user_text=user_text or "",
@@ -687,6 +726,9 @@ def _extract_team_lead_completeness_issues(task, artifacts):
         return issues
     if summary_meta.get("reviewPassed") is False:
         issues.append("Team Lead review did not pass.")
+    if summary_meta.get("reviewPassed") is True:
+        # Team Lead reviewed and approved — trust the review, no further workspace checks needed
+        return issues
 
     team_lead_stage = _read_workspace_json(task.workspace_path, "team-lead/stage-summary.json")
     team_lead_plan = _read_workspace_json(task.workspace_path, "team-lead/plan.json")
@@ -981,7 +1023,7 @@ def _build_step_message(task, original_message, task_id, capability, step_index,
     metadata.update({
         "requestedCapability": capability,
         "orchestratorTaskId": task_id,
-        "orchestratorCallbackUrl": f"{ADVERTISED_URL.rstrip('/')}/tasks/{task_id}/callbacks",
+        "orchestratorCallbackUrl": f"{ADVERTISED_URL.rstrip('/')}/tasks/{task_id}/callbacks?instance={COMPASS_INSTANCE_ID}",
         "compassUrl": ADVERTISED_URL.rstrip("/"),
         "sharedWorkspacePath": task.workspace_path,
         "workflowStep": step_index,
@@ -1675,11 +1717,18 @@ class CompassHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        qs = parse_qs(urlparse(self.path).query)
 
         # POST /tasks/{task_id}/progress — agents report major workflow steps
         m = re.fullmatch(r"/tasks/([^/]+)/progress", path)
         if m:
             task_id = m.group(1)
+            # Reject progress reports from stale Compass instances
+            caller_instance = (qs.get("instance") or [None])[0]
+            if caller_instance and caller_instance != COMPASS_INSTANCE_ID:
+                print(f"[compass] Stale progress ignored (task={task_id}, instance={caller_instance})")
+                self._send_json(410, {"error": "stale_instance"})
+                return
             body = self._read_body()
             step = (body.get("step") or "").strip()
             agent_id = body.get("agentId", "")
@@ -1703,6 +1752,12 @@ class CompassHandler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/tasks/([^/]+)/callbacks", path)
         if m:
             task_id = m.group(1)
+            # Reject callbacks from stale Compass instances
+            caller_instance = (qs.get("instance") or [None])[0]
+            if caller_instance and caller_instance != COMPASS_INSTANCE_ID:
+                print(f"[compass] Stale callback ignored (task={task_id}, instance={caller_instance})")
+                self._send_json(410, {"error": "stale_instance"})
+                return
             body = self._read_body()
             downstream_task_id = (body.get("downstreamTaskId") or body.get("taskId") or "").strip()
             if not downstream_task_id:
@@ -1760,6 +1815,7 @@ class CompassHandler(BaseHTTPRequestHandler):
 
 def main():
     print(f"[compass] Compass agent starting on {HOST}:{PORT}")
+    print(f"[compass] Instance ID: {COMPASS_INSTANCE_ID}")
     print(f"[compass] Artifact root: {artifact_store.root}")
     server = ThreadingHTTPServer((HOST, PORT), CompassHandler)
     # Increase listen backlog so concurrent callback + test requests are not refused.
