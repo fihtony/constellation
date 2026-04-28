@@ -214,6 +214,22 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                         "question_for_user": None,
                         "summary": "Implement CSTL-2 from Figma.",
                     }
+                if len(analyze_calls) == 3:
+                    return {
+                        "task_type": "feature",
+                        "platform": "web",
+                        "needs_jira_fetch": True,
+                        "jira_ticket_key": "CSTL-2",
+                        "needs_design_context": True,
+                        "design_url": "https://www.figma.com/design/abc123/English-Study-Hub",
+                        "design_type": "figma",
+                        "design_page_name": "Practice Quiz",
+                        "target_repo_url": "",
+                        "missing_info": [],
+                        "question_for_user": None,
+                        "summary": "Implement CSTL-2 from Figma.",
+                    }
+
                 self.assertIn("python 3.12", additional_info.lower())
                 self.assertIn("flask", additional_info.lower())
                 return {
@@ -229,6 +245,59 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                     "missing_info": [],
                     "question_for_user": None,
                     "summary": "Implement CSTL-2 from Figma in Flask.",
+                }
+
+            def fake_plan_information_gathering(_user_text: str, analysis: dict, workflow_ctx, **_kwargs) -> dict:
+                if analysis.get("needs_jira_fetch") and workflow_ctx.jira_info is None:
+                    return {
+                        "pending_tasks": ["Fetch Jira ticket CSTL-2"],
+                        "actions": [
+                            {
+                                "action": "fetch_agent_context",
+                                "capability": "jira.ticket.fetch",
+                                "message": "Fetch ticket CSTL-2",
+                                "reason": "Need the Jira ticket details before planning.",
+                            }
+                        ],
+                    }
+
+                if analysis.get("needs_design_context") and workflow_ctx.design_info is None:
+                    capability, message_text, page_name = team_lead_app._build_design_fetch_request(analysis)
+                    pending_text = f"Fetch design from {analysis['design_url']}"
+                    if page_name:
+                        pending_text += f" page: {page_name}"
+                    return {
+                        "pending_tasks": [pending_text],
+                        "actions": [
+                            {
+                                "action": "fetch_agent_context",
+                                "capability": capability,
+                                "message": message_text,
+                                "reason": "Need the design specification before planning.",
+                            }
+                        ],
+                    }
+
+                if analysis.get("question_for_user"):
+                    return {
+                        "pending_tasks": [f"Ask user: {analysis['question_for_user']}"],
+                        "actions": [
+                            {
+                                "action": "ask_user",
+                                "question": analysis["question_for_user"],
+                                "reason": "Need user clarification before planning.",
+                            }
+                        ],
+                    }
+
+                return {
+                    "pending_tasks": ["Proceed to implementation planning"],
+                    "actions": [
+                        {
+                            "action": "proceed_to_plan",
+                            "reason": "All critical implementation context is available.",
+                        }
+                    ],
                 }
 
             def fake_call_sync_agent(capability: str, message_text: str, *_args) -> dict:
@@ -278,6 +347,10 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 team_lead_app,
                 "_call_sync_agent",
                 side_effect=fake_call_sync_agent,
+            ), mock.patch.object(
+                team_lead_app,
+                "_plan_information_gathering",
+                side_effect=fake_plan_information_gathering,
             ), mock.patch.object(team_lead_app, "_create_plan", side_effect=fake_create_plan), mock.patch.object(
                 team_lead_app,
                 "_acquire_dev_agent",
@@ -334,6 +407,178 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             self.assertIn("TASK_STATE_INPUT_REQUIRED", history_states)
             self.assertIn("EXECUTING", history_states)
 
+    def test_team_lead_falls_back_to_user_question_when_fetch_actions_make_no_progress(self):
+        with tempfile.TemporaryDirectory(prefix="team_lead_no_progress_") as workspace:
+            task = team_lead_app.task_store.create()
+            ctx = team_lead_app._TaskContext()
+            ctx.compass_task_id = "compass-task-1"
+            ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
+            ctx.compass_url = "http://compass.local"
+            ctx.shared_workspace_path = workspace
+            ctx.user_text = "Implement CSTL-2."
+            ctx.original_message = {"metadata": {"stopBeforeDevDispatch": True}}
+            ctx.jira_info = {
+                "ticket_key": "CSTL-2",
+                "content": "Existing Jira ticket content.",
+                "request": "Fetch ticket CSTL-2",
+            }
+
+            def fake_analyze(_user_text: str, additional_info: str = "") -> dict:
+                if not additional_info:
+                    return {
+                        "task_type": "feature",
+                        "platform": "web",
+                        "needs_jira_fetch": True,
+                        "jira_ticket_key": "CSTL-2",
+                        "needs_design_context": False,
+                        "missing_info": ["confirmed web tech stack"],
+                        "question_for_user": "Please confirm the web tech stack.",
+                        "summary": "Implement CSTL-2.",
+                    }
+                return {
+                    "task_type": "feature",
+                    "platform": "web",
+                    "needs_jira_fetch": True,
+                    "jira_ticket_key": "CSTL-2",
+                    "needs_design_context": False,
+                    "missing_info": [],
+                    "question_for_user": None,
+                    "summary": "Implement CSTL-2 in Flask.",
+                }
+
+            def fake_plan_information_gathering(_user_text: str, _analysis: dict, _workflow_ctx, **_kwargs) -> dict:
+                return {
+                    "pending_tasks": [
+                        "Refresh Jira ticket CSTL-2",
+                        "Ask user: Please confirm the web tech stack.",
+                    ],
+                    "actions": [
+                        {
+                            "action": "fetch_agent_context",
+                            "capability": "jira.ticket.fetch",
+                            "message": "Fetch ticket CSTL-2",
+                            "reason": "Need the latest Jira ticket content before planning.",
+                        }
+                    ],
+                }
+
+            fake_plan = {
+                "platform": "web",
+                "dev_capability": "web.task.execute",
+                "target_repo_url": "",
+                "dev_instruction": "Implement the requested flow in Flask.",
+                "acceptance_criteria": ["Practice Quiz screen matches the design."],
+                "requires_tests": True,
+                "test_requirements": "Add integration coverage for the Practice Quiz screen.",
+                "screenshot_requirements": None,
+            }
+
+            with mock.patch.object(team_lead_app, "_analyze_task", side_effect=fake_analyze), mock.patch.object(
+                team_lead_app,
+                "_plan_information_gathering",
+                side_effect=fake_plan_information_gathering,
+            ), mock.patch.object(
+                team_lead_app,
+                "_call_sync_agent",
+                side_effect=AssertionError("no fetch action should run when it makes no progress"),
+            ) as sync_mock, mock.patch.object(
+                team_lead_app,
+                "_create_plan",
+                return_value=fake_plan,
+            ), mock.patch.object(team_lead_app, "_notify_compass"), mock.patch.object(
+                team_lead_app,
+                "_report_progress",
+            ), mock.patch.object(
+                team_lead_app,
+                "_generate_summary",
+                return_value="validation checkpoint reached",
+            ):
+                worker = threading.Thread(
+                    target=team_lead_app._run_workflow,
+                    args=(task.task_id, ctx),
+                    daemon=True,
+                )
+                worker.start()
+
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    current = team_lead_app.task_store.get(task.task_id)
+                    if current and current.state == "TASK_STATE_INPUT_REQUIRED":
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail("Team Lead never fell back to TASK_STATE_INPUT_REQUIRED")
+
+                current = team_lead_app.task_store.get(task.task_id)
+                self.assertIsNotNone(current)
+                self.assertIn("tech stack", current.status_message.lower())
+
+                with team_lead_app._INPUT_EVENTS_LOCK:
+                    entry = team_lead_app._INPUT_EVENTS.get(task.task_id)
+                    self.assertIsNotNone(entry)
+                    entry["info"] = "Use Python 3.12 and Flask."
+                    entry["event"].set()
+
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive(), "workflow thread did not finish")
+                sync_mock.assert_not_called()
+
+            current = team_lead_app.task_store.get(task.task_id)
+            self.assertEqual(current.state, "TASK_STATE_COMPLETED")
+            history_states = [entry["state"] for entry in current.history]
+            self.assertIn("TASK_STATE_INPUT_REQUIRED", history_states)
+
+    def test_team_lead_does_not_plan_with_unresolved_missing_info(self):
+        with tempfile.TemporaryDirectory(prefix="team_lead_unresolved_missing_") as workspace:
+            task = team_lead_app.task_store.create()
+            ctx = team_lead_app._TaskContext()
+            ctx.compass_task_id = "compass-task-1"
+            ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
+            ctx.compass_url = "http://compass.local"
+            ctx.shared_workspace_path = workspace
+            ctx.user_text = "Implement CSTL-2."
+            ctx.original_message = {"metadata": {"stopBeforeDevDispatch": True}}
+
+            analysis = {
+                "task_type": "feature",
+                "platform": "web",
+                "needs_jira_fetch": False,
+                "needs_design_context": False,
+                "missing_info": ["Exact Stitch screen ID is still missing"],
+                "question_for_user": None,
+                "summary": "Implement CSTL-2.",
+            }
+
+            with mock.patch.object(team_lead_app, "_analyze_task", return_value=analysis), mock.patch.object(
+                team_lead_app,
+                "_plan_information_gathering",
+                return_value={
+                    "pending_tasks": ["Proceed to implementation planning"],
+                    "actions": [
+                        {
+                            "action": "proceed_to_plan",
+                            "reason": "Planner claims it can proceed.",
+                        }
+                    ],
+                },
+            ), mock.patch.object(
+                team_lead_app,
+                "_create_plan",
+            ) as create_plan_mock, mock.patch.object(team_lead_app, "_notify_compass"), mock.patch.object(
+                team_lead_app,
+                "_report_progress",
+            ), mock.patch.object(
+                team_lead_app,
+                "_generate_summary",
+                return_value="failure summary",
+            ):
+                team_lead_app._run_workflow(task.task_id, ctx)
+
+            create_plan_mock.assert_not_called()
+            current = team_lead_app.task_store.get(task.task_id)
+            self.assertEqual(current.state, "TASK_STATE_FAILED")
+            self.assertEqual(current.status_message, "failure summary")
+
     def test_team_lead_reports_missing_jira_capability_clearly(self):
         with mock.patch.object(
             team_lead_app.agent_directory,
@@ -363,6 +608,58 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                     "/tmp/workspace",
                     "compass-task-1",
                 )
+
+    def test_team_lead_gather_planner_prefers_registered_fetch_over_user_question(self):
+        ctx = team_lead_app._TaskContext()
+        analysis = {
+            "task_type": "feature",
+            "platform": "web",
+            "needs_jira_fetch": True,
+            "jira_ticket_key": "CSTL-2",
+            "needs_design_context": False,
+            "missing_info": ["jira ticket content"],
+            "question_for_user": "Please paste the Jira ticket details.",
+            "summary": "Implement CSTL-2.",
+        }
+
+        runtime_plan = {
+            "pending_tasks": ["Ask user for the Jira ticket details"],
+            "actions": [
+                {
+                    "action": "ask_user",
+                    "question": "Please paste the Jira ticket details.",
+                    "reason": "Need more detail.",
+                },
+                {
+                    "action": "fetch_agent_context",
+                    "capability": "jira.ticket.fetch",
+                    "message": "Fetch ticket CSTL-2",
+                    "reason": "Need the Jira ticket body before planning.",
+                },
+            ],
+            "summary": "Fetch the ticket before asking the user.",
+        }
+
+        with mock.patch.object(
+            team_lead_app.agent_directory,
+            "list_agents",
+            return_value=[
+                {
+                    "agent_id": "jira-agent",
+                    "capabilities": ["jira.ticket.fetch"],
+                    "instances": [{"instance_id": "jira-1", "status": "idle"}],
+                }
+            ],
+        ), mock.patch.object(team_lead_app, "_run_agentic", return_value=json.dumps(runtime_plan)):
+            gather_plan = team_lead_app._plan_information_gathering(
+                "Implement CSTL-2.",
+                analysis,
+                ctx,
+            )
+
+        self.assertEqual(gather_plan["actions"][0]["action"], "fetch_agent_context")
+        self.assertEqual(gather_plan["actions"][0]["capability"], "jira.ticket.fetch")
+        self.assertIn("Ask user", gather_plan["pending_tasks"][0])
 
     def test_team_lead_finds_recovered_boundary_agent_on_next_attempt(self):
         class FakeRegistry:

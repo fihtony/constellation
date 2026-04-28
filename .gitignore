@@ -17,6 +17,7 @@ docs/
 reference/
 certs/
 android/
+tests/data/
 
 # Reports are committed for audit (do not ignore reports/)
 

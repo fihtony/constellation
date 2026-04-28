@@ -21,6 +21,12 @@ This workflow defines the default development lifecycle Team Lead uses to plan, 
 - `Architecture` and `Design` may be skipped only when Team Lead records why the skip is safe.
 - Rework must state what is missing, what evidence is required, and what the next acceptance bar is.
 - Implementation requests must include a Jira ticket URL or key before Team Lead moves past intake.
+- During `GATHERING_INFO`, Team Lead should maintain an explicit pending-task list and iterate:
+	analyze current context → choose the next registered capability to call → fetch context → re-analyze.
+- The gather loop should prefer registered boundary-agent capabilities over user questions.
+	Only after Jira/design/repo context has been exhausted may Team Lead pause for `INPUT_REQUIRED`.
+- Agentic runtime output during the gather loop must stay structured: it may decide the next pending
+	actions, but the Team Lead code remains responsible for executing A2A calls through Registry-discovered capabilities.
 - When a web implementation request includes Jira/design context but no explicit tech stack, Team Lead must pause with `INPUT_REQUIRED` and ask the user to confirm the stack before planning or dispatch.
 - If a design URL is known and the ticket names a page or screen but does not provide a node/screen ID, Team Lead should fetch design context by page or screen name before asking the user for more design detail.
 - After an `INPUT_REQUIRED` resume, Team Lead must continue the same task context and carry the confirmed constraints into the subsequent plan and downstream dispatch metadata.

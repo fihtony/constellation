@@ -71,6 +71,30 @@ class CompassCompletenessTests(unittest.TestCase):
         self.assertIn("Jira transition to 'In Review' is missing.", issues)
         self.assertIn("Jira PR comment is missing.", issues)
 
+    def test_extract_team_lead_completeness_issues_skips_validation_checkpoint(self):
+        with tempfile.TemporaryDirectory(prefix="compass_validation_checkpoint_") as workspace:
+            self._write_json(workspace, "team-lead/stage-summary.json", {
+                "analysis": {"jira_ticket_key": "CSTL-2", "target_repo_url": "https://github.com/example/repo"},
+            })
+            self._write_json(workspace, "team-lead/plan.json", {
+                "target_repo_url": "https://github.com/example/repo",
+            })
+
+            task = SimpleNamespace(workspace_path=workspace)
+            artifacts = [
+                {
+                    "metadata": {
+                        "capability": "team-lead.task.analyze",
+                        "reviewPassed": True,
+                        "validationCheckpoint": True,
+                    }
+                }
+            ]
+
+            issues = compass_app._extract_team_lead_completeness_issues(task, artifacts)
+
+        self.assertEqual(issues, [])
+
 
 if __name__ == "__main__":
     unittest.main()

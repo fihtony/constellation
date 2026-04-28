@@ -55,6 +55,8 @@ ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", "15"))
 TASK_TIMEOUT = int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "3600"))
 INPUT_WAIT_TIMEOUT = int(os.environ.get("INPUT_WAIT_TIMEOUT_SECONDS", "7200"))  # 2 hours
 MAX_REVIEW_CYCLES = int(os.environ.get("MAX_REVIEW_CYCLES", "2"))
+MAX_GATHER_ROUNDS = int(os.environ.get("MAX_GATHER_ROUNDS", "6"))
+MAX_INPUT_ROUNDS = int(os.environ.get("MAX_INPUT_ROUNDS", "2"))
 SYNC_AGENT_TIMEOUT = int(os.environ.get("SYNC_AGENT_TIMEOUT_SECONDS", "120"))
 DEV_AGENT_ACK_TIMEOUT = int(os.environ.get("DEV_AGENT_ACK_TIMEOUT_SECONDS", "300"))
 COMPASS_ACK_TIMEOUT = int(os.environ.get("COMPASS_ACK_TIMEOUT_SECONDS", "300"))
@@ -122,6 +124,20 @@ _TECH_STACK_HINTS = (
     "javascript",
 )
 
+_GATHER_ACTION_FETCH = "fetch_agent_context"
+_GATHER_ACTION_ASK_USER = "ask_user"
+_GATHER_ACTION_STOP = "stop"
+_GATHER_ACTION_PROCEED = "proceed_to_plan"
+_GATHER_FETCH_CAPABILITIES = {
+    "jira.ticket.fetch",
+    "scm.repo.search",
+    "scm.repo.inspect",
+    "figma.page.fetch",
+    "stitch.project.get",
+    "stitch.screen.fetch",
+    "stitch.screen.image",
+}
+
 
 class _TaskContext:
     """Internal per-task state for the Team Lead workflow."""
@@ -145,6 +161,7 @@ class _TaskContext:
         "review_result",
         "review_cycles",
         "phases_log",
+        "pending_tasks",
     )
 
     def __init__(self):
@@ -166,6 +183,7 @@ class _TaskContext:
         self.review_result: dict | None = None
         self.review_cycles: int = 0
         self.phases_log: list[str] = []
+        self.pending_tasks: list[str] = []
 
 
 # ---------------------------------------------------------------------------
@@ -960,6 +978,509 @@ def _inspect_target_repo(
     return {"repo_url": repo_url, "content": content}
 
 
+def _available_capability_snapshot(*, force: bool = False) -> dict:
+    snapshot = {
+        "registryAvailable": True,
+        "capabilities": [],
+    }
+    try:
+        agents = agent_directory.list_agents(force=force)
+    except RegistryUnavailableError as err:
+        snapshot["registryAvailable"] = False
+        snapshot["error"] = str(err)
+        return snapshot
+
+    indexed: dict[str, dict] = {}
+    for agent in agents or []:
+        instances = agent.get("instances") or []
+        idle_instances = sum(1 for instance in instances if instance.get("status") == "idle")
+        for capability in agent.get("capabilities") or []:
+            entry = indexed.setdefault(
+                capability,
+                {
+                    "capability": capability,
+                    "agentIds": [],
+                    "runningInstances": 0,
+                    "idleInstances": 0,
+                },
+            )
+            agent_id = str(agent.get("agent_id") or "").strip()
+            if agent_id and agent_id not in entry["agentIds"]:
+                entry["agentIds"].append(agent_id)
+            entry["runningInstances"] += len(instances)
+            entry["idleInstances"] += idle_instances
+
+    snapshot["capabilities"] = sorted(indexed.values(), key=lambda item: item["capability"])
+    return snapshot
+
+
+def _capability_names(snapshot: dict) -> set[str]:
+    return {
+        str(item.get("capability") or "").strip()
+        for item in (snapshot.get("capabilities") or [])
+        if str(item.get("capability") or "").strip()
+    }
+
+
+def _build_fallback_gather_plan(analysis: dict, ctx: _TaskContext, capability_snapshot: dict) -> dict:
+    available = _capability_names(capability_snapshot)
+    pending_tasks: list[str] = []
+    actions: list[dict] = []
+
+    def _append_fetch(capability: str, pending_text: str, message: str, reason: str) -> None:
+        pending_tasks.append(pending_text)
+        if not capability_snapshot.get("registryAvailable", True):
+            actions.append(
+                {
+                    "action": _GATHER_ACTION_STOP,
+                    "reason": f"Registry is unavailable while resolving required capability '{capability}'.",
+                }
+            )
+            return
+        if capability not in available:
+            actions.append(
+                {
+                    "action": _GATHER_ACTION_STOP,
+                    "reason": (
+                        f"Required capability '{capability}' is unavailable. "
+                        "Team Lead cannot continue information gathering without a registered boundary agent."
+                    ),
+                }
+            )
+            return
+        actions.append(
+            {
+                "action": _GATHER_ACTION_FETCH,
+                "capability": capability,
+                "message": message,
+                "reason": reason,
+            }
+        )
+
+    ticket_key = str(analysis.get("jira_ticket_key") or "").strip()
+    if analysis.get("needs_jira_fetch") and ticket_key and ctx.jira_info is None:
+        _append_fetch(
+            "jira.ticket.fetch",
+            f"Fetch Jira ticket {ticket_key}",
+            f"Fetch ticket {ticket_key}",
+            "Need the Jira ticket details before implementation planning.",
+        )
+
+    if analysis.get("needs_design_context") and analysis.get("design_url") and ctx.design_info is None:
+        capability, message, page_name = _build_design_fetch_request(analysis)
+        pending = f"Fetch design from {analysis.get('design_url')}"
+        if page_name:
+            pending += f" page: {page_name}"
+        _append_fetch(
+            capability,
+            pending,
+            message,
+            "Need the design specification before implementation planning.",
+        )
+
+    repo_url = str(analysis.get("target_repo_url") or "").strip()
+    if repo_url and ctx.repo_info is None:
+        _append_fetch(
+            "scm.repo.inspect",
+            f"Inspect repository {repo_url}",
+            f"Inspect repository {repo_url}",
+            "Need repository context before implementation planning.",
+        )
+
+    if actions:
+        return {
+            "pending_tasks": pending_tasks,
+            "actions": actions,
+            "summary": "Fetch additional boundary context before planning.",
+            "capability_snapshot": capability_snapshot,
+        }
+
+    missing = [str(item).strip() for item in (analysis.get("missing_info") or []) if str(item).strip()]
+    question = str(analysis.get("question_for_user") or "").strip()
+    if missing and question:
+        pending_tasks.append(f"Ask user: {question}")
+        return {
+            "pending_tasks": pending_tasks,
+            "actions": [
+                {
+                    "action": _GATHER_ACTION_ASK_USER,
+                    "question": question,
+                    "reason": "No further boundary fetch can supply the remaining critical information.",
+                }
+            ],
+            "summary": "Need user clarification before planning.",
+            "capability_snapshot": capability_snapshot,
+        }
+
+    return {
+        "pending_tasks": ["Proceed to implementation planning"],
+        "actions": [
+            {
+                "action": _GATHER_ACTION_PROCEED,
+                "reason": "All critical implementation information is available.",
+            }
+        ],
+        "summary": "Ready to create the implementation plan.",
+        "capability_snapshot": capability_snapshot,
+    }
+
+
+def _normalize_gather_plan(raw_plan: dict, fallback_plan: dict, capability_snapshot: dict) -> dict:
+    available = _capability_names(capability_snapshot)
+    pending_tasks = [
+        str(item).strip()
+        for item in (raw_plan.get("pending_tasks") or [])
+        if str(item).strip()
+    ]
+
+    normalized_actions: list[dict] = []
+    for raw_action in raw_plan.get("actions") or []:
+        action = str(raw_action.get("action") or "").strip().lower()
+        if action == _GATHER_ACTION_FETCH:
+            capability = str(raw_action.get("capability") or "").strip()
+            message = str(raw_action.get("message") or "").strip()
+            reason = str(raw_action.get("reason") or "").strip()
+            if capability in _GATHER_FETCH_CAPABILITIES and capability in available and message:
+                normalized_actions.append(
+                    {
+                        "action": _GATHER_ACTION_FETCH,
+                        "capability": capability,
+                        "message": message,
+                        "reason": reason,
+                    }
+                )
+        elif action == _GATHER_ACTION_ASK_USER:
+            question = str(raw_action.get("question") or "").strip()
+            reason = str(raw_action.get("reason") or "").strip()
+            if question:
+                normalized_actions.append(
+                    {
+                        "action": _GATHER_ACTION_ASK_USER,
+                        "question": question,
+                        "reason": reason,
+                    }
+                )
+        elif action == _GATHER_ACTION_STOP:
+            reason = str(raw_action.get("reason") or "").strip()
+            if reason:
+                normalized_actions.append(
+                    {
+                        "action": _GATHER_ACTION_STOP,
+                        "reason": reason,
+                    }
+                )
+        elif action == _GATHER_ACTION_PROCEED:
+            normalized_actions.append(
+                {
+                    "action": _GATHER_ACTION_PROCEED,
+                    "reason": str(raw_action.get("reason") or "").strip(),
+                }
+            )
+
+    if any(item["action"] == _GATHER_ACTION_FETCH for item in normalized_actions):
+        normalized_actions = [item for item in normalized_actions if item["action"] == _GATHER_ACTION_FETCH]
+    elif normalized_actions:
+        normalized_actions = [normalized_actions[0]]
+    else:
+        normalized_actions = list(fallback_plan.get("actions") or [])
+
+    if not pending_tasks:
+        pending_tasks = list(fallback_plan.get("pending_tasks") or [])
+
+    return {
+        "pending_tasks": pending_tasks,
+        "actions": normalized_actions,
+        "summary": str(raw_plan.get("summary") or fallback_plan.get("summary") or "").strip(),
+        "capability_snapshot": capability_snapshot,
+    }
+
+
+def _plan_information_gathering(
+    user_text: str,
+    analysis: dict,
+    ctx: _TaskContext,
+    *,
+    force_refresh: bool = False,
+) -> dict:
+    capability_snapshot = _available_capability_snapshot(force=force_refresh)
+    fallback_plan = _build_fallback_gather_plan(analysis, ctx, capability_snapshot)
+
+    def _trimmed(payload: dict | None) -> str:
+        if not payload:
+            return "null"
+        compact = dict(payload)
+        if compact.get("content"):
+            compact["content"] = str(compact.get("content") or "")[:2000]
+        return json.dumps(compact, ensure_ascii=False, indent=2)
+
+    prompt = prompts.GATHER_TEMPLATE.format(
+        user_text=user_text,
+        current_analysis=json.dumps(analysis or {}, ensure_ascii=False, indent=2),
+        jira_context=_trimmed(ctx.jira_info),
+        design_context=_trimmed(ctx.design_info),
+        repo_context=_trimmed(ctx.repo_info),
+        additional_context=ctx.additional_info or "(none)",
+        available_capabilities=json.dumps(capability_snapshot, ensure_ascii=False, indent=2),
+    )
+    system = build_system_prompt(prompts.GATHER_SYSTEM, "team-lead", include_workflow=True)
+    raw_plan = _parse_json_from_llm(
+        _run_agentic(prompt, f"[{AGENT_ID}] gather", system_prompt=system)
+    )
+    return _normalize_gather_plan(raw_plan, fallback_plan, capability_snapshot)
+
+
+def _save_gather_plan(workspace_path: str, gather_plan: dict) -> None:
+    _save_workspace_file(
+        workspace_path,
+        "team-lead/gather-plan.json",
+        json.dumps(
+            {
+                "pendingTasks": gather_plan.get("pending_tasks") or [],
+                "actions": gather_plan.get("actions") or [],
+                "summary": gather_plan.get("summary") or "",
+                "capabilitySnapshot": gather_plan.get("capability_snapshot") or {},
+                "updatedAt": local_iso_timestamp(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
+
+
+def _suppress_redundant_questions(
+    analysis: dict,
+    ctx: _TaskContext,
+    *,
+    log_fn=None,
+) -> dict:
+    updated = dict(analysis or {})
+    question = str(updated.get("question_for_user") or "")
+
+    if ctx.jira_info and ctx.jira_info.get("content"):
+        jira_keywords = ("jira", "ticket", "url", "browse", "atlassian", "issue", "story", "key")
+        if any(keyword in question.lower() for keyword in jira_keywords):
+            if log_fn:
+                log_fn(f"Suppressing Jira-related question (ticket already fetched): {question}")
+            updated["question_for_user"] = None
+            updated["missing_info"] = [
+                item for item in (updated.get("missing_info") or [])
+                if not any(keyword in str(item).lower() for keyword in jira_keywords)
+            ]
+
+        repo_keywords = ("repo", "repository", "github", "bitbucket", "clone", "git url", "codebase")
+        jira_lower = str(ctx.jira_info.get("content") or "").lower()
+        question = str(updated.get("question_for_user") or "")
+        if any(keyword in question.lower() for keyword in repo_keywords):
+            if any(host in jira_lower for host in ("github.com", "bitbucket")):
+                if log_fn:
+                    log_fn(f"Suppressing repo URL question (URL found in Jira ticket): {question}")
+                updated["question_for_user"] = None
+                updated["missing_info"] = [
+                    item for item in (updated.get("missing_info") or [])
+                    if not any(keyword in str(item).lower() for keyword in repo_keywords)
+                ]
+
+        preference_keywords = ("framework", "prefer", "flask", "fastapi", "react", "vue", "which")
+        question = str(updated.get("question_for_user") or "")
+        if any(keyword in question.lower() for keyword in preference_keywords):
+            for framework in ("flask", "fastapi", "react", "next.js", "vue", "django", "express"):
+                if framework in jira_lower:
+                    if log_fn:
+                        log_fn(f"Suppressing framework question ('{framework}' found in ticket): {question}")
+                    updated["question_for_user"] = None
+                    updated["missing_info"] = [
+                        item for item in (updated.get("missing_info") or [])
+                        if not any(keyword in str(item).lower() for keyword in preference_keywords)
+                    ]
+                    break
+
+    if ctx.design_info and ctx.design_info.get("content"):
+        question = str(updated.get("question_for_user") or "")
+        design_keywords = ("design", "stitch", "figma", "mockup", "wireframe", "screen")
+        if any(keyword in question.lower() for keyword in design_keywords):
+            if log_fn:
+                log_fn(f"Suppressing design-related question (context already fetched): {question}")
+            updated["question_for_user"] = None
+
+    return updated
+
+
+def _build_analysis_context(ctx: _TaskContext) -> str:
+    parts: list[str] = []
+    if ctx.jira_info and ctx.jira_info.get("content"):
+        ticket_key = str(ctx.jira_info.get("ticket_key") or "")
+        heading = f"Jira ticket {ticket_key}:" if ticket_key else "Jira ticket:"
+        parts.append(f"{heading}\n{ctx.jira_info['content']}")
+    if ctx.design_info and ctx.design_info.get("content"):
+        parts.append(f"Design context:\n{ctx.design_info['content']}")
+    if ctx.repo_info and ctx.repo_info.get("content"):
+        parts.append(f"Repository context:\n{ctx.repo_info['content']}")
+    if ctx.additional_info:
+        parts.append(f"Additional information from user:\n{ctx.additional_info}")
+    return "\n\n".join(part for part in parts if part)
+
+
+def _refresh_analysis_with_known_context(
+    user_text: str,
+    ctx: _TaskContext,
+    current_analysis: dict,
+    *,
+    log_fn=None,
+) -> dict:
+    combined_context = _build_analysis_context(ctx)
+    analysis = dict(current_analysis or {})
+    if combined_context:
+        if log_fn:
+            log_fn("Re-analyzing with gathered context")
+        analysis = _analyze_task(user_text, combined_context)
+    analysis = _enrich_analysis_from_context(analysis, ctx.jira_info, ctx.design_info, ctx.additional_info)
+    return _suppress_redundant_questions(analysis, ctx, log_fn=log_fn)
+
+
+def _execute_gather_action(
+    action: dict,
+    analysis: dict,
+    ctx: _TaskContext,
+    *,
+    team_lead_task_id: str,
+    workspace: str,
+    compass_task_id: str,
+    log_fn,
+) -> bool:
+    capability = str(action.get("capability") or "").strip()
+    message_text = str(action.get("message") or "").strip()
+    reason = str(action.get("reason") or message_text or capability).strip()
+    if not capability or capability not in _GATHER_FETCH_CAPABILITIES:
+        return False
+
+    def _is_repeat(existing: dict | None, request_text: str) -> bool:
+        if not existing:
+            return False
+        return str(existing.get("request") or "").strip() == request_text
+
+    if capability == "jira.ticket.fetch":
+        ticket_key = str(analysis.get("jira_ticket_key") or "").strip()
+        request_text = message_text or f"Fetch ticket {ticket_key}"
+        if not ticket_key or _is_repeat(ctx.jira_info, request_text):
+            return False
+        log_fn(f"{reason} ({capability})")
+        jira_task = _call_sync_agent(
+            capability,
+            request_text,
+            team_lead_task_id,
+            workspace,
+            compass_task_id,
+        )
+        content = "\n".join(artifact_text(artifact) for artifact in jira_task.get("artifacts", []))
+        ctx.jira_info = {"ticket_key": ticket_key, "content": content, "request": request_text}
+        _save_workspace_file(
+            workspace,
+            "team-lead/jira-context.json",
+            json.dumps(ctx.jira_info, ensure_ascii=False, indent=2),
+        )
+        log_fn(f"Jira ticket {ticket_key} fetched ({len(content)} chars)")
+        return True
+
+    if capability == "scm.repo.search":
+        request_text = message_text or reason
+        if not request_text or _is_repeat(ctx.repo_info, request_text):
+            return False
+        log_fn(f"{reason} ({capability})")
+        repo_task = _call_sync_agent(
+            capability,
+            request_text,
+            team_lead_task_id,
+            workspace,
+            compass_task_id,
+        )
+        content = "\n".join(artifact_text(artifact) for artifact in repo_task.get("artifacts", []))
+        repo_url = _extract_repo_url(content) or str(analysis.get("target_repo_url") or "").strip()
+        if repo_url and not str(analysis.get("target_repo_url") or "").strip():
+            analysis["target_repo_url"] = repo_url
+        ctx.repo_info = {"repo_url": repo_url, "content": content, "request": request_text}
+        _save_workspace_file(
+            workspace,
+            "team-lead/repo-context.json",
+            json.dumps(ctx.repo_info, ensure_ascii=False, indent=2),
+        )
+        log_fn(
+            f"Repository search context fetched ({len((ctx.repo_info or {}).get('content', ''))} chars)"
+        )
+        return True
+
+    if capability in {"figma.page.fetch", "stitch.project.get", "stitch.screen.fetch", "stitch.screen.image"}:
+        design_url = str(analysis.get("design_url") or "").strip()
+        if not design_url:
+            return False
+        _, fallback_message, page_name = _build_design_fetch_request(analysis)
+        request_text = message_text or fallback_message
+        if _is_repeat(ctx.design_info, request_text):
+            return False
+        log_fn(f"{reason} ({capability})")
+        design_task = _call_sync_agent(
+            capability,
+            request_text,
+            team_lead_task_id,
+            workspace,
+            compass_task_id,
+        )
+        content = "\n".join(artifact_text(artifact) for artifact in design_task.get("artifacts", []))
+        ctx.design_info = {
+            "url": design_url,
+            "type": "stitch" if capability.startswith("stitch.") else "figma",
+            "content": content,
+            "page_name": page_name,
+            "request": request_text,
+        }
+        _save_workspace_file(
+            workspace,
+            "team-lead/design-context.json",
+            json.dumps(ctx.design_info, ensure_ascii=False, indent=2),
+        )
+        log_fn(f"Design context fetched ({len(content)} chars)")
+        return True
+
+    if capability == "scm.repo.inspect":
+        repo_url = str(analysis.get("target_repo_url") or "").strip()
+        request_text = message_text or f"Inspect repository {repo_url}"
+        if not repo_url or _is_repeat(ctx.repo_info, request_text):
+            return False
+        log_fn(f"{reason} ({capability})")
+        repo_info = _inspect_target_repo(
+            team_lead_task_id,
+            repo_url,
+            workspace,
+            compass_task_id,
+        )
+        ctx.repo_info = repo_info or {"repo_url": repo_url, "content": ""}
+        ctx.repo_info["request"] = request_text
+        _save_workspace_file(
+            workspace,
+            "team-lead/repo-context.json",
+            json.dumps(ctx.repo_info, ensure_ascii=False, indent=2),
+        )
+        log_fn(
+            f"Repository context fetched ({len((ctx.repo_info or {}).get('content', ''))} chars)"
+        )
+        return True
+
+    return False
+
+
+def _is_truthy(value) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_stop_before_dev_dispatch(ctx: _TaskContext) -> bool:
+    metadata = ctx.original_message.get("metadata") or {}
+    if _is_truthy(metadata.get("stopBeforeDevDispatch")):
+        return True
+    validation_mode = metadata.get("validationMode") or {}
+    if isinstance(validation_mode, dict) and _is_truthy(validation_mode.get("stopBeforeDevDispatch")):
+        return True
+    return False
+
+
 def _create_plan(
     user_text: str,
     jira_info: dict | None,
@@ -1105,6 +1626,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     "hasPlan": bool(ctx.plan),
                     "reviewCycles": ctx.review_cycles,
                     "reviewPassed": (ctx.review_result or {}).get("passed") if ctx.review_result else None,
+                    "pendingTasks": ctx.pending_tasks,
                     "runtimeConfig": runtime_config,
                     "updatedAt": local_iso_timestamp(),
                 },
@@ -1128,285 +1650,19 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
 
         # ── Phase 2: Gather external info ───────────────────────────────────
         task_store.update_state(team_lead_task_id, "GATHERING_INFO", "Gathering required information…")
+        tech_stack_constraints: dict[str, str] = {}
+        input_rounds = 0
+        needs_reanalysis = False
 
-        if analysis.get("needs_jira_fetch") and analysis.get("jira_ticket_key"):
-            ticket_key = analysis["jira_ticket_key"]
-            log(f"Fetching Jira ticket: {ticket_key}")
-            try:
-                jira_task = _call_sync_agent(
-                    "jira.ticket.fetch",
-                    f"Fetch ticket {ticket_key}",
-                    team_lead_task_id,
-                    workspace,
-                    compass_task_id,
+        for gather_round in range(1, MAX_GATHER_ROUNDS + 1):
+            if needs_reanalysis:
+                analysis = _refresh_analysis_with_known_context(
+                    user_text,
+                    ctx,
+                    analysis,
+                    log_fn=log,
                 )
-                content = "\n".join(
-                    artifact_text(art) for art in jira_task.get("artifacts", [])
-                )
-                ctx.jira_info = {"ticket_key": ticket_key, "content": content}
-                analysis = _enrich_analysis_from_context(analysis, ctx.jira_info, ctx.design_info, ctx.additional_info)
-                ctx.analysis = analysis
-                log(f"Jira ticket {ticket_key} fetched ({len(content)} chars)")
-                # Save Jira info to shared workspace
-                _save_workspace_file(
-                    workspace,
-                    "team-lead/jira-context.json",
-                    json.dumps(ctx.jira_info, ensure_ascii=False, indent=2),
-                )
-            except Exception as err:
-                log(f"Warning: could not fetch Jira ticket {ticket_key}: {err}")
-                ctx.jira_info = {"ticket_key": ticket_key, "content": "", "error": str(err)}
 
-        if analysis.get("needs_design_context") and analysis.get("design_url"):
-            design_url = analysis["design_url"]
-            design_type = analysis.get("design_type") or "figma"
-            capability, design_msg, design_page_name = _build_design_fetch_request(analysis)
-            log(f"Fetching design context ({design_type}): {design_url} page='{design_page_name}'")
-            try:
-                design_task = _call_sync_agent(
-                    capability,
-                    design_msg,
-                    team_lead_task_id,
-                    workspace,
-                    compass_task_id,
-                )
-                content = "\n".join(
-                    artifact_text(art) for art in design_task.get("artifacts", [])
-                )
-                ctx.design_info = {
-                    "url": design_url,
-                    "type": design_type,
-                    "content": content,
-                    "page_name": design_page_name,
-                }
-                log(f"Design context fetched ({len(content)} chars)")
-                # Save design info to shared workspace
-                _save_workspace_file(
-                    workspace,
-                    "team-lead/design-context.json",
-                    json.dumps(ctx.design_info, ensure_ascii=False, indent=2),
-                )
-            except Exception as err:
-                log(f"Warning: could not fetch design from {design_url}: {err}")
-                ctx.design_info = {"url": design_url, "type": design_type, "content": "", "error": str(err)}
-
-        # ── Phase 2b: Re-analyze if Jira/design context was gathered ────────
-        # The initial analysis (Phase 1) ran before ticket/design data was available.
-        # Re-run analysis now so the LLM can clear question_for_user if the ticket
-        # already contains enough implementation detail.
-        gathered_ctx_parts = []
-        if ctx.jira_info and ctx.jira_info.get("content"):
-            gathered_ctx_parts.append(f"Jira ticket {ctx.jira_info['ticket_key']}:\n{ctx.jira_info['content']}")
-        if ctx.design_info and ctx.design_info.get("content"):
-            gathered_ctx_parts.append(f"Design context:\n{ctx.design_info['content']}")
-        if gathered_ctx_parts:
-            gathered_ctx = "\n\n".join(gathered_ctx_parts)
-            combined_additional = (
-                (gathered_ctx + "\n\n" + ctx.additional_info).strip()
-                if ctx.additional_info
-                else gathered_ctx
-            )
-            log("Re-analyzing with gathered context (Jira/design)")
-            analysis = _analyze_task(user_text, combined_additional)
-            analysis = _enrich_analysis_from_context(analysis, ctx.jira_info, ctx.design_info, ctx.additional_info)
-            ctx.analysis = analysis
-
-        # ── Phase 2b2: Fetch design context if re-analysis discovered a URL ──
-        # The initial analysis may not have detected the design URL because it
-        # was only present inside the Jira ticket content (not the user message).
-        if (
-            not ctx.design_info
-            and analysis.get("needs_design_context")
-            and analysis.get("design_url")
-        ):
-            design_url = analysis["design_url"]
-            design_type = analysis.get("design_type") or "figma"
-            capability, design_msg, design_page_name = _build_design_fetch_request(analysis)
-            log(f"Fetching design context discovered in re-analysis ({design_type}): {design_url}")
-            try:
-                design_task = _call_sync_agent(
-                    capability,
-                    design_msg,
-                    team_lead_task_id,
-                    workspace,
-                    compass_task_id,
-                )
-                content = "\n".join(
-                    artifact_text(art) for art in design_task.get("artifacts", [])
-                )
-                ctx.design_info = {
-                    "url": design_url,
-                    "type": design_type,
-                    "content": content,
-                    "page_name": design_page_name,
-                }
-                log(f"Design context fetched ({len(content)} chars)")
-                _save_workspace_file(
-                    workspace,
-                    "team-lead/design-context.json",
-                    json.dumps(ctx.design_info, ensure_ascii=False, indent=2),
-                )
-            except Exception as err:
-                log(f"Warning: could not fetch design from {design_url}: {err}")
-                ctx.design_info = {"url": design_url, "type": design_type, "content": "", "error": str(err)}
-
-        analysis = _enrich_analysis_from_context(analysis, ctx.jira_info, ctx.design_info, ctx.additional_info)
-        ctx.analysis = analysis
-
-        target_repo_url = (analysis.get("target_repo_url") or "").strip()
-        if target_repo_url and not ctx.repo_info:
-            log(f"Inspecting target repository: {target_repo_url}")
-            try:
-                ctx.repo_info = _inspect_target_repo(
-                    team_lead_task_id,
-                    target_repo_url,
-                    workspace,
-                    compass_task_id,
-                )
-                if ctx.repo_info:
-                    log(f"Repository context fetched ({len(ctx.repo_info.get('content', ''))} chars)")
-                    _save_workspace_file(
-                        workspace,
-                        "team-lead/repo-context.json",
-                        json.dumps(ctx.repo_info, ensure_ascii=False, indent=2),
-                    )
-                    repo_additional = (
-                        f"Repository context:\n{ctx.repo_info['content']}\n\n{ctx.additional_info}".strip()
-                        if ctx.additional_info
-                        else f"Repository context:\n{ctx.repo_info['content']}"
-                    )
-                    analysis = _analyze_task(user_text, repo_additional)
-                    analysis = _enrich_analysis_from_context(analysis, ctx.jira_info, ctx.design_info, ctx.additional_info)
-                    ctx.analysis = analysis
-            except Exception as err:
-                log(f"Warning: could not inspect target repository {target_repo_url}: {err}")
-
-        # ── Phase 2c: If Jira content was successfully fetched, suppress any
-        #    question that merely asks for the Jira URL / ticket content —
-        #    we already have it.  Also suppress repo URL questions when the
-        #    Jira ticket already contains a GitHub/Bitbucket URL.
-        if ctx.jira_info and ctx.jira_info.get("content"):
-            question = analysis.get("question_for_user") or ""
-            jira_keywords = ("jira", "ticket", "url", "browse", "atlassian", "issue", "story", "key")
-            if any(kw in question.lower() for kw in jira_keywords):
-                log(f"Suppressing Jira-related question (ticket already fetched): {question}")
-                analysis = dict(analysis)
-                analysis["question_for_user"] = None
-                analysis["missing_info"] = [
-                    m for m in (analysis.get("missing_info") or [])
-                    if not any(kw in m.lower() for kw in jira_keywords)
-                ]
-                ctx.analysis = analysis
-
-            # Suppress repo URL question if the Jira ticket content contains a GitHub URL
-            jira_lower = ctx.jira_info["content"].lower()
-            question = analysis.get("question_for_user") or ""
-            repo_keywords = ("repo", "repository", "github", "bitbucket", "clone", "git url", "codebase")
-            if any(kw in question.lower() for kw in repo_keywords):
-                if any(host in jira_lower for host in ("github.com", "bitbucket")):
-                    log(f"Suppressing repo URL question (URL found in Jira ticket): {question}")
-                    analysis = dict(analysis)
-                    analysis["question_for_user"] = None
-                    analysis["missing_info"] = [
-                        m for m in (analysis.get("missing_info") or [])
-                        if not any(kw in m.lower() for kw in repo_keywords)
-                    ]
-                    ctx.analysis = analysis
-
-        # ── Phase 2d: If design context was fetched, suppress design questions.
-        #    Also suppress "preferred framework" questions when the ticket already
-        #    specifies the tech stack — the LLM should use what was given.
-        if ctx.design_info and ctx.design_info.get("content"):
-            question = analysis.get("question_for_user") or ""
-            design_keywords = ("design", "stitch", "figma", "mockup", "wireframe", "screen")
-            if any(kw in question.lower() for kw in design_keywords):
-                log(f"Suppressing design-related question (context already fetched): {question}")
-                analysis = dict(analysis)
-                analysis["question_for_user"] = None
-                ctx.analysis = analysis
-
-        if ctx.jira_info and ctx.jira_info.get("content"):
-            question = analysis.get("question_for_user") or ""
-            preference_keywords = ("framework", "prefer", "flask", "fastapi", "react", "vue", "which")
-            jira_lower = ctx.jira_info["content"].lower()
-            # If the ticket mentions the framework, suppress the preference question
-            if any(kw in question.lower() for kw in preference_keywords):
-                for fw in ("flask", "fastapi", "react", "next.js", "vue", "django", "express"):
-                    if fw in jira_lower:
-                        log(f"Suppressing framework question ('{fw}' found in ticket): {question}")
-                        analysis = dict(analysis)
-                        analysis["question_for_user"] = None
-                        analysis["missing_info"] = [
-                            m for m in (analysis.get("missing_info") or [])
-                            if not any(kw in m.lower() for kw in preference_keywords)
-                        ]
-                        ctx.analysis = analysis
-                        break
-
-        tech_stack_constraints = _extract_tech_stack_constraints(
-            user_text,
-            json.dumps(ctx.jira_info or {}, ensure_ascii=False),
-            ctx.additional_info,
-        )
-        if tech_stack_constraints:
-            log(
-                "Detected tech stack constraints: "
-                + ", ".join(f"{key}={value}" for key, value in tech_stack_constraints.items())
-            )
-        analysis = _apply_tech_stack_confirmation_policy(analysis, tech_stack_constraints, user_text)
-        ctx.analysis = analysis
-
-        # ── Phase 3: Check for missing info (up to 2 INPUT_REQUIRED rounds) ─
-        for _input_round in range(2):
-            missing = analysis.get("missing_info") or []
-            question = analysis.get("question_for_user")
-            if not (missing and question):
-                break
-
-            log(f"Missing critical info — asking user: {question}")
-            task_store.update_state(team_lead_task_id, "TASK_STATE_INPUT_REQUIRED", question)
-
-            # Register resume event
-            input_event = threading.Event()
-            with _INPUT_EVENTS_LOCK:
-                _INPUT_EVENTS[team_lead_task_id] = {"event": input_event, "info": None}
-
-            # Notify Compass — user must reply with additional info
-            _notify_compass(
-                callback_url,
-                team_lead_task_id,
-                "TASK_STATE_INPUT_REQUIRED",
-                prompts.INPUT_REQUIRED_PREAMBLE + question,
-            )
-
-            # Block until user provides info or timeout
-            if not input_event.wait(timeout=INPUT_WAIT_TIMEOUT):
-                task_store.update_state(
-                    team_lead_task_id,
-                    "TASK_STATE_FAILED",
-                    "Timed out waiting for user input.",
-                )
-                _notify_compass(
-                    callback_url,
-                    team_lead_task_id,
-                    "TASK_STATE_FAILED",
-                    "Timed out waiting for user input.",
-                )
-                return
-
-            with _INPUT_EVENTS_LOCK:
-                entry = _INPUT_EVENTS.pop(team_lead_task_id, {})
-                new_info = entry.get("info") or ""
-
-            ctx.additional_info = (
-                (ctx.additional_info + "\n" + new_info).strip() if ctx.additional_info else new_info
-            )
-            log(f"User provided additional info: {new_info[:120]}")
-
-            # Re-analyze with the new information
-            task_store.update_state(team_lead_task_id, "ANALYZING", "Re-analyzing with additional information…")
-            log("Re-analyzing with updated context")
-            analysis = _analyze_task(user_text, ctx.additional_info)
             tech_stack_constraints = _extract_tech_stack_constraints(
                 user_text,
                 json.dumps(ctx.jira_info or {}, ensure_ascii=False),
@@ -1420,7 +1676,133 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             analysis = _apply_tech_stack_confirmation_policy(analysis, tech_stack_constraints, user_text)
             ctx.analysis = analysis
 
+            gather_plan = _plan_information_gathering(
+                user_text,
+                analysis,
+                ctx,
+                force_refresh=(gather_round > 1),
+            )
+            ctx.pending_tasks = list(gather_plan.get("pending_tasks") or [])
+            _save_gather_plan(workspace, gather_plan)
+            log(
+                f"Gather round {gather_round} pending tasks: "
+                + (", ".join(ctx.pending_tasks) if ctx.pending_tasks else "none")
+            )
+
+            actions = list(gather_plan.get("actions") or [])
+            if not actions:
+                break
+
+            fetch_actions = [
+                action for action in actions if action.get("action") == _GATHER_ACTION_FETCH
+            ]
+            if fetch_actions:
+                round_progress = False
+                for action in fetch_actions:
+                    round_progress = _execute_gather_action(
+                        action,
+                        analysis,
+                        ctx,
+                        team_lead_task_id=team_lead_task_id,
+                        workspace=workspace,
+                        compass_task_id=compass_task_id,
+                        log_fn=log,
+                    ) or round_progress
+                if round_progress:
+                    needs_reanalysis = True
+                    continue
+
+                fallback_plan = _build_fallback_gather_plan(
+                    analysis,
+                    ctx,
+                    _available_capability_snapshot(force=True),
+                )
+                fallback_actions = [
+                    item for item in (fallback_plan.get("actions") or [])
+                    if item.get("action") != _GATHER_ACTION_FETCH
+                ]
+                if not fallback_actions:
+                    break
+
+                ctx.pending_tasks = list(fallback_plan.get("pending_tasks") or [])
+                _save_gather_plan(workspace, fallback_plan)
+                log("No new boundary context fetched — falling back to clarification/proceed decision")
+                actions = fallback_actions
+
+            next_action = actions[0]
+            action_type = next_action.get("action")
+            if action_type == _GATHER_ACTION_ASK_USER:
+                if input_rounds >= MAX_INPUT_ROUNDS:
+                    raise RuntimeError(
+                        f"Team Lead exceeded the maximum clarification rounds ({MAX_INPUT_ROUNDS})."
+                    )
+                input_rounds += 1
+                question = str(next_action.get("question") or analysis.get("question_for_user") or "").strip()
+                if not question:
+                    raise RuntimeError("Gather plan requested user clarification without a question.")
+
+                log(f"Missing critical info — asking user: {question}")
+                task_store.update_state(team_lead_task_id, "TASK_STATE_INPUT_REQUIRED", question)
+
+                input_event = threading.Event()
+                with _INPUT_EVENTS_LOCK:
+                    _INPUT_EVENTS[team_lead_task_id] = {"event": input_event, "info": None}
+
+                _notify_compass(
+                    callback_url,
+                    team_lead_task_id,
+                    "TASK_STATE_INPUT_REQUIRED",
+                    prompts.INPUT_REQUIRED_PREAMBLE + question,
+                )
+
+                if not input_event.wait(timeout=INPUT_WAIT_TIMEOUT):
+                    task_store.update_state(
+                        team_lead_task_id,
+                        "TASK_STATE_FAILED",
+                        "Timed out waiting for user input.",
+                    )
+                    _notify_compass(
+                        callback_url,
+                        team_lead_task_id,
+                        "TASK_STATE_FAILED",
+                        "Timed out waiting for user input.",
+                    )
+                    return
+
+                with _INPUT_EVENTS_LOCK:
+                    entry = _INPUT_EVENTS.pop(team_lead_task_id, {})
+                    new_info = entry.get("info") or ""
+
+                ctx.additional_info = (
+                    (ctx.additional_info + "\n" + new_info).strip() if ctx.additional_info else new_info
+                )
+                log(f"User provided additional info: {new_info[:120]}")
+                task_store.update_state(team_lead_task_id, "ANALYZING", "Re-analyzing with additional information…")
+                needs_reanalysis = True
+                continue
+
+            if action_type == _GATHER_ACTION_STOP:
+                raise RuntimeError(str(next_action.get("reason") or "Team Lead stopped during information gathering."))
+
+            ctx.pending_tasks = []
+            break
+        else:
+            raise RuntimeError(
+                f"Team Lead exceeded the maximum information-gathering rounds ({MAX_GATHER_ROUNDS})."
+            )
+
         # ── Phase 4: Plan ────────────────────────────────────────────────────
+        unresolved_missing = [
+            str(item).strip()
+            for item in (analysis.get("missing_info") or [])
+            if str(item).strip()
+        ]
+        if unresolved_missing:
+            raise RuntimeError(
+                "Cannot create implementation plan with unresolved missing information: "
+                + "; ".join(unresolved_missing[:3])
+            )
+
         task_store.update_state(team_lead_task_id, "PLANNING", "Creating implementation plan…")
         log("Creating implementation plan")
 
@@ -1464,6 +1846,72 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             f"Dispatching to {dev_capability}…",
         )
         log(f"Looking up dev agent for capability: {dev_capability}")
+
+        if _should_stop_before_dev_dispatch(ctx):
+            checkpoint = {
+                "taskId": team_lead_task_id,
+                "agentId": AGENT_ID,
+                "readyToDispatchCapability": dev_capability,
+                "techStackConstraints": tech_stack_constraints,
+                "pendingTasks": ctx.pending_tasks,
+                "plan": {
+                    "platform": plan.get("platform"),
+                    "targetRepoUrl": plan.get("target_repo_url") or target_repo_url or "",
+                    "acceptanceCriteria": plan.get("acceptance_criteria") or [],
+                },
+                "updatedAt": local_iso_timestamp(),
+            }
+            _save_workspace_file(
+                workspace,
+                "team-lead/pre-dispatch-checkpoint.json",
+                json.dumps(checkpoint, ensure_ascii=False, indent=2),
+            )
+            checkpoint_text = (
+                f"Validation checkpoint reached. Team Lead gathered the required context, "
+                f"created the implementation plan, and is ready to dispatch {dev_capability}. "
+                "The workflow intentionally stopped before launching the development agent."
+            )
+            checkpoint_artifact = build_text_artifact(
+                "team-lead-pre-dispatch-checkpoint",
+                checkpoint_text,
+                metadata={
+                    "agentId": AGENT_ID,
+                    "capability": "team-lead.task.analyze",
+                    "orchestratorTaskId": compass_task_id,
+                    "teamLeadTaskId": team_lead_task_id,
+                    "validationCheckpoint": True,
+                    "readyToDispatchCapability": dev_capability,
+                },
+            )
+            log("Validation checkpoint reached — stopping before dev dispatch")
+            summary = _generate_summary(user_text, ctx.phases_log, "COMPLETED", [checkpoint_artifact])
+            _save_workspace_file(workspace, "team-lead/final-summary.md", summary)
+            final_summary_artifact = build_text_artifact(
+                "team-lead-summary",
+                summary,
+                metadata={
+                    "agentId": AGENT_ID,
+                    "capability": "team-lead.task.analyze",
+                    "orchestratorTaskId": compass_task_id,
+                    "teamLeadTaskId": team_lead_task_id,
+                    "platform": (ctx.plan or {}).get("platform", "unknown"),
+                    "reviewCycles": ctx.review_cycles,
+                    "reviewPassed": True,
+                    "validationCheckpoint": True,
+                    "readyToDispatchCapability": dev_capability,
+                },
+            )
+            all_artifacts = [final_summary_artifact, checkpoint_artifact]
+            task_store.update_state(team_lead_task_id, "TASK_STATE_COMPLETED", summary)
+            audit_log(
+                "TASK_COMPLETED",
+                task_id=team_lead_task_id,
+                compass_task_id=compass_task_id,
+                validation_checkpoint=True,
+            )
+            exit_handler.register(team_lead_task_id)
+            _notify_compass(callback_url, team_lead_task_id, "TASK_STATE_COMPLETED", summary, all_artifacts)
+            return
 
         agent_def, instance, dev_service_url = _acquire_dev_agent(
             dev_capability,

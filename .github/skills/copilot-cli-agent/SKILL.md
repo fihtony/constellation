@@ -171,6 +171,30 @@ ok, response = run_copilot(
 | Structured JSON output | | ✅ (more reliable) |
 | Cost-sensitive high-volume | | ✅ |
 
+## Orchestration Pattern For Constellation Agents
+
+When using Copilot CLI or Claude Code inside a Constellation agent, prefer this pattern:
+
+1. Ask the runtime for a **structured JSON decision** such as pending tasks, next actions, or plan fields.
+2. Keep the actual boundary operations in code: Registry capability lookup, A2A request construction, polling, retries, and artifact writing.
+3. Treat runtime output as orchestration guidance, not as permission to bypass registered agents.
+
+Example use case for Team Lead:
+
+```python
+result = get_runtime().run(
+    prompt="Plan the next information-gathering actions and return JSON.",
+    system_prompt="Use only the available capabilities listed in context.",
+)
+gather_plan = result["structured_output"]
+
+for action in gather_plan.get("actions", []):
+    if action.get("action") == "fetch_agent_context":
+        _call_sync_agent(action["capability"], action["message"], ...)
+```
+
+This keeps Copilot CLI valuable for multi-step reasoning while preserving Constellation's audit, capability-discovery, and credential boundaries.
+
 ---
 
 ## Environment Variables

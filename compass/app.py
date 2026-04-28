@@ -323,6 +323,8 @@ def _extract_team_lead_completeness_issues(task, artifacts):
             summary_artifact = artifact
             break
     summary_meta = (summary_artifact or {}).get("metadata") or {}
+    if summary_meta.get("validationCheckpoint"):
+        return issues
     if summary_meta.get("reviewPassed") is False:
         issues.append("Team Lead review did not pass.")
 
