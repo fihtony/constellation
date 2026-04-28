@@ -1968,6 +1968,31 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             for item in (analysis.get("missing_info") or [])
             if str(item).strip()
         ]
+        # Filter out missing_info entries for context already gathered during the
+        # gather loop.  The LLM may still report e.g. "need Stitch layer tree" even
+        # though we successfully fetched the Stitch screen — treat any design/repo/
+        # jira item as resolved if we have the corresponding ctx payload.
+        if ctx.design_info and ctx.design_info.get("content"):
+            _design_kws = {"stitch", "figma", "design", "screen", "layer", "asset",
+                           "png", "svg", "export", "thumbnail", "permission"}
+            unresolved_missing = [
+                item for item in unresolved_missing
+                if not any(kw in item.lower() for kw in _design_kws)
+            ]
+        if ctx.jira_info and ctx.jira_info.get("content"):
+            _jira_kws = {"jira", "ticket", "acceptance criteria", "acceptancecriteria",
+                         "acceptance_criteria"}
+            unresolved_missing = [
+                item for item in unresolved_missing
+                if not any(kw in item.lower() for kw in _jira_kws)
+            ]
+        if ctx.repo_info and ctx.repo_info.get("content"):
+            _repo_kws = {"repo", "repository", "branch", "stack", "github",
+                         "bitbucket", "language", "manifest"}
+            unresolved_missing = [
+                item for item in unresolved_missing
+                if not any(kw in item.lower() for kw in _repo_kws)
+            ]
         if unresolved_missing and not _should_stop_before_dev_dispatch(ctx):
             raise RuntimeError(
                 "Cannot create implementation plan with unresolved missing information: "

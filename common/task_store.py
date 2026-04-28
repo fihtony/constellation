@@ -39,6 +39,7 @@ class Task:
         "jira_ticket_id",
         "design_url",
         "design_type",
+        "router_context",
     )
 
     def __init__(self, context_id=None):
@@ -62,6 +63,7 @@ class Task:
         self.jira_ticket_id = ""
         self.design_url = ""
         self.design_type = ""
+        self.router_context = {}
 
     def to_dict(self):
         return {
@@ -84,6 +86,7 @@ class Task:
             "jiraTicketId": self.jira_ticket_id,
             "designUrl": self.design_url,
             "designType": self.design_type,
+            "routerContext": self.router_context,
         }
 
 

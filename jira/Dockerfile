@@ -20,4 +20,9 @@ LABEL constellation.agent_id="tracker-agent"
 LABEL constellation.agent_name="Tracker Agent"
 LABEL constellation.agent_role="fundamental"
 
+# Run as non-root user.
+RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 CMD ["python3", "jira/app.py"]

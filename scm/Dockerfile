@@ -24,4 +24,9 @@ LABEL constellation.agent_id="scm-agent"
 LABEL constellation.agent_name="SCM Agent"
 LABEL constellation.agent_role="integration"
 
+# Run as non-root user.
+RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 CMD ["python3", "scm/app.py"]

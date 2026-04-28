@@ -37,7 +37,7 @@ working together to complete complex engineering tasks.
 | **SCM Agent** | `scm/` | Integrates with Git SCM (Bitbucket/GitHub). Repo inspection, branch, PR operations. Runs on port 8020. |
 | **Android Agent** | `android/` | On-demand execution agent. Launched per-task by Team Lead via Docker socket. |
 | **UI Design Agent** | `ui-design/` | Design context agent. Fetches design data from Figma (REST API) and Google Stitch (MCP). Runs on port 8040. |
-| **Office Agent (planned)** | `office/` | On-demand document agent for local office files. Summarizes, analyzes, and organizes user-authorized folders. Planned port 8060. |
+| **Office Agent** | `office/` | On-demand document agent for local office files. Summarizes, analyzes, and organizes user-authorized folders. Runs on port 8060. |
 | **Common Library** | `common/` | Shared modules: registry client, launcher, runtime adapters, rules loader, artifact store, task store, etc. |
 
 ### MCP Tool Integrations (replacing standalone agents)
@@ -62,7 +62,7 @@ User
 ```
 
 **Design Rationale**:
-- Compass Agent routes development tasks to Team Lead (`team-lead.task.analyze`). When Office Agent is enabled, Compass may run one bounded runtime classification step for office-document requests and route them directly to Office Agent.
+- Compass Agent uses the shared agentic runtime for all user-facing routing work: task classification, clarification handling, and final user summaries. It routes office/document tasks directly to Office Agent and development tasks to Team Lead.
 - Team Lead Agent is the intelligence layer responsible for: task analysis, info gathering (Jira, design), planning, dev agent dispatch, code review, and result summarization.
 - Office Agent is a per-task execution agent for user-authorized local files. It may summarize, analyze, or reorganize documents, but only within explicitly mounted paths and with output mode chosen by the user.
 - Team Lead handles INPUT_REQUIRED by pausing its workflow and waiting for user input forwarded by Compass. No new Team Lead instance is created for resume — the SAME instance resumes.
@@ -508,7 +508,7 @@ REGISTRY_URL=http://registry:9000
 # OPENAI_BASE_URL=
 OPENAI_MODEL=gpt-5-mini
 OPENAI_API_KEY=
-ALLOW_MOCK_FALLBACK=1
+ALLOW_MOCK_FALLBACK=0  # Set to 1 only for offline/test environments
 
 # Runtime
 HOST=0.0.0.0
@@ -577,6 +577,12 @@ LABEL constellation.agent_id="my-agent"
 LABEL constellation.agent_name="My Agent"
 LABEL constellation.agent_role="execution"
 
+# Run as non-root user (REQUIRED for security — OWASP A05).
+# Do this after all installs and file copies so permissions are set correctly.
+RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 CMD ["python3", "my-agent/app.py"]
 ```
 
@@ -584,6 +590,10 @@ CMD ["python3", "my-agent/app.py"]
 - `constellation.agent_id` — matches `agentId` in `registry-config.json`
 - `constellation.agent_name` — human-readable display name
 - `constellation.agent_role` — one of: `fundamental`, `execution`, `integration`
+
+**Non-root user requirement:**
+Every agent container MUST run as a non-root user (`appuser`, UID 1000). The `USER appuser` instruction must come after all `RUN`/`COPY` steps so that `/app` ownership is set correctly.
+The Compass container needs `group_add: [docker]` in `docker-compose.yml` to allow the non-root user to access the Docker socket.
 
 ### 16. docker-compose.yml Entry
 
@@ -692,8 +702,8 @@ Before submitting a new agent, verify:
 | SCM prompts | `scm/prompts.py` | ALL LLM prompt strings for SCM Agent |
 | UI Design prompts | `ui-design/prompts.py` | ALL LLM prompt strings for UI Design Agent |
 | UI Design Agent | `ui-design/` | Figma REST API + Google Stitch MCP | port 8040 |
-| Office Agent (planned) | `office/` | Local office document execution agent | port 8060 |
-| Office prompts (planned) | `office/prompts.py` | ALL LLM prompt strings for Office Agent |
+| Office Agent | `office/` | Local office document execution agent | port 8060 |
+| Office prompts | `office/prompts.py` | ALL LLM prompt strings for Office Agent |
 | UI Design client (Figma) | `ui-design/figma_client.py` | Agent-local, NOT in `common/` |
 | UI Design client (Stitch) | `ui-design/stitch_client.py` | Agent-local, NOT in `common/` |
 | Compass Agent (control plane) | `compass/app.py` |
@@ -723,7 +733,7 @@ Before submitting a new agent, verify:
 - Runtime Git commands must use the isolated helper environment from `common.env_utils.build_isolated_git_env()` so agent subprocesses never read host Git credential helpers, host keychains, or user-level `~/.gitconfig`.
 - `copilot-cli` runtime authentication is isolated as well: only `COPILOT_GITHUB_TOKEN` is supported for agent execution. Do not rely on `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth`, or system keychain fallbacks inside agents.
 - Launchers and integration tests must sanitize inherited host GitHub credentials before spawning subprocesses. Test scripts may use only file-backed values from `tests/.env` for GitHub auth.
-- `compass` and `registry` remain control-plane services; do not add runtime-adapter reasoning loops there unless the architecture changes. The only approved Compass exception is a single bounded classification call for Office routing, without multi-step planning or external-system reasoning.
+- `registry` remains a non-agentic control-plane service. `compass` is now an agentic control-plane service for routing, clarification interpretation, and user-facing final summaries, but it must still avoid unbounded external-system reasoning loops and must not bypass registered boundary agents.
 - Task workspaces should keep `command-log.txt` and `stage-summary.json` under each agent subdirectory for auditability; runtime details belong inside `stage-summary.json` as `runtimeConfig`, not in a separate `runtime-config.json` file.
 - In execution task workspaces, generated source files should live in the real cloned repository directory; `web-agent/` and similar agent subdirectories are for metadata and audit artifacts only.
 - Web Agent branches should use deterministic naming based on Jira key plus orchestrator task id when available; only docs/tests-only changes may use `chore/...` naming without a ticket key.

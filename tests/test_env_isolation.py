@@ -96,6 +96,38 @@ class TestDockerLauncherEnvIsolation(unittest.TestCase):
             self.assertIn("COPILOT_GITHUB_TOKEN=github_pat_from_common", env_list)
             self.assertNotIn("COPILOT_GITHUB_TOKEN=github_pat_host", env_list)
 
+    def test_launcher_appends_extra_binds(self):
+        agent_definition = {
+            "agent_id": "office-agent",
+            "display_name": "Office Agent",
+            "execution_mode": "per-task",
+            "launch_spec": {
+                "image": "constellation-office-agent:latest",
+                "port": 8060,
+                "mountDockerSocket": False,
+                "startupDelaySeconds": 0,
+                "extraBinds": [
+                    "/Users/test/Documents:/app/userdata:ro",
+                    "/tmp/workspace:/app/workspace:rw",
+                ],
+            },
+        }
+        requests: list[tuple[str, str, dict | None]] = []
+
+        def fake_request(method, path, payload=None):
+            requests.append((method, path, payload))
+            return {}
+
+        with patch.dict(os.environ, {}, clear=True):
+            launcher = Launcher()
+            with patch.object(launcher, "_request", side_effect=fake_request), \
+                 patch("common.launcher.time.sleep", return_value=None):
+                launcher.launch_instance(agent_definition, "task-123")
+
+        binds = requests[0][2]["HostConfig"]["Binds"]
+        self.assertIn("/Users/test/Documents:/app/userdata:ro", binds)
+        self.assertIn("/tmp/workspace:/app/workspace:rw", binds)
+
 
 class TestRancherLauncherEnvIsolation(unittest.TestCase):
     def test_launcher_marks_child_env_trusted_and_uses_file_backed_token(self):
@@ -141,6 +173,38 @@ class TestRancherLauncherEnvIsolation(unittest.TestCase):
             self.assertIn("CONSTELLATION_TRUSTED_ENV=1", env_list)
             self.assertIn("COPILOT_GITHUB_TOKEN=github_pat_from_common", env_list)
             self.assertNotIn("COPILOT_GITHUB_TOKEN=github_pat_host", env_list)
+
+    def test_launcher_appends_extra_binds(self):
+        agent_definition = {
+            "agent_id": "office-agent",
+            "display_name": "Office Agent",
+            "execution_mode": "per-task",
+            "launch_spec": {
+                "image": "constellation-office-agent:latest",
+                "port": 8060,
+                "mountDockerSocket": False,
+                "startupDelaySeconds": 0,
+                "extraBinds": [
+                    "/Users/test/Documents:/app/userdata:ro",
+                    "/tmp/workspace:/app/workspace:rw",
+                ],
+            },
+        }
+        requests: list[tuple[str, str, dict | None]] = []
+
+        def fake_request(method, path, payload=None):
+            requests.append((method, path, payload))
+            return {}
+
+        with patch.dict(os.environ, {}, clear=True):
+            launcher = RancherLauncher()
+            with patch.object(launcher, "_request", side_effect=fake_request), \
+                 patch("common.launcher_rancher.time.sleep", return_value=None):
+                launcher.launch_instance(agent_definition, "task-123")
+
+        binds = requests[0][2]["HostConfig"]["Binds"]
+        self.assertIn("/Users/test/Documents:/app/userdata:ro", binds)
+        self.assertIn("/tmp/workspace:/app/workspace:rw", binds)
 
 
 if __name__ == "__main__":

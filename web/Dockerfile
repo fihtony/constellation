@@ -25,4 +25,9 @@ LABEL constellation.agent_id="web-agent"
 LABEL constellation.agent_name="Web Agent"
 LABEL constellation.agent_role="execution"
 
+# Run as non-root user.
+RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 CMD ["python3", "web/app.py"]

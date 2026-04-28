@@ -182,6 +182,10 @@ class RancherLauncher:
         # Rancher exposes its socket at the same path used by this launcher.
         if launch_spec.get("mountDockerSocket", True) and os.path.exists(self.socket_path):
             binds.append(f"{self.socket_path}:{self.socket_path}")
+        for bind in launch_spec.get("extraBinds", []) or []:
+            bind_text = str(bind or "").strip()
+            if bind_text:
+                binds.append(bind_text)
         if binds:
             payload["HostConfig"]["Binds"] = binds
 

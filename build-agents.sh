@@ -46,6 +46,15 @@ build_team_lead() {
     echo "    Done: constellation-team-lead-agent:latest"
 }
 
+build_office() {
+    echo "==> Building office agent image: constellation-office-agent:latest"
+    docker build \
+        -t constellation-office-agent:latest \
+        -f "${SCRIPT_DIR}/office/Dockerfile" \
+        "${SCRIPT_DIR}"
+    echo "    Done: constellation-office-agent:latest"
+}
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 TARGET="${1:-all}"
 
@@ -59,9 +68,17 @@ case "$TARGET" in
     team-lead)
         build_team_lead
         ;;
+    office)
+        build_office
+        ;;
     all)
         build_web
         build_team_lead
+        if [[ -f "${SCRIPT_DIR}/office/Dockerfile" ]]; then
+            build_office
+        else
+            echo "==> Skipping office agent image: ${SCRIPT_DIR}/office/Dockerfile not found"
+        fi
         if [[ -f "${SCRIPT_DIR}/android/Dockerfile" ]]; then
             build_android
         else
@@ -70,7 +87,7 @@ case "$TARGET" in
         ;;
     *)
         echo "Unknown target: $TARGET"
-        echo "Usage: $0 [android|web|team-lead|all]"
+        echo "Usage: $0 [android|web|team-lead|office|all]"
         exit 1
         ;;
 esac

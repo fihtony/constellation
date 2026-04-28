@@ -23,4 +23,9 @@ LABEL constellation.agent_id="team-lead-agent"
 LABEL constellation.agent_name="Team Lead Agent"
 LABEL constellation.agent_role="fundamental"
 
+# Run as non-root user.
+RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 CMD ["python3", "team-lead/app.py"]

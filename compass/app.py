@@ -18,9 +18,13 @@ from common.env_utils import load_dotenv
 from common.launcher import get_launcher
 from common.message_utils import artifact_text, deep_copy_json, extract_text
 from common.policy import PolicyEvaluator
+from common.per_task_exit import PerTaskExitHandler
 from common.registry_client import RegistryClient
+from common.rules_loader import build_system_prompt
+from common.runtime.adapter import get_runtime, summarize_runtime_configuration
 from common.task_store import TaskStore
 from common.time_utils import local_file_timestamp, local_iso_timestamp
+from compass import prompts
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -31,6 +35,14 @@ ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", os.environ.get("A2A_
 DOWNSTREAM_TASK_TIMEOUT = int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "3600"))
 UI_PATH = os.path.join(os.path.dirname(__file__), "ui", "index.html")
 COMPASS_COMPLETENESS_MAX_REVISIONS = int(os.environ.get("COMPASS_COMPLETENESS_MAX_REVISIONS", "2"))
+COMPASS_CHILD_ACK_TIMEOUT = int(os.environ.get("COMPASS_CHILD_ACK_TIMEOUT_SECONDS", "300"))
+OFFICE_ALLOWED_BASE_PATHS = [
+    os.path.realpath(path.strip())
+    for path in os.environ.get("OFFICE_ALLOWED_BASE_PATHS", "").split(":")
+    if path.strip()
+]
+OFFICE_CONTAINER_INPUT_PATH = "/app/userdata"
+OFFICE_CONTAINER_WORKSPACE_PATH = "/app/workspace"
 
 registry = RegistryClient()
 task_store = TaskStore()
@@ -78,7 +90,7 @@ def audit_log(event, **kwargs):
 
 
 def _runtime_config_summary():
-    return {
+    summary = {
         "service": "compass",
         "registryUrl": os.environ.get("REGISTRY_URL", "http://registry:9000"),
         "artifactRoot": os.environ.get("ARTIFACT_ROOT", "/app/artifacts"),
@@ -86,6 +98,347 @@ def _runtime_config_summary():
         "ackTimeoutSeconds": ACK_TIMEOUT,
         "taskTimeoutSeconds": DOWNSTREAM_TASK_TIMEOUT,
     }
+    summary["runtimeConfig"] = summarize_runtime_configuration()
+    return summary
+
+
+def _parse_json_from_runtime(text):
+    text = (text or "").strip()
+    if not text:
+        return {}
+    if text.startswith("```"):
+        lines = text.splitlines()
+        start = 1
+        end = len(lines)
+        while end > start and lines[end - 1].strip() in ("```", ""):
+            end -= 1
+        text = "\n".join(lines[start:end]).strip()
+    try:
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else {}
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        payload = json.loads(match.group())
+        return payload if isinstance(payload, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _run_agentic(prompt, actor, *, system_prompt=None, context=None, timeout=120, max_tokens=2048):
+    result = get_runtime().run(
+        prompt=prompt,
+        context=context,
+        system_prompt=system_prompt,
+        timeout=timeout,
+        max_tokens=max_tokens,
+    )
+    for warning in result.get("warnings") or []:
+        print(f"[compass] Runtime warning ({actor}): {warning}")
+    return result.get("raw_response") or result.get("summary") or ""
+
+
+def _normalize_workflow(items):
+    workflow = []
+    for item in items or []:
+        value = str(item or "").strip()
+        if value:
+            workflow.append(value)
+    return _dedupe(workflow)
+
+
+def _is_office_capability(capability):
+    return str(capability or "").startswith("office.")
+
+
+def _path_within_base(path, base):
+    try:
+        common = os.path.commonpath([os.path.realpath(path), os.path.realpath(base)])
+    except ValueError:
+        return False
+    return common == os.path.realpath(base)
+
+
+def _validate_office_target_paths(target_paths):
+    normalized = []
+    for raw_path in target_paths or []:
+        path = str(raw_path or "").strip()
+        if not path:
+            continue
+        if not os.path.isabs(path):
+            return [], f"Path must be absolute: {path}"
+        real_path = os.path.realpath(path)
+        if not os.path.exists(real_path):
+            return [], f"Path does not exist: {path}"
+        if OFFICE_ALLOWED_BASE_PATHS and not any(
+            _path_within_base(real_path, base) for base in OFFICE_ALLOWED_BASE_PATHS
+        ):
+            return [], f"Path is outside OFFICE_ALLOWED_BASE_PATHS: {path}"
+        normalized.append(real_path)
+    return _dedupe(normalized), ""
+
+
+def _build_output_target_question(paths):
+    joined = "\n".join(f"- {path}" for path in paths)
+    return (
+        "Choose where the Office task should write its output:\n"
+        "[A] workspace only (recommended, source stays read-only)\n"
+        "[B] modify the original location directly (requires write permission)\n\n"
+        f"Target path(s):\n{joined}"
+    )
+
+
+def _build_write_permission_question(paths):
+    joined = "\n".join(f"- {path}" for path in paths)
+    return (
+        "This Office task will modify the original location directly. Approve write access?\n"
+        "Reply yes to continue or no to stop.\n\n"
+        f"Target path(s):\n{joined}"
+    )
+
+
+def _route_input_required(task, question, router_context):
+    task.router_context = dict(router_context or {})
+    task_store.update_state(task.task_id, "TASK_STATE_INPUT_REQUIRED", question)
+    task_store.add_progress_step(task.task_id, question, agent_id="compass-agent")
+    return task.to_dict()
+
+
+def _resolve_workspace_host_path(workspace_path):
+    artifact_root_host = os.environ.get("ARTIFACT_ROOT_HOST", "").strip()
+    artifact_root_container = os.environ.get("ARTIFACT_ROOT", "/app/artifacts").strip() or "/app/artifacts"
+    if not artifact_root_host or not workspace_path:
+        return ""
+    workspace_real = os.path.realpath(workspace_path)
+    artifact_real = os.path.realpath(artifact_root_container)
+    if not _path_within_base(workspace_real, artifact_real):
+        return ""
+    relative = os.path.relpath(workspace_real, artifact_real)
+    return os.path.realpath(os.path.join(artifact_root_host, relative))
+
+
+def _build_office_dispatch_context(task):
+    router_context = dict(getattr(task, "router_context", {}) or {})
+    target_paths = [os.path.realpath(path) for path in router_context.get("targetPaths") or []]
+    if not target_paths:
+        raise ValueError("Office routing requires at least one target path.")
+
+    mount_roots = [path if os.path.isdir(path) else os.path.dirname(path) for path in target_paths]
+    mount_root = os.path.commonpath(mount_roots)
+    read_mode = "rw" if router_context.get("outputMode") == "inplace" else "ro"
+    workspace_host_path = _resolve_workspace_host_path(task.workspace_path)
+    mounted_targets = []
+    for host_path in target_paths:
+        relative = os.path.relpath(host_path, mount_root)
+        mounted_targets.append(os.path.join(OFFICE_CONTAINER_INPUT_PATH, relative))
+
+    extra_binds = [f"{mount_root}:{OFFICE_CONTAINER_INPUT_PATH}:{read_mode}"]
+    if workspace_host_path:
+        extra_binds.append(f"{workspace_host_path}:{OFFICE_CONTAINER_WORKSPACE_PATH}:rw")
+
+    router_context["dispatch"] = {
+        "mountRootHostPath": mount_root,
+        "mountedTargetPaths": mounted_targets,
+        "workspaceHostPath": workspace_host_path,
+        "extraBinds": extra_binds,
+        "readMode": read_mode,
+    }
+    task.router_context = router_context
+    return router_context
+
+
+def _interpret_office_reply(task, user_reply):
+    router_context = dict(getattr(task, "router_context", {}) or {})
+    prompt = prompts.OFFICE_REPLY_TEMPLATE.format(
+        original_request=extract_text(task.original_message or {}),
+        awaiting_step=router_context.get("awaitingStep") or "",
+        current_question=task.status_message or "",
+        office_context=json.dumps(router_context, ensure_ascii=False, indent=2),
+        user_reply=user_reply or "",
+    )
+    system = build_system_prompt(prompts.OFFICE_REPLY_SYSTEM, "compass")
+    response = _run_agentic(prompt, "office-reply", system_prompt=system)
+    data = _parse_json_from_runtime(response)
+    return {
+        "action": str(data.get("action") or "unclear").strip().lower() or "unclear",
+        "clarification_question": str(data.get("clarification_question") or "").strip() or None,
+    }
+
+
+def _start_task_worker(task, message, workflow):
+    task.pending_workflow = list(workflow)
+    task.router_context = dict(getattr(task, "router_context", {}) or {})
+    task_store.update_state(task.task_id, "ROUTING", f"Planned workflow: {', '.join(workflow)}")
+    task_store.add_progress_step(
+        task.task_id,
+        f"Planned workflow: {', '.join(workflow)}",
+        agent_id="compass-agent",
+    )
+    worker = threading.Thread(
+        target=_run_workflow,
+        args=(task.task_id, deep_copy_json(message), list(workflow)),
+        daemon=True,
+    )
+    worker.start()
+    return task.to_dict()
+
+
+def _maybe_prepare_office_route(task, workflow, route_decision):
+    if not workflow or not _is_office_capability(workflow[0]):
+        return None
+
+    validated_paths, error_message = _validate_office_target_paths(route_decision.get("target_paths") or [])
+    if not validated_paths:
+        question = route_decision.get("input_question") or error_message or "Please provide the absolute path for the Office task."
+        return _route_input_required(
+            task,
+            question,
+            {
+                "kind": "office",
+                "awaitingStep": "clarify_path",
+                "requestedCapability": workflow[0],
+            },
+        )
+
+    return _route_input_required(
+        task,
+        _build_output_target_question(validated_paths),
+        {
+            "kind": "office",
+            "awaitingStep": "output_mode",
+            "requestedCapability": workflow[0],
+            "officeSubtype": route_decision.get("office_subtype"),
+            "targetPaths": validated_paths,
+        },
+    )
+
+
+def _resume_compass_routed_task(prior_task, message):
+    router_context = dict(getattr(prior_task, "router_context", {}) or {})
+    if not router_context or prior_task.downstream_task_id:
+        return None
+
+    user_reply = extract_text(message)
+    awaiting_step = router_context.get("awaitingStep") or ""
+
+    if awaiting_step == "clarify_path":
+        original_text = extract_text(prior_task.original_message or {})
+        combined_text = (original_text + "\n\n" + user_reply).strip() if original_text else user_reply
+        combined_message = deep_copy_json(prior_task.original_message or message)
+        combined_message["parts"] = [{"text": combined_text}]
+        prior_task.original_message = deep_copy_json(combined_message)
+        route_decision = _route_with_runtime(combined_text, requested_capability=router_context.get("requestedCapability") or "")
+        workflow = route_decision.get("workflow") or [router_context.get("requestedCapability") or "team-lead.task.analyze"]
+        prior_task.summary = _truncate_text(route_decision.get("summary") or combined_text, 180)
+        if route_decision.get("needs_input") and not _is_office_capability(workflow[0]):
+            return _route_input_required(
+                prior_task,
+                route_decision.get("input_question") or "Please clarify the request.",
+                {
+                    "kind": "general",
+                    "awaitingStep": "clarify_path",
+                    "requestedCapability": workflow[0],
+                },
+            )
+        office_response = _maybe_prepare_office_route(prior_task, workflow, route_decision)
+        if office_response is not None:
+            return office_response
+        return _start_task_worker(prior_task, combined_message, workflow)
+
+    if awaiting_step == "output_mode":
+        decision = _interpret_office_reply(prior_task, user_reply)
+        if decision["action"] == "workspace":
+            router_context["outputMode"] = "workspace"
+            prior_task.router_context = router_context
+            _build_office_dispatch_context(prior_task)
+            return _start_task_worker(prior_task, prior_task.original_message or message, prior_task.pending_workflow or [router_context.get("requestedCapability")])
+        if decision["action"] == "inplace":
+            router_context["outputMode"] = "inplace"
+            router_context["awaitingStep"] = "confirm_write"
+            return _route_input_required(
+                prior_task,
+                _build_write_permission_question(router_context.get("targetPaths") or []),
+                router_context,
+            )
+        return _route_input_required(
+            prior_task,
+            decision["clarification_question"] or "Please choose workspace or in-place output.",
+            router_context,
+        )
+
+    if awaiting_step == "confirm_write":
+        decision = _interpret_office_reply(prior_task, user_reply)
+        if decision["action"] == "approve":
+            router_context["outputMode"] = "inplace"
+            prior_task.router_context = router_context
+            _build_office_dispatch_context(prior_task)
+            return _start_task_worker(prior_task, prior_task.original_message or message, prior_task.pending_workflow or [router_context.get("requestedCapability")])
+        if decision["action"] == "deny":
+            prior_task.router_context = router_context
+            task_store.update_state(
+                prior_task.task_id,
+                "TASK_STATE_FAILED",
+                "Office task requires write permission for in-place output, and the request was denied.",
+            )
+            return prior_task.to_dict()
+        return _route_input_required(
+            prior_task,
+            decision["clarification_question"] or "Please reply yes to approve write access or no to stop.",
+            router_context,
+        )
+
+    return None
+
+
+def _route_with_runtime(user_text, requested_capability=""):
+    system = build_system_prompt(prompts.ROUTE_SYSTEM, "compass", include_workflow=True)
+    prompt = prompts.ROUTE_TEMPLATE.format(
+        user_text=user_text or "",
+        requested_capability=requested_capability or "null",
+    )
+    response = _run_agentic(prompt, "route", system_prompt=system)
+    data = _parse_json_from_runtime(response)
+    workflow = _normalize_workflow(data.get("workflow") or [])
+    if requested_capability and not workflow:
+        workflow = [requested_capability]
+    if not workflow:
+        workflow = ["team-lead.task.analyze"]
+    data["workflow"] = workflow
+    data["summary"] = _truncate_text(data.get("summary") or user_text, 220)
+    data["task_type"] = str(data.get("task_type") or "dev").strip().lower() or "dev"
+    data["office_subtype"] = str(data.get("office_subtype") or "").strip().lower() or None
+    data["target_paths"] = [
+        str(path).strip() for path in (data.get("target_paths") or []) if str(path).strip()
+    ]
+    data["needs_input"] = bool(data.get("needs_input"))
+    data["input_question"] = str(data.get("input_question") or "").strip() or None
+    return data
+
+
+def _summarize_for_user(task, state, status_message, artifacts, workflow):
+    user_text = extract_text(task.original_message or {})
+    artifact_lines = []
+    for artifact in artifacts or []:
+        name = artifact.get("name") or "artifact"
+        text = artifact_text(artifact) or str(artifact.get("text") or "")
+        text = _truncate_text(text, 240)
+        if text:
+            artifact_lines.append(f"- {name}: {text}")
+    prompt = prompts.FINAL_SUMMARY_TEMPLATE.format(
+        user_text=user_text or "",
+        workflow=", ".join(workflow or []),
+        state=state or "",
+        status_message=status_message or "",
+        artifacts_summary="\n".join(artifact_lines) or "(none)",
+    )
+    system = build_system_prompt(prompts.FINAL_SUMMARY_SYSTEM, "compass")
+    response = _run_agentic(prompt, "final-summary", system_prompt=system)
+    data = _parse_json_from_runtime(response)
+    summary = str(data.get("summary") or "").strip()
+    return summary or status_message
 
 
 def _create_shared_workspace(task_id):
@@ -532,9 +885,8 @@ def _dedupe(items):
 
 
 def _infer_capability_workflow(user_text):
-    # All tasks are routed through Team Lead, which handles analysis,
-    # Jira/design context gathering, dev agent dispatch, and code review.
-    return ["team-lead.task.analyze"]
+    decision = _route_with_runtime(user_text)
+    return decision.get("workflow") or ["team-lead.task.analyze"]
 
 
 def _wait_for_instance(agent_id, container_name, timeout_seconds=20):
@@ -628,7 +980,22 @@ def _build_step_message(task, original_message, task_id, capability, step_index,
         "workflowStep": step_index,
         "workflowTotalSteps": total_steps,
         "upstreamArtifacts": upstream_artifacts,
+        "exitRule": PerTaskExitHandler.build(
+            rule_type="wait_for_parent_ack",
+            ack_timeout_seconds=COMPASS_CHILD_ACK_TIMEOUT,
+        ),
     })
+    router_context = dict(getattr(task, "router_context", {}) or {})
+    dispatch = router_context.get("dispatch") if isinstance(router_context.get("dispatch"), dict) else {}
+    if _is_office_capability(capability) and dispatch:
+        metadata.update({
+            "officeTargetPaths": list(dispatch.get("mountedTargetPaths") or []),
+            "officeHostTargetPaths": list(router_context.get("targetPaths") or []),
+            "officeOutputMode": router_context.get("outputMode") or "workspace",
+            "officeInputRoot": OFFICE_CONTAINER_INPUT_PATH,
+            "officeWorkspacePath": OFFICE_CONTAINER_WORKSPACE_PATH if dispatch.get("workspaceHostPath") else task.workspace_path,
+            "officeSubtype": router_context.get("officeSubtype") or "",
+        })
     message["metadata"] = metadata
     return message
 
@@ -799,7 +1166,14 @@ def _dispatch_step(task, original_message, capability, step_index, total_steps, 
         return {"terminal": True}
 
     agent, instance = _find_idle_agent_and_instance(agents)
-    candidate = agents[0]
+    candidate = deep_copy_json(agents[0])
+    if _is_office_capability(capability) and getattr(task, "router_context", {}):
+        dispatch = (task.router_context or {}).get("dispatch") or {}
+        if dispatch:
+            launch_spec = dict(candidate.get("launch_spec") or {})
+            existing_binds = list(launch_spec.get("extraBinds") or [])
+            launch_spec["extraBinds"] = existing_binds + list(dispatch.get("extraBinds") or [])
+            candidate["launch_spec"] = launch_spec
 
     if _should_launch_fresh_instance(candidate):
         agent, instance = candidate, None
@@ -1045,6 +1419,8 @@ def _run_workflow(task_id, message, workflow):
             task_store.update_state(task.task_id, final_state, final_message)
             return task.to_dict()
 
+    final_artifacts = upstream_artifacts[-8:] if upstream_artifacts else []
+    final_message = _summarize_for_user(task, final_state, final_message, final_artifacts, workflow)
     task_store.update_state(task.task_id, final_state, final_message)
     audit_log("TASK_COMPLETED", task_id=task.task_id, final_state=final_state)
     return task.to_dict()
@@ -1054,6 +1430,7 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
     task = task_store.create()
     task.workspace_path = _create_shared_workspace(task.task_id)
     task.original_message = deep_copy_json(message)
+    task.router_context = {}
     user_text = extract_text(message)
     task.summary = _truncate_text(user_text, 180)
     ticket_match = TICKET_RE.search(user_text or "")
@@ -1061,11 +1438,15 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
     design_url, design_type = _extract_design_reference(user_text)
     task.design_url = design_url
     task.design_type = design_type
-    workflow = (
-        forced_workflow
-        or ([requested_capability] if requested_capability else _infer_capability_workflow(user_text))
-    )
+    route_decision = None
+    if forced_workflow:
+        workflow = list(forced_workflow)
+    else:
+        route_decision = _route_with_runtime(user_text, requested_capability=requested_capability or "")
+        workflow = route_decision.get("workflow") or ([requested_capability] if requested_capability else ["team-lead.task.analyze"])
     task.pending_workflow = list(workflow)
+    if route_decision and route_decision.get("summary"):
+        task.summary = _truncate_text(route_decision.get("summary"), 180)
     audit_log(
         "TASK_CREATED",
         task_id=task.task_id,
@@ -1084,7 +1465,6 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
             "runtimeConfig": _runtime_config_summary(),
         },
     )
-    task_store.update_state(task.task_id, "ROUTING", f"Planned workflow: {', '.join(workflow)}")
     task_store.add_progress_step(
         task.task_id,
         "Task created and queued in Compass.",
@@ -1095,13 +1475,23 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
         f"Created shared workspace: {task.workspace_path}",
         agent_id="compass-agent",
     )
-    worker = threading.Thread(
-        target=_run_workflow,
-        args=(task.task_id, deep_copy_json(message), list(workflow)),
-        daemon=True,
-    )
-    worker.start()
-    return task.to_dict()
+
+    if route_decision and route_decision.get("needs_input"):
+        return _route_input_required(
+            task,
+            route_decision.get("input_question") or "Please clarify the request.",
+            {
+                "kind": route_decision.get("task_type") or "general",
+                "awaitingStep": "clarify_path",
+                "requestedCapability": workflow[0] if workflow else requested_capability,
+            },
+        )
+
+    office_response = _maybe_prepare_office_route(task, workflow, route_decision or {})
+    if office_response is not None:
+        return office_response
+
+    return _start_task_worker(task, message, workflow)
 
 
 def _resume_input_required_task(body: dict, message: dict) -> dict | None:
@@ -1112,6 +1502,10 @@ def _resume_input_required_task(body: dict, message: dict) -> dict | None:
     prior_task = task_store.get(context_id)
     if not prior_task or prior_task.state != "TASK_STATE_INPUT_REQUIRED":
         return None
+
+    routed_task = _resume_compass_routed_task(prior_task, message)
+    if routed_task is not None:
+        return routed_task
 
     tl_task_id = prior_task.downstream_task_id or ""
     tl_service_url = prior_task.downstream_service_url or ""

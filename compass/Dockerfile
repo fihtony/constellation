@@ -16,4 +16,9 @@ COPY compass/      /app/compass/
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
+# Run as non-root user. Docker socket access is granted at runtime via group_add in docker-compose.
+RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 CMD ["python3", "compass/app.py"]
