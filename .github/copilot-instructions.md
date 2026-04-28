@@ -37,6 +37,7 @@ working together to complete complex engineering tasks.
 | **SCM Agent** | `scm/` | Integrates with Git SCM (Bitbucket/GitHub). Repo inspection, branch, PR operations. Runs on port 8020. |
 | **Android Agent** | `android/` | On-demand execution agent. Launched per-task by Team Lead via Docker socket. |
 | **UI Design Agent** | `ui-design/` | Design context agent. Fetches design data from Figma (REST API) and Google Stitch (MCP). Runs on port 8040. |
+| **Office Agent (planned)** | `office/` | On-demand document agent for local office files. Summarizes, analyzes, and organizes user-authorized folders. Planned port 8060. |
 | **Common Library** | `common/` | Shared modules: registry client, launcher, runtime adapters, rules loader, artifact store, task store, etc. |
 
 ### MCP Tool Integrations (replacing standalone agents)
@@ -51,17 +52,19 @@ The system uses MCP (Model Context Protocol) servers instead of dedicated agents
 ```
 User
   └─► Compass Agent (control plane, thin router, UI)
-         └─► Team Lead Agent (intelligence layer — analysis, planning, coordination, review)
-                ├─► Jira Agent (A2A: jira.ticket.fetch, jira.comment.add, …)
-                ├─► UI Design Agent (A2A: figma.page.fetch, stitch.screen.fetch, …)
-                ├─► Android Agent (per-task container: android.task.execute)
-                ├─► iOS Agent (per-task container, future)
-                └─► Web Agent (per-task container, future)
+    ├─► Office Agent (per-task container: office.document.summarize / office.data.analyze / office.folder.organize)
+    └─► Team Lead Agent (intelligence layer — analysis, planning, coordination, review)
+      ├─► Jira Agent (A2A: jira.ticket.fetch, jira.comment.add, …)
+      ├─► UI Design Agent (A2A: figma.page.fetch, stitch.screen.fetch, …)
+      ├─► Android Agent (per-task container: android.task.execute)
+      ├─► iOS Agent (per-task container, future)
+      └─► Web Agent (per-task container, future)
 ```
 
 **Design Rationale**:
-- Compass Agent routes ALL user tasks to Team Lead (`team-lead.task.analyze`). It does NOT infer workflow or call Jira/SCM/design agents directly.
+- Compass Agent routes development tasks to Team Lead (`team-lead.task.analyze`). When Office Agent is enabled, Compass may run one bounded runtime classification step for office-document requests and route them directly to Office Agent.
 - Team Lead Agent is the intelligence layer responsible for: task analysis, info gathering (Jira, design), planning, dev agent dispatch, code review, and result summarization.
+- Office Agent is a per-task execution agent for user-authorized local files. It may summarize, analyze, or reorganize documents, but only within explicitly mounted paths and with output mode chosen by the user.
 - Team Lead handles INPUT_REQUIRED by pausing its workflow and waiting for user input forwarded by Compass. No new Team Lead instance is created for resume — the SAME instance resumes.
 - Dev agents (android, ios, web) are launched per-task by Team Lead via Docker socket + Registry + Launcher.
 
@@ -632,6 +635,7 @@ Skill IDs follow the pattern: `<domain>.<resource>.<action>`
 | `android` | `android.task.execute`, `android.build.run` |
 | `ios` | `ios.task.execute` |
 | `middleware` | `middleware.task.execute` |
+| `office` | `office.document.summarize`, `office.data.analyze`, `office.folder.organize` |
 | `team-lead` | `team-lead.task.analyze`, `team-lead.workflow.plan` |
 | `review` | `review.code.check`, `review.qa.validate` |
 
@@ -688,6 +692,8 @@ Before submitting a new agent, verify:
 | SCM prompts | `scm/prompts.py` | ALL LLM prompt strings for SCM Agent |
 | UI Design prompts | `ui-design/prompts.py` | ALL LLM prompt strings for UI Design Agent |
 | UI Design Agent | `ui-design/` | Figma REST API + Google Stitch MCP | port 8040 |
+| Office Agent (planned) | `office/` | Local office document execution agent | port 8060 |
+| Office prompts (planned) | `office/prompts.py` | ALL LLM prompt strings for Office Agent |
 | UI Design client (Figma) | `ui-design/figma_client.py` | Agent-local, NOT in `common/` |
 | UI Design client (Stitch) | `ui-design/stitch_client.py` | Agent-local, NOT in `common/` |
 | Compass Agent (control plane) | `compass/app.py` |
@@ -712,12 +718,12 @@ Before submitting a new agent, verify:
 
 ## Shared Runtime Notes
 
-- LLM-enabled agents (`team-lead`, `web`, `jira`, `scm`, `ui-design`) should load shared defaults from `common/.env` first, then apply their local `.env` overrides.
+- LLM-enabled agents (`team-lead`, `web`, `jira`, `scm`, `ui-design`, `office`) should load shared defaults from `common/.env` first, then apply their local `.env` overrides.
 - Protected GitHub/SCM credential variables (`GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `SCM_TOKEN`, `SCM_USERNAME`, `SCM_PASSWORD`, `TEST_GITHUB_TOKEN`) are file-backed by default. Ambient host values must be ignored unless a launcher or test has already loaded its own `.env` and explicitly marks the child process with `CONSTELLATION_TRUSTED_ENV=1`.
 - Runtime Git commands must use the isolated helper environment from `common.env_utils.build_isolated_git_env()` so agent subprocesses never read host Git credential helpers, host keychains, or user-level `~/.gitconfig`.
 - `copilot-cli` runtime authentication is isolated as well: only `COPILOT_GITHUB_TOKEN` is supported for agent execution. Do not rely on `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth`, or system keychain fallbacks inside agents.
 - Launchers and integration tests must sanitize inherited host GitHub credentials before spawning subprocesses. Test scripts may use only file-backed values from `tests/.env` for GitHub auth.
-- `compass` and `registry` remain non-agentic control-plane services; do not add runtime-adapter reasoning loops there unless the architecture changes.
+- `compass` and `registry` remain control-plane services; do not add runtime-adapter reasoning loops there unless the architecture changes. The only approved Compass exception is a single bounded classification call for Office routing, without multi-step planning or external-system reasoning.
 - Task workspaces should keep `command-log.txt` and `stage-summary.json` under each agent subdirectory for auditability; runtime details belong inside `stage-summary.json` as `runtimeConfig`, not in a separate `runtime-config.json` file.
 - In execution task workspaces, generated source files should live in the real cloned repository directory; `web-agent/` and similar agent subdirectories are for metadata and audit artifacts only.
 - Web Agent branches should use deterministic naming based on Jira key plus orchestrator task id when available; only docs/tests-only changes may use `chore/...` naming without a ticket key.

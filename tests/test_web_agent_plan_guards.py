@@ -169,6 +169,23 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         self.assertEqual(updated["missing_info"], [])
         self.assertIsNone(updated["question_for_user"])
 
+    def test_team_lead_prioritizes_stack_question_after_empty_repo_search(self):
+        ctx = team_lead_app._TaskContext()
+        ctx.repo_info = {
+            "repo_url": "",
+            "content": "",
+            "request": "queries=[\"CSTL-2\",\"lesson-library\"]",
+        }
+
+        analysis = {
+            "task_type": "feature",
+            "platform": "web",
+            "target_repo_url": None,
+            "question_for_user": "The Jira ticket does not specify the web tech stack. Please confirm the stack to use.",
+        }
+
+        self.assertTrue(team_lead_app._should_prioritize_stack_question(analysis, ctx))
+
     def test_team_lead_same_task_resumes_and_carries_stack_constraints_into_dev_launch(self):
         class StopBeforeDevLaunch(RuntimeError):
             pass
@@ -537,7 +554,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             ctx.compass_url = "http://compass.local"
             ctx.shared_workspace_path = workspace
             ctx.user_text = "Implement CSTL-2."
-            ctx.original_message = {"metadata": {"stopBeforeDevDispatch": True}}
+            ctx.original_message = {"metadata": {}}
 
             analysis = {
                 "task_type": "feature",
@@ -578,6 +595,97 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             current = team_lead_app.task_store.get(task.task_id)
             self.assertEqual(current.state, "TASK_STATE_FAILED")
             self.assertEqual(current.status_message, "failure summary")
+
+    def test_team_lead_validation_mode_can_checkpoint_with_noncritical_missing_info(self):
+        with tempfile.TemporaryDirectory(prefix="team_lead_validation_checkpoint_") as workspace:
+            task = team_lead_app.task_store.create()
+            ctx = team_lead_app._TaskContext()
+            ctx.compass_task_id = "compass-task-1"
+            ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
+            ctx.compass_url = "http://compass.local"
+            ctx.shared_workspace_path = workspace
+            ctx.user_text = "Implement CSTL-2."
+            ctx.original_message = {"metadata": {"stopBeforeDevDispatch": True}}
+            ctx.jira_info = {
+                "ticket_key": "CSTL-2",
+                "content": "Jira content with the Stitch URL and no repo URL.",
+                "request": "Fetch ticket CSTL-2",
+            }
+            ctx.design_info = {
+                "url": "https://stitch.withgoogle.com/projects/13629074018280446337?pli=1",
+                "type": "stitch",
+                "content": "Lesson Library screen metadata already fetched.",
+                "page_name": "Lesson Library page",
+                "request": "Fetch design from Stitch",
+            }
+            ctx.additional_info = "Use Python 3.12 and Flask."
+
+            def fake_analyze(_user_text: str, additional_info: str = "") -> dict:
+                return {
+                    "task_type": "feature",
+                    "platform": "web",
+                    "needs_jira_fetch": True,
+                    "jira_ticket_key": "CSTL-2",
+                    "needs_design_context": True,
+                    "design_url": "https://stitch.withgoogle.com/projects/13629074018280446337?pli=1",
+                    "design_type": "stitch",
+                    "design_page_name": "Lesson Library page",
+                    "target_repo_url": None,
+                    "missing_info": [
+                        "Google Stitch read/export API token or grant export permissions so screens and PNG assets can be fetched"
+                    ],
+                    "question_for_user": None,
+                    "summary": "Implement the Lesson Library page.",
+                }
+
+            fake_plan = {
+                "platform": "web",
+                "dev_capability": "web.task.execute",
+                "target_repo_url": "",
+                "dev_instruction": "Implement the requested flow in Flask.",
+                "acceptance_criteria": ["Lesson Library page matches the design."],
+                "requires_tests": True,
+                "test_requirements": "Add integration coverage.",
+                "screenshot_requirements": None,
+            }
+
+            with mock.patch.object(team_lead_app, "_analyze_task", side_effect=fake_analyze), mock.patch.object(
+                team_lead_app,
+                "_plan_information_gathering",
+                return_value={
+                    "pending_tasks": ["Fetch more Jira and Stitch details"],
+                    "actions": [
+                        {
+                            "action": "fetch_agent_context",
+                            "capability": "jira.ticket.fetch",
+                            "message": "Fetch ticket CSTL-2 again",
+                            "reason": "Gather more details.",
+                        }
+                    ],
+                },
+            ) as gather_mock, mock.patch.object(
+                team_lead_app,
+                "_call_sync_agent",
+                side_effect=AssertionError("validation checkpoint should not fetch more context once ready"),
+            ) as sync_mock, mock.patch.object(
+                team_lead_app,
+                "_create_plan",
+                return_value=fake_plan,
+            ), mock.patch.object(team_lead_app, "_notify_compass"), mock.patch.object(
+                team_lead_app,
+                "_report_progress",
+            ), mock.patch.object(
+                team_lead_app,
+                "_generate_summary",
+                return_value="validation checkpoint reached",
+            ):
+                team_lead_app._run_workflow(task.task_id, ctx)
+
+            gather_mock.assert_not_called()
+            sync_mock.assert_not_called()
+            current = team_lead_app.task_store.get(task.task_id)
+            self.assertEqual(current.state, "TASK_STATE_COMPLETED")
+            self.assertIn("validation checkpoint reached", current.status_message)
 
     def test_team_lead_reports_missing_jira_capability_clearly(self):
         with mock.patch.object(

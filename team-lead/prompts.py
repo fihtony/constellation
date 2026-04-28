@@ -267,6 +267,13 @@ Check:
    - .work/ evidence directories must NOT be in the PR
    - scripts/ operational helpers (Jira update scripts, branch creation instructions) must NOT be in the PR
 
+IMPORTANT: The "Workspace evidence" section contains auto-collected facts from the actual run
+(generated file list, test results, Jira action log). Trust this evidence over your inability to
+directly read source files. If the workspace evidence shows .gitignore and README.md in the
+generated files list, treat them as PRESENT. If test results say passed=True, treat tests as
+PASSED. If Jira actions show fetch/transition/comment as completed, treat workflow as FOLLOWED.
+Only fail criteria that workspace evidence explicitly contradicts or that are genuinely absent.
+
 The `score` field MUST always be a number 0-100. Never omit it or set it to null.
 
 Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
@@ -290,6 +297,9 @@ Development agent output:
 
 Artifacts produced:
 {artifacts_summary}
+
+Workspace evidence (auto-collected from actual run — treat as ground truth):
+{workspace_evidence}
 
 Evaluate each acceptance criterion and check that the dev workflow was followed
 (Jira In Progress → implementation → PR → Jira In Review with PR link).

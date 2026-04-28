@@ -898,9 +898,17 @@ def _extract_design_reference(text: str) -> tuple[str, str]:
 
 
 def _extract_design_page_name(*texts: str) -> str:
+    """Extract a design screen/page name from Jira ticket content or user message."""
     patterns = [
+        # Explicit keyword prefix: "page: Landing Page" or "screen: Landing Page"
         re.compile(r"(?:page|screen)(?:\s+name)?\s*[:=-]\s*['\"]?([^\n\r]+?)['\"]?(?:$|[\n\r])", re.IGNORECASE),
+        # Quoted: page "Landing Page" or screen 'Landing Page'
         re.compile(r'(?:page|screen)\s+["\']([^"\']+)["\']', re.IGNORECASE),
+        # Stitch/Figma JSON label field: "label":"Landing Page (Bare-bones)"
+        re.compile(r'"label"\s*:\s*"([^"]+)"'),
+        # Parenthetical qualifier: "Landing Page (Bare-bones)" or "Practice Quiz (Full)"
+        re.compile(r'\b([A-Z][A-Za-z]+(?: [A-Z][A-Za-z]+)*)\s*\((?:bare-bones|bare bones|full|minimal|draft|v\d+)\)', re.IGNORECASE),
+        # Keyword followed by capitalized phrase
         re.compile(r"(?:page|screen)\s+([A-Z][A-Za-z0-9][^\n\r.]{1,80})", re.IGNORECASE),
     ]
     for text in texts:
@@ -910,7 +918,7 @@ def _extract_design_page_name(*texts: str) -> str:
             match = pattern.search(text)
             if match:
                 page_name = match.group(1).strip().strip("'\" ")
-                if page_name:
+                if page_name and len(page_name) > 3:
                     return page_name
     return ""
 
@@ -1320,6 +1328,20 @@ def _build_analysis_context(ctx: _TaskContext) -> str:
     return "\n\n".join(part for part in parts if part)
 
 
+def _should_prioritize_stack_question(analysis: dict, ctx: _TaskContext) -> bool:
+    question = str(analysis.get("question_for_user") or "").strip().lower()
+    if not question or "stack" not in question:
+        return False
+    if str(analysis.get("target_repo_url") or "").strip():
+        return False
+    repo_info = ctx.repo_info or {}
+    if not repo_info:
+        return False
+    if str(repo_info.get("content") or "").strip():
+        return False
+    return True
+
+
 def _refresh_analysis_with_known_context(
     user_text: str,
     ctx: _TaskContext,
@@ -1361,7 +1383,14 @@ def _execute_gather_action(
     if capability == "jira.ticket.fetch":
         ticket_key = str(analysis.get("jira_ticket_key") or "").strip()
         request_text = message_text or f"Fetch ticket {ticket_key}"
-        if not ticket_key or _is_repeat(ctx.jira_info, request_text):
+        # Already have content for this ticket — skip regardless of request wording
+        if (
+            ctx.jira_info
+            and ctx.jira_info.get("content")
+            and str(ctx.jira_info.get("ticket_key") or "").strip() == ticket_key
+        ):
+            return False
+        if not ticket_key:
             return False
         log_fn(f"{reason} ({capability})")
         jira_task = _call_sync_agent(
@@ -1414,8 +1443,19 @@ def _execute_gather_action(
             return False
         _, fallback_message, page_name = _build_design_fetch_request(analysis)
         request_text = message_text or fallback_message
-        if _is_repeat(ctx.design_info, request_text):
-            return False
+
+        # Prevent redundant design fetches:
+        # - Any project-level fetch is skipped if we already have ANY design content
+        # - Screen-level fetches are skipped if we already fetched at screen level for the same page
+        if ctx.design_info and ctx.design_info.get("content"):
+            fetched_by = str(ctx.design_info.get("fetchedBy") or "").strip()
+            existing_page = str(ctx.design_info.get("page_name") or "").strip()
+            if capability == "stitch.project.get":
+                return False  # already have design context; project-level re-fetch not needed
+            if capability in {"stitch.screen.fetch", "figma.page.fetch", "stitch.screen.image"}:
+                if fetched_by in {"stitch.screen.fetch", "figma.page.fetch", "stitch.screen.image"}:
+                    if not page_name or existing_page == page_name:
+                        return False  # already fetched this screen
         log_fn(f"{reason} ({capability})")
         design_task = _call_sync_agent(
             capability,
@@ -1430,6 +1470,7 @@ def _execute_gather_action(
             "type": "stitch" if capability.startswith("stitch.") else "figma",
             "content": content,
             "page_name": page_name,
+            "fetchedBy": capability,
             "request": request_text,
         }
         _save_workspace_file(
@@ -1443,7 +1484,14 @@ def _execute_gather_action(
     if capability == "scm.repo.inspect":
         repo_url = str(analysis.get("target_repo_url") or "").strip()
         request_text = message_text or f"Inspect repository {repo_url}"
-        if not repo_url or _is_repeat(ctx.repo_info, request_text):
+        # Already have content for this repo — skip regardless of request wording
+        if (
+            ctx.repo_info
+            and ctx.repo_info.get("content")
+            and str(ctx.repo_info.get("repo_url") or "").strip() == repo_url
+        ):
+            return False
+        if not repo_url:
             return False
         log_fn(f"{reason} ({capability})")
         repo_info = _inspect_target_repo(
@@ -1479,6 +1527,34 @@ def _should_stop_before_dev_dispatch(ctx: _TaskContext) -> bool:
     if isinstance(validation_mode, dict) and _is_truthy(validation_mode.get("stopBeforeDevDispatch")):
         return True
     return False
+
+
+def _is_validation_checkpoint_ready(
+    ctx: _TaskContext,
+    analysis: dict,
+    tech_stack_constraints: dict | None,
+) -> bool:
+    if not _should_stop_before_dev_dispatch(ctx):
+        return False
+
+    if analysis.get("needs_jira_fetch") and not ctx.jira_info:
+        return False
+    if analysis.get("needs_design_context") and not ctx.design_info:
+        return False
+
+    missing_items = [str(item).strip().lower() for item in (analysis.get("missing_info") or []) if str(item).strip()]
+    question = str(analysis.get("question_for_user") or "").strip().lower()
+    stack_missing = any(
+        keyword in question
+        for keyword in ("stack", "framework", "python", "flask", "react", "node")
+    ) or any(
+        any(keyword in item for keyword in ("stack", "framework", "python", "flask", "react", "node"))
+        for item in missing_items
+    )
+    if stack_missing and not (tech_stack_constraints or {}):
+        return False
+
+    return True
 
 
 def _create_plan(
@@ -1519,12 +1595,63 @@ def _create_plan(
     return _enforce_plan_constraints(_parse_json_from_llm(response), tech_stack_constraints)
 
 
+def _load_workspace_review_evidence(workspace: str) -> str:
+    """Load auto-collected workspace artifacts for use in the LLM review context."""
+    if not workspace or not os.path.isdir(workspace):
+        return ""
+    lines: list[str] = []
+    try:
+        for agent_dir in sorted(os.listdir(workspace)):
+            agent_path = os.path.join(workspace, agent_dir)
+            if not os.path.isdir(agent_path):
+                continue
+            pr_path = os.path.join(agent_path, "pr-evidence.json")
+            if os.path.isfile(pr_path):
+                try:
+                    with open(pr_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    gen_files = data.get("generatedFiles") or []
+                    pr_url = data.get("url", "")
+                    build_passed = data.get("buildPassed")
+                    branch = data.get("branch", "")
+                    lines.append(f"PR URL: {pr_url}")
+                    lines.append(f"Branch: {branch}")
+                    lines.append(f"Build passed: {build_passed}")
+                    lines.append(f"Generated files committed to PR: {gen_files}")
+                except Exception:
+                    pass
+            tr_path = os.path.join(agent_path, "test-results.json")
+            if os.path.isfile(tr_path):
+                try:
+                    with open(tr_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    lines.append(f"Test results: passed={data.get('passed')}, output={str(data.get('output', ''))[:400]}")
+                except Exception:
+                    pass
+            jira_path = os.path.join(agent_path, "jira-actions.json")
+            if os.path.isfile(jira_path):
+                try:
+                    with open(jira_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    events = data.get("events") or []
+                    completed = [e.get("action") for e in events if e.get("status") == "completed"]
+                    lines.append(f"Jira actions completed: {completed}")
+                except Exception:
+                    pass
+            if lines:  # found evidence in this agent dir; stop
+                break
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
 def _review_output(
     user_text: str,
     plan: dict,
     dev_output: str,
     artifacts: list,
     design_info: dict | None = None,
+    workspace: str = "",
 ) -> dict:
     criteria_lines = "\n".join(
         f"- {c}" for c in (plan.get("acceptance_criteria") or [])
@@ -1539,6 +1666,8 @@ def _review_output(
         design_url = design_info.get("url", "")
         design_context_provided = f"Yes — {design_url}" if design_url else "Yes (no URL)"
 
+    workspace_evidence = _load_workspace_review_evidence(workspace) if workspace else ""
+
     prompt = prompts.REVIEW_TEMPLATE.format(
         user_text=user_text,
         acceptance_criteria=criteria_lines,
@@ -1546,6 +1675,7 @@ def _review_output(
         design_context_provided=design_context_provided,
         dev_output=(dev_output or "No output text.")[:3000],
         artifacts_summary=artifacts_summary,
+        workspace_evidence=workspace_evidence or "(none collected)",
     )
     system = build_system_prompt(prompts.REVIEW_SYSTEM, "team-lead", include_workflow=True)
     response = _run_agentic(prompt, f"[{AGENT_ID}] review", system_prompt=system)
@@ -1676,12 +1806,53 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             analysis = _apply_tech_stack_confirmation_policy(analysis, tech_stack_constraints, user_text)
             ctx.analysis = analysis
 
+            if _is_validation_checkpoint_ready(ctx, analysis, tech_stack_constraints):
+                ctx.pending_tasks = ["Proceed to implementation planning"]
+                _save_gather_plan(
+                    workspace,
+                    {
+                        "pending_tasks": ctx.pending_tasks,
+                        "actions": [
+                            {
+                                "action": _GATHER_ACTION_PROCEED,
+                                "reason": (
+                                    "Validation checkpoint mode has the essential context needed to create the implementation plan."
+                                ),
+                            }
+                        ],
+                        "summary": "Ready to create the implementation plan for validation checkpoint.",
+                        "capability_snapshot": _available_capability_snapshot(force=(gather_round > 1)),
+                    },
+                )
+                log(
+                    f"Gather round {gather_round} pending tasks: "
+                    + ", ".join(ctx.pending_tasks)
+                )
+                break
+
             gather_plan = _plan_information_gathering(
                 user_text,
                 analysis,
                 ctx,
                 force_refresh=(gather_round > 1),
             )
+            if _should_prioritize_stack_question(analysis, ctx):
+                question = str(analysis.get("question_for_user") or "").strip()
+                gather_plan = {
+                    "pending_tasks": [f"Ask user: {question}"],
+                    "actions": [
+                        {
+                            "action": _GATHER_ACTION_ASK_USER,
+                            "question": question,
+                            "reason": (
+                                "Repository discovery did not determine the web tech stack; "
+                                "ask the user now before continuing lower-priority fetches."
+                            ),
+                        }
+                    ],
+                    "summary": "Need user tech stack confirmation before further planning.",
+                    "capability_snapshot": gather_plan.get("capability_snapshot") or {},
+                }
             ctx.pending_tasks = list(gather_plan.get("pending_tasks") or [])
             _save_gather_plan(workspace, gather_plan)
             log(
@@ -1797,7 +1968,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             for item in (analysis.get("missing_info") or [])
             if str(item).strip()
         ]
-        if unresolved_missing:
+        if unresolved_missing and not _should_stop_before_dev_dispatch(ctx):
             raise RuntimeError(
                 "Cannot create implementation plan with unresolved missing information: "
                 + "; ".join(unresolved_missing[:3])
@@ -1981,7 +2152,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             )
             log(f"Reviewing dev output (cycle {review_cycle + 1}/{MAX_REVIEW_CYCLES})")
 
-            review = _review_output(user_text, plan, dev_output, final_artifacts, design_info=ctx.design_info)
+            review = _review_output(user_text, plan, dev_output, final_artifacts, design_info=ctx.design_info, workspace=workspace)
             ctx.review_result = review
             _save_workspace_file(
                 workspace,
