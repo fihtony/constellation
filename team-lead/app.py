@@ -85,6 +85,7 @@ _CALLBACK_LOCK = threading.Lock()
 _CALLBACK_EVENTS: dict[str, threading.Event] = {}
 _CALLBACK_RESULTS: dict[str, dict] = {}
 
+_JIRA_TICKET_KEY_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]+-\d+)\b")
 _REPO_URL_RE = re.compile(r"https?://[^\s\"'\}]*?(?:github\.com|bitbucket)[^\s\"'\}]*", re.IGNORECASE)
 _FIGMA_URL_RE = re.compile(r"https?://[^\s\"'\}]*figma\.com/[^\s\"'\}]+", re.IGNORECASE)
 _STITCH_URL_RE = re.compile(r"https?://[^\s\"'\}]*(?:stitch\.withgoogle\.com|stitch\.googleapis\.com)/[^\s\"'\}]+", re.IGNORECASE)
@@ -100,6 +101,26 @@ NON_TERMINAL_STATES = {
     "TASK_STATE_WORKING",
     "TASK_STATE_ACCEPTED",
 }
+
+_IMPLEMENTATION_TASK_TYPES = {"feature", "bug_fix", "improvement"}
+_TECH_STACK_HINTS = (
+    "tech stack",
+    "stack",
+    "framework",
+    "runtime",
+    "python",
+    "flask",
+    "fastapi",
+    "django",
+    "node",
+    "express",
+    "nestjs",
+    "react",
+    "next",
+    "vue",
+    "typescript",
+    "javascript",
+)
 
 
 class _TaskContext:
@@ -187,6 +208,63 @@ def audit_log(event: str, **kwargs):
     print(f"[audit] {json.dumps(entry, ensure_ascii=False)}")
 
 
+def _extract_jira_ticket_key(*texts: str) -> str:
+    for text in texts:
+        if not text:
+            continue
+        match = _JIRA_TICKET_KEY_RE.search(text)
+        if match:
+            return match.group(1).upper()
+    return ""
+
+
+def _is_implementation_request(analysis: dict | None, user_text: str = "") -> bool:
+    payload = analysis or {}
+    task_type = str(payload.get("task_type") or "").strip().lower()
+    if task_type in _IMPLEMENTATION_TASK_TYPES:
+        return True
+
+    platform = str(payload.get("platform") or "").strip().lower()
+    if platform not in {"web", "android", "ios"}:
+        return False
+
+    combined = "\n".join(
+        part
+        for part in (
+            user_text,
+            str(payload.get("summary") or ""),
+            "\n".join(payload.get("acceptance_criteria") or []),
+        )
+        if part
+    ).lower()
+    return any(verb in combined for verb in ("implement", "build", "create", "develop", "fix", "add"))
+
+
+def _ensure_jira_ticket_for_workflow(analysis: dict, user_text: str) -> dict:
+    updated = dict(analysis or {})
+    if not _is_implementation_request(updated, user_text):
+        return updated
+
+    ticket_key = str(updated.get("jira_ticket_key") or "").strip()
+    if not ticket_key:
+        ticket_key = _extract_jira_ticket_key(
+            user_text,
+            str(updated.get("summary") or ""),
+            "\n".join(updated.get("acceptance_criteria") or []),
+        )
+        if ticket_key:
+            updated["jira_ticket_key"] = ticket_key
+            updated["needs_jira_fetch"] = True
+
+    if ticket_key:
+        return updated
+
+    raise RuntimeError(
+        "A Jira ticket is required for implementation workflow requests. "
+        "Please provide a Jira ticket URL or key before Team Lead can continue."
+    )
+
+
 def _extract_tech_stack_constraints(*texts: str) -> dict:
     combined = "\n".join(text for text in texts if text)
     lower = combined.lower()
@@ -218,6 +296,48 @@ def _extract_tech_stack_constraints(*texts: str) -> dict:
         constraints["frontend_framework"] = "vue"
 
     return constraints
+
+
+def _has_tech_stack_signal(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(hint in lowered for hint in _TECH_STACK_HINTS)
+
+
+def _apply_tech_stack_confirmation_policy(
+    analysis: dict,
+    tech_stack_constraints: dict | None,
+    user_text: str = "",
+) -> dict:
+    updated = dict(analysis or {})
+    question = str(updated.get("question_for_user") or "").strip()
+    missing = [str(item).strip() for item in (updated.get("missing_info") or []) if str(item).strip()]
+
+    if tech_stack_constraints:
+        if _has_tech_stack_signal(question):
+            updated["question_for_user"] = None
+        updated["missing_info"] = [
+            item for item in missing if not _has_tech_stack_signal(item)
+        ]
+        return updated
+
+    if not _is_implementation_request(updated, user_text):
+        return updated
+    if str(updated.get("platform") or "").strip().lower() != "web":
+        return updated
+    if not str(updated.get("jira_ticket_key") or "").strip():
+        return updated
+    if question and not _has_tech_stack_signal(question):
+        return updated
+
+    confirmation_question = (
+        "The Jira ticket does not specify the web tech stack. "
+        "Please confirm the stack to use, for example Python Flask or Node.js/Express."
+    )
+    if not any(_has_tech_stack_signal(item) for item in missing):
+        missing.insert(0, "confirmed web tech stack")
+    updated["missing_info"] = missing
+    updated["question_for_user"] = confirmation_question
+    return updated
 
 
 def _render_tech_stack_constraints(constraints: dict | None) -> str:
@@ -759,6 +879,24 @@ def _extract_design_reference(text: str) -> tuple[str, str]:
     return "", ""
 
 
+def _extract_design_page_name(*texts: str) -> str:
+    patterns = [
+        re.compile(r"(?:page|screen)(?:\s+name)?\s*[:=-]\s*['\"]?([^\n\r]+?)['\"]?(?:$|[\n\r])", re.IGNORECASE),
+        re.compile(r'(?:page|screen)\s+["\']([^"\']+)["\']', re.IGNORECASE),
+        re.compile(r"(?:page|screen)\s+([A-Z][A-Za-z0-9][^\n\r.]{1,80})", re.IGNORECASE),
+    ]
+    for text in texts:
+        if not text:
+            continue
+        for pattern in patterns:
+            match = pattern.search(text)
+            if match:
+                page_name = match.group(1).strip().strip("'\" ")
+                if page_name:
+                    return page_name
+    return ""
+
+
 def _enrich_analysis_from_context(
     analysis: dict,
     jira_info: dict | None,
@@ -784,8 +922,23 @@ def _enrich_analysis_from_context(
             updated["design_url"] = design_url
             updated["design_type"] = design_type or updated.get("design_type") or None
             updated["needs_design_context"] = True
+    if not updated.get("design_page_name"):
+        design_page_name = _extract_design_page_name(context_blob)
+        if design_page_name:
+            updated["design_page_name"] = design_page_name
 
     return updated
+
+
+def _build_design_fetch_request(analysis: dict) -> tuple[str, str, str]:
+    design_url = (analysis.get("design_url") or "").strip()
+    design_type = (analysis.get("design_type") or "figma").strip() or "figma"
+    design_page_name = (analysis.get("design_page_name") or "").strip()
+    capability = "stitch.screen.fetch" if design_type == "stitch" else "figma.page.fetch"
+    design_message = f"Fetch design from {design_url}"
+    if design_page_name:
+        design_message += f" page: {design_page_name}"
+    return capability, design_message, design_page_name
 
 
 def _inspect_target_repo(
@@ -966,6 +1119,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         task_store.update_state(team_lead_task_id, "ANALYZING", "Analyzing the request…")
         log("Analyzing request")
         analysis = _analyze_task(user_text)
+        analysis = _ensure_jira_ticket_for_workflow(analysis, user_text)
         ctx.analysis = analysis
         log(
             f"Analysis complete — type={analysis.get('task_type')}, "
@@ -1006,15 +1160,9 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         if analysis.get("needs_design_context") and analysis.get("design_url"):
             design_url = analysis["design_url"]
             design_type = analysis.get("design_type") or "figma"
-            design_page_name = analysis.get("design_page_name") or ""
-            capability = (
-                "stitch.screen.fetch" if design_type == "stitch" else "figma.page.fetch"
-            )
+            capability, design_msg, design_page_name = _build_design_fetch_request(analysis)
             log(f"Fetching design context ({design_type}): {design_url} page='{design_page_name}'")
             try:
-                design_msg = f"Fetch design from {design_url}"
-                if design_page_name:
-                    design_msg += f" page: {design_page_name}"
                 design_task = _call_sync_agent(
                     capability,
                     design_msg,
@@ -1073,15 +1221,9 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         ):
             design_url = analysis["design_url"]
             design_type = analysis.get("design_type") or "figma"
-            capability = (
-                "stitch.screen.fetch" if design_type == "stitch" else "figma.page.fetch"
-            )
+            capability, design_msg, design_page_name = _build_design_fetch_request(analysis)
             log(f"Fetching design context discovered in re-analysis ({design_type}): {design_url}")
             try:
-                design_page_name = analysis.get("design_page_name") or ""
-                design_msg = f"Fetch design from {design_url}"
-                if design_page_name:
-                    design_msg += f" page: {design_page_name}"
                 design_task = _call_sync_agent(
                     capability,
                     design_msg,
@@ -1211,6 +1353,8 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 "Detected tech stack constraints: "
                 + ", ".join(f"{key}={value}" for key, value in tech_stack_constraints.items())
             )
+        analysis = _apply_tech_stack_confirmation_policy(analysis, tech_stack_constraints, user_text)
+        ctx.analysis = analysis
 
         # ── Phase 3: Check for missing info (up to 2 INPUT_REQUIRED rounds) ─
         for _input_round in range(2):
@@ -1263,6 +1407,17 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             task_store.update_state(team_lead_task_id, "ANALYZING", "Re-analyzing with additional information…")
             log("Re-analyzing with updated context")
             analysis = _analyze_task(user_text, ctx.additional_info)
+            tech_stack_constraints = _extract_tech_stack_constraints(
+                user_text,
+                json.dumps(ctx.jira_info or {}, ensure_ascii=False),
+                ctx.additional_info,
+            )
+            if tech_stack_constraints:
+                log(
+                    "Detected tech stack constraints: "
+                    + ", ".join(f"{key}={value}" for key, value in tech_stack_constraints.items())
+                )
+            analysis = _apply_tech_stack_confirmation_policy(analysis, tech_stack_constraints, user_text)
             ctx.analysis = analysis
 
         # ── Phase 4: Plan ────────────────────────────────────────────────────

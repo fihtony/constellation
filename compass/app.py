@@ -1102,6 +1102,83 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
     return task.to_dict()
 
 
+def _resume_input_required_task(body: dict, message: dict) -> dict | None:
+    context_id = (body.get("contextId") or message.get("contextId") or "").strip()
+    if not context_id:
+        return None
+
+    prior_task = task_store.get(context_id)
+    if not prior_task or prior_task.state != "TASK_STATE_INPUT_REQUIRED":
+        return None
+
+    tl_task_id = prior_task.downstream_task_id or ""
+    tl_service_url = prior_task.downstream_service_url or ""
+
+    if tl_task_id and not tl_service_url:
+        try:
+            instances = registry.list_instances("team-lead-agent")
+            for inst in instances:
+                if inst.get("current_task_id") == tl_task_id:
+                    tl_service_url = inst.get("service_url", "")
+                    break
+            if tl_service_url:
+                print(f"[compass] Recovered team-lead service URL from registry: {tl_service_url}")
+        except Exception as lookup_err:
+            print(f"[compass] Could not look up team-lead service URL: {lookup_err}")
+
+    if tl_task_id and tl_service_url:
+        print(
+            f"[compass] Forwarding user reply to Team Lead "
+            f"(tl_task={tl_task_id}, compass_task={context_id})"
+        )
+        try:
+            _a2a_call(tl_service_url, message, context_id=tl_task_id)
+            task_store.update_state(
+                context_id,
+                "TASK_STATE_WORKING",
+                "User provided additional information. Resuming…",
+            )
+            task_store.add_progress_step(
+                context_id,
+                "User provided additional information. Resuming task.",
+                agent_id="compass-agent",
+            )
+            if getattr(prior_task, "workspace_path", ""):
+                record_workspace_stage(
+                    prior_task.workspace_path,
+                    "compass",
+                    "Received user input and resumed task",
+                    task_id=context_id,
+                    extra={
+                        "teamLeadTaskId": tl_task_id,
+                        "userText": extract_text(message)[:1000],
+                        "runtimeConfig": _runtime_config_summary(),
+                    },
+                )
+            audit_log(
+                "TASK_RESUMED",
+                task_id=context_id,
+                tl_task_id=tl_task_id,
+            )
+        except Exception as err:
+            print(f"[compass] Failed to forward resume to Team Lead: {err}")
+            task_store.update_state(
+                context_id,
+                "TASK_STATE_INPUT_REQUIRED",
+                prior_task.status_message,
+            )
+        return prior_task.to_dict()
+
+    orig_text = extract_text(prior_task.original_message or {})
+    new_text = extract_text(message)
+    combined_text = (orig_text + "\n\n" + new_text).strip() if orig_text else new_text
+    merged = deep_copy_json(message)
+    merged["parts"] = [{"text": combined_text}]
+    workflow = prior_task.pending_workflow
+    print(f"[compass] INPUT_REQUIRED fallback: re-running workflow for task {context_id}")
+    return route_and_dispatch(merged, forced_workflow=workflow)
+
+
 class CompassHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1256,87 +1333,10 @@ class CompassHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "missing message"})
             return
 
-        # If the caller supplies a contextId pointing to a TASK_STATE_INPUT_REQUIRED task,
-        # forward the user's additional info to the Team Lead instance that raised the question.
-        # The original compass task is retained — no new task is created.
-        # contextId may appear at the top level or nested inside message.
-        context_id = (body.get("contextId") or message.get("contextId") or "").strip()
-        if context_id:
-            prior_task = task_store.get(context_id)
-            if prior_task and prior_task.state == "TASK_STATE_INPUT_REQUIRED":
-                tl_task_id = prior_task.downstream_task_id or ""
-                tl_service_url = prior_task.downstream_service_url or ""
-
-                # Fallback: service URL may not have been stored; look it up from registry
-                if tl_task_id and not tl_service_url:
-                    try:
-                        instances = registry.list_instances("team-lead-agent")
-                        for inst in instances:
-                            if inst.get("current_task_id") == tl_task_id:
-                                tl_service_url = inst.get("service_url", "")
-                                break
-                        if tl_service_url:
-                            print(f"[compass] Recovered team-lead service URL from registry: {tl_service_url}")
-                    except Exception as _lookup_err:
-                        print(f"[compass] Could not look up team-lead service URL: {_lookup_err}")
-
-                if tl_task_id and tl_service_url:
-                    # Forward additional info to Team Lead with the original TL task as context.
-                    # Team Lead will resume its paused workflow thread.
-                    print(
-                        f"[compass] Forwarding user reply to Team Lead "
-                        f"(tl_task={tl_task_id}, compass_task={context_id})"
-                    )
-                    try:
-                        _a2a_call(tl_service_url, message, context_id=tl_task_id)
-                        task_store.update_state(
-                            context_id,
-                            "TASK_STATE_WORKING",
-                            "User provided additional information. Resuming…",
-                        )
-                        task_store.add_progress_step(
-                            context_id,
-                            "User provided additional information. Resuming task.",
-                            agent_id="compass-agent",
-                        )
-                        if getattr(prior_task, "workspace_path", ""):
-                            record_workspace_stage(
-                                prior_task.workspace_path,
-                                "compass",
-                                "Received user input and resumed task",
-                                task_id=context_id,
-                                extra={
-                                    "teamLeadTaskId": tl_task_id,
-                                    "userText": extract_text(message)[:1000],
-                                    "runtimeConfig": _runtime_config_summary(),
-                                },
-                            )
-                        audit_log(
-                            "TASK_RESUMED",
-                            task_id=context_id,
-                            tl_task_id=tl_task_id,
-                        )
-                    except Exception as err:
-                        print(f"[compass] Failed to forward resume to Team Lead: {err}")
-                        task_store.update_state(
-                            context_id,
-                            "TASK_STATE_INPUT_REQUIRED",
-                            prior_task.status_message,  # keep original question visible
-                        )
-                    self._send_json(200, {"task": prior_task.to_dict()})
-                    return
-
-                # Fallback: no Team Lead info stored — re-run the workflow with merged context
-                orig_text = extract_text(prior_task.original_message or {})
-                new_text = extract_text(message)
-                combined_text = (orig_text + "\n\n" + new_text).strip() if orig_text else new_text
-                merged = deep_copy_json(message)
-                merged["parts"] = [{"text": combined_text}]
-                workflow = prior_task.pending_workflow
-                print(f"[compass] INPUT_REQUIRED fallback: re-running workflow for task {context_id}")
-                task_dict = route_and_dispatch(merged, forced_workflow=workflow)
-                self._send_json(200, {"task": task_dict})
-                return
+        resumed_task = _resume_input_required_task(body, message)
+        if resumed_task is not None:
+            self._send_json(200, {"task": resumed_task})
+            return
 
         print(f"[compass] Received message: {json.dumps(message, ensure_ascii=False)[:200]}")
         task_dict = route_and_dispatch(message, requested_capability=requested_capability)

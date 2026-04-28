@@ -8,9 +8,12 @@ import tempfile
 import unittest
 from pathlib import Path
 import os
+import threading
+import time
 from unittest import mock
 
 from web import app as web_app
+from common.task_store import TaskStore
 
 
 _TEAM_LEAD_DIR = Path(__file__).resolve().parents[1] / "team-lead"
@@ -33,6 +36,27 @@ _TEAM_LEAD_SPEC.loader.exec_module(team_lead_app)
 
 
 class WebAgentPlanGuardsTests(unittest.TestCase):
+    def setUp(self):
+        self._original_task_store = team_lead_app.task_store
+        team_lead_app.task_store = TaskStore()
+        with team_lead_app._TASK_CONTEXTS_LOCK:
+            team_lead_app._TASK_CONTEXTS.clear()
+        with team_lead_app._INPUT_EVENTS_LOCK:
+            team_lead_app._INPUT_EVENTS.clear()
+        with team_lead_app._CALLBACK_LOCK:
+            team_lead_app._CALLBACK_EVENTS.clear()
+            team_lead_app._CALLBACK_RESULTS.clear()
+
+    def tearDown(self):
+        team_lead_app.task_store = self._original_task_store
+        with team_lead_app._TASK_CONTEXTS_LOCK:
+            team_lead_app._TASK_CONTEXTS.clear()
+        with team_lead_app._INPUT_EVENTS_LOCK:
+            team_lead_app._INPUT_EVENTS.clear()
+        with team_lead_app._CALLBACK_LOCK:
+            team_lead_app._CALLBACK_EVENTS.clear()
+            team_lead_app._CALLBACK_RESULTS.clear()
+
     def test_team_lead_extracts_and_enforces_python_flask_constraints(self):
         constraints = team_lead_app._extract_tech_stack_constraints(
             "Implement the landing page",
@@ -73,6 +97,333 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         self.assertEqual(enriched["design_url"], "https://www.figma.com/file/abc123/landing-page")
         self.assertEqual(enriched["design_type"], "figma")
         self.assertTrue(enriched["needs_design_context"])
+
+    def test_team_lead_requires_jira_ticket_for_implementation_requests(self):
+        with self.assertRaisesRegex(RuntimeError, "A Jira ticket is required"):
+            team_lead_app._ensure_jira_ticket_for_workflow(
+                {
+                    "task_type": "feature",
+                    "platform": "web",
+                    "jira_ticket_key": None,
+                    "summary": "Implement a dashboard",
+                },
+                "Implement a new dashboard without a ticket.",
+            )
+
+    def test_team_lead_recovers_jira_ticket_key_from_request_text(self):
+        updated = team_lead_app._ensure_jira_ticket_for_workflow(
+            {
+                "task_type": "feature",
+                "platform": "web",
+                "jira_ticket_key": None,
+                "needs_jira_fetch": False,
+            },
+            "Implement https://tarch.atlassian.net/browse/CSTL-2 in the target repo.",
+        )
+
+        self.assertEqual(updated["jira_ticket_key"], "CSTL-2")
+        self.assertTrue(updated["needs_jira_fetch"])
+
+    def test_team_lead_builds_design_fetch_request_from_page_name(self):
+        capability, message_text, page_name = team_lead_app._build_design_fetch_request(
+            {
+                "design_url": "https://www.figma.com/design/abc123/English-Study-Hub",
+                "design_type": "figma",
+                "design_page_name": "Practice Quiz",
+            }
+        )
+
+        self.assertEqual(capability, "figma.page.fetch")
+        self.assertEqual(page_name, "Practice Quiz")
+        self.assertIn("page: Practice Quiz", message_text)
+
+    def test_team_lead_requests_tech_stack_confirmation_when_ticket_is_ambiguous(self):
+        updated = team_lead_app._apply_tech_stack_confirmation_policy(
+            {
+                "task_type": "feature",
+                "platform": "web",
+                "jira_ticket_key": "CSTL-2",
+                "missing_info": [],
+                "question_for_user": None,
+            },
+            {},
+            "Implement CSTL-2.",
+        )
+
+        self.assertIn("confirmed web tech stack", updated["missing_info"])
+        self.assertIn("tech stack", updated["question_for_user"].lower())
+
+    def test_team_lead_clears_tech_stack_question_after_user_confirms_stack(self):
+        updated = team_lead_app._apply_tech_stack_confirmation_policy(
+            {
+                "task_type": "feature",
+                "platform": "web",
+                "jira_ticket_key": "CSTL-2",
+                "missing_info": ["preferred framework"],
+                "question_for_user": "Which framework should I use?",
+            },
+            {"language": "python", "python_version": "3.12", "backend_framework": "flask"},
+            "Please use Python 3.12 and Flask.",
+        )
+
+        self.assertEqual(updated["missing_info"], [])
+        self.assertIsNone(updated["question_for_user"])
+
+    def test_team_lead_same_task_resumes_and_carries_stack_constraints_into_dev_launch(self):
+        class StopBeforeDevLaunch(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory(prefix="team_lead_resume_") as workspace:
+            task = team_lead_app.task_store.create()
+            ctx = team_lead_app._TaskContext()
+            ctx.compass_task_id = "compass-task-1"
+            ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
+            ctx.compass_url = "http://compass.local"
+            ctx.shared_workspace_path = workspace
+            ctx.user_text = "Implement https://tarch.atlassian.net/browse/CSTL-2"
+
+            analyze_calls: list[str] = []
+            agent_calls: list[tuple[str, str]] = []
+            captured_dev_message: dict = {}
+
+            def fake_analyze(user_text: str, additional_info: str = "") -> dict:
+                analyze_calls.append(additional_info)
+                if len(analyze_calls) == 1:
+                    return {
+                        "task_type": "feature",
+                        "platform": "web",
+                        "needs_jira_fetch": True,
+                        "jira_ticket_key": "CSTL-2",
+                        "needs_design_context": False,
+                        "missing_info": [],
+                        "question_for_user": None,
+                        "summary": "Implement CSTL-2.",
+                    }
+                if len(analyze_calls) == 2:
+                    return {
+                        "task_type": "feature",
+                        "platform": "web",
+                        "needs_jira_fetch": True,
+                        "jira_ticket_key": "CSTL-2",
+                        "needs_design_context": True,
+                        "design_url": "https://www.figma.com/design/abc123/English-Study-Hub",
+                        "design_type": "figma",
+                        "design_page_name": "Practice Quiz",
+                        "target_repo_url": "",
+                        "missing_info": [],
+                        "question_for_user": None,
+                        "summary": "Implement CSTL-2 from Figma.",
+                    }
+                self.assertIn("python 3.12", additional_info.lower())
+                self.assertIn("flask", additional_info.lower())
+                return {
+                    "task_type": "feature",
+                    "platform": "web",
+                    "needs_jira_fetch": True,
+                    "jira_ticket_key": "CSTL-2",
+                    "needs_design_context": True,
+                    "design_url": "https://www.figma.com/design/abc123/English-Study-Hub",
+                    "design_type": "figma",
+                    "design_page_name": "Practice Quiz",
+                    "target_repo_url": "",
+                    "missing_info": [],
+                    "question_for_user": None,
+                    "summary": "Implement CSTL-2 from Figma in Flask.",
+                }
+
+            def fake_call_sync_agent(capability: str, message_text: str, *_args) -> dict:
+                agent_calls.append((capability, message_text))
+                if capability == "jira.ticket.fetch":
+                    return {
+                        "artifacts": [
+                            {
+                                "parts": [
+                                    {
+                                        "text": "Ticket content with Figma https://www.figma.com/design/abc123/English-Study-Hub and page Practice Quiz."
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                if capability == "figma.page.fetch":
+                    return {"artifacts": [{"parts": [{"text": "Practice Quiz UI spec"}]}]}
+                raise AssertionError(f"Unexpected capability: {capability}")
+
+            def fake_create_plan(*_args, **_kwargs) -> dict:
+                return {
+                    "platform": "web",
+                    "dev_capability": "web.task.execute",
+                    "target_repo_url": "",
+                    "dev_instruction": "Implement the requested flow in Flask.",
+                    "acceptance_criteria": ["Practice Quiz screen matches the design."],
+                    "requires_tests": True,
+                    "test_requirements": "Add integration coverage for the Practice Quiz screen.",
+                    "screenshot_requirements": None,
+                }
+
+            def fake_acquire_dev_agent(*_args, **_kwargs):
+                return (
+                    {"agent_id": "web-agent", "execution_mode": "per-task"},
+                    {"instance_id": "web-1", "status": "idle", "service_url": "http://web-agent:8050"},
+                    "http://web-agent:8050",
+                )
+
+            def fake_a2a_send(agent_url: str, message: dict, context_id: str | None = None) -> dict:
+                captured_dev_message["agent_url"] = agent_url
+                captured_dev_message["context_id"] = context_id
+                captured_dev_message["message"] = message
+                raise StopBeforeDevLaunch("stop before launching the real web agent")
+
+            with mock.patch.object(team_lead_app, "_analyze_task", side_effect=fake_analyze), mock.patch.object(
+                team_lead_app,
+                "_call_sync_agent",
+                side_effect=fake_call_sync_agent,
+            ), mock.patch.object(team_lead_app, "_create_plan", side_effect=fake_create_plan), mock.patch.object(
+                team_lead_app,
+                "_acquire_dev_agent",
+                side_effect=fake_acquire_dev_agent,
+            ), mock.patch.object(team_lead_app, "_a2a_send", side_effect=fake_a2a_send), mock.patch.object(
+                team_lead_app,
+                "_notify_compass",
+            ), mock.patch.object(team_lead_app, "_report_progress"), mock.patch.object(
+                team_lead_app,
+                "_generate_summary",
+                return_value="workflow intercepted for test",
+            ), mock.patch.object(team_lead_app.registry, "mark_instance_busy"), mock.patch.object(
+                team_lead_app.registry,
+                "mark_instance_idle",
+            ):
+                worker = threading.Thread(
+                    target=team_lead_app._run_workflow,
+                    args=(task.task_id, ctx),
+                    daemon=True,
+                )
+                worker.start()
+
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    current = team_lead_app.task_store.get(task.task_id)
+                    if current and current.state == "TASK_STATE_INPUT_REQUIRED":
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail("Team Lead never entered TASK_STATE_INPUT_REQUIRED")
+
+                current = team_lead_app.task_store.get(task.task_id)
+                self.assertIsNotNone(current)
+                self.assertIn("tech stack", current.status_message.lower())
+                self.assertIn(
+                    ("figma.page.fetch", "Fetch design from https://www.figma.com/design/abc123/English-Study-Hub page: Practice Quiz"),
+                    agent_calls,
+                )
+
+                with team_lead_app._INPUT_EVENTS_LOCK:
+                    entry = team_lead_app._INPUT_EVENTS.get(task.task_id)
+                    self.assertIsNotNone(entry)
+                    entry["info"] = "Use Python 3.12 and Flask."
+                    entry["event"].set()
+
+                worker.join(timeout=5)
+
+            metadata = captured_dev_message["message"]["metadata"]
+            self.assertEqual(metadata["techStackConstraints"]["language"], "python")
+            self.assertEqual(metadata["techStackConstraints"]["python_version"], "3.12")
+            self.assertEqual(metadata["techStackConstraints"]["backend_framework"], "flask")
+
+            history_states = [entry["state"] for entry in team_lead_app.task_store.get(task.task_id).history]
+            self.assertIn("TASK_STATE_INPUT_REQUIRED", history_states)
+            self.assertIn("EXECUTING", history_states)
+
+    def test_team_lead_reports_missing_jira_capability_clearly(self):
+        with mock.patch.object(
+            team_lead_app.agent_directory,
+            "resolve_capability",
+            side_effect=team_lead_app.CapabilityUnavailableError("missing jira"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Required capability 'jira.ticket.fetch' is unavailable"):
+                team_lead_app._call_sync_agent(
+                    "jira.ticket.fetch",
+                    "Fetch ticket CSTL-2",
+                    "task-1",
+                    "/tmp/workspace",
+                    "compass-task-1",
+                )
+
+    def test_team_lead_reports_missing_scm_capability_clearly(self):
+        with mock.patch.object(
+            team_lead_app.agent_directory,
+            "resolve_capability",
+            side_effect=team_lead_app.CapabilityUnavailableError("missing scm"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Required capability 'scm.repo.inspect' is unavailable"):
+                team_lead_app._call_sync_agent(
+                    "scm.repo.inspect",
+                    "Inspect repository https://github.com/example/repo",
+                    "task-1",
+                    "/tmp/workspace",
+                    "compass-task-1",
+                )
+
+    def test_team_lead_finds_recovered_boundary_agent_on_next_attempt(self):
+        class FakeRegistry:
+            def __init__(self):
+                self.calls = 0
+
+            def find_any_active(self):
+                self.calls += 1
+                if self.calls <= 2:
+                    return []
+                return [
+                    {
+                        "agent_id": "jira-agent",
+                        "capabilities": ["jira.ticket.fetch"],
+                        "instances": [
+                            {
+                                "instance_id": "jira-1",
+                                "status": "idle",
+                                "service_url": "http://jira:8010",
+                            }
+                        ],
+                    }
+                ]
+
+            def get_topology(self):
+                return {"version": self.calls, "updatedAt": self.calls}
+
+        recovered_directory = team_lead_app.AgentDirectory(
+            "team-lead-agent",
+            FakeRegistry(),
+            cache_ttl_seconds=999,
+            watch_interval_seconds=999,
+        )
+
+        with mock.patch.object(team_lead_app, "agent_directory", recovered_directory), mock.patch.object(
+            team_lead_app,
+            "_a2a_send",
+            return_value={
+                "id": "jira-task-1",
+                "status": {"state": "TASK_STATE_COMPLETED"},
+                "artifacts": [{"parts": [{"text": "Recovered Jira capability."}]}],
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Required capability 'jira.ticket.fetch' is unavailable"):
+                team_lead_app._call_sync_agent(
+                    "jira.ticket.fetch",
+                    "Fetch ticket CSTL-2",
+                    "task-1",
+                    "/tmp/workspace",
+                    "compass-task-1",
+                )
+
+            result = team_lead_app._call_sync_agent(
+                "jira.ticket.fetch",
+                "Fetch ticket CSTL-2",
+                "task-1",
+                "/tmp/workspace",
+                "compass-task-1",
+            )
+
+        self.assertEqual(result["status"]["state"], "TASK_STATE_COMPLETED")
 
     def test_revision_metadata_preserves_constraints_and_workflow_requirements(self):
         metadata = team_lead_app._build_dev_task_metadata(

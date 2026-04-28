@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from compass import app as compass_app
 from common.task_store import TaskStore
@@ -76,6 +77,41 @@ class CompassDispatchTests(unittest.TestCase):
         self.assertEqual(card["currentMajorStep"], "Reviewing implementation")
         self.assertEqual(card["commandLogSections"][0]["agentId"], "team-lead")
         self.assertEqual(card["pr"]["url"], "https://github.com/example/repo/pull/9")
+
+    def test_resume_input_required_task_reuses_same_compass_task(self):
+        original_store = compass_app.task_store
+        compass_app.task_store = TaskStore()
+        try:
+            task = compass_app.task_store.create()
+            task.state = "TASK_STATE_INPUT_REQUIRED"
+            task.status_message = "Please confirm the tech stack."
+            task.downstream_task_id = "tl-task-7"
+            task.downstream_service_url = "http://team-lead:8030"
+            task.original_message = {"parts": [{"text": "Implement CSTL-2"}]}
+
+            body = {
+                "contextId": task.task_id,
+                "message": {"parts": [{"text": "Use Python Flask."}]},
+            }
+            message = body["message"]
+
+            with mock.patch.object(compass_app, "_a2a_call") as call_mock, mock.patch.object(
+                compass_app,
+                "audit_log",
+            ):
+                resumed = compass_app._resume_input_required_task(body, message)
+
+            self.assertIsNotNone(resumed)
+            self.assertEqual(resumed["id"], task.task_id)
+            self.assertEqual(compass_app.task_store.get(task.task_id).state, "TASK_STATE_WORKING")
+            self.assertEqual(compass_app.task_store.get(task.task_id).status_message, "User provided additional information. Resuming…")
+            call_mock.assert_called_once_with(
+                "http://team-lead:8030",
+                {"parts": [{"text": "Use Python Flask."}]},
+                context_id="tl-task-7",
+            )
+        finally:
+            compass_app.task_store = original_store
 
     def _write_json(self, workspace: str, relative_path: str, payload: dict) -> None:
         full_path = Path(workspace, relative_path)
