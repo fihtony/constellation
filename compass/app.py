@@ -162,6 +162,10 @@ def _path_within_base(path, base):
     return common == os.path.realpath(base)
 
 
+def _can_defer_office_path_existence_check(path):
+    return bool(os.environ.get("ARTIFACT_ROOT_HOST", "").strip()) and os.path.isabs(path)
+
+
 def _validate_office_target_paths(target_paths):
     normalized = []
     for raw_path in target_paths or []:
@@ -171,12 +175,15 @@ def _validate_office_target_paths(target_paths):
         if not os.path.isabs(path):
             return [], f"Path must be absolute: {path}"
         real_path = os.path.realpath(path)
-        if not os.path.exists(real_path):
-            return [], f"Path does not exist: {path}"
         if OFFICE_ALLOWED_BASE_PATHS and not any(
             _path_within_base(real_path, base) for base in OFFICE_ALLOWED_BASE_PATHS
         ):
             return [], f"Path is outside OFFICE_ALLOWED_BASE_PATHS: {path}"
+        if not os.path.exists(real_path):
+            if _can_defer_office_path_existence_check(real_path):
+                normalized.append(real_path)
+                continue
+            return [], f"Path does not exist: {path}"
         normalized.append(real_path)
     return _dedupe(normalized), ""
 

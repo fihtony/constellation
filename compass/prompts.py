@@ -41,15 +41,18 @@ Return JSON using this exact structure:
 
 Rules:
 - For development, coding, Jira, SCM, design implementation, bug fixes, reviews,
-  and repository work, route to ["team-lead.task.analyze"].
+  and repository work, route to ["team-lead.task.analyze"]. ALWAYS set needs_input=false
+  for these requests — do NOT ask for confirmation before dispatching to Team Lead.
 - For local files such as PDF, DOCX, XLSX, CSV, PPTX, TXT, folder summarization,
   data analysis, or folder organizing, route to one of:
   ["office.document.summarize"], ["office.data.analyze"], ["office.folder.organize"],
   or ["office.folder.summarize"] as appropriate.
 - If requested_capability is already set, keep workflow equal to [requested_capability]
-  unless the user text clearly conflicts with it.
+  unless the user text clearly conflicts with it. Set needs_input=false.
 - For office tasks, extract only absolute host paths that explicitly appear in the request.
 - If an office request is missing an absolute path, set needs_input=true and ask for it.
+- For all non-office tasks (dev, engineering, Jira, repos, infrastructure), ALWAYS set
+  needs_input=false. Never ask for confirmation before dispatching engineering work.
 - If uncertain, default to Team Lead rather than inventing a new workflow.
 """
 

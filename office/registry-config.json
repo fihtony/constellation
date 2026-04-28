@@ -7,7 +7,20 @@
     "port": 8060,
     "command": ["python3", "office/app.py"],
     "mountDockerSocket": false,
-    "passThroughEnv": ["ARTIFACT_ROOT_HOST", "ARTIFACT_ROOT", "COPILOT_GITHUB_TOKEN", "TZ"],
+    "passThroughEnv": [
+      "ARTIFACT_ROOT_HOST",
+      "ARTIFACT_ROOT",
+      "COPILOT_GITHUB_TOKEN",
+      "AGENT_RUNTIME",
+      "AGENT_MODEL",
+      "COPILOT_MODEL",
+      "OPENAI_MODEL",
+      "OPENAI_BASE_URL",
+      "OPENAI_API_KEY",
+      "ALLOW_MOCK_FALLBACK",
+      "LOCAL_TIMEZONE",
+      "TZ"
+    ],
     "env": {}
   },
   "scalingPolicy": {

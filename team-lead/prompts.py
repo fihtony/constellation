@@ -224,7 +224,7 @@ Respond with a JSON object:
 Rules:
 - dev_instruction must be detailed enough for the dev agent to act without further clarification.
 - acceptance_criteria must be measurable and verifiable.
-- If platform cannot be determined from context, default to "android".
+- If platform cannot be determined from context, default to "web".
 - Always include the target_repo_url in dev_instruction if it is known.
 - If the Jira ticket or user request explicitly specifies a tech stack, treat it as a hard requirement.
 - Do NOT infer React, Next.js, or Node.js from a sparse repo, a design-tool reference, or the word "web" alone.

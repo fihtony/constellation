@@ -2024,7 +2024,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             tech_stack_constraints=tech_stack_constraints,
         )
         ctx.plan = plan
-        dev_capability = plan.get("dev_capability") or "android.task.execute"
+        dev_capability = plan.get("dev_capability") or "web.task.execute"
         log(
             f"Plan ready — platform={plan.get('platform')}, "
             f"capability={dev_capability}"

@@ -47,6 +47,8 @@ reporter = InstanceReporter(
 )
 
 _SERVER: ThreadingHTTPServer | None = None
+_WRITE_ROOTS_LOCK = threading.Lock()
+_ACTIVE_WRITE_ROOTS: set[str] = set()
 
 
 def audit_log(event: str, **kwargs):
@@ -90,12 +92,19 @@ def _parse_json(text: str) -> dict:
         return {}
 
 
-def _run_agentic_json(prompt: str, actor: str, *, system_prompt: str, context: dict | None = None) -> dict:
+def _run_agentic_json(
+    prompt: str,
+    actor: str,
+    *,
+    system_prompt: str,
+    context: dict | None = None,
+    timeout: int = 180,
+) -> dict:
     result = get_runtime().run(
         prompt=prompt,
         context=context,
         system_prompt=system_prompt,
-        timeout=180,
+        timeout=timeout,
         max_tokens=4096,
     )
     for warning in result.get("warnings") or []:
@@ -256,16 +265,76 @@ def _read_txt(path: str) -> str:
         return handle.read()
 
 
-def _read_csv_rows(path: str, limit: int = 100) -> tuple[list[dict], list[str]]:
+def _read_csv_rows(path: str, limit: int | None = 100) -> tuple[list[dict], list[str]]:
     encoding = _detect_encoding(path)
     with open(path, "r", encoding=encoding, newline="", errors="replace") as handle:
         reader = csv.DictReader(handle)
         rows = []
         for row in reader:
             rows.append(dict(row))
-            if len(rows) >= limit:
+            if limit is not None and len(rows) >= limit:
                 break
         return rows, list(reader.fieldnames or [])
+
+
+def _coerce_float(value) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = text.replace(",", "").replace("$", "")
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_grouped_numeric_totals(rows: list[dict], fields: list[str], numeric_fields: list[str], max_groups: int = 20) -> dict:
+    grouped_totals: dict[str, dict[str, list[dict]]] = {}
+    for field in fields:
+        if field in numeric_fields:
+            continue
+        unique_values = []
+        seen = set()
+        for row in rows:
+            value = str(row.get(field) or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            unique_values.append(value)
+            if len(unique_values) > max_groups:
+                break
+        if len(unique_values) < 2 or len(unique_values) > max_groups:
+            continue
+
+        field_totals: dict[str, list[dict]] = {}
+        for numeric_field in numeric_fields:
+            buckets: dict[str, dict[str, float]] = {}
+            for row in rows:
+                group = str(row.get(field) or "").strip()
+                numeric_value = _coerce_float(row.get(numeric_field))
+                if not group or numeric_value is None:
+                    continue
+                bucket = buckets.setdefault(group, {"sum": 0.0, "count": 0.0})
+                bucket["sum"] += numeric_value
+                bucket["count"] += 1.0
+            if not buckets:
+                continue
+            ranked = sorted(
+                (
+                    {
+                        "group": group,
+                        "sum": round(values["sum"], 4),
+                        "count": int(values["count"]),
+                        "avg": round(values["sum"] / values["count"], 4),
+                    }
+                    for group, values in buckets.items()
+                ),
+                key=lambda item: (-item["sum"], item["group"]),
+            )
+            field_totals[numeric_field] = ranked[:max_groups]
+        if field_totals:
+            grouped_totals[field] = field_totals
+    return grouped_totals
 
 
 def _read_excel_workbook(path: str, limit_rows: int = 100) -> dict[str, list[list[object]]]:
@@ -454,16 +523,15 @@ def _collect_files(target_paths: list[str], *, allow_any: bool = False) -> tuple
 
 
 def _build_csv_profile(path: str) -> dict:
-    rows, fields = _read_csv_rows(path, limit=200)
+    rows, fields = _read_csv_rows(path, limit=None)
     numeric_stats = {}
     for field in fields:
         numeric_values = []
         for row in rows:
-            raw_value = row.get(field)
-            try:
-                numeric_values.append(float(str(raw_value)))
-            except (TypeError, ValueError):
+            numeric_value = _coerce_float(row.get(field))
+            if numeric_value is None:
                 continue
+            numeric_values.append(numeric_value)
         if numeric_values:
             numeric_stats[field] = {
                 "count": len(numeric_values),
@@ -471,12 +539,14 @@ def _build_csv_profile(path: str) -> dict:
                 "max": max(numeric_values),
                 "avg": round(sum(numeric_values) / len(numeric_values), 4),
             }
+    numeric_fields = list(numeric_stats)
     return {
         "path": path,
         "fields": fields,
         "rowCountPreview": len(rows),
         "sampleRows": rows[:10],
         "numericStats": numeric_stats,
+        "groupedNumericTotals": _build_grouped_numeric_totals(rows, fields, numeric_fields),
     }
 
 
@@ -499,13 +569,14 @@ def _build_workbook_profile(path: str) -> dict:
     return {"path": path, "sheets": sheet_profiles}
 
 
-def _extract_txt_fragments(path: str) -> list[dict]:
+def _extract_txt_fragments(path: str, fragment_prefix: str | None = None) -> list[dict]:
     text = _read_txt(path)
     lines = text.splitlines()
     fragments = []
     current_title = ""
     current_lines: list[str] = []
     index = 0
+    normalized_prefix = str(fragment_prefix or os.path.basename(path)).replace(os.sep, "/")
 
     def _flush():
         nonlocal index, current_title, current_lines
@@ -516,7 +587,7 @@ def _extract_txt_fragments(path: str) -> list[dict]:
             return
         index += 1
         fragments.append({
-            "fragmentId": f"{os.path.basename(path)}::{index}",
+            "fragmentId": f"{normalized_prefix}::{index}",
             "title": current_title,
             "sourcePath": path,
             "content": body,
@@ -537,7 +608,10 @@ def _extract_txt_fragments(path: str) -> list[dict]:
 
 def _build_organize_context(target_paths: list[str]) -> tuple[dict, list[str]]:
     files, warnings = _collect_files(target_paths, allow_any=True)
-    roots = [path if os.path.isdir(path) else os.path.dirname(path) for path in target_paths]
+    roots = [
+        os.path.realpath(path if os.path.isdir(path) else os.path.dirname(path))
+        for path in target_paths
+    ]
     common_root = os.path.commonpath(roots)
     inventory = []
     fragments = []
@@ -550,13 +624,31 @@ def _build_organize_context(target_paths: list[str]) -> tuple[dict, list[str]]:
             "sizeBytes": os.path.getsize(path),
         })
         if path.lower().endswith(".txt"):
-            fragments.extend(_extract_txt_fragments(path))
+            fragments.extend(_extract_txt_fragments(path, fragment_prefix=relative))
     return {
         "commonRoot": common_root,
         "files": inventory,
         "fragments": fragments,
         "allowedActions": ["mkdir", "copy_file", "write_text", "write_fragment"],
     }, warnings
+
+
+def _runtime_organize_context(organize_context: dict, preview_chars: int = 800) -> dict:
+    runtime_fragments = []
+    for fragment in organize_context.get("fragments", []):
+        preview = str(fragment.get("preview") or fragment.get("content") or "")[:preview_chars]
+        runtime_fragments.append({
+            "fragmentId": fragment.get("fragmentId"),
+            "title": fragment.get("title"),
+            "sourcePath": fragment.get("sourcePath"),
+            "preview": preview,
+        })
+    return {
+        "commonRoot": organize_context.get("commonRoot"),
+        "files": organize_context.get("files") or [],
+        "fragments": runtime_fragments,
+        "allowedActions": organize_context.get("allowedActions") or [],
+    }
 
 
 def _validate_actions(actions: list[dict], organize_context: dict) -> None:
@@ -580,13 +672,41 @@ def _write_warnings(metadata: dict, warnings: list[str]) -> None:
         _save_audit_file(metadata, "warnings.md", "\n".join(f"- {item}" for item in warnings) + "\n")
 
 
+def _normalize_generated_text_content(content: str) -> str:
+    text = str(content or "")
+    if "\\n" not in text and "\\r" not in text and "\\t" not in text:
+        return text
+    if "\n" in text or "\r" in text:
+        return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+
+
 def _non_overwrite_path(path: str) -> str:
     """Return path unchanged if it doesn't exist; otherwise append a compact timestamp suffix."""
     if not os.path.exists(path):
         return path
     base, ext = os.path.splitext(path)
     ts = local_iso_timestamp().replace(":", "").replace("-", "")[:15]
-    return f"{base}-{ts}{ext}"
+    candidate = f"{base}-{ts}{ext}"
+    index = 1
+    while os.path.exists(candidate):
+        candidate = f"{base}-{ts}-{index}{ext}"
+        index += 1
+    return candidate
+
+
+def _acquire_write_root(path: str) -> None:
+    normalized = os.path.realpath(path)
+    with _WRITE_ROOTS_LOCK:
+        if normalized in _ACTIVE_WRITE_ROOTS:
+            raise RuntimeError(f"Another Office task is already writing to: {normalized}")
+        _ACTIVE_WRITE_ROOTS.add(normalized)
+
+
+def _release_write_root(path: str) -> None:
+    normalized = os.path.realpath(path)
+    with _WRITE_ROOTS_LOCK:
+        _ACTIVE_WRITE_ROOTS.discard(normalized)
 
 
 def _artifact_metadata(metadata: dict, capability: str, task_id: str) -> dict:
@@ -605,6 +725,23 @@ def _target_output_dir(metadata: dict, target_paths: list[str], output_mode: str
     output_root = os.path.commonpath(roots)
     os.makedirs(output_root, exist_ok=True)
     return output_root
+
+
+def _write_manifest(output_root: str, task_id: str, output_mode: str, manifest_entries: list[dict]) -> None:
+    manifest_path = os.path.join(output_root, ".office-agent-manifest.json")
+    _write_text_file(
+        manifest_path,
+        json.dumps(
+            {
+                "taskId": task_id,
+                "outputMode": output_mode,
+                "executedActions": manifest_entries,
+                "updatedAt": local_iso_timestamp(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
 
 
 def _execute_summary(capability: str, user_text: str, metadata: dict, task_id: str) -> dict:
@@ -743,7 +880,8 @@ def _execute_organize(capability: str, user_text: str, metadata: dict, task_id: 
         prompts.ORGANIZE_TEMPLATE.format(user_text=user_text),
         "organize",
         system_prompt=build_system_prompt(prompts.ORGANIZE_SYSTEM, "office"),
-        context={"inventory": organize_context},
+        context={"inventory": _runtime_organize_context(organize_context)},
+        timeout=300,
     )
     actions = response.get("actions") or []
     if not isinstance(actions, list):
@@ -763,18 +901,28 @@ def _execute_organize(capability: str, user_text: str, metadata: dict, task_id: 
     fragments = {item["fragmentId"]: item for item in organize_context.get("fragments", [])}
     for action in actions:
         action_name = action.get("action")
-        destination = _safe_output_path(output_root, action.get("destination") or "")
+        requested_destination = action.get("destination") or ""
+        destination = _safe_output_path(output_root, requested_destination)
+        if action_name in {"copy_file", "write_text", "write_fragment"}:
+            resolved_destination = _non_overwrite_path(destination)
+            if resolved_destination != destination:
+                warnings.append(
+                    "Avoided overwrite for "
+                    f"{requested_destination}; wrote to {os.path.relpath(resolved_destination, output_root)} instead."
+                )
+            destination = resolved_destination
         if action_name == "mkdir":
             os.makedirs(destination, exist_ok=True)
         elif action_name == "copy_file":
             os.makedirs(os.path.dirname(destination), exist_ok=True)
             shutil.copy2(str(action.get("source")), destination)
         elif action_name == "write_text":
-            _write_text_file(destination, str(action.get("content") or ""))
+            _write_text_file(destination, _normalize_generated_text_content(str(action.get("content") or "")))
         elif action_name == "write_fragment":
             fragment = fragments[str(action.get("fragment_id"))]
             _write_text_file(destination, fragment.get("content", ""))
         manifest_entries.append({"action": action_name, "destination": destination, "ts": local_iso_timestamp()})
+        _write_manifest(output_root, task_id, output_mode, manifest_entries)
         # For inplace mode append per-step progress to command-log for human recoverability (§9.6).
         if output_mode == "inplace":
             _append_command_log(metadata, f"Executed {action_name} → {destination}")
@@ -785,20 +933,6 @@ def _execute_organize(capability: str, user_text: str, metadata: dict, task_id: 
     warnings.extend(str(item) for item in (response.get("warnings") or []) if str(item).strip())
     _write_text_file(os.path.join(_audit_dir(metadata), "organize-report.md"), summary_markdown)
     _write_warnings(metadata, warnings)
-    manifest_path = os.path.join(output_root, ".office-agent-manifest.json")
-    _write_text_file(
-        manifest_path,
-        json.dumps(
-            {
-                "taskId": task_id,
-                "outputMode": output_mode,
-                "executedActions": manifest_entries,
-                "updatedAt": local_iso_timestamp(),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-    )
     return {
         "summary": f"Organize plan executed at {output_root}",
         "artifacts": [
@@ -817,6 +951,7 @@ def _execute_capability(task_id: str, message: dict) -> dict:
     capability = str(metadata.get("requestedCapability") or "").strip()
     user_text = extract_text(message)
     input_root = str(metadata.get("officeInputRoot") or INPUT_ROOT).strip() or INPUT_ROOT
+    output_mode = str(metadata.get("officeOutputMode") or "workspace")
     if not capability:
         raise RuntimeError("Office task is missing requestedCapability metadata.")
 
@@ -828,19 +963,28 @@ def _execute_capability(task_id: str, message: dict) -> dict:
             raise RuntimeError(f"Target path escapes mounted input root: {path}")
 
     metadata["officeTargetPaths"] = target_paths
-    _append_command_log(metadata, f"Starting capability {capability}")
-    _update_stage_summary(metadata, task_id, "preflight", capability=capability, outputMode=metadata.get("officeOutputMode"))
+    write_root = ""
+    if output_mode == "inplace":
+        write_root = _target_output_dir(metadata, target_paths, output_mode)
+        _acquire_write_root(write_root)
 
-    if capability in {"office.document.summarize", "office.folder.summarize"}:
-        _update_stage_summary(metadata, task_id, "summarizing", capability=capability)
-        return _execute_summary(capability, user_text, metadata, task_id)
-    if capability == "office.data.analyze":
-        _update_stage_summary(metadata, task_id, "analyzing", capability=capability)
-        return _execute_analysis(capability, user_text, metadata, task_id)
-    if capability == "office.folder.organize":
-        _update_stage_summary(metadata, task_id, "organizing", capability=capability)
-        return _execute_organize(capability, user_text, metadata, task_id)
-    raise RuntimeError(f"Unsupported Office capability: {capability}")
+    try:
+        _append_command_log(metadata, f"Starting capability {capability}")
+        _update_stage_summary(metadata, task_id, "preflight", capability=capability, outputMode=metadata.get("officeOutputMode"))
+
+        if capability in {"office.document.summarize", "office.folder.summarize"}:
+            _update_stage_summary(metadata, task_id, "summarizing", capability=capability)
+            return _execute_summary(capability, user_text, metadata, task_id)
+        if capability == "office.data.analyze":
+            _update_stage_summary(metadata, task_id, "analyzing", capability=capability)
+            return _execute_analysis(capability, user_text, metadata, task_id)
+        if capability == "office.folder.organize":
+            _update_stage_summary(metadata, task_id, "organizing", capability=capability)
+            return _execute_organize(capability, user_text, metadata, task_id)
+        raise RuntimeError(f"Unsupported Office capability: {capability}")
+    finally:
+        if write_root:
+            _release_write_root(write_root)
 
 
 def _run_workflow(task_id: str, message: dict):

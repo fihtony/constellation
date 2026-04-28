@@ -48,6 +48,8 @@ Return JSON using this exact structure:
 
 Rules:
 - Reference the user's requested ranking, trends, or findings when present.
+- Treat groupedNumericTotals and numericStats as authoritative for full-dataset rankings when available.
+- Use sampleRows only as supporting examples, not as the basis for claiming the full dataset is insufficient.
 - If the data is insufficient for a requested conclusion, say so explicitly in the report.
 """
 

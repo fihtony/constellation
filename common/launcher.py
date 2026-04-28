@@ -177,6 +177,11 @@ class Launcher:
         # themselves launch nested per-task agents (web, android).
         if launch_spec.get("mountDockerSocket", True) and os.path.exists(self.socket_path):
             binds.append(f"{self.socket_path}:{self.socket_path}")
+            # Grant the container's process access to the Docker socket.
+            # Inside Docker Desktop the socket is owned by root:root (0:0) with
+            # 0660 permissions.  Adding GID 0 as a supplemental group lets a
+            # non-root appuser write to it without running as root.
+            payload["HostConfig"]["GroupAdd"] = ["0"]
         for bind in launch_spec.get("extraBinds", []) or []:
             bind_text = str(bind or "").strip()
             if bind_text:

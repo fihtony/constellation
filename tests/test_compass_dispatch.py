@@ -204,6 +204,68 @@ class CompassDispatchTests(unittest.TestCase):
         finally:
             compass_app.task_store = original_store
 
+    def test_route_and_dispatch_office_missing_path_prompts_for_clarification(self):
+        original_store = compass_app.task_store
+        compass_app.task_store = TaskStore()
+        try:
+            with tempfile.TemporaryDirectory(prefix="compass_office_clarify_") as workspace, \
+                 mock.patch.object(compass_app, "_create_shared_workspace", return_value=workspace), \
+                 mock.patch.object(compass_app, "_route_with_runtime", return_value={
+                     "summary": "Summarize the local document.",
+                     "workflow": ["office.document.summarize"],
+                     "task_type": "office",
+                     "office_subtype": "summarize",
+                     "target_paths": [],
+                     "needs_input": True,
+                     "input_question": "Please provide the absolute path to the document.",
+                 }), \
+                 mock.patch.object(compass_app, "audit_log"), \
+                 mock.patch.object(compass_app, "record_workspace_stage"):
+                task_dict = compass_app.route_and_dispatch(
+                    {"parts": [{"text": "Summarize my local report"}]}
+                )
+
+            self.assertEqual(task_dict["status"]["state"], "TASK_STATE_INPUT_REQUIRED")
+            self.assertIn("absolute path", task_dict["status"]["message"]["parts"][0]["text"])
+            self.assertEqual(task_dict["routerContext"]["awaitingStep"], "clarify_path")
+            self.assertEqual(task_dict["routerContext"]["requestedCapability"], "office.document.summarize")
+        finally:
+            compass_app.task_store = original_store
+
+    def test_validate_office_target_paths_rejects_relative_path(self):
+        paths, error = compass_app._validate_office_target_paths(["docs/report.txt"])
+        self.assertEqual(paths, [])
+        self.assertIn("Path must be absolute", error)
+
+    def test_validate_office_target_paths_defers_missing_host_path_when_containerized(self):
+        host_path = "/Users/tony/projects/constellation/tests/data/csv/sales_data.csv"
+        with mock.patch.dict(os.environ, {"ARTIFACT_ROOT_HOST": "/Users/tony/projects/constellation/artifacts"}, clear=False), \
+             mock.patch.object(compass_app.os.path, "exists", return_value=False):
+            paths, error = compass_app._validate_office_target_paths([host_path])
+
+        self.assertEqual(paths, [host_path])
+        self.assertEqual(error, "")
+
+    def test_validate_office_target_paths_rejects_outside_whitelist(self):
+        with tempfile.TemporaryDirectory(prefix="compass_allow_") as allowed, tempfile.TemporaryDirectory(prefix="compass_other_") as other:
+            outside = Path(other, "report.txt")
+            outside.write_text("secret", encoding="utf-8")
+            with mock.patch.object(compass_app, "OFFICE_ALLOWED_BASE_PATHS", [allowed]):
+                paths, error = compass_app._validate_office_target_paths([str(outside)])
+            self.assertEqual(paths, [])
+            self.assertIn("outside OFFICE_ALLOWED_BASE_PATHS", error)
+
+    def test_validate_office_target_paths_rejects_symlink_escape(self):
+        with tempfile.TemporaryDirectory(prefix="compass_allow_") as allowed, tempfile.TemporaryDirectory(prefix="compass_other_") as other:
+            outside = Path(other, "report.txt")
+            outside.write_text("secret", encoding="utf-8")
+            link = Path(allowed, "linked-report.txt")
+            link.symlink_to(outside)
+            with mock.patch.object(compass_app, "OFFICE_ALLOWED_BASE_PATHS", [allowed]):
+                paths, error = compass_app._validate_office_target_paths([str(link)])
+            self.assertEqual(paths, [])
+            self.assertIn("outside OFFICE_ALLOWED_BASE_PATHS", error)
+
     def test_resume_input_required_office_workspace_reuses_same_task(self):
         original_store = compass_app.task_store
         compass_app.task_store = TaskStore()

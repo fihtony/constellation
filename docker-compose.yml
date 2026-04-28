@@ -73,6 +73,8 @@ services:
     volumes:
       - ./artifacts:/app/artifacts
       - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "0"
     labels:
       constellation.agent_id: "compass-agent"
       constellation.agent_name: "Compass Agent"
