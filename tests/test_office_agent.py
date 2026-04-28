@@ -185,7 +185,7 @@ class TestExecuteOrganize(unittest.TestCase):
                 "warnings": [],
             }):
                 result = office_app._execute_capability("task-3", message)
-            output_file = Path(workspace, "office-agent", "organized-output", "students", "Yan", "essay_0103.txt")
+            output_file = Path(workspace, "office-agent", "organized-output", "files", "students", "Yan", "essay_0103.txt")
             plan_file = Path(workspace, "office-agent", "operations-plan.json")
             self.assertTrue(output_file.is_file())
             self.assertTrue(plan_file.is_file())
@@ -225,14 +225,13 @@ class TestExecuteOrganize(unittest.TestCase):
                 office_app._execute_capability("task-order", message)
             self.assertTrue(written_before_action, "operations-plan.json was not saved before action writes")
 
-    def test_copy_file_action(self):
-        """copy_file action copies a source file to a destination inside output root."""
+    def test_rejects_copy_file_action(self):
+        """copy_file is no longer allowed because organize must not duplicate source files."""
         with tempfile.TemporaryDirectory(prefix="office_copy_") as workspace:
             src_dir = Path(workspace, "src")
             src_dir.mkdir()
             source_file = src_dir / "doc.txt"
             source_file.write_text("Content to copy.", encoding="utf-8")
-            organize_context, _ = office_app._build_organize_context([str(src_dir)])
             message = _make_message("office.folder.organize", [str(src_dir)], workspace)
             with mock.patch.object(office_app, "_run_agentic_json", return_value={
                 "summary_markdown": "Copied.",
@@ -245,10 +244,8 @@ class TestExecuteOrganize(unittest.TestCase):
                 ],
                 "warnings": [],
             }):
-                result = office_app._execute_capability("task-copy", message)
-            dest = Path(workspace, "office-agent", "organized-output", "archive", "doc.txt")
-            self.assertTrue(dest.is_file())
-            self.assertEqual(dest.read_text(encoding="utf-8"), "Content to copy.")
+                with self.assertRaises(RuntimeError):
+                    office_app._execute_capability("task-copy", message)
 
     def test_inplace_mode_writes_to_source_dir(self):
         """In inplace outputMode, organised files are created inside the source directory tree."""
@@ -273,9 +270,35 @@ class TestExecuteOrganize(unittest.TestCase):
                 "warnings": [],
             }):
                 result = office_app._execute_capability("task-ip", message)
-            out_file = src_dir / "people" / "alice.txt"
+            out_file = src_dir / "organized-output" / "files" / "people" / "alice.txt"
             self.assertTrue(out_file.is_file())
             self.assertIn("Hi", out_file.read_text(encoding="utf-8"))
+            self.assertTrue((Path(workspace) / "office-agent" / "command-log.txt").is_file())
+            self.assertFalse((src_dir / "command-log.txt").exists())
+
+    def test_workspace_mode_strips_runtime_wrapper_dirs(self):
+        with tempfile.TemporaryDirectory(prefix="office_schema_") as workspace:
+            src_dir = Path(workspace, "src")
+            src_dir.mkdir()
+            (src_dir / "a.txt").write_text(">>> Student Ethan\nEssay\n", encoding="utf-8")
+            organize_context, _ = office_app._build_organize_context([str(src_dir)])
+            fragment = organize_context["fragments"][0]
+            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
+            with mock.patch.object(office_app, "_run_agentic_json", return_value={
+                "summary_markdown": "Done.",
+                "actions": [
+                    {
+                        "action": "write_fragment",
+                        "fragment_id": fragment["fragmentId"],
+                        "destination": "grouped/Ethan/0103/Ethan_1.txt",
+                    }
+                ],
+                "warnings": [],
+            }):
+                office_app._execute_capability("task-schema", message)
+            canonical = Path(workspace, "office-agent", "organized-output", "files", "Ethan", "0103", "Ethan_1.txt")
+            self.assertTrue(canonical.is_file())
+            self.assertFalse((Path(workspace, "office-agent", "organized-output", "grouped")).exists())
 
     def test_organize_conflict_avoidance_renames_existing_file(self):
         """Organize must not overwrite an existing output file; it creates a renamed copy instead."""
@@ -285,7 +308,7 @@ class TestExecuteOrganize(unittest.TestCase):
             (src_dir / "a.txt").write_text(">>> Alice\nEssay\n", encoding="utf-8")
             organize_context, _ = office_app._build_organize_context([str(src_dir)])
             fragment = organize_context["fragments"][0]
-            dest_dir = Path(workspace, "office-agent", "organized-output", "students", "Alice")
+            dest_dir = Path(workspace, "office-agent", "organized-output", "files", "students", "Alice")
             dest_dir.mkdir(parents=True, exist_ok=True)
             existing = dest_dir / "essay.txt"
             existing.write_text("existing", encoding="utf-8")
@@ -394,7 +417,7 @@ class TestExecuteOrganize(unittest.TestCase):
                 "warnings": [],
             }):
                 office_app._execute_capability("task-readme", message)
-            readme = Path(workspace, "office-agent", "organized-output", "students", "Yan", "README.txt")
+            readme = Path(workspace, "office-agent", "organized-output", "files", "students", "Yan", "README.txt")
             self.assertEqual(readme.read_text(encoding="utf-8"), "Line one\n\nLine two")
 
     def test_rejects_unsupported_action(self):

@@ -49,6 +49,18 @@ reporter = InstanceReporter(
 _SERVER: ThreadingHTTPServer | None = None
 _WRITE_ROOTS_LOCK = threading.Lock()
 _ACTIVE_WRITE_ROOTS: set[str] = set()
+_ORGANIZE_SCHEMA_ROOT = "files"
+_ORGANIZE_WRAPPER_SEGMENTS = {
+    "organized-output",
+    "grouped",
+    "by-student",
+    "originals",
+    "output",
+    "outputs",
+    "results",
+    "workspace",
+    "final",
+}
 
 
 def audit_log(event: str, **kwargs):
@@ -629,7 +641,7 @@ def _build_organize_context(target_paths: list[str]) -> tuple[dict, list[str]]:
         "commonRoot": common_root,
         "files": inventory,
         "fragments": fragments,
-        "allowedActions": ["mkdir", "copy_file", "write_text", "write_fragment"],
+        "allowedActions": ["mkdir", "write_text", "write_fragment"],
     }, warnings
 
 
@@ -651,18 +663,30 @@ def _runtime_organize_context(organize_context: dict, preview_chars: int = 800) 
     }
 
 
+def _canonicalize_organize_destination(destination: str) -> str:
+    relative = str(destination or "").strip().replace("\\", "/")
+    if not relative or os.path.isabs(relative):
+        raise RuntimeError(f"Unsafe organize destination: {destination}")
+    parts = [part for part in relative.split("/") if part and part != "."]
+    if not parts or ".." in parts:
+        raise RuntimeError(f"Unsafe organize destination: {destination}")
+    while len(parts) > 1 and parts[0].lower() in _ORGANIZE_WRAPPER_SEGMENTS:
+        parts = parts[1:]
+    normalized = "/".join(parts)
+    if normalized == _ORGANIZE_SCHEMA_ROOT:
+        raise RuntimeError(f"Unsafe organize destination: {destination}")
+    if normalized.startswith(f"{_ORGANIZE_SCHEMA_ROOT}/"):
+        return normalized
+    return f"{_ORGANIZE_SCHEMA_ROOT}/{normalized}"
+
+
 def _validate_actions(actions: list[dict], organize_context: dict) -> None:
-    valid_sources = {item["sourcePath"] for item in organize_context.get("files", [])}
     valid_fragments = {item["fragmentId"] for item in organize_context.get("fragments", [])}
     for action in actions:
         action_name = str(action.get("action") or "").strip()
-        if action_name not in {"mkdir", "copy_file", "write_text", "write_fragment"}:
+        if action_name not in {"mkdir", "write_text", "write_fragment"}:
             raise RuntimeError(f"Unsupported organize action: {action_name}")
-        destination = str(action.get("destination") or "").strip()
-        if not destination or os.path.isabs(destination) or ".." in destination.split("/"):
-            raise RuntimeError(f"Unsafe organize destination: {destination}")
-        if action_name == "copy_file" and os.path.realpath(str(action.get("source") or "")) not in valid_sources:
-            raise RuntimeError(f"Unknown organize source path: {action.get('source')}")
+        _canonicalize_organize_destination(str(action.get("destination") or ""))
         if action_name == "write_fragment" and str(action.get("fragment_id") or "") not in valid_fragments:
             raise RuntimeError(f"Unknown organize fragment id: {action.get('fragment_id')}")
 
@@ -890,7 +914,7 @@ def _execute_organize(capability: str, user_text: str, metadata: dict, task_id: 
 
     output_mode = str(metadata.get("officeOutputMode") or "workspace")
     base_output_root = _target_output_dir(metadata, target_paths, output_mode)
-    output_root = os.path.join(base_output_root, "organized-output") if output_mode == "workspace" else base_output_root
+    output_root = os.path.join(base_output_root, "organized-output")
     os.makedirs(output_root, exist_ok=True)
 
     # Persist the validated plan BEFORE any writes (required by design — R8 / §9.6).
@@ -901,9 +925,9 @@ def _execute_organize(capability: str, user_text: str, metadata: dict, task_id: 
     fragments = {item["fragmentId"]: item for item in organize_context.get("fragments", [])}
     for action in actions:
         action_name = action.get("action")
-        requested_destination = action.get("destination") or ""
+        requested_destination = _canonicalize_organize_destination(str(action.get("destination") or ""))
         destination = _safe_output_path(output_root, requested_destination)
-        if action_name in {"copy_file", "write_text", "write_fragment"}:
+        if action_name in {"write_text", "write_fragment"}:
             resolved_destination = _non_overwrite_path(destination)
             if resolved_destination != destination:
                 warnings.append(
@@ -913,15 +937,17 @@ def _execute_organize(capability: str, user_text: str, metadata: dict, task_id: 
             destination = resolved_destination
         if action_name == "mkdir":
             os.makedirs(destination, exist_ok=True)
-        elif action_name == "copy_file":
-            os.makedirs(os.path.dirname(destination), exist_ok=True)
-            shutil.copy2(str(action.get("source")), destination)
         elif action_name == "write_text":
             _write_text_file(destination, _normalize_generated_text_content(str(action.get("content") or "")))
         elif action_name == "write_fragment":
             fragment = fragments[str(action.get("fragment_id"))]
             _write_text_file(destination, fragment.get("content", ""))
-        manifest_entries.append({"action": action_name, "destination": destination, "ts": local_iso_timestamp()})
+        manifest_entries.append({
+            "action": action_name,
+            "destination": destination,
+            "relativeDestination": requested_destination,
+            "ts": local_iso_timestamp(),
+        })
         _write_manifest(output_root, task_id, output_mode, manifest_entries)
         # For inplace mode append per-step progress to command-log for human recoverability (§9.6).
         if output_mode == "inplace":

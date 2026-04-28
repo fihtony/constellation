@@ -73,7 +73,6 @@ Return JSON using this exact structure:
   "summary_markdown": "Markdown explanation of the plan",
   "actions": [
     {{"action": "mkdir", "destination": "relative/path"}},
-    {{"action": "copy_file", "source": "known-source-path", "destination": "relative/path"}},
     {{"action": "write_text", "destination": "relative/path", "content": "text"}},
     {{"action": "write_fragment", "fragment_id": "known-fragment-id", "destination": "relative/path"}}
   ],
@@ -81,8 +80,12 @@ Return JSON using this exact structure:
 }}
 
 Rules:
+- Infer the grouping logic from the user's request plus the provided inventory and fragment previews.
+- Do not assume any fixed source folder name or fixed source layout pattern.
 - Use only the provided source paths and fragment ids.
 - Destinations must always be relative paths under the allowed output root.
+- Do not duplicate the original source tree into the output.
+- Do not emit wrapper folders such as grouped, by-student, originals, organized-output, output, or results.
 - Prefer preserving originals. Do not plan deletions.
 - Use write_fragment when a source text file contains multiple logical sub-documents.
 """
