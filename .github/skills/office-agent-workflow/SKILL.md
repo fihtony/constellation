@@ -45,19 +45,21 @@ This skill covers:
 - Office Agent must never execute arbitrary shell commands from runtime output.
 - Organize plans must be validated against a strict action allowlist before any writes:
   - `mkdir`
-  - `copy_file`
   - `write_text`
   - `write_fragment`
 - Destinations must always be relative to the approved output root.
 - Default behavior preserves originals. MVP does not delete source files.
-- `copy_file` source validation uses `os.path.realpath()` before checking the allowlist.
+- Workspace-mode organize must not duplicate the original source tree into `organized-output/`.
+- Organize destinations are normalized into a single schema root: `organized-output/files/`.
+- In-place mode writes only final user-facing outputs under the source folder; audit files stay in the workspace audit dir.
 
 ---
 
 ## Output Conflict Protection
 
 - `_non_overwrite_path(path)` appends a compact timestamp suffix when the target file already exists.
-- Workspace mode writes `summary.md` / `analysis.md` (no task-id suffix); inplace mode uses `summary-{task_id}.md` to avoid collisions.
+- Workspace and inplace modes both default to `summary.md` / `analysis.md`; `_non_overwrite_path(path)` avoids collisions by renaming only when the target already exists.
+- For organize, final files live under `organized-output/files/` in both workspace and inplace modes.
 - For organize, the `.office-agent-manifest.json` always reflects the final executed actions.
 - Organize fragment ids must be unique across the full source tree; use relative source-path prefixes instead of bare basenames to avoid cross-folder collisions like `0103/1.txt::1` vs `0110/1.txt::1`.
 
@@ -134,6 +136,12 @@ Run the focused unit tests first:
   tests.test_env_isolation
 ```
 
+Then run the Office end-to-end flow through Compass, including inplace writes:
+
+```bash
+/Users/tony/projects/constellation/venv/bin/python tests/test_office_agent_e2e.py -v
+```
+
 Build the Office Agent image when validating container wiring:
 
 ```bash
@@ -147,6 +155,7 @@ Build the Office Agent image when validating container wiring:
 - Office task stays in `TASK_STATE_INPUT_REQUIRED` because the path is not absolute.
 - Office launch fails because `OFFICE_ALLOWED_BASE_PATHS` rejects the selected path.
 - Office organize fails because runtime returned an unsafe destination such as `../...`.
+- Office organize unexpectedly produces `grouped/`, `by-student/`, or `originals/` at the output root because destination normalization regressed.
 - Workspace output is missing because `ARTIFACT_ROOT_HOST` was not configured for Compass.
 - In-place mode was requested but the user denied write permission.
-- `copy_file` action fails validation because the source path uses a symlink alias vs realpath — validate both paths agree under realpath normalization.
+- In-place final outputs are missing from the user folder because the test looked for the Compass task id instead of the Office child-task file name or glob pattern.

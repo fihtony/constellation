@@ -62,8 +62,8 @@ class TestExecuteSummary(unittest.TestCase):
             self.assertIn("Summary created", result["summary"])
             self.assertEqual(result["artifacts"][0]["metadata"]["capability"], "office.folder.summarize")
 
-    def test_inplace_output_uses_task_id_suffix(self):
-        """In inplace mode the output filename embeds the task id."""
+    def test_inplace_output_uses_default_filename(self):
+        """In inplace mode the output filename is written next to the source using the default name."""
         with tempfile.TemporaryDirectory(prefix="office_inplace_") as workspace:
             source = Path(workspace, "report.txt")
             source.write_text("Content here.", encoding="utf-8")
@@ -75,8 +75,25 @@ class TestExecuteSummary(unittest.TestCase):
                 "warnings": [],
             }):
                 result = office_app._execute_capability("task-inplace", message)
-            # Output lives next to the source file, not in audit dir
-            self.assertIn("task-inplace", result["summary"])
+            output_path = Path(workspace, "summary.md")
+            self.assertTrue(output_path.is_file())
+            self.assertIn("Summary created", result["summary"])
+
+    def test_inplace_analysis_uses_default_filename(self):
+        with tempfile.TemporaryDirectory(prefix="office_inplace_analysis_") as workspace:
+            source = Path(workspace, "sales.csv")
+            source.write_text("name,amount\nAlice,10\nBob,20\n", encoding="utf-8")
+            message = _make_message(
+                "office.data.analyze", [str(source)], workspace, output_mode="inplace"
+            )
+            with mock.patch.object(office_app, "_run_agentic_json", return_value={
+                "summary_markdown": "# Analysis",
+                "warnings": [],
+            }):
+                result = office_app._execute_capability("task-inplace-analysis", message)
+            output_path = Path(workspace, "analysis.md")
+            self.assertTrue(output_path.is_file())
+            self.assertIn("Analysis created", result["summary"])
 
     def test_conflict_avoidance_renames_existing_file(self):
         """When summary.md already exists in workspace mode, a timestamped copy is created."""

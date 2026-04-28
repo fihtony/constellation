@@ -1762,6 +1762,10 @@ def main():
     print(f"[compass] Compass agent starting on {HOST}:{PORT}")
     print(f"[compass] Artifact root: {artifact_store.root}")
     server = ThreadingHTTPServer((HOST, PORT), CompassHandler)
+    # Increase listen backlog so concurrent callback + test requests are not refused.
+    # The default (5) causes transient ECONNREFUSED when multiple agents send callbacks
+    # simultaneously with new test requests.
+    server.socket.listen(128)
     server.serve_forever()
 
 

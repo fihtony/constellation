@@ -17,7 +17,6 @@ import os
 import re
 import shutil
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -83,6 +82,15 @@ def _read_json(path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _prepare_rw_fixture_dir(source_name: str) -> Path:
+    source_dir = (PROJECT_ROOT / "tests" / "data" / source_name).resolve()
+    target_dir = (PROJECT_ROOT / "tests" / "data" / f"{source_name}_rw").resolve()
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    shutil.copytree(source_dir, target_dir)
+    return target_dir
 
 
 def _run_checked(args: list[str], reporter: Reporter, *, label: str, timeout: int = 1200) -> bool:
@@ -265,6 +273,18 @@ def _extract_expected_txt_fragments(root: Path) -> set[str]:
         if seen_marker and body:
             fragments.add(body)
     return fragments
+
+
+def _fragment_output_paths(manifest: dict) -> set[Path]:
+    executed_actions = manifest.get("executedActions") if isinstance(manifest.get("executedActions"), list) else []
+    paths: set[Path] = set()
+    for action in executed_actions:
+        if str(action.get("action") or "") != "write_fragment":
+            continue
+        destination = str(action.get("destination") or "").strip()
+        if destination:
+            paths.add(Path(destination).resolve())
+    return paths
 
 
 def _reply_to_input_required(
@@ -507,10 +527,11 @@ def test_essay_organize(reporter: Reporter) -> None:
         reporter.fail("Essay organize README files still contain literal \\n sequences")
 
     expected_fragments = _extract_expected_txt_fragments(essays_dir)
+    fragment_paths = _fragment_output_paths(manifest)
     generated_fragment_texts = {
         path.read_text(encoding="utf-8", errors="replace").strip()
         for path in generated_files
-        if path.name.lower() not in {"readme.txt", "readme.md"}
+        if path.resolve() in fragment_paths
         and path.read_text(encoding="utf-8", errors="replace").strip()
     }
     unexpected = sorted(text[:120] for text in generated_fragment_texts if text not in expected_fragments)
@@ -540,189 +561,182 @@ def test_essay_organize(reporter: Reporter) -> None:
 
 def test_csv_analysis_inplace(reporter: Reporter) -> None:
     reporter.section("T4 — CSV Analysis In-Place Through Compass")
-    source_dir = (PROJECT_ROOT / "tests" / "data" / "csv").resolve()
-    with tempfile.TemporaryDirectory(prefix="office_csv_rw_") as tmp:
-        target_dir = Path(tmp, "csv_rw")
-        shutil.copytree(source_dir, target_dir)
-        csv_path = target_dir / "sales_data.csv"
-        expected_top_rep = _top_sales_rep(csv_path)
-        instruction = f"Analyze {csv_path} and write the final report back into the same folder."
-        final_task, workspace_host = _run_office_task(
-            instruction,
-            "office.data.analyze",
-            reporter,
-            "CSV analysis in-place",
-            target_path=csv_path,
-            output_mode="inplace",
-        )
-        if final_task is None or workspace_host is None:
-            return
+    target_dir = _prepare_rw_fixture_dir("csv")
+    csv_path = target_dir / "sales_data.csv"
+    expected_top_rep = _top_sales_rep(csv_path)
+    instruction = f"Analyze {csv_path} and write the final report back into the same folder."
+    _, workspace_host = _run_office_task(
+        instruction,
+        "office.data.analyze",
+        reporter,
+        "CSV analysis in-place",
+        target_path=csv_path,
+        output_mode="inplace",
+    )
+    if workspace_host is None:
+        return
 
-        report_path = target_dir / f"analysis-{final_task['id']}.md"
-        if report_path.is_file():
-            reporter.ok("CSV in-place wrote the final report into the user folder")
-        else:
-            reporter.fail("CSV in-place did not write analysis into the user folder", str(report_path))
-            return
-        report_text = report_path.read_text(encoding="utf-8")
-        if expected_top_rep.lower() in report_text.lower():
-            reporter.ok(f"CSV in-place analysis names the top sales rep ({expected_top_rep})")
-        else:
-            reporter.fail("CSV in-place analysis did not mention the expected top rep", report_text[:300])
-        if not (workspace_host / "office-agent" / "analysis.md").exists():
-            reporter.ok("CSV in-place kept the final report out of the workspace")
-        else:
-            reporter.fail("CSV in-place still wrote the final report into the workspace")
-        if (workspace_host / "office-agent" / "command-log.txt").is_file() and (workspace_host / "office-agent" / "stage-summary.json").is_file():
-            reporter.ok("CSV in-place kept audit files in the workspace")
-        else:
-            reporter.fail("CSV in-place is missing workspace audit files")
-        if not (target_dir / "command-log.txt").exists() and not (target_dir / "stage-summary.json").exists():
-            reporter.ok("CSV in-place did not leak agent audit files into the user folder")
-        else:
-            reporter.fail("CSV in-place leaked audit files into the user folder")
-        _assert_copilot_cli_runtime(workspace_host, reporter, "CSV analysis in-place")
+    report_path = target_dir / "analysis.md"
+    if report_path.is_file():
+        reporter.ok("CSV in-place wrote analysis.md into tests/data/csv_rw")
+    else:
+        reporter.fail("CSV in-place did not write analysis.md into the user folder", str(report_path))
+        return
+    report_text = report_path.read_text(encoding="utf-8")
+    if expected_top_rep.lower() in report_text.lower():
+        reporter.ok(f"CSV in-place analysis names the top sales rep ({expected_top_rep})")
+    else:
+        reporter.fail("CSV in-place analysis did not mention the expected top rep", report_text[:300])
+    if not (workspace_host / "office-agent" / "analysis.md").exists():
+        reporter.ok("CSV in-place kept the final report out of the workspace")
+    else:
+        reporter.fail("CSV in-place still wrote the final report into the workspace")
+    if (workspace_host / "office-agent" / "command-log.txt").is_file() and (workspace_host / "office-agent" / "stage-summary.json").is_file():
+        reporter.ok("CSV in-place kept audit files in the workspace")
+    else:
+        reporter.fail("CSV in-place is missing workspace audit files")
+    if not (target_dir / "command-log.txt").exists() and not (target_dir / "stage-summary.json").exists():
+        reporter.ok("CSV in-place did not leak agent audit files into the user folder")
+    else:
+        reporter.fail("CSV in-place leaked audit files into the user folder")
+    _assert_copilot_cli_runtime(workspace_host, reporter, "CSV analysis in-place")
 
 
 def test_pdf_summary_inplace(reporter: Reporter) -> None:
     reporter.section("T5 — PDF Summary In-Place Through Compass")
-    source_dir = (PROJECT_ROOT / "tests" / "data" / "stlouis").resolve()
-    with tempfile.TemporaryDirectory(prefix="office_pdf_rw_") as tmp:
-        target_dir = Path(tmp, "stlouis_rw")
-        shutil.copytree(source_dir, target_dir)
-        instruction = f"Summarize the PDF files in {target_dir} and write the final summary back into that folder."
-        final_task, workspace_host = _run_office_task(
-            instruction,
-            "office.folder.summarize",
-            reporter,
-            "PDF summary in-place",
-            target_path=target_dir,
-            output_mode="inplace",
-        )
-        if final_task is None or workspace_host is None:
-            return
+    target_dir = _prepare_rw_fixture_dir("stlouis")
+    instruction = f"Summarize the PDF files in {target_dir} and write the final summary back into that folder."
+    _, workspace_host = _run_office_task(
+        instruction,
+        "office.folder.summarize",
+        reporter,
+        "PDF summary in-place",
+        target_path=target_dir,
+        output_mode="inplace",
+    )
+    if workspace_host is None:
+        return
 
-        summary_path = target_dir / f"summary-{final_task['id']}.md"
-        if summary_path.is_file():
-            reporter.ok("PDF in-place wrote the final report into the user folder")
-        else:
-            reporter.fail("PDF in-place did not write summary into the user folder", str(summary_path))
-            return
-        summary_text = summary_path.read_text(encoding="utf-8")
-        markers = ["janvier", "january", "fevrier", "february", "octobre", "october", "decembre", "december"]
-        if any(marker in summary_text.lower() for marker in markers):
-            reporter.ok("PDF in-place summary reflects month/event context from the fixture data")
-        else:
-            reporter.fail("PDF in-place summary did not include expected notice context", summary_text[:300])
-        if not (workspace_host / "office-agent" / "summary.md").exists():
-            reporter.ok("PDF in-place kept the final summary out of the workspace")
-        else:
-            reporter.fail("PDF in-place still wrote the final summary into the workspace")
-        if (workspace_host / "office-agent" / "command-log.txt").is_file() and (workspace_host / "office-agent" / "stage-summary.json").is_file():
-            reporter.ok("PDF in-place kept audit files in the workspace")
-        else:
-            reporter.fail("PDF in-place is missing workspace audit files")
-        if not (target_dir / "command-log.txt").exists() and not (target_dir / "stage-summary.json").exists():
-            reporter.ok("PDF in-place did not leak agent audit files into the user folder")
-        else:
-            reporter.fail("PDF in-place leaked audit files into the user folder")
-        _assert_copilot_cli_runtime(workspace_host, reporter, "PDF summary in-place")
+    summary_path = target_dir / "summary.md"
+    if summary_path.is_file():
+        reporter.ok("PDF in-place wrote summary.md into tests/data/stlouis_rw")
+    else:
+        reporter.fail("PDF in-place did not write summary.md into the user folder", str(summary_path))
+        return
+    summary_text = summary_path.read_text(encoding="utf-8")
+    markers = ["janvier", "january", "fevrier", "february", "octobre", "october", "decembre", "december"]
+    if any(marker in summary_text.lower() for marker in markers):
+        reporter.ok("PDF in-place summary reflects month/event context from the fixture data")
+    else:
+        reporter.fail("PDF in-place summary did not include expected notice context", summary_text[:300])
+    if not (workspace_host / "office-agent" / "summary.md").exists():
+        reporter.ok("PDF in-place kept the final summary out of the workspace")
+    else:
+        reporter.fail("PDF in-place still wrote the final summary into the workspace")
+    if (workspace_host / "office-agent" / "command-log.txt").is_file() and (workspace_host / "office-agent" / "stage-summary.json").is_file():
+        reporter.ok("PDF in-place kept audit files in the workspace")
+    else:
+        reporter.fail("PDF in-place is missing workspace audit files")
+    if not (target_dir / "command-log.txt").exists() and not (target_dir / "stage-summary.json").exists():
+        reporter.ok("PDF in-place did not leak agent audit files into the user folder")
+    else:
+        reporter.fail("PDF in-place leaked audit files into the user folder")
+    _assert_copilot_cli_runtime(workspace_host, reporter, "PDF summary in-place")
 
 
 def test_essay_organize_inplace(reporter: Reporter) -> None:
     reporter.section("T6 — Essay Organize In-Place Through Compass")
-    source_dir = (PROJECT_ROOT / "tests" / "data" / "2026").resolve()
-    with tempfile.TemporaryDirectory(prefix="office_org_rw_") as tmp:
-        target_dir = Path(tmp, "2026_rw")
-        shutil.copytree(source_dir, target_dir)
-        instruction = (
-            f"Read {target_dir}, organize the essays by student and date, preserve the originals, "
-            "and write the final organized result back into the same folder."
+    target_dir = _prepare_rw_fixture_dir("2026")
+    instruction = (
+        f"Read {target_dir}, organize the essays by student and date, preserve the originals, "
+        "and write the final organized result back into the same folder."
+    )
+    _, workspace_host = _run_office_task(
+        instruction,
+        "office.folder.organize",
+        reporter,
+        "Essay organize in-place",
+        target_path=target_dir,
+        output_mode="inplace",
+    )
+    if workspace_host is None:
+        return
+
+    output_root = target_dir / "organized-output"
+    files_root = output_root / "files"
+    manifest_path = output_root / ".office-agent-manifest.json"
+    if output_root.is_dir() and files_root.is_dir():
+        reporter.ok("Essay organize in-place wrote the canonical organized-output tree into tests/data/2026_rw")
+    else:
+        reporter.fail("Essay organize in-place did not write the canonical organized-output tree into the user folder", str(output_root))
+        return
+    if not (workspace_host / "office-agent" / "organized-output").exists():
+        reporter.ok("Essay organize in-place kept final organized files out of the workspace")
+    else:
+        reporter.fail("Essay organize in-place still wrote final organized files into the workspace")
+    if manifest_path.is_file():
+        reporter.ok("Essay organize in-place wrote an execution manifest into the user folder")
+    else:
+        reporter.fail("Essay organize in-place is missing its manifest", str(manifest_path))
+
+    generated_files = [path for path in sorted(files_root.rglob("*.txt"))]
+    if len(generated_files) >= 3:
+        reporter.ok("Essay organize in-place produced grouped output files")
+    else:
+        reporter.fail("Essay organize in-place produced too few grouped files", f"count={len(generated_files)}")
+    if not (output_root / "originals").exists():
+        reporter.ok("Essay organize in-place did not duplicate the original tree")
+    else:
+        reporter.fail("Essay organize in-place still duplicated the original tree", str(output_root / "originals"))
+
+    readme_files = [path for path in sorted(output_root.rglob("README.*")) if path.is_file()]
+    if not readme_files:
+        reporter.ok("Essay organize in-place produced no README files in this valid layout")
+    elif all("\\n" not in path.read_text(encoding="utf-8") for path in readme_files):
+        reporter.ok("Essay organize in-place README files use real line breaks")
+    else:
+        reporter.fail("Essay organize in-place README files still contain literal \\n sequences")
+
+    manifest = _read_json(manifest_path)
+    expected_fragments = _extract_expected_txt_fragments(target_dir)
+    fragment_paths = _fragment_output_paths(manifest)
+    generated_fragment_texts = {
+        path.read_text(encoding="utf-8", errors="replace").strip()
+        for path in generated_files
+        if path.resolve() in fragment_paths
+        and path.read_text(encoding="utf-8", errors="replace").strip()
+    }
+    unexpected = sorted(text[:120] for text in generated_fragment_texts if text not in expected_fragments)
+    if not unexpected:
+        reporter.ok("Essay organize in-place output content matches source essay fragments")
+    else:
+        reporter.fail("Essay organize in-place output contains content that does not match the source fragments", "\n---\n".join(unexpected[:5]))
+
+    ethan_files = [
+        path for path in generated_files
+        if path.name != "README.txt" and re.search(r"\b(Ethan|Student_Ethan)\b", str(path.relative_to(output_root)))
+    ]
+    ethan_unique_contents = {
+        path.read_text(encoding="utf-8", errors="replace").strip()
+        for path in ethan_files
+        if path.read_text(encoding="utf-8", errors="replace").strip()
+    }
+    if ethan_files and len(ethan_unique_contents) >= min(3, len(ethan_files)):
+        reporter.ok("Essay organize in-place preserved distinct essay content across Ethan's dated files")
+    else:
+        reporter.fail(
+            "Essay organize in-place still repeats content across Ethan's grouped files",
+            "\n".join(str(path.relative_to(output_root)) for path in ethan_files[:10]),
         )
-        _, workspace_host = _run_office_task(
-            instruction,
-            "office.folder.organize",
-            reporter,
-            "Essay organize in-place",
-            target_path=target_dir,
-            output_mode="inplace",
-        )
-        if workspace_host is None:
-            return
-
-        output_root = target_dir / "organized-output"
-        files_root = output_root / "files"
-        manifest_path = output_root / ".office-agent-manifest.json"
-        if output_root.is_dir() and files_root.is_dir():
-            reporter.ok("Essay organize in-place wrote the canonical organized-output tree into the user folder")
-        else:
-            reporter.fail("Essay organize in-place did not write the canonical organized-output tree into the user folder", str(output_root))
-            return
-        if not (workspace_host / "office-agent" / "organized-output").exists():
-            reporter.ok("Essay organize in-place kept final organized files out of the workspace")
-        else:
-            reporter.fail("Essay organize in-place still wrote final organized files into the workspace")
-        if manifest_path.is_file():
-            reporter.ok("Essay organize in-place wrote an execution manifest into the user folder")
-        else:
-            reporter.fail("Essay organize in-place is missing its manifest", str(manifest_path))
-
-        generated_files = [path for path in sorted(files_root.rglob("*.txt"))]
-        if len(generated_files) >= 3:
-            reporter.ok("Essay organize in-place produced grouped output files")
-        else:
-            reporter.fail("Essay organize in-place produced too few grouped files", f"count={len(generated_files)}")
-        if not (output_root / "originals").exists():
-            reporter.ok("Essay organize in-place did not duplicate the original tree")
-        else:
-            reporter.fail("Essay organize in-place still duplicated the original tree", str(output_root / "originals"))
-
-        readme_files = [path for path in sorted(output_root.rglob("README.*")) if path.is_file()]
-        if not readme_files:
-            reporter.ok("Essay organize in-place produced no README files in this valid layout")
-        elif all("\\n" not in path.read_text(encoding="utf-8") for path in readme_files):
-            reporter.ok("Essay organize in-place README files use real line breaks")
-        else:
-            reporter.fail("Essay organize in-place README files still contain literal \\n sequences")
-
-        expected_fragments = _extract_expected_txt_fragments(target_dir)
-        generated_fragment_texts = {
-            path.read_text(encoding="utf-8", errors="replace").strip()
-            for path in generated_files
-            if path.name.lower() not in {"readme.txt", "readme.md"}
-            and path.read_text(encoding="utf-8", errors="replace").strip()
-        }
-        unexpected = sorted(text[:120] for text in generated_fragment_texts if text not in expected_fragments)
-        if not unexpected:
-            reporter.ok("Essay organize in-place output content matches source essay fragments")
-        else:
-            reporter.fail("Essay organize in-place output contains content that does not match the source fragments", "\n---\n".join(unexpected[:5]))
-
-        ethan_files = [
-            path for path in generated_files
-            if path.name != "README.txt" and re.search(r"\b(Ethan|Student_Ethan)\b", str(path.relative_to(output_root)))
-        ]
-        ethan_unique_contents = {
-            path.read_text(encoding="utf-8", errors="replace").strip()
-            for path in ethan_files
-            if path.read_text(encoding="utf-8", errors="replace").strip()
-        }
-        if ethan_files and len(ethan_unique_contents) >= min(3, len(ethan_files)):
-            reporter.ok("Essay organize in-place preserved distinct essay content across Ethan's dated files")
-        else:
-            reporter.fail(
-                "Essay organize in-place still repeats content across Ethan's grouped files",
-                "\n".join(str(path.relative_to(output_root)) for path in ethan_files[:10]),
-            )
-        if (workspace_host / "office-agent" / "command-log.txt").is_file() and (workspace_host / "office-agent" / "stage-summary.json").is_file():
-            reporter.ok("Essay organize in-place kept audit files in the workspace")
-        else:
-            reporter.fail("Essay organize in-place is missing workspace audit files")
-        if not (target_dir / "command-log.txt").exists() and not (target_dir / "stage-summary.json").exists():
-            reporter.ok("Essay organize in-place did not leak agent audit files into the user folder")
-        else:
-            reporter.fail("Essay organize in-place leaked audit files into the user folder")
-        _assert_copilot_cli_runtime(workspace_host, reporter, "Essay organize in-place")
+    if (workspace_host / "office-agent" / "command-log.txt").is_file() and (workspace_host / "office-agent" / "stage-summary.json").is_file():
+        reporter.ok("Essay organize in-place kept audit files in the workspace")
+    else:
+        reporter.fail("Essay organize in-place is missing workspace audit files")
+    if not (target_dir / "command-log.txt").exists() and not (target_dir / "stage-summary.json").exists():
+        reporter.ok("Essay organize in-place did not leak agent audit files into the user folder")
+    else:
+        reporter.fail("Essay organize in-place leaked audit files into the user folder")
+    _assert_copilot_cli_runtime(workspace_host, reporter, "Essay organize in-place")
 
 
 def main() -> int:

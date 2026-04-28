@@ -814,7 +814,7 @@ def _execute_summary(capability: str, user_text: str, metadata: dict, task_id: s
     warnings.extend(str(item) for item in (response.get("warnings") or []) if str(item).strip())
     output_mode = str(metadata.get("officeOutputMode") or "workspace")
     output_root = _target_output_dir(metadata, target_paths, output_mode)
-    base_filename = f"summary-{task_id}.md" if output_mode == "inplace" else "summary.md"
+    base_filename = "summary.md"
     output_path = _non_overwrite_path(os.path.join(output_root, base_filename))
     _write_text_file(output_path, summary_markdown)
     _write_warnings(metadata, warnings)
@@ -880,7 +880,7 @@ def _execute_analysis(capability: str, user_text: str, metadata: dict, task_id: 
     warnings.extend(str(item) for item in (response.get("warnings") or []) if str(item).strip())
     output_mode = str(metadata.get("officeOutputMode") or "workspace")
     output_root = _target_output_dir(metadata, target_paths, output_mode)
-    base_filename = f"analysis-{task_id}.md" if output_mode == "inplace" else "analysis.md"
+    base_filename = "analysis.md"
     output_path = _non_overwrite_path(os.path.join(output_root, base_filename))
     _write_text_file(output_path, summary_markdown)
     _write_warnings(metadata, warnings)

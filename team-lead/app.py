@@ -1318,7 +1318,9 @@ def _build_analysis_context(ctx: _TaskContext) -> str:
     if ctx.jira_info and ctx.jira_info.get("content"):
         ticket_key = str(ctx.jira_info.get("ticket_key") or "")
         heading = f"Jira ticket {ticket_key}:" if ticket_key else "Jira ticket:"
-        parts.append(f"{heading}\n{ctx.jira_info['content']}")
+        # Truncate to avoid exceeding LLM context limits when tickets accumulate many comments.
+        jira_content = ctx.jira_info['content'][:30000]
+        parts.append(f"{heading}\n{jira_content}")
     if ctx.design_info and ctx.design_info.get("content"):
         parts.append(f"Design context:\n{ctx.design_info['content']}")
     if ctx.repo_info and ctx.repo_info.get("content"):
@@ -1566,9 +1568,15 @@ def _create_plan(
     target_repo_url: str = "",
     tech_stack_constraints: dict | None = None,
 ) -> dict:
-    jira_ctx = (
-        f"Jira ticket details:\n{json.dumps(jira_info, ensure_ascii=False, indent=2)}"
+    jira_raw = (
+        json.dumps(jira_info, ensure_ascii=False, indent=2)
         if jira_info else ""
+    )
+    # Truncate Jira content so the plan prompt stays within LLM context limits.
+    # Comments/history beyond the first 30K chars are rarely needed for planning.
+    jira_ctx = (
+        f"Jira ticket details:\n{jira_raw[:30000]}"
+        if jira_raw else ""
     )
     design_ctx = (
         f"Design context ({design_info.get('type', 'design')}):\n"
