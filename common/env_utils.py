@@ -163,10 +163,17 @@ def build_isolated_git_env(base_env=None, *, scope="git"):
     home = isolated_runtime_home(scope)
     xdg_config_home = os.path.join(home, ".config")
     os.makedirs(xdg_config_home, exist_ok=True)
+    # Write a minimal isolated git config that trusts all directories (safe.directory=*)
+    # so bind-mounted workspaces with a different owner UID don't trigger "dubious ownership".
+    # credential.helper is explicitly cleared to prevent any credential leakage.
+    git_config_path = os.path.join(home, ".gitconfig-isolated")
+    if not os.path.exists(git_config_path):
+        with open(git_config_path, "w", encoding="utf-8") as fh:
+            fh.write("[safe]\n\tdirectory = *\n[credential]\n\thelper =\n")
     env.update({
         "HOME": home,
         "XDG_CONFIG_HOME": xdg_config_home,
-        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_GLOBAL": git_config_path,
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_ATTR_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",

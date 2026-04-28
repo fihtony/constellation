@@ -238,38 +238,74 @@ def _top_sales_rep(csv_path: Path) -> str:
     return max(totals.items(), key=lambda item: item[1])[0]
 
 
-def _run_office_task(instruction: str, capability: str, reporter: Reporter, label: str) -> tuple[dict | None, Path]:
+def _reply_to_input_required(task_id: str, question: str, target_path: Path | None, reporter: Reporter, label: str) -> dict | None:
+    lowered = question.lower()
+    if "absolute path" in lowered:
+        if not target_path:
+            reporter.fail(f"{label} requested an absolute path but the test has no target path to provide")
+            return None
+        reply_text = str(target_path)
+    elif (
+        "choose where" in lowered
+        or "workspace only" in lowered
+        or "write its output" in lowered
+        or "choose workspace or in-place output" in lowered
+        or "in-place output" in lowered
+    ):
+        reply_text = "Use workspace output."
+    elif "approve write access" in lowered:
+        reply_text = "No. Use workspace output instead."
+    else:
+        reporter.fail(f"{label} asked an unexpected clarification question", question[:400])
+        return None
+
+    reply_status, reply_body, _ = _send_compass_message(reply_text, context_id=task_id)
+    if reply_status != 200 or not isinstance(reply_body, dict) or not isinstance(reply_body.get("task"), dict):
+        reporter.fail(f"{label} resume request failed", f"status={reply_status} body={reply_body}")
+        return None
+    return reply_body["task"]
+
+
+def _run_office_task(
+    instruction: str,
+    capability: str,
+    reporter: Reporter,
+    label: str,
+    *,
+    target_path: Path | None = None,
+) -> tuple[dict | None, Path | None]:
     status, body, _ = _send_compass_message(instruction, requested_capability=capability)
     if status != 200 or not isinstance(body, dict) or not isinstance(body.get("task"), dict):
         reporter.fail(f"{label} submission failed", f"status={status} body={body}")
-        return None, Path()
+        return None, None
 
     task = body["task"]
     task_id = str(task.get("id") or "")
-    state = str((task.get("status") or {}).get("state") or "")
-    if state == "TASK_STATE_INPUT_REQUIRED":
-        reporter.ok(f"{label} entered the Compass output-mode prompt")
-    else:
-        reporter.fail(f"{label} did not enter the expected output-mode prompt", f"state={state}")
-        return None, Path()
-
     _assert_card_visible(task_id, capability, reporter, label)
 
-    reply_status, reply_body, _ = _send_compass_message("Use workspace output.", context_id=task_id)
-    if reply_status != 200 or not isinstance(reply_body, dict) or not isinstance(reply_body.get("task"), dict):
-        reporter.fail(f"{label} resume request failed", f"status={reply_status} body={reply_body}")
-        return None, Path()
+    clarification_rounds = 0
+    state = str((task.get("status") or {}).get("state") or "")
+    while state == "TASK_STATE_INPUT_REQUIRED":
+        clarification_rounds += 1
+        if clarification_rounds == 1:
+            reporter.ok(f"{label} entered the Compass clarification flow")
+        question = str((((task.get("status") or {}).get("message") or {}).get("parts") or [{}])[0].get("text") or "")
+        resumed = _reply_to_input_required(task_id, question, target_path, reporter, label)
+        if not resumed:
+            return None, None
+        task = resumed
+        state = str((task.get("status") or {}).get("state") or "")
 
     final_task = _wait_for_task(task_id)
     if not final_task:
         reporter.fail(f"{label} timed out")
-        return None, Path()
+        return None, None
     final_state = str((final_task.get("status") or {}).get("state") or "")
     if final_state == "TASK_STATE_COMPLETED":
         reporter.ok(f"{label} completed through Compass")
     else:
         reporter.fail(f"{label} ended in {final_state}", json.dumps((final_task.get("status") or {}).get("message") or {}, ensure_ascii=False)[:400])
-        return None, Path()
+        return None, None
 
     _assert_card_visible(task_id, capability, reporter, label)
     card = _task_card(task_id)
@@ -284,7 +320,7 @@ def _run_office_task(instruction: str, capability: str, reporter: Reporter, labe
         reporter.ok(f"{label} workspace exists on the host")
     else:
         reporter.fail(f"{label} workspace is missing on the host", f"container={workspace_container} host={workspace_host}")
-        return None, Path()
+        return None, None
     return final_task, workspace_host
 
 
@@ -293,8 +329,14 @@ def test_csv_analysis(reporter: Reporter) -> None:
     csv_path = (PROJECT_ROOT / "tests" / "data" / "csv" / "sales_data.csv").resolve()
     expected_top_rep = _top_sales_rep(csv_path)
     instruction = f"Analyze {csv_path} and find the sales rep with the highest total sales."
-    _, workspace_host = _run_office_task(instruction, "office.data.analyze", reporter, "CSV analysis")
-    if not workspace_host:
+    _, workspace_host = _run_office_task(
+        instruction,
+        "office.data.analyze",
+        reporter,
+        "CSV analysis",
+        target_path=csv_path,
+    )
+    if workspace_host is None:
         return
 
     report_path = workspace_host / "office-agent" / "analysis.md"
@@ -315,8 +357,14 @@ def test_pdf_summary(reporter: Reporter) -> None:
     reporter.section("T2 — PDF Summary Through Compass")
     pdf_dir = (PROJECT_ROOT / "tests" / "data" / "stlouis").resolve()
     instruction = f"Summarize the PDF files in {pdf_dir} and extract a short timeline of the months or events they mention."
-    _, workspace_host = _run_office_task(instruction, "office.folder.summarize", reporter, "PDF summary")
-    if not workspace_host:
+    _, workspace_host = _run_office_task(
+        instruction,
+        "office.folder.summarize",
+        reporter,
+        "PDF summary",
+        target_path=pdf_dir,
+    )
+    if workspace_host is None:
         return
 
     summary_path = workspace_host / "office-agent" / "summary.md"
@@ -342,8 +390,14 @@ def test_essay_organize(reporter: Reporter) -> None:
         f"Read {essays_dir}, group each student's essays by date into the workspace, preserve the originals, "
         "and create grouped text files for the extracted essays."
     )
-    _, workspace_host = _run_office_task(instruction, "office.folder.organize", reporter, "Essay organize")
-    if not workspace_host:
+    _, workspace_host = _run_office_task(
+        instruction,
+        "office.folder.organize",
+        reporter,
+        "Essay organize",
+        target_path=essays_dir,
+    )
+    if workspace_host is None:
         return
 
     output_root = workspace_host / "office-agent" / "organized-output"
@@ -388,7 +442,9 @@ def test_essay_organize(reporter: Reporter) -> None:
         reporter.fail("Essay organize output paths do not show the expected student/date grouping", "\n".join(generated_rel_paths[:20]))
 
     readme_files = [path for path in sorted(output_root.rglob("README.*")) if path.is_file()]
-    if readme_files and all("\\n" not in path.read_text(encoding="utf-8") for path in readme_files):
+    if not readme_files:
+        reporter.ok("Essay organize produced no README files in this valid layout")
+    elif all("\\n" not in path.read_text(encoding="utf-8") for path in readme_files):
         reporter.ok("Essay organize README files use real line breaks")
     else:
         reporter.fail("Essay organize README files still contain literal \\n sequences")

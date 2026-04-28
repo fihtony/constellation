@@ -59,6 +59,12 @@ This skill covers:
 - `_non_overwrite_path(path)` appends a compact timestamp suffix when the target file already exists.
 - Workspace mode writes `summary.md` / `analysis.md` (no task-id suffix); inplace mode uses `summary-{task_id}.md` to avoid collisions.
 - For organize, the `.office-agent-manifest.json` always reflects the final executed actions.
+- Organize fragment ids must be unique across the full source tree; use relative source-path prefixes instead of bare basenames to avoid cross-folder collisions like `0103/1.txt::1` vs `0110/1.txt::1`.
+
+## Analysis Data Fidelity
+
+- `_build_csv_profile(path)` now reads the full CSV and exposes `groupedNumericTotals` for categorical-to-numeric rankings such as `Sales_Rep -> Sales_Amount`.
+- When `groupedNumericTotals` is present, analysis should treat it as authoritative for full-dataset ranking instead of inferring from `sampleRows`.
 
 ---
 
