@@ -6,8 +6,8 @@
 # Their images must be built manually before starting the compose stack.
 #
 # Usage:
-#   ./build-agents.sh            # build all dynamic agent images
-#   ./build-agents.sh android    # build only the android agent image
+#   ./build-agents.sh            # build all dynamic agent images present in this repo
+#   ./build-agents.sh web        # build only the web agent image
 #
 # After building, start the compose stack as usual:
 #   docker compose up --build -d
@@ -16,6 +16,10 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 build_android() {
+    if [[ ! -f "${SCRIPT_DIR}/android/Dockerfile" ]]; then
+        echo "android agent source not present in this repository"
+        return 1
+    fi
     echo "==> Building android agent image: constellation-android-agent:latest"
     docker build \
         -t constellation-android-agent:latest \
@@ -42,6 +46,15 @@ build_team_lead() {
     echo "    Done: constellation-team-lead-agent:latest"
 }
 
+build_office() {
+    echo "==> Building office agent image: constellation-office-agent:latest"
+    docker build \
+        -t constellation-office-agent:latest \
+        -f "${SCRIPT_DIR}/office/Dockerfile" \
+        "${SCRIPT_DIR}"
+    echo "    Done: constellation-office-agent:latest"
+}
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 TARGET="${1:-all}"
 
@@ -55,14 +68,26 @@ case "$TARGET" in
     team-lead)
         build_team_lead
         ;;
+    office)
+        build_office
+        ;;
     all)
-        build_android
         build_web
         build_team_lead
+        if [[ -f "${SCRIPT_DIR}/office/Dockerfile" ]]; then
+            build_office
+        else
+            echo "==> Skipping office agent image: ${SCRIPT_DIR}/office/Dockerfile not found"
+        fi
+        if [[ -f "${SCRIPT_DIR}/android/Dockerfile" ]]; then
+            build_android
+        else
+            echo "==> Skipping android agent image: ${SCRIPT_DIR}/android/Dockerfile not found"
+        fi
         ;;
     *)
         echo "Unknown target: $TARGET"
-        echo "Usage: $0 [android|web|team-lead|all]"
+        echo "Usage: $0 [android|web|team-lead|office|all]"
         exit 1
         ;;
 esac

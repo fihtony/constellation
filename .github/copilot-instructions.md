@@ -37,7 +37,8 @@ working together to complete complex engineering tasks.
 | **SCM Agent** | `scm/` | Integrates with Git SCM (Bitbucket/GitHub). Repo inspection, branch, PR operations. Runs on port 8020. |
 | **Android Agent** | `android/` | On-demand execution agent. Launched per-task by Team Lead via Docker socket. |
 | **UI Design Agent** | `ui-design/` | Design context agent. Fetches design data from Figma (REST API) and Google Stitch (MCP). Runs on port 8040. |
-| **Common Library** | `common/` | Shared modules: registry client, launcher, LLM client, artifact store, task store, etc. |
+| **Office Agent** | `office/` | On-demand document agent for local office files. Summarizes, analyzes, and organizes user-authorized folders. Runs on port 8060. |
+| **Common Library** | `common/` | Shared modules: registry client, launcher, runtime adapters, rules loader, artifact store, task store, etc. |
 
 ### MCP Tool Integrations (replacing standalone agents)
 
@@ -51,27 +52,40 @@ The system uses MCP (Model Context Protocol) servers instead of dedicated agents
 ```
 User
   └─► Compass Agent (control plane, thin router, UI)
-         └─► Team Lead Agent (intelligence layer — analysis, planning, coordination, review)
-                ├─► Jira Agent (A2A: jira.ticket.fetch, jira.comment.add, …)
-                ├─► UI Design Agent (A2A: figma.page.fetch, stitch.screen.fetch, …)
-                ├─► Android Agent (per-task container: android.task.execute)
-                ├─► iOS Agent (per-task container, future)
-                └─► Web Agent (per-task container, future)
+    ├─► Office Agent (per-task container: office.document.summarize / office.data.analyze / office.folder.organize)
+    └─► Team Lead Agent (intelligence layer — analysis, planning, coordination, review)
+      ├─► Jira Agent (A2A: jira.ticket.fetch, jira.comment.add, …)
+      ├─► UI Design Agent (A2A: figma.page.fetch, stitch.screen.fetch, …)
+      ├─► Android Agent (per-task container: android.task.execute)
+      ├─► iOS Agent (per-task container, future)
+      └─► Web Agent (per-task container, future)
 ```
 
 **Design Rationale**:
-- Compass Agent routes ALL user tasks to Team Lead (`team-lead.task.analyze`). It does NOT infer workflow or call Jira/SCM/design agents directly.
+- Compass Agent uses the shared agentic runtime for all user-facing routing work: task classification, clarification handling, and final user summaries. It routes office/document tasks directly to Office Agent and development tasks to Team Lead.
 - Team Lead Agent is the intelligence layer responsible for: task analysis, info gathering (Jira, design), planning, dev agent dispatch, code review, and result summarization.
+- Office Agent is a per-task execution agent for user-authorized local files. It may summarize, analyze, or reorganize documents, but only within explicitly mounted paths and with output mode chosen by the user.
 - Team Lead handles INPUT_REQUIRED by pausing its workflow and waiting for user input forwarded by Compass. No new Team Lead instance is created for resume — the SAME instance resumes.
 - Dev agents (android, ios, web) are launched per-task by Team Lead via Docker socket + Registry + Launcher.
 
 ### Container Runtime
 
-This project uses **Docker Desktop**.
-- Host machine is accessible from containers at `host.docker.internal`
-- Docker socket: `/var/run/docker.sock`
+This project uses **Docker Desktop by default**, and also supports **Rancher Desktop**.
+- `CONTAINER_RUNTIME=docker` is the default; set `CONTAINER_RUNTIME=rancher` to use Rancher Desktop.
+- Host machine alias from containers:
+  - Docker Desktop: `host.docker.internal`
+  - Rancher Desktop: `host.rancher-desktop.internal`
+- Socket path visible to the current process:
+  - Host process + Docker Desktop: `/var/run/docker.sock`
+  - Host process + Rancher Desktop: `~/.rd/docker.sock` (or override with `DOCKER_SOCKET`)
+  - Inside launcher containers: always `/var/run/docker.sock`
+- Persistent launcher services must mount the host socket to `/var/run/docker.sock` inside the container.
+- Nested per-task launchers must re-bind the socket using the host-side mount source discovered from the current container, not by reusing the current container path as a host source.
 - Network name: `constellation-network`
-- LLM endpoint example: `http://host.docker.internal:1288/v1`
+- If `OPENAI_BASE_URL` is unset, Copilot Connect resolves automatically:
+  - host process: `http://localhost:1288/v1`
+  - Docker container: `http://host.docker.internal:1288/v1`
+  - Rancher container: `http://host.rancher-desktop.internal:1288/v1`
 
 ---
 
@@ -459,23 +473,23 @@ artifacts = [
 
 ### 12. LLM Usage
 
-Use `common/llm_client.py` for all LLM calls. It handles:
-- OpenAI-compatible API
-- Mock fallback when no LLM is configured (`ALLOW_MOCK_FALLBACK=1`)
-- Proper timeout and error handling
+Use `common/runtime/adapter.py` for all agentic LLM/CLI calls. It handles:
+- `copilot-cli` as the primary production backend
+- `claude-code` as an optional compatible backend
+- `copilot-connect` as the OpenAI-compatible fallback / local integration backend
+- Mock fallback when no real backend is available (`ALLOW_MOCK_FALLBACK=1`)
+- Proper timeout and structured result handling
 
 ```python
-from common.llm_client import LLMClient
+from common.runtime.adapter import get_runtime
 
-llm = LLMClient()
-
-response = llm.chat(
-    messages=[
-        {"role": "system", "content": "You are a helpful agent."},
-        {"role": "user", "content": user_text},
-    ],
-    max_tokens=2048,
+runtime = get_runtime()
+result = runtime.run(
+  prompt=user_text,
+  system_prompt="You are a helpful agent.",
+  max_tokens=2048,
 )
+response_text = result["raw_response"] or result["summary"]
 ```
 
 ### 13. Environment Variables (Required in .env.example)
@@ -490,11 +504,14 @@ ADVERTISED_BASE_URL=http://my-agent:8080
 # Registry
 REGISTRY_URL=http://registry:9000
 
-# LLM (use host.docker.internal for Docker Desktop environments)
-OPENAI_BASE_URL=http://host.docker.internal:1288/v1
+# LLM
+# Leave OPENAI_BASE_URL unset to use runtime-aware defaults:
+#   localhost on host, host.docker.internal in Docker,
+#   host.rancher-desktop.internal in Rancher
+# OPENAI_BASE_URL=
 OPENAI_MODEL=gpt-5-mini
 OPENAI_API_KEY=
-ALLOW_MOCK_FALLBACK=1
+ALLOW_MOCK_FALLBACK=0  # Set to 1 only for offline/test environments
 
 # Runtime
 HOST=0.0.0.0
@@ -539,6 +556,10 @@ response = generate_text(
 )
 ```
 
+When an agent needs curated workspace playbooks (for example delivery guidance for architecture/frontend/backend/database), build the final system prompt through `common.rules_loader.build_system_prompt(...)` and pass `skill_names=[...]` rather than open-coding repeated file reads in each call site.
+
+If an agent reads workspace skills at runtime, its Dockerfile MUST also copy `.github/skills/` into the image (current convention: `/app/.github/skills/`).
+
 ### 15. Dockerfile Requirements
 
 ```dockerfile
@@ -563,6 +584,12 @@ LABEL constellation.agent_id="my-agent"
 LABEL constellation.agent_name="My Agent"
 LABEL constellation.agent_role="execution"
 
+# Run as non-root user (REQUIRED for security — OWASP A05).
+# Do this after all installs and file copies so permissions are set correctly.
+RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 CMD ["python3", "my-agent/app.py"]
 ```
 
@@ -570,6 +597,10 @@ CMD ["python3", "my-agent/app.py"]
 - `constellation.agent_id` — matches `agentId` in `registry-config.json`
 - `constellation.agent_name` — human-readable display name
 - `constellation.agent_role` — one of: `fundamental`, `execution`, `integration`
+
+**Non-root user requirement:**
+Every agent container MUST run as a non-root user (`appuser`, UID 1000). The `USER appuser` instruction must come after all `RUN`/`COPY` steps so that `/app` ownership is set correctly.
+The Compass container must add the mounted Docker socket's numeric group id via `group_add` in `docker-compose.yml` so the non-root user can access the socket on both Docker Desktop and Rancher Desktop. Keep `0` for Docker Desktop compatibility and use `DOCKER_SOCKET_GID` to override the Rancher/Desktop-in-container gid when needed. On macOS, derive that value from a short helper container, for example: `export DOCKER_SOCKET_GID=$(docker run --rm -v "${DOCKER_SOCKET:-$HOME/.rd/docker.sock}:/var/run/docker.sock" python:3.12-slim python -c "import os; print(os.stat('/var/run/docker.sock').st_gid)")`.
 
 ### 16. docker-compose.yml Entry
 
@@ -621,6 +652,7 @@ Skill IDs follow the pattern: `<domain>.<resource>.<action>`
 | `android` | `android.task.execute`, `android.build.run` |
 | `ios` | `ios.task.execute` |
 | `middleware` | `middleware.task.execute` |
+| `office` | `office.document.summarize`, `office.data.analyze`, `office.folder.organize` |
 | `team-lead` | `team-lead.task.analyze`, `team-lead.workflow.plan` |
 | `review` | `review.code.check`, `review.qa.validate` |
 
@@ -673,17 +705,61 @@ Before submitting a new agent, verify:
 |---------|------|
 | **Team Lead Agent** | `team-lead/` | Intelligence layer: analysis, planning, dispatch, review | port 8030 |
 | Team Lead prompts | `team-lead/prompts.py` | ALL LLM prompt strings for Team Lead |
+| Jira prompts | `jira/prompts.py` | ALL LLM prompt strings for Jira Agent |
+| SCM prompts | `scm/prompts.py` | ALL LLM prompt strings for SCM Agent |
+| UI Design prompts | `ui-design/prompts.py` | ALL LLM prompt strings for UI Design Agent |
 | UI Design Agent | `ui-design/` | Figma REST API + Google Stitch MCP | port 8040 |
+| Office Agent | `office/` | Local office document execution agent | port 8060 |
+| Office prompts | `office/prompts.py` | ALL LLM prompt strings for Office Agent |
 | UI Design client (Figma) | `ui-design/figma_client.py` | Agent-local, NOT in `common/` |
 | UI Design client (Stitch) | `ui-design/stitch_client.py` | Agent-local, NOT in `common/` |
 | Compass Agent (control plane) | `compass/app.py` |
+| Runtime adapter factory | `common/runtime/adapter.py` | Unified runtime contract + backend factory |
+| Shared runtime env template | `common/.env.example` | Shared default runtime/timezone config loaded before agent-local `.env` |
+| Local time helpers | `common/time_utils.py` | Shared local timestamp helpers for workspace and audit logs |
+| Workspace/debug log helpers | `common/devlog.py` | Shared debug log + workspace stage logging helpers |
+| Copilot CLI backend | `common/runtime/copilot_cli.py` | Primary agentic CLI backend |
+| Claude Code backend | `common/runtime/claude_code.py` | Optional compatible backend |
+| Copilot Connect backend | `common/runtime/copilot_connect.py` | OpenAI-compatible backend / fallback |
 | Capability Registry | `registry/app.py` |
-| Shared LLM client | `common/llm_client.py` |
+| Shared low-level LLM client | `common/llm_client.py` | Legacy OpenAI-compatible helper used by runtime internals |
 | Shared Registry client | `common/registry_client.py` |
 | Task state machine | `common/task_store.py` |
 | Artifact storage | `common/artifact_store.py` |
 | Docker launcher | `common/launcher.py` |
+| Rancher launcher | `common/launcher_rancher.py` |
 | Instance heartbeat | `common/instance_reporter.py` |
 | A2A message helpers | `common/message_utils.py` |
 | Registry bootstrap | `scripts/init_register.py` |
 | E2E tests | `tests/test_e2e.py` |
+
+## Shared Runtime Notes
+
+- LLM-enabled agents (`team-lead`, `web`, `jira`, `scm`, `ui-design`, `office`) should load shared defaults from `common/.env` first, then apply their local `.env` overrides.
+- Team Lead and Web are the only current per-task agents that intentionally override the shared runtime baseline in `registry-config.json > launchSpec.env`: `AGENT_RUNTIME=copilot-cli` and `AGENT_MODEL=gpt-5-mini`. Other agents should stay on the shared `gpt-5-mini` default unless there is an explicit design change.
+- Protected GitHub/SCM credential variables (`GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `SCM_TOKEN`, `SCM_USERNAME`, `SCM_PASSWORD`, `TEST_GITHUB_TOKEN`) are file-backed by default. Ambient host values must be ignored unless a launcher or test has already loaded its own `.env` and explicitly marks the child process with `CONSTELLATION_TRUSTED_ENV=1`.
+- Runtime Git commands must use the isolated helper environment from `common.env_utils.build_isolated_git_env()` so agent subprocesses never read host Git credential helpers, host keychains, or user-level `~/.gitconfig`.
+- `copilot-cli` runtime authentication is isolated as well: only `COPILOT_GITHUB_TOKEN` is supported for agent execution. Do not rely on `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth`, or system keychain fallbacks inside agents.
+- Launchers and integration tests must sanitize inherited host GitHub credentials before spawning subprocesses. Test scripts may use only file-backed values from `tests/.env` for GitHub auth.
+- `ARTIFACT_ROOT` is the only artifact-root config now. Launchers must discover the host-side bind source for `/app/artifacts` by inspecting the current container's mounts through the Docker-compatible API; do not re-introduce `ARTIFACT_ROOT_HOST`.
+- `registry` remains a non-agentic control-plane service. `compass` is now an agentic control-plane service for routing, clarification interpretation, and user-facing final summaries, but it must still avoid unbounded external-system reasoning loops and must not bypass registered boundary agents.
+- Task workspaces should keep `command-log.txt` and `stage-summary.json` under each agent subdirectory for auditability; runtime details belong inside `stage-summary.json` as `runtimeConfig`, not in a separate `runtime-config.json` file.
+- Team Lead and Web currently inject the **six** workspace delivery playbooks `constellation-architecture-delivery`, `constellation-frontend-delivery`, `constellation-backend-delivery`, `constellation-database-delivery`, `constellation-code-review-delivery`, and `constellation-testing-delivery` through `build_system_prompt(...)`; their `stage-summary.json` should therefore retain both `runtimeConfig.runtime` and `runtimeConfig.skillPlaybooks` for auditability.
+- In execution task workspaces, generated source files should live in the real cloned repository directory; `web-agent/` and similar agent subdirectories are for metadata and audit artifacts only.
+- Web Agent branches should use deterministic naming based on Jira key plus orchestrator task id when available; only docs/tests-only changes may use `chore/...` naming without a ticket key.
+- Boundary agents (Jira, SCM, UI Design, future Jenkins/Stitch-style integrations) must be discovered through Registry capabilities at runtime; do not hardcode their service URLs inside Team Lead or execution agents.
+- Team Lead intake/gathering should use the agentic runtime to emit structured pending actions, but the code must still execute boundary calls itself through Registry-discovered capabilities. Do not let runtime output bypass A2A boundaries or directly hardcode external system access.
+- Always construct `RegistryClient(REGISTRY_URL)` explicitly and pass it to `AgentDirectory(owner_id, registry_client)`. Never rely on the module-level `REGISTRY_URL` default inside `RegistryClient` — `load_dotenv` may not have run yet at import time.
+- Registry now exposes topology metadata (`/topology`, `/events?sinceVersion=`); agents that call other agents should cache capability lookups and refresh on cache miss or topology change.
+- Compass applies a final completeness gate to Team Lead results using shared-workspace evidence (review result, PR evidence, Jira workflow evidence) and may trigger a same-workspace follow-up cycle before marking the user task complete. The only exception is an explicit Team Lead validation checkpoint artifact (`metadata.validationCheckpoint=true`), which intentionally stops before dev dispatch and skips the completeness gate.
+- **Per-task agent exit rule** (implemented in `common/per_task_exit.py`):
+  - The parent agent embeds `"exitRule": {"type": "wait_for_parent_ack", "ack_timeout_seconds": 300}` in the child's message metadata.
+  - The child agent calls `PerTaskExitHandler.parse(metadata)` to read the rule, and calls `exit_handler.apply(task_id, rule, shutdown_fn=_schedule_shutdown)` in its workflow `finally` block.
+  - The parent sends `POST {child_service_url}/tasks/{task_id}/ack` when it is done with the child (all review cycles complete, callback processed).
+  - The child exposes `POST /tasks/{id}/ack` to receive the parent ACK.
+  - Supported rule types: `wait_for_parent_ack` (default), `immediate` (old AUTO_STOP behavior), `persistent` (no auto-stop).
+  - Default ACK timeout: 5 minutes. The child shuts down after the timeout even if no ACK arrives.
+  - For revisions: Team Lead reuses the **same** dev-agent container (same service URL, new task ID via `POST /message:send`). It does NOT launch a new container. The ACK is sent only after all review cycles are done.
+  - Compass ACKs Team Lead after the completeness gate passes (or max revisions reached).
+- Python virtual environments created by Web Agent are placed in `tempfile.gettempdir()/constellation-venv-{hash}`, NOT inside the cloned repo directory, to avoid Docker-path shebang issues when the workspace is accessed locally.
+- Use `LOCAL_TIMEZONE` (preferred) or `TZ` to keep workspace timestamps aligned with the operator's local time.

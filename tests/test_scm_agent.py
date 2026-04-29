@@ -26,6 +26,7 @@ Run
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import re
 import socket
@@ -48,6 +49,7 @@ from agent_test_support import (
     PROJECT_ROOT,
     Reporter,
     agent_url_from_args,
+    build_test_subprocess_env,
     choose_base_branch,
     http_request,
     load_env_file,
@@ -73,6 +75,11 @@ CONTAINER_AGENT_URL = "http://127.0.0.1:8020"
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--integration",
+        action="store_true",
+        help="Compatibility flag; this script always runs live integration checks.",
+    )
     parser.add_argument("--agent-url", default="")
     parser.add_argument("--container", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -98,8 +105,7 @@ def start_local_agent(token: str, port: int, openai_base_url: str = "http://loca
     venv_python = os.path.join(PROJECT_ROOT, "venv", "bin", "python")
     python = venv_python if os.path.isfile(venv_python) else sys.executable
     agent_url = f"http://127.0.0.1:{port}"
-    env = {
-        **os.environ,
+    env = build_test_subprocess_env({
         "HOST": "127.0.0.1",
         "PORT": str(port),
         "AGENT_ID": "scm-agent",
@@ -111,7 +117,7 @@ def start_local_agent(token: str, port: int, openai_base_url: str = "http://loca
         "ALLOW_MOCK_FALLBACK": "1",
         "OPENAI_BASE_URL": openai_base_url,
         "PYTHONPATH": PROJECT_ROOT,
-    }
+    }, trusted=True)
     return subprocess.Popen(
         [python, "scm/app.py"],
         cwd=PROJECT_ROOT,
@@ -142,10 +148,6 @@ def main(argv=None):
     # -- Load test config ---------------------------------------------------
     env_values = load_env_file("tests/.env")
     token = env_values.get("TEST_GITHUB_TOKEN", "").strip()
-    if not token:
-        # Fall back to scm agent .env
-        scm_env = load_env_file("scm/.env")
-        token = scm_env.get("SCM_TOKEN", "").strip()
 
     # LLM endpoint: use localhost for local subprocess, host.docker.internal in containers
     openai_base_url = (
@@ -190,14 +192,20 @@ def main(argv=None):
     try:
         # TC-01 — Git auth --------------------------------------------------
         reporter.step("TC-01  Validate GitHub token via git ls-remote")
+        basic_auth = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
         code, stdout, stderr = run_command(
             [
                 "git",
-                "-c", f"http.extraHeader=Authorization: Bearer {token}",
+                "-c", f"http.extraHeader=AUTHORIZATION: basic {basic_auth}",
+                "-c", "credential.helper=",
                 "ls-remote", clone_url, "HEAD",
             ],
             cwd=PROJECT_ROOT,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            env=build_test_subprocess_env({
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_ASKPASS": "",
+                "GIT_SSH_COMMAND": "",
+            }),
         )
         if code == 0 and stdout:
             reporter.ok("GitHub token authenticates over HTTPS")

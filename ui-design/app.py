@@ -9,11 +9,12 @@ import sys
 import threading
 from urllib.parse import parse_qs, urlparse
 
-from common.devlog import debug_log
+from common.devlog import debug_log, record_workspace_stage
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
-from common.llm_client import generate_text
 from common.message_utils import build_text_artifact, extract_text
+from common.rules_loader import build_system_prompt
+from common.runtime.adapter import get_runtime, summarize_runtime_configuration
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -24,6 +25,7 @@ if _AGENT_DIR not in sys.path:
     sys.path.insert(0, _AGENT_DIR)
 
 import figma_client  # noqa: E402  (local to ui-design/)
+import prompts as agent_prompts  # noqa: E402  (local to ui-design/)
 import stitch_client  # noqa: E402  (local to ui-design/)
 
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -35,6 +37,13 @@ _AGENT_CARD_PATH = os.path.join(os.path.dirname(__file__), "agent-card.json")
 _TASK_SEQ = 0
 _TASK_SEQ_LOCK = threading.Lock()
 _TASKS: dict[str, dict] = {}
+
+
+def _runtime_config_summary() -> dict:
+    return {
+        "runtime": summarize_runtime_configuration(),
+        "provider": "figma+stitch",
+    }
 
 
 def _load_agent_card() -> dict:
@@ -70,6 +79,44 @@ def _looks_like_stitch_request(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Workspace file helper
+# ---------------------------------------------------------------------------
+
+def _save_workspace_file(workspace_path: str, relative_name: str, content: str) -> None:
+    """Write content to a file inside the shared workspace (best-effort)."""
+    if not workspace_path:
+        return
+    try:
+        full_path = os.path.join(workspace_path, relative_name)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    except OSError as exc:
+        print(f"[{AGENT_ID}] Warning: could not save workspace file {relative_name}: {exc}")
+
+
+def _run_agentic(
+    prompt: str,
+    actor: str,
+    *,
+    system_prompt: str | None = None,
+    context: dict | None = None,
+    timeout: int = 120,
+    max_tokens: int = 4096,
+) -> str:
+    result = get_runtime().run(
+        prompt=prompt,
+        context=context,
+        system_prompt=system_prompt,
+        timeout=timeout,
+        max_tokens=max_tokens,
+    )
+    for warning in result.get("warnings") or []:
+        print(f"[{AGENT_ID}] Runtime warning ({actor}): {warning}")
+    return result.get("raw_response") or result.get("summary") or ""
+
+
+# ---------------------------------------------------------------------------
 # Figma handler
 # ---------------------------------------------------------------------------
 
@@ -96,6 +143,8 @@ def _handle_figma_message(user_text: str, capability: str) -> tuple[str, list]:
                     f"Figma file: {meta.get('name')} "
                     f"(last modified: {meta.get('lastModified')})"
                 )
+            else:
+                summary_parts.append(f"Figma file metadata fetch status: {meta_status}")
             # Explicit element-spec request
             if capability == "figma.node.get" or node_id:
                 node_result, node_status = figma_client.fetch_nodes(file_key, [node_id]) if node_id else ({}, "no_node_id")
@@ -113,22 +162,34 @@ def _handle_figma_message(user_text: str, capability: str) -> tuple[str, list]:
                         f"Page matched: '{matched_page.get('name')}' "
                         f"(id: {matched_page.get('id')})"
                     )
-                else:
+                elif page_status == "page_not_found":
                     available = page_result.get("availablePages", [])
                     summary_parts.append(
                         f"Page '{page_name}' not found. Available: {available}"
                     )
+                else:
+                    summary_parts.append(
+                        f"Figma page fetch status: {page_status}"
+                    )
+        else:
+            summary_parts.append("Could not parse the Figma file key from the provided URL.")
+    else:
+        summary_parts.append("No Figma URL found in the request.")
 
-    prompt = (
-        "You are the UI Design Agent. The user requested Figma design data.\n\n"
-        f"User request: {user_text}\n"
-        f"Figma URL found: {figma_url or 'none'}\n"
-        f"Page requested: {page_name or 'none'}\n"
-        f"Fetch summary: {'; '.join(summary_parts) or 'no data fetched'}\n\n"
-        "Respond concisely with what was fetched and how it can be used."
+    prompt = agent_prompts.FIGMA_SUMMARY_TEMPLATE.format(
+        user_text=user_text,
+        figma_url=figma_url or "none",
+        page_name=page_name or "none",
+        fetch_summary='; '.join(summary_parts) or 'no data fetched',
     )
 
-    llm_text = generate_text(prompt, AGENT_ID)
+    llm_text = _run_agentic(
+        prompt,
+        AGENT_ID,
+        system_prompt=build_system_prompt(agent_prompts.FIGMA_SUMMARY_SYSTEM, "ui-design"),
+    )
+    if not str(llm_text).strip():
+        llm_text = "; ".join(summary_parts) or "No Figma data fetched."
     artifacts = [
         build_text_artifact(
             "figma-summary",
@@ -150,7 +211,7 @@ def _handle_figma_message(user_text: str, capability: str) -> tuple[str, list]:
 # Stitch handler
 # ---------------------------------------------------------------------------
 
-def _handle_stitch_message(user_text: str, capability: str) -> tuple[str, list]:
+def _handle_stitch_message(user_text: str, capability: str, workspace_path: str = "") -> tuple[str, list]:
     import re
 
     proj_match = re.search(r"\b(\d{15,20})\b", user_text)
@@ -159,7 +220,22 @@ def _handle_stitch_message(user_text: str, capability: str) -> tuple[str, list]:
     screen_match = re.search(r"\b([0-9a-f]{32})\b", user_text, re.IGNORECASE)
     screen_id = screen_match.group(1) if screen_match else ""
 
+    # Extract page/screen name from text:
+    #   "page: Landing Page (Bare-bones)"  or  "screen name: Foo Bar"  or  "page name 'Foo'"
+    page_name = ""
+    page_name_patterns = [
+        r'(?:page|screen)[_\s-]*name[:\s]+["\']?([^"\'\\n,]+?)["\']?(?:\s|$)',
+        r'(?:page|screen)[:\s]+["\']([^"\']+)["\']',
+        r'(?:page|screen)[:\s]+([A-Z][^\n,]{3,60}?)(?:\s*$|\s*,)',
+    ]
+    for pat in page_name_patterns:
+        m = re.search(pat, user_text, re.IGNORECASE)
+        if m:
+            page_name = m.group(1).strip().rstrip(".")
+            break
+
     summary_parts: list[str] = []
+    design_result: dict = {}
 
     if project_id and screen_id:
         result, status = stitch_client.get_screen(project_id, screen_id)
@@ -169,25 +245,69 @@ def _handle_stitch_message(user_text: str, capability: str) -> tuple[str, list]:
             )
             if result.get("imageUrls"):
                 summary_parts.append(f"Image URLs: {result['imageUrls'][:2]}")
+            design_result = result
         else:
             summary_parts.append(f"Stitch screen fetch failed: {status}")
+    elif project_id and page_name:
+        # Try to resolve page name → screen ID using list_screens
+        found_screen, find_status = stitch_client.find_screen_by_name(project_id, page_name)
+        if found_screen:
+            resolved_id = found_screen.get("id", "") or found_screen.get("screenId", "")
+            resolved_name = found_screen.get("name", page_name)
+            summary_parts.append(
+                f"Resolved page '{page_name}' → screen '{resolved_name}' (id={resolved_id})"
+            )
+            if resolved_id:
+                result, status = stitch_client.get_screen(project_id, resolved_id)
+                if status == "ok":
+                    summary_parts.append(
+                        f"Stitch screen fetched: project={project_id}, screen={resolved_id}"
+                    )
+                    if result.get("imageUrls"):
+                        summary_parts.append(f"Image URLs: {result['imageUrls'][:2]}")
+                    design_result = result
+                    screen_id = resolved_id
+                else:
+                    summary_parts.append(f"Stitch screen fetch failed after name resolution: {status}")
+            else:
+                summary_parts.append(f"Found screen by name but no ID available: {found_screen}")
+        else:
+            summary_parts.append(f"Page '{page_name}' not found in project {project_id}: {find_status}")
+            # Still fetch project metadata as fallback
+            result, status = stitch_client.get_project(project_id)
+            if status == "ok":
+                summary_parts.append(f"Stitch project fetched (fallback): {project_id}")
+                design_result = result
     elif project_id:
         result, status = stitch_client.get_project(project_id)
         if status == "ok":
             summary_parts.append(f"Stitch project fetched: {project_id}")
+            design_result = result
         else:
             summary_parts.append(f"Stitch project fetch failed: {status}")
 
-    prompt = (
-        "You are the UI Design Agent. The user requested Google Stitch design data.\n\n"
-        f"User request: {user_text}\n"
-        f"Project ID found: {project_id or 'none'}\n"
-        f"Screen ID found: {screen_id or 'none'}\n"
-        f"Fetch summary: {'; '.join(summary_parts) or 'no data fetched'}\n\n"
-        "Respond concisely with what was fetched and how it can be used."
+    # Save design content to shared workspace
+    if workspace_path and design_result:
+        _save_workspace_file(
+            workspace_path,
+            "ui-design/stitch-design.json",
+            json.dumps(design_result, ensure_ascii=False, indent=2),
+        )
+        debug_log(AGENT_ID, "stitch.workspace.saved", path=workspace_path)
+
+    prompt = agent_prompts.STITCH_SUMMARY_TEMPLATE.format(
+        user_text=user_text,
+        project_id=project_id or "none",
+        screen_id=screen_id or "none",
+        page_name=page_name or "none",
+        fetch_summary='; '.join(summary_parts) or 'no data fetched',
     )
 
-    llm_text = generate_text(prompt, AGENT_ID)
+    llm_text = _run_agentic(
+        prompt,
+        AGENT_ID,
+        system_prompt=build_system_prompt(agent_prompts.STITCH_SUMMARY_SYSTEM, "ui-design"),
+    )
     artifacts = [
         build_text_artifact(
             "stitch-summary",
@@ -198,10 +318,11 @@ def _handle_stitch_message(user_text: str, capability: str) -> tuple[str, list]:
                 "capability": capability or "stitch.screen.fetch",
                 "projectId": project_id,
                 "screenId": screen_id,
+                "pageName": page_name,
             },
         )
     ]
-    debug_log(AGENT_ID, "stitch.message.completed", projectId=project_id, screenId=screen_id)
+    debug_log(AGENT_ID, "stitch.message.completed", projectId=project_id, screenId=screen_id, pageName=page_name)
     return "; ".join(summary_parts) or "Stitch request processed.", artifacts
 
 
@@ -210,14 +331,12 @@ def _handle_stitch_message(user_text: str, capability: str) -> tuple[str, list]:
 # ---------------------------------------------------------------------------
 
 def _handle_generic_message(user_text: str) -> tuple[str, list]:
-    prompt = (
-        "You are the UI Design Agent. You can retrieve design data from:\n"
-        "- Figma: file metadata, pages, and nodes via REST API\n"
-        "- Google Stitch: project and screen design/code via MCP\n\n"
-        "The user has not specified a design source. Respond helpfully.\n\n"
-        f"User request: {user_text}"
+    prompt = agent_prompts.GENERIC_TEMPLATE.format(user_text=user_text)
+    llm_text = _run_agentic(
+        prompt,
+        AGENT_ID,
+        system_prompt=build_system_prompt(agent_prompts.GENERIC_SYSTEM, "ui-design"),
     )
-    llm_text = generate_text(prompt, AGENT_ID)
     artifacts = [
         build_text_artifact(
             "ui-design-response",
@@ -237,15 +356,24 @@ def _dispatch_message(message: dict) -> tuple[str, list]:
     user_text = extract_text(message)
     metadata = message.get("metadata", {}) if isinstance(message, dict) else {}
     capability = metadata.get("requestedCapability", "")
+    workspace_path = metadata.get("sharedWorkspacePath", "")
 
     debug_log(AGENT_ID, "ui-design.message.received",
               userText=user_text, capability=capability)
+    if workspace_path:
+        record_workspace_stage(
+            workspace_path,
+            "ui-design",
+            f"Started {capability or 'ui-design request'}",
+            task_id=(metadata.get("orchestratorTaskId") or ""),
+                extra={"runtimeConfig": _runtime_config_summary()},
+        )
 
     if capability.startswith("figma.") or _looks_like_figma_request(user_text):
         return _handle_figma_message(user_text, capability)
 
     if capability.startswith("stitch.") or _looks_like_stitch_request(user_text):
-        return _handle_stitch_message(user_text, capability)
+        return _handle_stitch_message(user_text, capability, workspace_path=workspace_path)
 
     return _handle_generic_message(user_text)
 
@@ -283,8 +411,19 @@ def _fire_callback(
 def _run_task_background(
     task_id: str, message: dict,
 ) -> None:
+    metadata = message.get("metadata", {}) if isinstance(message, dict) else {}
+    workspace_path = metadata.get("sharedWorkspacePath", "")
+    capability = metadata.get("requestedCapability", "")
     try:
         status_text, artifacts = _dispatch_message(message)
+        if workspace_path:
+            record_workspace_stage(
+                workspace_path,
+                "ui-design",
+                f"Completed {capability or 'ui-design request'}",
+                task_id=task_id,
+                    extra={"statusText": status_text, "runtimeConfig": _runtime_config_summary()},
+            )
         _TASKS[task_id] = {
             "id": task_id,
             "agentId": AGENT_ID,
@@ -297,7 +436,6 @@ def _run_task_background(
             },
             "artifacts": artifacts,
         }
-        metadata = message.get("metadata", {}) if isinstance(message, dict) else {}
         callback_url = metadata.get("orchestratorCallbackUrl", "")
         if callback_url:
             _fire_callback(
@@ -305,6 +443,14 @@ def _run_task_background(
             )
     except Exception as exc:
         print(f"[{AGENT_ID}] Task {task_id} failed: {exc}", flush=True)
+        if workspace_path:
+            record_workspace_stage(
+                workspace_path,
+                "ui-design",
+                f"Failed {capability or 'ui-design request'}",
+                task_id=task_id,
+                    extra={"error": str(exc), "runtimeConfig": _runtime_config_summary()},
+            )
         _TASKS[task_id] = {
             "id": task_id,
             "agentId": AGENT_ID,

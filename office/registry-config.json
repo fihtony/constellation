@@ -1,0 +1,30 @@
+{
+  "agentId": "office-agent",
+  "cardUrl": "http://office-agent:8060/.well-known/agent-card.json",
+  "executionMode": "per-task",
+  "launchSpec": {
+    "image": "constellation-office-agent:latest",
+    "port": 8060,
+    "command": ["python3", "office/app.py"],
+    "mountDockerSocket": false,
+    "passThroughEnv": [
+      "ARTIFACT_ROOT",
+      "COPILOT_GITHUB_TOKEN",
+      "AGENT_RUNTIME",
+      "AGENT_MODEL",
+      "COPILOT_MODEL",
+      "OPENAI_MODEL",
+      "OPENAI_BASE_URL",
+      "OPENAI_API_KEY",
+      "ALLOW_MOCK_FALLBACK",
+      "LOCAL_TIMEZONE",
+      "TZ"
+    ],
+    "env": {}
+  },
+  "scalingPolicy": {
+    "maxInstances": 3,
+    "perInstanceConcurrency": 1,
+    "idleTimeoutSeconds": 120
+  }
+}

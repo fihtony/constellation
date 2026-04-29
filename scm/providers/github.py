@@ -14,6 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from common.env_utils import build_isolated_git_env
 from scm.providers.base import SCMProvider
 
 GITHUB_API_BASE = "https://api.github.com"
@@ -129,15 +130,16 @@ class GitHubProvider(SCMProvider):
         return [], f"error_{status}"
 
     def create_branch(self, owner: str, repo: str, branch: str, from_ref: str) -> tuple[dict, str]:
-        # Resolve sha of from_ref
+        # Resolve sha of from_ref via API
         ref_status, ref_body = self._request("GET", f"repos/{owner}/{repo}/git/ref/heads/{from_ref}")
         if ref_status != 200:
-            # try as sha directly
             sha = from_ref
         else:
             sha = (ref_body.get("object") or {}).get("sha", "")
         if not sha:
             return {"error": "could not resolve from_ref sha"}, "error_ref_not_found"
+
+        # Try the REST API first
         status, body = self._request(
             "POST",
             f"repos/{owner}/{repo}/git/refs",
@@ -149,6 +151,32 @@ class GitHubProvider(SCMProvider):
                 "sha": sha,
                 "htmlUrl": f"https://github.com/{owner}/{repo}/tree/{branch}",
             }, "created"
+
+        # Fine-grained PATs may not be allowed to use the refs API (403).
+        # Fall back: create the branch via git push using token-embedded URL (same as push_files).
+        # Use _run_git_url_auth (no extraHeader) to avoid conflicting Basic+Bearer auth.
+        if status == 403 or status == 422:
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="scm-branch-") as tmpdir:
+                clone_url = self._authed_clone_url(owner, repo)
+                ok, _ = self._run_git_url_auth(
+                    ["clone", "--depth=1", "--branch", from_ref, clone_url, tmpdir]
+                )
+                if not ok:
+                    return body, f"create_failed_{status}"
+                self._run_git_url_auth(["config", "user.email", self._author_email], cwd=tmpdir)
+                self._run_git_url_auth(["config", "user.name", self._author_name], cwd=tmpdir)
+                ok2, res2 = self._run_git_url_auth(
+                    ["push", clone_url, f"HEAD:refs/heads/{branch}"], cwd=tmpdir
+                )
+                if ok2:
+                    return {
+                        "name": branch,
+                        "sha": sha,
+                        "htmlUrl": f"https://github.com/{owner}/{repo}/tree/{branch}",
+                    }, "created"
+                return res2, "create_failed_git_push"
+
         return body, f"create_failed_{status}"
 
     # ------------------------------------------------------------------
@@ -170,6 +198,15 @@ class GitHubProvider(SCMProvider):
             return self._normalize_pr(body), "ok"
         return body, f"error_{status}"
 
+    def _find_existing_open_pr(self, owner: str, repo: str, from_branch: str, to_branch: str) -> dict:
+        prs, status = self.list_prs(owner, repo, "open")
+        if status != "ok":
+            return {}
+        for pr in prs:
+            if pr.get("fromBranch") == from_branch and pr.get("toBranch") == to_branch:
+                return pr
+        return {}
+
     def create_pr(
         self,
         owner: str,
@@ -186,6 +223,10 @@ class GitHubProvider(SCMProvider):
         )
         if status in (200, 201):
             return self._normalize_pr(body), "created"
+        if status == 422:
+            existing_pr = self._find_existing_open_pr(owner, repo, from_branch, to_branch)
+            if existing_pr:
+                return existing_pr, "already_exists"
         return body, f"create_failed_{status}"
 
     def _normalize_pr(self, pr: dict) -> dict:
@@ -276,11 +317,11 @@ class GitHubProvider(SCMProvider):
         return f"https://github.com/{owner}/{repo}.git"
 
     def _git_env(self) -> dict:
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-        return env
+        return build_isolated_git_env(scope="scm-github")
 
     def _git_config_args(self) -> list[str]:
-        args = []
+        """Return git -c args for authentication via http.extraHeader."""
+        args = ["-c", "credential.helper="]
         auth = self._auth_header()
         if auth:
             args.extend(["-c", f"http.extraHeader=Authorization: {auth}"])
@@ -296,6 +337,32 @@ class GitHubProvider(SCMProvider):
             return False, {"command": command, "returncode": completed.returncode, "output": output}
         return True, {"command": command, "output": output}
 
+    def _run_git_url_auth(self, args: list[str], cwd: str | None = None, timeout: int = 180) -> tuple[bool, dict]:
+        """Run git without http.extraHeader — for operations where auth is embedded in the remote URL.
+
+        Using both token-in-URL and http.extraHeader simultaneously sends conflicting
+        Basic + Bearer credentials, which GitHub rejects. Use this method whenever the
+        clone URL already contains the token (e.g. from _authed_clone_url).
+        """
+        command = ["git", "-c", "credential.helper=", *args]
+        completed = subprocess.run(
+            command, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=self._git_env()
+        )
+        output = (completed.stdout or completed.stderr or "").strip()
+        if completed.returncode != 0:
+            return False, {"returncode": completed.returncode, "output": output}
+        return True, {"output": output}
+
+    def _authed_clone_url(self, owner: str, repo: str) -> str:
+        """Return clone URL with embedded token for reliable git auth.
+
+        Token is embedded as x-access-token (GitHub fine-grained PAT compatible).
+        This runs only inside the agent container and is never exposed externally.
+        """
+        if self._token:
+            return f"https://x-access-token:{self._token}@github.com/{owner}/{repo}.git"
+        return f"https://github.com/{owner}/{repo}.git"
+
     def push_files(
         self,
         owner: str,
@@ -306,22 +373,24 @@ class GitHubProvider(SCMProvider):
         commit_message: str,
         files_to_delete: list[str] | None = None,
     ) -> tuple[dict, str]:
-        clone_url = self.get_clone_url(owner, repo)
+        clone_url = self._authed_clone_url(owner, repo)
         with tempfile.TemporaryDirectory(prefix="scm-push-") as tmpdir:
-            ok, result = self._run_git(
+            # Use _run_git_url_auth throughout: auth is embedded in clone_url,
+            # adding http.extraHeader on top would send conflicting Basic+Bearer to GitHub.
+            ok, result = self._run_git_url_auth(
                 ["clone", "--depth=1", "--branch", base_branch, clone_url, tmpdir]
             )
             if not ok:
                 return result, "clone_failed"
 
             # Configure author
-            self._run_git(["config", "user.email", self._author_email], cwd=tmpdir)
-            self._run_git(["config", "user.name", self._author_name], cwd=tmpdir)
+            self._run_git_url_auth(["config", "user.email", self._author_email], cwd=tmpdir)
+            self._run_git_url_auth(["config", "user.name", self._author_name], cwd=tmpdir)
 
             # Create or switch to branch
-            ok_branch, _ = self._run_git(["checkout", "-b", branch], cwd=tmpdir)
+            ok_branch, _ = self._run_git_url_auth(["checkout", "-b", branch], cwd=tmpdir)
             if not ok_branch:
-                self._run_git(["checkout", branch], cwd=tmpdir)
+                self._run_git_url_auth(["checkout", branch], cwd=tmpdir)
 
             # Write files
             for f in files:
@@ -335,7 +404,7 @@ class GitHubProvider(SCMProvider):
                     full.write_text(content, encoding="utf-8")
                 else:
                     full.write_bytes(content)
-                self._run_git(["add", rel_path], cwd=tmpdir)
+                self._run_git_url_auth(["add", rel_path], cwd=tmpdir)
 
             # Delete files
             for d in (files_to_delete or []):
@@ -343,16 +412,17 @@ class GitHubProvider(SCMProvider):
                 full_del = Path(tmpdir) / rel
                 if full_del.exists():
                     full_del.unlink()
-                self._run_git(["rm", "--cached", "--ignore-unmatch", rel], cwd=tmpdir)
+                self._run_git_url_auth(["rm", "--cached", "--ignore-unmatch", rel], cwd=tmpdir)
 
-            ok, result = self._run_git(
+            ok, result = self._run_git_url_auth(
                 ["commit", "-m", commit_message], cwd=tmpdir
             )
             if not ok:
                 return result, "commit_failed"
 
-            ok, result = self._run_git(
-                ["push", "origin", f"HEAD:refs/heads/{branch}"], cwd=tmpdir
+            # Push using the authed URL directly (not 'origin') to ensure token auth
+            ok, result = self._run_git_url_auth(
+                ["push", clone_url, f"HEAD:refs/heads/{branch}"], cwd=tmpdir
             )
             if not ok:
                 return result, "push_failed"

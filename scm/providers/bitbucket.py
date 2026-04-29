@@ -15,6 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from common.env_utils import build_isolated_git_env
 from scm.providers.base import SCMProvider
 
 JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
@@ -338,7 +339,7 @@ class BitbucketProvider(SCMProvider):
         return self._git_clone_url(owner or self._default_project, repo)
 
     def _git_config_args(self) -> list[str]:
-        args = []
+        args = ["-c", "credential.helper="]
         auth = self._auth_header()
         if auth:
             args.extend(["-c", f"http.extraHeader=Authorization: {auth}"])
@@ -350,7 +351,7 @@ class BitbucketProvider(SCMProvider):
         command = ["git", *self._git_config_args(), *args]
         completed = subprocess.run(
             command, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            env=build_isolated_git_env(scope="scm-bitbucket"),
         )
         output = (completed.stdout or completed.stderr or "").strip()
         if completed.returncode != 0:

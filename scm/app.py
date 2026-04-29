@@ -15,17 +15,20 @@ import subprocess
 import tempfile
 import threading
 import time
+import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-from common.devlog import debug_log
-from common.env_utils import load_dotenv
+from common.devlog import debug_log, record_workspace_stage
+from common.env_utils import build_isolated_git_env, load_dotenv
 from common.instance_reporter import InstanceReporter
-from common.llm_client import generate_text
 from common.message_utils import build_text_artifact, extract_text
+from common.rules_loader import build_system_prompt, load_rules
+from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from scm import prompts
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -60,12 +63,37 @@ CLONE_TIMEOUT_SECONDS = int(os.environ.get("CLONE_TIMEOUT_SECONDS", "600"))
 _REPO_TREE_MAX_FILES = int(os.environ.get("REPO_TREE_MAX_FILES", "500"))
 _REPO_FILE_MAX_BYTES = int(os.environ.get("REPO_FILE_MAX_BYTES", str(512 * 1024)))
 
+
+def _run_agentic(
+    prompt: str,
+    actor: str,
+    *,
+    system_prompt: str | None = None,
+    context: dict | None = None,
+    timeout: int = 120,
+    max_tokens: int = 4096,
+) -> str:
+    result = get_runtime().run(
+        prompt=prompt,
+        context=context,
+        system_prompt=system_prompt,
+        timeout=timeout,
+        max_tokens=max_tokens,
+    )
+    for warning in result.get("warnings") or []:
+        print(f"[{AGENT_ID}] Runtime warning ({actor}): {warning}")
+    return result.get("raw_response") or result.get("summary") or ""
+
+# Back-end selector (only applies when SCM_PROVIDER=github): "rest" (default) | "mcp"
+_SCM_BACKEND = os.environ.get("SCM_BACKEND", "rest").strip().lower()
+
 # ---------------------------------------------------------------------------
 # Provider factory
 # ---------------------------------------------------------------------------
 
 def _make_provider():
     from scm.providers.github import GitHubProvider
+    from scm.providers.github_mcp import GitHubMCPProvider
     from scm.providers.bitbucket import BitbucketProvider
 
     provider_name = _SCM_PROVIDER
@@ -78,6 +106,14 @@ def _make_provider():
             provider_name = "bitbucket"
 
     if provider_name == "github":
+        if _SCM_BACKEND == "mcp":
+            print(f"[{AGENT_ID}] GitHub back-end: MCP (remote HTTP)")
+            return GitHubMCPProvider(
+                token=_SCM_TOKEN,
+                author_name=_GIT_AUTHOR_NAME,
+                author_email=_GIT_AUTHOR_EMAIL,
+            )
+        print(f"[{AGENT_ID}] GitHub back-end: REST API")
         return GitHubProvider(
             token=_SCM_TOKEN,
             username=_SCM_USERNAME,
@@ -239,20 +275,40 @@ def _read_skill_guide(limit: int = 2200) -> str:
 # Git clone to shared workspace (async)
 # ---------------------------------------------------------------------------
 
+def _resolve_clone_auth(owner: str, repo: str, clone_url: str) -> tuple[str, list[str]]:
+    git_config: list[str] = ["-c", "credential.helper="]
+    token = _SCM_TOKEN
+    if token and "github.com/" in clone_url:
+        clone_url = re.sub(r"https://[^@/]+@github\.com/", "https://github.com/", clone_url)
+        basic_auth = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+        git_config.extend(["-c", f"http.extraHeader=AUTHORIZATION: basic {basic_auth}"])
+        token = ""
+    if token and "x-access-token:" not in clone_url:
+        git_config.extend(["-c", f"http.extraHeader=Authorization: Bearer {token}"])
+    if _CORP_CA_BUNDLE and os.path.isfile(_CORP_CA_BUNDLE):
+        git_config.extend(["-c", f"http.sslCAInfo={_CORP_CA_BUNDLE}"])
+    return clone_url, git_config
+
+
+def _runtime_config_summary() -> dict:
+    return {
+        "runtime": summarize_runtime_configuration(),
+        "rulesLoaded": bool(load_rules("scm")),
+        "workflowRulesLoaded": bool(load_rules("scm", include_workflow=True)),
+        "provider": _provider.provider_name,
+        "backend": _SCM_BACKEND,
+    }
+
+
 def _clone_to_workspace(
     owner: str, repo: str, branch: str, target_path: str
 ) -> tuple[str | None, str]:
     clone_url = _provider.get_clone_url(owner, repo)
     clone_dir = os.path.join(target_path, repo)
     os.makedirs(target_path, exist_ok=True)
-    git_config = []
-    token = _SCM_TOKEN
-    if token:
-        git_config.extend(["-c", f"http.extraHeader=Authorization: Bearer {token}"])
-    if _CORP_CA_BUNDLE and os.path.isfile(_CORP_CA_BUNDLE):
-        git_config.extend(["-c", f"http.sslCAInfo={_CORP_CA_BUNDLE}"])
+    clone_url, git_config = _resolve_clone_auth(owner, repo, clone_url)
 
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    env = build_isolated_git_env(scope=f"{AGENT_ID}-workspace-clone")
 
     if os.path.isdir(os.path.join(clone_dir, ".git")):
         r = subprocess.run(
@@ -331,19 +387,67 @@ def _clone_async_worker(task_id: str, owner: str, repo: str, branch: str, target
     try:
         _update_task(task_id, state="TASK_STATE_WORKING",
                      message=f"Cloning {owner}/{repo} branch={branch} …")
+        record_workspace_stage(
+            target_path,
+            "scm",
+            f"Cloning {owner}/{repo} ({branch})",
+            task_id=task_id,
+            extra={
+                "owner": owner,
+                "repo": repo,
+                "branch": branch,
+                "runtimeConfig": _runtime_config_summary(),
+            },
+        )
         clone_dir, result = _clone_to_workspace(owner, repo, branch, target_path)
         if clone_dir:
+            clone_artifact = {
+                "name": "clone-result",
+                "artifactType": "application/json",
+                "parts": [{"text": json.dumps({"clonePath": clone_dir, "result": result})}],
+                "metadata": {"agentId": AGENT_ID, "capability": "scm.git.clone"},
+            }
             _update_task(task_id, state="TASK_STATE_COMPLETED",
                          message=f"Cloned {owner}/{repo} → {clone_dir} ({result})",
+                         artifacts=[clone_artifact],
                          extra={"clonePath": clone_dir, "result": result})
+            record_workspace_stage(
+                target_path,
+                "scm",
+                f"Completed scm.git.clone for {owner}/{repo}",
+                task_id=task_id,
+                extra={
+                    "clonePath": clone_dir,
+                    "result": result,
+                    "runtimeConfig": _runtime_config_summary(),
+                },
+            )
             _fire_clone_callback(callback_url, task_id, "TASK_STATE_COMPLETED", clone_dir, "")
         else:
             _update_task(task_id, state="TASK_STATE_FAILED",
                          message=f"Clone failed: {result}",
                          extra={"clonePath": "", "result": result})
+            record_workspace_stage(
+                target_path,
+                "scm",
+                f"Failed scm.git.clone for {owner}/{repo}",
+                task_id=task_id,
+                extra={
+                    "clonePath": "",
+                    "result": result,
+                    "runtimeConfig": _runtime_config_summary(),
+                },
+            )
             _fire_clone_callback(callback_url, task_id, "TASK_STATE_FAILED", "", result)
     except Exception as exc:
         _update_task(task_id, state="TASK_STATE_FAILED", message=str(exc))
+        record_workspace_stage(
+            target_path,
+            "scm",
+            f"Failed scm.git.clone for {owner}/{repo}",
+            task_id=task_id,
+            extra={"error": str(exc), "runtimeConfig": _runtime_config_summary()},
+        )
         _fire_clone_callback(callback_url, task_id, "TASK_STATE_FAILED", "", str(exc))
 
 
@@ -417,8 +521,8 @@ def _handle_repo_search(text: str) -> tuple[str, list]:
         for r in repos
     )
     artifact = build_text_artifact(
+        "repo-search-results",
         summary or "No repositories found.",
-        name="repo-search-results",
         metadata={"agentId": AGENT_ID, "capability": "scm.repo.search"},
     )
     return f"Found {len(repos)} repositories.", [artifact]
@@ -434,8 +538,8 @@ def _handle_repo_inspect(text: str) -> tuple[str, list]:
     branches, _ = _provider.list_branches(owner, repo)
     result = {**info, "branches": branches[:20]}
     artifact = build_text_artifact(
+        "repo-info",
         json.dumps(result, ensure_ascii=False, indent=2),
-        name="repo-info",
         metadata={"agentId": AGENT_ID, "capability": "scm.repo.inspect"},
     )
     return f"Repository {owner}/{repo} fetched ({len(branches)} branches).", [artifact]
@@ -449,8 +553,8 @@ def _handle_branch_list(text: str) -> tuple[str, list]:
     if status != "ok":
         return f"Branch list failed: {status}", []
     artifact = build_text_artifact(
+        "branches",
         json.dumps(branches, ensure_ascii=False, indent=2),
-        name="branches",
         metadata={"agentId": AGENT_ID, "capability": "scm.branch.list"},
     )
     return f"Listed {len(branches)} branches for {owner}/{repo}.", [artifact]
@@ -468,8 +572,8 @@ def _handle_branch_create(text: str, message: dict) -> tuple[str, list]:
     if status not in ("created",):
         return f"Branch creation failed: {status} — {result}", []
     artifact = build_text_artifact(
+        "branch-created",
         json.dumps(result, ensure_ascii=False, indent=2),
-        name="branch-created",
         metadata={"agentId": AGENT_ID, "capability": "scm.branch.create"},
     )
     return f"Branch '{branch}' created in {owner}/{repo} from '{from_ref}'.", [artifact]
@@ -485,8 +589,8 @@ def _handle_pr_list(text: str) -> tuple[str, list]:
     if status != "ok":
         return f"PR list failed: {status}", []
     artifact = build_text_artifact(
+        "pull-requests",
         json.dumps(prs, ensure_ascii=False, indent=2),
-        name="pull-requests",
         metadata={"agentId": AGENT_ID, "capability": "scm.pr.list"},
     )
     return f"Listed {len(prs)} {state} PRs for {owner}/{repo}.", [artifact]
@@ -502,8 +606,8 @@ def _handle_pr_get(text: str) -> tuple[str, list]:
     if status != "ok":
         return f"PR fetch failed: {status}", []
     artifact = build_text_artifact(
+        f"pr-{pr_id}",
         json.dumps(pr, ensure_ascii=False, indent=2),
-        name=f"pr-{pr_id}",
         metadata={"agentId": AGENT_ID, "capability": "scm.pr.get",
                   "linkedJiraIssues": pr.get("linkedJiraIssues", [])},
     )
@@ -511,23 +615,40 @@ def _handle_pr_get(text: str) -> tuple[str, list]:
 
 
 def _handle_pr_create(text: str, message: dict) -> tuple[str, list]:
-    owner, repo = _parse_owner_repo(text)
-    from_m = re.search(r"from[:\s]+([^\s,]+)", text, re.IGNORECASE)
-    to_m = re.search(r"(?:to|into|target)[:\s]+([^\s,]+)", text, re.IGNORECASE)
-    title_m = re.search(r"title[:\s]+(.+)", text, re.IGNORECASE)
-    from_branch = from_m.group(1) if from_m else ""
-    to_branch = to_m.group(1) if to_m else "main"
-    title = title_m.group(1).strip() if title_m else f"PR from {from_branch}"
+    # Prefer structured prPayload from metadata (avoids brittle text parsing)
+    pr_payload = (message.get("metadata") or {}).get("prPayload") or {}
+    if pr_payload:
+        owner = pr_payload.get("owner", "")
+        repo = pr_payload.get("repo", "")
+        from_branch = pr_payload.get("fromBranch", "")
+        to_branch = pr_payload.get("toBranch", "main")
+        title = pr_payload.get("title", f"PR from {from_branch}")
+        description = pr_payload.get("description", "")
+    else:
+        # Fall back to text parsing
+        owner, repo = _parse_owner_repo(text)
+        from_m = re.search(r"from[:\s]+([^\s,]+)", text, re.IGNORECASE)
+        to_m = re.search(r"(?:to|into|target)[:\s]+([^\s,]+)", text, re.IGNORECASE)
+        title_m = re.search(r"title[:\s]+(.+)", text, re.IGNORECASE)
+        from_branch = from_m.group(1) if from_m else ""
+        to_branch = to_m.group(1) if to_m else "main"
+        title = title_m.group(1).strip() if title_m else f"PR from {from_branch}"
+        description = ""
+        # Reject to_branch values that look like Jira keys (e.g. CSTL-1/feature)
+        if re.match(r"^[A-Z][A-Z0-9]+-\d+", to_branch or ""):
+            to_branch = "main"
     if not owner or not repo or not from_branch:
         return "Could not parse owner/repo/from_branch from request.", []
-    pr, status = _provider.create_pr(owner, repo, from_branch, to_branch, title)
-    if status not in ("created",):
+    pr, status = _provider.create_pr(owner, repo, from_branch, to_branch, title, description)
+    if status not in ("created", "already_exists"):
         return f"PR creation failed: {status} — {pr}", []
     artifact = build_text_artifact(
+        "pr-created",
         json.dumps(pr, ensure_ascii=False, indent=2),
-        name="pr-created",
         metadata={"agentId": AGENT_ID, "capability": "scm.pr.create"},
     )
+    if status == "already_exists":
+        return f"PR already exists: '{title}' ({pr.get('htmlUrl', '')})", [artifact]
     return f"PR created: '{title}' ({pr.get('htmlUrl', '')})", [artifact]
 
 
@@ -544,8 +665,8 @@ def _handle_pr_comment(text: str, message: dict) -> tuple[str, list]:
         return f"PR comment failed: {status} — {result}", []
     return f"Comment added to PR #{pr_id} in {owner}/{repo}.", [
         build_text_artifact(
+            "pr-comment",
             json.dumps(result, ensure_ascii=False, indent=2),
-            name="pr-comment",
             metadata={"agentId": AGENT_ID, "capability": "scm.pr.comment"},
         )
     ]
@@ -562,16 +683,21 @@ def _handle_pr_comment_list(text: str) -> tuple[str, list]:
         return f"PR comment list failed: {status}", []
     return f"Listed {len(comments)} comments on PR #{pr_id}.", [
         build_text_artifact(
+            "pr-comments",
             json.dumps(comments, ensure_ascii=False, indent=2),
-            name="pr-comments",
             metadata={"agentId": AGENT_ID, "capability": "scm.pr.comment.list"},
         )
     ]
 
 
 def _handle_git_push(text: str, message: dict) -> tuple[str, list]:
-    owner, repo = _parse_owner_repo(text)
+    # Prefer structured pushPayload from metadata over text parsing
     payload = (message.get("metadata") or {}).get("pushPayload") or {}
+    if payload:
+        owner = payload.get("owner", "")
+        repo = payload.get("repo", "")
+    else:
+        owner, repo = _parse_owner_repo(text)
     branch = payload.get("branch", "")
     base_branch = payload.get("baseBranch", "main")
     files = payload.get("files", [])
@@ -584,8 +710,8 @@ def _handle_git_push(text: str, message: dict) -> tuple[str, list]:
         return f"Git push failed: {status} — {result}", []
     return f"Pushed {len(files)} file(s) to {owner}/{repo}:{branch}.", [
         build_text_artifact(
+            "git-push",
             json.dumps(result, ensure_ascii=False, indent=2),
-            name="git-push",
             metadata={"agentId": AGENT_ID, "capability": "scm.git.push"},
         )
     ]
@@ -594,17 +720,22 @@ def _handle_git_push(text: str, message: dict) -> tuple[str, list]:
 def _handle_llm_dispatch(text: str, message: dict, system_prompt: str) -> tuple[str, list]:
     """Use LLM to understand intent and call the appropriate provider method."""
     try:
-        llm_response = generate_text(
-            system=system_prompt,
-            prompt=text,
+        llm_response = _run_agentic(
+            prompts.DISPATCH_TEMPLATE.format(
+                provider_name=_provider.provider_name,
+                user_text=text,
+                metadata=json.dumps(message.get("metadata") or {}, ensure_ascii=False, indent=2),
+            ),
+            AGENT_ID,
+            system_prompt=(build_system_prompt(prompts.DISPATCH_SYSTEM, "scm") + "\n\n" + (system_prompt or "")).strip(),
             max_tokens=1024,
         )
     except Exception as exc:
         llm_response = f"LLM error: {exc}"
 
     artifact = build_text_artifact(
+        "scm-analysis",
         llm_response,
-        name="scm-analysis",
         metadata={"agentId": AGENT_ID, "provider": _provider.provider_name},
     )
     return llm_response[:200], [artifact]
@@ -615,11 +746,21 @@ def _handle_llm_dispatch(text: str, message: dict, system_prompt: str) -> tuple[
 # ---------------------------------------------------------------------------
 
 def _run_task_async(task_id: str, message: dict):
+    metadata = message.get("metadata") or {}
+    workspace_path = metadata.get("sharedWorkspacePath") or ""
+    capability = metadata.get("requestedCapability", "")
     try:
         _update_task(task_id, state="TASK_STATE_WORKING",
                      message="SCM agent is processing the task.")
+        if workspace_path:
+            record_workspace_stage(
+                workspace_path,
+                "scm",
+                f"Started {capability or 'scm request'}",
+                task_id=task_id,
+                extra={"runtimeConfig": _runtime_config_summary()},
+            )
         # Special handling for async clone
-        capability = (message.get("metadata") or {}).get("requestedCapability", "")
         if capability == "scm.git.clone":
             _dispatch_clone(task_id, message)
             return
@@ -627,11 +768,27 @@ def _run_task_async(task_id: str, message: dict):
         status_text, artifacts = process_message(message)
         _update_task(task_id, state="TASK_STATE_COMPLETED",
                      message=status_text, artifacts=artifacts)
+        if workspace_path:
+            record_workspace_stage(
+                workspace_path,
+                "scm",
+                f"Completed {capability or 'scm request'}",
+                task_id=task_id,
+                extra={"statusText": status_text, "runtimeConfig": _runtime_config_summary()},
+            )
         _notify_completion(message, task_id, "TASK_STATE_COMPLETED", status_text, artifacts)
     except Exception as error:
         print(f"[{AGENT_ID}] Task {task_id} failed: {error}")
         failure_text = f"SCM agent failed: {error}"
         _update_task(task_id, state="TASK_STATE_FAILED", message=failure_text, artifacts=[])
+        if workspace_path:
+            record_workspace_stage(
+                workspace_path,
+                "scm",
+                f"Failed {capability or 'scm request'}",
+                task_id=task_id,
+                extra={"error": str(error), "runtimeConfig": _runtime_config_summary()},
+            )
         _notify_completion(message, task_id, "TASK_STATE_FAILED", failure_text, [])
 
 
@@ -647,6 +804,17 @@ def _dispatch_clone(task_id: str, message: dict):
     if not owner or not repo:
         _update_task(task_id, state="TASK_STATE_FAILED",
                      message="Could not parse owner/repo for clone.")
+        if metadata.get("sharedWorkspacePath"):
+            record_workspace_stage(
+                metadata.get("sharedWorkspacePath"),
+                "scm",
+                "Failed scm.git.clone",
+                task_id=task_id,
+                extra={
+                    "error": "Could not parse owner/repo for clone.",
+                    "runtimeConfig": _runtime_config_summary(),
+                },
+            )
         return
     # Run the actual clone in a background thread
     t = threading.Thread(

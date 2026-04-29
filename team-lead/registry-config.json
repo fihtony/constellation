@@ -1,21 +1,23 @@
 {
   "agentId": "team-lead-agent",
-  "cardUrl": "http://team-lead:8030/.well-known/agent-card.json",
+  "cardUrl": "http://team-lead-agent:8030/.well-known/agent-card.json",
   "executionMode": "per-task",
   "launchSpec": {
     "image": "constellation-team-lead-agent:latest",
     "port": 8030,
     "command": ["python3", "team-lead/app.py"],
-    "passThroughEnv": ["ARTIFACT_ROOT_HOST", "ARTIFACT_ROOT", "DYNAMIC_AGENT_NETWORK"],
+    "mountDockerSocket": true,
+    "passThroughEnv": ["ARTIFACT_ROOT", "COPILOT_GITHUB_TOKEN", "TZ"],
     "env": {
-      "OPENAI_BASE_URL": "http://host.docker.internal:1288/v1",
-      "OPENAI_MODEL": "gpt-5-mini",
-      "ALLOW_MOCK_FALLBACK": "1"
+      "AGENT_RUNTIME": "copilot-cli",
+      "AGENT_MODEL": "gpt-5-mini",
+      "COMPASS_URL": "http://compass:8080",
+      "DYNAMIC_AGENT_NETWORK": "constellation-network"
     }
   },
   "scalingPolicy": {
     "maxInstances": 5,
     "perInstanceConcurrency": 1,
-    "idleTimeoutSeconds": 120
+    "idleTimeoutSeconds": 300
   }
 }

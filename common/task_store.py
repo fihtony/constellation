@@ -35,6 +35,16 @@ class Task:
         # Used by Compass to resume an INPUT_REQUIRED task forwarded to Team Lead
         "downstream_task_id",    # Team Lead task ID that raised INPUT_REQUIRED
         "downstream_service_url",  # Team Lead service URL for sending the resume message
+        "summary",
+        "jira_ticket_id",
+        "design_url",
+        "design_type",
+        "router_context",
+        # Owner / multi-channel fields (Teams integration)
+        "owner_user_id",
+        "owner_display_name",
+        "tenant_id",
+        "source_channel",
     )
 
     def __init__(self, context_id=None):
@@ -54,6 +64,15 @@ class Task:
         self.pending_workflow = None
         self.downstream_task_id = ""
         self.downstream_service_url = ""
+        self.summary = ""
+        self.jira_ticket_id = ""
+        self.design_url = ""
+        self.design_type = ""
+        self.router_context = {}
+        self.owner_user_id = ""
+        self.owner_display_name = ""
+        self.tenant_id = ""
+        self.source_channel = ""
 
     def to_dict(self):
         return {
@@ -70,6 +89,17 @@ class Task:
             "progressSteps": self.progress_steps,
             "workspacePath": self.workspace_path,
             "downstreamTaskId": self.downstream_task_id,
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+            "summary": self.summary,
+            "jiraTicketId": self.jira_ticket_id,
+            "designUrl": self.design_url,
+            "designType": self.design_type,
+            "routerContext": self.router_context,
+            "ownerUserId": self.owner_user_id,
+            "ownerDisplayName": self.owner_display_name,
+            "tenantId": self.tenant_id,
+            "sourceChannel": self.source_channel,
         }
 
 
@@ -87,6 +117,14 @@ class TaskStore:
     def get(self, task_id):
         with self._lock:
             return self._tasks.get(task_id)
+
+    def list_tasks(self):
+        with self._lock:
+            return sorted(
+                self._tasks.values(),
+                key=lambda task: (task.created_at, task.task_id),
+                reverse=True,
+            )
 
     def update_state(self, task_id, state, status_message=""):
         with self._lock:

@@ -23,6 +23,14 @@ def _figma_token():
     return os.environ.get("FIGMA_TOKEN", "").strip()
 
 
+def _max_retry_wait_seconds() -> float:
+    raw = os.environ.get("FIGMA_MAX_RETRY_WAIT_SECONDS", "5").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 5.0
+
+
 def _corp_ca_bundle():
     return (
         os.environ.get("CORP_CA_BUNDLE", "") or os.environ.get("SSL_CERT_FILE", "")
@@ -65,13 +73,20 @@ def _figma_get(path):
             last_status, last_body = exc.code, body
             if exc.code == 429 and attempt < _MAX_RETRIES:
                 retry_after = exc.headers.get("Retry-After", "")
-                wait = float(retry_after) if retry_after else _BACKOFF_BASE * (2 ** attempt)
+                try:
+                    requested_wait = float(retry_after) if retry_after else _BACKOFF_BASE * (2 ** attempt)
+                except ValueError:
+                    requested_wait = _BACKOFF_BASE * (2 ** attempt)
+                wait_cap = _max_retry_wait_seconds()
+                wait = min(requested_wait, wait_cap) if wait_cap > 0 else 0.0
                 print(
                     f"[figma_client] 429 rate-limited; waiting {wait:.1f}s "
+                    f"(requested {requested_wait:.1f}s) "
                     f"(attempt {attempt + 1}/{_MAX_RETRIES})",
                     flush=True,
                 )
-                time.sleep(wait)
+                if wait > 0:
+                    time.sleep(wait)
                 continue
             return exc.code, body
         except URLError as exc:
