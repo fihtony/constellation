@@ -12,6 +12,7 @@ RUN apt-get update \
 
 COPY common/      /app/common/
 COPY team-lead/   /app/team_lead/
+COPY .github/skills/ /app/.github/skills/
 # Create hyphenated alias so docker-compose command path still works
 RUN ln -s /app/team_lead /app/team-lead
 

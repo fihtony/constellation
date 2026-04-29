@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir flask pytest requests
 
 COPY common/  /app/common/
 COPY web/     /app/web/
+COPY .github/skills/ /app/.github/skills/
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app

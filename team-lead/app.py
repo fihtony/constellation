@@ -124,6 +124,15 @@ _TECH_STACK_HINTS = (
     "javascript",
 )
 
+_DEVELOPMENT_SKILL_NAMES = [
+    "constellation-architecture-delivery",
+    "constellation-frontend-delivery",
+    "constellation-backend-delivery",
+    "constellation-database-delivery",
+    "constellation-code-review-delivery",
+    "constellation-testing-delivery",
+]
+
 _GATHER_ACTION_FETCH = "fetch_agent_context"
 _GATHER_ACTION_ASK_USER = "ask_user"
 _GATHER_ACTION_STOP = "stop"
@@ -904,6 +913,15 @@ def _run_agentic(
     return result.get("raw_response") or result.get("summary") or ""
 
 
+def _build_team_lead_system_prompt(base_prompt: str, *, include_workflow: bool = False) -> str:
+    return build_system_prompt(
+        base_prompt,
+        "team-lead",
+        include_workflow=include_workflow,
+        skill_names=_DEVELOPMENT_SKILL_NAMES,
+    )
+
+
 def _analyze_task(user_text: str, additional_info: str = "") -> dict:
     additional_context = (
         f"Additional information provided by user:\n{additional_info}"
@@ -913,7 +931,7 @@ def _analyze_task(user_text: str, additional_info: str = "") -> dict:
         user_text=user_text,
         additional_context=additional_context,
     )
-    system = build_system_prompt(prompts.ANALYZE_SYSTEM, "team-lead")
+    system = _build_team_lead_system_prompt(prompts.ANALYZE_SYSTEM)
     response = _run_agentic(prompt, f"[{AGENT_ID}] analyze", system_prompt=system)
     return _parse_json_from_llm(response)
 
@@ -1299,7 +1317,7 @@ def _plan_information_gathering(
         additional_context=ctx.additional_info or "(none)",
         available_capabilities=json.dumps(capability_snapshot, ensure_ascii=False, indent=2),
     )
-    system = build_system_prompt(prompts.GATHER_SYSTEM, "team-lead", include_workflow=True)
+    system = _build_team_lead_system_prompt(prompts.GATHER_SYSTEM, include_workflow=True)
     raw_plan = _parse_json_from_llm(
         _run_agentic(prompt, f"[{AGENT_ID}] gather", system_prompt=system)
     )
@@ -1798,7 +1816,7 @@ def _create_plan(
         design_context=design_ctx,
         additional_context=extra_ctx,
     )
-    system = build_system_prompt(prompts.PLAN_SYSTEM, "team-lead")
+    system = _build_team_lead_system_prompt(prompts.PLAN_SYSTEM)
     response = _run_agentic(prompt, f"[{AGENT_ID}] plan", system_prompt=system)
     return _enforce_plan_constraints(_parse_json_from_llm(response), tech_stack_constraints)
 
@@ -1885,7 +1903,7 @@ def _review_output(
         artifacts_summary=artifacts_summary,
         workspace_evidence=workspace_evidence or "(none collected)",
     )
-    system = build_system_prompt(prompts.REVIEW_SYSTEM, "team-lead", include_workflow=True)
+    system = _build_team_lead_system_prompt(prompts.REVIEW_SYSTEM, include_workflow=True)
     response = _run_agentic(prompt, f"[{AGENT_ID}] review", system_prompt=system)
     return _parse_json_from_llm(response)
 
@@ -1912,7 +1930,7 @@ def _generate_summary(
         return _run_agentic(
             prompt,
             f"[{AGENT_ID}] summarize",
-            system_prompt=build_system_prompt(prompts.SUMMARIZE_SYSTEM, "team-lead", include_workflow=True),
+            system_prompt=_build_team_lead_system_prompt(prompts.SUMMARIZE_SYSTEM, include_workflow=True),
         )
     except Exception as err:
         return f"Task {final_state.lower()}. Summary unavailable: {err}"
@@ -1944,6 +1962,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         "runtime": summarize_runtime_configuration(),
         "rulesLoaded": bool(load_rules("team-lead")),
         "workflowRulesLoaded": bool(load_rules("team-lead", include_workflow=True)),
+        "skillPlaybooks": list(_DEVELOPMENT_SKILL_NAMES),
     }
 
     def log(phase: str):

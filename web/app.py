@@ -68,6 +68,15 @@ reporter = InstanceReporter(
     port=PORT,
 )
 
+_DEVELOPMENT_SKILL_NAMES = [
+    "constellation-architecture-delivery",
+    "constellation-frontend-delivery",
+    "constellation-backend-delivery",
+    "constellation-database-delivery",
+    "constellation-code-review-delivery",
+    "constellation-testing-delivery",
+]
+
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -543,6 +552,14 @@ def _run_agentic(
     return result.get("raw_response") or result.get("summary") or ""
 
 
+def _build_web_system_prompt(base_prompt: str) -> str:
+    return build_system_prompt(
+        base_prompt,
+        "web",
+        skill_names=_DEVELOPMENT_SKILL_NAMES,
+    )
+
+
 def _analyze_task(task_instruction: str, acceptance_criteria: list, repo_context: str) -> dict:
     criteria_text = "\n".join(f"- {c}" for c in (acceptance_criteria or [])) or "Not specified."
     prompt = prompts.ANALYZE_TEMPLATE.format(
@@ -550,7 +567,7 @@ def _analyze_task(task_instruction: str, acceptance_criteria: list, repo_context
         acceptance_criteria=criteria_text,
         repo_context=repo_context or "None provided.",
     )
-    system = build_system_prompt(prompts.ANALYZE_SYSTEM, "web")
+    system = _build_web_system_prompt(prompts.ANALYZE_SYSTEM)
     response = _run_agentic(prompt, f"[{AGENT_ID}] analyze", system_prompt=system)
     return _parse_json_from_llm(response)
 
@@ -573,7 +590,7 @@ def _plan_implementation(
         repo_snapshot=repo_snapshot_text,
         design_context=design_context_text,
     )
-    system = build_system_prompt(prompts.PLAN_SYSTEM, "web")
+    system = _build_web_system_prompt(prompts.PLAN_SYSTEM)
     response = _run_agentic(
         prompt,
         f"[{AGENT_ID}] plan",
@@ -593,7 +610,7 @@ def _plan_implementation(
         design_context=design_context_text,
         previous_response=response or "<empty response>",
     )
-    repair_system = build_system_prompt(prompts.PLAN_REPAIR_SYSTEM, "web")
+    repair_system = _build_web_system_prompt(prompts.PLAN_REPAIR_SYSTEM)
     repaired_response = _run_agentic(
         repair_prompt,
         f"[{AGENT_ID}] plan-repair",
@@ -630,7 +647,7 @@ def _generate_file_code(
     return _run_agentic(
         prompt,
         f"[{AGENT_ID}] codegen:{file_info.get('path', '')}",
-        system_prompt=build_system_prompt(prompts.CODEGEN_SYSTEM, "web"),
+        system_prompt=_build_web_system_prompt(prompts.CODEGEN_SYSTEM),
         timeout=180,
         max_tokens=8192,
     )
@@ -819,7 +836,7 @@ def _generate_pr_description(
     response = _run_agentic(
         prompt,
         f"[{AGENT_ID}] pr-description",
-        system_prompt=build_system_prompt(prompts.PR_DESCRIPTION_SYSTEM, "web"),
+        system_prompt=_build_web_system_prompt(prompts.PR_DESCRIPTION_SYSTEM),
     )
     lines = response.strip().splitlines()
     title = lines[0].strip() if lines else "Web Agent: implement task"
@@ -845,7 +862,7 @@ def _generate_summary(
         return _run_agentic(
             prompt,
             f"[{AGENT_ID}] summary",
-            system_prompt=build_system_prompt(prompts.SUMMARY_SYSTEM, "web"),
+            system_prompt=_build_web_system_prompt(prompts.SUMMARY_SYSTEM),
         )
     except Exception as err:
         return f"Web Agent completed. Summary unavailable: {err}"
@@ -1895,7 +1912,7 @@ def _build_and_test_with_recovery(
         fix_response = _run_agentic(
             fix_prompt,
             f"[{AGENT_ID}] build-fix-attempt-{attempt}",
-            system_prompt=build_system_prompt(prompts.BUILD_FIX_SYSTEM, "web"),
+            system_prompt=_build_web_system_prompt(prompts.BUILD_FIX_SYSTEM),
             timeout=180,
             max_tokens=8192,
         )
@@ -2434,6 +2451,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         "workflowRulesLoaded": bool(load_rules("web", include_workflow=True)),
         "workflowInstructionsPresent": bool(metadata.get("devWorkflowInstructions")),
         "techStackConstraints": tech_stack_constraints,
+        "skillPlaybooks": list(_DEVELOPMENT_SKILL_NAMES),
     }
 
     def log(phase: str):

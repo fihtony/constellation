@@ -351,6 +351,27 @@ def _assert_matching_stack_constraints(plan_constraints: dict, runtime_constrain
             fail(f"Team Lead and Web Agent disagree on {key}", f"team-lead={left!r}, web-agent={right!r}")
 
 
+def _assert_runtime_target(runtime_summary: dict, label: str) -> None:
+    requested_backend = str(runtime_summary.get("requestedBackend") or "").strip()
+    effective_backend = str(runtime_summary.get("effectiveBackend") or "").strip()
+    model = str(runtime_summary.get("model") or "").strip()
+
+    if requested_backend == "copilot-cli":
+        ok(f"{label} requested backend is copilot-cli")
+    else:
+        fail(f"{label} requested backend is not copilot-cli", f"actual={requested_backend!r}")
+
+    if effective_backend == "copilot-cli":
+        ok(f"{label} effective backend is copilot-cli")
+    else:
+        fail(f"{label} effective backend is not copilot-cli", f"actual={effective_backend!r}")
+
+    if model == "gpt-5-mini":
+        ok(f"{label} model is gpt-5-mini")
+    else:
+        fail(f"{label} model is not gpt-5-mini", f"actual={model!r}")
+
+
 def _latest_completed_jira_event(events: list[dict], action: str) -> dict | None:
     for event in reversed(events):
         if event.get("action") == action and event.get("status") == "completed":
@@ -831,6 +852,20 @@ def test_cstl1_full_workflow():  # noqa: C901
     _ws_file_ok(host_ws, "team-lead/command-log.txt", "Team Lead command log")
     _ws_file_ok(host_ws, "team-lead/review-notes.json", "Team Lead review notes")
 
+    step("b3. Verify Team Lead runtime target and skill playbooks")
+    team_lead_stage_payload = _read_json_file(os.path.join(host_ws, "team-lead/stage-summary.json"))
+    team_lead_runtime_payload = team_lead_stage_payload.get("runtimeConfig") if isinstance(team_lead_stage_payload, dict) else None
+    if isinstance(team_lead_runtime_payload, dict):
+        runtime_summary = team_lead_runtime_payload.get("runtime") if isinstance(team_lead_runtime_payload.get("runtime"), dict) else {}
+        _assert_runtime_target(runtime_summary, "Team Lead runtime")
+        skill_playbooks = team_lead_runtime_payload.get("skillPlaybooks") or []
+        if len(skill_playbooks) >= 4:
+            ok("Team Lead runtime config records development skill playbooks")
+        else:
+            fail("Team Lead runtime config missing development skill playbooks", str(skill_playbooks))
+    else:
+        fail("Team Lead runtime config unreadable", os.path.join(host_ws, "team-lead/stage-summary.json"))
+
     step("b2. Verify Jira-derived stack constraints propagated into the Team Lead plan")
     plan_payload = _read_json_file(os.path.join(host_ws, "team-lead/plan.json"))
     plan_constraints: dict = {}
@@ -877,11 +912,18 @@ def test_cstl1_full_workflow():  # noqa: C901
     web_stage_payload = _read_json_file(os.path.join(host_ws, "web-agent/stage-summary.json"))
     web_runtime_payload = web_stage_payload.get("runtimeConfig") if isinstance(web_stage_payload, dict) else None
     if isinstance(web_runtime_payload, dict):
+        runtime_summary = web_runtime_payload.get("runtime") if isinstance(web_runtime_payload.get("runtime"), dict) else {}
+        _assert_runtime_target(runtime_summary, "Web Agent runtime")
         web_constraints = web_runtime_payload.get("techStackConstraints") or {}
         if web_constraints:
             ok("Web Agent runtime config includes tech stack constraints")
         else:
             fail("Web Agent runtime config missing tech stack constraints")
+        skill_playbooks = web_runtime_payload.get("skillPlaybooks") or []
+        if len(skill_playbooks) >= 4:
+            ok("Web Agent runtime config records development skill playbooks")
+        else:
+            fail("Web Agent runtime config missing development skill playbooks", str(skill_playbooks))
         _assert_expected_stack_constraints(web_constraints, expected_constraints, "Web Agent runtime config")
         _assert_matching_stack_constraints(plan_constraints, web_constraints)
     else:
