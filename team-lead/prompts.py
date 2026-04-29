@@ -218,7 +218,7 @@ Respond with a JSON object:
   ],
   "requires_tests": true|false,
   "test_requirements": "Explicit description of required test coverage: what type of tests (unit/integration/e2e), what to test, minimum pass threshold. Never null when requires_tests is true.",
-  "screenshot_requirements": "For UI tasks: describe what screenshots or visual evidence should be included in the PR (e.g., Stitch design URL reference + screenshot of rendered page). For non-UI tasks: null."
+  "screenshot_requirements": "For UI tasks: describe what screenshots or visual evidence should be included in the PR. The web agent captures screenshots automatically and places them in docs/evidence/screenshot-WxH.png (e.g., docs/evidence/screenshot-1280x900.png and docs/evidence/screenshot-375x812.png) \u2014 never .work/ directories. For non-UI tasks: null."
 }}
 
 Rules:
@@ -234,6 +234,9 @@ Rules:
 - If design context is provided, dev_instruction MUST instruct the dev agent to implement the UI
   exactly as shown in the design (matching layout, colours, typography, components) and include
   the design URL as a reference in the PR description.
+- For UI tasks, the acceptance_criteria item about visual evidence MUST reference docs/evidence/
+  (e.g., docs/evidence/screenshot-1280x900.png and docs/evidence/screenshot-375x812.png).
+  Never reference .work/screenshots or work/screenshots — those directories are excluded from the PR.
 """
 
 # ---------------------------------------------------------------------------
@@ -259,8 +262,9 @@ Check:
 7. Design fidelity (if design context was provided):
    - The PR description references the design URL
    - The PR description embeds the design thumbnail or references the design image
-   - `web-agent/design-reference.png` and `web-agent/implementation-screenshot.png` should be
-     noted as workspace artifacts for visual comparison
+   - `web-agent/design-reference.png`, `web-agent/screenshot-1280x900.png`, and
+     `web-agent/screenshot-375x812.png` should be noted as workspace artifacts for visual comparison
+   - Screenshots committed to the PR land under `docs/evidence/` (not `.work/screenshots`)
    - The implementation matches the design layout, colours, and component structure
    - Any deviations from the design are explicitly called out and justified
 8. No unnecessary files committed to the PR:

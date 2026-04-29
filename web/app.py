@@ -75,6 +75,15 @@ _DEVELOPMENT_SKILL_NAMES = [
     "constellation-database-delivery",
     "constellation-code-review-delivery",
     "constellation-testing-delivery",
+    "constellation-ui-evidence-delivery",
+]
+
+# Viewports for UI implementation screenshots captured after each build.
+# Each entry is (width_px, height_px).  Files land in docs/evidence/ named
+# screenshot-{W}x{H}.png — no platform labels so the web agent stays generic.
+_UI_SCREENSHOT_VIEWPORTS: list[tuple[int, int]] = [
+    (1280, 900),   # standard laptop / desktop
+    (375, 812),    # standard phone (iPhone-class)
 ]
 
 
@@ -823,13 +832,27 @@ def _generate_pr_description(
             design_parts.append(f"thumbnail_url: {design_context_meta['thumbnailUrl']}")
     design_reference = "\n".join(design_parts) if design_parts else "No design reference provided."
 
-    # Build implementation screenshot URL (GitHub raw URL so it can be embedded in the PR body)
-    impl_screenshot_url = ""
-    _screenshot_path = "docs/evidence/implementation-screenshot-desktop.png"
-    if repo_url and branch_name and _screenshot_path in files_changed:
-        # Convert https://github.com/{owner}/{repo} → https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}
-        _raw_base = repo_url.rstrip("/").replace("https://github.com/", "https://raw.githubusercontent.com/")
-        impl_screenshot_url = f"{_raw_base}/{branch_name}/{_screenshot_path}"
+    # Build viewport-based screenshots block (GitHub raw URLs when available)
+    # Files are named docs/evidence/screenshot-{W}x{H}.png — no platform labels.
+    _raw_base = ""
+    if repo_url and branch_name:
+        _raw_base = repo_url.rstrip("/").replace(
+            "https://github.com/", "https://raw.githubusercontent.com/"
+        )
+    screenshots_lines: list[str] = []
+    for _w, _h in _UI_SCREENSHOT_VIEWPORTS:
+        _rel = f"docs/evidence/screenshot-{_w}x{_h}.png"
+        if _rel in files_changed:
+            if _raw_base:
+                _url = f"{_raw_base}/{branch_name}/{_rel}"
+                screenshots_lines.append(f"### {_w}×{_h}\n![Screenshot {_w}x{_h}]({_url})")
+            else:
+                screenshots_lines.append(f"### {_w}×{_h}\nSee `{_rel}` in committed files.")
+    screenshots_block = (
+        "\n\n".join(screenshots_lines)
+        if screenshots_lines
+        else "No UI screenshots (backend-only or screenshot capture unavailable)."
+    )
 
     # Build test evidence block
     if test_output:
@@ -844,7 +867,7 @@ def _generate_pr_description(
         implementation_summary=implementation_summary,
         design_reference=design_reference,
         test_evidence=test_evidence,
-        implementation_screenshot_url=impl_screenshot_url,
+        screenshots_block=screenshots_block,
     )
     response = _run_agentic(
         prompt,
@@ -854,6 +877,24 @@ def _generate_pr_description(
     lines = response.strip().splitlines()
     title = lines[0].strip() if lines else "Web Agent: implement task"
     body = "\n".join(lines[2:]).strip() if len(lines) > 2 else ""
+
+    # Post-process: force the screenshots block verbatim into the body.
+    # LLMs reliably strip the leading '!' from ![alt](url) syntax, turning
+    # inline images into plain links.  We bypass that by replacing the entire
+    # ## Screenshots section after the LLM call.
+    if screenshots_block and "No UI screenshots" not in screenshots_block:
+        import re as _re
+        _section = f"## Screenshots\n\n{screenshots_block}"
+        body, _replaced = _re.subn(
+            r"## Screenshots\b.*?(?=\n## |\Z)",
+            _section,
+            body,
+            count=1,
+            flags=_re.DOTALL,
+        )
+        if not _replaced:
+            body = body + f"\n\n{_section}"
+
     return title, body
 
 
@@ -2228,6 +2269,7 @@ def _take_ui_screenshot(
     out_path: str,
     log_fn,
     analysis: dict | None = None,
+    viewport: tuple = (1280, 900),
 ) -> bool:
     """
     Start the local UI app on a free port and take a headless chromium screenshot.
@@ -2288,13 +2330,14 @@ def _take_ui_screenshot(
                 return False
 
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            _w, _h = viewport
             result = subprocess.run(
                 [
                     chromium_bin,
                     "--headless", "--no-sandbox", "--disable-gpu",
                     "--disable-dev-shm-usage",
                     f"--screenshot={out_path}",
-                    "--window-size=1280,900",
+                    f"--window-size={_w},{_h}",
                     started_url,
                 ],
                 timeout=30,
@@ -2376,13 +2419,14 @@ def _take_ui_screenshot(
             return False
 
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        _w, _h = viewport
         result = subprocess.run(
             [
                 chromium_bin,
                 "--headless", "--no-sandbox", "--disable-gpu",
                 "--disable-dev-shm-usage",
                 f"--screenshot={out_path}",
-                "--window-size=1280,900",
+                f"--window-size={_w},{_h}",
                 url,
             ],
             timeout=30,
@@ -2844,9 +2888,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         if _is_ui_task and workspace:
             evidence_dir = os.path.join(workspace, AGENT_ID)
             os.makedirs(evidence_dir, exist_ok=True)
-            log("Capturing UI evidence (design reference + implementation screenshot)")
+            log("Capturing UI evidence (design reference + implementation screenshots)")
             design_ref_path = os.path.join(evidence_dir, "design-reference.png")
-            impl_screenshot_path = os.path.join(evidence_dir, "implementation-screenshot.png")
 
             # 1. Design reference — download Stitch thumbnail if available
             design_reference = _get_design_reference_details(workspace)
@@ -2879,20 +2922,27 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     design_url,
                 )
 
-            # 2. Implementation screenshot — headless chromium (best-effort)
+            # 2. Implementation screenshots — one per viewport (best-effort)
+            # Files are named screenshot-{W}x{H}.png — no platform labels.
+            _captured: dict[tuple[int, int], str] = {}  # viewport → local path
             if build_dir:
                 py_exec = _ensure_local_python_env(
                     build_dir, analysis.get("language", "python"), log
                 )
-                if _take_ui_screenshot(build_dir, py_exec, impl_screenshot_path, log, analysis=analysis):
-                    # Replace any LLM-generated placeholder with the real binary PNG
-                    import shutil as _shutil
-                    for _rel in ("work/screenshots/index.png", ".work/screenshots/index.png"):
-                        _placeholder = os.path.join(build_dir, _rel)
-                        if os.path.exists(_placeholder):
-                            os.makedirs(os.path.dirname(_placeholder), exist_ok=True)
-                            _shutil.copy2(impl_screenshot_path, _placeholder)
-                            log(f"Replaced placeholder screenshot at {_rel}")
+                for _vp in _UI_SCREENSHOT_VIEWPORTS:
+                    _vw, _vh = _vp
+                    _out = os.path.join(evidence_dir, f"screenshot-{_vw}x{_vh}.png")
+                    if _take_ui_screenshot(build_dir, py_exec, _out, log, analysis=analysis, viewport=_vp):
+                        _captured[_vp] = _out
+                        # Replace LLM-generated placeholder if first (widest) viewport
+                        if not _captured or _vp == _UI_SCREENSHOT_VIEWPORTS[0]:
+                            import shutil as _shutil
+                            for _rel in ("work/screenshots/index.png", ".work/screenshots/index.png"):
+                                _placeholder = os.path.join(build_dir, _rel)
+                                if os.path.exists(_placeholder):
+                                    os.makedirs(os.path.dirname(_placeholder), exist_ok=True)
+                                    _shutil.copy2(_out, _placeholder)
+                                    log(f"Replaced placeholder screenshot at {_rel}")
 
             if clone_path:
                 if os.path.isfile(design_ref_path):
@@ -2903,12 +2953,12 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                         "docs/evidence/design-reference.png",
                         log,
                     )
-                if os.path.isfile(impl_screenshot_path):
+                for (_vw, _vh), _src in _captured.items():
                     _register_generated_artifact(
                         clone_path,
                         generated_files,
-                        impl_screenshot_path,
-                        "docs/evidence/implementation-screenshot-desktop.png",
+                        _src,
+                        f"docs/evidence/screenshot-{_vw}x{_vh}.png",
                         log,
                     )
                 _register_runtime_repo_artifacts(
