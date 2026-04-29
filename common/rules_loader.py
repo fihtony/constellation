@@ -23,6 +23,7 @@ import os
 
 # Base directory of the project (one level up from common/)
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SKILLS_ROOT = os.path.join(_PROJECT_ROOT, ".github", "skills")
 
 # Default rule files to load, in order
 DEFAULT_RULE_FILES = [
@@ -38,6 +39,23 @@ DEFAULT_WORKFLOW_FILES = [
 
 # Cache: agent_dir → combined rules string
 _cache: dict[str, str] = {}
+
+
+def _read_text_file(path: str) -> str:
+    if not path or not os.path.isfile(path):
+        return ""
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _strip_frontmatter(text: str) -> str:
+    stripped = (text or "").strip()
+    if not stripped.startswith("---\n"):
+        return stripped
+    parts = stripped.split("\n---\n", 1)
+    if len(parts) == 2:
+        return parts[1].strip()
+    return stripped
 
 
 def load_rules(
@@ -108,7 +126,59 @@ def load_rules(
     return combined
 
 
-def build_system_prompt(base_prompt: str, agent_dir: str, **kwargs) -> str:
+def load_skills(
+    skill_names: list[str] | None,
+    *,
+    max_chars: int = 4500,
+) -> str:
+    """Load and concatenate skill guides from ``.github/skills``.
+
+    Parameters
+    ----------
+    skill_names:
+        Skill directory names under ``.github/skills``.
+    max_chars:
+        Truncate the combined output to this many characters.
+
+    Returns
+    -------
+    str
+        Combined skill text, or empty string if no skills were found.
+    """
+    if not skill_names:
+        return ""
+
+    normalized_names = [name.strip() for name in skill_names if name and name.strip()]
+    if not normalized_names:
+        return ""
+
+    cache_key = f"skills:{','.join(normalized_names)}:{max_chars}"
+    if cache_key in _cache:
+        return _cache[cache_key]
+
+    parts: list[str] = []
+    for skill_name in normalized_names:
+        skill_path = os.path.join(_SKILLS_ROOT, skill_name, "SKILL.md")
+        content = _strip_frontmatter(_read_text_file(skill_path))
+        if content:
+            parts.append(content)
+
+    combined = "\n\n---\n\n".join(parts)
+    if len(combined) > max_chars:
+        combined = combined[:max_chars] + "\n...[skills truncated]"
+
+    _cache[cache_key] = combined
+    return combined
+
+
+def build_system_prompt(
+    base_prompt: str,
+    agent_dir: str,
+    *,
+    skill_names: list[str] | None = None,
+    skill_max_chars: int = 4500,
+    **kwargs,
+) -> str:
     """Combine a base system prompt with loaded agent rules.
 
     Parameters
@@ -123,13 +193,20 @@ def build_system_prompt(base_prompt: str, agent_dir: str, **kwargs) -> str:
     Returns
     -------
     str
-        The combined prompt: ``base_prompt + rules_context``.
+        The combined prompt: ``base_prompt + rules_context + skill_context``.
     """
     rules = load_rules(agent_dir, **kwargs)
-    if not rules:
-        return base_prompt
-    return (
-        f"{base_prompt}\n\n"
-        f"--- AGENT RULES (you MUST follow these constraints) ---\n\n"
-        f"{rules}"
-    )
+    skills = load_skills(skill_names, max_chars=skill_max_chars)
+
+    parts = [base_prompt]
+    if rules:
+        parts.append(
+            "--- AGENT RULES (you MUST follow these constraints) ---\n\n"
+            f"{rules}"
+        )
+    if skills:
+        parts.append(
+            "--- ADDITIONAL SKILLS (apply these playbooks when relevant) ---\n\n"
+            f"{skills}"
+        )
+    return "\n\n".join(parts)

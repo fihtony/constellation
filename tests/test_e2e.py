@@ -261,6 +261,96 @@ def _normalize_text(value: str) -> str:
     return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
 
 
+def _jira_doc_to_text(value) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(part for part in (_jira_doc_to_text(item) for item in value) if part).strip()
+    if not isinstance(value, dict):
+        return ""
+
+    parts: list[str] = []
+    node_type = str(value.get("type") or "")
+    if node_type == "text" and value.get("text"):
+        parts.append(str(value.get("text") or ""))
+    if node_type == "inlineCard":
+        url = str((value.get("attrs") or {}).get("url") or "").strip()
+        if url:
+            parts.append(url)
+    for item in value.get("content") or []:
+        child_text = _jira_doc_to_text(item)
+        if child_text:
+            parts.append(child_text)
+    return "\n".join(parts).strip()
+
+
+def _ticket_stack_expectations(issue: dict | None) -> dict:
+    fields = (issue or {}).get("fields") or {}
+    text_blob = "\n".join(
+        part
+        for part in [
+            str(fields.get("summary") or "").strip(),
+            _jira_doc_to_text(fields.get("description") or {}),
+        ]
+        if part
+    ).lower()
+    expectations: dict[str, str] = {}
+    if "react.js" in text_blob or "reactjs" in text_blob or re.search(r"\breact\b", text_blob):
+        expectations["frontend_framework"] = "react"
+    elif "next.js" in text_blob or "nextjs" in text_blob:
+        expectations["frontend_framework"] = "nextjs"
+    elif re.search(r"\bvue(?:\.js)?\b", text_blob):
+        expectations["frontend_framework"] = "vue"
+
+    if re.search(r"\bpython\s*3\.12\b", text_blob):
+        expectations["language"] = "python"
+        expectations["python_version"] = "3.12"
+    elif re.search(r"\bpython\b", text_blob):
+        expectations["language"] = "python"
+
+    if re.search(r"\bflask\b", text_blob):
+        expectations["backend_framework"] = "flask"
+    elif re.search(r"\bfastapi\b", text_blob):
+        expectations["backend_framework"] = "fastapi"
+    elif re.search(r"\bexpress(?:\.js)?\b", text_blob):
+        expectations["backend_framework"] = "express"
+    return expectations
+
+
+def _assert_expected_stack_constraints(constraints: dict, expectations: dict, label: str) -> None:
+    if not expectations:
+        warn(f"{label} has no explicit stack constraints in Jira; skipping ticket-specific checks")
+        return
+    for key, expected in expectations.items():
+        actual = str(constraints.get(key) or "").strip()
+        if key in {"frontend_framework", "backend_framework", "language"}:
+            if _normalize_text(actual) == _normalize_text(expected):
+                ok(f"{label} captured Jira-required {key}: {expected}")
+            else:
+                fail(f"{label} did not capture Jira-required {key}", f"expected={expected!r}, actual={actual!r}")
+        elif actual == expected:
+            ok(f"{label} captured Jira-required {key}: {expected}")
+        else:
+            fail(f"{label} did not capture Jira-required {key}", f"expected={expected!r}, actual={actual!r}")
+
+
+def _assert_matching_stack_constraints(plan_constraints: dict, runtime_constraints: dict) -> None:
+    for key in ("language", "python_version", "backend_framework", "frontend_framework"):
+        left = str(plan_constraints.get(key) or "").strip()
+        right = str(runtime_constraints.get(key) or "").strip()
+        if not left and not right:
+            continue
+        if key in {"language", "backend_framework", "frontend_framework"}:
+            if _normalize_text(left) == _normalize_text(right):
+                ok(f"Team Lead and Web Agent agree on {key}: {left or right}")
+            else:
+                fail(f"Team Lead and Web Agent disagree on {key}", f"team-lead={left!r}, web-agent={right!r}")
+        elif left == right:
+            ok(f"Team Lead and Web Agent agree on {key}: {left}")
+        else:
+            fail(f"Team Lead and Web Agent disagree on {key}", f"team-lead={left!r}, web-agent={right!r}")
+
+
 def _latest_completed_jira_event(events: list[dict], action: str) -> dict | None:
     for event in reversed(events):
         if event.get("action") == action and event.get("status") == "completed":
@@ -335,7 +425,7 @@ def _jira_h() -> dict:
 
 def jira_get_issue(key: str) -> dict | None:
     if JIRA_TOKEN and JIRA_EMAIL:
-        s, b = http_json(f"{JIRA_API_BASE}/issue/{key}?fields=status,assignee,comment",
+        s, b = http_json(f"{JIRA_API_BASE}/issue/{key}?fields=status,assignee,comment,summary,description",
                          headers=_jira_h())
         if s == 200:
             return b
@@ -596,7 +686,7 @@ def test_7_malformed_request():
 
 
 # ---------------------------------------------------------------------------
-# Scenario CSTL-1: Full E2E Workflow Validation
+# Scenario: Full E2E Workflow Validation
 # ---------------------------------------------------------------------------
 
 def _ws_file_ok(ws_host: str, rel: str, label: str) -> bool:
@@ -609,7 +699,7 @@ def _ws_file_ok(ws_host: str, rel: str, label: str) -> bool:
 
 
 def test_cstl1_full_workflow():  # noqa: C901
-    section("CSTL-1 Full E2E Workflow Validation")
+    section(f"{JIRA_TICKET_KEY} Full E2E Workflow Validation")
     print(f"\n  Ticket:  {JIRA_TICKET_URL}")
     print(f"  Repo:    {GITHUB_REPO_URL}")
     print(f"  Timeout: {WORKFLOW_POLL_TIMEOUT}s\n")
@@ -632,6 +722,7 @@ def test_cstl1_full_workflow():  # noqa: C901
         )
     else:
         warn("Could not fetch Jira baseline (check TEST_JIRA_TOKEN in tests/.env)")
+    expected_constraints = _ticket_stack_expectations(j_before)
 
     step("Record GitHub PRs/branches BEFORE test")
     prs_before: list = []
@@ -740,65 +831,16 @@ def test_cstl1_full_workflow():  # noqa: C901
     _ws_file_ok(host_ws, "team-lead/command-log.txt", "Team Lead command log")
     _ws_file_ok(host_ws, "team-lead/review-notes.json", "Team Lead review notes")
 
-    step("b2. Verify Jira-derived Python/Flask constraints propagated into the Team Lead plan")
+    step("b2. Verify Jira-derived stack constraints propagated into the Team Lead plan")
     plan_payload = _read_json_file(os.path.join(host_ws, "team-lead/plan.json"))
+    plan_constraints: dict = {}
     if isinstance(plan_payload, dict):
-        constraints = plan_payload.get("tech_stack_constraints") or {}
-        if constraints:
+        plan_constraints = plan_payload.get("tech_stack_constraints") or {}
+        if plan_constraints:
             ok("Team Lead plan includes structured tech stack constraints")
         else:
             fail("Team Lead plan missing tech stack constraints")
-
-        if constraints.get("language") == "python":
-            ok("Team Lead plan captured Python as the required language")
-        else:
-            fail("Team Lead plan did not capture Python as the required language", str(constraints))
-
-        if str(constraints.get("python_version") or "") == "3.12":
-            ok("Team Lead plan captured Python 3.12 from Jira")
-        else:
-            fail("Team Lead plan did not capture Python 3.12", str(constraints))
-
-        if _normalize_text(constraints.get("backend_framework")) == "flask":
-            ok("Team Lead plan captured Flask as the backend framework")
-        else:
-            fail("Team Lead plan did not capture Flask as the backend framework", str(constraints))
-
-        frontend_framework = _normalize_text(constraints.get("frontend_framework"))
-        if frontend_framework in ("", "none"):
-            ok("Team Lead plan did not force an unrelated frontend framework")
-        elif frontend_framework in ("react", "nextjs"):
-            fail(
-                "Team Lead plan still forced a React/Next frontend",
-                str(constraints),
-            )
-        else:
-            warn(f"Team Lead plan captured an unexpected frontend framework: {constraints.get('frontend_framework')!r}")
-
-        acceptance_text = " ".join(plan_payload.get("acceptance_criteria") or []).lower()
-        if "python 3.12" in acceptance_text and "flask" in acceptance_text:
-            ok("Team Lead acceptance criteria reinforce Python 3.12 + Flask")
-        else:
-            fail(
-                "Team Lead acceptance criteria do not reinforce Python 3.12 + Flask",
-                acceptance_text[:240],
-            )
-
-        plan_text = json.dumps(plan_payload, ensure_ascii=False).lower()
-        legacy_markers = [
-            "react router",
-            "src/pages/landingpage.tsx",
-            "pages/index.tsx",
-            "node.js/express backend",
-        ]
-        found_legacy = next((marker for marker in legacy_markers if marker in plan_text), "")
-        if found_legacy:
-            fail(
-                "Team Lead plan still contains React/Next implementation steps",
-                f"legacy marker: {found_legacy}",
-            )
-        else:
-            ok("Team Lead plan no longer contains React/Next-specific implementation steps")
+        _assert_expected_stack_constraints(plan_constraints, expected_constraints, "Team Lead plan")
     else:
         fail("Team Lead plan JSON unreadable", os.path.join(host_ws, "team-lead/plan.json"))
 
@@ -831,7 +873,7 @@ def test_cstl1_full_workflow():  # noqa: C901
                  f"Expected: {host_ws}/{repo_name}/.git — "
                  "check SCM agent logs for clone errors")
 
-    step("d2. Verify Web Agent received Jira-derived Python/Flask constraints")
+    step("d2. Verify Web Agent received Jira-derived stack constraints")
     web_stage_payload = _read_json_file(os.path.join(host_ws, "web-agent/stage-summary.json"))
     web_runtime_payload = web_stage_payload.get("runtimeConfig") if isinstance(web_stage_payload, dict) else None
     if isinstance(web_runtime_payload, dict):
@@ -840,29 +882,8 @@ def test_cstl1_full_workflow():  # noqa: C901
             ok("Web Agent runtime config includes tech stack constraints")
         else:
             fail("Web Agent runtime config missing tech stack constraints")
-
-        if web_constraints.get("language") == "python":
-            ok("Web Agent received Python as the required language")
-        else:
-            fail("Web Agent did not receive Python as the required language", str(web_constraints))
-
-        if str(web_constraints.get("python_version") or "") == "3.12":
-            ok("Web Agent received Python 3.12 from Team Lead")
-        else:
-            fail("Web Agent did not receive Python 3.12", str(web_constraints))
-
-        if _normalize_text(web_constraints.get("backend_framework")) == "flask":
-            ok("Web Agent received Flask as the backend framework")
-        else:
-            fail("Web Agent did not receive Flask as the backend framework", str(web_constraints))
-
-        web_frontend = _normalize_text(web_constraints.get("frontend_framework"))
-        if web_frontend in ("", "none"):
-            ok("Web Agent was not forced onto an unrelated frontend framework")
-        elif web_frontend in ("react", "nextjs"):
-            fail("Web Agent still received a React/Next frontend constraint", str(web_constraints))
-        else:
-            warn(f"Web Agent received an unexpected frontend framework: {web_constraints.get('frontend_framework')!r}")
+        _assert_expected_stack_constraints(web_constraints, expected_constraints, "Web Agent runtime config")
+        _assert_matching_stack_constraints(plan_constraints, web_constraints)
     else:
         fail("Web Agent runtime config unreadable", os.path.join(host_ws, "web-agent/stage-summary.json"))
 

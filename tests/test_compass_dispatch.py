@@ -368,6 +368,39 @@ class CompassDispatchTests(unittest.TestCase):
         finally:
             compass_app.task_store = original_store
 
+    def test_route_with_runtime_recognizes_dev_task(self):
+        """TC-PERM-08: LLM classifies a development request as 'dev' task."""
+        with mock.patch.object(compass_app, "_run_agentic", return_value=json.dumps({
+            "summary": "Develop a new iOS application.",
+            "workflow": ["team-lead.task.analyze"],
+            "task_type": "dev",
+            "office_subtype": None,
+            "target_paths": [],
+            "needs_input": False,
+            "input_question": None,
+            "reasoning": "Building an iOS app is a software development task.",
+        })):
+            decision = compass_app._route_with_runtime(
+                "Help me develop an iOS application with SwiftUI."
+            )
+
+        self.assertEqual(decision["task_type"], "dev")
+        self.assertEqual(decision["workflow"], ["team-lead.task.analyze"])
+        self.assertFalse(decision["needs_input"])
+
+    def test_validate_office_target_paths_rejects_dotdot(self):
+        """TC-PERM-05: Path containing .. resolves outside the whitelist is rejected."""
+        with tempfile.TemporaryDirectory(prefix="compass_allow_") as allowed, \
+             tempfile.TemporaryDirectory(prefix="compass_other_") as other:
+            outside = Path(other, "secret.txt")
+            outside.write_text("secret", encoding="utf-8")
+            # The path uses .. to escape the allowed directory
+            sneaky = os.path.join(allowed, "..", os.path.basename(other), "secret.txt")
+            with mock.patch.object(compass_app, "OFFICE_ALLOWED_BASE_PATHS", [allowed]):
+                paths, error = compass_app._validate_office_target_paths([sneaky])
+            self.assertEqual(paths, [])
+            self.assertIn("outside OFFICE_ALLOWED_BASE_PATHS", error)
+
     def _write_json(self, workspace: str, relative_path: str, payload: dict) -> None:
         full_path = Path(workspace, relative_path)
         full_path.parent.mkdir(parents=True, exist_ok=True)

@@ -88,7 +88,7 @@ This skill covers:
 ## Container Security
 
 - All agent containers run as non-root `appuser` (UID 1000); see each `Dockerfile`.
-- Compass container needs `group_add: [docker]` in `docker-compose.yml` to access the Docker socket as non-root.
+- Compass container must receive the mounted Docker socket's numeric group id through `group_add` in `docker-compose.yml` to access the socket as non-root on both Docker Desktop and Rancher Desktop. Keep group `0` for Docker Desktop compatibility, and when Rancher Desktop needs an override, derive `DOCKER_SOCKET_GID` from a helper container: `docker run --rm -v "${DOCKER_SOCKET:-$HOME/.rd/docker.sock}:/var/run/docker.sock" python:3.12-slim python -c "import os; print(os.stat('/var/run/docker.sock').st_gid)"`.
 
 ---
 

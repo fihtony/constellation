@@ -137,6 +137,42 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         self.assertEqual(page_name, "Practice Quiz")
         self.assertIn("page: Practice Quiz", message_text)
 
+    def test_team_lead_skips_redundant_figma_fetch_for_equivalent_node_labels(self):
+        ctx = team_lead_app._TaskContext()
+        ctx.design_info = {
+            "url": "https://www.figma.com/design/gxd2LNayM2hh3V3qTlcyPF?node-id=1-470",
+            "type": "figma",
+            "content": "Summary (fetch failed — rate limited)",
+            "page_name": "node_id=1-470",
+            "fetchedBy": "figma.page.fetch",
+            "request": "Fetch design from https://www.figma.com/design/gxd2LNayM2hh3V3qTlcyPF?node-id=1-470",
+        }
+        analysis = {
+            "design_url": "https://www.figma.com/design/gxd2LNayM2hh3V3qTlcyPF?node-id=1-470",
+            "design_type": "figma",
+            "design_page_name": "node 1-470",
+        }
+        action = {
+            "action": "fetch_agent_context",
+            "capability": "figma.page.fetch",
+            "message": "Fetch design from https://www.figma.com/design/gxd2LNayM2hh3V3qTlcyPF?node-id=1-470 page: node 1-470",
+            "reason": "Need the design specification before planning.",
+        }
+
+        with mock.patch.object(team_lead_app, "_call_sync_agent") as sync_mock:
+            progressed = team_lead_app._execute_gather_action(
+                action,
+                analysis,
+                ctx,
+                team_lead_task_id="task-1",
+                workspace="",
+                compass_task_id="compass-task-1",
+                log_fn=lambda _message: None,
+            )
+
+        self.assertFalse(progressed)
+        sync_mock.assert_not_called()
+
     def test_team_lead_requests_tech_stack_confirmation_when_ticket_is_ambiguous(self):
         updated = team_lead_app._apply_tech_stack_confirmation_policy(
             {
@@ -152,6 +188,27 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
 
         self.assertIn("confirmed web tech stack", updated["missing_info"])
         self.assertIn("tech stack", updated["question_for_user"].lower())
+
+    def test_team_lead_filters_defaultable_web_styling_questions(self):
+        ctx = team_lead_app._TaskContext()
+        ctx.jira_info = {"ticket_key": "CSTL-4", "content": "Jira ticket content."}
+        ctx.repo_info = {
+            "repo_url": "https://github.com/fihtony/english-study-hub",
+            "content": "Repo uses React app routing and CSS modules.",
+        }
+
+        unresolved = team_lead_app._filter_unresolved_missing_info(
+            {
+                "platform": "web",
+                "missing_info": [
+                    "Preferred styling approach or tooling (plain CSS, SASS, Tailwind, CSS-in-JS, component library) if any.",
+                    "Exact analytics event names.",
+                ],
+            },
+            ctx,
+        )
+
+        self.assertEqual(unresolved, ["Exact analytics event names."])
 
     def test_team_lead_clears_tech_stack_question_after_user_confirms_stack(self):
         updated = team_lead_app._apply_tech_stack_confirmation_policy(
@@ -545,6 +602,135 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             history_states = [entry["state"] for entry in current.history]
             self.assertIn("TASK_STATE_INPUT_REQUIRED", history_states)
 
+    def test_team_lead_executes_new_fallback_fetch_when_runtime_plan_repeats_stale_fetches(self):
+        with tempfile.TemporaryDirectory(prefix="team_lead_fallback_fetch_") as workspace:
+            task = team_lead_app.task_store.create()
+            ctx = team_lead_app._TaskContext()
+            ctx.compass_task_id = "compass-task-1"
+            ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
+            ctx.compass_url = "http://compass.local"
+            ctx.shared_workspace_path = workspace
+            ctx.user_text = "Implement CSTL-4."
+            ctx.additional_info = "Use React with an Express backend."
+            ctx.original_message = {"metadata": {"stopBeforeDevDispatch": True}}
+            ctx.jira_info = {
+                "ticket_key": "CSTL-4",
+                "content": "Ticket content with linked Figma design.",
+                "request": "Fetch ticket CSTL-4",
+            }
+            ctx.repo_info = {
+                "repo_url": "https://github.com/fihtony/english-study-hub",
+                "content": "Repository metadata already fetched.",
+                "request": "Inspect repository https://github.com/fihtony/english-study-hub",
+            }
+
+            analysis = {
+                "task_type": "feature",
+                "platform": "web",
+                "needs_jira_fetch": True,
+                "jira_ticket_key": "CSTL-4",
+                "needs_design_context": True,
+                "design_url": "https://www.figma.com/design/abc123/English-Study-Hub",
+                "design_type": "figma",
+                "design_page_name": "Practice Quiz",
+                "target_repo_url": "https://github.com/fihtony/english-study-hub",
+                "missing_info": [],
+                "question_for_user": None,
+                "summary": "Implement CSTL-4.",
+            }
+            expected_capability, expected_message, _ = team_lead_app._build_design_fetch_request(analysis)
+
+            def fake_plan_information_gathering(_user_text: str, _analysis: dict, _workflow_ctx, **_kwargs) -> dict:
+                return {
+                    "pending_tasks": [
+                        "Fetch the full Jira issue CSTL-4 (all fields, AC, links, attachments, comments, sprint/epic context).",
+                        "Inspect the target repository fihtony/english-study-hub (branch, file tree, manifests, README, CI, infer tech stack).",
+                        "Fetch the referenced Figma design node/page from the provided Figma URL (capture images, node structure, styles, and page name).",
+                    ],
+                    "actions": [
+                        {
+                            "action": "fetch_agent_context",
+                            "capability": "jira.ticket.fetch",
+                            "message": "Fetch ticket CSTL-4",
+                            "reason": "Need the latest Jira issue details.",
+                        },
+                        {
+                            "action": "fetch_agent_context",
+                            "capability": "scm.repo.inspect",
+                            "message": "Inspect repository https://github.com/fihtony/english-study-hub",
+                            "reason": "Need the latest repository metadata.",
+                        },
+                    ],
+                }
+
+            def fake_call_sync_agent(capability: str, message_text: str, *_args) -> dict:
+                self.assertEqual(capability, expected_capability)
+                self.assertEqual(message_text, expected_message)
+                return {"artifacts": [{"parts": [{"text": "Practice Quiz design context"}]}]}
+
+            fake_plan = {
+                "platform": "web",
+                "dev_capability": "web.task.execute",
+                "target_repo_url": "https://github.com/fihtony/english-study-hub",
+                "dev_instruction": "Implement the requested page in the target repository.",
+                "acceptance_criteria": ["Practice Quiz screen matches the design."],
+                "requires_tests": True,
+                "test_requirements": "Add integration coverage for the Practice Quiz screen.",
+                "screenshot_requirements": None,
+            }
+
+            with mock.patch.object(team_lead_app, "_analyze_task", return_value=analysis), mock.patch.object(
+                team_lead_app,
+                "_plan_information_gathering",
+                side_effect=fake_plan_information_gathering,
+            ), mock.patch.object(
+                team_lead_app.agent_directory,
+                "list_agents",
+                return_value=[
+                    {
+                        "agent_id": "ui-design-agent",
+                        "capabilities": ["figma.page.fetch"],
+                        "instances": [
+                            {
+                                "instance_id": "ui-1",
+                                "status": "idle",
+                                "service_url": "http://ui-design:8040",
+                            }
+                        ],
+                    }
+                ],
+            ), mock.patch.object(
+                team_lead_app,
+                "_call_sync_agent",
+                side_effect=fake_call_sync_agent,
+            ) as sync_mock, mock.patch.object(
+                team_lead_app,
+                "_create_plan",
+                return_value=fake_plan,
+            ), mock.patch.object(team_lead_app, "_notify_compass"), mock.patch.object(
+                team_lead_app,
+                "_report_progress",
+            ), mock.patch.object(
+                team_lead_app,
+                "_generate_summary",
+                return_value="validation checkpoint reached",
+            ):
+                team_lead_app._run_workflow(task.task_id, ctx)
+
+            sync_mock.assert_called_once_with(
+                expected_capability,
+                expected_message,
+                task.task_id,
+                workspace,
+                "compass-task-1",
+            )
+            self.assertIsNotNone(ctx.design_info)
+            self.assertEqual(ctx.design_info["fetchedBy"], expected_capability)
+            self.assertTrue(Path(workspace, "team-lead/design-context.json").is_file())
+
+            current = team_lead_app.task_store.get(task.task_id)
+            self.assertEqual(current.state, "TASK_STATE_COMPLETED")
+
     def test_team_lead_does_not_plan_with_unresolved_missing_info(self):
         with tempfile.TemporaryDirectory(prefix="team_lead_unresolved_missing_") as workspace:
             task = team_lead_app.task_store.create()
@@ -716,6 +902,73 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                     "/tmp/workspace",
                     "compass-task-1",
                 )
+
+    def test_team_lead_sync_agent_timeout_raises_instead_of_returning_working_task(self):
+        with mock.patch.object(
+            team_lead_app.agent_directory,
+            "resolve_capability",
+            return_value=(
+                {"agent_id": "ui-design-agent"},
+                {"service_url": "http://ui-design:8040"},
+            ),
+        ), mock.patch.object(
+            team_lead_app,
+            "_a2a_send",
+            return_value={
+                "id": "ui-task-1",
+                "status": {"state": "TASK_STATE_WORKING"},
+                "artifacts": [],
+            },
+        ), mock.patch.object(team_lead_app, "_poll_agent_task", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "did not complete within sync timeout"):
+                team_lead_app._call_sync_agent(
+                    "figma.page.fetch",
+                    "Fetch design from https://www.figma.com/design/abc123/Test page: Community",
+                    "task-1",
+                    "/tmp/workspace",
+                    "compass-task-1",
+                )
+
+    def test_team_lead_filters_defaultable_web_ui_missing_info(self):
+        ctx = team_lead_app._TaskContext()
+        ctx.jira_info = {"content": "Jira ticket content is available."}
+        ctx.repo_info = {"content": "Repository context is available."}
+        ctx.design_info = {"content": "Figma fetch returned rate-limit details."}
+
+        unresolved = team_lead_app._filter_unresolved_missing_info(
+            {
+                "platform": "web",
+                "missing_info": [
+                    "Desired route/path and integration point in the repo (where page should be mounted)",
+                    "Any required dynamic data or API endpoints / mock data contracts",
+                    "Responsive breakpoints and browser support expectations",
+                ],
+            },
+            ctx,
+        )
+
+        self.assertEqual(unresolved, [])
+
+    def test_team_lead_suppresses_defaultable_web_ui_questions_with_full_context(self):
+        ctx = team_lead_app._TaskContext()
+        ctx.jira_info = {"content": "Jira ticket content is available."}
+        ctx.repo_info = {"content": "Repository context is available."}
+        ctx.design_info = {"content": "Figma node context is available."}
+
+        updated = team_lead_app._suppress_redundant_questions(
+            {
+                "platform": "web",
+                "missing_info": [
+                    "Explicit acceptance criteria (pass/fail conditions, pages/components to implement, responsive breakpoints, test/QA steps).",
+                    "Desired assignment and any reviewer/owner to set on the Jira ticket before implementation.",
+                ],
+                "question_for_user": "Please provide explicit acceptance criteria for CSTL-4 and the desired reviewer.",
+            },
+            ctx,
+        )
+
+        self.assertEqual(updated.get("question_for_user"), None)
+        self.assertEqual(updated.get("missing_info"), [])
 
     def test_team_lead_gather_planner_prefers_registered_fetch_over_user_question(self):
         ctx = team_lead_app._TaskContext()
@@ -1030,6 +1283,30 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         self.assertIn("app/page.tsx", removed_paths)
         self.assertIn("src/pages/__tests__/LandingPage.next.test.tsx", removed_paths)
 
+    def test_normalize_plan_path_converts_common_dotfile_aliases(self):
+        self.assertEqual(web_app._normalize_plan_path("gitignore"), ".gitignore")
+        self.assertEqual(web_app._normalize_plan_path("nvmrc"), ".nvmrc")
+        self.assertEqual(web_app._normalize_plan_path("config/dockerignore"), "config/.dockerignore")
+
+    def test_sanitize_plan_files_drops_non_example_env_files(self):
+        files = [
+            {"path": "client/.env", "action": "create"},
+            {"path": "server/.env.example", "action": "create"},
+            {"path": "gitignore", "action": "create"},
+        ]
+
+        kept, removed = web_app._sanitize_plan_files(
+            files,
+            {"frontend_framework": "react"},
+            [],
+        )
+
+        self.assertEqual(
+            [file_info["path"] for file_info in kept],
+            ["server/.env.example", ".gitignore"],
+        )
+        self.assertEqual(removed[0]["path"], "client/.env")
+
     def test_jira_actions_are_appended_to_workspace_evidence(self):
         with tempfile.TemporaryDirectory(prefix="web_agent_jira_") as workspace:
             web_app._record_jira_action(
@@ -1163,6 +1440,161 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
 
         self.assertEqual(run_mock.call_count, 2)
         self.assertEqual([file_info["path"] for file_info in plan["files"]], ["app.py", "tests/test_app.py"])
+
+    def test_plan_implementation_uses_extended_timeout_budget(self):
+        valid_plan = {
+            "plan_summary": "Create the React/Express implementation plan.",
+            "files": [
+                {
+                    "path": "client/src/App.jsx",
+                    "action": "create",
+                    "purpose": "Render the main page.",
+                    "key_logic": "Create the React entry component.",
+                    "dependencies": ["react"],
+                }
+            ],
+            "install_dependencies": ["react"],
+            "setup_commands": ["npm install"],
+            "notes": "Use the existing repository.",
+        }
+
+        with mock.patch.object(
+            web_app,
+            "_run_agentic",
+            return_value=json.dumps(valid_plan),
+        ) as run_mock:
+            plan = web_app._plan_implementation(
+                "Implement CSTL-4 in React/Express.",
+                ["Render /study."],
+                {"backend_framework": "express", "frontend_framework": "react"},
+                "README.md exists",
+                "Figma reference is rate-limited.",
+            )
+
+        self.assertEqual(plan["files"][0]["path"], "client/src/App.jsx")
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertEqual(run_mock.call_args.kwargs.get("timeout"), web_app.PLAN_TIMEOUT_SECONDS)
+        self.assertEqual(run_mock.call_args.kwargs.get("max_tokens"), web_app.PLAN_MAX_TOKENS)
+
+    def test_web_agent_detects_node_build_steps_from_root_package_json(self):
+        with tempfile.TemporaryDirectory(prefix="web_node_build_") as build_dir:
+            Path(build_dir, "package.json").write_text(
+                json.dumps(
+                    {
+                        "scripts": {
+                            "test": "jest --coverage",
+                            "build": "vite build",
+                        },
+                        "devDependencies": {
+                            "jest": "^29.0.0",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            steps = web_app._detect_node_build_steps(build_dir)
+
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[0]["cwd"], build_dir)
+        self.assertEqual(steps[0]["cmd"][:2], ["npm", "test"])
+        self.assertIn("--coverage", steps[0]["cmd"])
+        self.assertEqual(steps[1]["cmd"], ["npm", "run", "build"])
+
+    def test_web_agent_installs_written_node_dependencies_for_generated_package_manifests(self):
+        with tempfile.TemporaryDirectory(prefix="web_written_npm_") as build_dir:
+            Path(build_dir, "package.json").write_text(json.dumps({"name": "root"}), encoding="utf-8")
+            client_dir = Path(build_dir, "client")
+            client_dir.mkdir(parents=True, exist_ok=True)
+            Path(client_dir, "package.json").write_text(json.dumps({"name": "client"}), encoding="utf-8")
+            server_dir = Path(build_dir, "server")
+            server_dir.mkdir(parents=True, exist_ok=True)
+            Path(server_dir, "package.json").write_text(json.dumps({"name": "server"}), encoding="utf-8")
+
+            calls: list[str] = []
+
+            def fake_run(*_args, **kwargs):
+                calls.append(kwargs["cwd"])
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(web_app.subprocess, "run", side_effect=fake_run):
+                web_app._install_written_node_dependencies(build_dir, lambda _message: None)
+
+        self.assertEqual(calls, [build_dir, str(client_dir), str(server_dir)])
+
+    def test_web_agent_detects_client_dev_launch_plan_for_ui_screenshot(self):
+        with tempfile.TemporaryDirectory(prefix="web_ui_launch_") as build_dir:
+            client_dir = Path(build_dir, "client")
+            client_dir.mkdir(parents=True, exist_ok=True)
+            Path(client_dir, "package.json").write_text(
+                json.dumps(
+                    {
+                        "scripts": {
+                            "dev": "vite",
+                            "build": "vite build",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            plan = web_app._detect_ui_launch_plan(
+                build_dir,
+                {"frontend_framework": "react"},
+                43123,
+            )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan["cwd"], str(client_dir))
+        self.assertEqual(
+            plan["cmd"],
+            ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", "43123"],
+        )
+        self.assertIn("http://127.0.0.1:43123/", plan["urls"])
+
+    def test_web_agent_registers_generated_artifact_for_commit(self):
+        with tempfile.TemporaryDirectory(prefix="web_artifact_commit_") as temp_dir:
+            clone_dir = Path(temp_dir, "repo")
+            clone_dir.mkdir(parents=True, exist_ok=True)
+            source_path = Path(temp_dir, "implementation-screenshot.png")
+            source_path.write_bytes(b"png-data")
+            generated_files: list[dict] = []
+
+            registered = web_app._register_generated_artifact(
+                str(clone_dir),
+                generated_files,
+                str(source_path),
+                "docs/evidence/implementation-screenshot-desktop.png",
+                lambda _message: None,
+            )
+
+            artifact_exists = Path(
+                clone_dir,
+                "docs/evidence/implementation-screenshot-desktop.png",
+            ).is_file()
+
+        self.assertTrue(registered)
+        self.assertTrue(artifact_exists)
+        self.assertEqual(generated_files[0]["path"], "docs/evidence/implementation-screenshot-desktop.png")
+
+    def test_web_agent_registers_runtime_repo_artifacts_for_commit(self):
+        with tempfile.TemporaryDirectory(prefix="web_runtime_artifacts_") as temp_dir:
+            clone_dir = Path(temp_dir, "repo")
+            artifact_dir = clone_dir / "artifacts" / "figma" / "file123" / "1_470"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            screenshot_path = artifact_dir / "cstl4_desktop.png"
+            screenshot_path.write_bytes(b"png-data")
+            generated_files: list[dict] = []
+
+            registered_count = web_app._register_runtime_repo_artifacts(
+                str(clone_dir),
+                generated_files,
+                ["artifacts/figma"],
+                lambda _message: None,
+            )
+
+        self.assertEqual(registered_count, 1)
+        self.assertEqual(generated_files[0]["path"], "artifacts/figma/file123/1_470/cstl4_desktop.png")
 
 
 if __name__ == "__main__":

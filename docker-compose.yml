@@ -74,6 +74,7 @@ services:
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
     group_add:
       - "0"
+      - "${DOCKER_SOCKET_GID:-102}"
     labels:
       constellation.agent_id: "compass-agent"
       constellation.agent_name: "Compass Agent"

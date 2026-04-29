@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 from common.artifact_store import ArtifactStore
 from common.devlog import record_workspace_stage
 from common.env_utils import load_dotenv
+from common.instance_reporter import InstanceReporter
 from common.launcher import get_launcher
 from common.message_utils import artifact_text, deep_copy_json, extract_text
 from common.policy import PolicyEvaluator
@@ -29,6 +30,7 @@ from compass import prompts
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
+AGENT_ID = os.environ.get("AGENT_ID", "compass-agent")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://localhost:{PORT}")
@@ -1817,6 +1819,8 @@ def main():
     print(f"[compass] Compass agent starting on {HOST}:{PORT}")
     print(f"[compass] Instance ID: {COMPASS_INSTANCE_ID}")
     print(f"[compass] Artifact root: {artifact_store.root}")
+    reporter = InstanceReporter(agent_id=AGENT_ID, service_url=ADVERTISED_URL, port=PORT)
+    reporter.start()
     server = ThreadingHTTPServer((HOST, PORT), CompassHandler)
     # Increase listen backlog so concurrent callback + test requests are not refused.
     # The default (5) causes transient ECONNREFUSED when multiple agents send callbacks

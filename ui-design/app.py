@@ -143,6 +143,8 @@ def _handle_figma_message(user_text: str, capability: str) -> tuple[str, list]:
                     f"Figma file: {meta.get('name')} "
                     f"(last modified: {meta.get('lastModified')})"
                 )
+            else:
+                summary_parts.append(f"Figma file metadata fetch status: {meta_status}")
             # Explicit element-spec request
             if capability == "figma.node.get" or node_id:
                 node_result, node_status = figma_client.fetch_nodes(file_key, [node_id]) if node_id else ({}, "no_node_id")
@@ -160,11 +162,19 @@ def _handle_figma_message(user_text: str, capability: str) -> tuple[str, list]:
                         f"Page matched: '{matched_page.get('name')}' "
                         f"(id: {matched_page.get('id')})"
                     )
-                else:
+                elif page_status == "page_not_found":
                     available = page_result.get("availablePages", [])
                     summary_parts.append(
                         f"Page '{page_name}' not found. Available: {available}"
                     )
+                else:
+                    summary_parts.append(
+                        f"Figma page fetch status: {page_status}"
+                    )
+        else:
+            summary_parts.append("Could not parse the Figma file key from the provided URL.")
+    else:
+        summary_parts.append("No Figma URL found in the request.")
 
     prompt = agent_prompts.FIGMA_SUMMARY_TEMPLATE.format(
         user_text=user_text,
@@ -178,6 +188,8 @@ def _handle_figma_message(user_text: str, capability: str) -> tuple[str, list]:
         AGENT_ID,
         system_prompt=build_system_prompt(agent_prompts.FIGMA_SUMMARY_SYSTEM, "ui-design"),
     )
+    if not str(llm_text).strip():
+        llm_text = "; ".join(summary_parts) or "No Figma data fetched."
     artifacts = [
         build_text_artifact(
             "figma-summary",

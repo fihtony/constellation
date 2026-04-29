@@ -757,5 +757,258 @@ class TestWriteRootLocking(unittest.TestCase):
                 office_app._release_write_root(workspace)
 
 
+# ---------------------------------------------------------------------------
+# TC-ERR-02: Password-protected / encrypted PDF
+# ---------------------------------------------------------------------------
+
+class TestPasswordProtectedPdf(unittest.TestCase):
+    def test_single_encrypted_pdf_fails(self):
+        """TC-ERR-02: Single encrypted PDF task fails with clear error."""
+        with tempfile.TemporaryDirectory(prefix="office_enc_pdf_") as workspace:
+            source = Path(workspace, "encrypted.pdf")
+            source.write_bytes(b"%PDF-1.4 encrypted stub")
+            message = _make_message("office.document.summarize", [str(source)], workspace)
+            with mock.patch.object(office_app, "_read_pdf", side_effect=RuntimeError("File is encrypted or password-protected.")):
+                with self.assertRaises(RuntimeError, msg="No readable files"):
+                    office_app._execute_capability("task-enc", message)
+
+    def test_folder_with_encrypted_pdf_continues(self):
+        """TC-ERR-03 variant: Folder with one bad PDF + good files continues with warnings."""
+        with tempfile.TemporaryDirectory(prefix="office_mixed_pdf_") as workspace:
+            src_dir = Path(workspace, "docs")
+            src_dir.mkdir()
+            (src_dir / "good.txt").write_text("Hello world", encoding="utf-8")
+            (src_dir / "bad.pdf").write_bytes(b"%PDF-1.4 encrypted stub")
+            message = _make_message("office.folder.summarize", [str(src_dir)], workspace)
+
+            def _mock_extract(path):
+                if "bad.pdf" in path:
+                    raise RuntimeError("File is encrypted or password-protected.")
+                return {"path": path, "type": ".txt", "preview": "Hello world"}
+
+            with mock.patch.object(office_app, "_extract_document_preview", side_effect=_mock_extract), \
+                 mock.patch.object(office_app, "_run_agentic_json", return_value={
+                     "summary_markdown": "# Summary of good files",
+                     "warnings": [],
+                 }):
+                result = office_app._execute_capability("task-mixed", message)
+            self.assertIn("Summary created", result["summary"])
+            self.assertTrue(any("bad.pdf" in w for w in result.get("warnings", [])))
+
+
+# ---------------------------------------------------------------------------
+# TC-ERR-03: Mixed folder with corrupted .xls + normal files
+# ---------------------------------------------------------------------------
+
+class TestMixedFolderPartialSuccess(unittest.TestCase):
+    def test_folder_with_corrupted_xls_partial_success(self):
+        """TC-ERR-03: Folder with one corrupted .xls and other normal CSV files."""
+        with tempfile.TemporaryDirectory(prefix="office_mixed_xls_") as workspace:
+            src_dir = Path(workspace, "data")
+            src_dir.mkdir()
+            (src_dir / "good.csv").write_text("A,B\n1,2\n3,4\n", encoding="utf-8")
+            (src_dir / "bad.xls").write_bytes(b"corrupted xls content")
+            message = _make_message("office.data.analyze", [str(src_dir)], workspace)
+            with mock.patch.object(office_app, "_run_agentic_json", return_value={
+                "summary_markdown": "# Analysis\n\nCSV data analyzed.",
+                "warnings": [],
+            }):
+                result = office_app._execute_capability("task-mixed-xls", message)
+            self.assertIn("Analysis created", result["summary"])
+            self.assertTrue(any("bad.xls" in w for w in result.get("warnings", [])))
+
+
+# ---------------------------------------------------------------------------
+# TC-ERR-09: Concurrent write to same directory
+# ---------------------------------------------------------------------------
+
+class TestConcurrentWriteRejection(unittest.TestCase):
+    def test_second_inplace_task_fails_fast(self):
+        """TC-ERR-09: Two inplace tasks to the same directory — second fails fast."""
+        with tempfile.TemporaryDirectory(prefix="office_concurrent_") as workspace:
+            source = Path(workspace, "data.txt")
+            source.write_text("Sample content", encoding="utf-8")
+            # First task acquires the write lock
+            office_app._acquire_write_root(workspace)
+            try:
+                message = _make_message(
+                    "office.document.summarize", [str(source)], workspace, output_mode="inplace"
+                )
+                with self.assertRaises(RuntimeError, msg="Another Office task is already writing"):
+                    office_app._execute_capability("task-concurrent-2", message)
+            finally:
+                office_app._release_write_root(workspace)
+
+
+# ---------------------------------------------------------------------------
+# TC-PERM-05: Path containing .. (path traversal)
+# ---------------------------------------------------------------------------
+
+class TestPathTraversal(unittest.TestCase):
+    def test_dotdot_in_target_path_rejected(self):
+        """TC-PERM-05: Target path containing .. is rejected."""
+        with tempfile.TemporaryDirectory(prefix="office_traversal_") as workspace:
+            # Create the file outside the expected root
+            sneaky_path = os.path.join(workspace, "subdir", "..", "..", "etc", "passwd")
+            message = _make_message("office.document.summarize", [sneaky_path], workspace)
+            # The path after realpath resolution should escape the input root
+            with self.assertRaises(RuntimeError):
+                office_app._execute_capability("task-traversal", message)
+
+
+# ---------------------------------------------------------------------------
+# TC-ERR-01: Legacy .doc file rejection
+# ---------------------------------------------------------------------------
+
+class TestLegacyDocRejection(unittest.TestCase):
+    def test_doc_file_rejected(self):
+        """TC-ERR-01: .doc file returns clear error message."""
+        with tempfile.TemporaryDirectory(prefix="office_doc_") as workspace:
+            source = Path(workspace, "legacy.doc")
+            source.write_bytes(b"\xd0\xcf\x11\xe0 legacy doc")
+            message = _make_message("office.document.summarize", [str(source)], workspace)
+            with self.assertRaises(RuntimeError, msg="Legacy Office format"):
+                office_app._execute_capability("task-doc", message)
+
+    def test_ppt_file_rejected(self):
+        """TC-ERR-01: .ppt file returns clear error message."""
+        with tempfile.TemporaryDirectory(prefix="office_ppt_") as workspace:
+            source = Path(workspace, "legacy.ppt")
+            source.write_bytes(b"\xd0\xcf\x11\xe0 legacy ppt")
+            message = _make_message("office.document.summarize", [str(source)], workspace)
+            with self.assertRaises(RuntimeError, msg="Legacy Office format"):
+                office_app._execute_capability("task-ppt", message)
+
+
+# ---------------------------------------------------------------------------
+# TC-ERR-07: Runtime generates illegal action
+# ---------------------------------------------------------------------------
+
+class TestIllegalRuntimeAction(unittest.TestCase):
+    def test_delete_action_rejected(self):
+        """TC-ERR-07: LLM generates a 'delete' action — plan validation rejects it."""
+        with tempfile.TemporaryDirectory(prefix="office_illegal_") as workspace:
+            src_dir = Path(workspace, "src")
+            src_dir.mkdir()
+            (src_dir / "a.txt").write_text(">>> Alice\nContent\n", encoding="utf-8")
+            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
+            with mock.patch.object(office_app, "_run_agentic_json", return_value={
+                "actions": [{"action": "delete", "destination": "files/a.txt"}],
+                "summary_markdown": "Deleted file.",
+                "warnings": [],
+            }):
+                with self.assertRaises(RuntimeError, msg="Unsupported organize action"):
+                    office_app._execute_capability("task-illegal", message)
+
+    def test_rm_rf_action_rejected(self):
+        """TC-ERR-07: LLM generates 'rm -rf /' — rejected immediately."""
+        with tempfile.TemporaryDirectory(prefix="office_rm_") as workspace:
+            src_dir = Path(workspace, "src")
+            src_dir.mkdir()
+            (src_dir / "a.txt").write_text(">>> Alice\nContent\n", encoding="utf-8")
+            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
+            with mock.patch.object(office_app, "_run_agentic_json", return_value={
+                "actions": [{"action": "shell_exec", "destination": "files/", "content": "rm -rf /"}],
+                "summary_markdown": "Done.",
+                "warnings": [],
+            }):
+                with self.assertRaises(RuntimeError, msg="Unsupported organize action"):
+                    office_app._execute_capability("task-rmrf", message)
+
+
+# ---------------------------------------------------------------------------
+# TC-ERR-06: Output file already exists — non-overwrite behavior
+# ---------------------------------------------------------------------------
+
+class TestNonOverwriteOutput(unittest.TestCase):
+    def test_summary_avoids_overwriting_existing_file(self):
+        """TC-ERR-06: When summary.md already exists, a timestamped alternative is used."""
+        with tempfile.TemporaryDirectory(prefix="office_overwrite_") as workspace:
+            existing = Path(workspace, "office-agent", "summary.md")
+            existing.parent.mkdir(parents=True, exist_ok=True)
+            existing.write_text("# Previous summary", encoding="utf-8")
+            source = Path(workspace, "doc.txt")
+            source.write_text("Sample document content.", encoding="utf-8")
+            message = _make_message("office.document.summarize", [str(source)], workspace)
+            with mock.patch.object(office_app, "_run_agentic_json", return_value={
+                "summary_markdown": "# New summary",
+                "warnings": [],
+            }):
+                result = office_app._execute_capability("task-overwrite", message)
+            # Original file should be preserved
+            self.assertEqual(existing.read_text(encoding="utf-8"), "# Previous summary")
+            # New file should exist with a different name
+            md_files = list(Path(workspace, "office-agent").glob("summary*.md"))
+            self.assertGreaterEqual(len(md_files), 2)
+
+
+# ---------------------------------------------------------------------------
+# TC-ERR-10: Large directory preflight rejection
+# ---------------------------------------------------------------------------
+
+class TestPreflightLargeDirectory(unittest.TestCase):
+    def test_large_dir_file_count_returns_preflight_report(self):
+        """TC-ERR-10: Directory exceeding file count limit returns preflight report."""
+        with tempfile.TemporaryDirectory(prefix="office_preflight_") as workspace:
+            source = Path(workspace, "big.txt")
+            source.write_text("Some text.", encoding="utf-8")
+            message = _make_message("office.document.summarize", [str(source)], workspace)
+            over_scan = {
+                "fileCount": 5000, "totalBytes": 100 * 1024 * 1024,
+                "largeFiles": [], "overFileCountLimit": True, "overBytesLimit": False,
+                "limitFileCount": 2000, "limitTotalMB": 250,
+            }
+            with mock.patch.object(office_app, "_preflight_scan", return_value=over_scan):
+                result = office_app._execute_capability("task-bigdir", message)
+            self.assertIn("Preflight limit exceeded", result["summary"])
+            self.assertEqual(result["artifacts"][0]["name"], "office-preflight-report")
+
+    def test_large_dir_total_bytes_returns_preflight_report(self):
+        """TC-ERR-10: Directory exceeding total bytes limit returns preflight report."""
+        with tempfile.TemporaryDirectory(prefix="office_preflight_bytes_") as workspace:
+            source = Path(workspace, "big.txt")
+            source.write_text("Some text.", encoding="utf-8")
+            message = _make_message("office.data.analyze", [str(source)], workspace)
+            over_scan = {
+                "fileCount": 100, "totalBytes": 500 * 1024 * 1024,
+                "largeFiles": [], "overFileCountLimit": False, "overBytesLimit": True,
+                "limitFileCount": 2000, "limitTotalMB": 250,
+            }
+            with mock.patch.object(office_app, "_preflight_scan", return_value=over_scan):
+                result = office_app._execute_capability("task-bigbytes", message)
+            self.assertIn("Preflight limit exceeded", result["summary"])
+
+
+# ---------------------------------------------------------------------------
+# Rules loading verification
+# ---------------------------------------------------------------------------
+
+class TestRulesLoading(unittest.TestCase):
+    def test_office_rules_exist_and_are_loadable(self):
+        """Verify rules files exist per agentic runtime doc §4.4."""
+        from common.rules_loader import load_rules
+        rules_text = load_rules("office")
+        self.assertIn("Office", rules_text)
+        self.assertIn("safety", rules_text.lower())
+
+    def test_build_system_prompt_includes_rules(self):
+        """Verify build_system_prompt injects rules into prompts."""
+        from common.rules_loader import build_system_prompt
+        prompt = build_system_prompt("Base system prompt.", "office")
+        self.assertIn("Base system prompt.", prompt)
+        self.assertIn("AGENT RULES", prompt)
+
+
+# ---------------------------------------------------------------------------
+# Workflow file existence
+# ---------------------------------------------------------------------------
+
+class TestWorkflowFileExists(unittest.TestCase):
+    def test_office_workflow_file_exists(self):
+        """Verify workflows/default-workflow.md exists per agentic runtime doc §4.4."""
+        workflow_path = Path(__file__).resolve().parent.parent / "office" / "workflows" / "default-workflow.md"
+        self.assertTrue(workflow_path.is_file(), f"Missing: {workflow_path}")
+
+
 if __name__ == "__main__":
     unittest.main()

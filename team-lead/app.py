@@ -604,6 +604,36 @@ def _poll_agent_task(agent_url: str, task_id: str, timeout: int = 60) -> dict | 
     return None
 
 
+def _task_status_text(task: dict) -> str:
+    parts = ((task.get("status") or {}).get("message") or {}).get("parts") or []
+    return "\n".join(
+        str(part.get("text") or "").strip()
+        for part in parts
+        if str(part.get("text") or "").strip()
+    ).strip()
+
+
+def _task_artifact_text(task: dict) -> str:
+    content = "\n".join(artifact_text(artifact) for artifact in (task.get("artifacts") or [])).strip()
+    if content:
+        return content
+    return _task_status_text(task)
+
+
+def _require_successful_sync_task(capability: str, task: dict, *, timeout_seconds: int) -> dict:
+    state = str((task.get("status") or {}).get("state") or "").strip()
+    status_text = _task_status_text(task)
+    if state in {"TASK_STATE_COMPLETED", "COMPLETED"}:
+        return task
+    if state in {"TASK_STATE_FAILED", "FAILED"}:
+        detail = f": {status_text}" if status_text else ""
+        raise RuntimeError(f"Required capability '{capability}' failed{detail}")
+    detail = f" Last status: {status_text}" if status_text else ""
+    raise RuntimeError(
+        f"Required capability '{capability}' did not complete within sync timeout ({timeout_seconds}s).{detail}"
+    )
+
+
 def _call_sync_agent(
     capability: str,
     message_text: str,
@@ -646,14 +676,20 @@ def _call_sync_agent(
 
     terminal_states = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED"}
     if state in terminal_states:
-        return downstream_task
+        return _require_successful_sync_task(capability, downstream_task, timeout_seconds=0)
 
     if task_id:
         result = _poll_agent_task(agent_url, task_id, timeout=SYNC_AGENT_TIMEOUT)
         if result:
-            return result
+            return _require_successful_sync_task(
+                capability,
+                result,
+                timeout_seconds=SYNC_AGENT_TIMEOUT,
+            )
 
-    return downstream_task
+    raise RuntimeError(
+        f"Required capability '{capability}' did not complete within sync timeout ({SYNC_AGENT_TIMEOUT}s)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -921,6 +957,19 @@ def _extract_design_page_name(*texts: str) -> str:
                 if page_name and len(page_name) > 3:
                     return page_name
     return ""
+
+
+def _normalize_design_page_key(value: str) -> str:
+    """Normalize design page identifiers so equivalent node labels compare equal."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+
+    node_match = re.search(r"\bnode(?:[_\s-]*id)?\s*[:=\s-]*([0-9]+)[:\-]([0-9]+)\b", text)
+    if node_match:
+        return f"node:{node_match.group(1)}-{node_match.group(2)}"
+
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
 
 def _enrich_analysis_from_context(
@@ -1203,6 +1252,26 @@ def _normalize_gather_plan(raw_plan: dict, fallback_plan: dict, capability_snaps
     }
 
 
+def _select_new_fallback_fetch_actions(attempted_fetch_actions: list[dict], fallback_plan: dict) -> list[dict]:
+    attempted = {
+        (
+            str(item.get("capability") or "").strip(),
+            str(item.get("message") or "").strip(),
+        )
+        for item in attempted_fetch_actions
+        if str(item.get("action") or "").strip() == _GATHER_ACTION_FETCH
+    }
+    return [
+        item
+        for item in (fallback_plan.get("actions") or [])
+        if item.get("action") == _GATHER_ACTION_FETCH
+        and (
+            str(item.get("capability") or "").strip(),
+            str(item.get("message") or "").strip(),
+        ) not in attempted
+    ]
+
+
 def _plan_information_gathering(
     user_text: str,
     analysis: dict,
@@ -1310,6 +1379,36 @@ def _suppress_redundant_questions(
                 log_fn(f"Suppressing design-related question (context already fetched): {question}")
             updated["question_for_user"] = None
 
+    if (
+        str(updated.get("platform") or "").strip().lower() == "web"
+        and ctx.jira_info and ctx.jira_info.get("content")
+        and ctx.repo_info and ctx.repo_info.get("content")
+        and ctx.design_info and ctx.design_info.get("content")
+    ):
+        defaultable_ui_keywords = (
+            "acceptance criteria",
+            "pass/fail",
+            "responsive breakpoints",
+            "qa step",
+            "test/qa",
+            "reviewer",
+            "owner",
+            "assignee",
+            "assignment",
+        )
+        question = str(updated.get("question_for_user") or "")
+        if any(keyword in question.lower() for keyword in defaultable_ui_keywords):
+            if log_fn:
+                log_fn(
+                    "Suppressing defaultable UI implementation question "
+                    f"(ticket + repo + design context already available): {question}"
+                )
+            updated["question_for_user"] = None
+        updated["missing_info"] = [
+            item for item in (updated.get("missing_info") or [])
+            if not any(keyword in str(item).lower() for keyword in defaultable_ui_keywords)
+        ]
+
     return updated
 
 
@@ -1361,6 +1460,105 @@ def _refresh_analysis_with_known_context(
     return _suppress_redundant_questions(analysis, ctx, log_fn=log_fn)
 
 
+def _filter_unresolved_missing_info(analysis: dict, ctx: _TaskContext) -> list[str]:
+    unresolved_missing = [
+        str(item).strip()
+        for item in (analysis.get("missing_info") or [])
+        if str(item).strip()
+    ]
+    # Filter out missing_info entries for context already gathered during the
+    # gather loop. The LLM may still report e.g. "need Stitch layer tree" even
+    # though we already have design context in hand.
+    if ctx.design_info and ctx.design_info.get("content"):
+        design_kws = {"stitch", "figma", "design", "screen", "layer", "asset",
+                      "png", "svg", "export", "thumbnail", "permission"}
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in design_kws)
+        ]
+    if ctx.jira_info and ctx.jira_info.get("content"):
+        jira_kws = {"jira", "ticket", "acceptance criteria", "acceptancecriteria",
+                    "acceptance_criteria"}
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in jira_kws)
+        ]
+    if ctx.repo_info and ctx.repo_info.get("content"):
+        repo_kws = {"repo", "repository", "branch", "stack", "github",
+                    "bitbucket", "language", "manifest"}
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in repo_kws)
+        ]
+    ci_kws = {"ci ", "ci/", "ci config", "continuous", "workflow", "pipeline",
+              "github actions", "gitlab", "jenkins", "circleci", "travis",
+              "build system", "build tool", "build config", "target ci"}
+    unresolved_missing = [
+        item for item in unresolved_missing
+        if not any(kw in item.lower() for kw in ci_kws)
+    ]
+    pr_kws = {"canonical pr", "canonical branch", "authoritative pr", "which pr",
+              "which branch", "pr url", "branch name", "merge target"}
+    unresolved_missing = [
+        item for item in unresolved_missing
+        if not any(kw in item.lower() for kw in pr_kws)
+    ]
+    # For UI implementation tasks, the web agent can derive these defaults from
+    # the repo and ticket context without blocking plan creation.
+    if (
+        str(analysis.get("platform") or "").strip().lower() == "web"
+        and ctx.jira_info and ctx.jira_info.get("content")
+        and ctx.repo_info and ctx.repo_info.get("content")
+    ):
+        defaultable_web_kws = {
+            "dynamic data",
+            "api endpoint",
+            "api endpoints",
+            "mock data",
+            "route/path",
+            "integration point",
+            "where page should be mounted",
+            "responsive",
+            "breakpoint",
+            "browser support",
+            "styling approach",
+            "styling tooling",
+            "plain css",
+            "sass",
+            "scss",
+            "tailwind",
+            "css-in-js",
+            "component library",
+            "design system",
+        }
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in defaultable_web_kws)
+        ]
+    if (
+        str(analysis.get("platform") or "").strip().lower() == "web"
+        and ctx.jira_info and ctx.jira_info.get("content")
+        and ctx.repo_info and ctx.repo_info.get("content")
+        and ctx.design_info and ctx.design_info.get("content")
+    ):
+        defaultable_ui_ticket_kws = {
+            "acceptance criteria",
+            "pass/fail",
+            "responsive breakpoint",
+            "qa step",
+            "test/qa",
+            "reviewer",
+            "owner",
+            "assignee",
+            "assignment",
+        }
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in defaultable_ui_ticket_kws)
+        ]
+    return unresolved_missing
+
+
 def _execute_gather_action(
     action: dict,
     analysis: dict,
@@ -1402,7 +1600,7 @@ def _execute_gather_action(
             workspace,
             compass_task_id,
         )
-        content = "\n".join(artifact_text(artifact) for artifact in jira_task.get("artifacts", []))
+        content = _task_artifact_text(jira_task)
         ctx.jira_info = {"ticket_key": ticket_key, "content": content, "request": request_text}
         _save_workspace_file(
             workspace,
@@ -1424,7 +1622,7 @@ def _execute_gather_action(
             workspace,
             compass_task_id,
         )
-        content = "\n".join(artifact_text(artifact) for artifact in repo_task.get("artifacts", []))
+        content = _task_artifact_text(repo_task)
         repo_url = _extract_repo_url(content) or str(analysis.get("target_repo_url") or "").strip()
         if repo_url and not str(analysis.get("target_repo_url") or "").strip():
             analysis["target_repo_url"] = repo_url
@@ -1452,11 +1650,13 @@ def _execute_gather_action(
         if ctx.design_info and ctx.design_info.get("content"):
             fetched_by = str(ctx.design_info.get("fetchedBy") or "").strip()
             existing_page = str(ctx.design_info.get("page_name") or "").strip()
+            normalized_existing_page = _normalize_design_page_key(existing_page)
+            normalized_requested_page = _normalize_design_page_key(page_name)
             if capability == "stitch.project.get":
                 return False  # already have design context; project-level re-fetch not needed
             if capability in {"stitch.screen.fetch", "figma.page.fetch", "stitch.screen.image"}:
                 if fetched_by in {"stitch.screen.fetch", "figma.page.fetch", "stitch.screen.image"}:
-                    if not page_name or existing_page == page_name:
+                    if not normalized_requested_page or normalized_existing_page == normalized_requested_page:
                         return False  # already fetched this screen
         log_fn(f"{reason} ({capability})")
         design_task = _call_sync_agent(
@@ -1466,7 +1666,7 @@ def _execute_gather_action(
             workspace,
             compass_task_id,
         )
-        content = "\n".join(artifact_text(artifact) for artifact in design_task.get("artifacts", []))
+        content = _task_artifact_text(design_task)
         ctx.design_info = {
             "url": design_url,
             "type": "stitch" if capability.startswith("stitch.") else "figma",
@@ -1896,6 +2096,26 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     ctx,
                     _available_capability_snapshot(force=True),
                 )
+                fallback_fetch_actions = _select_new_fallback_fetch_actions(fetch_actions, fallback_plan)
+                if fallback_fetch_actions:
+                    ctx.pending_tasks = list(fallback_plan.get("pending_tasks") or [])
+                    _save_gather_plan(workspace, fallback_plan)
+                    log("No new boundary context fetched from current plan — retrying with fallback fetch actions")
+                    fallback_progress = False
+                    for action in fallback_fetch_actions:
+                        fallback_progress = _execute_gather_action(
+                            action,
+                            analysis,
+                            ctx,
+                            team_lead_task_id=team_lead_task_id,
+                            workspace=workspace,
+                            compass_task_id=compass_task_id,
+                            log_fn=log,
+                        ) or fallback_progress
+                    if fallback_progress:
+                        needs_reanalysis = True
+                        continue
+
                 fallback_actions = [
                     item for item in (fallback_plan.get("actions") or [])
                     if item.get("action") != _GATHER_ACTION_FETCH
@@ -1974,51 +2194,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             )
 
         # ── Phase 4: Plan ────────────────────────────────────────────────────
-        unresolved_missing = [
-            str(item).strip()
-            for item in (analysis.get("missing_info") or [])
-            if str(item).strip()
-        ]
-        # Filter out missing_info entries for context already gathered during the
-        # gather loop.  The LLM may still report e.g. "need Stitch layer tree" even
-        # though we successfully fetched the Stitch screen — treat any design/repo/
-        # jira item as resolved if we have the corresponding ctx payload.
-        if ctx.design_info and ctx.design_info.get("content"):
-            _design_kws = {"stitch", "figma", "design", "screen", "layer", "asset",
-                           "png", "svg", "export", "thumbnail", "permission"}
-            unresolved_missing = [
-                item for item in unresolved_missing
-                if not any(kw in item.lower() for kw in _design_kws)
-            ]
-        if ctx.jira_info and ctx.jira_info.get("content"):
-            _jira_kws = {"jira", "ticket", "acceptance criteria", "acceptancecriteria",
-                         "acceptance_criteria"}
-            unresolved_missing = [
-                item for item in unresolved_missing
-                if not any(kw in item.lower() for kw in _jira_kws)
-            ]
-        if ctx.repo_info and ctx.repo_info.get("content"):
-            _repo_kws = {"repo", "repository", "branch", "stack", "github",
-                         "bitbucket", "language", "manifest"}
-            unresolved_missing = [
-                item for item in unresolved_missing
-                if not any(kw in item.lower() for kw in _repo_kws)
-            ]
-        # Suppress CI/workflow questions — the web agent generates CI config itself
-        _ci_kws = {"ci ", "ci/", "ci config", "continuous", "workflow", "pipeline",
-                   "github actions", "gitlab", "jenkins", "circleci", "travis",
-                   "build system", "build tool", "build config", "target ci"}
-        unresolved_missing = [
-            item for item in unresolved_missing
-            if not any(kw in item.lower() for kw in _ci_kws)
-        ]
-        # Suppress canonical PR/branch questions — the web agent creates a new branch
-        _pr_kws = {"canonical pr", "canonical branch", "authoritative pr", "which pr",
-                   "which branch", "pr url", "branch name", "merge target"}
-        unresolved_missing = [
-            item for item in unresolved_missing
-            if not any(kw in item.lower() for kw in _pr_kws)
-        ]
+        unresolved_missing = _filter_unresolved_missing_info(analysis, ctx)
         if unresolved_missing and not _should_stop_before_dev_dispatch(ctx):
             raise RuntimeError(
                 "Cannot create implementation plan with unresolved missing information: "

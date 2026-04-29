@@ -52,6 +52,9 @@ COMPASS_URL = os.environ.get("COMPASS_URL", "http://compass:8080")
 ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", "15"))
 TASK_TIMEOUT = int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "600"))
 SYNC_AGENT_TIMEOUT = int(os.environ.get("SYNC_AGENT_TIMEOUT_SECONDS", "120"))
+PLAN_TIMEOUT_SECONDS = 300
+PLAN_REPAIR_TIMEOUT_SECONDS = 120
+PLAN_MAX_TOKENS = 8192
 
 _AGENT_CARD_PATH = os.path.join(os.path.dirname(__file__), "agent-card.json")
 
@@ -571,7 +574,13 @@ def _plan_implementation(
         design_context=design_context_text,
     )
     system = build_system_prompt(prompts.PLAN_SYSTEM, "web")
-    response = _run_agentic(prompt, f"[{AGENT_ID}] plan", system_prompt=system)
+    response = _run_agentic(
+        prompt,
+        f"[{AGENT_ID}] plan",
+        system_prompt=system,
+        timeout=PLAN_TIMEOUT_SECONDS,
+        max_tokens=PLAN_MAX_TOKENS,
+    )
     plan = _parse_json_from_llm(response)
     if plan.get("files"):
         return plan
@@ -589,6 +598,8 @@ def _plan_implementation(
         repair_prompt,
         f"[{AGENT_ID}] plan-repair",
         system_prompt=repair_system,
+        timeout=PLAN_REPAIR_TIMEOUT_SECONDS,
+        max_tokens=PLAN_MAX_TOKENS,
     )
     repaired_plan = _parse_json_from_llm(repaired_response)
     return repaired_plan or plan
@@ -626,7 +637,19 @@ def _generate_file_code(
 
 
 def _normalize_plan_path(path: str) -> str:
-    return (path or "").strip().replace("\\", "/").lstrip("./")
+    normalized = (path or "").strip().replace("\\", "/").lstrip("./")
+    if not normalized:
+        return normalized
+    dir_name, base_name = os.path.split(normalized)
+    dotfile_aliases = {
+        "gitignore": ".gitignore",
+        "nvmrc": ".nvmrc",
+        "dockerignore": ".dockerignore",
+    }
+    replacement = dotfile_aliases.get(base_name.lower())
+    if replacement:
+        normalized = os.path.join(dir_name, replacement) if dir_name else replacement
+    return normalized.replace("\\", "/")
 
 
 def _is_spa_router_file(path: str) -> bool:
@@ -710,9 +733,12 @@ def _sanitize_plan_files(files: list[dict], analysis: dict, review_issues: list[
     for file_info in normalized_files:
         path = file_info["path"]
         path_lower = path.lower()
+        base_name = os.path.basename(path_lower)
         reason = ""
 
-        if _is_operational_plan_artifact(file_info):
+        if base_name.startswith(".env") and ".example" not in base_name:
+            reason = "drop environment-specific file; keep only example env templates"
+        elif _is_operational_plan_artifact(file_info):
             reason = "workflow evidence belongs in workspace artifacts, not repo file plan"
         elif prefer_nextjs and _is_spa_router_file(path):
             reason = "drop SPA router shell for Next.js implementation"
@@ -1309,6 +1335,41 @@ def _install_plan_dependencies(deps: list[str], language: str, log_fn):
             log_fn(f"Warning: npm install failed: {err}")
 
 
+def _install_written_node_dependencies(build_dir: str, log_fn) -> None:
+    """Install npm dependencies after generated package manifests have been written."""
+    root_manifest = _load_package_json(os.path.join(build_dir, "package.json"))
+    if not root_manifest:
+        return
+
+    package_dirs: list[str] = [build_dir]
+    has_workspaces = isinstance(root_manifest.get("workspaces"), (list, dict))
+    if not has_workspaces:
+        for rel_dir in ("client", "server"):
+            if _load_package_json(os.path.join(build_dir, rel_dir, "package.json")):
+                package_dirs.append(os.path.join(build_dir, rel_dir))
+
+    seen_dirs: set[str] = set()
+    for package_dir in package_dirs:
+        if package_dir in seen_dirs:
+            continue
+        seen_dirs.add(package_dir)
+        rel_dir = os.path.relpath(package_dir, build_dir)
+        label = "." if rel_dir == "." else rel_dir
+        log_fn(f"Installing npm dependencies from generated manifests ({label})")
+        try:
+            subprocess.run(
+                ["npm", "install", "--no-fund", "--no-audit"],
+                cwd=package_dir,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=True,
+                env={**os.environ, "CI": "true"},
+            )
+        except Exception as err:
+            log_fn(f"Warning: npm install from generated manifests failed in {label}: {err}")
+
+
 def _write_files_to_directory(base_dir: str, files: list[dict]) -> list[str]:
     """Write generated code files into the specified directory."""
     if not base_dir:
@@ -1606,9 +1667,103 @@ def _detect_build_command(
     return None
 
 
+def _load_package_json(package_json_path: str) -> dict:
+    if not os.path.isfile(package_json_path):
+        return {}
+    try:
+        with open(package_json_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _package_uses_jest(manifest: dict) -> bool:
+    scripts = manifest.get("scripts") if isinstance(manifest.get("scripts"), dict) else {}
+    for section_name in ("dependencies", "devDependencies"):
+        section = manifest.get(section_name)
+        if isinstance(section, dict) and "jest" in section:
+            return True
+    script_text = "\n".join(str(value) for value in scripts.values()).lower()
+    return "jest" in script_text
+
+
+def _detect_node_build_steps(build_dir: str) -> list[dict]:
+    """Return npm test/build steps for root or client/server workspaces."""
+    steps: list[dict] = []
+
+    def _append_steps(manifest: dict, cwd: str, label: str, *, include_test: bool, include_build: bool) -> None:
+        scripts = manifest.get("scripts") if isinstance(manifest.get("scripts"), dict) else {}
+        if include_test and "test" in scripts:
+            command = ["npm", "test"]
+            if _package_uses_jest(manifest):
+                command.extend(["--", "--runInBand", "--coverage"])
+            steps.append({"cwd": cwd, "cmd": command, "label": f"{label}:test"})
+        if include_build and "build" in scripts:
+            steps.append({"cwd": cwd, "cmd": ["npm", "run", "build"], "label": f"{label}:build"})
+
+    root_manifest = _load_package_json(os.path.join(build_dir, "package.json"))
+    root_scripts = root_manifest.get("scripts") if isinstance(root_manifest.get("scripts"), dict) else {}
+    root_has_test = "test" in root_scripts
+    root_has_build = "build" in root_scripts
+    if root_manifest:
+        _append_steps(
+            root_manifest,
+            build_dir,
+            "root",
+            include_test=True,
+            include_build=True,
+        )
+
+    for rel_dir in ("client", "server"):
+        manifest = _load_package_json(os.path.join(build_dir, rel_dir, "package.json"))
+        if not manifest:
+            continue
+        _append_steps(
+            manifest,
+            os.path.join(build_dir, rel_dir),
+            rel_dir,
+            include_test=not root_has_test,
+            include_build=not root_has_build,
+        )
+
+    return steps
+
+
 def _run_build(build_dir: str, language: str, python_executable: str | None = None) -> tuple[bool, str]:
     """Run the build/test command in build_dir. Returns (success, output)."""
     python_cmd = python_executable or sys.executable
+    node_steps = _detect_node_build_steps(build_dir)
+    if node_steps:
+        import shutil
+
+        if not shutil.which("npm"):
+            return False, "npm not found for Node.js build/test workflow."
+
+        outputs: list[str] = []
+        env = {**os.environ, "CI": "true"}
+        try:
+            for step in node_steps:
+                result = subprocess.run(
+                    step["cmd"],
+                    cwd=step["cwd"],
+                    capture_output=True,
+                    text=True,
+                    timeout=240,
+                    env=env,
+                )
+                step_output = (result.stdout + "\n" + result.stderr).strip()
+                rel_cwd = os.path.relpath(step["cwd"], build_dir)
+                display_cwd = "." if rel_cwd == "." else rel_cwd
+                outputs.append(f"$ {' '.join(step['cmd'])} ({display_cwd})\n{step_output}".strip())
+                if result.returncode != 0:
+                    return False, "\n\n".join(outputs)
+            return True, "\n\n".join(outputs)
+        except subprocess.TimeoutExpired:
+            return False, "Node.js build/test timed out after 240 seconds."
+        except Exception as exc:
+            return False, f"Could not run Node.js build/test workflow: {exc}"
+
     cmd = _detect_build_command(build_dir, language, python_executable=python_cmd)
     if cmd is None:
         # No test harness — validate Python syntax of every .py file
@@ -1828,21 +1983,71 @@ def _generate_gitignore_content(analysis: dict) -> str:
 # UI evidence: design reference download + implementation screenshot
 # ---------------------------------------------------------------------------
 
-def _get_design_thumbnail_url(workspace: str) -> str:
-    """Extract the design thumbnail URL from ui-design/stitch-design.json in the workspace."""
+def _find_chromium_binary() -> str:
+    import shutil
+
+    return (
+        shutil.which("chromium")
+        or shutil.which("chromium-browser")
+        or shutil.which("google-chrome")
+        or shutil.which("google-chrome-stable")
+        or ""
+    )
+
+
+def _capture_browser_screenshot(url: str, out_path: str, log_fn) -> bool:
+    chromium_bin = _find_chromium_binary()
+    if not chromium_bin:
+        log_fn("chromium not found — skipping browser screenshot")
+        return False
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        result = subprocess.run(
+            [
+                chromium_bin,
+                "--headless",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--hide-scrollbars",
+                "--virtual-time-budget=5000",
+                f"--screenshot={out_path}",
+                "--window-size=1440,1024",
+                url,
+            ],
+            timeout=45,
+            capture_output=True,
+        )
+        if result.returncode == 0 and os.path.isfile(out_path):
+            return True
+        stderr_text = (result.stderr or b"").decode(errors="replace")[:200]
+        log_fn(f"Browser screenshot failed: {stderr_text or 'unknown error'}")
+        return False
+    except Exception as exc:
+        log_fn(f"Browser screenshot error: {exc}")
+        return False
+
+
+def _get_design_reference_details(workspace: str) -> dict:
+    """Return best-effort design reference inputs for screenshot capture."""
+    details = {"thumbnail_url": "", "design_url": ""}
     if not workspace:
-        return ""
+        return details
+
+    design_context = _read_workspace_json(workspace, "team-lead/design-context.json")
+    if design_context.get("url"):
+        details["design_url"] = str(design_context.get("url", ""))
+
     stitch_path = os.path.join(workspace, "ui-design", "stitch-design.json")
     if not os.path.isfile(stitch_path):
-        return ""
+        return details
     try:
         with open(stitch_path, encoding="utf-8") as fh:
             data = json.load(fh)
-        # Prefer screen-level imageUrls (present when a specific screen was fetched)
         image_urls = data.get("imageUrls") or []
         if image_urls and image_urls[0]:
-            return image_urls[0]
-        # Fallback: project-level thumbnailScreenshot from the JSON-encoded "text" field
+            details["thumbnail_url"] = image_urls[0]
+            return details
         for raw in [data.get("text", "")] + [
             item.get("text", "") for item in (data.get("content") or []) if isinstance(item, dict)
         ]:
@@ -1852,12 +2057,13 @@ def _get_design_thumbnail_url(workspace: str) -> str:
                 inner = json.loads(raw)
                 url = (inner.get("thumbnailScreenshot") or {}).get("downloadUrl", "")
                 if url:
-                    return url
+                    details["thumbnail_url"] = url
+                    return details
             except Exception:
                 pass
     except Exception:
         pass
-    return ""
+    return details
 
 
 def _download_url_to_file(url: str, dest_path: str) -> bool:
@@ -1875,26 +2081,142 @@ def _download_url_to_file(url: str, dest_path: str) -> bool:
         return False
 
 
+def _detect_ui_launch_plan(build_dir: str, analysis: dict, port: int) -> dict | None:
+    """Return a best-effort local launch plan for taking UI screenshots."""
+    frontend = str((analysis or {}).get("frontend_framework", "") or "").strip().lower()
+    client_pkg_path = os.path.join(build_dir, "client", "package.json")
+    root_pkg_path = os.path.join(build_dir, "package.json")
+    candidate_specs = [
+        ("client", _load_package_json(client_pkg_path), os.path.join(build_dir, "client")),
+        ("root", _load_package_json(root_pkg_path), build_dir),
+    ]
+
+    def _candidate_urls(*ports: int) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        for item_port in ports:
+            for suffix in ("/", "/cstl-4"):
+                url = f"http://127.0.0.1:{item_port}{suffix}"
+                if url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+        return urls
+
+    for label, manifest, cwd in candidate_specs:
+        scripts = manifest.get("scripts") if isinstance(manifest.get("scripts"), dict) else {}
+        if not scripts:
+            continue
+        if "preview" in scripts:
+            return {
+                "label": f"{label}:preview",
+                "cwd": cwd,
+                "cmd": ["npm", "run", "preview", "--", "--host", "127.0.0.1", "--port", str(port)],
+                "urls": _candidate_urls(port),
+            }
+        if "dev" in scripts:
+            return {
+                "label": f"{label}:dev",
+                "cwd": cwd,
+                "cmd": ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", str(port)],
+                "urls": _candidate_urls(port, 5173, 3000, 4173),
+            }
+        if "start" in scripts:
+            return {
+                "label": f"{label}:start",
+                "cwd": cwd,
+                "cmd": ["npm", "start"],
+                "urls": _candidate_urls(port, 5173, 3000, 4173),
+            }
+
+    if frontend in {"react", "vue", "nextjs"} and (
+        os.path.isfile(client_pkg_path) or os.path.isfile(root_pkg_path)
+    ):
+        return {
+            "label": "fallback:node-ui",
+            "cwd": build_dir,
+            "cmd": ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", str(port)],
+            "urls": _candidate_urls(port, 5173, 3000, 4173),
+        }
+    return None
+
+
+def _register_generated_artifact(
+    clone_path: str,
+    generated_files: list[dict],
+    source_path: str,
+    repo_rel_path: str,
+    log_fn,
+) -> bool:
+    """Copy a generated artifact into the repo and register it for commit/PR evidence."""
+    import shutil
+
+    if not clone_path or not source_path or not os.path.isfile(source_path):
+        return False
+
+    normalized_rel_path = _normalize_plan_path(repo_rel_path)
+    if not normalized_rel_path:
+        return False
+
+    dest_path = os.path.join(clone_path, normalized_rel_path)
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    if os.path.abspath(source_path) != os.path.abspath(dest_path):
+        shutil.copy2(source_path, dest_path)
+    if not any(_normalize_plan_path(item.get("path", "")) == normalized_rel_path for item in generated_files):
+        generated_files.append({"path": normalized_rel_path, "content": "", "action": "create"})
+    log_fn(f"Registered artifact in repo: {normalized_rel_path}")
+    return True
+
+
+def _register_runtime_repo_artifacts(
+    clone_path: str,
+    generated_files: list[dict],
+    rel_dirs: list[str],
+    log_fn,
+) -> int:
+    """Register runtime-generated files that already exist inside the cloned repo."""
+    if not clone_path:
+        return 0
+
+    registered = 0
+    for rel_dir in rel_dirs:
+        normalized_rel_dir = _normalize_plan_path(rel_dir)
+        if not normalized_rel_dir:
+            continue
+        artifact_dir = os.path.join(clone_path, normalized_rel_dir)
+        if not os.path.isdir(artifact_dir):
+            continue
+
+        for root, _, files in os.walk(artifact_dir):
+            for file_name in files:
+                source_path = os.path.join(root, file_name)
+                repo_rel_path = os.path.relpath(source_path, clone_path)
+                if _register_generated_artifact(
+                    clone_path,
+                    generated_files,
+                    source_path,
+                    repo_rel_path,
+                    log_fn,
+                ):
+                    registered += 1
+    return registered
+
+
 def _take_ui_screenshot(
     build_dir: str,
     python_executable: str,
     out_path: str,
     log_fn,
+    analysis: dict | None = None,
 ) -> bool:
     """
-    Start the Flask app on a free port and take a headless chromium screenshot.
+    Start the local UI app on a free port and take a headless chromium screenshot.
     Returns True if a screenshot was successfully saved to out_path.
     """
     import shutil
     import socket
     import time
 
-    chromium_bin = (
-        shutil.which("chromium")
-        or shutil.which("chromium-browser")
-        or shutil.which("google-chrome")
-        or shutil.which("google-chrome-stable")
-    )
+    chromium_bin = _find_chromium_binary()
     if not chromium_bin:
         log_fn("chromium not found — skipping UI screenshot")
         return False
@@ -1903,6 +2225,76 @@ def _take_ui_screenshot(
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
+
+    launch_plan = _detect_ui_launch_plan(build_dir, analysis or {}, port)
+    if launch_plan:
+        env = {
+            **os.environ,
+            "CI": "true",
+            "HOST": "127.0.0.1",
+            "PORT": str(port),
+            "BROWSER": "none",
+        }
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                launch_plan["cmd"],
+                cwd=launch_plan["cwd"],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            started_url = ""
+            for _ in range(40):
+                time.sleep(0.5)
+                if proc.poll() is not None:
+                    break
+                for url in launch_plan.get("urls", []):
+                    try:
+                        urlopen(url, timeout=2).read()
+                        started_url = url
+                        break
+                    except Exception:
+                        continue
+                if started_url:
+                    break
+
+            if not started_url:
+                log_fn(
+                    f"UI app did not start for screenshot plan {launch_plan.get('label')} — skipping screenshot"
+                )
+                return False
+
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            result = subprocess.run(
+                [
+                    chromium_bin,
+                    "--headless", "--no-sandbox", "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    f"--screenshot={out_path}",
+                    "--window-size=1280,900",
+                    started_url,
+                ],
+                timeout=30,
+                capture_output=True,
+            )
+            if result.returncode == 0 and os.path.isfile(out_path):
+                log_fn(f"Implementation screenshot saved ({os.path.getsize(out_path) // 1024} KB)")
+                return True
+            stderr_text = (result.stderr or b"").decode(errors="replace")[:200]
+            log_fn(f"Screenshot failed: {stderr_text or 'unknown error'}")
+            return False
+        except Exception as exc:
+            log_fn(f"Screenshot error: {exc}")
+            return False
+        finally:
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
 
     # Auto-detect Flask app module for FLASK_APP env var
     flask_app_module = "app"
@@ -2373,8 +2765,11 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             written_clone_paths = _write_files_to_directory(clone_path, generated_files)
             log(f"Wrote {len(written_clone_paths)} file(s) into cloned repository")
 
-        # ── Phase 5b: Build and test with LLM-guided recovery ───────────────
         build_dir = clone_path or agent_workspace
+        if build_dir and os.path.isdir(build_dir):
+            _install_written_node_dependencies(build_dir, log)
+
+        # ── Phase 5b: Build and test with LLM-guided recovery ───────────────
         build_ok = True  # default: assume passing if no build dir
         build_output = ""  # populated below if build/tests are actually run
         if build_dir and os.path.isdir(build_dir):
@@ -2428,13 +2823,18 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             evidence_dir = os.path.join(workspace, AGENT_ID)
             os.makedirs(evidence_dir, exist_ok=True)
             log("Capturing UI evidence (design reference + implementation screenshot)")
+            design_ref_path = os.path.join(evidence_dir, "design-reference.png")
+            impl_screenshot_path = os.path.join(evidence_dir, "implementation-screenshot.png")
 
             # 1. Design reference — download Stitch thumbnail if available
-            thumbnail_url = _get_design_thumbnail_url(workspace)
+            design_reference = _get_design_reference_details(workspace)
+            thumbnail_url = design_reference.get("thumbnail_url", "")
+            design_url = design_reference.get("design_url", "")
+            design_saved = False
             if thumbnail_url:
-                design_ref_path = os.path.join(evidence_dir, "design-reference.png")
                 if _download_url_to_file(thumbnail_url, design_ref_path):
                     log("Design reference screenshot downloaded")
+                    design_saved = True
                     _save_workspace_file(
                         workspace,
                         f"{AGENT_ID}/design-reference-url.txt",
@@ -2448,13 +2848,21 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                         thumbnail_url,
                     )
 
+            if not design_saved and design_url:
+                if _capture_browser_screenshot(design_url, design_ref_path, log):
+                    log("Design reference screenshot captured from design URL")
+                _save_workspace_file(
+                    workspace,
+                    f"{AGENT_ID}/design-reference-url.txt",
+                    design_url,
+                )
+
             # 2. Implementation screenshot — headless chromium (best-effort)
-            if build_dir and build_ok:
+            if build_dir:
                 py_exec = _ensure_local_python_env(
                     build_dir, analysis.get("language", "python"), log
                 )
-                impl_screenshot_path = os.path.join(evidence_dir, "implementation-screenshot.png")
-                if _take_ui_screenshot(build_dir, py_exec, impl_screenshot_path, log):
+                if _take_ui_screenshot(build_dir, py_exec, impl_screenshot_path, log, analysis=analysis):
                     # Replace any LLM-generated placeholder with the real binary PNG
                     import shutil as _shutil
                     for _rel in ("work/screenshots/index.png", ".work/screenshots/index.png"):
@@ -2463,6 +2871,30 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                             os.makedirs(os.path.dirname(_placeholder), exist_ok=True)
                             _shutil.copy2(impl_screenshot_path, _placeholder)
                             log(f"Replaced placeholder screenshot at {_rel}")
+
+            if clone_path:
+                if os.path.isfile(design_ref_path):
+                    _register_generated_artifact(
+                        clone_path,
+                        generated_files,
+                        design_ref_path,
+                        "docs/evidence/design-reference.png",
+                        log,
+                    )
+                if os.path.isfile(impl_screenshot_path):
+                    _register_generated_artifact(
+                        clone_path,
+                        generated_files,
+                        impl_screenshot_path,
+                        "docs/evidence/implementation-screenshot-desktop.png",
+                        log,
+                    )
+                _register_runtime_repo_artifacts(
+                    clone_path,
+                    generated_files,
+                    ["artifacts/figma"],
+                    log,
+                )
 
         if clone_path and branch_name:
             if not branch_kind:

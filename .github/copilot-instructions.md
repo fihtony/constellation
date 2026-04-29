@@ -596,7 +596,7 @@ CMD ["python3", "my-agent/app.py"]
 
 **Non-root user requirement:**
 Every agent container MUST run as a non-root user (`appuser`, UID 1000). The `USER appuser` instruction must come after all `RUN`/`COPY` steps so that `/app` ownership is set correctly.
-The Compass container needs `group_add: [docker]` in `docker-compose.yml` to allow the non-root user to access the Docker socket.
+The Compass container must add the mounted Docker socket's numeric group id via `group_add` in `docker-compose.yml` so the non-root user can access the socket on both Docker Desktop and Rancher Desktop. Keep `0` for Docker Desktop compatibility and use `DOCKER_SOCKET_GID` to override the Rancher/Desktop-in-container gid when needed. On macOS, derive that value from a short helper container, for example: `export DOCKER_SOCKET_GID=$(docker run --rm -v "${DOCKER_SOCKET:-$HOME/.rd/docker.sock}:/var/run/docker.sock" python:3.12-slim python -c "import os; print(os.stat('/var/run/docker.sock').st_gid)")`.
 
 ### 16. docker-compose.yml Entry
 
