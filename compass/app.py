@@ -59,6 +59,11 @@ _artifact_root_instance = os.path.join(_artifact_root_base, f"compass-{COMPASS_I
 artifact_store = ArtifactStore(root=_artifact_root_instance)
 launcher = get_launcher()
 policy = PolicyEvaluator()
+COMPASS_API_KEY = os.environ.get("COMPASS_API_KEY", "").strip()
+
+# Notification target registry (Teams Gateway or other webhook subscribers)
+_notification_targets_lock = threading.Lock()
+_notification_targets: list[dict] = []  # [{"url": "http://...", "registeredAt": ...}]
 
 TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
 FIGMA_URL_RE = re.compile(r"https?://[^\s\"'\}]*figma\.com/[^\s\"'\}]+", re.IGNORECASE)
@@ -92,6 +97,53 @@ NON_TERMINAL_TASK_STATES = {
 CALLBACK_LOCK = threading.Lock()
 CALLBACK_EVENTS = {}
 CALLBACK_RESULTS = {}
+
+# States that trigger notification webhooks
+_NOTIFY_STATES = {"TASK_STATE_INPUT_REQUIRED", "TASK_STATE_COMPLETED", "TASK_STATE_FAILED"}
+
+
+def _fire_notification(task):
+    """POST task state change to all registered notification targets (best-effort)."""
+    state = task.state
+    if state not in _NOTIFY_STATES:
+        return
+    with _notification_targets_lock:
+        targets = list(_notification_targets)
+    if not targets:
+        return
+    payload = json.dumps({
+        "taskId": task.task_id,
+        "state": state,
+        "statusMessage": task.status_message,
+        "ownerUserId": task.owner_user_id,
+        "tenantId": task.tenant_id,
+        "sourceChannel": task.source_channel,
+        "artifacts": task.artifacts[-5:] if task.artifacts else [],
+        "summary": task.summary,
+    }, ensure_ascii=False).encode("utf-8")
+    for target in targets:
+        url = target.get("url", "")
+        if not url:
+            continue
+        try:
+            req = Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+            with urlopen(req, timeout=5):
+                pass
+        except Exception as err:
+            print(f"[compass] Notification to {url} failed: {err}")
+
+
+def _update_state_and_notify(task_id, state, status_message=""):
+    """Update task state and fire notification webhooks for key states."""
+    task = task_store.update_state(task_id, state, status_message)
+    if task:
+        threading.Thread(target=_fire_notification, args=(task,), daemon=True).start()
+    return task
 
 
 def audit_log(event, **kwargs):
@@ -242,7 +294,7 @@ def _build_write_permission_question(paths):
 
 def _route_input_required(task, question, router_context):
     task.router_context = dict(router_context or {})
-    task_store.update_state(task.task_id, "TASK_STATE_INPUT_REQUIRED", question)
+    _update_state_and_notify(task.task_id, "TASK_STATE_INPUT_REQUIRED", question)
     task_store.add_progress_step(task.task_id, question, agent_id="compass-agent")
     return task.to_dict()
 
@@ -1125,7 +1177,7 @@ def _wait_for_downstream_completion(task, agent_id, capability, service_url, dow
                         # then re-register the waiter and keep waiting for the final result.
                         task.downstream_task_id = downstream_task_id
                         task.downstream_service_url = service_url
-                        task_store.update_state(
+                        _update_state_and_notify(
                             task.task_id,
                             "TASK_STATE_INPUT_REQUIRED",
                             callback_result.get("status_message", "Additional information required."),
@@ -1164,7 +1216,7 @@ def _wait_for_downstream_completion(task, agent_id, capability, service_url, dow
                         if task.state != "TASK_STATE_INPUT_REQUIRED":
                             task.downstream_task_id = downstream_task_id
                             task.downstream_service_url = service_url
-                            task_store.update_state(
+                            _update_state_and_notify(
                                 task.task_id,
                                 "TASK_STATE_INPUT_REQUIRED",
                                 polled_result.get("status_message", "Additional information required."),
@@ -1395,6 +1447,7 @@ def _dispatch_step(task, original_message, capability, step_index, total_steps, 
                 )
                 # Max revisions reached — ACK Team Lead so it can shut down
                 _send_agent_ack(service_url, downstream_task_id)
+                _fire_notification(task)
                 return {"terminal": True}
 
             revision_cycle += 1
@@ -1429,7 +1482,7 @@ def _dispatch_step(task, original_message, capability, step_index, total_steps, 
                 revision_cycle,
             )
     except Exception as error:
-        task_store.update_state(task.task_id, "FAILED", f"Dispatch failed: {error}")
+        _update_state_and_notify(task.task_id, "FAILED", f"Dispatch failed: {error}")
         audit_log("TASK_FAILED", task_id=task.task_id, capability=capability, error=str(error))
         return {"terminal": True}
     finally:
@@ -1467,12 +1520,12 @@ def _run_workflow(task_id, message, workflow):
         final_state = result["state"]
         final_message = str(result.get("status_message") or f"Workflow finished via {result['agent_id']}.")
         if step_index < len(workflow):
-            task_store.update_state(task.task_id, final_state, final_message)
+            _update_state_and_notify(task.task_id, final_state, final_message)
             return task.to_dict()
 
     final_artifacts = upstream_artifacts[-8:] if upstream_artifacts else []
     final_message = _summarize_for_user(task, final_state, final_message, final_artifacts, workflow)
-    task_store.update_state(task.task_id, final_state, final_message)
+    _update_state_and_notify(task.task_id, final_state, final_message)
     audit_log("TASK_COMPLETED", task_id=task.task_id, final_state=final_state)
     return task.to_dict()
 
@@ -1489,6 +1542,14 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
     design_url, design_type = _extract_design_reference(user_text)
     task.design_url = design_url
     task.design_type = design_type
+
+    # Extract owner / channel metadata from message.metadata (Teams Gateway sets these)
+    msg_meta = message.get("metadata") or {}
+    task.owner_user_id = (msg_meta.get("ownerUserId") or "").strip()
+    task.owner_display_name = (msg_meta.get("ownerDisplayName") or "").strip()
+    task.tenant_id = (msg_meta.get("tenantId") or "").strip()
+    task.source_channel = (msg_meta.get("sourceChannel") or "").strip()
+
     route_decision = None
     if forced_workflow:
         workflow = list(forced_workflow)
@@ -1651,6 +1712,19 @@ class CompassHandler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
+    def _check_api_key(self):
+        """Return True if API key is valid or not configured. Send 401 and return False otherwise."""
+        if not COMPASS_API_KEY:
+            return True
+        auth = (self.headers.get("Authorization") or "").strip()
+        if auth == f"Bearer {COMPASS_API_KEY}":
+            return True
+        # Allow local Web UI requests without auth (no Authorization header at all)
+        if not auth:
+            return True
+        self._send_json(401, {"error": "invalid_api_key"})
+        return False
+
     def do_GET(self):
         path = urlparse(self.path).path
 
@@ -1681,6 +1755,12 @@ class CompassHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 since = 0
             self._send_json(200, _read_agent_logs(since=since))
+            return
+
+        if path == "/api/notification-targets":
+            with _notification_targets_lock:
+                targets = list(_notification_targets)
+            self._send_json(200, {"targets": targets})
             return
 
         if path == "/api/tasks":
@@ -1720,6 +1800,23 @@ class CompassHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         qs = parse_qs(urlparse(self.path).query)
+
+        # POST /api/notification-targets — register a webhook URL for task state notifications
+        if path == "/api/notification-targets":
+            if not self._check_api_key():
+                return
+            body = self._read_body()
+            url = (body.get("url") or "").strip()
+            if not url:
+                self._send_json(400, {"error": "missing_url"})
+                return
+            with _notification_targets_lock:
+                existing = [t for t in _notification_targets if t["url"] == url]
+                if not existing:
+                    _notification_targets.append({"url": url, "registeredAt": local_iso_timestamp()})
+                    print(f"[compass] Registered notification target: {url}")
+            self._send_json(200, {"ok": True})
+            return
 
         # POST /tasks/{task_id}/progress — agents report major workflow steps
         m = re.fullmatch(r"/tasks/([^/]+)/progress", path)
@@ -1801,6 +1898,26 @@ class CompassHandler(BaseHTTPRequestHandler):
         print(f"[compass] Received message: {json.dumps(message, ensure_ascii=False)[:200]}")
         task_dict = route_and_dispatch(message, requested_capability=requested_capability)
         self._send_json(200, {"task": task_dict})
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        if path == "/api/notification-targets":
+            if not self._check_api_key():
+                return
+            body = self._read_body()
+            url = (body.get("url") or "").strip()
+            if not url:
+                self._send_json(400, {"error": "missing_url"})
+                return
+            with _notification_targets_lock:
+                before = len(_notification_targets)
+                _notification_targets[:] = [t for t in _notification_targets if t["url"] != url]
+                removed = before - len(_notification_targets)
+            if removed:
+                print(f"[compass] Unregistered notification target: {url}")
+            self._send_json(200, {"ok": True, "removed": removed})
+            return
+        self._send_json(404, {"error": "not_found"})
 
     def log_message(self, fmt, *args):
         # Suppress noisy health-check, agent-card polls, and debug log polling

@@ -17,7 +17,13 @@ docs/
 reference/
 certs/
 android/
-tests/data*/
+tests/data*
+
+# SQLite database files (persisted in data/ directory, not committed)
+data/
+*.db
+*.db-wal
+*.db-shm
 
 # Reports are committed for audit (do not ignore reports/)
 
