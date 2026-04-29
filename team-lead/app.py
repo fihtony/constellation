@@ -131,6 +131,7 @@ _DEVELOPMENT_SKILL_NAMES = [
     "constellation-database-delivery",
     "constellation-code-review-delivery",
     "constellation-testing-delivery",
+    "constellation-ui-evidence-delivery",
 ]
 
 _GATHER_ACTION_FETCH = "fetch_agent_context"

@@ -284,8 +284,8 @@ Design reference:
 Test evidence:
 {test_evidence}
 
-Implementation screenshot URL (GitHub raw URL for the committed screenshot, may be empty):
-{implementation_screenshot_url}
+Screenshots (pre-formatted Markdown — copy verbatim into the ## Screenshots section):
+{screenshots_block}
 
 Write the PR title on the first line, then a blank line, then the PR body.
 Format:
@@ -301,11 +301,7 @@ Format:
      ![Design Reference](<thumbnail_url>)
      If no thumbnail_url is available, just show the design URL as a clickable link.)
   ## Screenshots
-    (Embed the implementation screenshot directly in the PR body using the provided URL:
-     If `implementation_screenshot_url` is non-empty, embed it as:
-     ![Implementation Screenshot](<implementation_screenshot_url>)
-     If `implementation_screenshot_url` is empty, note that the screenshot is saved as
-     `docs/evidence/implementation-screenshot-desktop.png` in the PR's changed files.)
+    Copy the pre-formatted screenshots block VERBATIM here, do not reformat or summarise it.
   ## Testing
     (Describe what tests were written and/or the test results.
      If test output was provided, include a short summary of pass/fail counts.
