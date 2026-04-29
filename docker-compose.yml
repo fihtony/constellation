@@ -275,6 +275,41 @@ services:
   #     retries: 20
   #     start_period: 2s
 
+  teams-gateway:
+    image: constellation-teams-gateway:latest
+    build:
+      context: .
+      dockerfile: teams-gateway/Dockerfile
+    command: ["python3", "teams-gateway/app.py"]
+    depends_on:
+      compass:
+        condition: service_healthy
+    env_file:
+      - ./teams-gateway/.env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8070"
+      AGENT_ID: "teams-gateway"
+      ADVERTISED_BASE_URL: "http://teams-gateway:8070"
+      COMPASS_URL: "http://compass:8080"
+      REGISTRY_URL: "http://registry:9000"
+      TEAMS_GATEWAY_DB_PATH: "/app/data/teams-gateway/teams-gateway.db"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      - ./data:/app/data
+    labels:
+      constellation.agent_id: "teams-gateway"
+      constellation.agent_name: "Teams Gateway"
+      constellation.agent_role: "integration"
+    ports:
+      - "8070:8070"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8070/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
 networks:
   default:
     name: constellation-network

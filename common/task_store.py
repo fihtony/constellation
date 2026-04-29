@@ -40,6 +40,11 @@ class Task:
         "design_url",
         "design_type",
         "router_context",
+        # Owner / multi-channel fields (Teams integration)
+        "owner_user_id",
+        "owner_display_name",
+        "tenant_id",
+        "source_channel",
     )
 
     def __init__(self, context_id=None):
@@ -64,6 +69,10 @@ class Task:
         self.design_url = ""
         self.design_type = ""
         self.router_context = {}
+        self.owner_user_id = ""
+        self.owner_display_name = ""
+        self.tenant_id = ""
+        self.source_channel = ""
 
     def to_dict(self):
         return {
@@ -87,6 +96,10 @@ class Task:
             "designUrl": self.design_url,
             "designType": self.design_type,
             "routerContext": self.router_context,
+            "ownerUserId": self.owner_user_id,
+            "ownerDisplayName": self.owner_display_name,
+            "tenantId": self.tenant_id,
+            "sourceChannel": self.source_channel,
         }
 
 
