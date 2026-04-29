@@ -352,7 +352,11 @@ class RuntimeAdapterTests(unittest.TestCase):
         )
 
         self.assertNotEqual(env["HOME"], "/Users/personal")
-        self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+        # GIT_CONFIG_GLOBAL points to an isolated gitconfig file (not /dev/null)
+        # so that safe.directory=* can be set for Docker bind-mounted workspaces.
+        git_cfg = env["GIT_CONFIG_GLOBAL"]
+        self.assertTrue(git_cfg.endswith(".gitconfig-isolated"), git_cfg)
+        self.assertTrue(os.path.isfile(git_cfg), f"gitconfig not created: {git_cfg}")
         self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(env["GCM_INTERACTIVE"], "never")
