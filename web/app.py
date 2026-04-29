@@ -694,7 +694,9 @@ def _is_operational_plan_artifact(file_info: dict) -> bool:
         return True
     if path_lower.startswith("artifacts/"):
         return True
-    # Reject .work/ evidence files (CI evidence, Jira API responses, test output logs)
+    # Reject work/ and .work/ evidence directories (screenshots, test logs, CI evidence, Jira API responses)
+    if path_lower.startswith("work/") or "/work/" in path_lower:
+        return True
     if path_lower.startswith(".work/") or "/.work/" in path_lower:
         return True
     # Reject scripts/ helper folders (branch/PR scripts, Jira update scripts, etc.)
@@ -803,6 +805,8 @@ def _generate_pr_description(
     implementation_summary: str,
     design_context_meta: dict | None = None,
     test_output: str = "",
+    repo_url: str = "",
+    branch_name: str = "",
 ) -> tuple[str, str]:
     """Return (pr_title, pr_body)."""
     criteria_text = "\n".join(f"- {c}" for c in (acceptance_criteria or [])) or "Not specified."
@@ -819,6 +823,14 @@ def _generate_pr_description(
             design_parts.append(f"thumbnail_url: {design_context_meta['thumbnailUrl']}")
     design_reference = "\n".join(design_parts) if design_parts else "No design reference provided."
 
+    # Build implementation screenshot URL (GitHub raw URL so it can be embedded in the PR body)
+    impl_screenshot_url = ""
+    _screenshot_path = "docs/evidence/implementation-screenshot-desktop.png"
+    if repo_url and branch_name and _screenshot_path in files_changed:
+        # Convert https://github.com/{owner}/{repo} → https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}
+        _raw_base = repo_url.rstrip("/").replace("https://github.com/", "https://raw.githubusercontent.com/")
+        impl_screenshot_url = f"{_raw_base}/{branch_name}/{_screenshot_path}"
+
     # Build test evidence block
     if test_output:
         test_evidence = test_output[:800]
@@ -832,6 +844,7 @@ def _generate_pr_description(
         implementation_summary=implementation_summary,
         design_reference=design_reference,
         test_evidence=test_evidence,
+        implementation_screenshot_url=impl_screenshot_url,
     )
     response = _run_agentic(
         prompt,
@@ -2061,23 +2074,14 @@ def _get_design_reference_details(workspace: str) -> dict:
     try:
         with open(stitch_path, encoding="utf-8") as fh:
             data = json.load(fh)
-        image_urls = data.get("imageUrls") or []
-        if image_urls and image_urls[0]:
-            details["thumbnail_url"] = image_urls[0]
-            return details
-        for raw in [data.get("text", "")] + [
-            item.get("text", "") for item in (data.get("content") or []) if isinstance(item, dict)
-        ]:
-            if not raw:
-                continue
-            try:
-                inner = json.loads(raw)
-                url = (inner.get("thumbnailScreenshot") or {}).get("downloadUrl", "")
-                if url:
-                    details["thumbnail_url"] = url
-                    return details
-            except Exception:
-                pass
+        # Only use imageUrls when this JSON came from a get_screen call (has screenId).
+        # Project-level stitch data does NOT have screenId; its thumbnailScreenshot is the
+        # project thumbnail (which may show a different screen — e.g. Practice Quiz instead
+        # of Landing Page). Never use project-level thumbnails as design reference images.
+        if data.get("screenId"):
+            image_urls = data.get("imageUrls") or []
+            if image_urls and image_urls[0]:
+                details["thumbnail_url"] = image_urls[0]
     except Exception:
         pass
     return details
@@ -2980,6 +2984,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                         plan.get("plan_summary") or "Web agent implementation",
                         design_context_meta=design_context_meta,
                         test_output=build_output if build_dir else "",
+                        repo_url=repo_url or "",
+                        branch_name=branch_name or "",
                     )
                     _save_pr_evidence(
                         workspace,

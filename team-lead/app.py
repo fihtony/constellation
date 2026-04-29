@@ -455,26 +455,20 @@ def _build_dev_task_metadata(
         ),
     }
     if design_context and (design_context.get("content") or design_context.get("url")):
-        # Try to read the Stitch thumbnail URL saved to the workspace
+        # Only use the Stitch thumbnail URL when the stitch-design.json came from a
+        # get_screen call (identified by the presence of a "screenId" key at the top level).
+        # Project-level stitch data only has a project thumbnail which may show a different
+        # screen than the one being implemented — never pass that as the design reference.
         _thumbnail_url = ""
         _stitch_path = os.path.join(workspace, "ui-design", "stitch-design.json") if workspace else ""
         if _stitch_path and os.path.isfile(_stitch_path):
             try:
                 with open(_stitch_path, encoding="utf-8") as _f:
                     _stitch_data = json.load(_f)
-                for _raw in [_stitch_data.get("text", "")] + [
-                    _item.get("text", "") for _item in (_stitch_data.get("content") or [])
-                    if isinstance(_item, dict)
-                ]:
-                    if _raw:
-                        try:
-                            _inner = json.loads(_raw)
-                            _url = (_inner.get("thumbnailScreenshot") or {}).get("downloadUrl", "")
-                            if _url:
-                                _thumbnail_url = _url
-                                break
-                        except Exception:
-                            pass
+                if _stitch_data.get("screenId"):
+                    _image_urls = _stitch_data.get("imageUrls") or []
+                    if _image_urls and _image_urls[0]:
+                        _thumbnail_url = _image_urls[0]
             except Exception:
                 pass
         metadata["designContext"] = {

@@ -86,7 +86,8 @@ Critical planning rules:
 - The `files` list must contain only repository source/config/test files that should be
   created or modified in git. Do NOT include workflow artifacts such as PR drafts,
   Jira evidence notes, CI logs, or step-by-step scratch files.
-- NEVER include `.work/` files (evidence logs, curl outputs, Jira API responses).
+- NEVER include `work/` or `.work/` directories or any files inside them (e.g. screenshots,
+  test result logs, curl outputs, Jira API responses). These are transient work artifacts.
 - NEVER include `scripts/` helper files whose sole purpose is running Jira updates,
   branch creation commands, or PR instructions — these are operational scaffolding,
   not source code deliverables.
@@ -158,7 +159,7 @@ Repair rules:
   repository source/config/test files needed to satisfy the task and acceptance criteria.
 - The `files` list must contain only repository files that belong in git.
 - Do NOT include workflow artifacts such as PR drafts, Jira evidence, CI logs, or scratch notes.
-- Do NOT include `.work/` evidence files or `scripts/` operational helpers.
+- Do NOT include `work/` or `.work/` evidence files or `scripts/` operational helpers.
 """
 
 PLAN_REPAIR_TEMPLATE = """\
@@ -256,6 +257,10 @@ Output the complete file content only. No markdown, no explanation.
 PR_DESCRIPTION_SYSTEM = """\
 You are a software engineer writing a pull request description.
 Write clear, professional PR descriptions that explain what changed and why.
+For the ## Checklist section, you MUST use GitHub Markdown task list syntax:
+  - Use `- [x]` for items you have verified are done (tests pass, files are committed, etc.)
+  - Use `- [ ]` for items that require manual review by a human (visual UI verification, etc.)
+Do NOT use plain bullets for checklist items. Only `- [x]` and `- [ ]` are valid formats.
 """
 
 PR_DESCRIPTION_TEMPLATE = """\
@@ -279,6 +284,9 @@ Design reference:
 Test evidence:
 {test_evidence}
 
+Implementation screenshot URL (GitHub raw URL for the committed screenshot, may be empty):
+{implementation_screenshot_url}
+
 Write the PR title on the first line, then a blank line, then the PR body.
 Format:
 [title]
@@ -288,22 +296,28 @@ Format:
   ## Changes
   ## Design Reference
     (If a design URL or Stitch/Figma screen was provided, include it here.
-     List the design URL and the key design requirements that were implemented.
+     List the design URL, screen name/ID, and the key design requirements that were implemented.
      If a thumbnail_url is provided in the design reference, embed it as a Markdown image:
      ![Design Reference](<thumbnail_url>)
-     Note: "Attach the implementation screenshot from the workspace artifacts for visual comparison.")
+     If no thumbnail_url is available, just show the design URL as a clickable link.)
   ## Screenshots
-    (If an implementation screenshot was captured, note it is saved as
-     `web-agent/implementation-screenshot.png` in the workspace artifacts.
-     Reviewers should compare it against the design reference above.)
+    (Embed the implementation screenshot directly in the PR body using the provided URL:
+     If `implementation_screenshot_url` is non-empty, embed it as:
+     ![Implementation Screenshot](<implementation_screenshot_url>)
+     If `implementation_screenshot_url` is empty, note that the screenshot is saved as
+     `docs/evidence/implementation-screenshot-desktop.png` in the PR's changed files.)
   ## Testing
     (Describe what tests were written and/or the test results.
      If test output was provided, include a short summary of pass/fail counts.
      If this is a UI implementation, note how to run the app locally for visual verification.)
   ## Checklist
+    Use GitHub Markdown task list syntax ONLY (`- [x]` for done, `- [ ]` for manual review).
+    Mark `[x]` for any item you have already verified (e.g. tests pass, CI added, no work/ files committed).
+    Mark `[ ]` only for items requiring human visual review (e.g. UI fidelity vs design).
+    Suggested items (adapt based on what you know):
     - [ ] UI matches the Stitch/Figma design (visual review required — see screenshots above)
-    - [ ] All tests pass locally
-    - [ ] No unnecessary files committed (no .work/, no scripts/ helpers)
+    - [x] All tests pass locally
+    - [x] No work/ or .work/ evidence files committed
 ]
 """
 
