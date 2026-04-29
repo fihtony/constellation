@@ -9,9 +9,7 @@ import threading
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000").rstrip("/")
-HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
-INSTANCE_REPORTER_ENABLED = os.environ.get("INSTANCE_REPORTER_ENABLED", "1").strip().lower() not in {
+_DISABLED_VALUES = {
     "0",
     "false",
     "no",
@@ -36,17 +34,42 @@ def _post_json(url, payload, method="POST"):
 
 
 class InstanceReporter:
-    def __init__(self, agent_id, service_url, port, container_id=None):
+    def __init__(
+        self,
+        agent_id,
+        service_url,
+        port,
+        container_id=None,
+        *,
+        registry_url=None,
+        heartbeat_interval=None,
+        enabled=None,
+    ):
         self.agent_id = agent_id
         self.service_url = service_url
         self.port = port
         self.container_id = container_id or os.environ.get("CONTAINER_ID") or f"{agent_id}-local"
+        self.registry_url = (registry_url or os.environ.get("REGISTRY_URL", "http://registry:9000")).rstrip("/")
+        raw_interval = (
+            heartbeat_interval
+            if heartbeat_interval is not None
+            else os.environ.get("HEARTBEAT_INTERVAL", "30")
+        )
+        try:
+            self.heartbeat_interval = max(1, int(raw_interval))
+        except (TypeError, ValueError):
+            self.heartbeat_interval = 30
+        if enabled is None:
+            raw_enabled = os.environ.get("INSTANCE_REPORTER_ENABLED", "1").strip().lower()
+            self.enabled = raw_enabled not in _DISABLED_VALUES
+        else:
+            self.enabled = bool(enabled)
         self.instance_id = None
         self._stop = threading.Event()
         self._thread = None
 
     def start(self):
-        if not INSTANCE_REPORTER_ENABLED:
+        if not self.enabled:
             print(f"[reporter] Instance reporting disabled for {self.agent_id}")
             return
         result = self._register()
@@ -66,7 +89,7 @@ class InstanceReporter:
 
     def _register(self):
         return _post_json(
-            f"{REGISTRY_URL}/agents/{self.agent_id}/instances",
+            f"{self.registry_url}/agents/{self.agent_id}/instances",
             {
                 "serviceUrl": self.service_url,
                 "port": self.port,
@@ -77,7 +100,7 @@ class InstanceReporter:
     def _remove(self):
         try:
             request = Request(
-                f"{REGISTRY_URL}/agents/{self.agent_id}/instances/{self.instance_id}",
+                f"{self.registry_url}/agents/{self.agent_id}/instances/{self.instance_id}",
                 method="DELETE",
             )
             urlopen(request, timeout=3)
@@ -86,10 +109,10 @@ class InstanceReporter:
             pass
 
     def _heartbeat_loop(self):
-        while not self._stop.wait(HEARTBEAT_INTERVAL):
+        while not self._stop.wait(self.heartbeat_interval):
             if self.instance_id:
                 _post_json(
-                    f"{REGISTRY_URL}/agents/{self.agent_id}/instances/{self.instance_id}",
+                    f"{self.registry_url}/agents/{self.agent_id}/instances/{self.instance_id}",
                     {"heartbeat": True},
                     method="PUT",
                 )

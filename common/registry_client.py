@@ -26,6 +26,12 @@ class RegistryClient:
     def __init__(self, base_url=None):
         self.base_url = (base_url or REGISTRY_URL).rstrip("/")
 
+    def get_topology(self):
+        return _fetch(f"{self.base_url}/topology")
+
+    def get_events(self, since_version=0):
+        return _fetch(f"{self.base_url}/events?sinceVersion={int(since_version)}")
+
     def find_by_capability(self, capability):
         return _fetch(f"{self.base_url}/query?capability={capability}")
 

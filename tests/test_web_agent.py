@@ -41,7 +41,12 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TESTS_ROOT = os.path.dirname(os.path.abspath(__file__))
+if TESTS_ROOT not in sys.path:
+    sys.path.insert(0, TESTS_ROOT)
 sys.path.insert(0, PROJECT_ROOT)
+
+from agent_test_support import build_test_subprocess_env
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -170,8 +175,7 @@ class Report:
 # ---------------------------------------------------------------------------
 
 def _start_agent(env_overrides: dict[str, str]) -> subprocess.Popen:
-    env = os.environ.copy()
-    env.update(env_overrides)
+    env = build_test_subprocess_env(env_overrides, trusted=True)
     env["PYTHONPATH"] = PROJECT_ROOT
     env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
@@ -304,7 +308,11 @@ def test_build_python_app(base_url: str, report: Report, verbose: bool = False):
             report.step("Running generated unit tests")
             result = subprocess.run(
                 [sys.executable, "-m", "pytest", "--tb=short", "-q", agent_dir],
-                capture_output=True, text=True, timeout=60, cwd=agent_dir,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd=agent_dir,
+                env=build_test_subprocess_env(),
             )
             output = (result.stdout + result.stderr).strip()
             if verbose:

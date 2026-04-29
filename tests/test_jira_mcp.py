@@ -12,6 +12,7 @@ Required keys in tests/.env:
 Usage:
     python3 tests/test_jira_mcp.py              # dry-run (no network)
     python3 tests/test_jira_mcp.py --integration [-v]
+    python3 tests/test_jira_mcp.py --integration --provider [-v]  # also run JiraMCPProvider tests
 """
 
 from __future__ import annotations
@@ -552,6 +553,173 @@ def test_atlassian_jira_comment_lifecycle(
 
 
 # ---------------------------------------------------------------------------
+# JiraMCPProvider class-level tests
+# ---------------------------------------------------------------------------
+
+def _build_mcp_provider():
+    """Instantiate a JiraMCPProvider from tests/.env config."""
+    from jira.providers.mcp import JiraMCPProvider
+    return JiraMCPProvider(
+        jira_base_url=JIRA_BASE_URL,
+        jira_token=_env("TEST_JIRA_TOKEN"),
+        jira_email=_env("TEST_JIRA_EMAIL"),
+        jira_auth_mode="basic",
+        mcp_url=ATLASSIAN_MCP_URL,
+        timeout=30,
+    )
+
+
+def run_provider_tests(reporter: Reporter) -> None:
+    reporter.section("JiraMCPProvider — Atlassian Rovo MCP (provider class)")
+
+    token = _env("TEST_JIRA_TOKEN")
+    if not token:
+        reporter.skip("All JiraMCPProvider tests", "TEST_JIRA_TOKEN not set in tests/.env")
+        return
+
+    try:
+        provider = _build_mcp_provider()
+    except Exception as exc:
+        reporter.fail("Failed to instantiate JiraMCPProvider", str(exc))
+        return
+
+    # PROV-01  get_myself (REST fallback)
+    reporter.step("PROV-01  provider.get_myself()")
+    try:
+        user, result = provider.get_myself()
+        if result == "ok" and isinstance(user, dict) and user.get("accountId"):
+            reporter.ok(f"get_myself() → {user.get('emailAddress') or user.get('displayName')}")
+        else:
+            reporter.fail("get_myself() failed", f"result={result} user={str(user)[:150]}")
+    except Exception as exc:
+        reporter.fail("get_myself() raised exception", str(exc))
+
+    # PROV-02  fetch_issue
+    reporter.step(f"PROV-02  provider.fetch_issue({JIRA_TICKET_KEY})")
+    issue_fetched = None
+    try:
+        issue_fetched, result = provider.fetch_issue(JIRA_TICKET_KEY)
+        if result == "fetched" and isinstance(issue_fetched, dict):
+            summary_text = (issue_fetched.get("fields") or {}).get("summary", "")
+            reporter.ok(f"fetch_issue({JIRA_TICKET_KEY}) → {summary_text[:80]}")
+        else:
+            reporter.fail(f"fetch_issue({JIRA_TICKET_KEY}) failed", f"result={result}")
+    except Exception as exc:
+        reporter.fail(f"fetch_issue({JIRA_TICKET_KEY}) raised exception", str(exc))
+
+    # PROV-03  search_issues
+    reporter.step(f"PROV-03  provider.search_issues('key = {JIRA_TICKET_KEY}')")
+    try:
+        search_body, result = provider.search_issues(f"key = {JIRA_TICKET_KEY}", max_results=1)
+        if result == "ok":
+            total = 0
+            if isinstance(search_body, dict):
+                total = len(search_body.get("issues", []))
+            elif isinstance(search_body, list):
+                total = len(search_body)
+            reporter.ok(f"search_issues() returned {total} issue(s)")
+        else:
+            reporter.fail("search_issues() failed", f"result={result} body={str(search_body)[:150]}")
+    except Exception as exc:
+        reporter.fail("search_issues() raised exception", str(exc))
+
+    # PROV-04  get_transitions (REST fallback)
+    reporter.step(f"PROV-04  provider.get_transitions({JIRA_TICKET_KEY})")
+    transitions = []
+    current_status = ""
+    try:
+        transitions, result = provider.get_transitions(JIRA_TICKET_KEY)
+        if result == "ok" and transitions:
+            names = [t.get("name") for t in transitions if isinstance(t, dict)]
+            reporter.ok(f"get_transitions() → {len(transitions)} transitions: {names[:5]}")
+            # Try to find current status from fetched issue
+            if isinstance(issue_fetched, dict):
+                current_status = (issue_fetched.get("fields") or {}).get("status", {}).get("name", "")
+        else:
+            reporter.fail("get_transitions() failed", f"result={result}")
+    except Exception as exc:
+        reporter.fail("get_transitions() raised exception", str(exc))
+
+    # PROV-05  transition_issue + restore
+    if transitions and current_status:
+        # Pick a non-current transition target
+        target_name = None
+        for t in transitions:
+            if not isinstance(t, dict):
+                continue
+            to_name = (t.get("to") or {}).get("name", "")
+            if to_name and to_name.lower() != current_status.lower():
+                target_name = t.get("name")
+                break
+        if not target_name and transitions:
+            target_name = transitions[0].get("name")
+
+        if target_name:
+            reporter.step(f"PROV-05  provider.transition_issue({JIRA_TICKET_KEY}, '{target_name}') + restore")
+            try:
+                tid, result = provider.transition_issue(JIRA_TICKET_KEY, target_name)
+                if tid:
+                    reporter.ok(f"transition_issue({JIRA_TICKET_KEY}) → {result}")
+                    # Restore
+                    tid2, result2 = provider.transition_issue(JIRA_TICKET_KEY, current_status)
+                    if tid2:
+                        reporter.ok(f"Status restored to: {current_status}")
+                    else:
+                        reporter.fail(f"Restore transition to '{current_status}' failed", f"result={result2}")
+                else:
+                    reporter.fail(f"transition_issue to '{target_name}' failed", f"result={result}")
+            except Exception as exc:
+                reporter.fail("transition_issue() raised exception", str(exc))
+        else:
+            reporter.skip("PROV-05 transition", "No suitable non-current transition found")
+    else:
+        reporter.skip("PROV-05 transition", "No transitions available or current status unknown")
+
+    # PROV-06  add_comment
+    reporter.step(f"PROV-06  provider.add_comment({JIRA_TICKET_KEY})")
+    comment_id = None
+    try:
+        comment_id, result = provider.add_comment(
+            JIRA_TICKET_KEY, "[Agent Test] Constellation JiraMCPProvider test comment — add"
+        )
+        if comment_id and result == "added":
+            reporter.ok(f"add_comment({JIRA_TICKET_KEY}) → comment {comment_id}")
+        else:
+            reporter.fail(f"add_comment({JIRA_TICKET_KEY}) failed", f"result={result}")
+            comment_id = None
+    except Exception as exc:
+        reporter.fail("add_comment() raised exception", str(exc))
+        comment_id = None
+
+    # PROV-07  update_comment (REST fallback)
+    if comment_id:
+        reporter.step(f"PROV-07  provider.update_comment({JIRA_TICKET_KEY}, {comment_id})")
+        try:
+            cid2, result = provider.update_comment(
+                JIRA_TICKET_KEY, comment_id,
+                "[Agent Test] Constellation JiraMCPProvider test comment — updated"
+            )
+            if cid2 and result == "updated":
+                reporter.ok(f"update_comment({comment_id}) succeeded (REST fallback)")
+            else:
+                reporter.fail(f"update_comment({comment_id}) failed", f"result={result}")
+        except Exception as exc:
+            reporter.fail("update_comment() raised exception", str(exc))
+
+    # PROV-08  delete_comment (REST fallback, cleanup)
+    if comment_id:
+        reporter.step(f"PROV-08  provider.delete_comment({JIRA_TICKET_KEY}, {comment_id})")
+        try:
+            cid3, result = provider.delete_comment(JIRA_TICKET_KEY, comment_id)
+            if cid3 and result == "deleted":
+                reporter.ok(f"delete_comment({comment_id}) succeeded (REST fallback) — cleaned up")
+            else:
+                reporter.fail(f"delete_comment({comment_id}) failed", f"result={result}")
+        except Exception as exc:
+            reporter.fail("delete_comment() raised exception", str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Suite runner
 # ---------------------------------------------------------------------------
 
@@ -589,6 +757,8 @@ def main(argv=None):
     )
     parser.add_argument("--integration", action="store_true",
                         help="Run live integration tests (requires tests/.env credentials)")
+    parser.add_argument("--provider", action="store_true",
+                        help="Also run JiraMCPProvider class-level tests (implies --integration)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -603,10 +773,13 @@ def main(argv=None):
     reporter.section("Static / dry-run checks")
     test_jira_url_parseable(reporter)
 
-    if not args.integration:
+    run_integration = args.integration or args.provider
+    if not run_integration:
         print("\n\033[93mIntegration tests skipped — pass --integration to run live checks.\033[0m")
     else:
         run_jira_tests(reporter)
+        if args.provider:
+            run_provider_tests(reporter)
 
     print(f"\nPassed: {reporter.passed}  Failed: {reporter.failed}  Skipped: {reporter.skipped}")
     return 0 if reporter.failed == 0 else 1

@@ -57,7 +57,7 @@ class Artifact:
 
 class ArtifactStore:
     def __init__(self, root=None):
-        self.root = root or os.environ.get("ARTIFACT_ROOT") or os.path.join(os.getcwd(), "artifact")
+        self.root = root or os.environ.get("ARTIFACT_ROOT") or os.path.join(os.getcwd(), "artifacts")
         os.makedirs(self.root, exist_ok=True)
         self._lock = threading.Lock()
 

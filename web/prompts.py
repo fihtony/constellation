@@ -42,6 +42,11 @@ Determine:
 - What files need to be created or modified
 - Whether you need the current state of the repository before proceeding
 
+Rules:
+- If the task instruction explicitly requires Python, Flask, or another named stack, treat that as a hard constraint.
+- Do NOT infer React, Next.js, or Node.js only because the target repository is sparse, references a design tool, or has a generic README.
+- If the repository is empty or nearly empty, choose the stack required by the task and scaffold it in-place.
+
 Respond with a JSON object:
 {{
   "task_summary": "One sentence description of what needs to be built",
@@ -70,6 +75,36 @@ must create a detailed implementation plan. The plan should enumerate every file
 that needs to be created or changed, with its purpose and the key logic it must contain.
 
 Be specific and actionable. The plan will be used to generate actual source code.
+
+Critical planning rules:
+- Choose exactly one frontend routing architecture that matches `analysis.frontend_framework`.
+- If `frontend_framework` is `nextjs`, do NOT include React SPA shell files such as
+  `src/App.*`, `src/main.*`, `src/routes.*`, `src/router.*`, or a duplicate `src/pages/*`
+  route tree when `pages/*` or `app/*` routes are already present.
+- If `frontend_framework` is `react`, do NOT include Next.js route files such as `pages/*`
+  or `app/*`.
+- The `files` list must contain only repository source/config/test files that should be
+  created or modified in git. Do NOT include workflow artifacts such as PR drafts,
+  Jira evidence notes, CI logs, or step-by-step scratch files.
+- NEVER include `work/` or `.work/` directories or any files inside them (e.g. screenshots,
+  test result logs, curl outputs, Jira API responses). These are transient work artifacts.
+- NEVER include `scripts/` helper files whose sole purpose is running Jira updates,
+  branch creation commands, or PR instructions — these are operational scaffolding,
+  not source code deliverables.
+- Always include `.gitignore` if it is missing from the repository or does not cover the
+  project's tech stack. For Python/Flask include: `__pycache__/`, `*.pyc`, `venv/`, `.venv/`,
+  `.env`, `.pytest_cache/`, `*.egg-info/`, `dist/`, `build/`. For Node.js include:
+  `node_modules/`, `.next/`, `dist/`, `.env`.
+- Always include `README.md` (action: `modify` if the file already exists, `create` if missing).
+  The README must describe the project, list the tech stack, and include setup and run instructions.
+  For a Flask project, include: how to install dependencies (`pip install -r requirements.txt`),
+  how to run the dev server (`python run.py` or `flask run`), and how to run tests (`pytest`).
+
+Important rules for Flask backends:
+- The Flask app must use: `app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'), static_folder=os.path.join(os.path.dirname(__file__), '..', 'static'))`
+  so templates AND static files resolve correctly no matter from which directory the app or its tests are run.
+  The `static_folder` must point to the project-root `static/` directory (one level up from `app/`), NOT to `app/static/`.
+- Tests must import the Flask app object and use `app.test_client()` — never use subprocess or curl.
 
 Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
 """
@@ -112,6 +147,60 @@ Respond with a JSON object:
 }}
 """
 
+PLAN_REPAIR_SYSTEM = """\
+You are a senior full-stack web developer repairing a previously malformed implementation plan.
+
+Return ONLY a valid JSON object matching the required plan schema.
+Do NOT include markdown fences or explanatory text.
+
+Repair rules:
+- Preserve the intent of the previous response when it is usable.
+- If the previous response omitted or corrupted the `files` list, infer the minimal set of
+  repository source/config/test files needed to satisfy the task and acceptance criteria.
+- The `files` list must contain only repository files that belong in git.
+- Do NOT include workflow artifacts such as PR drafts, Jira evidence, CI logs, or scratch notes.
+- Do NOT include `work/` or `.work/` evidence files or `scripts/` operational helpers.
+"""
+
+PLAN_REPAIR_TEMPLATE = """\
+The previous planning response was invalid, malformed, or incomplete.
+
+Task:
+{task_instruction}
+
+Acceptance criteria:
+{acceptance_criteria}
+
+Tech stack analysis:
+{analysis_json}
+
+Existing codebase snapshot (if any):
+{repo_snapshot}
+
+Design context (if any):
+{design_context}
+
+Previous invalid response:
+{previous_response}
+
+Return a repaired JSON object with this exact shape:
+{{
+  "plan_summary": "Brief description of the overall approach",
+  "files": [
+    {{
+      "path": "relative/path/to/file.ext",
+      "action": "create|modify",
+      "purpose": "What this file does",
+      "key_logic": "What must be implemented in this file",
+      "dependencies": ["other files or packages this file depends on"]
+    }}
+  ],
+  "install_dependencies": ["package1", "package2"],
+  "setup_commands": ["command1", "command2"],
+  "notes": "Any important implementation notes"
+}}
+"""
+
 # ---------------------------------------------------------------------------
 # Code Generation — Single File
 # ---------------------------------------------------------------------------
@@ -125,6 +214,11 @@ for a single file as instructed. The code must:
 3. Include proper error handling
 4. Be self-contained or clearly import its dependencies
 5. Follow OWASP security guidelines (no SQL injection, XSS, etc.)
+6. For Flask apps: use `app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'), static_folder=os.path.join(os.path.dirname(__file__), '..', 'static'))` — static_folder MUST point to the project-root `static/` (one level above `app/`) so `/static/css/styles.css` resolves correctly regardless of working directory.
+7. For Flask `run.py`: always read the port from `int(os.environ.get("PORT", 5000))` to support
+   dynamic port assignment during testing and screenshots.
+8. For pytest tests of Flask apps: import the app object, set `app.testing = True`, use `app.test_client()`.
+   Never use subprocess or assume a specific cwd.
 
 CRITICAL: Output ONLY the raw source code. Do NOT wrap it in markdown code fences.
 Do NOT include any explanation before or after the code.
@@ -163,6 +257,10 @@ Output the complete file content only. No markdown, no explanation.
 PR_DESCRIPTION_SYSTEM = """\
 You are a software engineer writing a pull request description.
 Write clear, professional PR descriptions that explain what changed and why.
+For the ## Checklist section, you MUST use GitHub Markdown task list syntax:
+  - Use `- [x]` for items you have verified are done (tests pass, files are committed, etc.)
+  - Use `- [ ]` for items that require manual review by a human (visual UI verification, etc.)
+Do NOT use plain bullets for checklist items. Only `- [x]` and `- [ ]` are valid formats.
 """
 
 PR_DESCRIPTION_TEMPLATE = """\
@@ -180,11 +278,43 @@ Files changed:
 Implementation summary:
 {implementation_summary}
 
+Design reference:
+{design_reference}
+
+Test evidence:
+{test_evidence}
+
+Screenshots (pre-formatted Markdown — copy verbatim into the ## Screenshots section):
+{screenshots_block}
+
 Write the PR title on the first line, then a blank line, then the PR body.
 Format:
 [title]
 
-[body with ## sections: Summary, Changes, Testing]
+[body with these ## sections:
+  ## Summary
+  ## Changes
+  ## Design Reference
+    (If a design URL or Stitch/Figma screen was provided, include it here.
+     List the design URL, screen name/ID, and the key design requirements that were implemented.
+     If a thumbnail_url is provided in the design reference, embed it as a Markdown image:
+     ![Design Reference](<thumbnail_url>)
+     If no thumbnail_url is available, just show the design URL as a clickable link.)
+  ## Screenshots
+    Copy the pre-formatted screenshots block VERBATIM here, do not reformat or summarise it.
+  ## Testing
+    (Describe what tests were written and/or the test results.
+     If test output was provided, include a short summary of pass/fail counts.
+     If this is a UI implementation, note how to run the app locally for visual verification.)
+  ## Checklist
+    Use GitHub Markdown task list syntax ONLY (`- [x]` for done, `- [ ]` for manual review).
+    Mark `[x]` for any item you have already verified (e.g. tests pass, CI added, no work/ files committed).
+    Mark `[ ]` only for items requiring human visual review (e.g. UI fidelity vs design).
+    Suggested items (adapt based on what you know):
+    - [ ] UI matches the Stitch/Figma design (visual review required — see screenshots above)
+    - [x] All tests pass locally
+    - [x] No work/ or .work/ evidence files committed
+]
 """
 
 # ---------------------------------------------------------------------------
@@ -255,7 +385,15 @@ Rules:
 1. Only modify files that are actually broken.
 2. Produce complete file contents — never partial snippets.
 3. Keep the original logic intact; only fix what is broken.
-4. Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
+4. For Flask apps: always use `template_folder=os.path.join(os.path.dirname(__file__), 'templates'), static_folder=os.path.join(os.path.dirname(__file__), '..', 'static')`
+   in the Flask() constructor so templates AND static files resolve correctly regardless of working directory.
+   The static_folder MUST point to the project-root `static/` directory (one level above `app/`), NOT `app/static/`.
+   This is REQUIRED — the test `test_static_css_is_served_` calls `client.get('/static/css/styles.css')` and expects HTTP 200.
+   If the test is failing with a 404 for /static/css/styles.css, fix app/__init__.py to set static_folder correctly.
+5. For pytest: when testing a Flask app, import the app module directly (do NOT use subprocess);
+   set `app.testing = True` and use `app.test_client()`. Do NOT rely on filesystem paths from cwd.
+6. File paths in the `fixes` array must be relative to the build directory (e.g. `app.py`, `templates/index.html`).
+7. Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
 """
 
 BUILD_FIX_TEMPLATE = """\

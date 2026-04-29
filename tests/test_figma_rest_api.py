@@ -63,11 +63,10 @@ FIGMA_API_BASE = "https://api.figma.com/v1"
 # ---------------------------------------------------------------------------
 
 def _figma_token() -> str:
-    # Priority: TEST_FIGMA_TOKEN in tests/.env → FIGMA_TOKEN env var → ui-design/.env
+    # ONLY from tests/.env — raise if missing
     token = _env("TEST_FIGMA_TOKEN") or os.environ.get("FIGMA_TOKEN", "")
     if not token:
-        ui_env = load_env_file("ui-design/.env")
-        token = ui_env.get("FIGMA_TOKEN", "").strip()
+        raise SystemExit("ERROR: TEST_FIGMA_TOKEN not set in tests/.env — cannot run tests")
     return token
 
 

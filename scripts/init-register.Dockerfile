@@ -10,6 +10,7 @@ COPY common/  /app/common/
 COPY jira/        /app/jira/
 COPY scm/         /app/scm/
 COPY compass/     /app/compass/
+COPY office/      /app/office/
 COPY team-lead/   /app/team_lead/
 COPY ui-design/   /app/ui-design/
 COPY web/         /app/web/

@@ -8,6 +8,7 @@ services:
     environment:
       REGISTRY_HOST: "0.0.0.0"
       REGISTRY_PORT: "9000"
+      TZ: "${TZ:-UTC}"
     labels:
       constellation.agent_id: "capability-registry"
       constellation.agent_name: "Capability Registry"
@@ -52,6 +53,8 @@ services:
         condition: service_healthy
       scm:
         condition: service_healthy
+      ui-design:
+        condition: service_healthy
     env_file:
       - ./compass/.env
     environment:
@@ -64,10 +67,14 @@ services:
       ARTIFACT_ROOT: "/app/artifacts"
       DEFAULT_DYNAMIC_IMAGE: "constellation-android-agent:latest"
       DYNAMIC_AGENT_NETWORK: "constellation-network"
-      ARTIFACT_ROOT_HOST: "${ARTIFACT_ROOT_HOST:-}"
+      DOCKER_SOCKET: "/var/run/docker.sock"
+      TZ: "${TZ:-UTC}"
     volumes:
       - ./artifacts:/app/artifacts
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    group_add:
+      - "0"
+      - "${DOCKER_SOCKET_GID:-102}"
     labels:
       constellation.agent_id: "compass-agent"
       constellation.agent_name: "Compass Agent"
@@ -97,9 +104,7 @@ services:
       ADVERTISED_BASE_URL: "http://jira:8010"
       REGISTRY_URL: "http://registry:9000"
       HEARTBEAT_INTERVAL: "30"
-      OPENAI_BASE_URL: "http://host.docker.internal:1288/v1"
-      OPENAI_MODEL: "gpt-5-mini"
-      ALLOW_MOCK_FALLBACK: "1"
+      TZ: "${TZ:-UTC}"
     build:
       context: .
       dockerfile: jira/Dockerfile
@@ -108,6 +113,8 @@ services:
       constellation.agent_id: "jira-agent"
       constellation.agent_name: "Jira Agent"
       constellation.agent_role: "fundamental"
+    volumes:
+      - ./artifacts:/app/artifacts
     ports:
       - "8010:8010"
     healthcheck:
@@ -137,9 +144,8 @@ services:
       ADVERTISED_BASE_URL: "http://scm:8020"
       REGISTRY_URL: "http://registry:9000"
       HEARTBEAT_INTERVAL: "30"
-      OPENAI_BASE_URL: "http://host.docker.internal:1288/v1"
-      OPENAI_MODEL: "gpt-5-mini"
-      ALLOW_MOCK_FALLBACK: "1"
+      SCM_PROVIDER: "github"
+      TZ: "${TZ:-UTC}"
     volumes:
       - ./artifacts:/app/artifacts
     labels:
@@ -155,13 +161,85 @@ services:
       retries: 20
       start_period: 2s
 
-  # team-lead is a per-task agent — built separately via build-agents.sh and
-  # launched on demand by Compass via Docker socket.  It is NOT started here.
-  # The entry below is kept for reference only.
+  ui-design:
+    image: constellation-ui-design-agent:latest
+    build:
+      context: .
+      dockerfile: ui-design/Dockerfile
+    command: ["python3", "ui-design/app.py"]
+    depends_on:
+      registry:
+        condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
+    env_file:
+      - ./ui-design/.env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8040"
+      AGENT_ID: "ui-design-agent"
+      ADVERTISED_BASE_URL: "http://ui-design:8040"
+      REGISTRY_URL: "http://registry:9000"
+      HEARTBEAT_INTERVAL: "30"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      - ./artifacts:/app/artifacts
+    labels:
+      constellation.agent_id: "ui-design-agent"
+      constellation.agent_name: "UI Design Agent"
+      constellation.agent_role: "integration"
+    ports:
+      - "8040:8040"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8040/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+
+  # team-lead is a per-task intelligence-layer agent — built via build-agents.sh and
+  # launched on demand by Compass via Docker socket when a task arrives.
+  # It is NOT started here as a persistent service.
+  # The entry below is kept for reference; remove the comment to run it standalone.
   #
   # team-lead:
   #   image: constellation-team-lead-agent:latest
-  #   ...
+  #   build:
+  #     context: .
+  #     dockerfile: team-lead/Dockerfile
+  #   command: ["python3", "team-lead/app.py"]
+  #   depends_on:
+  #     registry:
+  #       condition: service_healthy
+  #     init-register:
+  #       condition: service_completed_successfully
+  #   env_file:
+  #     - ./team-lead/.env
+  #   environment:
+  #     HOST: "0.0.0.0"
+  #     PORT: "8030"
+  #     AGENT_ID: "team-lead-agent"
+  #     ADVERTISED_BASE_URL: "http://team-lead:8030"
+  #     REGISTRY_URL: "http://registry:9000"
+  #     JIRA_AGENT_URL: "http://jira:8010"
+  #     SCM_AGENT_URL: "http://scm:8020"
+  #     UI_DESIGN_AGENT_URL: "http://ui-design:8040"
+  #     COMPASS_URL: "http://compass:8080"
+  #     HEARTBEAT_INTERVAL: "30"
+  #     OPENAI_BASE_URL: "http://host.docker.internal:1288/v1"
+  #     ALLOW_MOCK_FALLBACK: "0"
+  #     DYNAMIC_AGENT_NETWORK: "constellation-network"
+  #     ARTIFACT_ROOT: "/app/artifacts"
+  #     DOCKER_SOCKET: "/var/run/docker.sock"
+  #   volumes:
+  #     - ./artifacts:/app/artifacts
+  #     - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+  #   labels:
+  #     constellation.agent_id: "team-lead-agent"
+  #     constellation.agent_name: "Team Lead Agent"
+  #     constellation.agent_role: "fundamental"
+  #   ports:
+  #     - "8030:8030"
 
   # web-agent is a per-task agent — built separately via build-agents.sh and
   # launched on demand by Team Lead via Docker socket. It is NOT started here.
@@ -197,6 +275,41 @@ services:
   #     timeout: 2s
   #     retries: 20
   #     start_period: 2s
+
+  teams-gateway:
+    image: constellation-teams-gateway:latest
+    build:
+      context: .
+      dockerfile: teams-gateway/Dockerfile
+    command: ["python3", "teams-gateway/app.py"]
+    depends_on:
+      compass:
+        condition: service_healthy
+    env_file:
+      - ./teams-gateway/.env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8070"
+      AGENT_ID: "teams-gateway"
+      ADVERTISED_BASE_URL: "http://teams-gateway:8070"
+      COMPASS_URL: "http://compass:8080"
+      REGISTRY_URL: "http://registry:9000"
+      TEAMS_GATEWAY_DB_PATH: "/app/data/teams-gateway/teams-gateway.db"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      - ./data:/app/data
+    labels:
+      constellation.agent_id: "teams-gateway"
+      constellation.agent_name: "Teams Gateway"
+      constellation.agent_role: "integration"
+    ports:
+      - "8070:8070"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8070/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
 
 networks:
   default:
