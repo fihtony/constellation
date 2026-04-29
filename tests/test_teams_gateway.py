@@ -21,12 +21,17 @@ import time
 import unittest
 from unittest.mock import patch, MagicMock
 
-# Ensure project root is on path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Ensure project root and teams-gateway directory are on path (matches ui-design pattern)
+_PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
+_TEAMS_GATEWAY_DIR = os.path.join(_PROJECT_ROOT, "teams-gateway")
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+if _TEAMS_GATEWAY_DIR not in sys.path:
+    sys.path.insert(0, _TEAMS_GATEWAY_DIR)
 
-from teams_gateway.message_normalizer import normalize_message
-from teams_gateway.db import GatewayDB
-from teams_gateway import cards
+from message_normalizer import normalize_message
+from db import GatewayDB
+import cards
 
 
 def _make_activity(
@@ -312,24 +317,24 @@ class TestActivityHandling(unittest.TestCase):
         # Patch the module-level db in teams_gateway.app
         self.db = GatewayDB(db_path=db_path)
 
-        import teams_gateway.app as gw_app
+        import app as gw_app
         self._orig_db = gw_app.db
         gw_app.db = self.db
         # Clear per-user rate limit state so tests don't bleed into each other
         gw_app._rate_limits.clear()
 
     def tearDown(self):
-        import teams_gateway.app as gw_app
+        import app as gw_app
         gw_app.db = self._orig_db
         gw_app._rate_limits.clear()
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    @patch("teams_gateway.compass_client.send_message")
+    @patch("compass_client.send_message")
     def test_tc001_create_dev_task(self, mock_send):
         """TC-001: New message creates task via Compass."""
         mock_send.return_value = {"task": {"id": "task-0001", "status": {"state": "TASK_STATE_WORKING"}}}
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         activity = _make_activity(text="Implement login page")
         card = _handle_activity(activity)
         self.assertIsNotNone(card)
@@ -339,42 +344,42 @@ class TestActivityHandling(unittest.TestCase):
         self.assertEqual(call_msg["metadata"]["ownerUserId"], "user-aad-001")
         self.assertEqual(call_msg["metadata"]["sourceChannel"], "teams")
 
-    @patch("teams_gateway.compass_client.send_message")
+    @patch("compass_client.send_message")
     def test_tc003_task_confirmation_card(self, mock_send):
         """TC-003: Confirmation card contains task ID."""
         mock_send.return_value = {"task": {"id": "task-0042"}}
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(text="Build feature X"))
         self.assertIsNotNone(card)
         card_json = json.dumps(card)
         self.assertIn("task-0042", card_json)
 
-    @patch("teams_gateway.compass_client.send_message")
+    @patch("compass_client.send_message")
     def test_tc004_task_has_owner(self, mock_send):
         """TC-004: Task creation passes owner metadata."""
         mock_send.return_value = {"task": {"id": "task-0001"}}
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         _handle_activity(_make_activity(text="hello", user_aad_id="my-aad-id"))
         call_msg = mock_send.call_args[0][0]
         self.assertEqual(call_msg["metadata"]["ownerUserId"], "my-aad-id")
         self.assertEqual(call_msg["metadata"]["sourceChannel"], "teams")
 
-    @patch("teams_gateway.compass_client.send_message")
+    @patch("compass_client.send_message")
     def test_tc007_dedup(self, mock_send):
         """TC-007: Duplicate activity silently ignored."""
         mock_send.return_value = {"task": {"id": "task-0001"}}
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         _handle_activity(_make_activity(text="first", activity_id="dedup-unique-001"))
         _handle_activity(_make_activity(text="second", activity_id="dedup-unique-001"))
         self.assertEqual(mock_send.call_count, 1)  # only called once
 
-    @patch("teams_gateway.compass_client.send_message")
+    @patch("compass_client.send_message")
     def test_tc006_concurrent_limit(self, mock_send):
         """TC-006: Concurrent task limit enforced."""
         mock_send.return_value = {"task": {"id": "task-0001"}}
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
 
-        import teams_gateway.app as gw_app
+        import app as gw_app
         orig_max = gw_app.MAX_TASKS_PER_USER
         # Also bump rate limit to avoid rate-limit interference
         orig_rate = gw_app.RATE_LIMIT_PER_MINUTE
@@ -396,11 +401,11 @@ class TestActivityHandling(unittest.TestCase):
 
     def test_mn005_message_too_long(self):
         """MN-005/TC: Overlong message rejected with error card."""
-        import teams_gateway.app as gw_app
+        import app as gw_app
         orig = gw_app.MAX_MESSAGE_LENGTH
         gw_app.MAX_MESSAGE_LENGTH = 100
         try:
-            from teams_gateway.app import _handle_activity
+            from app import _handle_activity
             card = _handle_activity(_make_activity(text="x" * 200, activity_id="long-msg"))
             card_json = json.dumps(card)
             self.assertIn("too long", card_json.lower())
@@ -409,40 +414,40 @@ class TestActivityHandling(unittest.TestCase):
 
     def test_empty_message(self):
         """MN-006: Empty message returns prompt."""
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(text="", activity_id="empty-msg"))
         card_json = json.dumps(card)
         self.assertIn("enter your request", card_json.lower())
 
     def test_cmd001_tasks_command(self):
         """CMD-001: /tasks returns task list."""
-        with patch("teams_gateway.compass_client.list_tasks") as mock_list:
+        with patch("compass_client.list_tasks") as mock_list:
             mock_list.return_value = [
                 {"id": "t1", "status": {"state": "WORKING"}, "ownerUserId": "user-aad-001"},
             ]
-            from teams_gateway.app import _handle_activity
+            from app import _handle_activity
             card = _handle_activity(_make_activity(text="/tasks", activity_id="cmd-tasks"))
             self.assertIsNotNone(card)
 
     def test_cmd003_help_command(self):
         """CMD-003: /help returns help card."""
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(text="/help", activity_id="cmd-help"))
         card_json = json.dumps(card)
         self.assertIn("/tasks", card_json)
 
     def test_cmd005_unknown_command(self):
         """CMD-005: Unknown command returns error."""
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(text="/unknown", activity_id="cmd-unk"))
         card_json = json.dumps(card)
         self.assertIn("Unknown command", card_json)
 
     def test_cmd007_case_insensitive(self):
         """CMD-007: Commands case insensitive."""
-        with patch("teams_gateway.compass_client.list_tasks") as mock_list:
+        with patch("compass_client.list_tasks") as mock_list:
             mock_list.return_value = []
-            from teams_gateway.app import _handle_activity
+            from app import _handle_activity
             card = _handle_activity(_make_activity(text="/TASKS", activity_id="cmd-upper"))
             card_json = json.dumps(card)
             self.assertIn("No running tasks", card_json)
@@ -450,7 +455,7 @@ class TestActivityHandling(unittest.TestCase):
     def test_sec005_owner_check_task_detail(self):
         """SEC-005: User cannot view another user's task."""
         self.db.add_task_mapping("t001", "other-user", "tenant-001")
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(text="/task t001", activity_id="sec-005"))
         card_json = json.dumps(card)
         self.assertIn("permission", card_json.lower())
@@ -458,16 +463,16 @@ class TestActivityHandling(unittest.TestCase):
     def test_sec006_owner_check_resume(self):
         """SEC-006: User cannot resume another user's task."""
         self.db.add_task_mapping("t001", "other-user", "tenant-001")
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(text="/resume t001 my answer", activity_id="sec-006"))
         card_json = json.dumps(card)
         self.assertIn("permission", card_json.lower())
 
     def test_sec007_xss_in_message(self):
         """SEC-007: XSS payload stripped from input."""
-        with patch("teams_gateway.compass_client.send_message") as mock_send:
+        with patch("compass_client.send_message") as mock_send:
             mock_send.return_value = {"task": {"id": "t001"}}
-            from teams_gateway.app import _handle_activity
+            from app import _handle_activity
             card = _handle_activity(_make_activity(
                 text='<script>alert("xss")</script>hello',
                 text_format="xml",
@@ -478,7 +483,7 @@ class TestActivityHandling(unittest.TestCase):
 
     def test_lc001_bot_install(self):
         """LC-001: Bot install stores conversation ref and sends welcome."""
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         activity = _make_activity(
             activity_type="conversationUpdate",
             members_added=[{"id": "bot-id-1"}],
@@ -495,7 +500,7 @@ class TestActivityHandling(unittest.TestCase):
     def test_lc003_bot_uninstall(self):
         """LC-003: Bot uninstall removes conversation ref."""
         self.db.upsert_conversation_ref("user-aad-001", "tenant-001", "c1", "https://svc", "b1")
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         activity = _make_activity(
             activity_type="conversationUpdate",
             members_removed=[{"id": "bot-id-1"}],
@@ -505,8 +510,8 @@ class TestActivityHandling(unittest.TestCase):
         ref = self.db.get_conversation_ref("user-aad-001", "tenant-001")
         self.assertIsNone(ref)
 
-    @patch("teams_gateway.compass_client.get_task")
-    @patch("teams_gateway.compass_client.resume_task")
+    @patch("compass_client.get_task")
+    @patch("compass_client.resume_task")
     def test_ir002_resume_input_required(self, mock_resume, mock_get):
         """IR-002: User replies to INPUT_REQUIRED task."""
         mock_get.return_value = {"task": {"id": "t001", "status": {"state": "TASK_STATE_INPUT_REQUIRED"}}}
@@ -515,11 +520,11 @@ class TestActivityHandling(unittest.TestCase):
         self.db.add_task_mapping("t001", "user-aad-001", "tenant-001")
         self.db.update_task_state("t001", "TASK_STATE_INPUT_REQUIRED")
 
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(text="/resume t001 yes", activity_id="ir-002"))
         mock_resume.assert_called_once()
 
-    @patch("teams_gateway.compass_client.send_message")
+    @patch("compass_client.send_message")
     def test_ir005_auto_route_to_newest_ir(self, mock_send):
         """IR-005: Auto-route text to newest INPUT_REQUIRED task."""
         mock_send.return_value = {"task": {"id": "t002"}}
@@ -529,9 +534,9 @@ class TestActivityHandling(unittest.TestCase):
         self.db.add_task_mapping("t002", "user-aad-001", "tenant-001")
         self.db.update_task_state("t002", "TASK_STATE_INPUT_REQUIRED")
 
-        with patch("teams_gateway.compass_client.resume_task") as mock_resume:
+        with patch("compass_client.resume_task") as mock_resume:
             mock_resume.return_value = {"task": {"id": "t002"}}
-            from teams_gateway.app import _handle_activity
+            from app import _handle_activity
             card = _handle_activity(_make_activity(text="my answer", activity_id="ir-005"))
             mock_resume.assert_called_once()
 
@@ -601,7 +606,7 @@ class TestGatewayHTTPEndpoints(unittest.TestCase):
 
     def test_gw001_health(self):
         """GW-001: GET /health returns ok."""
-        from teams_gateway.app import TeamsGatewayHandler
+        from app import TeamsGatewayHandler
 
         handler = self._create_handler("GET", "/health", TeamsGatewayHandler)
         self.assertIn(b'"status": "ok"', handler._response_body)
@@ -659,13 +664,13 @@ class TestActivityHandlingExtended(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
         db_path = os.path.join(self.tmpdir, "tg2", "tg.db")
         self.db = GatewayDB(db_path=db_path)
-        import teams_gateway.app as gw_app
+        import app as gw_app
         self._orig_db = gw_app.db
         gw_app.db = self.db
         gw_app._rate_limits.clear()
 
     def tearDown(self):
-        import teams_gateway.app as gw_app
+        import app as gw_app
         gw_app.db = self._orig_db
         gw_app._rate_limits.clear()
         import shutil
@@ -673,11 +678,11 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     # ---- TC-002: office task routing ----
 
-    @patch("teams_gateway.compass_client.send_message")
+    @patch("compass_client.send_message")
     def test_tc002_office_task(self, mock_send):
         """TC-002: Office task also creates task via Compass."""
         mock_send.return_value = {"task": {"id": "task-office-01"}}
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(
             text="Summarize the Q3 financial report",
             activity_id="tc002-office",
@@ -690,12 +695,12 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     # ---- TC-005: rapid task creation (3 tasks, not rate-limited) ----
 
-    @patch("teams_gateway.compass_client.send_message")
+    @patch("compass_client.send_message")
     def test_tc005_rapid_tasks_not_rate_limited(self, mock_send):
         """TC-005: Three tasks in quick succession all create (up to rate limit)."""
         mock_send.return_value = {"task": {"id": "task-x"}}
-        from teams_gateway.app import _handle_activity
-        import teams_gateway.app as gw_app
+        from app import _handle_activity
+        import app as gw_app
         orig = gw_app.RATE_LIMIT_PER_MINUTE
         gw_app.RATE_LIMIT_PER_MINUTE = 10  # well above 3
         try:
@@ -707,15 +712,15 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     # ---- TC-008: rate limit trigger ----
 
-    @patch("teams_gateway.compass_client.send_message")
+    @patch("compass_client.send_message")
     def test_tc008_rate_limit_trigger(self, mock_send):
         """TC-008: 4th task within a minute is rate-limited."""
         mock_send.return_value = {"task": {"id": "task-x"}}
-        import teams_gateway.app as gw_app
+        import app as gw_app
         orig = gw_app.RATE_LIMIT_PER_MINUTE
         gw_app.RATE_LIMIT_PER_MINUTE = 3
         try:
-            from teams_gateway.app import _handle_activity
+            from app import _handle_activity
             for i in range(3):
                 _handle_activity(_make_activity(text=f"task {i}", activity_id=f"tc008-ok-{i}"))
             # 4th should be rate limited
@@ -728,10 +733,10 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     # ---- TC-009: Compass 500 error ----
 
-    @patch("teams_gateway.compass_client.send_message", side_effect=Exception("500 Internal Server Error"))
+    @patch("compass_client.send_message", side_effect=Exception("500 Internal Server Error"))
     def test_tc009_compass_500(self, mock_send):
         """TC-009: Compass 500 returns friendly error card."""
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(text="build something", activity_id="tc009"))
         card_json = json.dumps(card)
         self.assertIn("failed", card_json.lower())
@@ -740,9 +745,9 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     def test_tq004_no_tasks_for_user(self):
         """TQ-004: /tasks returns friendly message when user has no tasks."""
-        with patch("teams_gateway.compass_client.list_tasks") as mock_list:
+        with patch("compass_client.list_tasks") as mock_list:
             mock_list.return_value = []
-            from teams_gateway.app import _handle_activity
+            from app import _handle_activity
             card = _handle_activity(_make_activity(text="/tasks", activity_id="tq004"))
             card_json = json.dumps(card)
             self.assertIn("No running tasks", card_json)
@@ -751,8 +756,8 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     def test_tq005_task_not_found(self):
         """TQ-005: /task <bad-id> returns not found."""
-        with patch("teams_gateway.compass_client.get_task", side_effect=Exception("404 Not Found")):
-            from teams_gateway.app import _handle_activity
+        with patch("compass_client.get_task", side_effect=Exception("404 Not Found")):
+            from app import _handle_activity
             card = _handle_activity(_make_activity(text="/task no-such-task", activity_id="tq005"))
             card_json = json.dumps(card)
             self.assertIn("not found", card_json.lower())
@@ -769,8 +774,8 @@ class TestActivityHandlingExtended(unittest.TestCase):
                 "summary": "A" * 100,
             }
         ]
-        with patch("teams_gateway.compass_client.list_tasks", return_value=tasks):
-            from teams_gateway.app import _handle_activity
+        with patch("compass_client.list_tasks", return_value=tasks):
+            from app import _handle_activity
             card = _handle_activity(_make_activity(text="/tasks", activity_id="tq007"))
             card_json = json.dumps(card)
             self.assertIn("t-abc", card_json)
@@ -794,11 +799,11 @@ class TestActivityHandlingExtended(unittest.TestCase):
     def test_cmd002_task_detail_command(self):
         """CMD-002: /task <id> routes to task detail handler."""
         self.db.add_task_mapping("t001", "user-aad-001", "tenant-001")
-        with patch("teams_gateway.compass_client.get_task") as mock_get:
+        with patch("compass_client.get_task") as mock_get:
             mock_get.return_value = {
                 "task": {"id": "t001", "status": {"state": "TASK_STATE_WORKING"}, "ownerUserId": "user-aad-001"}
             }
-            from teams_gateway.app import _handle_activity
+            from app import _handle_activity
             card = _handle_activity(_make_activity(text="/task t001", activity_id="cmd002"))
             card_json = json.dumps(card)
             self.assertIn("t001", card_json)
@@ -806,8 +811,8 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     # ---- CMD-004: /resume command ----
 
-    @patch("teams_gateway.compass_client.get_task")
-    @patch("teams_gateway.compass_client.resume_task")
+    @patch("compass_client.get_task")
+    @patch("compass_client.resume_task")
     def test_cmd004_resume_command(self, mock_resume, mock_get):
         """CMD-004: /resume <id> <text> resumes the task."""
         mock_get.return_value = {
@@ -816,7 +821,7 @@ class TestActivityHandlingExtended(unittest.TestCase):
         mock_resume.return_value = {"task": {"id": "t001"}}
         self.db.add_task_mapping("t001", "user-aad-001", "tenant-001")
 
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(text="/resume t001 my detailed reply", activity_id="cmd004"))
         mock_resume.assert_called_once()
         # Verify reply text was passed
@@ -827,9 +832,9 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     def test_cmd006_tasks_extra_params_ignored(self):
         """CMD-006: /tasks with extra params still returns task list."""
-        with patch("teams_gateway.compass_client.list_tasks") as mock_list:
+        with patch("compass_client.list_tasks") as mock_list:
             mock_list.return_value = []
-            from teams_gateway.app import _handle_activity
+            from app import _handle_activity
             card = _handle_activity(_make_activity(text="/tasks extra ignored", activity_id="cmd006"))
             card_json = json.dumps(card)
             self.assertIn("No running tasks", card_json)
@@ -841,8 +846,8 @@ class TestActivityHandlingExtended(unittest.TestCase):
         self.db.add_task_mapping("t001", "user-aad-001", "tenant-001")
         self.db.upsert_conversation_ref("user-aad-001", "tenant-001", "c1", "https://svc", "b1")
 
-        from teams_gateway.app import _handle_notification
-        with patch("teams_gateway.app._send_proactive_message") as mock_send:
+        from app import _handle_notification
+        with patch("app._send_proactive_message") as mock_send:
             mock_send.return_value = "ok"
             _handle_notification({
                 "taskId": "t001",
@@ -866,8 +871,8 @@ class TestActivityHandlingExtended(unittest.TestCase):
         self.db.update_task_state("t001", "TASK_STATE_INPUT_REQUIRED")
         self.db.upsert_conversation_ref("user-aad-001", "tenant-001", "c1", "https://svc", "b1")
 
-        from teams_gateway.app import _handle_notification
-        with patch("teams_gateway.app._send_proactive_message") as mock_send:
+        from app import _handle_notification
+        with patch("app._send_proactive_message") as mock_send:
             mock_send.return_value = "ok"
             # Compass sends COMPLETED after UI reply resumed the task
             _handle_notification({
@@ -884,8 +889,8 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     # ---- IR-006: /resume explicit command ----
 
-    @patch("teams_gateway.compass_client.get_task")
-    @patch("teams_gateway.compass_client.resume_task")
+    @patch("compass_client.get_task")
+    @patch("compass_client.resume_task")
     def test_ir006_explicit_resume_specifies_task(self, mock_resume, mock_get):
         """IR-006: /resume <id> routes to correct task (explicit, ignores IR auto-routing)."""
         mock_get.return_value = {
@@ -898,7 +903,7 @@ class TestActivityHandlingExtended(unittest.TestCase):
         self.db.add_task_mapping("t002", "user-aad-001", "tenant-001")
         self.db.update_task_state("t002", "TASK_STATE_INPUT_REQUIRED")
 
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(text="/resume t002 the answer for t002", activity_id="ir006"))
         mock_resume.assert_called_once()
         # Should have resumed t002, not t001
@@ -907,7 +912,7 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     # ---- IR-007: /resume on non-INPUT_REQUIRED task ----
 
-    @patch("teams_gateway.compass_client.get_task")
+    @patch("compass_client.get_task")
     def test_ir007_resume_non_ir_task(self, mock_get):
         """IR-007: /resume on WORKING task returns error."""
         mock_get.return_value = {
@@ -915,7 +920,7 @@ class TestActivityHandlingExtended(unittest.TestCase):
         }
         self.db.add_task_mapping("t001", "user-aad-001", "tenant-001")
 
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(text="/resume t001 some reply", activity_id="ir007"))
         card_json = json.dumps(card)
         self.assertIn("not currently waiting", card_json.lower())
@@ -931,7 +936,7 @@ class TestActivityHandlingExtended(unittest.TestCase):
         self.assertIsNone(self.db.get_conversation_ref("user-aad-001", "tenant-001"))
 
         # Reinstall via conversationUpdate membersAdded
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         card = _handle_activity(_make_activity(
             activity_type="conversationUpdate",
             members_added=[{"id": "bot-id-1"}],
@@ -945,7 +950,7 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     # ---- LC-005: service URL update on new activity ----
 
-    @patch("teams_gateway.compass_client.send_message")
+    @patch("compass_client.send_message")
     def test_lc005_service_url_updated(self, mock_send):
         """LC-005: serviceUrl updated on each new Activity."""
         mock_send.return_value = {"task": {"id": "t001"}}
@@ -953,7 +958,7 @@ class TestActivityHandlingExtended(unittest.TestCase):
         self.db.upsert_conversation_ref(
             "user-aad-001", "tenant-001", "c1", "https://old-svc.example.com", "b1"
         )
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         _handle_activity(_make_activity(
             text="new message",
             service_url="https://new-svc.trafficmanager.net/teams/",
@@ -964,11 +969,11 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     # ---- CC-001: two users creating tasks concurrently ----
 
-    @patch("teams_gateway.compass_client.send_message")
+    @patch("compass_client.send_message")
     def test_cc001_two_users_concurrent_tasks(self, mock_send):
         """CC-001: Two users create tasks concurrently — independent, no interference."""
         mock_send.return_value = {"task": {"id": "shared-task"}}
-        from teams_gateway.app import _handle_activity
+        from app import _handle_activity
         errors = []
         cards_by_user = {}
 
@@ -994,12 +999,12 @@ class TestActivityHandlingExtended(unittest.TestCase):
 
     # ---- CC-002: same user sends from two devices ----
 
-    @patch("teams_gateway.compass_client.send_message")
+    @patch("compass_client.send_message")
     def test_cc002_same_user_two_devices(self, mock_send):
         """CC-002: Same user sends messages from two different activity IDs (two devices)."""
         mock_send.return_value = {"task": {"id": "task-device"}}
-        from teams_gateway.app import _handle_activity
-        import teams_gateway.app as gw_app
+        from app import _handle_activity
+        import app as gw_app
         orig = gw_app.RATE_LIMIT_PER_MINUTE
         gw_app.RATE_LIMIT_PER_MINUTE = 10
         try:
@@ -1018,12 +1023,12 @@ class TestNotificationHandling(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
         db_path = os.path.join(self.tmpdir, "tgn", "tg.db")
         self.db = GatewayDB(db_path=db_path)
-        import teams_gateway.app as gw_app
+        import app as gw_app
         self._orig_db = gw_app.db
         gw_app.db = self.db
 
     def tearDown(self):
-        import teams_gateway.app as gw_app
+        import app as gw_app
         gw_app.db = self._orig_db
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -1035,8 +1040,8 @@ class TestNotificationHandling(unittest.TestCase):
     def test_pn001_completed_notification_sent(self):
         """PN-001: COMPLETED state triggers proactive message with Good-color card."""
         self._setup_user()
-        from teams_gateway.app import _handle_notification
-        with patch("teams_gateway.app._send_proactive_message") as mock_send:
+        from app import _handle_notification
+        with patch("app._send_proactive_message") as mock_send:
             mock_send.return_value = "ok"
             _handle_notification({
                 "taskId": "t001",
@@ -1054,8 +1059,8 @@ class TestNotificationHandling(unittest.TestCase):
     def test_pn002_failed_notification_sent(self):
         """PN-002: FAILED state triggers Attention-color card."""
         self._setup_user()
-        from teams_gateway.app import _handle_notification
-        with patch("teams_gateway.app._send_proactive_message") as mock_send:
+        from app import _handle_notification
+        with patch("app._send_proactive_message") as mock_send:
             mock_send.return_value = "ok"
             _handle_notification({
                 "taskId": "t001",
@@ -1086,8 +1091,8 @@ class TestNotificationHandling(unittest.TestCase):
     def test_pn008_403_marks_conv_invalid(self):
         """PN-008: 403 from Bot Framework marks conversation reference invalid."""
         self._setup_user()
-        from teams_gateway.app import _handle_notification
-        with patch("teams_gateway.app._send_proactive_message", return_value="unauthorized"):
+        from app import _handle_notification
+        with patch("app._send_proactive_message", return_value="unauthorized"):
             _handle_notification({
                 "taskId": "t001",
                 "state": "TASK_STATE_COMPLETED",
@@ -1102,8 +1107,8 @@ class TestNotificationHandling(unittest.TestCase):
     def test_ir009_notification_failure_increments_counter(self):
         """IR-009: Notification failure increments failure counter, auto-invalidates at 5."""
         self._setup_user()
-        from teams_gateway.app import _handle_notification
-        with patch("teams_gateway.app._send_proactive_message", return_value="error"):
+        from app import _handle_notification
+        with patch("app._send_proactive_message", return_value="error"):
             for _ in range(5):
                 _handle_notification({
                     "taskId": "t001",
@@ -1120,8 +1125,8 @@ class TestNotificationHandling(unittest.TestCase):
         """Notification without a valid conv ref is silently skipped."""
         # No conversation ref stored
         self.db.add_task_mapping("t001", "user-aad-001", "tenant-001")
-        from teams_gateway.app import _handle_notification
-        with patch("teams_gateway.app._send_proactive_message") as mock_send:
+        from app import _handle_notification
+        with patch("app._send_proactive_message") as mock_send:
             _handle_notification({
                 "taskId": "t001",
                 "state": "TASK_STATE_COMPLETED",
@@ -1134,8 +1139,8 @@ class TestNotificationHandling(unittest.TestCase):
     def test_sec009_path_sanitization(self):
         """SEC-009: Internal paths stripped from notification payload before sending."""
         self._setup_user()
-        from teams_gateway.app import _handle_notification
-        with patch("teams_gateway.app._send_proactive_message") as mock_send:
+        from app import _handle_notification
+        with patch("app._send_proactive_message") as mock_send:
             mock_send.return_value = "ok"
             _handle_notification({
                 "taskId": "t001",
@@ -1156,8 +1161,8 @@ class TestNotificationHandling(unittest.TestCase):
     def test_pn_working_state_not_notified(self):
         """WORKING state does not trigger a proactive message (only key states do)."""
         self._setup_user()
-        from teams_gateway.app import _handle_notification
-        with patch("teams_gateway.app._send_proactive_message") as mock_send:
+        from app import _handle_notification
+        with patch("app._send_proactive_message") as mock_send:
             _handle_notification({
                 "taskId": "t001",
                 "state": "TASK_STATE_WORKING",

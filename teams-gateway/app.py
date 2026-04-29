@@ -12,9 +12,10 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
-from teams_gateway import compass_client, cards
-from teams_gateway.db import GatewayDB
-from teams_gateway.message_normalizer import normalize_message
+import compass_client
+import cards
+from db import GatewayDB
+from message_normalizer import normalize_message
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8070"))
