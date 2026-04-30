@@ -5,9 +5,6 @@ WORKDIR /app
 # Install git (REST back-end) + Node.js 22 + npx (MCP back-end, MCP_RUNNER=npx)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tini git curl \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @github/copilot \
     && rm -rf /var/lib/apt/lists/*
 
 COPY common/  /app/common/

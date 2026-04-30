@@ -11,7 +11,6 @@ import tempfile
 from typing import Callable
 
 from common.runtime.adapter import AgenticResult, AgentRuntimeAdapter
-from common.runtime.copilot_connect import CopilotConnectAdapter
 
 DEFAULT_MODEL = "claude-haiku-4-5"
 
@@ -27,34 +26,8 @@ SDK_DISALLOWED_TOOLS = [
 
 
 class ClaudeCodeAdapter(AgentRuntimeAdapter):
-    def __init__(self) -> None:
-        self._fallback = CopilotConnectAdapter()
-
     def supports_mcp(self) -> bool:
         return True
-
-    def _fallback_result(
-        self,
-        prompt: str,
-        *,
-        context: dict | None,
-        system_prompt: str | None,
-        model: str | None,
-        timeout: int,
-        max_tokens: int,
-        warning: str,
-    ) -> dict:
-        result = self._fallback.run(
-            prompt,
-            context=context,
-            system_prompt=system_prompt,
-            model=model,
-            timeout=timeout,
-            max_tokens=max_tokens,
-        )
-        result.setdefault("warnings", []).insert(0, warning)
-        result["backend_used"] = result.get("backend_used") or "copilot-connect"
-        return result
 
     def run(
         self,
@@ -67,14 +40,10 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
     ) -> dict:
         binary = os.environ.get("CLAUDE_CODE_BIN", "claude").strip() or "claude"
         if shutil.which(binary) is None:
-            return self._fallback_result(
-                prompt,
-                context=context,
-                system_prompt=system_prompt,
-                model=model,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                warning=f"Claude Code CLI binary '{binary}' not found; falling back to copilot-connect.",
+            return self.build_failure_result(
+                f"Claude Code CLI binary '{binary}' not found.",
+                warning=f"Claude Code CLI binary '{binary}' not found.",
+                backend_used="claude-code",
             )
 
         effective_model = self.resolve_model(
@@ -106,48 +75,32 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
                 env=env,
             )
         except subprocess.TimeoutExpired:
-            return self._fallback_result(
-                prompt,
-                context=context,
-                system_prompt=system_prompt,
-                model=model,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                warning=f"Claude Code CLI timed out after {timeout}s; falling back to copilot-connect.",
+            return self.build_failure_result(
+                f"Claude Code CLI timed out after {timeout}s.",
+                warning=f"Claude Code CLI timed out after {timeout}s.",
+                backend_used="claude-code",
             )
         except OSError as exc:
-            return self._fallback_result(
-                prompt,
-                context=context,
-                system_prompt=system_prompt,
-                model=model,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                warning=f"Claude Code CLI failed to start: {exc}; falling back to copilot-connect.",
+            return self.build_failure_result(
+                f"Claude Code CLI failed to start: {exc}",
+                warning=f"Claude Code CLI failed to start: {exc}",
+                backend_used="claude-code",
             )
 
         if result.returncode != 0:
             error_text = (result.stderr or result.stdout or "").strip()
-            return self._fallback_result(
-                prompt,
-                context=context,
-                system_prompt=system_prompt,
-                model=model,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                warning=f"Claude Code CLI exited with {result.returncode}: {error_text[:300]}; falling back to copilot-connect.",
+            return self.build_failure_result(
+                f"Claude Code CLI exited with {result.returncode}: {error_text[:300]}",
+                warning=f"Claude Code CLI exited with {result.returncode}.",
+                backend_used="claude-code",
             )
 
         raw = (result.stdout or "").strip()
         if not raw:
-            return self._fallback_result(
-                prompt,
-                context=context,
-                system_prompt=system_prompt,
-                model=model,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                warning="Claude Code CLI returned an empty response; falling back to copilot-connect.",
+            return self.build_failure_result(
+                "Claude Code CLI returned an empty response.",
+                warning="Claude Code CLI returned an empty response.",
+                backend_used="claude-code",
             )
 
         return self.build_result(raw, backend_used="claude-code")

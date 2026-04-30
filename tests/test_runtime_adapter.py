@@ -32,16 +32,22 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.env_patcher.stop()
 
     def test_get_runtime_supports_all_documented_backends(self):
-        for backend in ("copilot-cli", "claude-code", "copilot-connect", "mock"):
+        for backend in ("connect-agent", "copilot-cli", "claude-code", "mock"):
             runtime = get_runtime(backend)
             self.assertIsNotNone(runtime)
 
     def test_get_runtime_unknown_backend_falls_back_to_connect(self):
         runtime = get_runtime("does-not-exist")
-        self.assertEqual(runtime.__class__.__name__, "CopilotConnectAdapter")
+        self.assertEqual(runtime.__class__.__name__, "ConnectAgentAdapter")
 
-    def test_copilot_connect_uses_model_override_and_contract(self):
+    def test_copilot_connect_resolves_to_connect_agent(self):
         os.environ["AGENT_RUNTIME"] = "copilot-connect"
+        runtime = get_runtime()
+        # copilot-connect is no longer a registered runtime; unknown backends resolve to connect-agent
+        self.assertEqual(runtime.__class__.__name__, "ConnectAgentAdapter")
+
+    def test_connect_agent_uses_model_override_and_contract(self):
+        os.environ["AGENT_RUNTIME"] = "connect-agent"
         os.environ["OPENAI_BASE_URL"] = "http://example.test/v1"
 
         payload = {
@@ -64,52 +70,31 @@ class RuntimeAdapterTests(unittest.TestCase):
             def read(self):
                 return json.dumps(payload).encode("utf-8")
 
-        with patch("common.runtime.copilot_connect.urlopen", return_value=_Response()) as mocked_open:
+        with patch("common.runtime.connect_agent.transport.urlopen", return_value=_Response()) as mocked_open:
             result = get_runtime().run("hello", model="gpt-test", max_tokens=256)
 
         self.assertEqual(result["summary"], "ok")
-        self.assertEqual(result["backend_used"], "copilot-connect")
+        self.assertEqual(result["backend_used"], "connect-agent")
         request = mocked_open.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
         self.assertEqual(body["model"], "gpt-test")
         self.assertEqual(body["max_tokens"], 256)
 
-    def test_copilot_cli_falls_back_to_connect_when_token_missing(self):
+    def test_copilot_cli_fails_when_token_missing(self):
         os.environ["AGENT_RUNTIME"] = "copilot-cli"
-        fallback_result = {
-            "summary": "fallback",
-            "structured_output": {},
-            "artifacts": [],
-            "warnings": [],
-            "next_actions": [],
-            "raw_response": "fallback",
-            "backend_used": "copilot-connect",
-        }
-        with patch("common.runtime.copilot_connect.CopilotConnectAdapter.run", return_value=dict(fallback_result)):
-            result = get_runtime().run("hello")
-        self.assertEqual(result["summary"], "fallback")
-        self.assertIn("COPILOT_GITHUB_TOKEN is not configured", result["warnings"][0])
+        result = get_runtime().run("hello")
+        self.assertIn("COPILOT_GITHUB_TOKEN is not configured", result["summary"])
+        self.assertEqual(result["backend_used"], "copilot-cli")
 
-    def test_copilot_cli_ignores_generic_github_tokens(self):
+    def test_copilot_cli_fails_when_generic_github_tokens_only(self):
         os.environ["AGENT_RUNTIME"] = "copilot-cli"
         os.environ["GH_TOKEN"] = "ambient_gh_token"
         os.environ["GITHUB_TOKEN"] = "personal_github_token"
 
-        fallback_result = {
-            "summary": "fallback",
-            "structured_output": {},
-            "artifacts": [],
-            "warnings": [],
-            "next_actions": [],
-            "raw_response": "fallback",
-            "backend_used": "copilot-connect",
-        }
+        result = get_runtime().run("hello")
 
-        with patch("common.runtime.copilot_connect.CopilotConnectAdapter.run", return_value=dict(fallback_result)):
-            result = get_runtime().run("hello")
-
-        self.assertEqual(result["summary"], "fallback")
-        self.assertIn("generic GitHub credentials are ignored", result["warnings"][0])
+        self.assertIn("COPILOT_GITHUB_TOKEN is not configured", result["summary"])
+        self.assertEqual(result["backend_used"], "copilot-cli")
 
     def test_copilot_cli_uses_cli_when_binary_and_token_are_configured(self):
         os.environ["AGENT_RUNTIME"] = "copilot-cli"
@@ -147,16 +132,14 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertTrue(env["COPILOT_HOME"].startswith(env["HOME"]))
         self.assertTrue(env["GH_CONFIG_DIR"].startswith(env["XDG_CONFIG_HOME"]))
 
-    def test_copilot_connect_falls_back_to_mock_when_endpoint_is_unreachable(self):
-        os.environ["AGENT_RUNTIME"] = "copilot-connect"
-        os.environ["ALLOW_MOCK_FALLBACK"] = "1"
+    def test_connect_agent_fails_when_endpoint_is_unreachable(self):
+        os.environ["AGENT_RUNTIME"] = "connect-agent"
 
-        with patch("common.runtime.copilot_connect.urlopen", side_effect=URLError("offline")):
+        with patch("common.runtime.connect_agent.transport.urlopen", side_effect=URLError("offline")):
             result = get_runtime().run("hello offline")
 
-        self.assertEqual(result["backend_used"], "copilot-connect")
-        self.assertIn("Fell back to mock response.", result["warnings"])
-        self.assertIn("MOCK_LLM_RESPONSE", result["raw_response"])
+        self.assertEqual(result["backend_used"], "connect-agent")
+        self.assertIn("unreachable", result["summary"])
 
     def test_mock_runtime_returns_configured_response(self):
         os.environ["AGENT_RUNTIME"] = "mock"
@@ -167,22 +150,12 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(result["backend_used"], "mock")
         self.assertEqual(result["summary"], "mock ok")
 
-    def test_claude_code_falls_back_to_connect_when_binary_missing(self):
+    def test_claude_code_fails_when_binary_missing(self):
         os.environ["AGENT_RUNTIME"] = "claude-code"
-        fallback_result = {
-            "summary": "fallback",
-            "structured_output": {},
-            "artifacts": [],
-            "warnings": [],
-            "next_actions": [],
-            "raw_response": "fallback",
-            "backend_used": "copilot-connect",
-        }
-        with patch("common.runtime.claude_code.shutil.which", return_value=None), \
-             patch("common.runtime.copilot_connect.CopilotConnectAdapter.run", return_value=dict(fallback_result)):
+        with patch("common.runtime.claude_code.shutil.which", return_value=None):
             result = get_runtime().run("hello")
-        self.assertEqual(result["summary"], "fallback")
-        self.assertIn("Claude Code CLI binary", result["warnings"][0])
+        self.assertIn("not found", result["summary"])
+        self.assertEqual(result["backend_used"], "claude-code")
 
     def test_runtime_configuration_summary_is_redacted(self):
         os.environ["AGENT_RUNTIME"] = "copilot-cli"
@@ -196,16 +169,16 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertTrue(summary["tokenSources"]["COPILOT_GITHUB_TOKEN"])
         self.assertNotIn("copilot_token_secret", json.dumps(summary))
 
-    def test_runtime_configuration_summary_falls_back_when_copilot_cli_is_not_ready(self):
+    def test_runtime_configuration_summary_reports_error_when_copilot_cli_is_not_ready(self):
         os.environ["AGENT_RUNTIME"] = "copilot-cli"
 
         with patch("common.runtime.adapter.shutil.which", return_value="/usr/bin/copilot"):
             summary = summarize_runtime_configuration()
 
         self.assertEqual(summary["requestedBackend"], "copilot-cli")
-        self.assertEqual(summary["effectiveBackend"], "copilot-connect")
+        self.assertEqual(summary["effectiveBackend"], "copilot-cli")
         self.assertFalse(summary["tokenConfigured"])
-        self.assertEqual(summary["fallbackReason"], "Copilot CLI token is not configured.")
+        self.assertIn("not ready", summary["error"])
 
     def test_resolve_openai_base_url_uses_rancher_host_inside_container(self):
         os.environ["CONTAINER_RUNTIME"] = "rancher"
@@ -222,13 +195,13 @@ class RuntimeAdapterTests(unittest.TestCase):
         with patch("common.env_utils._is_containerized_process", return_value=False):
             self.assertEqual(resolve_openai_base_url(), "http://localhost:1288/v1")
 
-    def test_runtime_configuration_summary_reports_resolved_connect_url(self):
-        os.environ["AGENT_RUNTIME"] = "copilot-connect"
+    def test_runtime_configuration_summary_reports_connect_agent_details(self):
+        os.environ["AGENT_RUNTIME"] = "connect-agent"
 
         with patch("common.runtime.adapter.resolve_openai_base_url", return_value="http://host.rancher-desktop.internal:1288/v1"):
             summary = summarize_runtime_configuration()
 
-        self.assertEqual(summary["effectiveBackend"], "copilot-connect")
+        self.assertEqual(summary["effectiveBackend"], "connect-agent")
         self.assertEqual(summary["resolvedBaseUrl"], "http://host.rancher-desktop.internal:1288/v1")
         self.assertFalse(summary["baseUrlConfigured"])
 

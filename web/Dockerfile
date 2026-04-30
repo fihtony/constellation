@@ -2,14 +2,10 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install Node.js 22 (required for GitHub Copilot CLI) + git + chromium for headless UI screenshots
+# Install system dependencies (tini for signal handling, git for SCM tools)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates tini git curl \
-       chromium fonts-freefont-ttf \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
-    && npm install -g @github/copilot \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir flask pytest requests

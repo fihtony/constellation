@@ -474,9 +474,10 @@ artifacts = [
 ### 12. LLM Usage
 
 Use `common/runtime/adapter.py` for all agentic LLM/CLI calls. It handles:
-- `copilot-cli` as the primary production backend
+- `connect-agent` as the primary built-in production backend
+- `copilot-cli` as an optional compatible CLI backend
 - `claude-code` as an optional compatible backend
-- `copilot-connect` as the OpenAI-compatible fallback / local integration backend
+- `copilot-connect` as the legacy compatibility backend on top of the shared connect-agent transport
 - Mock fallback when no real backend is available (`ALLOW_MOCK_FALLBACK=1`)
 - Proper timeout and structured result handling
 
@@ -736,7 +737,7 @@ Before submitting a new agent, verify:
 ## Shared Runtime Notes
 
 - LLM-enabled agents (`team-lead`, `web`, `jira`, `scm`, `ui-design`, `office`) should load shared defaults from `common/.env` first, then apply their local `.env` overrides.
-- Team Lead and Web are the only current per-task agents that intentionally override the shared runtime baseline in `registry-config.json > launchSpec.env`: `AGENT_RUNTIME=copilot-cli` and `AGENT_MODEL=gpt-5-mini`. Other agents should stay on the shared `gpt-5-mini` default unless there is an explicit design change.
+- Team Lead and Web are the only current per-task agents that intentionally pin the shared runtime baseline in `registry-config.json > launchSpec.env`: `AGENT_RUNTIME=connect-agent` and `AGENT_MODEL=gpt-5-mini`. Other agents should stay on the shared `gpt-5-mini` default unless there is an explicit design change.
 - Protected GitHub/SCM credential variables (`GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `SCM_TOKEN`, `SCM_USERNAME`, `SCM_PASSWORD`, `TEST_GITHUB_TOKEN`) are file-backed by default. Ambient host values must be ignored unless a launcher or test has already loaded its own `.env` and explicitly marks the child process with `CONSTELLATION_TRUSTED_ENV=1`.
 - Runtime Git commands must use the isolated helper environment from `common.env_utils.build_isolated_git_env()` so agent subprocesses never read host Git credential helpers, host keychains, or user-level `~/.gitconfig`.
 - `copilot-cli` runtime authentication is isolated as well: only `COPILOT_GITHUB_TOKEN` is supported for agent execution. Do not rely on `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth`, or system keychain fallbacks inside agents.

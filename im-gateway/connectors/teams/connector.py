@@ -19,6 +19,17 @@ from im_gateway.connectors.teams import cards
 from im_gateway.connectors.teams.normalizer import normalize_text
 
 
+def _session_mode_for_conversation(conversation: dict) -> str:
+    conversation_type = str((conversation or {}).get("conversationType") or "").strip().lower()
+    if conversation_type == "personal":
+        return "personal"
+    if conversation_type in ("groupchat", "group"):
+        return "shared-session"
+    if conversation_type == "channel":
+        return "team-scoped"
+    return "personal"
+
+
 class TeamsConnector(IMConnector):
     """Microsoft Teams connector (Bot Framework Activities → NormalizedMessage)."""
 
@@ -63,9 +74,11 @@ class TeamsConnector(IMConnector):
             raw_payload.get("channelData", {}).get("tenant", {}).get("id", "")
             or raw_payload.get("conversation", {}).get("tenantId", "")
         )
-        conversation_id = raw_payload.get("conversation", {}).get("id", "")
+        conversation = raw_payload.get("conversation", {})
+        conversation_id = conversation.get("id", "")
         service_url = raw_payload.get("serviceUrl", "")
         bot_id = (raw_payload.get("recipient", {}) or {}).get("id", "")
+        session_mode = _session_mode_for_conversation(conversation)
 
         # Normalize text
         raw_text = raw_payload.get("text", "")
@@ -89,6 +102,7 @@ class TeamsConnector(IMConnector):
             text=text,
             command=command,
             command_args=command_args,
+            session_mode=session_mode,
             reply_target={
                 "conversation_id": conversation_id,
                 "service_url": service_url,
@@ -106,10 +120,12 @@ class TeamsConnector(IMConnector):
             activity.get("channelData", {}).get("tenant", {}).get("id", "")
             or activity.get("conversation", {}).get("tenantId", "")
         )
-        conversation_id = activity.get("conversation", {}).get("id", "")
+        conversation = activity.get("conversation", {})
+        conversation_id = conversation.get("id", "")
         service_url = activity.get("serviceUrl", "")
         bot_id = (activity.get("recipient", {}) or {}).get("id", "")
         recipient_id = bot_id
+        session_mode = _session_mode_for_conversation(conversation)
 
         members_added = activity.get("membersAdded", [])
         members_removed = activity.get("membersRemoved", [])
@@ -123,6 +139,7 @@ class TeamsConnector(IMConnector):
                     text="",
                     command="__install__",
                     command_args="",
+                    session_mode=session_mode,
                     reply_target={
                         "conversation_id": conversation_id,
                         "service_url": service_url,
@@ -141,6 +158,7 @@ class TeamsConnector(IMConnector):
                     text="",
                     command="__uninstall__",
                     command_args="",
+                    session_mode=session_mode,
                     reply_target={},
                     thread_ref=conversation_id,
                     raw_payload=activity,

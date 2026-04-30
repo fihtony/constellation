@@ -19,6 +19,7 @@ certs/
 android/
 tests/data*
 teams-bot/
+.connect-agent/
 
 # SQLite database files (persisted in data/ directory, not committed)
 data/

@@ -4,9 +4,6 @@ WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tini git curl \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
-    && npm install -g @github/copilot \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \

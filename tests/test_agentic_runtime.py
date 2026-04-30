@@ -26,6 +26,11 @@ class AgenticResultTests(unittest.TestCase):
         self.assertIsNone(result.continuation)
         self.assertEqual(result.turns_used, 0)
         self.assertEqual(result.backend_used, "")
+        self.assertEqual(result.evidence, [])
+        self.assertEqual(result.approvals_used, [])
+        self.assertEqual(result.policy_profile, "")
+        self.assertIsNone(result.checkpoint_id)
+        self.assertIsNone(result.verifier_summary)
 
     def test_full_fields(self):
         result = AgenticResult(
@@ -37,11 +42,19 @@ class AgenticResultTests(unittest.TestCase):
             raw_output="raw text",
             turns_used=12,
             backend_used="claude-code",
+            evidence=[{"tool": "bash"}],
+            approvals_used=[{"type": "manual"}],
+            policy_profile="workspace-write",
+            checkpoint_id="cp-1",
+            verifier_summary="verified",
         )
         self.assertFalse(result.success)
         self.assertEqual(result.continuation, "sess-abc")
         self.assertEqual(result.turns_used, 12)
         self.assertEqual(result.backend_used, "claude-code")
+        self.assertEqual(result.policy_profile, "workspace-write")
+        self.assertEqual(result.checkpoint_id, "cp-1")
+        self.assertEqual(result.verifier_summary, "verified")
 
 
 class AgenticCheckpointTests(unittest.TestCase):
@@ -50,14 +63,16 @@ class AgenticCheckpointTests(unittest.TestCase):
         self.assertEqual(cp.task_id, "t1")
         self.assertEqual(cp.provider, "claude-code")
         self.assertIsNone(cp.continuation)
+        self.assertEqual(cp.policy_hash, "")
+        self.assertEqual(cp.toolset_hash, "")
         self.assertEqual(cp.open_questions, [])
         self.assertEqual(cp.pending_approvals, [])
 
     def test_provider_tag_prevents_cross_provider_reuse(self):
         cp_claude = AgenticCheckpoint(task_id="t1", provider="claude-code", continuation="sess-x", summary="")
-        cp_copilot = AgenticCheckpoint(task_id="t1", provider="copilot-connect", continuation="thread-y", summary="")
-        self.assertNotEqual(cp_claude.provider, cp_copilot.provider)
-        self.assertNotEqual(cp_claude.continuation, cp_copilot.continuation)
+        cp_connect = AgenticCheckpoint(task_id="t1", provider="connect-agent", continuation="thread-y", summary="")
+        self.assertNotEqual(cp_claude.provider, cp_connect.provider)
+        self.assertNotEqual(cp_claude.continuation, cp_connect.continuation)
 
 
 class MockAdapterAgenticTests(unittest.TestCase):
@@ -145,6 +160,7 @@ class ClaudeCodeAgenticTests(unittest.TestCase):
             result = runtime.run_agentic("do something")
         self.assertIsInstance(result, AgenticResult)
         self.assertFalse(result.success)
+        self.assertEqual(result.backend_used, "claude-code")
         self.assertIn("not found", result.summary)
 
     def test_run_agentic_succeeds_when_binary_available(self):
@@ -210,16 +226,71 @@ class ClaudeCodeAgenticTests(unittest.TestCase):
         self.assertTrue(runtime.supports_mcp())
 
 
+class ConnectAgentAgenticTests(unittest.TestCase):
+    class _FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def read(self):
+            return json.dumps(self._payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def setUp(self):
+        self.env_patcher = patch.dict(os.environ, {"AGENT_RUNTIME": "connect-agent", "OPENAI_MODEL": "gpt-5-mini"}, clear=True)
+        self.env_patcher.start()
+        from common.runtime import adapter as m
+        m._INSTANCES.clear()
+        from common.tools.registry import clear_registry
+        clear_registry()
+
+    def tearDown(self):
+        self.env_patcher.stop()
+
+    def test_run_agentic_bootstraps_tools_from_constellation_mcp_server(self):
+        captured_payloads = []
+
+        def _fake_urlopen(req, timeout=0):
+            captured_payloads.append(json.loads(req.data.decode("utf-8")))
+            return self._FakeResponse({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": "done"},
+                }],
+            })
+
+        mcp_servers = {
+            "constellation": {
+                "command": "python3",
+                "args": ["-m", "common.mcp.constellation_server", "--tools", "progress_tools"],
+            }
+        }
+
+        with patch("common.runtime.connect_agent.transport.urlopen", side_effect=_fake_urlopen):
+            runtime = get_runtime()
+            result = runtime.run_agentic("do something", mcp_servers=mcp_servers, max_turns=1)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.backend_used, "connect-agent")
+        self.assertIn("tools", captured_payloads[0])
+        tool_names = [item["function"]["name"] for item in captured_payloads[0]["tools"]]
+        self.assertIn("report_progress", tool_names)
+
+
 class ProviderRegistryTests(unittest.TestCase):
     def test_all_backends_auto_registered(self):
         # Importing each backend module triggers self-registration.
         from common.runtime.provider_registry import is_registered, list_runtimes
         import common.runtime.mock        # noqa: F401
         import common.runtime.claude_code # noqa: F401
-        import common.runtime.copilot_connect # noqa: F401
+        import common.runtime.connect_agent # noqa: F401
         import common.runtime.copilot_cli # noqa: F401
 
-        for name in ("mock", "claude-code", "copilot-connect", "copilot-cli"):
+        for name in ("mock", "claude-code", "connect-agent", "copilot-cli"):
             self.assertTrue(is_registered(name), f"{name!r} should be registered")
 
     def test_duplicate_registration_raises(self):
@@ -239,6 +310,35 @@ class ProviderRegistryTests(unittest.TestCase):
         from common.runtime.provider_registry import get_runtime_class
         with self.assertRaises(KeyError):
             get_runtime_class("nonexistent-runtime-xyz")
+
+    def test_runtime_launch_contribution_round_trip(self):
+        from common.runtime.provider_registry import (
+            RuntimeLaunchContribution,
+            VolumeMount,
+            _launch_registry,
+            get_launch_contribution,
+            register_runtime_launch,
+        )
+
+        original = _launch_registry.pop("demo-runtime", None)
+        try:
+            register_runtime_launch(
+                "demo-runtime",
+                lambda context: RuntimeLaunchContribution(
+                    mounts=[VolumeMount(source="/host/demo", target="/mnt/demo", read_only=True)],
+                    env={"DEMO_FLAG": context.get("flag", "0")},
+                    launcher_profile="docker-sandbox",
+                ),
+            )
+            contribution = get_launch_contribution("demo-runtime", {"flag": "1"})
+            self.assertEqual(contribution.env["DEMO_FLAG"], "1")
+            self.assertEqual(contribution.launcher_profile, "docker-sandbox")
+            self.assertEqual(contribution.mounts[0].target, "/mnt/demo")
+        finally:
+            if original is None:
+                _launch_registry.pop("demo-runtime", None)
+            else:
+                _launch_registry["demo-runtime"] = original
 
 
 if __name__ == "__main__":

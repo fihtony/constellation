@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 COMPASS_URL = os.environ.get("COMPASS_URL", "http://compass:8080")
@@ -58,10 +59,13 @@ def get_task(task_id: str) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def list_tasks() -> list[dict]:
-    """GET /api/tasks from Compass, return the tasks array."""
+def list_tasks(owner_user_id: str | None = None) -> list[dict]:
+    """GET /api/tasks from Compass, optionally filtering by ownerUserId."""
+    query = ""
+    if owner_user_id and owner_user_id.strip():
+        query = "?" + urlencode({"ownerUserId": owner_user_id.strip()})
     req = Request(
-        f"{COMPASS_URL}/api/tasks",
+        f"{COMPASS_URL}/api/tasks{query}",
         headers=_headers(),
         method="GET",
     )

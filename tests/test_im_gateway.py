@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 # Ensure project root is on PYTHONPATH
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -116,6 +117,7 @@ class TestNormalizedMessage(unittest.TestCase):
             channel="teams", user_id="x", workspace_id="y",
             text="t", command="", command_args="t",
         )
+        self.assertEqual(msg.session_mode, "personal")
         self.assertEqual(msg.reply_target, {})
         self.assertEqual(msg.thread_ref, "")
         self.assertFalse(msg.is_duplicate)
@@ -144,7 +146,7 @@ class TestTeamsConnector(unittest.TestCase):
             "textFormat": "html",
             "from": {"aadObjectId": "user-aad-123"},
             "channelData": {"tenant": {"id": "tenant-456"}},
-            "conversation": {"id": "conv-789"},
+            "conversation": {"id": "conv-789", "conversationType": "personal"},
             "serviceUrl": "https://smba.trafficmanager.net",
             "recipient": {"id": "bot-id"},
         }
@@ -154,6 +156,39 @@ class TestTeamsConnector(unittest.TestCase):
         self.assertEqual(msg.user_id, "user-aad-123")
         self.assertEqual(msg.workspace_id, "tenant-456")
         self.assertEqual(msg.text, "Hello")
+        self.assertEqual(msg.session_mode, "personal")
+
+    def test_normalize_group_chat_session_mode(self):
+        c = self._make_connector()
+        activity = {
+            "type": "message",
+            "text": "Hello team",
+            "textFormat": "plain",
+            "from": {"aadObjectId": "user-group-1"},
+            "channelData": {"tenant": {"id": "tenant-456"}},
+            "conversation": {"id": "conv-group", "conversationType": "groupChat"},
+            "serviceUrl": "https://smba.trafficmanager.net",
+            "recipient": {"id": "bot-id"},
+        }
+        msg = c.normalize_inbound(activity)
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.session_mode, "shared-session")
+
+    def test_normalize_channel_session_mode(self):
+        c = self._make_connector()
+        activity = {
+            "type": "message",
+            "text": "Hello channel",
+            "textFormat": "plain",
+            "from": {"aadObjectId": "user-channel-1"},
+            "channelData": {"tenant": {"id": "tenant-456"}},
+            "conversation": {"id": "conv-channel", "conversationType": "channel"},
+            "serviceUrl": "https://smba.trafficmanager.net",
+            "recipient": {"id": "bot-id"},
+        }
+        msg = c.normalize_inbound(activity)
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.session_mode, "team-scoped")
 
     def test_normalize_command(self):
         c = self._make_connector()
@@ -325,6 +360,24 @@ class TestSlackConnector(unittest.TestCase):
         self.assertEqual(msg.workspace_id, "T123")
         self.assertEqual(msg.text, "Hello world")
         self.assertEqual(msg.reply_target["channel"], "D789")
+        self.assertEqual(msg.session_mode, "personal")
+
+    def test_normalize_mpim_message_sets_shared_session(self):
+        c = self._make_connector()
+        payload = {
+            "team_id": "T123",
+            "event": {
+                "type": "message",
+                "user": "U456",
+                "channel": "G999",
+                "channel_type": "mpim",
+                "text": "Hello group",
+                "ts": "1234567890.123456",
+            },
+        }
+        msg = c.normalize_inbound(payload)
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.session_mode, "shared-session")
 
     def test_normalize_ignores_bot_messages(self):
         c = self._make_connector()
@@ -712,6 +765,24 @@ class TestHandleInbound(unittest.TestCase):
         msg = self._make_msg(text="/help", command="/help", channel="teams")
         result = app_mod.handle_inbound(msg, connector)
         self.assertEqual(result["contentType"], "application/vnd.microsoft.card.adaptive")
+
+    def test_new_message_persists_session_mode(self):
+        import im_gateway.app as app_mod
+        import im_gateway.compass_client as cc
+
+        connector = self._make_connector("slack")
+        msg = self._make_msg(text="Build feature", channel="slack")
+        msg.session_mode = "shared-session"
+
+        original = cc.send_message
+        cc.send_message = lambda message: {"task": {"id": "task-session-1"}}
+        try:
+            result = app_mod.handle_inbound(msg, connector)
+            self.assertIn("task-session-1", json.dumps(result))
+            tasks = app_mod.db.get_user_tasks("slack", "U1", "T1")
+            self.assertEqual(tasks[0]["session_mode"], "shared-session")
+        finally:
+            cc.send_message = original
 
 
 # ── Sanitization ───────────────────────────────────────────────────────────
@@ -1297,14 +1368,74 @@ class TestCompassSubcommandRouting(unittest.TestCase):
         # This will try to call compass_client.list_tasks, so we mock it
         import im_gateway.compass_client as cc
         original = cc.list_tasks
-        cc.list_tasks = lambda: []
+        seen_owner_ids = []
+
+        def _fake_list_tasks(owner_user_id=None):
+            seen_owner_ids.append(owner_user_id)
+            return []
+
+        cc.list_tasks = _fake_list_tasks
         try:
             result = app.handle_inbound(msg, connector)
             # Should render task list (empty)
             self.assertIn("No running tasks", json.dumps(result))
+            self.assertEqual(seen_owner_ids, ["U1"])
         finally:
             cc.list_tasks = original
 
+
+class TestCompassClient(unittest.TestCase):
+    class _FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def read(self):
+            return json.dumps(self._payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def test_list_tasks_without_owner_filter(self):
+        import im_gateway.compass_client as cc
+
+        seen_urls = []
+
+        def _fake_urlopen(req, timeout=0):
+            seen_urls.append(req.full_url)
+            return self._FakeResponse({"tasks": []})
+
+        original = cc.urlopen
+        cc.urlopen = _fake_urlopen
+        try:
+            result = cc.list_tasks()
+            self.assertEqual(result, [])
+            self.assertTrue(seen_urls[0].endswith("/api/tasks"))
+        finally:
+            cc.urlopen = original
+
+    def test_list_tasks_with_owner_filter(self):
+        import im_gateway.compass_client as cc
+
+        seen_urls = []
+
+        def _fake_urlopen(req, timeout=0):
+            seen_urls.append(req.full_url)
+            return self._FakeResponse({"tasks": []})
+
+        original = cc.urlopen
+        cc.urlopen = _fake_urlopen
+        try:
+            result = cc.list_tasks(owner_user_id="user 1")
+            self.assertEqual(result, [])
+            self.assertIn("ownerUserId=user+1", seen_urls[0])
+        finally:
+            cc.urlopen = original
+
+
+class TestCompassSubcommandRoutingExtended(TestCompassSubcommandRouting):
     def test_compass_task_subcommand(self):
         """'/compass task t1' should be normalized to /task with args 't1'."""
         app = self._app_mod
@@ -1701,6 +1832,653 @@ class TestTeamsNormalizer(unittest.TestCase):
         from im_gateway.connectors.teams.normalizer import normalize_text
         self.assertEqual(normalize_text(""), "")
         self.assertEqual(normalize_text(None), "")
+
+
+# ── Feature 1: Multi-mode session field in DB ─────────────────────────────
+
+class TestSessionModeField(unittest.TestCase):
+    """Test session_mode column in user_task_mapping."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._db_path = os.path.join(self._tmpdir, "session_mode_test.db")
+        from im_gateway.db import GatewayDB
+        self.db = GatewayDB(db_path=self._db_path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_default_session_mode_is_personal(self):
+        self.db.add_task_mapping("t1", "slack", "U1", "W1", thread_ref="ts1")
+        owner = self.db.get_task_owner("t1")
+        self.assertIsNotNone(owner)
+        # Query full row to check session_mode
+        import sqlite3
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT session_mode FROM user_task_mapping WHERE task_id='t1'").fetchone()
+        conn.close()
+        self.assertEqual(row["session_mode"], "personal")
+
+    def test_session_mode_shared_session(self):
+        self.db.add_task_mapping("t2", "teams", "U2", "W2", session_mode="shared-session")
+        import sqlite3
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT session_mode FROM user_task_mapping WHERE task_id='t2'").fetchone()
+        conn.close()
+        self.assertEqual(row["session_mode"], "shared-session")
+
+    def test_session_mode_team_scoped(self):
+        self.db.add_task_mapping("t3", "slack", "U3", "W3", session_mode="team-scoped")
+        import sqlite3
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT session_mode FROM user_task_mapping WHERE task_id='t3'").fetchone()
+        conn.close()
+        self.assertEqual(row["session_mode"], "team-scoped")
+
+    def test_invalid_session_mode_falls_back_to_personal(self):
+        self.db.add_task_mapping("t4", "slack", "U4", "W4", session_mode="invalid-mode")
+        import sqlite3
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT session_mode FROM user_task_mapping WHERE task_id='t4'").fetchone()
+        conn.close()
+        self.assertEqual(row["session_mode"], "personal")
+
+    def test_schema_migration_from_v2(self):
+        """Simulate a v2 DB and verify migration adds session_mode."""
+        import sqlite3
+        # Create a v2-style DB without session_mode
+        db_path_v2 = os.path.join(self._tmpdir, "v2_test.db")
+        conn = sqlite3.connect(db_path_v2)
+        conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
+            channel TEXT NOT NULL, user_id TEXT NOT NULL, workspace TEXT NOT NULL,
+            target TEXT NOT NULL, is_valid INTEGER DEFAULT 1, failures INTEGER DEFAULT 0,
+            updated_at TEXT NOT NULL, PRIMARY KEY (channel, user_id, workspace))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_task_mapping (
+            task_id TEXT NOT NULL PRIMARY KEY, channel TEXT NOT NULL,
+            user_id TEXT NOT NULL, workspace TEXT NOT NULL, thread_ref TEXT,
+            state TEXT NOT NULL DEFAULT 'SUBMITTED',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_utm_user ON user_task_mapping(channel, user_id, workspace)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_utm_state ON user_task_mapping(state)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS activity_dedup (
+            activity_id TEXT NOT NULL PRIMARY KEY, processed_at TEXT NOT NULL)""")
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+        conn.close()
+
+        # Now open with GatewayDB which should migrate
+        from im_gateway.db import GatewayDB
+        db2 = GatewayDB(db_path=db_path_v2)
+        db2.add_task_mapping("migrated-t1", "slack", "U1", "W1", session_mode="shared-session")
+        conn = sqlite3.connect(db_path_v2)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT session_mode FROM user_task_mapping WHERE task_id='migrated-t1'").fetchone()
+        conn.close()
+        self.assertEqual(row["session_mode"], "shared-session")
+
+
+# ── Feature 2: Filter tasks by ownerUserId ─────────────────────────────────
+
+class TestTaskFilterByOwner(unittest.TestCase):
+    """Test task_store filtering by owner_user_id."""
+
+    def test_list_tasks_filter_by_owner(self):
+        from common.task_store import TaskStore
+        store = TaskStore()
+        t1 = store.create()
+        t1.owner_user_id = "alice"
+        t2 = store.create()
+        t2.owner_user_id = "bob"
+        t3 = store.create()
+        t3.owner_user_id = "alice"
+
+        all_tasks = store.list_tasks()
+        self.assertEqual(len(all_tasks), 3)
+
+        alice_tasks = store.list_tasks("alice")
+        self.assertEqual(len(alice_tasks), 2)
+        bob_tasks = store.list_tasks("bob")
+        self.assertEqual(len(bob_tasks), 1)
+
+    def test_filter_empty_owner(self):
+        from common.task_store import TaskStore
+        store = TaskStore()
+        t1 = store.create()
+        t1.owner_user_id = "alice"
+        t2 = store.create()
+        t2.owner_user_id = ""
+
+        all_tasks = store.list_tasks()
+        no_filter = [t for t in all_tasks]
+        self.assertEqual(len(no_filter), 2)
+
+        alice_only = store.list_tasks("alice")
+        self.assertEqual(len(alice_only), 1)
+
+    def test_filter_nonexistent_owner(self):
+        from common.task_store import TaskStore
+        store = TaskStore()
+        t1 = store.create()
+        t1.owner_user_id = "alice"
+
+        filtered = store.list_tasks("charlie")
+        self.assertEqual(len(filtered), 0)
+
+
+# ── Feature 3: Per-task agent ACK endpoint ─────────────────────────────────
+
+class TestPerTaskExitHandlerExtended(unittest.TestCase):
+    """Extended tests for PerTaskExitHandler."""
+
+    def test_build_exit_rule(self):
+        from common.per_task_exit import PerTaskExitHandler
+        rule = PerTaskExitHandler.build(rule_type="immediate", ack_timeout_seconds=60)
+        self.assertEqual(rule["type"], "immediate")
+        self.assertEqual(rule["ack_timeout_seconds"], 60)
+
+    def test_build_default(self):
+        from common.per_task_exit import PerTaskExitHandler
+        rule = PerTaskExitHandler.build()
+        self.assertEqual(rule["type"], "wait_for_parent_ack")
+        self.assertEqual(rule["ack_timeout_seconds"], 300)
+
+    def test_parse_missing_exit_rule(self):
+        from common.per_task_exit import PerTaskExitHandler
+        rule = PerTaskExitHandler.parse({})
+        self.assertEqual(rule["type"], "wait_for_parent_ack")
+        self.assertEqual(rule["ack_timeout_seconds"], 300)
+
+    def test_parse_none_metadata(self):
+        from common.per_task_exit import PerTaskExitHandler
+        rule = PerTaskExitHandler.parse(None)
+        self.assertEqual(rule["type"], "wait_for_parent_ack")
+
+    def test_parse_custom_exit_rule(self):
+        from common.per_task_exit import PerTaskExitHandler
+        metadata = {"exitRule": {"type": "immediate", "ack_timeout_seconds": 30}}
+        rule = PerTaskExitHandler.parse(metadata)
+        self.assertEqual(rule["type"], "immediate")
+        self.assertEqual(rule["ack_timeout_seconds"], 30)
+
+    def test_register_and_acknowledge(self):
+        from common.per_task_exit import PerTaskExitHandler
+        handler = PerTaskExitHandler()
+        handler.register("task-100")
+        result = handler.acknowledge("task-100")
+        self.assertTrue(result)
+
+    def test_acknowledge_unknown_task(self):
+        from common.per_task_exit import PerTaskExitHandler
+        handler = PerTaskExitHandler()
+        result = handler.acknowledge("nonexistent")
+        self.assertFalse(result)
+
+    def test_wait_with_early_ack(self):
+        import threading
+        from common.per_task_exit import PerTaskExitHandler
+        handler = PerTaskExitHandler()
+        handler.register("task-200")
+
+        def ack_later():
+            time.sleep(0.1)
+            handler.acknowledge("task-200")
+
+        t = threading.Thread(target=ack_later, daemon=True)
+        t.start()
+        result = handler.wait("task-200", timeout=5)
+        self.assertTrue(result)
+
+    def test_wait_timeout(self):
+        from common.per_task_exit import PerTaskExitHandler
+        handler = PerTaskExitHandler()
+        handler.register("task-300")
+        result = handler.wait("task-300", timeout=0.1)
+        self.assertFalse(result)
+
+    def test_cleanup(self):
+        from common.per_task_exit import PerTaskExitHandler
+        handler = PerTaskExitHandler()
+        handler.register("task-400")
+        handler.cleanup("task-400")
+        result = handler.acknowledge("task-400")
+        self.assertFalse(result)
+
+    def test_apply_immediate(self):
+        from common.per_task_exit import PerTaskExitHandler
+        handler = PerTaskExitHandler()
+        shutdown_called = []
+        handler.apply(
+            "task-500",
+            {"type": "immediate"},
+            shutdown_fn=lambda delay_seconds=2: shutdown_called.append(delay_seconds),
+            agent_id="test",
+        )
+        self.assertEqual(len(shutdown_called), 1)
+
+    def test_apply_persistent_no_shutdown(self):
+        from common.per_task_exit import PerTaskExitHandler
+        handler = PerTaskExitHandler()
+        shutdown_called = []
+        handler.apply(
+            "task-600",
+            {"type": "persistent"},
+            shutdown_fn=lambda delay_seconds=2: shutdown_called.append(delay_seconds),
+            agent_id="test",
+        )
+        self.assertEqual(len(shutdown_called), 0)
+
+    def test_apply_wait_for_ack_with_timeout(self):
+        import threading
+        from common.per_task_exit import PerTaskExitHandler
+        handler = PerTaskExitHandler()
+        shutdown_called = []
+
+        def run_apply():
+            handler.apply(
+                "task-700",
+                {"type": "wait_for_parent_ack", "ack_timeout_seconds": 1},
+                shutdown_fn=lambda delay_seconds=2: shutdown_called.append(delay_seconds),
+                agent_id="test",
+            )
+
+        t = threading.Thread(target=run_apply, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(shutdown_called), 1)
+
+
+# ── Feature 4: MCP containerized server ────────────────────────────────────
+
+class TestMCPConstellationServer(unittest.TestCase):
+    """Test the embeddable MCP constellation server module loading."""
+
+    def test_load_tool_modules_empty(self):
+        from common.mcp.constellation_server import _load_tool_modules
+        from common.tools.registry import clear_registry
+        clear_registry()
+        loaded = _load_tool_modules(["nonexistent_module"])
+        self.assertEqual(loaded, [])
+
+    def test_load_valid_tool_module(self):
+        from common.tools.registry import clear_registry, list_tools
+        clear_registry()
+        from common.mcp.constellation_server import _load_tool_modules
+        # Load one of the known tool modules
+        loaded = _load_tool_modules(["jira_tools"])
+        # The module might fail if env vars missing, but _load_tool_modules handles that gracefully
+        # We just check it doesn't raise
+        self.assertIsInstance(loaded, list)
+
+    def test_known_tool_modules_list(self):
+        from common.mcp.constellation_server import _KNOWN_TOOL_MODULES
+        self.assertIn("jira_tools", _KNOWN_TOOL_MODULES)
+        self.assertIn("scm_tools", _KNOWN_TOOL_MODULES)
+        self.assertIn("design_tools", _KNOWN_TOOL_MODULES)
+
+    def test_main_with_empty_tools_flag(self):
+        """Verify main() parses --tools correctly (doesn't start server — that blocks)."""
+        # We can't actually run main() because start_mcp_server blocks on stdin.
+        # Instead verify parsing logic by testing _load_tool_modules.
+        from common.mcp.constellation_server import _load_tool_modules
+        from common.tools.registry import clear_registry
+        clear_registry()
+        loaded = _load_tool_modules([])
+        # When called with empty list, it loads all known modules
+        # Some may fail due to missing env vars but should not raise
+        self.assertIsInstance(loaded, list)
+
+    def test_bootstrap_tools_from_mcp_servers_filters_constellation_servers(self):
+        from common.mcp.constellation_server import bootstrap_tools_from_mcp_servers
+        from common.tools.registry import clear_registry, is_registered
+
+        clear_registry()
+        loaded = bootstrap_tools_from_mcp_servers({
+            "constellation": {
+                "command": "python3",
+                "args": ["-m", "common.mcp.constellation_server", "--tools", "progress_tools"],
+            },
+            "external": {
+                "command": "node",
+                "args": ["server.js"],
+            },
+        })
+
+        self.assertEqual(loaded["constellation"], ["progress_tools"])
+        self.assertNotIn("external", loaded)
+        self.assertTrue(is_registered("report_progress"))
+
+
+class TestMCPAdapter(unittest.TestCase):
+    """Test MCP adapter request handling."""
+
+    def setUp(self):
+        from common.tools.registry import clear_registry
+        clear_registry()
+
+    def test_initialize(self):
+        from common.tools.mcp_adapter import _handle_request
+        resp = _handle_request({"id": 1, "method": "initialize"})
+        self.assertEqual(resp["id"], 1)
+        self.assertIn("protocolVersion", resp["result"])
+        self.assertIn("capabilities", resp["result"])
+
+    def test_tools_list_empty(self):
+        from common.tools.mcp_adapter import _handle_request
+        resp = _handle_request({"id": 2, "method": "tools/list"})
+        self.assertEqual(resp["result"]["tools"], [])
+
+    def test_tools_call_unknown(self):
+        from common.tools.mcp_adapter import _handle_request
+        resp = _handle_request({"id": 3, "method": "tools/call", "params": {"name": "nonexistent"}})
+        self.assertIn("error", resp)
+
+    def test_unknown_method(self):
+        from common.tools.mcp_adapter import _handle_request
+        resp = _handle_request({"id": 4, "method": "unknown/method"})
+        self.assertIn("error", resp)
+        self.assertIn("Method not found", resp["error"]["message"])
+
+    def test_tools_call_with_registered_tool(self):
+        from common.tools.base import ConstellationTool, ToolSchema
+        from common.tools.registry import register_tool
+        from common.tools.mcp_adapter import _handle_request
+
+        class EchoTool(ConstellationTool):
+            @property
+            def schema(self):
+                return ToolSchema(name="echo", description="Echo input", input_schema={"type": "object", "properties": {"msg": {"type": "string"}}})
+
+            def execute(self, args):
+                return self.ok(args.get("msg", ""))
+
+        register_tool(EchoTool())
+        resp = _handle_request({"id": 5, "method": "tools/call", "params": {"name": "echo", "arguments": {"msg": "hello"}}})
+        self.assertFalse(resp["result"]["isError"])
+        self.assertEqual(resp["result"]["content"][0]["text"], "hello")
+
+
+class TestToolRegistry(unittest.TestCase):
+    """Test tool registry operations."""
+
+    def setUp(self):
+        from common.tools.registry import clear_registry
+        clear_registry()
+
+    def test_register_and_get(self):
+        from common.tools.base import ConstellationTool, ToolSchema
+        from common.tools.registry import register_tool, get_tool
+
+        class DummyTool(ConstellationTool):
+            @property
+            def schema(self):
+                return ToolSchema(name="dummy", description="Dummy", input_schema={})
+            def execute(self, args):
+                return self.ok("done")
+
+        register_tool(DummyTool())
+        tool = get_tool("dummy")
+        result = tool.execute({})
+        self.assertFalse(result["isError"])
+
+    def test_register_duplicate_raises(self):
+        from common.tools.base import ConstellationTool, ToolSchema
+        from common.tools.registry import register_tool
+
+        class Tool1(ConstellationTool):
+            @property
+            def schema(self):
+                return ToolSchema(name="dup", description="Dup", input_schema={})
+            def execute(self, args):
+                return self.ok("")
+
+        register_tool(Tool1())
+        with self.assertRaises(ValueError):
+            register_tool(Tool1())
+
+    def test_get_unknown_raises(self):
+        from common.tools.registry import get_tool
+        with self.assertRaises(KeyError):
+            get_tool("nonexistent_tool")
+
+    def test_list_tools(self):
+        from common.tools.base import ConstellationTool, ToolSchema
+        from common.tools.registry import register_tool, list_tools
+
+        class T1(ConstellationTool):
+            @property
+            def schema(self):
+                return ToolSchema(name="t1", description="", input_schema={})
+            def execute(self, args):
+                return self.ok("")
+
+        class T2(ConstellationTool):
+            @property
+            def schema(self):
+                return ToolSchema(name="t2", description="", input_schema={})
+            def execute(self, args):
+                return self.ok("")
+
+        register_tool(T1())
+        register_tool(T2())
+        tools = list_tools()
+        self.assertEqual(len(tools), 2)
+        names = [t.schema.name for t in tools]
+        self.assertIn("t1", names)
+        self.assertIn("t2", names)
+
+    def test_is_registered(self):
+        from common.tools.base import ConstellationTool, ToolSchema
+        from common.tools.registry import register_tool, is_registered
+
+        class Reg(ConstellationTool):
+            @property
+            def schema(self):
+                return ToolSchema(name="regcheck", description="", input_schema={})
+            def execute(self, args):
+                return self.ok("")
+
+        self.assertFalse(is_registered("regcheck"))
+        register_tool(Reg())
+        self.assertTrue(is_registered("regcheck"))
+
+
+class TestNativeAdapter(unittest.TestCase):
+    """Test native function-calling adapter."""
+
+    def setUp(self):
+        from common.tools.registry import clear_registry
+        clear_registry()
+
+    def test_get_function_definitions_empty(self):
+        from common.tools.native_adapter import get_function_definitions
+        defs = get_function_definitions()
+        self.assertEqual(defs, [])
+
+    def test_get_function_definitions_with_tool(self):
+        from common.tools.base import ConstellationTool, ToolSchema
+        from common.tools.registry import register_tool
+        from common.tools.native_adapter import get_function_definitions
+
+        class SumTool(ConstellationTool):
+            @property
+            def schema(self):
+                return ToolSchema(
+                    name="sum_tool",
+                    description="Sum numbers",
+                    input_schema={"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}},
+                )
+            def execute(self, args):
+                return self.ok(str(args.get("a", 0) + args.get("b", 0)))
+
+        register_tool(SumTool())
+        defs = get_function_definitions()
+        self.assertEqual(len(defs), 1)
+        self.assertEqual(defs[0]["type"], "function")
+        self.assertEqual(defs[0]["function"]["name"], "sum_tool")
+
+    def test_get_function_definitions_filters_requested_names(self):
+        from common.tools.base import ConstellationTool, ToolSchema
+        from common.tools.registry import register_tool
+        from common.tools.native_adapter import get_function_definitions
+
+        class ToolA(ConstellationTool):
+            @property
+            def schema(self):
+                return ToolSchema(name="tool_a", description="A", input_schema={})
+            def execute(self, args):
+                return self.ok("a")
+
+        class ToolB(ConstellationTool):
+            @property
+            def schema(self):
+                return ToolSchema(name="tool_b", description="B", input_schema={})
+            def execute(self, args):
+                return self.ok("b")
+
+        register_tool(ToolA())
+        register_tool(ToolB())
+        defs = get_function_definitions(["tool_b", "missing_tool"])
+        self.assertEqual([item["function"]["name"] for item in defs], ["tool_b"])
+
+    def test_dispatch_function_call(self):
+        from common.tools.base import ConstellationTool, ToolSchema
+        from common.tools.registry import register_tool
+        from common.tools.native_adapter import dispatch_function_call
+
+        class PingTool(ConstellationTool):
+            @property
+            def schema(self):
+                return ToolSchema(name="ping_tool", description="Ping", input_schema={})
+            def execute(self, args):
+                return self.ok("pong")
+
+        register_tool(PingTool())
+        result = dispatch_function_call("ping_tool", {})
+        self.assertEqual(result, "pong")
+
+
+# ── Feature 5: Launcher profile application ────────────────────────────────
+
+class TestLauncherProfile(unittest.TestCase):
+    """Test launcher security profile application."""
+
+    def test_apply_default_profile(self):
+        from common.launcher import Launcher
+        payload = {"HostConfig": {"AutoRemove": True}, "Labels": {}}
+        Launcher._apply_launcher_profile({}, payload)
+        self.assertEqual(payload["Labels"]["constellation.launcher_profile"], "default")
+        # Default profile adds no extra restrictions
+        self.assertNotIn("ReadonlyRootfs", payload["HostConfig"])
+
+    def test_apply_docker_sandbox_profile(self):
+        from common.launcher import Launcher
+        payload = {"HostConfig": {"AutoRemove": True}, "Labels": {}}
+        Launcher._apply_launcher_profile(
+            {"security": {"launcherProfile": "docker-sandbox"}},
+            payload,
+        )
+        hc = payload["HostConfig"]
+        self.assertTrue(hc["ReadonlyRootfs"])
+        self.assertEqual(hc["CapDrop"], ["ALL"])
+        self.assertEqual(hc["CapAdd"], ["NET_BIND_SERVICE"])
+        self.assertIn("no-new-privileges", hc["SecurityOpt"])
+        self.assertEqual(payload["Labels"]["constellation.launcher_profile"], "docker-sandbox")
+
+    def test_apply_docker_restricted_profile(self):
+        from common.launcher import Launcher
+        payload = {"HostConfig": {"AutoRemove": True}, "Labels": {}}
+        Launcher._apply_launcher_profile(
+            {"security": {"launcherProfile": "docker-restricted"}},
+            payload,
+        )
+        hc = payload["HostConfig"]
+        self.assertTrue(hc["ReadonlyRootfs"])
+        self.assertEqual(hc["CapDrop"], ["ALL"])
+        self.assertEqual(hc["NetworkMode"], "none")
+        self.assertNotIn("CapAdd", hc)
+        self.assertEqual(payload["Labels"]["constellation.launcher_profile"], "docker-restricted")
+
+    def test_unknown_profile_falls_back_to_default(self):
+        from common.launcher import Launcher
+        payload = {"HostConfig": {"AutoRemove": True}, "Labels": {}}
+        Launcher._apply_launcher_profile(
+            {"security": {"launcherProfile": "microvm-experimental"}},
+            payload,
+        )
+        self.assertEqual(payload["Labels"]["constellation.requested_launcher_profile"], "microvm-experimental")
+        self.assertEqual(payload["Labels"]["constellation.launcher_profile"], "default")
+        self.assertNotIn("ReadonlyRootfs", payload["HostConfig"])
+
+    def test_no_security_section(self):
+        from common.launcher import Launcher
+        payload = {"HostConfig": {}, "Labels": {}}
+        Launcher._apply_launcher_profile({"image": "test:latest"}, payload)
+        self.assertEqual(payload["Labels"]["constellation.launcher_profile"], "default")
+
+    def test_profile_preserves_existing_host_config(self):
+        from common.launcher import Launcher
+        payload = {"HostConfig": {"AutoRemove": True, "Memory": 536870912}, "Labels": {}}
+        Launcher._apply_launcher_profile(
+            {"security": {"launcherProfile": "docker-sandbox"}},
+            payload,
+        )
+        self.assertTrue(payload["HostConfig"]["AutoRemove"])
+        self.assertEqual(payload["HostConfig"]["Memory"], 536870912)
+        self.assertTrue(payload["HostConfig"]["ReadonlyRootfs"])
+
+    def test_launcher_profiles_dict(self):
+        from common.launcher import Launcher
+        self.assertIn("default", Launcher._LAUNCHER_PROFILES)
+        self.assertIn("docker-sandbox", Launcher._LAUNCHER_PROFILES)
+        self.assertIn("docker-restricted", Launcher._LAUNCHER_PROFILES)
+
+    def test_launch_instance_applies_runtime_launch_contribution(self):
+        from common.launcher import Launcher
+        from common.runtime.provider_registry import RuntimeLaunchContribution, VolumeMount
+
+        launcher = Launcher()
+        requests = []
+
+        def _fake_request(method, path, payload=None):
+            requests.append((method, path, payload))
+            return {}
+
+        launcher._request = _fake_request
+        launcher._discover_host_source = lambda path: "/host/artifacts" if path == "/app/artifacts" else path
+
+        contribution = RuntimeLaunchContribution(
+            mounts=[VolumeMount(source="/host/tools", target="/mnt/tools", read_only=True)],
+            env={"EXTRA_FLAG": "1"},
+            launcher_profile="docker-restricted",
+        )
+        agent_definition = {
+            "agent_id": "demo-agent",
+            "display_name": "Demo Agent",
+            "execution_mode": "per-task",
+            "launch_spec": {
+                "image": "demo:latest",
+                "port": 9001,
+                "command": ["python3", "demo/app.py"],
+                "mountDockerSocket": False,
+                "env": {"AGENT_RUNTIME": "demo-runtime"},
+            },
+        }
+
+        with patch.dict(os.environ, {"ARTIFACT_ROOT": "/app/artifacts"}, clear=False), \
+             patch("common.launcher.time.sleep", return_value=None), \
+             patch("common.runtime.provider_registry.get_launch_contribution", return_value=contribution):
+            launcher.launch_instance(agent_definition, "TASK-42")
+
+        create_payload = requests[0][2]
+        self.assertIn("EXTRA_FLAG=1", create_payload["Env"])
+        self.assertIn("/host/tools:/mnt/tools:ro", create_payload["HostConfig"]["Binds"])
+        self.assertEqual(create_payload["Labels"]["constellation.launcher_profile"], "docker-restricted")
 
 
 if __name__ == "__main__":

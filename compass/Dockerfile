@@ -5,9 +5,6 @@ WORKDIR /app
 # Install CA certs, tini, Node.js 22, and Claude Code CLI
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tini curl \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
-    && npm install -g @anthropic-ai/claude-code \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy corporate certs early so they are in the build layer cache

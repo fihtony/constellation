@@ -9,8 +9,21 @@ from __future__ import annotations
 from common.tools.registry import get_tool, list_tools
 
 
-def get_function_definitions() -> list[dict]:
-    """Return OpenAI function_calling schema for all registered tools."""
+def get_function_definitions(tool_names: list[str] | None = None) -> list[dict]:
+    """Return OpenAI function_calling schema for registered tools.
+
+    When *tool_names* is provided, only currently registered tools with those
+    names are returned, preserving the requested order.
+    """
+    if tool_names:
+        tools = []
+        for name in tool_names:
+            try:
+                tools.append(get_tool(name))
+            except KeyError:
+                continue
+    else:
+        tools = list_tools()
     return [
         {
             "type": "function",
@@ -20,7 +33,7 @@ def get_function_definitions() -> list[dict]:
                 "parameters": t.schema.input_schema,
             },
         }
-        for t in list_tools()
+        for t in tools
     ]
 
 

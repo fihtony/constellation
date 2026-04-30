@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import time
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 _CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -26,14 +26,15 @@ CREATE TABLE IF NOT EXISTS conversations (
 );
 
 CREATE TABLE IF NOT EXISTS user_task_mapping (
-    task_id    TEXT NOT NULL PRIMARY KEY,
-    channel    TEXT NOT NULL,
-    user_id    TEXT NOT NULL,
-    workspace  TEXT NOT NULL,
-    thread_ref TEXT,              -- Teams: conversation_id; Slack: thread_ts
-    state      TEXT NOT NULL DEFAULT 'SUBMITTED',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    task_id       TEXT NOT NULL PRIMARY KEY,
+    channel       TEXT NOT NULL,
+    user_id       TEXT NOT NULL,
+    workspace     TEXT NOT NULL,
+    thread_ref    TEXT,              -- Teams: conversation_id; Slack: thread_ts
+    session_mode  TEXT NOT NULL DEFAULT 'personal',  -- personal | shared-session | team-scoped
+    state         TEXT NOT NULL DEFAULT 'SUBMITTED',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_utm_user
@@ -80,11 +81,24 @@ class GatewayDB:
             conn.executescript(_CREATE_TABLES)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version < _SCHEMA_VERSION:
+                self._migrate(conn, version)
                 conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             conn.commit()
         finally:
             conn.close()
         print(f"[im-gateway] Database initialized: {self._db_path} (schema v{_SCHEMA_VERSION})")
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection, from_version: int) -> None:
+        """Apply incremental schema migrations."""
+        if from_version < 3:
+            # v3: add session_mode column to user_task_mapping
+            try:
+                conn.execute(
+                    "ALTER TABLE user_task_mapping ADD COLUMN session_mode TEXT NOT NULL DEFAULT 'personal'"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists (e.g. fresh DB)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=10)
@@ -200,16 +214,19 @@ class GatewayDB:
         user_id: str,
         workspace: str,
         thread_ref: str = "",
+        session_mode: str = "personal",
     ) -> None:
+        if session_mode not in ("personal", "shared-session", "team-scoped"):
+            session_mode = "personal"
         now = _iso_now()
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(
                     """INSERT OR REPLACE INTO user_task_mapping
-                       (task_id, channel, user_id, workspace, thread_ref, state, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, 'SUBMITTED', ?, ?)""",
-                    (task_id, channel, user_id, workspace, thread_ref, now, now),
+                       (task_id, channel, user_id, workspace, thread_ref, session_mode, state, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, 'SUBMITTED', ?, ?)""",
+                    (task_id, channel, user_id, workspace, thread_ref, session_mode, now, now),
                 )
                 conn.commit()
             finally:

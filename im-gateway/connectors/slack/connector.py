@@ -26,6 +26,25 @@ from im_gateway.connectors.registry import register_connector
 from im_gateway.connectors.slack import blocks
 from im_gateway.connectors.slack.normalizer import normalize_text
 
+
+def _session_mode_for_event(event: dict) -> str:
+    channel_type = str(event.get("channel_type") or "").strip().lower()
+    if channel_type in ("im", "app_home"):
+        return "personal"
+    if channel_type == "mpim":
+        return "shared-session"
+    if channel_type in ("channel", "group"):
+        return "team-scoped"
+
+    channel_id = str(event.get("channel") or "").strip().upper()
+    if channel_id.startswith("D"):
+        return "personal"
+    if channel_id.startswith("C"):
+        return "team-scoped"
+    if channel_id.startswith("G"):
+        return "shared-session"
+    return "personal"
+
 MAX_BLOCK_TEXT_LEN = 3000
 MAX_BLOCKS = 50
 
@@ -100,6 +119,7 @@ class SlackConnector(IMConnector):
         channel = event.get("channel", "")
         text = event.get("text", "")
         thread_ts = event.get("thread_ts", "") or event.get("ts", "")
+        session_mode = _session_mode_for_event(event)
 
         # Normalize Slack special tokens
         text = normalize_text(text)
@@ -121,6 +141,7 @@ class SlackConnector(IMConnector):
             text=text,
             command=command,
             command_args=command_args,
+            session_mode=session_mode,
             reply_target={
                 "channel": channel,
                 "thread_ts": thread_ts,

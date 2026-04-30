@@ -136,12 +136,12 @@ def handle_inbound(msg: NormalizedMessage, connector: IMConnector) -> dict | Non
 
 def _handle_tasks_command(msg: NormalizedMessage, connector: IMConnector) -> dict:
     try:
-        all_tasks = compass_client.list_tasks()
+        all_tasks = compass_client.list_tasks(owner_user_id=msg.user_id)
     except Exception as err:
         print(f"[{AGENT_ID}] Failed to list tasks: {err}")
         return connector.render_error("System temporarily unavailable. Please try again later.")
 
-    user_tasks = [t for t in all_tasks if t.get("ownerUserId") == msg.user_id]
+    user_tasks = [t for t in all_tasks if t.get("ownerUserId") in (None, "", msg.user_id)]
     return connector.render_task_list(user_tasks)
 
 
@@ -267,7 +267,14 @@ def _handle_new_message(text: str, msg: NormalizedMessage, connector: IMConnecto
         task = result.get("task", {})
         task_id = task.get("id", "")
         if task_id:
-            db.add_task_mapping(task_id, msg.channel, msg.user_id, msg.workspace_id, msg.thread_ref)
+            db.add_task_mapping(
+                task_id,
+                msg.channel,
+                msg.user_id,
+                msg.workspace_id,
+                msg.thread_ref,
+                msg.session_mode,
+            )
         return connector.render_task_created(task_id, text[:200])
     except Exception as err:
         print(f"[{AGENT_ID}] Task creation failed: {err}")

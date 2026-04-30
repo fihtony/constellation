@@ -10,7 +10,6 @@ from typing import Callable
 
 from common.env_utils import build_isolated_copilot_env
 from common.runtime.adapter import AgenticResult, AgentRuntimeAdapter
-from common.runtime.copilot_connect import CopilotConnectAdapter
 
 DEFAULT_MODEL = "gpt-5-mini"
 
@@ -22,32 +21,6 @@ def _resolve_token() -> tuple[str, str | None]:
 
 
 class CopilotCliAdapter(AgentRuntimeAdapter):
-    def __init__(self) -> None:
-        self._fallback = CopilotConnectAdapter()
-
-    def _fallback_result(
-        self,
-        prompt: str,
-        *,
-        context: dict | None,
-        system_prompt: str | None,
-        model: str | None,
-        timeout: int,
-        max_tokens: int,
-        warning: str,
-    ) -> dict:
-        result = self._fallback.run(
-            prompt,
-            context=context,
-            system_prompt=system_prompt,
-            model=model,
-            timeout=timeout,
-            max_tokens=max_tokens,
-        )
-        result.setdefault("warnings", []).insert(0, warning)
-        result["backend_used"] = result.get("backend_used") or "copilot-connect"
-        return result
-
     def run(
         self,
         prompt: str,
@@ -57,28 +30,20 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
         timeout: int = 120,
         max_tokens: int = 4096,
     ) -> dict:
-        token, token_source = _resolve_token()
+        token, _token_source = _resolve_token()
         binary = os.environ.get("COPILOT_CLI_BIN", "copilot").strip() or "copilot"
         if not token:
-            return self._fallback_result(
-                prompt,
-                context=context,
-                system_prompt=system_prompt,
-                model=model,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                warning="COPILOT_GITHUB_TOKEN is not configured; generic GitHub credentials are ignored for runtime isolation, falling back to copilot-connect.",
+            return self.build_failure_result(
+                "COPILOT_GITHUB_TOKEN is not configured; Copilot CLI cannot run.",
+                warning="COPILOT_GITHUB_TOKEN is not configured.",
+                backend_used="copilot-cli",
             )
 
         if shutil.which(binary) is None:
-            return self._fallback_result(
-                prompt,
-                context=context,
-                system_prompt=system_prompt,
-                model=model,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                warning=f"Copilot CLI binary '{binary}' not found; falling back to copilot-connect.",
+            return self.build_failure_result(
+                f"Copilot CLI binary '{binary}' not found.",
+                warning=f"Copilot CLI binary '{binary}' not found.",
+                backend_used="copilot-cli",
             )
 
         effective_model = self.resolve_model(
@@ -95,8 +60,6 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
             cmd = [binary, *shlex.split(extra_args), "--model", effective_model, "-sp", full_prompt]
         env = build_isolated_copilot_env(token, os.environ)
 
-        warnings: list[str] = []
-
         try:
             result = subprocess.run(
                 cmd,
@@ -106,51 +69,35 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
                 env=env,
             )
         except subprocess.TimeoutExpired:
-            return self._fallback_result(
-                prompt,
-                context=context,
-                system_prompt=system_prompt,
-                model=model,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                warning=f"Copilot CLI timed out after {timeout}s; falling back to copilot-connect.",
+            return self.build_failure_result(
+                f"Copilot CLI timed out after {timeout}s.",
+                warning=f"Copilot CLI timed out after {timeout}s.",
+                backend_used="copilot-cli",
             )
         except OSError as exc:
-            return self._fallback_result(
-                prompt,
-                context=context,
-                system_prompt=system_prompt,
-                model=model,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                warning=f"Copilot CLI failed to start: {exc}; falling back to copilot-connect.",
+            return self.build_failure_result(
+                f"Copilot CLI failed to start: {exc}",
+                warning=f"Copilot CLI failed to start: {exc}",
+                backend_used="copilot-cli",
             )
 
         if result.returncode != 0:
             error_text = (result.stderr or result.stdout or "").strip()
-            return self._fallback_result(
-                prompt,
-                context=context,
-                system_prompt=system_prompt,
-                model=model,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                warning=f"Copilot CLI exited with {result.returncode}: {error_text[:300]}; falling back to copilot-connect.",
+            return self.build_failure_result(
+                f"Copilot CLI exited with {result.returncode}: {error_text[:300]}",
+                warning=f"Copilot CLI exited with {result.returncode}.",
+                backend_used="copilot-cli",
             )
 
         raw = (result.stdout or "").strip()
         if not raw:
-            return self._fallback_result(
-                prompt,
-                context=context,
-                system_prompt=system_prompt,
-                model=model,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                warning="Copilot CLI returned an empty response; falling back to copilot-connect.",
+            return self.build_failure_result(
+                "Copilot CLI returned an empty response.",
+                warning="Copilot CLI returned an empty response.",
+                backend_used="copilot-cli",
             )
 
-        return self.build_result(raw, warnings=warnings, backend_used="copilot-cli")
+        return self.build_result(raw, backend_used="copilot-cli")
 
     def run_agentic(
         self,
@@ -167,27 +114,16 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
         on_progress: Callable[[str], None] | None = None,
         continuation: str | None = None,
     ) -> AgenticResult:
-        """Delegate agentic execution to copilot-connect's function_calling loop.
+        """Copilot CLI does not support headless agentic mode.
 
-        Copilot CLI does not expose a headless agentic mode; we fall back to
-        the copilot-connect adapter which simulates multi-turn execution via
-        the OpenAI function_calling API.
+        Use connect-agent runtime instead if you need agentic execution.
         """
-        result = self._fallback.run_agentic(
-            task,
-            system_prompt=system_prompt,
-            cwd=cwd,
-            tools=tools,
-            mcp_servers=mcp_servers,
-            allowed_tools=allowed_tools,
-            disallowed_tools=disallowed_tools,
-            max_turns=max_turns,
-            timeout=timeout,
-            on_progress=on_progress,
-            continuation=continuation,
+        del task, system_prompt, cwd, tools, mcp_servers, allowed_tools, disallowed_tools
+        del max_turns, timeout, on_progress, continuation
+        raise NotImplementedError(
+            "CopilotCliAdapter does not support run_agentic(). "
+            "Use connect-agent runtime for agentic execution."
         )
-        result.backend_used = "copilot-cli(connect-fallback)"
-        return result
 
 
 from common.runtime.provider_registry import register_runtime  # noqa: E402

@@ -712,7 +712,11 @@ def _generate_file_code(
 
 
 def _normalize_plan_path(path: str) -> str:
-    normalized = (path or "").strip().replace("\\", "/").lstrip("./")
+    normalized = (path or "").strip().replace("\\", "/")
+    # Strip leading ./ or / prefixes only as complete units to avoid removing
+    # legitimate leading dots (e.g. .github/, .gitignore)
+    while normalized.startswith("./") or normalized.startswith("/"):
+        normalized = normalized[2:] if normalized.startswith("./") else normalized[1:]
     if not normalized:
         return normalized
     dir_name, base_name = os.path.split(normalized)
@@ -758,8 +762,9 @@ def _is_operational_plan_artifact(file_info: dict) -> bool:
     if path_lower.startswith(".work/") or "/.work/" in path_lower:
         return True
     # Reject scripts/ helper folders (branch/PR scripts, Jira update scripts, etc.)
+    # Note: do NOT include "script" — too broad; it would match any JS file described as a script
     if path_lower.startswith("scripts/") and any(
-        kw in text for kw in ("jira", "branch", "pr", "update", "instructions", "helper", "script")
+        kw in text for kw in ("jira", "branch", "pr", "update", "instructions", "helper")
     ):
         return True
     base_name = os.path.basename(path_lower)

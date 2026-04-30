@@ -16,6 +16,7 @@ class NormalizedMessage:
     text: str  # Normalized plain text
     command: str  # Parsed command (e.g. "/tasks") or ""
     command_args: str  # Args after the command or ""
+    session_mode: str = "personal"  # personal | shared-session | team-scoped
     reply_target: dict = field(default_factory=dict)  # Platform-specific delivery info
     thread_ref: str = ""  # Teams conversation_id / Slack thread_ts / ...
     raw_payload: dict = field(default_factory=dict)  # Original platform payload (for audit)

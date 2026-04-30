@@ -1764,7 +1764,10 @@ class CompassHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/tasks":
-            cards = [_serialize_task_card(task) for task in task_store.list_tasks()]
+            query = parse_qs(urlparse(self.path).query)
+            owner_filter = ((query.get("ownerUserId") or [""])[0] or "").strip()
+            all_tasks = task_store.list_tasks(owner_filter or None)
+            cards = [_serialize_task_card(task) for task in all_tasks]
             self._send_json(200, {"tasks": cards})
             return
 
