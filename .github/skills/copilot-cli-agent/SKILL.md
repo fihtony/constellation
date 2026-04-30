@@ -30,7 +30,7 @@ Constellation policy override:
 Create a fine-grained PAT at https://github.com/settings/personal-access-tokens/new:
 - Under **Permissions → Account permissions** → select **Copilot Requests**
 
-Supported token prefixes: `github_pat_` (fine-grained), `gho_` (OAuth), `ghu_` (GitHub App)  
+Supported token types: fine-grained PAT, OAuth token, GitHub App token  
 Classic PAT (`ghp_`) is **NOT** supported.
 
 ---

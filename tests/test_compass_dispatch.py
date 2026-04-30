@@ -7,6 +7,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+os.environ.setdefault(
+    "ARTIFACT_ROOT",
+    os.path.join(tempfile.gettempdir(), "constellation-test-artifacts"),
+)
+
 from compass import app as compass_app
 from common.task_store import TaskStore
 
