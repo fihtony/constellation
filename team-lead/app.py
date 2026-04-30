@@ -58,7 +58,7 @@ MAX_REVIEW_CYCLES = int(os.environ.get("MAX_REVIEW_CYCLES", "2"))
 MAX_GATHER_ROUNDS = int(os.environ.get("MAX_GATHER_ROUNDS", "6"))
 MAX_INPUT_ROUNDS = int(os.environ.get("MAX_INPUT_ROUNDS", "2"))
 SYNC_AGENT_TIMEOUT = int(os.environ.get("SYNC_AGENT_TIMEOUT_SECONDS", "120"))
-DEV_AGENT_ACK_TIMEOUT = int(os.environ.get("DEV_AGENT_ACK_TIMEOUT_SECONDS", "300"))
+DEV_AGENT_ACK_TIMEOUT = int(os.environ.get("DEV_AGENT_ACK_TIMEOUT_SECONDS", "3600"))
 COMPASS_ACK_TIMEOUT = int(os.environ.get("COMPASS_ACK_TIMEOUT_SECONDS", "300"))
 
 _AGENT_CARD_PATH = os.path.join(os.path.dirname(__file__), "agent-card.json")
@@ -225,6 +225,38 @@ def _append_workspace_file(workspace_path: str, relative_name: str, content: str
             fh.write(content)
     except OSError as exc:
         print(f"[{AGENT_ID}] Warning: could not append workspace file {relative_name}: {exc}")
+
+
+def _read_pr_url_from_workspace(workspace: str) -> str:
+    """Return the PR URL saved by the web-agent, if available."""
+    path = os.path.join(workspace, "web-agent", "branch-info.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh).get("prUrl", "")
+    except Exception:
+        return ""
+
+
+def _post_pr_review_comment(pr_url: str, feedback: str, workspace: str, task_id: str) -> None:
+    """Best-effort: post review feedback as a comment on the PR via SCM agent."""
+    if not pr_url or not feedback:
+        return
+    try:
+        scm_url = _resolve_agent_service_url("scm.pr.comment")
+        if not scm_url:
+            print(f"[{AGENT_ID}] No SCM agent with scm.pr.comment capability — skipping PR comment")
+            return
+        msg = {
+            "messageId": f"tl-review-{task_id}",
+            "role": "ROLE_USER",
+            "parts": [{"text": f"Please add this review comment to PR {pr_url}:\n\n{feedback}"}],
+            "metadata": {"prUrl": pr_url, "commentText": feedback},
+        }
+        rev_task = _a2a_send(scm_url, msg)
+        _poll_agent_task(scm_url, rev_task.get("id", ""), timeout=30)
+        print(f"[{AGENT_ID}] Posted review comment to PR {pr_url}")
+    except Exception as exc:
+        print(f"[{AGENT_ID}] Could not post PR review comment: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -2430,6 +2462,11 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             feedback = review.get("feedback_for_dev") or ""
             log(f"Review failed — sending revision request to dev agent: {feedback[:120]}")
 
+            # Post review feedback to the PR as a comment (best-effort)
+            _pr_url = _read_pr_url_from_workspace(workspace)
+            if _pr_url:
+                _post_pr_review_comment(_pr_url, feedback, workspace, team_lead_task_id)
+
             # Reuse the SAME dev agent container (it is still running, waiting for our ACK).
             # Do NOT call _acquire_dev_agent again — that would try to launch a new container
             # which may cause DNS / timing issues while the first container is still alive.
@@ -2795,9 +2832,11 @@ def _schedule_shutdown(delay_seconds: int = 5):
 def main():
     global _SERVER
     print(f"[{AGENT_ID}] Team Lead Agent starting on {HOST}:{PORT}")
-    reporter.start()
+    # Bind and listen BEFORE registering with the registry so that Compass can
+    # dispatch immediately after the instance appears without getting ECONNREFUSED.
     agent_directory.start()
     _SERVER = ThreadingHTTPServer((HOST, PORT), TeamLeadHandler)
+    reporter.start()
     _SERVER.serve_forever()
 
 

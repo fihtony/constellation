@@ -1,6 +1,6 @@
 {
-  "agentId": "teams-gateway",
-  "cardUrl": "http://teams-gateway:8070/.well-known/agent-card.json",
+  "agentId": "im-gateway",
+  "cardUrl": "http://im-gateway:8070/.well-known/agent-card.json",
   "executionMode": "persistent",
   "scalingPolicy": {
     "maxInstances": 1,

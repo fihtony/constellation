@@ -29,8 +29,8 @@ class TestSubprocessEnvIsolation(unittest.TestCase):
             {
                 "PATH": "/usr/bin",
                 "GH_TOKEN": "gho_host",
-                "GITHUB_TOKEN": "github_pat_host",
-                "COPILOT_GITHUB_TOKEN": "github_pat_host_copilot",
+                "GITHUB_TOKEN": "ambient_github_token",
+                "COPILOT_GITHUB_TOKEN": "ambient_copilot_token",
             },
             clear=True,
         ):
@@ -45,9 +45,9 @@ class TestSubprocessEnvIsolation(unittest.TestCase):
 
     def test_build_test_subprocess_env_marks_explicit_test_credentials_trusted(self):
         with patch.dict(os.environ, {"PATH": "/usr/bin", "GH_TOKEN": "gho_host"}, clear=True):
-            env = build_test_subprocess_env({"SCM_TOKEN": "github_pat_from_tests"}, trusted=True)
+            env = build_test_subprocess_env({"SCM_TOKEN": "scm_token_from_tests"}, trusted=True)
 
-        self.assertEqual(env["SCM_TOKEN"], "github_pat_from_tests")
+        self.assertEqual(env["SCM_TOKEN"], "scm_token_from_tests")
         self.assertEqual(env["CONSTELLATION_TRUSTED_ENV"], "1")
         self.assertNotIn("GH_TOKEN", env)
 
@@ -61,7 +61,7 @@ class TestDockerLauncherEnvIsolation(unittest.TestCase):
             os.makedirs(agent_dir, exist_ok=True)
 
             with open(os.path.join(common_dir, ".env"), "w", encoding="utf-8") as handle:
-                handle.write("COPILOT_GITHUB_TOKEN=github_pat_from_common\n")
+                handle.write("COPILOT_GITHUB_TOKEN=copilot_token_from_common\n")
             with open(os.path.join(agent_dir, ".env"), "w", encoding="utf-8") as handle:
                 handle.write("OPENAI_MODEL=gpt-5-mini\n")
 
@@ -85,7 +85,7 @@ class TestDockerLauncherEnvIsolation(unittest.TestCase):
                 requests.append((method, path, payload))
                 return {}
 
-            with patch.dict(os.environ, {"COPILOT_GITHUB_TOKEN": "github_pat_host"}, clear=True):
+            with patch.dict(os.environ, {"COPILOT_GITHUB_TOKEN": "ambient_copilot_token"}, clear=True):
                 launcher = Launcher()
                 with patch.object(launcher, "_request", side_effect=fake_request), \
                      patch("common.launcher.time.sleep", return_value=None):
@@ -94,8 +94,8 @@ class TestDockerLauncherEnvIsolation(unittest.TestCase):
             payload = requests[0][2]
             env_list = payload["Env"]
             self.assertIn("CONSTELLATION_TRUSTED_ENV=1", env_list)
-            self.assertIn("COPILOT_GITHUB_TOKEN=github_pat_from_common", env_list)
-            self.assertNotIn("COPILOT_GITHUB_TOKEN=github_pat_host", env_list)
+            self.assertIn("COPILOT_GITHUB_TOKEN=copilot_token_from_common", env_list)
+            self.assertNotIn("COPILOT_GITHUB_TOKEN=ambient_copilot_token", env_list)
 
     def test_launcher_appends_extra_binds(self):
         agent_definition = {
@@ -188,7 +188,7 @@ class TestRancherLauncherEnvIsolation(unittest.TestCase):
             os.makedirs(agent_dir, exist_ok=True)
 
             with open(os.path.join(common_dir, ".env"), "w", encoding="utf-8") as handle:
-                handle.write("COPILOT_GITHUB_TOKEN=github_pat_from_common\n")
+                handle.write("COPILOT_GITHUB_TOKEN=copilot_token_from_common\n")
             with open(os.path.join(agent_dir, ".env"), "w", encoding="utf-8") as handle:
                 handle.write("OPENAI_MODEL=gpt-5-mini\n")
 
@@ -212,7 +212,7 @@ class TestRancherLauncherEnvIsolation(unittest.TestCase):
                 requests.append((method, path, payload))
                 return {}
 
-            with patch.dict(os.environ, {"COPILOT_GITHUB_TOKEN": "github_pat_host"}, clear=True):
+            with patch.dict(os.environ, {"COPILOT_GITHUB_TOKEN": "ambient_copilot_token"}, clear=True):
                 launcher = RancherLauncher()
                 with patch.object(launcher, "_request", side_effect=fake_request), \
                      patch("common.launcher_rancher.time.sleep", return_value=None):
@@ -221,8 +221,8 @@ class TestRancherLauncherEnvIsolation(unittest.TestCase):
             payload = requests[0][2]
             env_list = payload["Env"]
             self.assertIn("CONSTELLATION_TRUSTED_ENV=1", env_list)
-            self.assertIn("COPILOT_GITHUB_TOKEN=github_pat_from_common", env_list)
-            self.assertNotIn("COPILOT_GITHUB_TOKEN=github_pat_host", env_list)
+            self.assertIn("COPILOT_GITHUB_TOKEN=copilot_token_from_common", env_list)
+            self.assertNotIn("COPILOT_GITHUB_TOKEN=ambient_copilot_token", env_list)
 
     def test_launcher_appends_extra_binds(self):
         agent_definition = {

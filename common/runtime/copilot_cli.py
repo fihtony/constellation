@@ -6,9 +6,10 @@ import os
 import shlex
 import shutil
 import subprocess
+from typing import Callable
 
 from common.env_utils import build_isolated_copilot_env
-from common.runtime.adapter import AgentRuntimeAdapter
+from common.runtime.adapter import AgenticResult, AgentRuntimeAdapter
 from common.runtime.copilot_connect import CopilotConnectAdapter
 
 DEFAULT_MODEL = "gpt-5-mini"
@@ -150,3 +151,45 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
             )
 
         return self.build_result(raw, warnings=warnings, backend_used="copilot-cli")
+
+    def run_agentic(
+        self,
+        task: str,
+        *,
+        system_prompt: str | None = None,
+        cwd: str | None = None,
+        tools: list[str] | None = None,
+        mcp_servers: dict | None = None,
+        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
+        max_turns: int = 50,
+        timeout: int = 1800,
+        on_progress: Callable[[str], None] | None = None,
+        continuation: str | None = None,
+    ) -> AgenticResult:
+        """Delegate agentic execution to copilot-connect's function_calling loop.
+
+        Copilot CLI does not expose a headless agentic mode; we fall back to
+        the copilot-connect adapter which simulates multi-turn execution via
+        the OpenAI function_calling API.
+        """
+        result = self._fallback.run_agentic(
+            task,
+            system_prompt=system_prompt,
+            cwd=cwd,
+            tools=tools,
+            mcp_servers=mcp_servers,
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+            max_turns=max_turns,
+            timeout=timeout,
+            on_progress=on_progress,
+            continuation=continuation,
+        )
+        result.backend_used = "copilot-cli(connect-fallback)"
+        return result
+
+
+from common.runtime.provider_registry import register_runtime  # noqa: E402
+
+register_runtime("copilot-cli", CopilotCliAdapter)

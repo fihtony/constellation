@@ -1,4 +1,8 @@
-"""SQLite persistence layer for Teams Gateway."""
+"""Unified persistence layer for IM Gateway.
+
+Platform-agnostic schema as specified in docs/compass-slack-integration-zh.md §3.3.
+Replaces the Teams-specific DB schema with generic channel/user_id/workspace fields.
+"""
 
 from __future__ import annotations
 
@@ -7,68 +11,59 @@ import sqlite3
 import threading
 import time
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 _CREATE_TABLES = """
-CREATE TABLE IF NOT EXISTS conversation_references (
-    user_aad_id           TEXT NOT NULL,
-    tenant_id             TEXT NOT NULL,
-    conversation_id       TEXT NOT NULL,
-    service_url           TEXT NOT NULL,
-    bot_id                TEXT NOT NULL,
-    is_valid              INTEGER NOT NULL DEFAULT 1,
-    consecutive_failures  INTEGER NOT NULL DEFAULT 0,
-    created_at            TEXT NOT NULL,
-    updated_at            TEXT NOT NULL,
-    PRIMARY KEY (user_aad_id, tenant_id)
+CREATE TABLE IF NOT EXISTS conversations (
+    channel       TEXT NOT NULL,   -- "teams" | "slack" | "lark" | ...
+    user_id       TEXT NOT NULL,   -- platform-specific user identifier
+    workspace     TEXT NOT NULL,   -- tenant_id / team_id
+    target        TEXT NOT NULL,   -- JSON: platform-specific delivery target
+    is_valid      INTEGER DEFAULT 1,
+    failures      INTEGER DEFAULT 0,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (channel, user_id, workspace)
 );
 
 CREATE TABLE IF NOT EXISTS user_task_mapping (
-    task_id          TEXT NOT NULL PRIMARY KEY,
-    user_aad_id      TEXT NOT NULL,
-    tenant_id        TEXT NOT NULL,
-    last_known_state TEXT NOT NULL DEFAULT 'SUBMITTED',
-    created_at       TEXT NOT NULL,
-    updated_at       TEXT NOT NULL
+    task_id    TEXT NOT NULL PRIMARY KEY,
+    channel    TEXT NOT NULL,
+    user_id    TEXT NOT NULL,
+    workspace  TEXT NOT NULL,
+    thread_ref TEXT,              -- Teams: conversation_id; Slack: thread_ts
+    state      TEXT NOT NULL DEFAULT 'SUBMITTED',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_utm_user
-    ON user_task_mapping(user_aad_id, tenant_id);
+    ON user_task_mapping(channel, user_id, workspace);
 
 CREATE INDEX IF NOT EXISTS idx_utm_state
-    ON user_task_mapping(last_known_state);
+    ON user_task_mapping(state);
 
 CREATE TABLE IF NOT EXISTS activity_dedup (
     activity_id   TEXT NOT NULL PRIMARY KEY,
     processed_at  TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS notification_queue (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_aad_id   TEXT NOT NULL,
-    tenant_id     TEXT NOT NULL,
-    task_id       TEXT NOT NULL,
-    event_type    TEXT NOT NULL,
-    payload       TEXT NOT NULL,
-    attempts      INTEGER NOT NULL DEFAULT 0,
-    next_retry_at TEXT NOT NULL,
-    status        TEXT NOT NULL DEFAULT 'pending',
-    created_at    TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_nq_retry
-    ON notification_queue(status, next_retry_at)
-    WHERE status = 'pending';
 """
 
 
+def _iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _iso_from_ts(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
 class GatewayDB:
-    """Thread-safe SQLite wrapper for Teams Gateway persistence."""
+    """Thread-safe SQLite wrapper for IM Gateway persistence."""
 
     def __init__(self, db_path: str | None = None):
         self._db_path = db_path or os.environ.get(
-            "TEAMS_GATEWAY_DB_PATH",
-            "/app/data/teams-gateway/teams-gateway.db",
+            "IM_GATEWAY_DB_PATH",
+            "/app/data/im-gateway/im-gateway.db",
         )
         self._lock = threading.Lock()
         self._init_db()
@@ -79,10 +74,9 @@ class GatewayDB:
             os.makedirs(db_dir, exist_ok=True)
         conn = sqlite3.connect(self._db_path)
         try:
-            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA journal_mode = DELETE")  # safe across mounts
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
             conn.executescript(_CREATE_TABLES)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version < _SCHEMA_VERSION:
@@ -90,105 +84,107 @@ class GatewayDB:
             conn.commit()
         finally:
             conn.close()
-        print(f"[teams-gateway] Database initialized: {self._db_path} (schema v{_SCHEMA_VERSION})")
+        print(f"[im-gateway] Database initialized: {self._db_path} (schema v{_SCHEMA_VERSION})")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=10)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA journal_mode = DELETE")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
-    # ---- Conversation References ----
+    # ---- Conversations (replaces conversation_references) ----
 
-    def upsert_conversation_ref(
+    def upsert_conversation(
         self,
-        user_aad_id: str,
-        tenant_id: str,
-        conversation_id: str,
-        service_url: str,
-        bot_id: str,
-    ):
+        channel: str,
+        user_id: str,
+        workspace: str,
+        target: dict,
+    ) -> None:
+        import json as _json
         now = _iso_now()
+        target_json = _json.dumps(target, ensure_ascii=False)
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(
-                    """INSERT INTO conversation_references
-                       (user_aad_id, tenant_id, conversation_id, service_url, bot_id,
-                        is_valid, consecutive_failures, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?)
-                       ON CONFLICT(user_aad_id, tenant_id) DO UPDATE SET
-                         conversation_id = excluded.conversation_id,
-                         service_url = excluded.service_url,
-                         bot_id = excluded.bot_id,
+                    """INSERT INTO conversations
+                       (channel, user_id, workspace, target, is_valid, failures, updated_at)
+                       VALUES (?, ?, ?, ?, 1, 0, ?)
+                       ON CONFLICT(channel, user_id, workspace) DO UPDATE SET
+                         target = excluded.target,
                          is_valid = 1,
-                         consecutive_failures = 0,
+                         failures = 0,
                          updated_at = excluded.updated_at""",
-                    (user_aad_id, tenant_id, conversation_id, service_url, bot_id, now, now),
+                    (channel, user_id, workspace, target_json, now),
                 )
                 conn.commit()
             finally:
                 conn.close()
 
-    def get_conversation_ref(self, user_aad_id: str, tenant_id: str) -> dict | None:
+    def get_conversation(self, channel: str, user_id: str, workspace: str) -> dict | None:
+        import json as _json
         with self._lock:
             conn = self._connect()
             try:
                 row = conn.execute(
-                    "SELECT * FROM conversation_references WHERE user_aad_id=? AND tenant_id=?",
-                    (user_aad_id, tenant_id),
+                    "SELECT * FROM conversations WHERE channel=? AND user_id=? AND workspace=?",
+                    (channel, user_id, workspace),
                 ).fetchone()
-                return dict(row) if row else None
+                if not row:
+                    return None
+                result = dict(row)
+                result["target"] = _json.loads(result["target"])
+                return result
             finally:
                 conn.close()
 
-    def delete_conversation_ref(self, user_aad_id: str, tenant_id: str):
+    def delete_conversation(self, channel: str, user_id: str, workspace: str) -> None:
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(
-                    "DELETE FROM conversation_references WHERE user_aad_id=? AND tenant_id=?",
-                    (user_aad_id, tenant_id),
+                    "DELETE FROM conversations WHERE channel=? AND user_id=? AND workspace=?",
+                    (channel, user_id, workspace),
                 )
                 conn.commit()
             finally:
                 conn.close()
 
-    def mark_conversation_invalid(self, user_aad_id: str, tenant_id: str):
+    def mark_conversation_invalid(self, channel: str, user_id: str, workspace: str) -> None:
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(
-                    """UPDATE conversation_references SET is_valid=0, updated_at=?
-                       WHERE user_aad_id=? AND tenant_id=?""",
-                    (_iso_now(), user_aad_id, tenant_id),
+                    """UPDATE conversations SET is_valid=0, updated_at=?
+                       WHERE channel=? AND user_id=? AND workspace=?""",
+                    (_iso_now(), channel, user_id, workspace),
                 )
                 conn.commit()
             finally:
                 conn.close()
 
-    def increment_failure(self, user_aad_id: str, tenant_id: str) -> int:
-        """Increment consecutive_failures, auto-invalidate at 5. Returns new count."""
+    def increment_failure(self, channel: str, user_id: str, workspace: str) -> int:
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(
-                    """UPDATE conversation_references
-                       SET consecutive_failures = consecutive_failures + 1, updated_at=?
-                       WHERE user_aad_id=? AND tenant_id=?""",
-                    (_iso_now(), user_aad_id, tenant_id),
+                    """UPDATE conversations
+                       SET failures = failures + 1, updated_at=?
+                       WHERE channel=? AND user_id=? AND workspace=?""",
+                    (_iso_now(), channel, user_id, workspace),
                 )
                 row = conn.execute(
-                    "SELECT consecutive_failures FROM conversation_references WHERE user_aad_id=? AND tenant_id=?",
-                    (user_aad_id, tenant_id),
+                    "SELECT failures FROM conversations WHERE channel=? AND user_id=? AND workspace=?",
+                    (channel, user_id, workspace),
                 ).fetchone()
                 count = row[0] if row else 0
                 if count >= 5:
                     conn.execute(
-                        "UPDATE conversation_references SET is_valid=0 WHERE user_aad_id=? AND tenant_id=?",
-                        (user_aad_id, tenant_id),
+                        "UPDATE conversations SET is_valid=0 WHERE channel=? AND user_id=? AND workspace=?",
+                        (channel, user_id, workspace),
                     )
                 conn.commit()
                 return count
@@ -197,42 +193,49 @@ class GatewayDB:
 
     # ---- User-Task Mapping ----
 
-    def add_task_mapping(self, task_id: str, user_aad_id: str, tenant_id: str):
+    def add_task_mapping(
+        self,
+        task_id: str,
+        channel: str,
+        user_id: str,
+        workspace: str,
+        thread_ref: str = "",
+    ) -> None:
         now = _iso_now()
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(
                     """INSERT OR REPLACE INTO user_task_mapping
-                       (task_id, user_aad_id, tenant_id, last_known_state, created_at, updated_at)
-                       VALUES (?, ?, ?, 'SUBMITTED', ?, ?)""",
-                    (task_id, user_aad_id, tenant_id, now, now),
+                       (task_id, channel, user_id, workspace, thread_ref, state, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, 'SUBMITTED', ?, ?)""",
+                    (task_id, channel, user_id, workspace, thread_ref, now, now),
                 )
                 conn.commit()
             finally:
                 conn.close()
 
-    def update_task_state(self, task_id: str, state: str):
+    def update_task_state(self, task_id: str, state: str) -> None:
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(
-                    "UPDATE user_task_mapping SET last_known_state=?, updated_at=? WHERE task_id=?",
+                    "UPDATE user_task_mapping SET state=?, updated_at=? WHERE task_id=?",
                     (state, _iso_now(), task_id),
                 )
                 conn.commit()
             finally:
                 conn.close()
 
-    def get_user_tasks(self, user_aad_id: str, tenant_id: str) -> list[dict]:
+    def get_user_tasks(self, channel: str, user_id: str, workspace: str) -> list[dict]:
         with self._lock:
             conn = self._connect()
             try:
                 rows = conn.execute(
                     """SELECT * FROM user_task_mapping
-                       WHERE user_aad_id=? AND tenant_id=?
+                       WHERE channel=? AND user_id=? AND workspace=?
                        ORDER BY created_at DESC""",
-                    (user_aad_id, tenant_id),
+                    (channel, user_id, workspace),
                 ).fetchall()
                 return [dict(r) for r in rows]
             finally:
@@ -243,14 +246,14 @@ class GatewayDB:
             conn = self._connect()
             try:
                 row = conn.execute(
-                    "SELECT user_aad_id, tenant_id FROM user_task_mapping WHERE task_id=?",
+                    "SELECT channel, user_id, workspace, thread_ref FROM user_task_mapping WHERE task_id=?",
                     (task_id,),
                 ).fetchone()
                 return dict(row) if row else None
             finally:
                 conn.close()
 
-    def count_active_tasks(self, user_aad_id: str, tenant_id: str) -> int:
+    def count_active_tasks(self, channel: str, user_id: str, workspace: str) -> int:
         terminal = ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED")
         placeholders = ",".join("?" for _ in terminal)
         with self._lock:
@@ -258,8 +261,8 @@ class GatewayDB:
             try:
                 row = conn.execute(
                     f"""SELECT COUNT(*) FROM user_task_mapping
-                       WHERE user_aad_id=? AND tenant_id=? AND last_known_state NOT IN ({placeholders})""",
-                    (user_aad_id, tenant_id) + terminal,
+                       WHERE channel=? AND user_id=? AND workspace=? AND state NOT IN ({placeholders})""",
+                    (channel, user_id, workspace) + terminal,
                 ).fetchone()
                 return row[0] if row else 0
             finally:
@@ -268,7 +271,6 @@ class GatewayDB:
     # ---- Activity Dedup ----
 
     def check_and_record_activity(self, activity_id: str) -> bool:
-        """Return True if activity was already processed (duplicate)."""
         now = _iso_now()
         with self._lock:
             conn = self._connect()
@@ -288,20 +290,17 @@ class GatewayDB:
             finally:
                 conn.close()
 
-    def cleanup_old_activities(self, max_age_seconds: int = 600):
+    def cleanup_old_activities(self, max_age_seconds: int = 600) -> None:
         cutoff = _iso_from_ts(time.time() - max_age_seconds)
         with self._lock:
             conn = self._connect()
             try:
-                conn.execute(
-                    "DELETE FROM activity_dedup WHERE processed_at < ?",
-                    (cutoff,),
-                )
+                conn.execute("DELETE FROM activity_dedup WHERE processed_at < ?", (cutoff,))
                 conn.commit()
             finally:
                 conn.close()
 
-    def cleanup_old_task_mappings(self, max_age_days: int = 30):
+    def cleanup_old_task_mappings(self, max_age_days: int = 30) -> None:
         cutoff = _iso_from_ts(time.time() - max_age_days * 86400)
         terminal = ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED")
         placeholders = ",".join("?" for _ in terminal)
@@ -310,17 +309,9 @@ class GatewayDB:
             try:
                 conn.execute(
                     f"""DELETE FROM user_task_mapping
-                       WHERE last_known_state IN ({placeholders}) AND updated_at < ?""",
+                       WHERE state IN ({placeholders}) AND updated_at < ?""",
                     terminal + (cutoff,),
                 )
                 conn.commit()
             finally:
                 conn.close()
-
-
-def _iso_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def _iso_from_ts(ts: float) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))

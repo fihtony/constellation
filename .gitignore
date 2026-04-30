@@ -29,6 +29,7 @@ data/
 # Reports are committed for audit (do not ignore reports/)
 
 # IDE
+.claude/
 .idea/
 .vscode/
 *.swp

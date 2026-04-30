@@ -184,6 +184,7 @@ services:
       TZ: "${TZ:-UTC}"
     volumes:
       - ./artifacts:/app/artifacts
+      - ./reference:/app/reference:ro
     labels:
       constellation.agent_id: "ui-design-agent"
       constellation.agent_name: "UI Design Agent"
@@ -276,31 +277,31 @@ services:
   #     retries: 20
   #     start_period: 2s
 
-  teams-gateway:
-    image: constellation-teams-gateway:latest
+  im-gateway:
+    image: constellation-im-gateway:latest
     build:
       context: .
-      dockerfile: teams-gateway/Dockerfile
-    command: ["python3", "teams-gateway/app.py"]
+      dockerfile: im-gateway/Dockerfile
+    command: ["python3", "-m", "im_gateway.app"]
     depends_on:
       compass:
         condition: service_healthy
     env_file:
-      - ./teams-gateway/.env
+      - ./im-gateway/.env
     environment:
       HOST: "0.0.0.0"
       PORT: "8070"
-      AGENT_ID: "teams-gateway"
-      ADVERTISED_BASE_URL: "http://teams-gateway:8070"
+      AGENT_ID: "im-gateway"
+      ADVERTISED_BASE_URL: "http://im-gateway:8070"
       COMPASS_URL: "http://compass:8080"
       REGISTRY_URL: "http://registry:9000"
-      TEAMS_GATEWAY_DB_PATH: "/app/data/teams-gateway/teams-gateway.db"
+      IM_GATEWAY_DB_PATH: "/app/data/im-gateway/im-gateway.db"
       TZ: "${TZ:-UTC}"
     volumes:
       - ./data:/app/data
     labels:
-      constellation.agent_id: "teams-gateway"
-      constellation.agent_name: "Teams Gateway"
+      constellation.agent_id: "im-gateway"
+      constellation.agent_name: "IM Gateway"
       constellation.agent_role: "integration"
     ports:
       - "8070:8070"

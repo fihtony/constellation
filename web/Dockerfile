@@ -5,7 +5,7 @@ WORKDIR /app
 # Install Node.js 22 (required for GitHub Copilot CLI) + git + chromium for headless UI screenshots
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       ca-certificates git curl \
+       ca-certificates tini git curl \
        chromium fonts-freefont-ttf \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
@@ -31,4 +31,5 @@ RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
     && chown -R appuser:appuser /app
 USER appuser
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python3", "web/app.py"]

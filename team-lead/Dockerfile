@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install Node.js 22 (required for GitHub Copilot CLI)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates tini curl \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && npm install -g @github/copilot \
@@ -29,4 +29,5 @@ RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
     && chown -R appuser:appuser /app
 USER appuser
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python3", "team-lead/app.py"]

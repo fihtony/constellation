@@ -193,7 +193,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         ctx = team_lead_app._TaskContext()
         ctx.jira_info = {"ticket_key": "CSTL-4", "content": "Jira ticket content."}
         ctx.repo_info = {
-            "repo_url": "https://github.com/fihtony/english-study-hub",
+            "repo_url": "https://github.com/example-org/english-study-hub",
             "content": "Repo uses React app routing and CSS modules.",
         }
 
@@ -619,9 +619,9 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 "request": "Fetch ticket CSTL-4",
             }
             ctx.repo_info = {
-                "repo_url": "https://github.com/fihtony/english-study-hub",
+                "repo_url": "https://github.com/example-org/english-study-hub",
                 "content": "Repository metadata already fetched.",
-                "request": "Inspect repository https://github.com/fihtony/english-study-hub",
+                "request": "Inspect repository https://github.com/example-org/english-study-hub",
             }
 
             analysis = {
@@ -633,7 +633,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 "design_url": "https://www.figma.com/design/abc123/English-Study-Hub",
                 "design_type": "figma",
                 "design_page_name": "Practice Quiz",
-                "target_repo_url": "https://github.com/fihtony/english-study-hub",
+                "target_repo_url": "https://github.com/example-org/english-study-hub",
                 "missing_info": [],
                 "question_for_user": None,
                 "summary": "Implement CSTL-4.",
@@ -644,7 +644,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 return {
                     "pending_tasks": [
                         "Fetch the full Jira issue CSTL-4 (all fields, AC, links, attachments, comments, sprint/epic context).",
-                        "Inspect the target repository fihtony/english-study-hub (branch, file tree, manifests, README, CI, infer tech stack).",
+                        "Inspect the target repository example-org/english-study-hub (branch, file tree, manifests, README, CI, infer tech stack).",
                         "Fetch the referenced Figma design node/page from the provided Figma URL (capture images, node structure, styles, and page name).",
                     ],
                     "actions": [
@@ -657,7 +657,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                         {
                             "action": "fetch_agent_context",
                             "capability": "scm.repo.inspect",
-                            "message": "Inspect repository https://github.com/fihtony/english-study-hub",
+                            "message": "Inspect repository https://github.com/example-org/english-study-hub",
                             "reason": "Need the latest repository metadata.",
                         },
                     ],
@@ -671,7 +671,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             fake_plan = {
                 "platform": "web",
                 "dev_capability": "web.task.execute",
-                "target_repo_url": "https://github.com/fihtony/english-study-hub",
+                "target_repo_url": "https://github.com/example-org/english-study-hub",
                 "dev_instruction": "Implement the requested page in the target repository.",
                 "acceptance_criteria": ["Practice Quiz screen matches the design."],
                 "requires_tests": True,

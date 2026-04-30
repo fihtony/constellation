@@ -201,7 +201,7 @@ This keeps Copilot CLI valuable for multi-step reasoning while preserving Conste
 
 ```env
 # Required: Fine-grained PAT with "Copilot Requests" permission
-COPILOT_GITHUB_TOKEN=github_pat_...
+COPILOT_GITHUB_TOKEN=<your-copilot-github-token>
 
 # Optional: override model (default: gpt-5-mini)
 COPILOT_MODEL=gpt-5-mini

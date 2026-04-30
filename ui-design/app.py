@@ -286,6 +286,38 @@ def _handle_stitch_message(user_text: str, capability: str, workspace_path: str 
         else:
             summary_parts.append(f"Stitch project fetch failed: {status}")
 
+    # Enrich design_result with local reference files if STITCH_LOCAL_REFS is configured.
+    # Format: "screenId1:/path/to/ref1,screenId2:/path/to/ref2"
+    _local_ref_map: dict[str, str] = {}
+    for _entry in os.environ.get("STITCH_LOCAL_REFS", "").split(","):
+        _entry = _entry.strip()
+        if ":" in _entry:
+            _sid, _rpath = _entry.split(":", 1)
+            _local_ref_map[_sid.strip().lower()] = _rpath.strip()
+    _local_ref_path = (
+        _local_ref_map.get((screen_id or "").lower())
+        or _local_ref_map.get((project_id or "").lower())
+        or ""
+    )
+    if _local_ref_path and os.path.isdir(_local_ref_path):
+        import shutil as _shutil
+        _screen_png = os.path.join(_local_ref_path, "screen.png")
+        if workspace_path and os.path.isfile(_screen_png):
+            _dest = os.path.join(workspace_path, "ui-design", "design-reference.png")
+            os.makedirs(os.path.dirname(_dest), exist_ok=True)
+            _shutil.copy2(_screen_png, _dest)
+            summary_parts.append("Local design reference screenshot saved to workspace")
+        _code_html_path = os.path.join(_local_ref_path, "code.html")
+        _design_md_path = os.path.join(_local_ref_path, "DESIGN.md")
+        if os.path.isfile(_code_html_path):
+            with open(_code_html_path, encoding="utf-8") as _fh:
+                design_result["localCodeHtml"] = _fh.read()
+            summary_parts.append(f"Local code.html loaded ({len(design_result['localCodeHtml'])} chars)")
+        if os.path.isfile(_design_md_path):
+            with open(_design_md_path, encoding="utf-8") as _fh:
+                design_result["localDesignMd"] = _fh.read()
+            summary_parts.append("Local DESIGN.md loaded")
+
     # Save design content to shared workspace
     if workspace_path and design_result:
         _save_workspace_file(

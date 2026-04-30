@@ -69,7 +69,7 @@ JIRA_API_BASE   = f"{JIRA_BASE_URL}/rest/api/3"
 JIRA_TOKEN      = _ENV.get("TEST_JIRA_TOKEN", "")
 JIRA_EMAIL      = _ENV.get("TEST_JIRA_EMAIL", "")
 
-GITHUB_REPO_URL = _ENV.get("TEST_GITHUB_REPO_URL", "https://github.com/fihtony/english-study-hub")
+GITHUB_REPO_URL = _ENV.get("TEST_GITHUB_REPO_URL", "https://github.com/example-org/english-study-hub")
 GITHUB_TOKEN    = _ENV.get("TEST_GITHUB_TOKEN", "")
 _gh = GITHUB_REPO_URL.rstrip("/").split("/")
 GITHUB_OWNER    = _gh[-2] if len(_gh) >= 2 else ""

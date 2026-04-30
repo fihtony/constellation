@@ -130,7 +130,7 @@ Rejected with explicit guidance:
 Run the focused unit tests first:
 
 ```bash
-/Users/tony/projects/constellation/venv/bin/python -m unittest \
+venv/bin/python -m unittest \
   tests.test_compass_dispatch \
   tests.test_office_agent \
   tests.test_env_isolation
@@ -139,7 +139,7 @@ Run the focused unit tests first:
 Then run the Office end-to-end flow through Compass, including inplace writes:
 
 ```bash
-/Users/tony/projects/constellation/venv/bin/python tests/test_office_agent_e2e.py -v
+venv/bin/python tests/test_office_agent_e2e.py -v
 ```
 
 Build the Office Agent image when validating container wiring:

@@ -1,4 +1,4 @@
-"""HTTP client for Compass API calls from Teams Gateway."""
+"""HTTP client for Compass API calls from IM Gateway."""
 
 from __future__ import annotations
 

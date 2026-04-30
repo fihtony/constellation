@@ -419,3 +419,56 @@ Analyze the failure and return a JSON object listing only the files that need ch
   ]
 }}
 """
+
+
+# ---------------------------------------------------------------------------
+# Self-Assessment
+# ---------------------------------------------------------------------------
+
+SELF_ASSESS_SYSTEM = """\
+You are a senior software engineer performing a self-review of your own implementation before
+submitting it for peer code review.
+
+Your goal is to objectively assess whether the implementation fully satisfies every acceptance
+criterion and meets production-quality standards. Be honest — identify real gaps and missing
+functionality, not minor style preferences.
+
+Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
+"""
+
+SELF_ASSESS_TEMPLATE = """\
+Review the following implementation against the acceptance criteria and identify any gaps.
+
+## Task
+{task_instruction}
+
+## Acceptance Criteria
+{acceptance_criteria}
+
+## Files Implemented
+{files_summary}
+
+## Build / Test Results
+{test_results}
+
+{screenshot_hint}
+
+## Instructions
+For each acceptance criterion, determine whether it is genuinely met by the implementation.
+Identify files that need improvement to address unmet criteria.
+
+Respond with a JSON object:
+{{
+  "passed": true/false,
+  "issues": ["description of gap 1", "description of gap 2"],
+  "files_to_fix": ["path/to/file.py", "path/to/other.js"],
+  "summary": "Brief overall assessment (1-2 sentences)"
+}}
+
+Rules:
+- Set "passed" to true only if ALL acceptance criteria are clearly met AND the build/tests pass.
+- Keep "issues" focused on acceptance-criteria gaps, not minor style preferences.
+- List only the specific files that need changes in "files_to_fix".
+- If build/tests failed, "passed" must be false.
+- If a required file is missing entirely, name the file that should be created in "files_to_fix".
+"""

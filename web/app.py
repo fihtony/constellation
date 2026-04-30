@@ -76,6 +76,12 @@ _DEVELOPMENT_SKILL_NAMES = [
     "constellation-code-review-delivery",
     "constellation-testing-delivery",
     "constellation-ui-evidence-delivery",
+    "react-nextjs-delivery",
+    "ant-design-delivery",
+    "mui-delivery",
+    "nodejs-express-delivery",
+    "java-spring-delivery",
+    "sql-mongodb-delivery",
 ]
 
 # Viewports for UI implementation screenshots captured after each build.
@@ -629,6 +635,49 @@ def _plan_implementation(
     )
     repaired_plan = _parse_json_from_llm(repaired_response)
     return repaired_plan or plan
+
+
+def _self_assess_implementation(
+    task_instruction: str,
+    acceptance_criteria: list,
+    generated_files: list[dict],
+    build_ok: bool | None,
+    build_output: str,
+    screenshot_paths: list[str],
+) -> dict:
+    """Ask LLM to self-review the implementation vs acceptance criteria.
+
+    Returns {"passed": bool, "issues": [...], "files_to_fix": [...], "summary": "..."}
+    """
+    criteria_text = "\n".join(f"- {c}" for c in (acceptance_criteria or [])) or "Not specified."
+    files_summary = "\n".join(
+        f"- {gf['path']} ({gf.get('action', 'create')})"
+        for gf in generated_files
+    ) or "No files generated."
+    if build_ok is None:
+        test_results = "Build/test was not run."
+    elif build_ok:
+        test_results = "✅ Build and tests passed."
+    else:
+        excerpt = (build_output or "")[:1000]
+        test_results = f"❌ Build/tests failed.\n{excerpt}"
+    if screenshot_paths:
+        screenshot_hint = f"Screenshots captured: {', '.join(os.path.basename(p) for p in screenshot_paths)}"
+    else:
+        screenshot_hint = "No screenshots captured (non-UI task or screenshot failed)."
+    prompt = prompts.SELF_ASSESS_TEMPLATE.format(
+        task_instruction=task_instruction[:2000],
+        acceptance_criteria=criteria_text,
+        files_summary=files_summary,
+        test_results=test_results,
+        screenshot_hint=screenshot_hint,
+    )
+    system = _build_web_system_prompt(prompts.SELF_ASSESS_SYSTEM)
+    response = _run_agentic(prompt, f"[{AGENT_ID}] self-assess", system_prompt=system, timeout=60)
+    result = _parse_json_from_llm(response)
+    if not isinstance(result, dict):
+        return {"passed": False, "issues": ["Assessment parse error"], "files_to_fix": [], "summary": ""}
+    return result
 
 
 def _generate_file_code(
@@ -2101,9 +2150,14 @@ def _capture_browser_screenshot(url: str, out_path: str, log_fn) -> bool:
 
 def _get_design_reference_details(workspace: str) -> dict:
     """Return best-effort design reference inputs for screenshot capture."""
-    details = {"thumbnail_url": "", "design_url": ""}
+    details = {"thumbnail_url": "", "design_url": "", "local_design_ref": ""}
     if not workspace:
         return details
+
+    # Priority: local reference screenshot saved by UI Design Agent
+    local_ref = os.path.join(workspace, "ui-design", "design-reference.png")
+    if os.path.isfile(local_ref):
+        details["local_design_ref"] = local_ref
 
     design_context = _read_workspace_json(workspace, "team-lead/design-context.json")
     if design_context.get("url"):
@@ -2545,6 +2599,20 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 f"REVISION REQUEST — please fix the following issues:\n{issues_text}"
             )
 
+        # Restore clone/branch state from prior task in the same workspace (revision)
+        if is_revision and workspace:
+            _ci = _read_workspace_json(workspace, f"{AGENT_ID}/clone-info.json")
+            _bi = _read_workspace_json(workspace, f"{AGENT_ID}/branch-info.json")
+            if _ci and _ci.get("clonePath") and os.path.isdir(_ci["clonePath"]):
+                clone_path = _ci["clonePath"]
+                repo_url = repo_url or _ci.get("repoUrl", "")
+                log(f"Revision: reusing existing clone at {clone_path}")
+            if _bi and _bi.get("branch"):
+                branch_name = _bi["branch"]
+                branch_kind = _bi.get("branchKind", "feature")
+                pr_url = _bi.get("prUrl", "")
+                log(f"Revision: restored branch={branch_name} pr={pr_url}")
+
         # ── Phase 1: Analyze ────────────────────────────────────────────────
         task_store.update_state(task_id, "ANALYZING", "Analyzing the web development task…")
         log("Analyzing task")
@@ -2596,17 +2664,29 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 )
 
             # ── Dev Workflow Step 1: Mark ticket In Progress ─────────────────
-            log(f"Updating Jira ticket {ticket_key}: In Progress → assign self → comment")
-            _jira_transition(ticket_key, "In Progress", task_id, workspace, compass_task_id)
-            _jira_assign_self(ticket_key, task_id, workspace, compass_task_id)
-            _jira_add_comment(
-                ticket_key,
-                f"🤖 **Web Agent** (`{AGENT_ID}`) has picked up this ticket and started development.\n"
-                f"Internal task ID: `{workflow_task_id}`",
-                task_id,
-                workspace,
-                compass_task_id,
-            )
+            if not is_revision:
+                log(f"Updating Jira ticket {ticket_key}: In Progress → assign self → comment")
+                _jira_transition(ticket_key, "In Progress", task_id, workspace, compass_task_id)
+                _jira_assign_self(ticket_key, task_id, workspace, compass_task_id)
+                _jira_add_comment(
+                    ticket_key,
+                    f"🤖 **Web Agent** (`{AGENT_ID}`) has picked up this ticket and started development.\n"
+                    f"Internal task ID: `{workflow_task_id}`",
+                    task_id,
+                    workspace,
+                    compass_task_id,
+                )
+            else:
+                rev_cycle = metadata.get("revisionCycle", 1)
+                log(f"Revision {rev_cycle}: adding Jira progress comment for {ticket_key}")
+                _jira_add_comment(
+                    ticket_key,
+                    f"📝 **Revision {rev_cycle}**: Applying code review feedback.\n"
+                    f"Internal task ID: `{workflow_task_id}`",
+                    task_id,
+                    workspace,
+                    compass_task_id,
+                )
 
         repo_url = metadata_repo_url or analysis.get("repo_url") or ""
         # Fall back to extracting from instruction text
@@ -2618,52 +2698,61 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 repo_url = url_match.group().rstrip("/.,;)")
 
         if repo_url and workspace:
-            log(f"Cloning repository: {repo_url}")
-            try:
-                clone_path = _clone_repo(task_id, repo_url, workspace, compass_task_id)
-            except Exception as err:
-                _save_workspace_file(
-                    workspace,
-                    f"{AGENT_ID}/clone-info.json",
-                    json.dumps(
-                        {
-                            "taskId": workflow_task_id,
-                            "agentTaskId": task_id,
-                            "agentId": AGENT_ID,
-                            "repoUrl": repo_url,
-                            "clonePath": "",
-                            "status": "failed",
-                            "error": str(err),
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                )
-                raise
             if clone_path:
-                log(f"Repository cloned to {clone_path}")
-                _save_workspace_file(
-                    workspace,
-                    f"{AGENT_ID}/clone-info.json",
-                    json.dumps(
-                        {
-                            "taskId": workflow_task_id,
-                            "agentTaskId": task_id,
-                            "agentId": AGENT_ID,
-                            "repoUrl": repo_url,
-                            "clonePath": clone_path,
-                            "status": "completed",
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                )
+                # Revision: reuse existing clone, just refresh snapshot and re-analyse
+                log(f"Revision: refreshing snapshot from existing clone {clone_path}")
                 repo_snapshot = _read_repo_snapshot(clone_path)
-                # Re-analyze with repo context
                 analysis = _apply_tech_stack_constraints(
                     _analyze_task(task_instruction, acceptance_criteria, repo_snapshot[:2000]),
                     tech_stack_constraints,
                 )
+            else:
+                log(f"Cloning repository: {repo_url}")
+                try:
+                    clone_path = _clone_repo(task_id, repo_url, workspace, compass_task_id)
+                except Exception as err:
+                    _save_workspace_file(
+                        workspace,
+                        f"{AGENT_ID}/clone-info.json",
+                        json.dumps(
+                            {
+                                "taskId": workflow_task_id,
+                                "agentTaskId": task_id,
+                                "agentId": AGENT_ID,
+                                "repoUrl": repo_url,
+                                "clonePath": "",
+                                "status": "failed",
+                                "error": str(err),
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                    )
+                    raise
+                if clone_path:
+                    log(f"Repository cloned to {clone_path}")
+                    _save_workspace_file(
+                        workspace,
+                        f"{AGENT_ID}/clone-info.json",
+                        json.dumps(
+                            {
+                                "taskId": workflow_task_id,
+                                "agentTaskId": task_id,
+                                "agentId": AGENT_ID,
+                                "repoUrl": repo_url,
+                                "clonePath": clone_path,
+                                "status": "completed",
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                    )
+                    repo_snapshot = _read_repo_snapshot(clone_path)
+                    # Re-analyze with repo context
+                    analysis = _apply_tech_stack_constraints(
+                        _analyze_task(task_instruction, acceptance_criteria, repo_snapshot[:2000]),
+                        tech_stack_constraints,
+                    )
 
         # ── Phase 3: Plan ────────────────────────────────────────────────────
         task_store.update_state(task_id, "PLANNING", "Creating implementation plan…")
@@ -2680,6 +2769,31 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 parts.append(design_context_meta["content"])
             design_context_str = "\n".join(parts)
             log(f"Using design context from Team Lead ({len(design_context_str)} chars)")
+
+        # Augment with local reference files saved by UI Design Agent (full spec + HTML template)
+        if workspace:
+            _stitch_local = _read_workspace_json(workspace, "ui-design/stitch-design.json")
+            _local_code_html = _stitch_local.get("localCodeHtml", "")
+            _local_design_md = _stitch_local.get("localDesignMd", "")
+            if _local_code_html or _local_design_md:
+                _extra: list[str] = []
+                if _local_design_md:
+                    _extra.append(
+                        "## Design System Specification (DESIGN.md)\n"
+                        "Follow this design spec exactly — colors, typography, spacing, components.\n"
+                        + _local_design_md
+                    )
+                if _local_code_html:
+                    _extra.append(
+                        "## Reference HTML Implementation\n"
+                        "This is the pixel-perfect reference implementation. "
+                        "Use this as the authoritative design template — replicate the layout, "
+                        "color scheme, typography, and component structure faithfully.\n"
+                        f"```html\n{_local_code_html}\n```"
+                    )
+                design_context_str = "\n\n".join(filter(None, [design_context_str] + _extra))
+                log(f"Design context enriched with local Stitch reference ({len(design_context_str)} chars)")
+
         plan = _plan_implementation(
             task_instruction,
             acceptance_criteria,
@@ -2741,17 +2855,20 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         planned_paths = [file_info.get("path", "") for file_info in files_to_implement]
         ticket_key = ticket_match.group(1) if ticket_match else ""
         if repo_url and clone_path:
-            branch_name, branch_kind = _select_branch_name(
-                task_instruction,
-                analysis,
-                planned_paths,
-                ticket_key,
-                task_id,
-                repo_url,
-                clone_path,
-                workspace,
-                compass_task_id,
-            )
+            if not branch_name:
+                branch_name, branch_kind = _select_branch_name(
+                    task_instruction,
+                    analysis,
+                    planned_paths,
+                    ticket_key,
+                    task_id,
+                    repo_url,
+                    clone_path,
+                    workspace,
+                    compass_task_id,
+                )
+            else:
+                log(f"Revision: reusing branch {branch_name}")
             _checkout_local_branch(clone_path, branch_name, "main", log)
             _save_workspace_file(
                 workspace,
@@ -2880,6 +2997,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             )
 
         # ── Phase 5c: Capture UI evidence (design reference + screenshot) ────
+        _screenshot_paths: list[str] = []
         _is_ui_task = (
             analysis.get("frontend_framework", "none") not in ("none", "")
             or any(fi.get("path", "").endswith(".html") for fi in generated_files)
@@ -2891,12 +3009,19 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             log("Capturing UI evidence (design reference + implementation screenshots)")
             design_ref_path = os.path.join(evidence_dir, "design-reference.png")
 
-            # 1. Design reference — download Stitch thumbnail if available
+            # 1. Design reference — local file > Stitch thumbnail > browser capture
             design_reference = _get_design_reference_details(workspace)
+            local_design_ref = design_reference.get("local_design_ref", "")
             thumbnail_url = design_reference.get("thumbnail_url", "")
             design_url = design_reference.get("design_url", "")
             design_saved = False
-            if thumbnail_url:
+            if local_design_ref:
+                import shutil as _shutil
+                os.makedirs(os.path.dirname(design_ref_path), exist_ok=True)
+                _shutil.copy2(local_design_ref, design_ref_path)
+                log("Design reference screenshot copied from local reference")
+                design_saved = True
+            elif thumbnail_url:
                 if _download_url_to_file(thumbnail_url, design_ref_path):
                     log("Design reference screenshot downloaded")
                     design_saved = True
@@ -2967,6 +3092,114 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     ["artifacts/figma"],
                     log,
                 )
+            _screenshot_paths = list(_captured.values()) if _is_ui_task else []
+
+        # ── Phase 5d: Self-assessment loop (up to 5 iterations) ─────────────
+        MAX_SELF_IMPROVE = 5
+        for _sa_iter in range(MAX_SELF_IMPROVE):
+            log(f"Self-assess [{_sa_iter + 1}/{MAX_SELF_IMPROVE}]")
+            task_store.update_state(
+                task_id, "SELF_ASSESSING",
+                f"Self-assessment [{_sa_iter + 1}/{MAX_SELF_IMPROVE}]…",
+            )
+            _assess = _self_assess_implementation(
+                task_instruction,
+                acceptance_criteria,
+                generated_files,
+                build_ok,
+                build_output,
+                _screenshot_paths,
+            )
+            _assess_passed = bool(_assess.get("passed"))
+            _assess_issues = _assess.get("issues") or []
+            _assess_files = _assess.get("files_to_fix") or []
+            log(
+                f"Self-assess [{_sa_iter + 1}/{MAX_SELF_IMPROVE}]: "
+                f"passed={_assess_passed}, issues={len(_assess_issues)}"
+            )
+            _save_workspace_file(
+                workspace,
+                f"{AGENT_ID}/self-assess-{_sa_iter + 1}.json",
+                json.dumps(
+                    {
+                        "iteration": _sa_iter + 1,
+                        "passed": _assess_passed,
+                        "issues": _assess_issues,
+                        "filesToFix": _assess_files,
+                        "summary": _assess.get("summary", ""),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+            if _assess_passed or _sa_iter == MAX_SELF_IMPROVE - 1:
+                if not _assess_passed:
+                    log("Self-assess: max iterations reached, proceeding with current implementation")
+                break
+            if not _assess_files:
+                log("Self-assess: issues found but no specific files to fix — proceeding")
+                break
+            log(f"Self-assess: re-generating {len(_assess_files)} file(s): {_assess_files}")
+            _fix_context = ""
+            for _fi in files_to_implement:
+                if _fi.get("path") not in _assess_files:
+                    continue
+                _existing_fix = ""
+                if clone_path:
+                    _fp = os.path.join(clone_path, _fi["path"].lstrip("/"))
+                    if os.path.isfile(_fp):
+                        try:
+                            with open(_fp, encoding="utf-8", errors="replace") as _fh:
+                                _existing_fix = _fh.read(8000)
+                        except Exception:
+                            pass
+                _new_code = _generate_file_code(
+                    _fi, task_instruction, analysis, _fix_context, _existing_fix,
+                )
+                _new_code = _strip_code_fences(_new_code)
+                for _gf in generated_files:
+                    if _gf["path"] == _fi["path"]:
+                        _gf["content"] = _new_code
+                        break
+                else:
+                    generated_files.append({
+                        "path": _fi["path"], "content": _new_code,
+                        "action": _fi.get("action", "modify"),
+                    })
+                _fix_context += f"\n{_fi['path']}: {_fi.get('purpose', '')}\n"
+            if clone_path:
+                _fixed_subset = [gf for gf in generated_files if gf["path"] in _assess_files]
+                _written_fix = _write_files_to_directory(clone_path, _fixed_subset)
+                log(f"Self-assess: wrote {len(_written_fix)} fixed file(s)")
+                if build_dir and os.path.isdir(build_dir):
+                    build_ok, build_output, _ = _build_and_test_with_recovery(
+                        build_dir, task_instruction, analysis.get("language", "python"), log,
+                    )
+                    log(f"Self-assess: rebuild {'passed' if build_ok else 'failed'}")
+                    for _gf in generated_files:
+                        _rel = _gf["path"].lstrip("/")
+                        _cand = os.path.join(build_dir, _rel)
+                        if os.path.isfile(_cand):
+                            try:
+                                with open(_cand, encoding="utf-8") as _fh:
+                                    _gf["content"] = _fh.read()
+                            except Exception:
+                                pass
+                if _is_ui_task and build_dir and workspace:
+                    _py_exec2 = _ensure_local_python_env(
+                        build_dir, analysis.get("language", "python"), log,
+                    )
+                    _captured2: dict = {}
+                    for _vp2 in _UI_SCREENSHOT_VIEWPORTS:
+                        _vw2, _vh2 = _vp2
+                        _out2 = os.path.join(workspace, AGENT_ID, f"screenshot-{_vw2}x{_vh2}.png")
+                        if _take_ui_screenshot(
+                            build_dir, _py_exec2, _out2, log, analysis=analysis, viewport=_vp2,
+                        ):
+                            _captured2[_vp2] = _out2
+                    if _captured2:
+                        _screenshot_paths = list(_captured2.values())
+                        log(f"Self-assess: refreshed {len(_screenshot_paths)} screenshot(s)")
 
         if clone_path and branch_name:
             if not branch_kind:
@@ -3052,10 +3285,13 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                         buildPassed=build_ok,
                         generatedFiles=files_changed,
                     )
-                    pr_url = _create_pr(
-                        task_id, repo_url, branch_name, base_branch,
-                        pr_title, pr_body, workspace, compass_task_id
-                    )
+                    if is_revision and pr_url:
+                        log(f"Revision: pushing to existing PR {pr_url}")
+                    else:
+                        pr_url = _create_pr(
+                            task_id, repo_url, branch_name, base_branch,
+                            pr_title, pr_body, workspace, compass_task_id
+                        )
                     _save_pr_evidence(
                         workspace,
                         taskId=workflow_task_id,
@@ -3095,14 +3331,15 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                         ),
                     )
                     if pr_url:
-                        log(f"PR created: {pr_url}")
+                        log(f"{'PR updated' if is_revision else 'PR created'}: {pr_url}")
                         # ── Dev Workflow Step 2: Update Jira after PR ────────
                         if ticket_match:
                             ticket_key = ticket_match.group(1)
-                            _jira_transition(
-                                ticket_key, "In Review",
-                                task_id, workspace, compass_task_id,
-                            )
+                            if not is_revision:
+                                _jira_transition(
+                                    ticket_key, "In Review",
+                                    task_id, workspace, compass_task_id,
+                                )
                             test_status = "✅ Build/tests passed" if build_ok else "⚠️ Build/tests had issues"
                             _jira_add_comment(
                                 ticket_key,
@@ -3362,9 +3599,9 @@ def _schedule_shutdown(delay_seconds: int = 5):
 def main():
     global _SERVER
     print(f"[{AGENT_ID}] Web Agent starting on {HOST}:{PORT}")
-    reporter.start()
     agent_directory.start()
     _SERVER = ThreadingHTTPServer((HOST, PORT), WebAgentHandler)
+    reporter.start()
     _SERVER.serve_forever()
 
 
