@@ -61,7 +61,7 @@ launcher = get_launcher()
 policy = PolicyEvaluator()
 COMPASS_API_KEY = os.environ.get("COMPASS_API_KEY", "").strip()
 
-# Notification target registry (Teams Gateway or other webhook subscribers)
+# Notification target registry (IM Gateway or other webhook subscribers)
 _notification_targets_lock = threading.Lock()
 _notification_targets: list[dict] = []  # [{"url": "http://...", "registeredAt": ...}]
 
@@ -1543,7 +1543,7 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
     task.design_url = design_url
     task.design_type = design_type
 
-    # Extract owner / channel metadata from message.metadata (Teams Gateway sets these)
+    # Extract owner / channel metadata from message.metadata (IM Gateway sets these)
     msg_meta = message.get("metadata") or {}
     task.owner_user_id = (msg_meta.get("ownerUserId") or "").strip()
     task.owner_display_name = (msg_meta.get("ownerDisplayName") or "").strip()

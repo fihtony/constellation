@@ -23,12 +23,8 @@ from urllib.error import HTTPError
 
 from im_gateway.connectors import IMConnector, NormalizedMessage
 from im_gateway.connectors.registry import register_connector
-
-# Slack special-token patterns
-_MENTION_RE = re.compile(r"<@([A-Z0-9]+)>")
-_CHANNEL_RE = re.compile(r"<#([A-Z0-9]+)\|([^>]*)>")
-_LINK_RE = re.compile(r"<(https?://[^|>]+)\|([^>]+)>")
-_BARE_LINK_RE = re.compile(r"<(https?://[^>]+)>")
+from im_gateway.connectors.slack import blocks
+from im_gateway.connectors.slack.normalizer import normalize_text
 
 MAX_BLOCK_TEXT_LEN = 3000
 MAX_BLOCKS = 50
@@ -106,7 +102,7 @@ class SlackConnector(IMConnector):
         thread_ts = event.get("thread_ts", "") or event.get("ts", "")
 
         # Normalize Slack special tokens
-        text = self._normalize_text(text)
+        text = normalize_text(text)
         if not text:
             return None
 
@@ -135,136 +131,38 @@ class SlackConnector(IMConnector):
 
     @staticmethod
     def _normalize_text(text: str) -> str:
-        """Normalize Slack-specific tokens to plain text."""
-        if not text:
-            return ""
-        # <@U123> -> @user
-        text = _MENTION_RE.sub(r"@\1", text)
-        # <#C123|general> -> #general
-        text = _CHANNEL_RE.sub(r"#\2", text)
-        # <https://example.com|label> -> label (https://example.com)
-        text = _LINK_RE.sub(r"\2 (\1)", text)
-        # <https://example.com> -> https://example.com
-        text = _BARE_LINK_RE.sub(r"\1", text)
-        return text.strip()
+        """Normalize Slack-specific tokens to plain text.
+
+        Delegates to the standalone normalizer module. This static method
+        is kept for backward compatibility with tests that call it directly.
+        """
+        return normalize_text(text)
 
     # ---- Outbound rendering (Block Kit + mrkdwn) ----
 
     def render_task_created(self, task_id: str, summary: str) -> dict:
-        blocks = [
-            {"type": "header", "text": {"type": "plain_text", "text": "\u2705 Task Created"}},
-            {"type": "section", "fields": [
-                {"type": "mrkdwn", "text": f"*Task ID:*\n{task_id}"},
-                {"type": "mrkdwn", "text": "*Status:*\nWORKING"},
-            ]},
-        ]
-        if summary:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": _truncate(summary, 200)}})
-        blocks.append({"type": "context", "elements": [
-            {"type": "mrkdwn", "text": f"Use `/compass task {task_id}` to check status."}
-        ]})
-        return {"blocks": blocks}
+        return blocks.task_created(task_id, summary)
 
     def render_task_list(self, tasks: list[dict]) -> dict:
-        if not tasks:
-            return {"blocks": [
-                {"type": "section", "text": {"type": "mrkdwn", "text": "No running tasks. Send a message to create one."}},
-            ]}
-
-        blocks: list[dict] = [
-            {"type": "header", "text": {"type": "plain_text", "text": "Your Tasks"}},
-        ]
-        for t in tasks[:10]:
-            tid = t.get("id") or t.get("task_id", "")
-            state = t.get("state") or t.get("status", {}).get("state", "")
-            summary = t.get("summary", "")[:50]
-            emoji = _state_emoji(state)
-            text = f"{emoji} *{tid}* — {state}"
-            if summary:
-                text += f"\n{summary}"
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
-        if len(tasks) > 10:
-            blocks.append({"type": "context", "elements": [
-                {"type": "mrkdwn", "text": "Showing latest 10. View all in Compass UI."}
-            ]})
-        return {"blocks": blocks[:MAX_BLOCKS]}
+        return blocks.task_list(tasks)
 
     def render_task_detail(self, task: dict) -> dict:
-        state = task.get("status", {}).get("state", "UNKNOWN")
-        status_msg = ""
-        msg_data = task.get("status", {}).get("message", {})
-        if isinstance(msg_data, dict):
-            parts = msg_data.get("parts", [])
-            if parts and isinstance(parts[0], dict):
-                status_msg = parts[0].get("text", "")
-        task_id = task.get("id", "")
-        emoji = _state_emoji(state)
-        blocks = [
-            {"type": "header", "text": {"type": "plain_text", "text": f"{emoji} Task {task_id}"}},
-            {"type": "section", "fields": [
-                {"type": "mrkdwn", "text": f"*Status:*\n{state}"},
-            ]},
-        ]
-        if status_msg:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": _truncate(status_msg, MAX_BLOCK_TEXT_LEN)}})
-        return {"blocks": blocks}
+        return blocks.task_detail(task)
 
     def render_input_required(self, question: str, task_id: str) -> dict:
-        blocks = [
-            {"type": "header", "text": {"type": "plain_text", "text": "\u2753 Input Required"}},
-            {"type": "section", "fields": [
-                {"type": "mrkdwn", "text": f"*Task:*\n{task_id}"},
-            ]},
-            {"type": "section", "text": {"type": "mrkdwn", "text": _truncate(question, MAX_BLOCK_TEXT_LEN)}},
-            {"type": "context", "elements": [
-                {"type": "mrkdwn", "text": f"Reply in this thread or use `/compass resume {task_id} <your answer>`"}
-            ]},
-        ]
-        return {"blocks": blocks}
+        return blocks.input_required(question, task_id)
 
     def render_task_completed(self, task_id: str, summary: str, links: list[dict] | None = None) -> dict:
-        blocks = [
-            {"type": "header", "text": {"type": "plain_text", "text": "\u2705 Task Completed"}},
-            {"type": "section", "fields": [
-                {"type": "mrkdwn", "text": f"*Task:*\n{task_id}"},
-            ]},
-            {"type": "section", "text": {"type": "mrkdwn", "text": _truncate(summary, MAX_BLOCK_TEXT_LEN)}},
-        ]
-        if links:
-            link_texts = [f"<{l['url']}|{l.get('title', 'Link')}>" for l in links[:5]]
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": " | ".join(link_texts)}})
-        return {"blocks": blocks}
+        return blocks.task_completed(task_id, summary, links)
 
     def render_task_failed(self, task_id: str, error_summary: str) -> dict:
-        blocks = [
-            {"type": "header", "text": {"type": "plain_text", "text": "\u274c Task Failed"}},
-            {"type": "section", "fields": [
-                {"type": "mrkdwn", "text": f"*Task:*\n{task_id}"},
-            ]},
-            {"type": "section", "text": {"type": "mrkdwn", "text": _truncate(error_summary, MAX_BLOCK_TEXT_LEN)}},
-        ]
-        return {"blocks": blocks}
+        return blocks.task_failed(task_id, error_summary)
 
     def render_help(self) -> dict:
-        blocks = [
-            {"type": "header", "text": {"type": "plain_text", "text": "Compass Bot"}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": "I can help you create and track development and office tasks."}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": (
-                "*Available commands:*\n"
-                "\u2022 `/compass tasks` — List your running tasks\n"
-                "\u2022 `/compass task <id>` — View task details\n"
-                "\u2022 `/compass resume <id> <text>` — Reply to a task waiting for input\n"
-                "\u2022 `/compass help` — Show this help\n"
-                "\n_Or just send a message to create a new task._"
-            )}},
-        ]
-        return {"blocks": blocks}
+        return blocks.help_message()
 
     def render_error(self, message: str) -> dict:
-        blocks = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": f":warning: {_truncate(message, MAX_BLOCK_TEXT_LEN)}"}},
-        ]
-        return {"blocks": blocks}
+        return blocks.error_message(message)
 
     # ---- Proactive messaging ----
 
@@ -316,27 +214,10 @@ class SlackConnector(IMConnector):
             return "error"
 
 
-# ---- Helpers ----
+# ---- Helpers (re-exported for backward compatibility with tests) ----
 
-def _state_emoji(state: str) -> str:
-    mapping = {
-        "TASK_STATE_COMPLETED": "\u2705",
-        "COMPLETED": "\u2705",
-        "TASK_STATE_FAILED": "\u274c",
-        "FAILED": "\u274c",
-        "TASK_STATE_INPUT_REQUIRED": "\u2753",
-        "TASK_STATE_WORKING": "\U0001f504",
-        "WORKING": "\U0001f504",
-        "ROUTING": "\U0001f504",
-        "SUBMITTED": "\U0001f504",
-    }
-    return mapping.get(state, "\U0001f504")
-
-
-def _truncate(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - 30] + "\n\n_...truncated. See Compass UI for full content._"
+_state_emoji = blocks.state_emoji
+_truncate = blocks.truncate
 
 
 # Self-register at import time

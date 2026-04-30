@@ -1119,5 +1119,589 @@ class TestNotificationHandler(unittest.TestCase):
         self.assertNotIn("/app/artifacts", content_json)
 
 
+# ── Additional Coverage: Teams render_task_failed ──────────────────────────
+
+class TestTeamsConnectorExtended(unittest.TestCase):
+    """Extended coverage for Teams connector rendering."""
+
+    def _make_connector(self):
+        from im_gateway.connectors.teams.connector import TeamsConnector
+        return TeamsConnector({})
+
+    def test_render_task_failed(self):
+        c = self._make_connector()
+        card = c.render_task_failed("task-fail-1", "Build failed: exit code 1")
+        card_json = json.dumps(card)
+        self.assertIn("task-fail-1", card_json)
+        self.assertIn("Build failed", card_json)
+        self.assertEqual(card["contentType"], "application/vnd.microsoft.card.adaptive")
+
+    def test_render_task_completed_no_links(self):
+        c = self._make_connector()
+        card = c.render_task_completed("t1", "All done!")
+        card_json = json.dumps(card)
+        self.assertIn("Task Completed", card_json)
+        self.assertIn("All done!", card_json)
+
+
+# ── Additional Coverage: Slack render_task_failed content ──────────────────
+
+class TestSlackConnectorExtended(unittest.TestCase):
+    """Extended coverage for Slack connector rendering."""
+
+    def _make_connector(self):
+        from im_gateway.connectors.slack.connector import SlackConnector
+        return SlackConnector({"SLACK_BOT_TOKEN": "xoxb-test"})
+
+    def test_render_task_failed_content(self):
+        c = self._make_connector()
+        result = c.render_task_failed("task-x", "npm run build exited with code 1")
+        block_text = json.dumps(result)
+        self.assertIn("Task Failed", block_text)
+        self.assertIn("task-x", block_text)
+        self.assertIn("npm run build", block_text)
+
+    def test_render_task_completed_no_links(self):
+        c = self._make_connector()
+        result = c.render_task_completed("t1", "All done!", links=None)
+        self.assertIn("Task Completed", json.dumps(result))
+        self.assertNotIn("<http", json.dumps(result))
+
+    def test_render_task_detail(self):
+        c = self._make_connector()
+        task = {
+            "id": "t-detail",
+            "status": {
+                "state": "TASK_STATE_WORKING",
+                "message": {"parts": [{"text": "Processing step 3..."}]},
+            },
+        }
+        result = c.render_task_detail(task)
+        block_text = json.dumps(result)
+        self.assertIn("t-detail", block_text)
+        self.assertIn("TASK_STATE_WORKING", block_text)
+        self.assertIn("Processing step 3", block_text)
+
+    def test_text_normalization_combined(self):
+        """Multiple Slack tokens in a single message."""
+        from im_gateway.connectors.slack.connector import SlackConnector
+        text = "<@U111> check <#C222|dev> and <https://jira.com/PROJ-1|PROJ-1>"
+        result = SlackConnector._normalize_text(text)
+        self.assertIn("@U111", result)
+        self.assertIn("#dev", result)
+        self.assertIn("PROJ-1 (https://jira.com/PROJ-1)", result)
+
+    def test_text_normalization_empty(self):
+        from im_gateway.connectors.slack.connector import SlackConnector
+        self.assertEqual(SlackConnector._normalize_text(""), "")
+        self.assertEqual(SlackConnector._normalize_text(None), "")
+
+    def test_truncate_long_text(self):
+        from im_gateway.connectors.slack.connector import _truncate
+        short = "hello"
+        self.assertEqual(_truncate(short, 100), short)
+        long_text = "x" * 5000
+        result = _truncate(long_text, 3000)
+        self.assertLessEqual(len(result), 3100)
+        self.assertIn("truncated", result)
+
+    def test_state_emoji_mapping(self):
+        from im_gateway.connectors.slack.connector import _state_emoji
+        self.assertEqual(_state_emoji("TASK_STATE_COMPLETED"), "\u2705")
+        self.assertEqual(_state_emoji("TASK_STATE_FAILED"), "\u274c")
+        self.assertEqual(_state_emoji("TASK_STATE_INPUT_REQUIRED"), "\u2753")
+        self.assertEqual(_state_emoji("TASK_STATE_WORKING"), "\U0001f504")
+        self.assertEqual(_state_emoji("UNKNOWN_STATE"), "\U0001f504")
+
+
+# ── Additional Coverage: DB cleanup_old_task_mappings ──────────────────────
+
+class TestGatewayDBExtended(unittest.TestCase):
+    """Extended DB coverage: cleanup, edge cases."""
+
+    def setUp(self):
+        self._tmpfile = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmpfile.close()
+        from im_gateway.db import GatewayDB
+        self.db = GatewayDB(db_path=self._tmpfile.name)
+
+    def tearDown(self):
+        os.unlink(self._tmpfile.name)
+
+    def test_cleanup_old_task_mappings(self):
+        """Completed tasks older than cutoff are cleaned up."""
+        self.db.add_task_mapping("t1", "slack", "U1", "T1")
+        self.db.update_task_state("t1", "TASK_STATE_COMPLETED")
+        # Use negative age so cutoff is in the future, guaranteeing deletion
+        self.db.cleanup_old_task_mappings(max_age_days=-1)
+        tasks = self.db.get_user_tasks("slack", "U1", "T1")
+        self.assertEqual(len(tasks), 0)
+
+    def test_cleanup_preserves_active_tasks(self):
+        """Active tasks should not be cleaned up even with negative cutoff."""
+        self.db.add_task_mapping("t1", "slack", "U1", "T1")
+        # State is SUBMITTED (active), not completed
+        self.db.cleanup_old_task_mappings(max_age_days=-1)
+        tasks = self.db.get_user_tasks("slack", "U1", "T1")
+        self.assertEqual(len(tasks), 1)
+
+    def test_get_task_owner_nonexistent(self):
+        result = self.db.get_task_owner("no-such-task")
+        self.assertIsNone(result)
+
+    def test_count_active_excludes_failed(self):
+        self.db.add_task_mapping("t1", "slack", "U1", "T1")
+        self.db.add_task_mapping("t2", "slack", "U1", "T1")
+        self.db.update_task_state("t1", "TASK_STATE_FAILED")
+        active = self.db.count_active_tasks("slack", "U1", "T1")
+        self.assertEqual(active, 1)
+
+    def test_get_conversation_nonexistent(self):
+        result = self.db.get_conversation("slack", "nobody", "nowhere")
+        self.assertIsNone(result)
+
+
+# ── Additional Coverage: Compass Subcommand Routing ────────────────────────
+
+class TestCompassSubcommandRouting(unittest.TestCase):
+    """Test /compass <subcommand> normalization in handle_inbound."""
+
+    def setUp(self):
+        import im_gateway.app as app_mod
+        self._app_mod = app_mod
+        self._tmpfile = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmpfile.close()
+        from im_gateway.db import GatewayDB
+        app_mod.db = GatewayDB(db_path=self._tmpfile.name)
+
+    def tearDown(self):
+        os.unlink(self._tmpfile.name)
+
+    def _make_msg(self, text="", command="", command_args=""):
+        from im_gateway.connectors import NormalizedMessage
+        return NormalizedMessage(
+            channel="slack", user_id="U1", workspace_id="T1",
+            text=text, command=command, command_args=command_args,
+            reply_target={"channel": "D1"},
+        )
+
+    def _make_connector(self):
+        from im_gateway.connectors.slack.connector import SlackConnector
+        return SlackConnector({"SLACK_BOT_TOKEN": "xoxb-test"})
+
+    def test_compass_tasks_subcommand(self):
+        """'/compass tasks' should be normalized to /tasks."""
+        app = self._app_mod
+        connector = self._make_connector()
+        msg = self._make_msg(text="/compass tasks", command="/compass", command_args="tasks")
+        # This will try to call compass_client.list_tasks, so we mock it
+        import im_gateway.compass_client as cc
+        original = cc.list_tasks
+        cc.list_tasks = lambda: []
+        try:
+            result = app.handle_inbound(msg, connector)
+            # Should render task list (empty)
+            self.assertIn("No running tasks", json.dumps(result))
+        finally:
+            cc.list_tasks = original
+
+    def test_compass_task_subcommand(self):
+        """'/compass task t1' should be normalized to /task with args 't1'."""
+        app = self._app_mod
+        connector = self._make_connector()
+        msg = self._make_msg(text="/compass task t1", command="/compass", command_args="task t1")
+        import im_gateway.compass_client as cc
+        original = cc.get_task
+        cc.get_task = lambda tid: {"task": {"id": "t1", "status": {"state": "TASK_STATE_WORKING"}}}
+        try:
+            result = app.handle_inbound(msg, connector)
+            self.assertIn("t1", json.dumps(result))
+        finally:
+            cc.get_task = original
+
+    def test_compass_empty_subcommand_shows_help(self):
+        """'/compass' with no subcommand should show help."""
+        app = self._app_mod
+        connector = self._make_connector()
+        msg = self._make_msg(text="/compass", command="/compass", command_args="")
+        result = app.handle_inbound(msg, connector)
+        self.assertIn("Compass Bot", json.dumps(result))
+
+    def test_compass_resume_subcommand(self):
+        """'/compass resume t1 my answer' should be normalized correctly."""
+        app = self._app_mod
+        connector = self._make_connector()
+        msg = self._make_msg(
+            text="/compass resume t1 my answer",
+            command="/compass",
+            command_args="resume t1 my answer",
+        )
+        import im_gateway.compass_client as cc
+        original_get = cc.get_task
+        original_resume = cc.resume_task
+        cc.get_task = lambda tid: {"task": {"id": "t1", "status": {"state": "TASK_STATE_INPUT_REQUIRED"}}}
+        cc.resume_task = lambda tid, msg: {"task": {"id": "t1"}}
+        try:
+            result = app.handle_inbound(msg, connector)
+            self.assertIn("resuming", json.dumps(result).lower())
+        finally:
+            cc.get_task = original_get
+            cc.resume_task = original_resume
+
+
+# ── Additional Coverage: Rate Limiting ─────────────────────────────────────
+
+class TestRateLimiting(unittest.TestCase):
+    """Test rate limiting logic."""
+
+    def test_rate_limit_check(self):
+        import im_gateway.app as app_mod
+        # Clear any prior state
+        app_mod._rate_limits.clear()
+
+        # First few requests should pass
+        for i in range(app_mod.RATE_LIMIT_PER_MINUTE):
+            self.assertTrue(app_mod._check_rate_limit("slack", "U-rate"))
+
+        # Next request should be blocked
+        self.assertFalse(app_mod._check_rate_limit("slack", "U-rate"))
+
+    def test_rate_limit_different_users(self):
+        import im_gateway.app as app_mod
+        app_mod._rate_limits.clear()
+
+        for i in range(app_mod.RATE_LIMIT_PER_MINUTE):
+            app_mod._check_rate_limit("slack", "U-a")
+
+        # Different user should not be affected
+        self.assertTrue(app_mod._check_rate_limit("slack", "U-b"))
+
+    def test_rate_limit_different_channels(self):
+        import im_gateway.app as app_mod
+        app_mod._rate_limits.clear()
+
+        for i in range(app_mod.RATE_LIMIT_PER_MINUTE):
+            app_mod._check_rate_limit("slack", "U-c")
+
+        # Same user on different channel should not be affected
+        self.assertTrue(app_mod._check_rate_limit("teams", "U-c"))
+
+
+# ── Additional Coverage: Notification Edge Cases ───────────────────────────
+
+class TestNotificationEdgeCases(unittest.TestCase):
+    """Test notification edge cases: invalid conversation, missing connector."""
+
+    def setUp(self):
+        import im_gateway.app as app_mod
+        self._app_mod = app_mod
+        self._tmpfile = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmpfile.close()
+        from im_gateway.db import GatewayDB
+        app_mod.db = GatewayDB(db_path=self._tmpfile.name)
+
+        from im_gateway.connectors.slack.connector import SlackConnector
+        self._connector = SlackConnector({"SLACK_BOT_TOKEN": "xoxb-test"})
+        self._sent_messages = []
+
+        def mock_send(target, content):
+            self._sent_messages.append({"target": target, "content": content})
+            return "ok"
+        self._connector.send_message = mock_send
+        app_mod._connector_map = {"slack": self._connector}
+
+    def tearDown(self):
+        os.unlink(self._tmpfile.name)
+
+    def test_notification_no_valid_conversation(self):
+        """Notification for user with no valid conversation should be silently skipped."""
+        app = self._app_mod
+        app.db.upsert_conversation("slack", "U1", "T1", {"channel": "D1"})
+        app.db.mark_conversation_invalid("slack", "U1", "T1")
+        app.db.add_task_mapping("t1", "slack", "U1", "T1")
+
+        app._handle_notification({
+            "taskId": "t1",
+            "state": "TASK_STATE_COMPLETED",
+            "summary": "Done",
+            "ownerUserId": "U1",
+            "sourceChannel": "slack",
+            "tenantId": "T1",
+        })
+        self.assertEqual(len(self._sent_messages), 0)
+
+    def test_notification_missing_connector(self):
+        """Notification for unknown channel should be silently skipped."""
+        app = self._app_mod
+        app.db.upsert_conversation("lark", "U1", "T1", {"channel": "D1"})
+        app.db.add_task_mapping("t1", "lark", "U1", "T1")
+
+        app._handle_notification({
+            "taskId": "t1",
+            "state": "TASK_STATE_COMPLETED",
+            "summary": "Done",
+            "ownerUserId": "U1",
+            "sourceChannel": "lark",
+            "tenantId": "T1",
+        })
+        self.assertEqual(len(self._sent_messages), 0)
+
+    def test_notification_unauthorized_marks_invalid(self):
+        """Connector returning 'unauthorized' should mark conversation invalid."""
+        app = self._app_mod
+        app.db.upsert_conversation("slack", "U1", "T1", {"channel": "D1"})
+        app.db.add_task_mapping("t1", "slack", "U1", "T1")
+
+        # Override send_message to return "unauthorized"
+        self._connector.send_message = lambda target, content: "unauthorized"
+
+        app._handle_notification({
+            "taskId": "t1",
+            "state": "TASK_STATE_COMPLETED",
+            "summary": "Done",
+            "ownerUserId": "U1",
+            "sourceChannel": "slack",
+            "tenantId": "T1",
+        })
+        conv = app.db.get_conversation("slack", "U1", "T1")
+        self.assertEqual(conv["is_valid"], 0)
+
+    def test_notification_error_increments_failure(self):
+        """Connector returning 'error' should increment failure count."""
+        app = self._app_mod
+        app.db.upsert_conversation("slack", "U1", "T1", {"channel": "D1"})
+        app.db.add_task_mapping("t1", "slack", "U1", "T1")
+
+        self._connector.send_message = lambda target, content: "error"
+
+        app._handle_notification({
+            "taskId": "t1",
+            "state": "TASK_STATE_COMPLETED",
+            "summary": "Done",
+            "ownerUserId": "U1",
+            "sourceChannel": "slack",
+            "tenantId": "T1",
+        })
+        conv = app.db.get_conversation("slack", "U1", "T1")
+        self.assertEqual(conv["failures"], 1)
+        self.assertEqual(conv["is_valid"], 1)  # not yet invalid at 1 failure
+
+
+# ── Additional Coverage: Sanitization edge cases ──────────────────────────
+
+class TestSanitizationExtended(unittest.TestCase):
+    def test_strip_data_paths(self):
+        import im_gateway.app as app_mod
+        text = "Stored at /app/data/im-gateway/im-gateway.db"
+        result = app_mod._sanitize_summary(text)
+        self.assertNotIn("/app/data", result)
+        self.assertIn("[data-path]", result)
+
+    def test_strip_multiple_credential_types(self):
+        import im_gateway.app as app_mod
+        text = "password=abc123 and secret=xyz789"
+        result = app_mod._sanitize_summary(text)
+        self.assertNotIn("abc123", result)
+        self.assertNotIn("xyz789", result)
+        self.assertEqual(result.count("[REDACTED]"), 2)
+
+    def test_clean_text_unchanged(self):
+        import im_gateway.app as app_mod
+        text = "Task completed successfully with PR created"
+        result = app_mod._sanitize_summary(text)
+        self.assertEqual(result, text)
+
+
+# ── Slack blocks.py standalone tests ───────────────────────────────────────
+
+class TestSlackBlocks(unittest.TestCase):
+    """Test the standalone blocks.py module directly."""
+
+    def test_truncate_short(self):
+        from im_gateway.connectors.slack.blocks import truncate
+        self.assertEqual(truncate("hello", 100), "hello")
+
+    def test_truncate_long(self):
+        from im_gateway.connectors.slack.blocks import truncate
+        result = truncate("x" * 5000, 3000)
+        self.assertIn("truncated", result)
+        self.assertLessEqual(len(result), 3100)
+
+    def test_state_emoji(self):
+        from im_gateway.connectors.slack.blocks import state_emoji
+        self.assertEqual(state_emoji("TASK_STATE_COMPLETED"), "\u2705")
+        self.assertEqual(state_emoji("UNKNOWN"), "\U0001f504")
+
+    def test_task_created(self):
+        from im_gateway.connectors.slack.blocks import task_created
+        result = task_created("t1", "Build feature X")
+        self.assertIn("blocks", result)
+        self.assertIn("Task Created", json.dumps(result))
+        self.assertIn("t1", json.dumps(result))
+
+    def test_task_list_empty(self):
+        from im_gateway.connectors.slack.blocks import task_list
+        result = task_list([])
+        self.assertIn("No running tasks", json.dumps(result))
+
+    def test_task_list_with_tasks(self):
+        from im_gateway.connectors.slack.blocks import task_list
+        tasks = [{"id": "t1", "status": {"state": "WORKING"}}]
+        result = task_list(tasks)
+        self.assertIn("t1", json.dumps(result))
+
+    def test_task_list_max_blocks(self):
+        from im_gateway.connectors.slack.blocks import task_list, MAX_BLOCKS
+        tasks = [{"id": f"t{i}", "status": {"state": "WORKING"}} for i in range(60)]
+        result = task_list(tasks)
+        self.assertLessEqual(len(result["blocks"]), MAX_BLOCKS)
+
+    def test_task_detail(self):
+        from im_gateway.connectors.slack.blocks import task_detail
+        task = {"id": "t1", "status": {"state": "TASK_STATE_WORKING", "message": {"parts": [{"text": "Step 2"}]}}}
+        result = task_detail(task)
+        self.assertIn("t1", json.dumps(result))
+        self.assertIn("Step 2", json.dumps(result))
+
+    def test_input_required(self):
+        from im_gateway.connectors.slack.blocks import input_required
+        result = input_required("Which priority?", "t1")
+        rjson = json.dumps(result)
+        self.assertIn("Input Required", rjson)
+        self.assertIn("t1", rjson)
+
+    def test_task_completed(self):
+        from im_gateway.connectors.slack.blocks import task_completed
+        result = task_completed("t1", "Done!", [{"url": "https://pr", "title": "PR"}])
+        rjson = json.dumps(result)
+        self.assertIn("Task Completed", rjson)
+        self.assertIn("https://pr", rjson)
+
+    def test_task_failed(self):
+        from im_gateway.connectors.slack.blocks import task_failed
+        result = task_failed("t1", "Build error")
+        self.assertIn("Task Failed", json.dumps(result))
+
+    def test_help_message(self):
+        from im_gateway.connectors.slack.blocks import help_message
+        result = help_message()
+        self.assertIn("Compass Bot", json.dumps(result))
+
+    def test_error_message(self):
+        from im_gateway.connectors.slack.blocks import error_message
+        result = error_message("Oops")
+        self.assertIn(":warning:", json.dumps(result))
+
+
+# ── Slack normalizer.py standalone tests ───────────────────────────────────
+
+class TestSlackNormalizer(unittest.TestCase):
+    """Test the standalone normalizer.py module directly."""
+
+    def test_mention(self):
+        from im_gateway.connectors.slack.normalizer import normalize_text
+        self.assertEqual(normalize_text("<@U123>"), "@U123")
+
+    def test_channel(self):
+        from im_gateway.connectors.slack.normalizer import normalize_text
+        self.assertEqual(normalize_text("<#C456|general>"), "#general")
+
+    def test_labeled_link(self):
+        from im_gateway.connectors.slack.normalizer import normalize_text
+        result = normalize_text("<https://example.com|Example>")
+        self.assertEqual(result, "Example (https://example.com)")
+
+    def test_bare_link(self):
+        from im_gateway.connectors.slack.normalizer import normalize_text
+        self.assertEqual(normalize_text("<https://example.com>"), "https://example.com")
+
+    def test_empty(self):
+        from im_gateway.connectors.slack.normalizer import normalize_text
+        self.assertEqual(normalize_text(""), "")
+        self.assertEqual(normalize_text(None), "")
+
+    def test_combined(self):
+        from im_gateway.connectors.slack.normalizer import normalize_text
+        text = "Hey <@U1> check <#C2|dev> at <https://a.com|link>"
+        result = normalize_text(text)
+        self.assertIn("@U1", result)
+        self.assertIn("#dev", result)
+        self.assertIn("link (https://a.com)", result)
+
+
+# ── Teams cards.py standalone tests ────────────────────────────────────────
+
+class TestTeamsCards(unittest.TestCase):
+    """Test the standalone cards.py module directly."""
+
+    def test_card_envelope(self):
+        from im_gateway.connectors.teams.cards import card_envelope
+        result = card_envelope([{"type": "TextBlock", "text": "Hi"}])
+        self.assertEqual(result["contentType"], "application/vnd.microsoft.card.adaptive")
+        self.assertEqual(result["content"]["type"], "AdaptiveCard")
+        self.assertEqual(len(result["content"]["body"]), 1)
+
+    def test_state_emoji(self):
+        from im_gateway.connectors.teams.cards import state_emoji
+        self.assertEqual(state_emoji("TASK_STATE_COMPLETED"), "\u2705")
+        self.assertEqual(state_emoji("UNKNOWN"), "\U0001f504")
+
+    def test_task_created(self):
+        from im_gateway.connectors.teams.cards import task_created
+        result = task_created("t1", "Build X")
+        self.assertIn("Task Created", json.dumps(result))
+
+    def test_task_list_empty(self):
+        from im_gateway.connectors.teams.cards import task_list
+        result = task_list([])
+        self.assertIn("No running tasks", json.dumps(result))
+
+    def test_task_list_with_tasks(self):
+        from im_gateway.connectors.teams.cards import task_list
+        tasks = [{"id": "t1", "status": {"state": "WORKING"}}]
+        result = task_list(tasks)
+        self.assertIn("t1", json.dumps(result))
+
+    def test_task_failed(self):
+        from im_gateway.connectors.teams.cards import task_failed
+        result = task_failed("t1", "Error occurred")
+        rjson = json.dumps(result)
+        self.assertIn("Task Failed", rjson)
+        self.assertIn("t1", rjson)
+
+    def test_help_message(self):
+        from im_gateway.connectors.teams.cards import help_message
+        result = help_message()
+        self.assertIn("Compass Bot", json.dumps(result))
+
+    def test_error_message(self):
+        from im_gateway.connectors.teams.cards import error_message
+        result = error_message("Something wrong")
+        self.assertIn("Error", json.dumps(result))
+
+
+# ── Teams normalizer.py standalone tests ───────────────────────────────────
+
+class TestTeamsNormalizer(unittest.TestCase):
+    """Test the standalone normalizer.py module directly."""
+
+    def test_plain_text(self):
+        from im_gateway.connectors.teams.normalizer import normalize_text
+        self.assertEqual(normalize_text("Hello world", "plain"), "Hello world")
+
+    def test_html_strip(self):
+        from im_gateway.connectors.teams.normalizer import normalize_text
+        self.assertEqual(normalize_text("<p>Hello</p>", "html"), "Hello")
+
+    def test_html_unescape(self):
+        from im_gateway.connectors.teams.normalizer import normalize_text
+        self.assertEqual(normalize_text("A &amp; B"), "A & B")
+
+    def test_empty(self):
+        from im_gateway.connectors.teams.normalizer import normalize_text
+        self.assertEqual(normalize_text(""), "")
+        self.assertEqual(normalize_text(None), "")
+
+
 if __name__ == "__main__":
     unittest.main()
