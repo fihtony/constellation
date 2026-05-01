@@ -230,13 +230,27 @@ def _append_workspace_file(workspace_path: str, relative_name: str, content: str
 
 
 def _read_pr_url_from_workspace(workspace: str) -> str:
-    """Return the PR URL saved by the web-agent, if available."""
-    path = os.path.join(workspace, "web-agent", "branch-info.json")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh).get("prUrl", "")
-    except Exception:
+    """Return the PR URL saved by any execution agent, if available.
+
+    Scans all workspace subdirectories for branch-info.json so that any
+    platform agent (android, ios, web, …) is discovered dynamically.
+    """
+    if not workspace or not os.path.isdir(workspace):
         return ""
+    try:
+        entries = sorted(os.listdir(workspace))
+    except OSError:
+        return ""
+    for entry in entries:
+        path = os.path.join(workspace, entry, "branch-info.json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                pr_url = json.load(fh).get("prUrl", "")
+                if pr_url:
+                    return pr_url
+        except Exception:
+            continue
+    return ""
 
 
 def _post_pr_review_comment(pr_url: str, feedback: str, workspace: str, task_id: str) -> None:
@@ -547,7 +561,9 @@ _DEV_WORKFLOW_INSTRUCTIONS = (
     "2. Implement the feature following the acceptance criteria.\n"
     "3. Write and run tests. Install any missing dependencies at runtime.\n"
     "4. Push your implementation to a feature branch and create a Pull Request "
-    "targeting the default branch.\n"
+    "targeting the default branch. Before creating the branch, list existing remote "
+    "branches via the SCM agent (scm.branch.list). If the desired branch name already "
+    "exists, append '_2', '_3', etc. until a unique name is found.\n"
     "5. After the PR is created: transition the Jira ticket to 'In Review' and "
     "add a comment that includes the PR URL, test status, and a brief summary.\n"
     "All steps are required. Skipping Jira/PR steps is not acceptable."
@@ -1750,6 +1766,40 @@ def _filter_unresolved_missing_info(
             item for item in unresolved_missing
             if not any(kw in item.lower() for kw in defaultable_ui_ticket_kws)
         ]
+    # Organisational conventions and preferences (README templates, PR reviewer
+    # assignments, code-owner preferences) are always resolvable by the dev
+    # agent using project defaults or industry best practice.  Filter them out
+    # whenever both Jira and repo context have already been gathered so that
+    # these "nice-to-have" items never block task execution.
+    if ctx.jira_info and ctx.jira_info.get("content") and ctx.repo_info and ctx.repo_info.get("content"):
+        org_preference_kws = {
+            "reviewer",
+            "code owner",
+            "code reviewer",
+            "pr reviewer",
+            "preferred reviewer",
+            "review assignment",
+            "readme",
+            "readme template",
+            "org-specific",
+            "wording requirement",
+            "wording requirements",
+            "template wording",
+            "naming convention",
+            "commit convention",
+            "commit message convention",
+            # PR review state / merge decisions are SCM concerns, not planning blockers
+            "review outcome",
+            "pr review",
+            "approve or request",
+            "merge the existing",
+            "should i review",
+            "shall i review",
+        }
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in org_preference_kws)
+        ]
     return unresolved_missing
 
 
@@ -2015,8 +2065,8 @@ def _load_workspace_review_evidence(workspace: str) -> str:
                 try:
                     with open(pr_path, encoding="utf-8") as f:
                         data = json.load(f)
-                    gen_files = data.get("generatedFiles") or []
-                    pr_url = data.get("url", "")
+                    gen_files = data.get("generatedFiles") or data.get("filesChanged") or []
+                    pr_url = data.get("url") or data.get("prUrl") or ""
                     build_passed = data.get("buildPassed")
                     branch = data.get("branch", "")
                     lines.append(f"PR URL: {pr_url}")
@@ -2050,6 +2100,64 @@ def _load_workspace_review_evidence(workspace: str) -> str:
     return "\n".join(lines)
 
 
+def _review_output_with_timeout(
+    user_text: str,
+    plan: dict,
+    dev_output: str,
+    artifacts: list,
+    design_info: dict | None = None,
+    workspace: str = "",
+    timeout_seconds: int = 300,
+) -> dict:
+    """Wrapper around _review_output that enforces a hard wall-clock timeout.
+
+    If the LLM call hangs beyond *timeout_seconds*, returns a synthetic
+    failure review so the workflow can proceed (accept with noted issues)
+    rather than blocking the entire Team Lead container until Compass
+    times out the step.
+    """
+    result_holder: list = []
+    exc_holder: list = []
+
+    def _run():
+        try:
+            result_holder.append(
+                _review_output(user_text, plan, dev_output, artifacts,
+                               design_info=design_info, workspace=workspace)
+            )
+        except Exception as exc:  # noqa: BLE001
+            exc_holder.append(exc)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_seconds)
+    if t.is_alive():
+        print(f"[{AGENT_ID}] WARNING: _review_output timed out after {timeout_seconds}s — "
+              "accepting output with timeout noted.")
+        return {
+            "passed": False,
+            "score": 0,
+            "criteria_results": [],
+            "workflow_followed": False,
+            "workflow_notes": f"Review timed out after {timeout_seconds}s; could not evaluate.",
+            "design_fidelity_checked": False,
+            "design_fidelity_notes": "N/A",
+            "test_coverage_adequate": False,
+            "test_coverage_notes": "Review timed out.",
+            "unnecessary_files_in_pr": [],
+            "issues": [f"Code review LLM call timed out after {timeout_seconds}s."],
+            "missing_requirements": [],
+            "feedback_for_dev": (
+                "The review timed out before it could evaluate your output. "
+                "Please verify all acceptance criteria are met."
+            ),
+            "summary": f"Review timed out after {timeout_seconds}s — accepting with issues noted.",
+        }
+    if exc_holder:
+        raise exc_holder[0]
+    return result_holder[0] if result_holder else {}
+
+
 def _review_output(
     user_text: str,
     plan: dict,
@@ -2076,6 +2184,7 @@ def _review_output(
     prompt = prompts.REVIEW_TEMPLATE.format(
         user_text=user_text,
         acceptance_criteria=criteria_lines,
+        requires_tests=str(plan.get("requires_tests", True)).lower(),
         test_requirements=plan.get("test_requirements") or "Not specified.",
         design_context_provided=design_context_provided,
         dev_output=(dev_output or "No output text.")[:3000],
@@ -2083,7 +2192,7 @@ def _review_output(
         workspace_evidence=workspace_evidence or "(none collected)",
     )
     system = _build_team_lead_system_prompt(prompts.REVIEW_SYSTEM, include_workflow=True)
-    response = _run_agentic(prompt, f"[{AGENT_ID}] review", system_prompt=system)
+    response = _run_agentic(prompt, f"[{AGENT_ID}] review", system_prompt=system, timeout=240)
     return _parse_json_from_llm(response)
 
 
@@ -2337,6 +2446,45 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             next_action = actions[0]
             action_type = next_action.get("action")
             if action_type == _GATHER_ACTION_ASK_USER:
+                # Before escalating to the user, check whether the question
+                # covers context that was already gathered from boundary agents.
+                # If it does, skip it and proceed to planning rather than
+                # blocking on an unnecessary clarification round.
+                _q_text = str(next_action.get("question") or "").lower()
+                _suppress_gather_q = False
+                if _jira_fetch_succeeded(ctx):
+                    _jira_q_kws = {
+                        "acceptance criteria", "acceptancecriteria", "jira", "ticket",
+                        "checklist item", "story criteria", "pass/fail", "qa step", "test/qa",
+                    }
+                    if any(kw in _q_text for kw in _jira_q_kws):
+                        log(f"Suppressing gather-plan question (Jira already fetched): {next_action.get('question')}")
+                        _suppress_gather_q = True
+                if not _suppress_gather_q and ctx.jira_info and ctx.jira_info.get("content") and ctx.repo_info and ctx.repo_info.get("content"):
+                    _org_q_kws = {
+                        "reviewer", "code owner", "code reviewer", "pr reviewer",
+                        "readme template", "readme format", "org-specific",
+                        "wording requirement", "wording requirements",
+                        "naming convention", "commit convention",
+                        # PR state/review outcome is an SCM concern — never block gather with it
+                        "review outcome", "pr review", "approve or request",
+                        "merge the existing pr", "merge or rework",
+                        "should i review", "shall i review",
+                        # Existing PR / branch strategy decisions — always proceed with new impl
+                        "existing pr", "existing pull request", "open a new pr", "new pr",
+                        "update the existing", "create a new pr", "create a new branch",
+                        "open new pr", "existing prs", "prior pr",
+                        "pr #", "pull request #", "pr number", "pull request number",
+                        "whether to open", "whether to create", "should i open",
+                        "update or create", "merge or open", "new pull request",
+                    }
+                    if any(kw in _q_text for kw in _org_q_kws):
+                        log(f"Suppressing gather-plan question (jira+repo context available): {next_action.get('question')}")
+                        _suppress_gather_q = True
+                if _suppress_gather_q:
+                    # Treat as proceed: all resolvable context is already in hand.
+                    break
+
                 if input_rounds >= MAX_INPUT_ROUNDS:
                     raise RuntimeError(
                         f"Team Lead exceeded the maximum clarification rounds ({MAX_INPUT_ROUNDS})."
@@ -2623,7 +2771,11 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             )
             log(f"Reviewing dev output (cycle {review_cycle + 1}/{MAX_REVIEW_CYCLES})")
 
-            review = _review_output(user_text, plan, dev_output, final_artifacts, design_info=ctx.design_info, workspace=workspace)
+            review = _review_output_with_timeout(
+                user_text, plan, dev_output, final_artifacts,
+                design_info=ctx.design_info, workspace=workspace,
+                timeout_seconds=300,
+            )
             ctx.review_result = review
             _save_workspace_file(
                 workspace,
@@ -2762,6 +2914,10 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 "platform": (ctx.plan or {}).get("platform", "unknown"),
                 "reviewCycles": ctx.review_cycles,
                 "reviewPassed": (ctx.review_result or {}).get("passed", True),
+                # True when Team Lead exhausted all review cycles and accepted the output
+                # with noted issues. Compass must NOT trigger a completeness retry in this case
+                # because Team Lead has already made a deliberate accept-with-defects decision.
+                "reviewMaxCyclesReached": ctx.review_cycles >= MAX_REVIEW_CYCLES,
             },
         )
         all_artifacts = [final_summary_artifact] + (final_artifacts or [])

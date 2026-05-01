@@ -16,7 +16,6 @@ artifacts/
 docs/
 reference/
 certs/
-android/
 tests/data*
 teams-bot/
 .connect-agent/

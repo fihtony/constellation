@@ -3389,8 +3389,12 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 "taskId": workflow_task_id,
                 "agentTaskId": task_id,
                 "prUrl": pr_url,
+                "url": pr_url,      # alias used by Compass evidence extraction
                 "branch": branch_name,
                 "filesCount": len(generated_files),
+                # jiraInReview is read by Compass to display "Completed / In Review"
+                # without having to scan the shared workspace filesystem.
+                "jiraInReview": bool(pr_url and ticket_match),
             },
         )
         final_artifacts = [summary_artifact]
