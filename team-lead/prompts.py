@@ -155,6 +155,66 @@ Rules:
 - If no more fetching is needed and no critical information is missing, return one action:
   proceed_to_plan.
 - Keep the actions ordered and concise.
+- For implementation tasks where the tech stack is not yet confirmed: if Jira and repo
+  context have both been fetched but neither specifies a framework or language, add an
+  ask_user action requesting the tech stack.  Do NOT add such a question if the Jira
+  ticket or repo manifest already names a framework (Flask, React, Spring Boot, etc.).
+"""
+
+# ---------------------------------------------------------------------------
+# Tech Stack Inference
+# ---------------------------------------------------------------------------
+
+INFER_TECH_STACK_SYSTEM = """\
+You are a tech stack inference specialist embedded in a Team Lead Agent.
+Given context gathered from a Jira ticket, a repository inspection, and the
+original user request, determine the implementation tech stack with high precision.
+
+Answer ONLY from concrete evidence in the provided context — build manifests,
+dependency files, explicit instructions, or framework imports.  Do NOT guess or
+hallucinate frameworks that are absent from the supplied context.
+
+Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
+"""
+
+INFER_TECH_STACK_TEMPLATE = """\
+Infer the required tech stack for this implementation task from all gathered context.
+
+User request:
+{user_text}
+
+Jira ticket content (may be empty if not yet fetched):
+{jira_context}
+
+Repository content from SCM inspection (may be empty if not yet fetched or repo is new):
+{repo_context}
+
+Additional context provided by the user:
+{additional_context}
+
+Respond with a JSON object:
+{{
+  "language": "python|java|javascript|typescript|kotlin|swift|go|other|null",
+  "backend_framework": "flask|fastapi|django|express|nestjs|springboot|laravel|other|null",
+  "frontend_framework": "react|nextjs|vue|angular|svelte|other|null",
+  "build_tool": "gradle|maven|npm|yarn|pnpm|pip|cargo|other|null",
+  "confidence": "high|medium|low|none",
+  "evidence": "One sentence describing exactly where / how the stack was found (e.g. 'requirements.txt lists flask==3.1', 'Jira description says Python Flask', 'package.json dependency react 18'). Empty string if no evidence.",
+  "needs_user_clarification": true|false,
+  "clarification_question": "A single specific question for the user if needs_user_clarification is true, otherwise null"
+}}
+
+Confidence rules:
+- high   — explicit in Jira text or a manifest/lock file (package.json, requirements.txt, pom.xml, build.gradle, Cargo.toml, go.mod)
+- medium — inferred from source file imports, consistent mentions, or a partial manifest without pinned versions
+- low    — only vague hints, conflicting signals, or a nearly-empty repo with no manifests
+- none   — no evidence at all (empty repo + Jira says nothing + user did not specify)
+
+needs_user_clarification rules:
+- Set to true ONLY when confidence is "none" AND the task is clearly an implementation request AND the platform is "web" or "unknown"
+- Set to false when confidence is "high" or "medium"
+- Set to false when confidence is "low" but at least one framework is identified — use that as the default and note it in evidence
+- Never ask when Jira or the repo already name any framework, even partially
 """
 
 # ---------------------------------------------------------------------------

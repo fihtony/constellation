@@ -2,13 +2,16 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install CA certs, tini, Node.js 22, and Claude Code CLI
+# Install CA certs, tini, and curl
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tini curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy corporate certs early so they are in the build layer cache
-RUN update-ca-certificates
+# Import any corporate CA certificates placed in certs/ (supports .crt and .pem)
+COPY certs/ /usr/local/share/ca-certificates/
+RUN find /usr/local/share/ca-certificates/ -name "*.pem" \
+        -exec sh -c 'cp "$1" "${1%.pem}.crt"' _ {} \; \
+    && update-ca-certificates
 
 COPY common/       /app/common/
 COPY compass/      /app/compass/

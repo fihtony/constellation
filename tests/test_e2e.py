@@ -356,15 +356,16 @@ def _assert_runtime_target(runtime_summary: dict, label: str) -> None:
     effective_backend = str(runtime_summary.get("effectiveBackend") or "").strip()
     model = str(runtime_summary.get("model") or "").strip()
 
-    if requested_backend == "copilot-cli":
-        ok(f"{label} requested backend is copilot-cli")
+    _valid_backends = {"copilot-cli", "connect-agent"}
+    if requested_backend in _valid_backends:
+        ok(f"{label} requested backend is {requested_backend}")
     else:
-        fail(f"{label} requested backend is not copilot-cli", f"actual={requested_backend!r}")
+        fail(f"{label} requested backend is not a valid agent backend", f"actual={requested_backend!r}")
 
-    if effective_backend == "copilot-cli":
-        ok(f"{label} effective backend is copilot-cli")
+    if effective_backend in _valid_backends:
+        ok(f"{label} effective backend is {effective_backend}")
     else:
-        fail(f"{label} effective backend is not copilot-cli", f"actual={effective_backend!r}")
+        fail(f"{label} effective backend is not a valid agent backend", f"actual={effective_backend!r}")
 
     if model == "gpt-5-mini":
         ok(f"{label} model is gpt-5-mini")

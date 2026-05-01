@@ -238,3 +238,27 @@ def summary_exit_code(reporter):
     print(f"\nPassed: {reporter.passed}")
     print(f"Failed: {reporter.failed}")
     return 0 if reporter.failed == 0 else 1
+
+
+def find_corp_ca_bundle(env_values: dict | None = None) -> str:
+    """Return path to the corporate CA bundle, or empty string if none found.
+
+    Resolution order:
+    1. ``CORP_CA_BUNDLE`` from the supplied *env_values* dict (tests/.env).
+    2. ``CORP_CA_BUNDLE`` from the current process environment.
+    3. First ``*.pem``, ``*.crt``, or ``*.cer`` file found in ``certs/``.
+    """
+    import glob
+
+    for source in (env_values or {}, os.environ):
+        ca = str(source.get("CORP_CA_BUNDLE") or "").strip()
+        if ca and os.path.isfile(ca):
+            return ca
+
+    certs_dir = os.path.join(PROJECT_ROOT, "certs")
+    if os.path.isdir(certs_dir):
+        for pattern in ("*.pem", "*.crt", "*.cer"):
+            matches = sorted(glob.glob(os.path.join(certs_dir, pattern)))
+            if matches:
+                return matches[0]
+    return ""

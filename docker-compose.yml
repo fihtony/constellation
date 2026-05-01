@@ -144,7 +144,6 @@ services:
       ADVERTISED_BASE_URL: "http://scm:8020"
       REGISTRY_URL: "http://registry:9000"
       HEARTBEAT_INTERVAL: "30"
-      SCM_PROVIDER: "github"
       TZ: "${TZ:-UTC}"
     volumes:
       - ./artifacts:/app/artifacts

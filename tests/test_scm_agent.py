@@ -51,6 +51,7 @@ from agent_test_support import (
     agent_url_from_args,
     build_test_subprocess_env,
     choose_base_branch,
+    find_corp_ca_bundle,
     http_request,
     load_env_file,
     run_command,
@@ -59,8 +60,11 @@ from agent_test_support import (
 )
 from agent_test_targets import (
     assert_scm_write_allowed,
+    scm_base_url,
     scm_clone_url,
+    scm_default_project,
     scm_owner,
+    scm_provider,
     scm_repo_slug,
     scm_write_root,
 )
@@ -101,23 +105,40 @@ def _free_port(start: int = DEFAULT_LOCAL_PORT) -> int:
         return s.getsockname()[1]
 
 
-def start_local_agent(token: str, port: int, openai_base_url: str = "http://localhost:1288/v1") -> subprocess.Popen | None:
+def start_local_agent(
+    token: str,
+    port: int,
+    openai_base_url: str = "http://localhost:1288/v1",
+    ca_bundle: str = "",
+) -> subprocess.Popen | None:
     venv_python = os.path.join(PROJECT_ROOT, "venv", "bin", "python")
     python = venv_python if os.path.isfile(venv_python) else sys.executable
     agent_url = f"http://127.0.0.1:{port}"
-    env = build_test_subprocess_env({
+    provider = scm_provider()
+    env_overrides: dict = {
         "HOST": "127.0.0.1",
         "PORT": str(port),
         "AGENT_ID": "scm-agent",
         "ADVERTISED_BASE_URL": agent_url,
         "REGISTRY_URL": "http://127.0.0.1:9000",
         "INSTANCE_REPORTER_ENABLED": "0",
-        "SCM_PROVIDER": "github",
+        "SCM_PROVIDER": provider,
         "SCM_TOKEN": token,
         "ALLOW_MOCK_FALLBACK": "1",
         "OPENAI_BASE_URL": openai_base_url,
         "PYTHONPATH": PROJECT_ROOT,
-    }, trusted=True)
+    }
+    if provider == "bitbucket":
+        base = scm_base_url()
+        if base:
+            env_overrides["SCM_BASE_URL"] = base
+        project = scm_default_project()
+        if project:
+            env_overrides["SCM_DEFAULT_PROJECT"] = project
+        if ca_bundle:
+            env_overrides["CORP_CA_BUNDLE"] = ca_bundle
+            env_overrides["SSL_CERT_FILE"] = ca_bundle
+    env = build_test_subprocess_env(env_overrides, trusted=True)
     return subprocess.Popen(
         [python, "scm/app.py"],
         cwd=PROJECT_ROOT,
@@ -148,6 +169,7 @@ def main(argv=None):
     # -- Load test config ---------------------------------------------------
     env_values = load_env_file("tests/.env")
     token = env_values.get("TEST_GITHUB_TOKEN", "").strip()
+    ca_bundle = find_corp_ca_bundle(env_values)
 
     # LLM endpoint: use localhost for local subprocess, host.docker.internal in containers
     openai_base_url = (
@@ -158,11 +180,12 @@ def main(argv=None):
     owner = scm_owner()
     repo = scm_repo_slug()
     clone_url = scm_clone_url()
+    provider = scm_provider()
 
-    reporter.section(f"SCM Agent Integration (GitHub) — {owner}/{repo}")
+    reporter.section(f"SCM Agent Integration ({provider.capitalize()}) — {owner}/{repo}")
 
     if not token:
-        reporter.fail("GitHub token missing — set TEST_GITHUB_TOKEN in tests/.env")
+        reporter.fail("SCM token missing — set TEST_GITHUB_TOKEN in tests/.env")
         return summary_exit_code(reporter)
 
     # -- Start / connect to agent -------------------------------------------
@@ -177,7 +200,7 @@ def main(argv=None):
     if not args.agent_url and not args.container:
         port = int(agent_url.rsplit(":", 1)[-1])
         reporter.section("Starting local SCM agent subprocess")
-        proc = start_local_agent(token, port, openai_base_url)
+        proc = start_local_agent(token, port, openai_base_url, ca_bundle)
         if not proc:
             reporter.fail("Cannot start local agent", "venv/bin/python not found")
             return summary_exit_code(reporter)
@@ -191,13 +214,20 @@ def main(argv=None):
 
     try:
         # TC-01 — Git auth --------------------------------------------------
-        reporter.step("TC-01  Validate GitHub token via git ls-remote")
-        basic_auth = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+        reporter.step(f"TC-01  Validate {provider} token via git ls-remote")
+        if provider == "bitbucket":
+            git_auth_args = ["-c", f"http.extraHeader=Authorization: Bearer {token}",
+                             "-c", "credential.helper="]
+            if ca_bundle:
+                git_auth_args.extend(["-c", f"http.sslCAInfo={ca_bundle}"])
+        else:
+            basic_auth = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+            git_auth_args = ["-c", f"http.extraHeader=AUTHORIZATION: basic {basic_auth}",
+                             "-c", "credential.helper="]
         code, stdout, stderr = run_command(
             [
                 "git",
-                "-c", f"http.extraHeader=AUTHORIZATION: basic {basic_auth}",
-                "-c", "credential.helper=",
+                *git_auth_args,
                 "ls-remote", clone_url, "HEAD",
             ],
             cwd=PROJECT_ROOT,
@@ -208,9 +238,9 @@ def main(argv=None):
             }),
         )
         if code == 0 and stdout:
-            reporter.ok("GitHub token authenticates over HTTPS")
+            reporter.ok(f"{provider.capitalize()} token authenticates over HTTPS")
         else:
-            reporter.fail("GitHub token rejected by git ls-remote", stderr or stdout)
+            reporter.fail(f"{provider.capitalize()} token rejected by git ls-remote", stderr or stdout)
             return summary_exit_code(reporter)
 
         # TC-02 — Health ----------------------------------------------------

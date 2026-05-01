@@ -161,6 +161,7 @@ class _TaskContext:
         "user_text",
         "analysis",
         "jira_info",
+        "jira_fetch_attempts",
         "repo_info",
         "design_info",
         "additional_info",
@@ -183,6 +184,7 @@ class _TaskContext:
         self.user_text: str = ""
         self.analysis: dict = {}
         self.jira_info: dict | None = None
+        self.jira_fetch_attempts: int = 0
         self.repo_info: dict | None = None
         self.design_info: dict | None = None
         self.additional_info: str = ""
@@ -361,6 +363,105 @@ def _extract_tech_stack_constraints(*texts: str) -> dict:
 def _has_tech_stack_signal(text: str) -> bool:
     lowered = str(text or "").lower()
     return any(hint in lowered for hint in _TECH_STACK_HINTS)
+
+
+def _infer_tech_stack_agentic(
+    user_text: str,
+    ctx: "_TaskContext",
+) -> tuple[dict, bool, str]:
+    """Infer the implementation tech stack using the agentic runtime.
+
+    Reads Jira ticket content, repository inspection content, and the user
+    message — then asks the LLM to identify the language, backend framework,
+    and frontend framework with a confidence rating.
+
+    Returns:
+        (constraints, needs_clarification, clarification_question)
+        - constraints: dict suitable for _apply_tech_stack_confirmation_policy
+          (non-empty only when confidence is high or medium)
+        - needs_clarification: True when the LLM determined it cannot infer
+          the stack and a user question is warranted
+        - clarification_question: the specific question to ask the user, or ""
+    """
+    jira_ctx = (ctx.jira_info or {}).get("content") or ""
+    repo_ctx = (ctx.repo_info or {}).get("content") or ""
+
+    # No gathered context yet — fall back to fast keyword scan so we don't
+    # burn an LLM call before the gather loop has fetched anything.
+    if not jira_ctx and not repo_ctx:
+        kw = _extract_tech_stack_constraints(user_text, ctx.additional_info or "")
+        return kw, False, ""
+
+    try:
+        prompt = prompts.INFER_TECH_STACK_TEMPLATE.format(
+            user_text=user_text,
+            jira_context=jira_ctx[:8000] if jira_ctx else "(not yet fetched)",
+            repo_context=repo_ctx[:4000] if repo_ctx else "(not yet fetched or repo is empty)",
+            additional_context=ctx.additional_info or "(none)",
+        )
+        response = _run_agentic(
+            prompt,
+            f"[{AGENT_ID}] infer_tech_stack",
+            system_prompt=prompts.INFER_TECH_STACK_SYSTEM,
+            timeout=60,
+        )
+        result = _parse_json_from_llm(response)
+        if not isinstance(result, dict):
+            raise ValueError("LLM returned non-dict for tech stack inference")
+
+        confidence = str(result.get("confidence") or "none").lower()
+        evidence = str(result.get("evidence") or "").strip()
+
+        constraints: dict[str, str] = {}
+        for field, key in (
+            ("language", "language"),
+            ("backend_framework", "backend_framework"),
+            ("frontend_framework", "frontend_framework"),
+            ("build_tool", "build_tool"),
+        ):
+            val = str(result.get(field) or "").strip().lower()
+            if val and val != "null" and val != "other":
+                constraints[key] = val
+
+        # Only surface constraints when we have reasonable confidence;
+        # low/none means the evidence is too thin to hard-constrain the plan.
+        if confidence not in ("high", "medium"):
+            constraints = {}
+
+        needs_clarification = (
+            bool(result.get("needs_user_clarification"))
+            and confidence in ("none", "low")
+            and not constraints
+        )
+        clarification_q = (
+            str(result.get("clarification_question") or "").strip()
+            if needs_clarification else ""
+        )
+
+        if constraints:
+            print(
+                f"[{AGENT_ID}] Tech stack inferred (confidence={confidence}, "
+                f"evidence='{evidence}'): "
+                + ", ".join(f"{k}={v}" for k, v in constraints.items())
+            )
+        elif needs_clarification:
+            print(f"[{AGENT_ID}] Tech stack unclear — will ask user: {clarification_q}")
+        else:
+            print(f"[{AGENT_ID}] Tech stack not determined (confidence={confidence}); proceeding without constraints")
+
+        return constraints, needs_clarification, clarification_q
+
+    except Exception as err:
+        # Agentic call failed — fall back to keyword matching so the workflow
+        # is never hard-blocked by a runtime error in inference.
+        print(f"[{AGENT_ID}] Tech stack agentic inference failed ({err}); falling back to keyword scan")
+        kw = _extract_tech_stack_constraints(
+            user_text,
+            jira_ctx,
+            repo_ctx,
+            ctx.additional_info or "",
+        )
+        return kw, False, ""
 
 
 def _apply_tech_stack_confirmation_policy(
@@ -1369,6 +1470,14 @@ def _save_gather_plan(workspace_path: str, gather_plan: dict) -> None:
     )
 
 
+def _jira_fetch_succeeded(ctx: _TaskContext) -> bool:
+    """Return True only if a Jira ticket was successfully fetched (not a permission/error response)."""
+    if not ctx.jira_info or not ctx.jira_info.get("content"):
+        return False
+    content = str(ctx.jira_info.get("content") or "")
+    return "fetch_failed" not in content and "Fetch status: fetch_failed" not in content
+
+
 def _suppress_redundant_questions(
     analysis: dict,
     ctx: _TaskContext,
@@ -1378,7 +1487,7 @@ def _suppress_redundant_questions(
     updated = dict(analysis or {})
     question = str(updated.get("question_for_user") or "")
 
-    if ctx.jira_info and ctx.jira_info.get("content"):
+    if _jira_fetch_succeeded(ctx):
         jira_keywords = ("jira", "ticket", "url", "browse", "atlassian", "issue", "story", "key")
         if any(keyword in question.lower() for keyword in jira_keywords):
             if log_fn:
@@ -1505,7 +1614,11 @@ def _refresh_analysis_with_known_context(
     return _suppress_redundant_questions(analysis, ctx, log_fn=log_fn)
 
 
-def _filter_unresolved_missing_info(analysis: dict, ctx: _TaskContext) -> list[str]:
+def _filter_unresolved_missing_info(
+    analysis: dict,
+    ctx: "_TaskContext",
+    tech_stack_constraints: dict | None = None,
+) -> list[str]:
     unresolved_missing = [
         str(item).strip()
         for item in (analysis.get("missing_info") or [])
@@ -1548,6 +1661,42 @@ def _filter_unresolved_missing_info(analysis: dict, ctx: _TaskContext) -> list[s
         item for item in unresolved_missing
         if not any(kw in item.lower() for kw in pr_kws)
     ]
+    # Platform / deployment environment details are best-effort and can be
+    # handled by the dev agent at runtime.  Filter them out only when the
+    # agentic tech-stack inference has already confirmed the stack (i.e.,
+    # tech_stack_constraints is non-empty).  When the stack is genuinely
+    # unknown the gather loop must surface these items so the user gets asked.
+    platform_kws = {
+        "platform", "tech-stack", "tech stack", "technology stack",
+        "deployment constraint", "environment constraint",
+        "deployment detail", "environment detail",
+        "hosting environment", "infrastructure",
+        "labels/components", "labels and components",
+    }
+    if tech_stack_constraints:
+        # Stack is confirmed — the dev agent can resolve these defaults.
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in platform_kws)
+        ]
+    elif (
+        ctx.jira_info and ctx.jira_info.get("content")
+        and ctx.repo_info and ctx.repo_info.get("content")
+    ):
+        # Both Jira and repo have been inspected and the agentic inference
+        # still returned no constraints — the "confirmed tech stack" item in
+        # missing_info is intentional and must be kept so the user gets asked.
+        # Only filter the pure deployment/environment noise that never blocks planning.
+        env_only_kws = {
+            "deployment constraint", "environment constraint",
+            "deployment detail", "environment detail",
+            "hosting environment", "infrastructure",
+            "labels/components", "labels and components",
+        }
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in env_only_kws)
+        ]
     # For UI implementation tasks, the web agent can derive these defaults from
     # the repo and ticket context without blocking plan creation.
     if (
@@ -1628,16 +1777,19 @@ def _execute_gather_action(
     if capability == "jira.ticket.fetch":
         ticket_key = str(analysis.get("jira_ticket_key") or "").strip()
         request_text = message_text or f"Fetch ticket {ticket_key}"
-        # Already have content for this ticket — skip regardless of request wording
+        # Already have content for this ticket — skip only if the previous fetch SUCCEEDED
         if (
-            ctx.jira_info
-            and ctx.jira_info.get("content")
+            _jira_fetch_succeeded(ctx)
             and str(ctx.jira_info.get("ticket_key") or "").strip() == ticket_key
         ):
+            return False
+        # Limit retries for permanently-failed fetches (e.g. permission denied)
+        if ctx.jira_fetch_attempts >= 2 and not _jira_fetch_succeeded(ctx):
             return False
         if not ticket_key:
             return False
         log_fn(f"{reason} ({capability})")
+        ctx.jira_fetch_attempts += 1
         jira_task = _call_sync_agent(
             capability,
             request_text,
@@ -2047,16 +2199,24 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     log_fn=log,
                 )
 
-            tech_stack_constraints = _extract_tech_stack_constraints(
-                user_text,
-                json.dumps(ctx.jira_info or {}, ensure_ascii=False),
-                ctx.additional_info,
+            tech_stack_constraints, _stack_needs_clarification, _stack_clarification_q = (
+                _infer_tech_stack_agentic(user_text, ctx)
             )
             if tech_stack_constraints:
                 log(
-                    "Detected tech stack constraints: "
+                    "Tech stack inferred: "
                     + ", ".join(f"{key}={value}" for key, value in tech_stack_constraints.items())
                 )
+            elif _stack_needs_clarification and _stack_clarification_q:
+                # Agentic inference could not determine the stack from Jira/repo context;
+                # surface it as a user question so the gather loop can pick it up.
+                if not _has_tech_stack_signal(str(analysis.get("question_for_user") or "")):
+                    analysis["question_for_user"] = _stack_clarification_q
+                _missing = [str(i).strip() for i in (analysis.get("missing_info") or []) if str(i).strip()]
+                if not any(_has_tech_stack_signal(i) for i in _missing):
+                    _missing.insert(0, "confirmed tech stack / framework")
+                    analysis["missing_info"] = _missing
+                log(f"Tech stack unknown after Jira+repo inspection — queued user question: {_stack_clarification_q}")
             analysis = _apply_tech_stack_confirmation_policy(analysis, tech_stack_constraints, user_text)
             ctx.analysis = analysis
 
@@ -2240,12 +2400,50 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             )
 
         # ── Phase 4: Plan ────────────────────────────────────────────────────
-        unresolved_missing = _filter_unresolved_missing_info(analysis, ctx)
+        unresolved_missing = _filter_unresolved_missing_info(analysis, ctx, tech_stack_constraints)
         if unresolved_missing and not _should_stop_before_dev_dispatch(ctx):
-            raise RuntimeError(
-                "Cannot create implementation plan with unresolved missing information: "
-                + "; ".join(unresolved_missing[:3])
-            )
+            # Ask the user rather than hard-failing, so transient info gaps
+            # (e.g. Jira permission errors, unknown platform) surface as a
+            # question instead of a dead-end failure.
+            if input_rounds < MAX_INPUT_ROUNDS:
+                input_rounds += 1
+                question = (
+                    "I could not gather all the context needed to start implementation. "
+                    "Please clarify: "
+                    + "; ".join(unresolved_missing[:3])
+                )
+                log(f"Unresolved missing info — asking user: {question}")
+                task_store.update_state(team_lead_task_id, "TASK_STATE_INPUT_REQUIRED", question)
+                input_event = threading.Event()
+                with _INPUT_EVENTS_LOCK:
+                    _INPUT_EVENTS[team_lead_task_id] = {"event": input_event, "info": None}
+                _notify_compass(
+                    callback_url,
+                    team_lead_task_id,
+                    "TASK_STATE_INPUT_REQUIRED",
+                    prompts.INPUT_REQUIRED_PREAMBLE + question,
+                )
+                if not input_event.wait(timeout=INPUT_WAIT_TIMEOUT):
+                    task_store.update_state(team_lead_task_id, "TASK_STATE_FAILED",
+                                           "Timed out waiting for user input.")
+                    exit_handler.register(team_lead_task_id)
+                    _notify_compass(callback_url, team_lead_task_id, "TASK_STATE_FAILED",
+                                   "Timed out waiting for user input.")
+                    return
+                with _INPUT_EVENTS_LOCK:
+                    entry = _INPUT_EVENTS.pop(team_lead_task_id, {})
+                    new_info = entry.get("info") or ""
+                ctx.additional_info = (
+                    (ctx.additional_info + "\n" + new_info).strip() if ctx.additional_info else new_info
+                )
+                log(f"User provided additional info for planning: {new_info[:120]}")
+                # Re-derive unresolved after user input; if still unresolved, proceed anyway.
+                analysis["missing_info"] = []
+            else:
+                raise RuntimeError(
+                    "Cannot create implementation plan with unresolved missing information: "
+                    + "; ".join(unresolved_missing[:3])
+                )
 
         task_store.update_state(team_lead_task_id, "PLANNING", "Creating implementation plan…")
         log("Creating implementation plan")
