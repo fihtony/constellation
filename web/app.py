@@ -680,6 +680,76 @@ def _self_assess_implementation(
     return result
 
 
+def _compare_design_fidelity(
+    generated_files: list[dict],
+    build_ok: bool | None,
+    build_output: str,
+    design_spec: str,
+    reference_html: str,
+    screenshot_paths: list[str],
+) -> dict:
+    """Ask LLM to compare the implementation against the design source of truth."""
+    if not design_spec and not reference_html:
+        return {
+            "fidelity_score": 100,
+            "implemented": [],
+            "missing": [],
+            "redundant": [],
+            "wrong": [],
+            "summary": "No design reference provided.",
+        }
+
+    implemented_sections: list[str] = []
+    for generated_file in generated_files:
+        path = generated_file.get("path", "")
+        if not path.lower().endswith((".js", ".jsx", ".ts", ".tsx", ".css", ".html")):
+            continue
+        content = (generated_file.get("content") or "")[:4000]
+        implemented_sections.append(f"## {path}\n{content}")
+    implemented_files = "\n\n".join(implemented_sections) or "No relevant UI files generated."
+
+    if build_ok is None:
+        build_status = "Build/test was not run."
+    elif build_ok:
+        build_status = "✅ Build and tests passed."
+    else:
+        build_status = f"❌ Build/tests failed.\n{(build_output or '')[:1000]}"
+    if screenshot_paths:
+        build_status += f"\nScreenshots: {', '.join(os.path.basename(path) for path in screenshot_paths)}"
+
+    prompt = prompts.DESIGN_COMPARE_TEMPLATE.format(
+        design_spec=(design_spec or "No design spec provided.")[:12000],
+        reference_html=(reference_html or "No reference HTML provided.")[:12000],
+        implemented_files=implemented_files[:20000],
+        build_status=build_status,
+    )
+    system = _build_web_system_prompt(prompts.DESIGN_COMPARE_SYSTEM)
+    response = _run_agentic(prompt, f"[{AGENT_ID}] design-compare", system_prompt=system, timeout=90)
+    result = _parse_json_from_llm(response)
+    if not isinstance(result, dict):
+        return {
+            "fidelity_score": 0,
+            "implemented": [],
+            "missing": [
+                {
+                    "requirement": "Design comparison parse error",
+                    "severity": "major",
+                    "file_to_fix": "",
+                    "fix_hint": "Re-run the design audit with a valid JSON response.",
+                }
+            ],
+            "redundant": [],
+            "wrong": [],
+            "summary": "Design comparison parse error.",
+        }
+    result.setdefault("implemented", [])
+    result.setdefault("missing", [])
+    result.setdefault("redundant", [])
+    result.setdefault("wrong", [])
+    result.setdefault("summary", "")
+    return result
+
+
 def _generate_file_code(
     file_info: dict,
     task_instruction: str,
@@ -2560,6 +2630,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         "techStackConstraints": tech_stack_constraints,
         "skillPlaybooks": list(_DEVELOPMENT_SKILL_NAMES),
     }
+    design_spec_for_audit = str(design_context_meta.get("content") or "")
+    reference_html_for_audit = ""
 
     def log(phase: str):
         ts = local_clock_time()
@@ -2788,6 +2860,10 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             _local_code_html = _stitch_local.get("localCodeHtml", "")
             _local_design_md = _stitch_local.get("localDesignMd", "")
             if _local_code_html or _local_design_md:
+                if _local_design_md:
+                    design_spec_for_audit = _local_design_md
+                if _local_code_html:
+                    reference_html_for_audit = _local_code_html
                 _extra: list[str] = []
                 if _local_design_md:
                     _extra.append(
@@ -3114,6 +3190,38 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 task_id, "SELF_ASSESSING",
                 f"Self-assessment [{_sa_iter + 1}/{MAX_SELF_IMPROVE}]…",
             )
+            _design_compare = _compare_design_fidelity(
+                generated_files,
+                build_ok,
+                build_output,
+                design_spec_for_audit,
+                reference_html_for_audit,
+                _screenshot_paths,
+            )
+            _design_missing = _design_compare.get("missing") or []
+            _design_redundant = _design_compare.get("redundant") or []
+            _design_wrong = _design_compare.get("wrong") or []
+            _design_findings = _design_missing + _design_redundant + _design_wrong
+            _design_files = [
+                item.get("file_to_fix", "") for item in _design_findings if item.get("file_to_fix")
+            ]
+            _save_workspace_file(
+                workspace,
+                f"{AGENT_ID}/design-compare-{_sa_iter + 1}.json",
+                json.dumps(
+                    {
+                        "iteration": _sa_iter + 1,
+                        "fidelityScore": _design_compare.get("fidelity_score", 0),
+                        "implemented": _design_compare.get("implemented") or [],
+                        "missing": _design_missing,
+                        "redundant": _design_redundant,
+                        "wrong": _design_wrong,
+                        "summary": _design_compare.get("summary", ""),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
             _assess = _self_assess_implementation(
                 task_instruction,
                 acceptance_criteria,
@@ -3122,12 +3230,22 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 build_output,
                 _screenshot_paths,
             )
-            _assess_passed = bool(_assess.get("passed"))
-            _assess_issues = _assess.get("issues") or []
-            _assess_files = _assess.get("files_to_fix") or []
+            _assess_passed = bool(_assess.get("passed")) and not _design_findings
+            _assess_issues = list(_assess.get("issues") or [])
+            for _finding in _design_findings:
+                _file_to_fix = _finding.get("file_to_fix") or "unknown-file"
+                _severity = _finding.get("severity", "major")
+                _requirement = _finding.get("requirement", "Unspecified design issue")
+                _fix_hint = _finding.get("fix_hint", "Fix the design mismatch.")
+                _assess_issues.append(
+                    f"{_file_to_fix}: {_severity}: {_requirement} — {_fix_hint}"
+                )
+            _assess_issues = list(dict.fromkeys(_assess_issues))
+            _assess_files = list(dict.fromkeys((_assess.get("files_to_fix") or []) + _design_files))
             log(
                 f"Self-assess [{_sa_iter + 1}/{MAX_SELF_IMPROVE}]: "
-                f"passed={_assess_passed}, issues={len(_assess_issues)}"
+                f"passed={_assess_passed}, issues={len(_assess_issues)}, "
+                f"design_score={_design_compare.get('fidelity_score', 0)}"
             )
             _save_workspace_file(
                 workspace,
@@ -3153,6 +3271,11 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 break
             log(f"Self-assess: re-generating {len(_assess_files)} file(s): {_assess_files}")
             _fix_context = ""
+            _file_issue_map: dict[str, list[str]] = {}
+            for _issue in _assess_issues:
+                for _target_file in _assess_files:
+                    if _target_file and _target_file in _issue:
+                        _file_issue_map.setdefault(_target_file, []).append(_issue)
             for _fi in files_to_implement:
                 if _fi.get("path") not in _assess_files:
                     continue
@@ -3165,8 +3288,13 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                                 _existing_fix = _fh.read(8000)
                         except Exception:
                             pass
+                _targeted_instruction = task_instruction
+                _file_issues = _file_issue_map.get(_fi["path"], [])
+                if _file_issues:
+                    _targeted_instruction += "\n\nFix these specific review findings for this file:\n"
+                    _targeted_instruction += "\n".join(f"- {_issue}" for _issue in _file_issues)
                 _new_code = _generate_file_code(
-                    _fi, task_instruction, analysis, _fix_context, _existing_fix,
+                    _fi, _targeted_instruction, analysis, _fix_context, _existing_fix,
                 )
                 _new_code = _strip_code_fences(_new_code)
                 for _gf in generated_files:
@@ -3179,6 +3307,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                         "action": _fi.get("action", "modify"),
                     })
                 _fix_context += f"\n{_fi['path']}: {_fi.get('purpose', '')}\n"
+                if _file_issues:
+                    _fix_context += "Review findings:\n" + "\n".join(f"- {_issue}" for _issue in _file_issues) + "\n"
             if clone_path:
                 _fixed_subset = [gf for gf in generated_files if gf["path"] in _assess_files]
                 _written_fix = _write_files_to_directory(clone_path, _fixed_subset)

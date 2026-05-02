@@ -219,6 +219,8 @@ for a single file as instructed. The code must:
    dynamic port assignment during testing and screenshots.
 8. For pytest tests of Flask apps: import the app object, set `app.testing = True`, use `app.test_client()`.
    Never use subprocess or assume a specific cwd.
+9. Treat every explicit extra requirement in the task instruction as a hard requirement. Do not ignore
+  custom validation, screenshot, file-placement, or review instructions that apply only to the current task.
 
 CRITICAL: Output ONLY the raw source code. Do NOT wrap it in markdown code fences.
 Do NOT include any explanation before or after the code.
@@ -467,10 +469,11 @@ Respond with a JSON object:
 
 Rules:
 - Set "passed" to true only if ALL acceptance criteria are clearly met AND the build/tests pass.
-- Keep "issues" focused on acceptance-criteria gaps, not minor style preferences.
+- Keep "issues" focused on acceptance-criteria gaps, missing behaviour, redundant behaviour, or clearly wrong output.
 - List only the specific files that need changes in "files_to_fix".
 - If build/tests failed, "passed" must be false.
 - If a required file is missing entirely, name the file that should be created in "files_to_fix".
+- If screenshots or a design audit indicate missing, redundant, or wrong UI details, "passed" must be false.
 """
 
 # ---------------------------------------------------------------------------
@@ -482,12 +485,16 @@ You are a senior UI engineer performing a design fidelity audit. Your job is to 
 a React implementation against its original design specification and identify every gap.
 
 Be precise and actionable. Focus on:
+- Component-by-component, attribute-by-attribute comparison
 - Missing sections or components
+- Redundant sections, elements, classes, or attributes that should not be present
+- Wrong attributes or values even when the element exists
 - Wrong colors (check exact hex values against design tokens)
 - Wrong typography (font family, size, weight, line-height)
 - Wrong layout (spacing, alignment, max-width, responsive behavior)
 - Wrong component details (border-radius, shadow, hover states)
 - Missing design tokens in tailwind.config.js
+- Unrequested theme variants such as `dark:` classes when the task only requires the light/default design
 
 Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
 """
@@ -508,6 +515,8 @@ Compare the following React implementation against the design specification.
 {build_status}
 
 For each design requirement, determine if it is correctly implemented.
+When reference HTML is provided, compare components one by one and check exact tags, text,
+href/button/icon/data attributes, class tokens, colors, spacing, typography, and child order.
 
 Respond with a JSON object:
 {{
@@ -521,13 +530,30 @@ Respond with a JSON object:
       "fix_hint": "specific change needed"
     }}
   ],
+  "redundant": [
+    {{
+      "requirement": "description of what should be removed",
+      "severity": "critical|major|minor",
+      "file_to_fix": "src/component/File.jsx",
+      "fix_hint": "specific removal needed"
+    }}
+  ],
+  "wrong": [
+    {{
+      "requirement": "description of what exists but is incorrect",
+      "severity": "critical|major|minor",
+      "file_to_fix": "src/component/File.jsx",
+      "fix_hint": "specific correction needed"
+    }}
+  ],
   "summary": "Overall assessment in 1-2 sentences"
 }}
 
 Rules:
-- Score 100 only if ALL design requirements are correctly implemented.
+- Score 100 only if ALL design requirements are correctly implemented and there are zero missing, redundant, or wrong items.
 - Score 0-50 means critical sections are missing.
 - Score 51-80 means main sections present but colors/typography/spacing wrong.
 - Score 81-99 means minor gaps only.
 - Every item in "missing" must include a specific fix_hint.
+- Every item in "redundant" and "wrong" must include a specific fix_hint.
 """

@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,8 +52,99 @@ _TESTS_DATA_DIR = os.path.join(_REPO_ROOT, "tests", "data")
 _BASE_PROJECT_NAME = "open-english-study-hub"
 _REFERENCE_SCREENSHOT = os.path.join(_DESIGN_DIR, "screen.png")
 
-# Minimum compiled CSS size to confirm Tailwind v3 actually processed
-_MIN_CSS_SIZE_BYTES = 30_000
+# Compiled Tailwind output for this small landing page should be present but not bloated.
+_MIN_CSS_SIZE_BYTES = 8_000
+_MAX_CSS_SIZE_BYTES = 120_000
+
+_STRUCTURE_RULES = {
+    "src/App.jsx": {
+        "required": [
+            "bg-background",
+            "text-on-background",
+            "font-body-ui",
+            "min-h-screen",
+            "flex flex-col",
+            "<NavBar />",
+            "<HeroSection />",
+            "<Footer />",
+        ],
+        "forbidden": ["dark:"],
+    },
+    "src/components/NavBar.jsx": {
+        "required": [
+            "<header",
+            "bg-white",
+            "border-b",
+            "border-gray-100",
+            "max-w-[1120px]",
+            "text-xl",
+            "font-bold",
+            "tracking-tighter",
+            "text-blue-900",
+            "font-['Work_Sans']",
+            "hidden md:flex items-center space-x-gutter",
+            "Lessons",
+            "Flashcards",
+            "Progress",
+            "Library",
+            "Sign In",
+        ],
+        "forbidden": ["dark:"],
+    },
+    "src/components/HeroSection.jsx": {
+        "required": [
+            "flex-grow flex flex-col items-center justify-center",
+            "px-margin-mobile",
+            "py-section-padding",
+            "font-h1",
+            "text-h1",
+            "text-primary",
+            "Master Academic English with Scholarly Precision.",
+            "bg-on-tertiary-container",
+            "text-on-tertiary",
+            "Start Learning Now",
+            "Advanced Grammar",
+            "Research Writing",
+            "Formal Vocabulary",
+            "arrow_forward",
+            "bg-outline-variant",
+        ],
+        "forbidden": ["dark:"],
+    },
+    "src/components/Footer.jsx": {
+        "required": [
+            "<footer",
+            "bg-slate-50",
+            "border-t",
+            "border-gray-200",
+            "max-w-[1120px]",
+            "© 2024 Linguist Library. Premium Academic English Study.",
+            "Terms of Service",
+            "Privacy Policy",
+            "Contact Support",
+            "font-semibold",
+            "text-slate-900",
+        ],
+        "forbidden": ["dark:"],
+    },
+}
+
+_TAILWIND_CONFIG_REQUIRED_SNIPPETS = [
+    "#002045",
+    "#13696a",
+    "#f57d32",
+    "#f9f9ff",
+    "Work Sans",
+    "Newsreader",
+    "section-padding",
+    "container-max",
+]
+
+_TAILWIND_CONFIG_FORBIDDEN_PATTERNS = [
+    r"safelist\\s*:",
+    r"pattern\\s*:\\s*/\\.\\*/",
+    r"raw\\s*:",
+]
 
 
 def _read_file_safe(path: str) -> str:
@@ -70,24 +162,45 @@ def _load_design_content() -> dict[str, str]:
     }
 
 
+def _save_reference_screenshot(project_dir: str) -> str | None:
+    if not os.path.isfile(_REFERENCE_SCREENSHOT):
+        return None
+    reference_copy_path = os.path.join(project_dir, "reference-screenshot.png")
+    shutil.copy2(_REFERENCE_SCREENSHOT, reference_copy_path)
+    return reference_copy_path
+
+
 # ---------------------------------------------------------------------------
 # Independent validation — do NOT trust agent self-report
 # ---------------------------------------------------------------------------
 
 def _validate_css_compilation(project_dir: str) -> dict:
-    """Check if Tailwind was properly compiled (not just directives passed through)."""
+    """Check if Tailwind was properly compiled and kept minimal for this page."""
     dist_assets = os.path.join(project_dir, "dist", "assets")
     if not os.path.isdir(dist_assets):
-        return {"compiled": False, "reason": "dist/assets missing", "css_size_bytes": 0}
+        return {
+            "compiled": False,
+            "minimal_bundle": False,
+            "valid": False,
+            "reason": "dist/assets missing",
+            "css_size_bytes": 0,
+        }
 
     css_files = [f for f in os.listdir(dist_assets) if f.endswith(".css")]
     if not css_files:
-        return {"compiled": False, "reason": "no CSS file in dist/assets", "css_size_bytes": 0}
+        return {
+            "compiled": False,
+            "minimal_bundle": False,
+            "valid": False,
+            "reason": "no CSS file in dist/assets",
+            "css_size_bytes": 0,
+        }
 
     css_path = os.path.join(dist_assets, css_files[0])
     css_size = os.path.getsize(css_path)
     with open(css_path, encoding="utf-8", errors="replace") as fh:
         css_content = fh.read()
+    tailwind_config = _read_file_safe(os.path.join(project_dir, "tailwind.config.js"))
 
     # Tailwind directives left raw means PostCSS did NOT run
     has_raw_directives = "@tailwind base" in css_content or "@tailwind components" in css_content
@@ -100,22 +213,74 @@ def _validate_css_compilation(project_dir: str) -> dict:
         or "display: flex" in css_content
     )
     compiled = css_size >= _MIN_CSS_SIZE_BYTES and not has_raw_directives and has_real_utilities
+    has_required_tokens = all(snippet in tailwind_config for snippet in _TAILWIND_CONFIG_REQUIRED_SNIPPETS)
+    forbidden_config_matches = [
+        pattern for pattern in _TAILWIND_CONFIG_FORBIDDEN_PATTERNS if re.search(pattern, tailwind_config)
+    ]
+    minimal_bundle = (
+        css_size <= _MAX_CSS_SIZE_BYTES
+        and not forbidden_config_matches
+        and has_required_tokens
+    )
+    valid = compiled and minimal_bundle
 
-    reason = "OK"
+    reasons: list[str] = []
     if has_raw_directives:
-        reason = "@tailwind directives were NOT processed (Tailwind PostCSS never ran)"
+        reasons.append("@tailwind directives were NOT processed (Tailwind PostCSS never ran)")
     elif css_size < _MIN_CSS_SIZE_BYTES:
-        reason = f"CSS too small ({css_size} bytes) — Tailwind utilities not compiled"
+        reasons.append(
+            f"CSS too small ({css_size} bytes) — Tailwind utilities likely were not compiled"
+        )
     elif not has_real_utilities:
-        reason = "CSS has no Tailwind utility classes — build misconfigured"
+        reasons.append("CSS has no Tailwind utility classes — build misconfigured")
+
+    if css_size > _MAX_CSS_SIZE_BYTES:
+        reasons.append(
+            f"CSS too large ({css_size} bytes) — small page should not include megabytes of unused Tailwind output"
+        )
+    if forbidden_config_matches:
+        reasons.append("tailwind.config.js contains broad safelist/raw content patterns")
+    if not has_required_tokens:
+        reasons.append("tailwind.config.js is missing required design tokens")
+
+    reason = "OK" if not reasons else " | ".join(reasons)
 
     return {
         "compiled": compiled,
+        "minimal_bundle": minimal_bundle,
+        "valid": valid,
         "reason": reason,
         "css_size_bytes": css_size,
         "has_raw_directives": has_raw_directives,
         "has_real_utilities": has_real_utilities,
+        "has_required_tokens": has_required_tokens,
+        "forbidden_config_matches": forbidden_config_matches,
         "css_file": css_files[0],
+    }
+
+
+def _validate_structure(project_dir: str) -> dict:
+    issues: list[str] = []
+    files_checked: list[str] = []
+
+    for rel_path, rule in _STRUCTURE_RULES.items():
+        file_path = os.path.join(project_dir, rel_path)
+        content = _read_file_safe(file_path)
+        files_checked.append(rel_path)
+        if not content:
+            issues.append(f"{rel_path}: file missing or empty")
+            continue
+        missing = [snippet for snippet in rule["required"] if snippet not in content]
+        forbidden = [snippet for snippet in rule["forbidden"] if snippet in content]
+        for snippet in missing:
+            issues.append(f"{rel_path}: missing `{snippet}`")
+        for snippet in forbidden:
+            issues.append(f"{rel_path}: contains forbidden `{snippet}`")
+
+    return {
+        "passed": not issues,
+        "files_checked": files_checked,
+        "issues": issues,
     }
 
 
@@ -203,22 +368,28 @@ def _build_task_prompt(design: dict[str, str], project_dir: str, prev_validation
     feedback_block = ""
     if prev_validation:
         css = prev_validation.get("css", {})
+        structure = prev_validation.get("structure", {})
         screenshot = prev_validation.get("screenshot_comparison", {})
         similarity = screenshot.get("similarity", 0)
         css_bytes = css.get("css_size_bytes", 0)
         css_reason = css.get("reason", "unknown")
         is_white = screenshot.get("is_white_page", False)
+        structure_issues = structure.get("issues", [])[:10]
+        structure_block = "\n".join(f"- {issue}" for issue in structure_issues)
 
         feedback_block = f"""
 ## CRITICAL ISSUES FROM PREVIOUS ATTEMPT (you MUST fix all of these)
 
 Previous attempt had these failures — do NOT repeat them:
 
-### CSS Compilation FAILED
-- Compiled CSS size: {css_bytes} bytes (needs > 30,000 bytes)
+    ### CSS / Bundle Validation
+    - Compiled CSS size: {css_bytes} bytes
 - Reason: {css_reason}
 - Visual similarity with reference design: {similarity}%
 {"- Screenshot shows an unstyled white page — no Tailwind styles were applied" if is_white else ""}
+
+    ### Structural Mismatches
+    {structure_block or '- None recorded'}
 
 ### Root Cause
 The main bugs in the previous attempt:
@@ -227,6 +398,8 @@ The main bugs in the previous attempt:
    If "npm run build" says "Missing script: build", restore with `echo | npm create vite@latest . -- --template react`.
 2. **Wrong Tailwind version** — must be tailwindcss@3, NOT tailwindcss (which is v4).
 3. **Missing postcss.config.js** — run `npx tailwindcss init -p` to create it.
+    4. **CSS bundle bloat** — broad `safelist`, `pattern: /.*/`, raw content padding, or fake filler CSS are NOT allowed.
+    5. **Light-theme fidelity** — for this test, `dark:` classes are redundant/wrong because the reference screenshot is the light theme only.
 
 ### MANDATORY FIXES
 1. NEVER write package.json — the Vite scaffold is already there
@@ -234,7 +407,9 @@ The main bugs in the previous attempt:
 3. Run `npx tailwindcss init -p` to generate BOTH tailwind.config.js AND postcss.config.js
 4. Install React Vite plugin: `npm install -D @vitejs/plugin-react`
 5. Create vite.config.js with the React plugin (see Step 1 below)
-6. After build, VERIFY: `wc -c dist/assets/*.css` — must show > 30000 bytes
+    6. After build, VERIFY: `wc -c dist/assets/*.css` — for this page it should be in the low tens of KB, not under 8000 bytes and not over 120000 bytes
+    7. Remove every `dark:` utility unless the task explicitly asks for a dark theme (this test does not)
+    8. Compare each component against the reference HTML attribute by attribute until there are zero missing, redundant, or wrong items
 
 """
 
@@ -424,9 +599,11 @@ cd {project_dir} && npm run build
 ```bash
 wc -c {project_dir}/dist/assets/*.css
 ```
-- If the CSS file is LESS than 30000 bytes, Tailwind did NOT compile properly.
+- If the CSS file is LESS than 8000 bytes, Tailwind likely did NOT compile properly.
+- If the CSS file is MORE than 120000 bytes for this single landing page, you likely added unused Tailwind output. Remove safelist/raw/filler bloat.
 - If you see `@tailwind base` literally in the CSS output, PostCSS did NOT run.
 - Common fix: verify `postcss.config.js` exists and has `tailwindcss` and `autoprefixer` plugins.
+- NEVER use `safelist`, `pattern: /.*/`, large `raw:` content blocks, or dummy CSS rules/comments to inflate bundle size.
 
 Check for errors and fix them. Re-run build after each fix.
 
@@ -434,7 +611,7 @@ Check for errors and fix them. Re-run build after each fix.
 
 After a successful build:
 ```bash
-# Check CSS is compiled (must be > 30KB)
+# Check CSS is compiled and minimal (should be > 8KB and < 120KB for this page)
 wc -c {project_dir}/dist/assets/*.css
 
 # Check for raw @tailwind directives (should show nothing)
@@ -444,14 +621,24 @@ grep "@tailwind" {project_dir}/dist/assets/*.css && echo "CSS NOT COMPILED" || e
 head -c 500 {project_dir}/dist/assets/*.css
 ```
 
-If CSS is not compiled, fix the Tailwind setup and rebuild.
+If CSS is not compiled or is bloated, fix the Tailwind setup and rebuild.
 
 ### Step 6 — Design Comparison
 
 After a successful build with compiled CSS:
-- List each design requirement: ✅ implemented / ❌ missing
+- Compare NavBar, HeroSection, and Footer to the reference HTML ONE COMPONENT AT A TIME.
+- For each component, compare: exact tag names, text content, href/button/icon attributes, class tokens, colors, spacing, typography, and child order.
+- Treat any redundant or wrong attribute/class as a failure — not just missing items.
+- Because this test targets the light-theme screenshot, remove all `dark:` classes and any dark-only styling.
+- List each design requirement: ✅ implemented / ❌ missing / ❌ redundant / ❌ wrong
 - Fix all missing items, rebuild
-- Repeat until ALL requirements are met
+- Repeat until there are ZERO missing, redundant, or wrong items
+
+## Additional Test-Only Requirements
+- Save the final implementation screenshot to `{project_dir}/screenshot.png`.
+- Do not write screenshots or validation artifacts anywhere outside `{project_dir}`.
+- Keep the generated CSS minimal: only include utilities actually used by this page.
+- Do not add files outside the project directory.
 
 ### Step 7 — Write README.md
 
@@ -480,13 +667,17 @@ npm run build
 - [ ] vite.config.js exists with @vitejs/plugin-react
 - [ ] `npm run build` exits with code 0
 - [ ] dist/ contains index.html and bundled JS/CSS
-- [ ] dist/assets/*.css is > 30KB (Tailwind actually compiled)
+- [ ] dist/assets/*.css is between 8KB and 120KB for this page (compiled and not bloated)
 - [ ] CSS contains NO literal `@tailwind` directives
+- [ ] tailwind.config.js contains the required design tokens and NO broad safelist/raw content shortcuts
 - [ ] NavBar with logo, nav links (Lessons/Flashcards/Progress/Library), Sign In button
 - [ ] HeroSection with h1, orange CTA button (#f57d32), three category links
-- [ ] Footer with copyright and Terms/Privacy/Contact links
+- [ ] Footer with light grey background, copyright and Terms/Privacy/Contact links
+- [ ] No `dark:` classes or dark-only styling remain in the implementation
+- [ ] Component-by-component audit finds zero missing, redundant, or wrong attributes/classes
 - [ ] tailwind.config.js has ALL design color tokens from reference HTML
 - [ ] Work Sans + Newsreader fonts loaded via Google Fonts @import
+- [ ] Final screenshot saved to `{project_dir}/screenshot.png`
 - [ ] README.md written
 
 When all criteria are met, output:
@@ -508,7 +699,11 @@ def _check_project_state(project_dir: str) -> dict:
     has_dist = os.path.isdir(os.path.join(project_dir, "dist"))
     has_src = os.path.isdir(os.path.join(project_dir, "src"))
     has_tailwind = os.path.isfile(os.path.join(project_dir, "tailwind.config.js"))
-    has_postcss = os.path.isfile(os.path.join(project_dir, "postcss.config.js"))
+    has_postcss = (
+        os.path.isfile(os.path.join(project_dir, "postcss.config.js"))
+        or os.path.isfile(os.path.join(project_dir, "postcss.config.cjs"))
+        or os.path.isfile(os.path.join(project_dir, "postcss.config.mjs"))
+    )
     has_vite_config = (
         os.path.isfile(os.path.join(project_dir, "vite.config.js"))
         or os.path.isfile(os.path.join(project_dir, "vite.config.ts"))
@@ -566,14 +761,24 @@ def _validate_full(project_dir: str, attempt: int) -> dict:
 
     # CSS compilation check
     css = _validate_css_compilation(project_dir)
-    css_icon = "✅" if css["compiled"] else "❌"
+    css_icon = "✅" if css["valid"] else ("⚠️" if css["compiled"] else "❌")
     print(f"\nCSS compilation: {css_icon}")
     print(f"  CSS file: {css.get('css_file', 'N/A')}")
     print(f"  CSS size: {css.get('css_size_bytes', 0):,} bytes")
     print(f"  Reason:   {css.get('reason', 'N/A')}")
 
+    structure = _validate_structure(project_dir)
+    structure_icon = "✅" if structure["passed"] else "❌"
+    print(f"\nStructure audit: {structure_icon}")
+    if structure["passed"]:
+        print("  All required component attributes matched the test rules.")
+    else:
+        for issue in structure["issues"][:12]:
+            print(f"  - {issue}")
+
     # Screenshot
     print("\nCapturing screenshot of built page...")
+    reference_copy_path = _save_reference_screenshot(project_dir)
     screenshot_path = _capture_screenshot(project_dir)
 
     # Visual comparison
@@ -590,28 +795,33 @@ def _validate_full(project_dir: str, attempt: int) -> dict:
     else:
         print("\nVisual comparison: ❌ (screenshot could not be captured)")
 
-    # Quality score: weighted combination of CSS + visual + config files
-    css_score = 100 if css["compiled"] else 0
+    # Quality score: weighted combination of CSS + visual + structure + config files
+    css_score = 100 if css["valid"] else (60 if css["compiled"] else 0)
     visual_score = comparison.get("similarity", 0)
+    structure_score = max(0, 100 - 12 * len(structure["issues"]))
     has_postcss_score = 100 if state["has_postcss"] else 0
     has_dist_score = 100 if state["has_dist"] else 0
     quality_score = round(
-        0.35 * css_score
-        + 0.40 * visual_score
-        + 0.15 * has_postcss_score
-        + 0.10 * has_dist_score
+        0.28 * css_score
+        + 0.34 * visual_score
+        + 0.20 * structure_score
+        + 0.10 * has_postcss_score
+        + 0.08 * has_dist_score
     )
 
     print(f"\nOverall quality score: {quality_score}/100")
-    print(f"  CSS compiled:      {css_score}/100 (weight 35%)")
-    print(f"  Visual similarity: {visual_score}/100 (weight 40%)")
-    print(f"  PostCSS config:    {has_postcss_score}/100 (weight 15%)")
-    print(f"  Build output:      {has_dist_score}/100 (weight 10%)")
+    print(f"  CSS validity:      {css_score}/100 (weight 28%)")
+    print(f"  Visual similarity: {visual_score}/100 (weight 34%)")
+    print(f"  Structure audit:   {structure_score}/100 (weight 20%)")
+    print(f"  PostCSS config:    {has_postcss_score}/100 (weight 10%)")
+    print(f"  Build output:      {has_dist_score}/100 (weight 8%)")
 
     validation = {
         "attempt": attempt,
         "state": state,
         "css": css,
+        "structure": structure,
+        "reference_screenshot_path": reference_copy_path,
         "screenshot_path": screenshot_path,
         "screenshot_comparison": comparison,
         "quality_score": quality_score,
@@ -750,8 +960,10 @@ def run_test(
         "agent_summary": result.summary[:2000],
         "quality_score": validation["quality_score"],
         "css_compiled": validation["css"]["compiled"],
+        "css_valid": validation["css"]["valid"],
         "css_size_bytes": validation["css"].get("css_size_bytes", 0),
         "visual_similarity": validation["screenshot_comparison"].get("similarity", 0),
+        "structure_passed": validation["structure"]["passed"],
     }
     report_path = os.path.join(project_dir, "test-report.json")
     with open(report_path, "w", encoding="utf-8") as fh:
@@ -761,8 +973,10 @@ def run_test(
     quality = validation["quality_score"]
     is_complete = (
         validation["state"]["complete"]
-        and validation["css"]["compiled"]
-        and quality >= 75
+        and validation["css"]["valid"]
+        and validation["structure"]["passed"]
+        and validation["screenshot_comparison"].get("similarity", 0) >= 90
+        and quality >= 90
     )
 
     _print_separator()
@@ -774,12 +988,16 @@ def run_test(
     else:
         print(f"⚠️  ATTEMPT {attempt} FAILED VALIDATION — quality score {quality}/100")
         css = validation["css"]
-        if not css["compiled"]:
-            print(f"   ❌ CSS NOT COMPILED: {css.get('reason')}")
-            print("      → Next attempt: use tailwindcss@3 + postcss.config.js + vite.config.js")
+        if not css["valid"]:
+            print(f"   ❌ CSS INVALID: {css.get('reason')}")
+            print("      → Next attempt: compile Tailwind correctly and remove unused/bloated output")
         sim = validation["screenshot_comparison"].get("similarity", 0)
-        if sim < 70:
-            print(f"   ❌ VISUAL MISMATCH: {sim}% similarity (needs ≥70%)")
+        if sim < 90:
+            print(f"   ❌ VISUAL MISMATCH: {sim}% similarity (needs ≥90%)")
+        if not validation["structure"]["passed"]:
+            print("   ❌ STRUCTURAL MISMATCHES:")
+            for issue in validation["structure"]["issues"][:8]:
+                print(f"      - {issue}")
         if not validation["state"]["has_postcss"]:
             print("   ❌ postcss.config.js missing — Tailwind PostCSS plugin never ran")
         if not validation["state"]["has_vite_config"]:
