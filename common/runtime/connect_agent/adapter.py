@@ -323,7 +323,8 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
                 expected_policy_profile=profile.name,
                 expected_tool_names=session_tool_names,
             )
-            task_id = checkpoint_state.get("task_id", task_id)
+            if checkpoint_state is not None:
+                task_id = checkpoint_state.get("task_id", task_id)
 
         effective_system = system_prompt or DEFAULT_AGENTIC_SYSTEM
 
