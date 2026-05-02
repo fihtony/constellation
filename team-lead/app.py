@@ -580,6 +580,7 @@ def _build_dev_task_metadata(
     tech_stack_constraints: dict | None,
     acceptance_criteria: list | None,
     requires_tests: bool,
+    jira_ticket_key: str = "",
     is_revision: bool = False,
     revision_cycle: int = 0,
     review_issues: list | None = None,
@@ -597,6 +598,7 @@ def _build_dev_task_metadata(
         "techStackConstraints": tech_stack_constraints or {},
         "acceptanceCriteria": acceptance_criteria or [],
         "requiresTests": requires_tests,
+        "jiraTicketKey": jira_ticket_key,
         "devWorkflowInstructions": _DEV_WORKFLOW_INSTRUCTIONS,
         # Exit rule: dev agent must wait for our ACK before shutting down
         "exitRule": PerTaskExitHandler.build(
@@ -1372,13 +1374,23 @@ def _normalize_gather_plan(raw_plan: dict, fallback_plan: dict, capability_snaps
             question = str(raw_action.get("question") or "").strip()
             reason = str(raw_action.get("reason") or "").strip()
             if question:
-                normalized_actions.append(
-                    {
-                        "action": _GATHER_ACTION_ASK_USER,
-                        "question": question,
-                        "reason": reason,
-                    }
-                )
+                # Drop questions about content that the dev agent can determine
+                # autonomously (docs-specific placeholders, contact details, etc.)
+                _suppressible_q_kws = {
+                    "support contact", "contact detail", "contact info",
+                    "email, team", "slack channel", "team name", "support info",
+                    "support information", "contact/team", "contact or",
+                    "existing pr", "open new pr", "new pr vs", "pr vs update",
+                    "which pr", "which branch to use", "create a new pr",
+                }
+                if not any(kw in question.lower() for kw in _suppressible_q_kws):
+                    normalized_actions.append(
+                        {
+                            "action": _GATHER_ACTION_ASK_USER,
+                            "question": question,
+                            "reason": reason,
+                        }
+                    )
         elif action == _GATHER_ACTION_STOP:
             reason = str(raw_action.get("reason") or "").strip()
             if reason:
@@ -1672,7 +1684,9 @@ def _filter_unresolved_missing_info(
         if not any(kw in item.lower() for kw in ci_kws)
     ]
     pr_kws = {"canonical pr", "canonical branch", "authoritative pr", "which pr",
-              "which branch", "pr url", "branch name", "merge target"}
+              "which branch", "pr url", "branch name", "merge target",
+              "existing pr", "open a new pr", "open new pr", "merge existing",
+              "merge an existing", "reuse", "create a new pr"}
     unresolved_missing = [
         item for item in unresolved_missing
         if not any(kw in item.lower() for kw in pr_kws)
@@ -1788,6 +1802,16 @@ def _filter_unresolved_missing_info(
             "naming convention",
             "commit convention",
             "commit message convention",
+            # Contact details / support info in docs tasks are best-effort:
+            # the dev agent will use placeholder values or repo defaults.
+            "contact detail",
+            "support contact",
+            "support information",
+            "contact/team",
+            "email, team",
+            "support channel",
+            "formal acceptance criteria",
+            "qa sign-off",
             # PR review state / merge decisions are SCM concerns, not planning blockers
             "review outcome",
             "pr review",
@@ -2730,6 +2754,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 tech_stack_constraints=tech_stack_constraints,
                 acceptance_criteria=plan.get("acceptance_criteria") or [],
                 requires_tests=plan.get("requires_tests", False),
+                jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
                 design_context=ctx.design_info,
             ),
         }
@@ -2845,6 +2870,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     tech_stack_constraints=tech_stack_constraints,
                     acceptance_criteria=plan.get("acceptance_criteria") or [],
                     requires_tests=plan.get("requires_tests", False),
+                    jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
                     is_revision=True,
                     revision_cycle=review_cycle + 1,
                     review_issues=review.get("issues") or [],

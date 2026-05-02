@@ -115,6 +115,23 @@ _BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
         "max_timeout_seconds": 1800,
         "subagent_profile": "workspace-write",
     },
+    "design-to-code": {
+        "allow_tools": _CORE_TOOL_NAMES + _WRITE_TOOL_NAMES,
+        "sensitive_path_deny_list": [
+            ".env", ".env.*", "*.pem", "*.key", "id_rsa*",
+            ".git/config", ".git/credentials", "**/.ssh/**", "**/secrets/**",
+        ],
+        "bash_deny_patterns": [
+            "rm -rf /", "sudo ", "shutdown", "reboot", "mkfs",
+            "dd if=", ":(){ ", "chmod -R 777 /",
+            "> /dev/", "chown root", "> ~/.ssh/", "> /etc/",
+        ],
+        "allow_network": False,
+        "max_turns": 100,
+        "max_timeout_seconds": 3600,
+        "bash_max_timeout": 600,
+        "subagent_profile": "workspace-write",
+    },
     "integration-call": {
         "allow_tools": _CORE_TOOL_NAMES + _WRITE_TOOL_NAMES + _DOMAIN_TOOL_NAMES,
         "sensitive_path_deny_list": [

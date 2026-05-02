@@ -2654,10 +2654,17 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 ),
             )
 
-        # Extract Jira ticket key if present in instruction
-        ticket_match = re.search(r"\b([A-Z][A-Z0-9]+-\d+)\b", task_instruction)
-        if ticket_match and workspace:
-            ticket_key = ticket_match.group(1)
+        # Extract Jira ticket key: prefer explicit metadata field from Team Lead,
+        # then fall back to regex.  Require at least 2 digits to avoid matching
+        # technical terms like "UTF-8", "ISO-8", "HTTP-2", etc.
+        ticket_key_from_meta = str(metadata.get("jiraTicketKey") or "").strip()
+        ticket_match = None
+        if ticket_key_from_meta:
+            ticket_key = ticket_key_from_meta
+        else:
+            ticket_match = re.search(r"\b([A-Z][A-Z0-9]+-\d{2,})\b", task_instruction)
+            ticket_key = ticket_match.group(1) if ticket_match else ""
+        if ticket_key and workspace:
             log(f"Fetching Jira context for {ticket_key}")
             jira_content = _fetch_jira_context(task_id, ticket_key, workspace, compass_task_id)
             if jira_content:
@@ -3394,7 +3401,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 "filesCount": len(generated_files),
                 # jiraInReview is read by Compass to display "Completed / In Review"
                 # without having to scan the shared workspace filesystem.
-                "jiraInReview": bool(pr_url and ticket_match),
+                "jiraInReview": bool(pr_url and ticket_key),
             },
         )
         final_artifacts = [summary_artifact]

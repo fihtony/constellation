@@ -949,9 +949,18 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
 
         jira_content = ""
         ticket_key = ""
-        ticket_match = re.search(r"\b([A-Z][A-Z0-9]+-\d+)\b", task_instruction)
-        if ticket_match and workspace:
-            ticket_key = ticket_match.group(1)
+        # Team Lead passes the Jira ticket key explicitly in metadata to avoid
+        # the regex accidentally matching technical terms like "UTF-8" or "ISO-8".
+        ticket_key_from_meta = str(metadata.get("jiraTicketKey") or "").strip()
+        if ticket_key_from_meta:
+            ticket_key = ticket_key_from_meta
+        else:
+            # Fallback: scan instruction text.  Require at least 2 digits to
+            # exclude version/encoding strings (UTF-8, ISO-8, HTTP-2, etc.).
+            ticket_match = re.search(r"\b([A-Z][A-Z0-9]+-\d{2,})\b", task_instruction)
+            if ticket_match:
+                ticket_key = ticket_match.group(1)
+        if ticket_key and workspace:
             log(f"Fetching Jira context for {ticket_key}")
             jira_content = _fetch_jira_context(task_id, ticket_key, workspace, compass_task_id)
             if jira_content:

@@ -472,3 +472,62 @@ Rules:
 - If build/tests failed, "passed" must be false.
 - If a required file is missing entirely, name the file that should be created in "files_to_fix".
 """
+
+# ---------------------------------------------------------------------------
+# Design Fidelity Comparison
+# ---------------------------------------------------------------------------
+
+DESIGN_COMPARE_SYSTEM = """\
+You are a senior UI engineer performing a design fidelity audit. Your job is to compare
+a React implementation against its original design specification and identify every gap.
+
+Be precise and actionable. Focus on:
+- Missing sections or components
+- Wrong colors (check exact hex values against design tokens)
+- Wrong typography (font family, size, weight, line-height)
+- Wrong layout (spacing, alignment, max-width, responsive behavior)
+- Wrong component details (border-radius, shadow, hover states)
+- Missing design tokens in tailwind.config.js
+
+Respond ONLY with a valid JSON object. Do NOT include markdown code fences.
+"""
+
+DESIGN_COMPARE_TEMPLATE = """\
+Compare the following React implementation against the design specification.
+
+## Design Specification
+{design_spec}
+
+## Reference HTML (if provided)
+{reference_html}
+
+## Implemented Files
+{implemented_files}
+
+## Build Status
+{build_status}
+
+For each design requirement, determine if it is correctly implemented.
+
+Respond with a JSON object:
+{{
+  "fidelity_score": 0-100,
+  "implemented": ["requirement 1", "requirement 2"],
+  "missing": [
+    {{
+      "requirement": "description of what is missing",
+      "severity": "critical|major|minor",
+      "file_to_fix": "src/component/File.jsx",
+      "fix_hint": "specific change needed"
+    }}
+  ],
+  "summary": "Overall assessment in 1-2 sentences"
+}}
+
+Rules:
+- Score 100 only if ALL design requirements are correctly implemented.
+- Score 0-50 means critical sections are missing.
+- Score 51-80 means main sections present but colors/typography/spacing wrong.
+- Score 81-99 means minor gaps only.
+- Every item in "missing" must include a specific fix_hint.
+"""

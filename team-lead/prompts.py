@@ -31,6 +31,11 @@ Before asking the user for missing implementation details, exhaust the fetched
 context first: Jira raw payload/custom fields, repository metadata, and design
 context already supplied in additional_context.
 
+Do NOT include PR/branch strategy in missing_info or question_for_user.
+Never ask about existing PRs, existing branches, or whether to create a new PR
+vs update an existing one — always assume a fresh implementation on a new branch.
+Existing open PRs from previous runs are irrelevant to the current task.
+
 Respond ONLY with a valid JSON object. Do NOT include markdown code fences or
 any text outside the JSON.
 """

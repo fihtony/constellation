@@ -33,7 +33,9 @@ from common.runtime.connect_agent.sandbox import (
 # ---------------------------------------------------------------------------
 # Shared state — set by the agent loop before tool execution
 # ---------------------------------------------------------------------------
-_sandbox_root: str = os.getcwd()
+# Use CONNECT_AGENT_SANDBOX_ROOT env var when available so that module
+# reloads (importlib.reload) don't reset the sandbox to os.getcwd().
+_sandbox_root: str = os.environ.get("CONNECT_AGENT_SANDBOX_ROOT") or os.getcwd()
 _allow_roots: list[str] = []
 _sensitive_patterns: list[str] = []
 _bash_deny_patterns: list[str] = []
