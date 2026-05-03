@@ -247,6 +247,14 @@ class BitbucketProvider(SCMProvider):
         )
         if status in (200, 201):
             return self._normalize_pr(body, project, repo), "created"
+        # Bitbucket Server returns 409 when a PR for this source branch already exists.
+        # The body contains {"errors": [{"existingPullRequest": {...}}]} — extract it.
+        if status == 409:
+            errors = body.get("errors") or [] if isinstance(body, dict) else []
+            for err in errors:
+                existing = err.get("existingPullRequest") or {}
+                if existing:
+                    return self._normalize_pr(existing, project, repo), "already_exists"
         return body, f"create_failed_{status}"
 
     def _normalize_pr(self, pr: dict, project: str, repo: str) -> dict:

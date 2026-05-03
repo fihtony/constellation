@@ -30,7 +30,7 @@ Constellation policy override:
 Create a fine-grained PAT at https://github.com/settings/personal-access-tokens/new:
 - Under **Permissions → Account permissions** → select **Copilot Requests**
 
-Supported token prefixes: `github_pat_` (fine-grained), `gho_` (OAuth), `ghu_` (GitHub App)  
+Supported token types: fine-grained PAT, OAuth token, GitHub App token  
 Classic PAT (`ghp_`) is **NOT** supported.
 
 ---
@@ -201,7 +201,7 @@ This keeps Copilot CLI valuable for multi-step reasoning while preserving Conste
 
 ```env
 # Required: Fine-grained PAT with "Copilot Requests" permission
-COPILOT_GITHUB_TOKEN=github_pat_...
+COPILOT_GITHUB_TOKEN=<your-copilot-github-token>
 
 # Optional: override model (default: gpt-5-mini)
 COPILOT_MODEL=gpt-5-mini

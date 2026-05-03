@@ -2,6 +2,10 @@
 
 All agents that need agentic reasoning should call ``get_runtime().run(...)``
 instead of invoking a raw LLM or CLI command directly.
+
+Supports two execution modes:
+- ``run()``:         Single structured prompt → response (existing mode).
+- ``run_agentic()``: Autonomous multi-turn execution with tools (new mode).
 """
 
 from __future__ import annotations
@@ -11,12 +15,55 @@ import os
 import re
 import shutil
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Callable
 
-from common.env_utils import env_flag, resolve_openai_base_url
+from common.env_utils import resolve_openai_base_url
+
+
+@dataclass
+class AgenticResult:
+    """Result of an agentic (multi-turn) execution."""
+
+    success: bool
+    summary: str
+    artifacts: list[dict] = field(default_factory=list)
+    tool_calls: list[dict] = field(default_factory=list)
+    continuation: str | None = None
+    raw_output: str = ""
+    turns_used: int = 0
+    backend_used: str = ""
+    evidence: list[dict] = field(default_factory=list)
+    approvals_used: list[dict] = field(default_factory=list)
+    policy_profile: str = ""
+    checkpoint_id: str | None = None
+    verifier_summary: str | None = None
+
+
+@dataclass
+class AgenticCheckpoint:
+    """Persisted state for resuming an agentic execution."""
+
+    task_id: str
+    provider: str
+    continuation: str | None
+    summary: str
+    policy_hash: str = ""
+    toolset_hash: str = ""
+    verified_state: str | None = None
+    open_questions: list[str] = field(default_factory=list)
+    pending_approvals: list[dict] = field(default_factory=list)
+    last_updated_at: str = ""
 
 
 class AgentRuntimeAdapter(ABC):
-    """Abstract base class for runtime backends."""
+    """Abstract base class for runtime backends.
+
+    Backends must implement both ``run()`` (single-shot) and
+    ``run_agentic()`` (multi-turn autonomous).  Backends that do not
+    natively support agentic mode should raise ``NotImplementedError``
+    or implement a function-calling simulation.
+    """
 
     @abstractmethod
     def run(
@@ -30,6 +77,37 @@ class AgentRuntimeAdapter(ABC):
     ) -> dict:
         """Execute a prompt and return the standard runtime result contract."""
         raise NotImplementedError
+
+    def run_agentic(
+        self,
+        task: str,
+        *,
+        system_prompt: str | None = None,
+        cwd: str | None = None,
+        tools: list[str] | None = None,
+        mcp_servers: dict | None = None,
+        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
+        max_turns: int = 50,
+        timeout: int = 1800,
+        on_progress: Callable[[str], None] | None = None,
+        continuation: str | None = None,
+    ) -> AgenticResult:
+        """Autonomous multi-turn execution with tool access.
+
+        Default implementation raises NotImplementedError.  Backends that
+        support agentic mode override this method.
+        """
+        del task, system_prompt, cwd, tools, mcp_servers, allowed_tools, disallowed_tools
+        del max_turns, timeout, on_progress, continuation
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support run_agentic(). "
+            "Use a backend that supports agentic mode (e.g. claude-code, copilot-cli)."
+        )
+
+    def supports_mcp(self) -> bool:
+        """Return True if this backend can consume MCP servers natively."""
+        return False
 
     @staticmethod
     def resolve_model(*candidates: str | None, fallback: str) -> str:
@@ -129,7 +207,7 @@ class AgentRuntimeAdapter(ABC):
 _ALIASES = {
     "copilot": "copilot-cli",
     "copilot-cli": "copilot-cli",
-    "copilot-connect": "copilot-connect",
+    "connect-agent": "connect-agent",
     "claude": "claude-code",
     "claude-code": "claude-code",
     "mock": "mock",
@@ -139,8 +217,8 @@ _INSTANCES: dict[str, AgentRuntimeAdapter] = {}
 
 
 def resolve_backend_name(backend: str | None = None) -> tuple[str, str]:
-    requested = (backend or os.environ.get("AGENT_RUNTIME") or "copilot-connect").strip().lower()
-    return requested, _ALIASES.get(requested, "copilot-connect")
+    requested = (backend or os.environ.get("AGENT_RUNTIME") or "connect-agent").strip().lower()
+    return requested, _ALIASES.get(requested, "connect-agent")
 
 
 def _copilot_cli_status() -> dict:
@@ -179,12 +257,10 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
     summary = {
         "requestedBackend": requested,
         "effectiveBackend": effective,
-        "allowMockFallback": env_flag("ALLOW_MOCK_FALLBACK", default=False),
     }
 
     if effective == "copilot-cli":
         cli_status = _copilot_cli_status()
-        summary["effectiveBackend"] = "copilot-cli" if cli_status["ready"] else "copilot-connect"
         summary.update(
             {
                 **cli_status,
@@ -196,13 +272,10 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 ),
             }
         )
-        if not cli_status["tokenConfigured"]:
-            summary["fallbackReason"] = "Copilot CLI token is not configured."
-        elif not cli_status["binaryAvailable"]:
-            summary["fallbackReason"] = f"Copilot CLI binary '{cli_status['binary']}' is not available."
+        if not cli_status["ready"]:
+            summary["error"] = "Copilot CLI is not ready (token or binary missing)."
     elif effective == "claude-code":
         claude_status = _claude_code_status()
-        summary["effectiveBackend"] = "claude-code" if claude_status["ready"] else "copilot-connect"
         summary.update(
             {
                 **claude_status,
@@ -213,9 +286,9 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 ),
             }
         )
-        if not claude_status["binaryAvailable"]:
-            summary["fallbackReason"] = f"Claude Code binary '{claude_status['binary']}' is not available."
-    elif effective == "copilot-connect":
+        if not claude_status["ready"]:
+            summary["error"] = f"Claude Code binary '{claude_status['binary']}' is not available."
+    elif effective == "connect-agent":
         summary.update(
             {
                 "baseUrlConfigured": bool(os.environ.get("OPENAI_BASE_URL", "").strip()),
@@ -226,6 +299,9 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                     os.environ.get("OPENAI_MODEL"),
                     fallback="gpt-5-mini",
                 ),
+                "sandboxRoot": os.environ.get("CONNECT_AGENT_SANDBOX_ROOT", ""),
+                "maxTurns": os.environ.get("CONNECT_AGENT_MAX_TURNS", "50"),
+                "timeout": os.environ.get("CONNECT_AGENT_TIMEOUT", "1800"),
             }
         )
     elif effective == "mock":
@@ -251,10 +327,10 @@ def _load_backend_class(backend: str) -> type[AgentRuntimeAdapter]:
         from common.runtime.claude_code import ClaudeCodeAdapter
 
         return ClaudeCodeAdapter
-    if backend == "copilot-connect":
-        from common.runtime.copilot_connect import CopilotConnectAdapter
+    if backend == "connect-agent":
+        from common.runtime.connect_agent import ConnectAgentAdapter
 
-        return CopilotConnectAdapter
+        return ConnectAgentAdapter
     if backend == "mock":
         from common.runtime.mock import MockAdapter
 
@@ -271,7 +347,7 @@ def get_runtime(
     Backend resolution priority:
     1. explicit ``backend`` argument
     2. ``AGENT_RUNTIME`` environment variable
-    3. default ``copilot-connect``
+    3. default ``connect-agent``
     """
     requested, effective_backend = resolve_backend_name(backend)
 

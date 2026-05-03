@@ -58,7 +58,7 @@ MAX_REVIEW_CYCLES = int(os.environ.get("MAX_REVIEW_CYCLES", "2"))
 MAX_GATHER_ROUNDS = int(os.environ.get("MAX_GATHER_ROUNDS", "6"))
 MAX_INPUT_ROUNDS = int(os.environ.get("MAX_INPUT_ROUNDS", "2"))
 SYNC_AGENT_TIMEOUT = int(os.environ.get("SYNC_AGENT_TIMEOUT_SECONDS", "120"))
-DEV_AGENT_ACK_TIMEOUT = int(os.environ.get("DEV_AGENT_ACK_TIMEOUT_SECONDS", "300"))
+DEV_AGENT_ACK_TIMEOUT = int(os.environ.get("DEV_AGENT_ACK_TIMEOUT_SECONDS", "3600"))
 COMPASS_ACK_TIMEOUT = int(os.environ.get("COMPASS_ACK_TIMEOUT_SECONDS", "300"))
 
 _AGENT_CARD_PATH = os.path.join(os.path.dirname(__file__), "agent-card.json")
@@ -161,6 +161,7 @@ class _TaskContext:
         "user_text",
         "analysis",
         "jira_info",
+        "jira_fetch_attempts",
         "repo_info",
         "design_info",
         "additional_info",
@@ -183,6 +184,7 @@ class _TaskContext:
         self.user_text: str = ""
         self.analysis: dict = {}
         self.jira_info: dict | None = None
+        self.jira_fetch_attempts: int = 0
         self.repo_info: dict | None = None
         self.design_info: dict | None = None
         self.additional_info: str = ""
@@ -225,6 +227,52 @@ def _append_workspace_file(workspace_path: str, relative_name: str, content: str
             fh.write(content)
     except OSError as exc:
         print(f"[{AGENT_ID}] Warning: could not append workspace file {relative_name}: {exc}")
+
+
+def _read_pr_url_from_workspace(workspace: str) -> str:
+    """Return the PR URL saved by any execution agent, if available.
+
+    Scans all workspace subdirectories for branch-info.json so that any
+    platform agent (android, ios, web, …) is discovered dynamically.
+    """
+    if not workspace or not os.path.isdir(workspace):
+        return ""
+    try:
+        entries = sorted(os.listdir(workspace))
+    except OSError:
+        return ""
+    for entry in entries:
+        path = os.path.join(workspace, entry, "branch-info.json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                pr_url = json.load(fh).get("prUrl", "")
+                if pr_url:
+                    return pr_url
+        except Exception:
+            continue
+    return ""
+
+
+def _post_pr_review_comment(pr_url: str, feedback: str, workspace: str, task_id: str) -> None:
+    """Best-effort: post review feedback as a comment on the PR via SCM agent."""
+    if not pr_url or not feedback:
+        return
+    try:
+        scm_url = _resolve_agent_service_url("scm.pr.comment")
+        if not scm_url:
+            print(f"[{AGENT_ID}] No SCM agent with scm.pr.comment capability — skipping PR comment")
+            return
+        msg = {
+            "messageId": f"tl-review-{task_id}",
+            "role": "ROLE_USER",
+            "parts": [{"text": f"Please add this review comment to PR {pr_url}:\n\n{feedback}"}],
+            "metadata": {"prUrl": pr_url, "commentText": feedback},
+        }
+        rev_task = _a2a_send(scm_url, msg)
+        _poll_agent_task(scm_url, rev_task.get("id", ""), timeout=30)
+        print(f"[{AGENT_ID}] Posted review comment to PR {pr_url}")
+    except Exception as exc:
+        print(f"[{AGENT_ID}] Could not post PR review comment: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +379,105 @@ def _has_tech_stack_signal(text: str) -> bool:
     return any(hint in lowered for hint in _TECH_STACK_HINTS)
 
 
+def _infer_tech_stack_agentic(
+    user_text: str,
+    ctx: "_TaskContext",
+) -> tuple[dict, bool, str]:
+    """Infer the implementation tech stack using the agentic runtime.
+
+    Reads Jira ticket content, repository inspection content, and the user
+    message — then asks the LLM to identify the language, backend framework,
+    and frontend framework with a confidence rating.
+
+    Returns:
+        (constraints, needs_clarification, clarification_question)
+        - constraints: dict suitable for _apply_tech_stack_confirmation_policy
+          (non-empty only when confidence is high or medium)
+        - needs_clarification: True when the LLM determined it cannot infer
+          the stack and a user question is warranted
+        - clarification_question: the specific question to ask the user, or ""
+    """
+    jira_ctx = (ctx.jira_info or {}).get("content") or ""
+    repo_ctx = (ctx.repo_info or {}).get("content") or ""
+
+    # No gathered context yet — fall back to fast keyword scan so we don't
+    # burn an LLM call before the gather loop has fetched anything.
+    if not jira_ctx and not repo_ctx:
+        kw = _extract_tech_stack_constraints(user_text, ctx.additional_info or "")
+        return kw, False, ""
+
+    try:
+        prompt = prompts.INFER_TECH_STACK_TEMPLATE.format(
+            user_text=user_text,
+            jira_context=jira_ctx[:8000] if jira_ctx else "(not yet fetched)",
+            repo_context=repo_ctx[:4000] if repo_ctx else "(not yet fetched or repo is empty)",
+            additional_context=ctx.additional_info or "(none)",
+        )
+        response = _run_agentic(
+            prompt,
+            f"[{AGENT_ID}] infer_tech_stack",
+            system_prompt=prompts.INFER_TECH_STACK_SYSTEM,
+            timeout=60,
+        )
+        result = _parse_json_from_llm(response)
+        if not isinstance(result, dict):
+            raise ValueError("LLM returned non-dict for tech stack inference")
+
+        confidence = str(result.get("confidence") or "none").lower()
+        evidence = str(result.get("evidence") or "").strip()
+
+        constraints: dict[str, str] = {}
+        for field, key in (
+            ("language", "language"),
+            ("backend_framework", "backend_framework"),
+            ("frontend_framework", "frontend_framework"),
+            ("build_tool", "build_tool"),
+        ):
+            val = str(result.get(field) or "").strip().lower()
+            if val and val != "null" and val != "other":
+                constraints[key] = val
+
+        # Only surface constraints when we have reasonable confidence;
+        # low/none means the evidence is too thin to hard-constrain the plan.
+        if confidence not in ("high", "medium"):
+            constraints = {}
+
+        needs_clarification = (
+            bool(result.get("needs_user_clarification"))
+            and confidence in ("none", "low")
+            and not constraints
+        )
+        clarification_q = (
+            str(result.get("clarification_question") or "").strip()
+            if needs_clarification else ""
+        )
+
+        if constraints:
+            print(
+                f"[{AGENT_ID}] Tech stack inferred (confidence={confidence}, "
+                f"evidence='{evidence}'): "
+                + ", ".join(f"{k}={v}" for k, v in constraints.items())
+            )
+        elif needs_clarification:
+            print(f"[{AGENT_ID}] Tech stack unclear — will ask user: {clarification_q}")
+        else:
+            print(f"[{AGENT_ID}] Tech stack not determined (confidence={confidence}); proceeding without constraints")
+
+        return constraints, needs_clarification, clarification_q
+
+    except Exception as err:
+        # Agentic call failed — fall back to keyword matching so the workflow
+        # is never hard-blocked by a runtime error in inference.
+        print(f"[{AGENT_ID}] Tech stack agentic inference failed ({err}); falling back to keyword scan")
+        kw = _extract_tech_stack_constraints(
+            user_text,
+            jira_ctx,
+            repo_ctx,
+            ctx.additional_info or "",
+        )
+        return kw, False, ""
+
+
 def _apply_tech_stack_confirmation_policy(
     analysis: dict,
     tech_stack_constraints: dict | None,
@@ -414,7 +561,9 @@ _DEV_WORKFLOW_INSTRUCTIONS = (
     "2. Implement the feature following the acceptance criteria.\n"
     "3. Write and run tests. Install any missing dependencies at runtime.\n"
     "4. Push your implementation to a feature branch and create a Pull Request "
-    "targeting the default branch.\n"
+    "targeting the default branch. Before creating the branch, list existing remote "
+    "branches via the SCM agent (scm.branch.list). If the desired branch name already "
+    "exists, append '_2', '_3', etc. until a unique name is found.\n"
     "5. After the PR is created: transition the Jira ticket to 'In Review' and "
     "add a comment that includes the PR URL, test status, and a brief summary.\n"
     "All steps are required. Skipping Jira/PR steps is not acceptable."
@@ -431,6 +580,7 @@ def _build_dev_task_metadata(
     tech_stack_constraints: dict | None,
     acceptance_criteria: list | None,
     requires_tests: bool,
+    jira_ticket_key: str = "",
     is_revision: bool = False,
     revision_cycle: int = 0,
     review_issues: list | None = None,
@@ -448,6 +598,7 @@ def _build_dev_task_metadata(
         "techStackConstraints": tech_stack_constraints or {},
         "acceptanceCriteria": acceptance_criteria or [],
         "requiresTests": requires_tests,
+        "jiraTicketKey": jira_ticket_key,
         "devWorkflowInstructions": _DEV_WORKFLOW_INSTRUCTIONS,
         # Exit rule: dev agent must wait for our ACK before shutting down
         "exitRule": PerTaskExitHandler.build(
@@ -1223,13 +1374,23 @@ def _normalize_gather_plan(raw_plan: dict, fallback_plan: dict, capability_snaps
             question = str(raw_action.get("question") or "").strip()
             reason = str(raw_action.get("reason") or "").strip()
             if question:
-                normalized_actions.append(
-                    {
-                        "action": _GATHER_ACTION_ASK_USER,
-                        "question": question,
-                        "reason": reason,
-                    }
-                )
+                # Drop questions about content that the dev agent can determine
+                # autonomously (docs-specific placeholders, contact details, etc.)
+                _suppressible_q_kws = {
+                    "support contact", "contact detail", "contact info",
+                    "email, team", "slack channel", "team name", "support info",
+                    "support information", "contact/team", "contact or",
+                    "existing pr", "open new pr", "new pr vs", "pr vs update",
+                    "which pr", "which branch to use", "create a new pr",
+                }
+                if not any(kw in question.lower() for kw in _suppressible_q_kws):
+                    normalized_actions.append(
+                        {
+                            "action": _GATHER_ACTION_ASK_USER,
+                            "question": question,
+                            "reason": reason,
+                        }
+                    )
         elif action == _GATHER_ACTION_STOP:
             reason = str(raw_action.get("reason") or "").strip()
             if reason:
@@ -1337,6 +1498,14 @@ def _save_gather_plan(workspace_path: str, gather_plan: dict) -> None:
     )
 
 
+def _jira_fetch_succeeded(ctx: _TaskContext) -> bool:
+    """Return True only if a Jira ticket was successfully fetched (not a permission/error response)."""
+    if not ctx.jira_info or not ctx.jira_info.get("content"):
+        return False
+    content = str(ctx.jira_info.get("content") or "")
+    return "fetch_failed" not in content and "Fetch status: fetch_failed" not in content
+
+
 def _suppress_redundant_questions(
     analysis: dict,
     ctx: _TaskContext,
@@ -1346,7 +1515,7 @@ def _suppress_redundant_questions(
     updated = dict(analysis or {})
     question = str(updated.get("question_for_user") or "")
 
-    if ctx.jira_info and ctx.jira_info.get("content"):
+    if _jira_fetch_succeeded(ctx):
         jira_keywords = ("jira", "ticket", "url", "browse", "atlassian", "issue", "story", "key")
         if any(keyword in question.lower() for keyword in jira_keywords):
             if log_fn:
@@ -1473,7 +1642,11 @@ def _refresh_analysis_with_known_context(
     return _suppress_redundant_questions(analysis, ctx, log_fn=log_fn)
 
 
-def _filter_unresolved_missing_info(analysis: dict, ctx: _TaskContext) -> list[str]:
+def _filter_unresolved_missing_info(
+    analysis: dict,
+    ctx: "_TaskContext",
+    tech_stack_constraints: dict | None = None,
+) -> list[str]:
     unresolved_missing = [
         str(item).strip()
         for item in (analysis.get("missing_info") or [])
@@ -1511,11 +1684,49 @@ def _filter_unresolved_missing_info(analysis: dict, ctx: _TaskContext) -> list[s
         if not any(kw in item.lower() for kw in ci_kws)
     ]
     pr_kws = {"canonical pr", "canonical branch", "authoritative pr", "which pr",
-              "which branch", "pr url", "branch name", "merge target"}
+              "which branch", "pr url", "branch name", "merge target",
+              "existing pr", "open a new pr", "open new pr", "merge existing",
+              "merge an existing", "reuse", "create a new pr"}
     unresolved_missing = [
         item for item in unresolved_missing
         if not any(kw in item.lower() for kw in pr_kws)
     ]
+    # Platform / deployment environment details are best-effort and can be
+    # handled by the dev agent at runtime.  Filter them out only when the
+    # agentic tech-stack inference has already confirmed the stack (i.e.,
+    # tech_stack_constraints is non-empty).  When the stack is genuinely
+    # unknown the gather loop must surface these items so the user gets asked.
+    platform_kws = {
+        "platform", "tech-stack", "tech stack", "technology stack",
+        "deployment constraint", "environment constraint",
+        "deployment detail", "environment detail",
+        "hosting environment", "infrastructure",
+        "labels/components", "labels and components",
+    }
+    if tech_stack_constraints:
+        # Stack is confirmed — the dev agent can resolve these defaults.
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in platform_kws)
+        ]
+    elif (
+        ctx.jira_info and ctx.jira_info.get("content")
+        and ctx.repo_info and ctx.repo_info.get("content")
+    ):
+        # Both Jira and repo have been inspected and the agentic inference
+        # still returned no constraints — the "confirmed tech stack" item in
+        # missing_info is intentional and must be kept so the user gets asked.
+        # Only filter the pure deployment/environment noise that never blocks planning.
+        env_only_kws = {
+            "deployment constraint", "environment constraint",
+            "deployment detail", "environment detail",
+            "hosting environment", "infrastructure",
+            "labels/components", "labels and components",
+        }
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in env_only_kws)
+        ]
     # For UI implementation tasks, the web agent can derive these defaults from
     # the repo and ticket context without blocking plan creation.
     if (
@@ -1569,6 +1780,50 @@ def _filter_unresolved_missing_info(analysis: dict, ctx: _TaskContext) -> list[s
             item for item in unresolved_missing
             if not any(kw in item.lower() for kw in defaultable_ui_ticket_kws)
         ]
+    # Organisational conventions and preferences (README templates, PR reviewer
+    # assignments, code-owner preferences) are always resolvable by the dev
+    # agent using project defaults or industry best practice.  Filter them out
+    # whenever both Jira and repo context have already been gathered so that
+    # these "nice-to-have" items never block task execution.
+    if ctx.jira_info and ctx.jira_info.get("content") and ctx.repo_info and ctx.repo_info.get("content"):
+        org_preference_kws = {
+            "reviewer",
+            "code owner",
+            "code reviewer",
+            "pr reviewer",
+            "preferred reviewer",
+            "review assignment",
+            "readme",
+            "readme template",
+            "org-specific",
+            "wording requirement",
+            "wording requirements",
+            "template wording",
+            "naming convention",
+            "commit convention",
+            "commit message convention",
+            # Contact details / support info in docs tasks are best-effort:
+            # the dev agent will use placeholder values or repo defaults.
+            "contact detail",
+            "support contact",
+            "support information",
+            "contact/team",
+            "email, team",
+            "support channel",
+            "formal acceptance criteria",
+            "qa sign-off",
+            # PR review state / merge decisions are SCM concerns, not planning blockers
+            "review outcome",
+            "pr review",
+            "approve or request",
+            "merge the existing",
+            "should i review",
+            "shall i review",
+        }
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in org_preference_kws)
+        ]
     return unresolved_missing
 
 
@@ -1596,16 +1851,19 @@ def _execute_gather_action(
     if capability == "jira.ticket.fetch":
         ticket_key = str(analysis.get("jira_ticket_key") or "").strip()
         request_text = message_text or f"Fetch ticket {ticket_key}"
-        # Already have content for this ticket — skip regardless of request wording
+        # Already have content for this ticket — skip only if the previous fetch SUCCEEDED
         if (
-            ctx.jira_info
-            and ctx.jira_info.get("content")
+            _jira_fetch_succeeded(ctx)
             and str(ctx.jira_info.get("ticket_key") or "").strip() == ticket_key
         ):
+            return False
+        # Limit retries for permanently-failed fetches (e.g. permission denied)
+        if ctx.jira_fetch_attempts >= 2 and not _jira_fetch_succeeded(ctx):
             return False
         if not ticket_key:
             return False
         log_fn(f"{reason} ({capability})")
+        ctx.jira_fetch_attempts += 1
         jira_task = _call_sync_agent(
             capability,
             request_text,
@@ -1831,8 +2089,8 @@ def _load_workspace_review_evidence(workspace: str) -> str:
                 try:
                     with open(pr_path, encoding="utf-8") as f:
                         data = json.load(f)
-                    gen_files = data.get("generatedFiles") or []
-                    pr_url = data.get("url", "")
+                    gen_files = data.get("generatedFiles") or data.get("filesChanged") or []
+                    pr_url = data.get("url") or data.get("prUrl") or ""
                     build_passed = data.get("buildPassed")
                     branch = data.get("branch", "")
                     lines.append(f"PR URL: {pr_url}")
@@ -1866,6 +2124,64 @@ def _load_workspace_review_evidence(workspace: str) -> str:
     return "\n".join(lines)
 
 
+def _review_output_with_timeout(
+    user_text: str,
+    plan: dict,
+    dev_output: str,
+    artifacts: list,
+    design_info: dict | None = None,
+    workspace: str = "",
+    timeout_seconds: int = 300,
+) -> dict:
+    """Wrapper around _review_output that enforces a hard wall-clock timeout.
+
+    If the LLM call hangs beyond *timeout_seconds*, returns a synthetic
+    failure review so the workflow can proceed (accept with noted issues)
+    rather than blocking the entire Team Lead container until Compass
+    times out the step.
+    """
+    result_holder: list = []
+    exc_holder: list = []
+
+    def _run():
+        try:
+            result_holder.append(
+                _review_output(user_text, plan, dev_output, artifacts,
+                               design_info=design_info, workspace=workspace)
+            )
+        except Exception as exc:  # noqa: BLE001
+            exc_holder.append(exc)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_seconds)
+    if t.is_alive():
+        print(f"[{AGENT_ID}] WARNING: _review_output timed out after {timeout_seconds}s — "
+              "accepting output with timeout noted.")
+        return {
+            "passed": False,
+            "score": 0,
+            "criteria_results": [],
+            "workflow_followed": False,
+            "workflow_notes": f"Review timed out after {timeout_seconds}s; could not evaluate.",
+            "design_fidelity_checked": False,
+            "design_fidelity_notes": "N/A",
+            "test_coverage_adequate": False,
+            "test_coverage_notes": "Review timed out.",
+            "unnecessary_files_in_pr": [],
+            "issues": [f"Code review LLM call timed out after {timeout_seconds}s."],
+            "missing_requirements": [],
+            "feedback_for_dev": (
+                "The review timed out before it could evaluate your output. "
+                "Please verify all acceptance criteria are met."
+            ),
+            "summary": f"Review timed out after {timeout_seconds}s — accepting with issues noted.",
+        }
+    if exc_holder:
+        raise exc_holder[0]
+    return result_holder[0] if result_holder else {}
+
+
 def _review_output(
     user_text: str,
     plan: dict,
@@ -1892,6 +2208,7 @@ def _review_output(
     prompt = prompts.REVIEW_TEMPLATE.format(
         user_text=user_text,
         acceptance_criteria=criteria_lines,
+        requires_tests=str(plan.get("requires_tests", True)).lower(),
         test_requirements=plan.get("test_requirements") or "Not specified.",
         design_context_provided=design_context_provided,
         dev_output=(dev_output or "No output text.")[:3000],
@@ -1899,7 +2216,7 @@ def _review_output(
         workspace_evidence=workspace_evidence or "(none collected)",
     )
     system = _build_team_lead_system_prompt(prompts.REVIEW_SYSTEM, include_workflow=True)
-    response = _run_agentic(prompt, f"[{AGENT_ID}] review", system_prompt=system)
+    response = _run_agentic(prompt, f"[{AGENT_ID}] review", system_prompt=system, timeout=240)
     return _parse_json_from_llm(response)
 
 
@@ -2015,16 +2332,24 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     log_fn=log,
                 )
 
-            tech_stack_constraints = _extract_tech_stack_constraints(
-                user_text,
-                json.dumps(ctx.jira_info or {}, ensure_ascii=False),
-                ctx.additional_info,
+            tech_stack_constraints, _stack_needs_clarification, _stack_clarification_q = (
+                _infer_tech_stack_agentic(user_text, ctx)
             )
             if tech_stack_constraints:
                 log(
-                    "Detected tech stack constraints: "
+                    "Tech stack inferred: "
                     + ", ".join(f"{key}={value}" for key, value in tech_stack_constraints.items())
                 )
+            elif _stack_needs_clarification and _stack_clarification_q:
+                # Agentic inference could not determine the stack from Jira/repo context;
+                # surface it as a user question so the gather loop can pick it up.
+                if not _has_tech_stack_signal(str(analysis.get("question_for_user") or "")):
+                    analysis["question_for_user"] = _stack_clarification_q
+                _missing = [str(i).strip() for i in (analysis.get("missing_info") or []) if str(i).strip()]
+                if not any(_has_tech_stack_signal(i) for i in _missing):
+                    _missing.insert(0, "confirmed tech stack / framework")
+                    analysis["missing_info"] = _missing
+                log(f"Tech stack unknown after Jira+repo inspection — queued user question: {_stack_clarification_q}")
             analysis = _apply_tech_stack_confirmation_policy(analysis, tech_stack_constraints, user_text)
             ctx.analysis = analysis
 
@@ -2145,6 +2470,45 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             next_action = actions[0]
             action_type = next_action.get("action")
             if action_type == _GATHER_ACTION_ASK_USER:
+                # Before escalating to the user, check whether the question
+                # covers context that was already gathered from boundary agents.
+                # If it does, skip it and proceed to planning rather than
+                # blocking on an unnecessary clarification round.
+                _q_text = str(next_action.get("question") or "").lower()
+                _suppress_gather_q = False
+                if _jira_fetch_succeeded(ctx):
+                    _jira_q_kws = {
+                        "acceptance criteria", "acceptancecriteria", "jira", "ticket",
+                        "checklist item", "story criteria", "pass/fail", "qa step", "test/qa",
+                    }
+                    if any(kw in _q_text for kw in _jira_q_kws):
+                        log(f"Suppressing gather-plan question (Jira already fetched): {next_action.get('question')}")
+                        _suppress_gather_q = True
+                if not _suppress_gather_q and ctx.jira_info and ctx.jira_info.get("content") and ctx.repo_info and ctx.repo_info.get("content"):
+                    _org_q_kws = {
+                        "reviewer", "code owner", "code reviewer", "pr reviewer",
+                        "readme template", "readme format", "org-specific",
+                        "wording requirement", "wording requirements",
+                        "naming convention", "commit convention",
+                        # PR state/review outcome is an SCM concern — never block gather with it
+                        "review outcome", "pr review", "approve or request",
+                        "merge the existing pr", "merge or rework",
+                        "should i review", "shall i review",
+                        # Existing PR / branch strategy decisions — always proceed with new impl
+                        "existing pr", "existing pull request", "open a new pr", "new pr",
+                        "update the existing", "create a new pr", "create a new branch",
+                        "open new pr", "existing prs", "prior pr",
+                        "pr #", "pull request #", "pr number", "pull request number",
+                        "whether to open", "whether to create", "should i open",
+                        "update or create", "merge or open", "new pull request",
+                    }
+                    if any(kw in _q_text for kw in _org_q_kws):
+                        log(f"Suppressing gather-plan question (jira+repo context available): {next_action.get('question')}")
+                        _suppress_gather_q = True
+                if _suppress_gather_q:
+                    # Treat as proceed: all resolvable context is already in hand.
+                    break
+
                 if input_rounds >= MAX_INPUT_ROUNDS:
                     raise RuntimeError(
                         f"Team Lead exceeded the maximum clarification rounds ({MAX_INPUT_ROUNDS})."
@@ -2208,12 +2572,50 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             )
 
         # ── Phase 4: Plan ────────────────────────────────────────────────────
-        unresolved_missing = _filter_unresolved_missing_info(analysis, ctx)
+        unresolved_missing = _filter_unresolved_missing_info(analysis, ctx, tech_stack_constraints)
         if unresolved_missing and not _should_stop_before_dev_dispatch(ctx):
-            raise RuntimeError(
-                "Cannot create implementation plan with unresolved missing information: "
-                + "; ".join(unresolved_missing[:3])
-            )
+            # Ask the user rather than hard-failing, so transient info gaps
+            # (e.g. Jira permission errors, unknown platform) surface as a
+            # question instead of a dead-end failure.
+            if input_rounds < MAX_INPUT_ROUNDS:
+                input_rounds += 1
+                question = (
+                    "I could not gather all the context needed to start implementation. "
+                    "Please clarify: "
+                    + "; ".join(unresolved_missing[:3])
+                )
+                log(f"Unresolved missing info — asking user: {question}")
+                task_store.update_state(team_lead_task_id, "TASK_STATE_INPUT_REQUIRED", question)
+                input_event = threading.Event()
+                with _INPUT_EVENTS_LOCK:
+                    _INPUT_EVENTS[team_lead_task_id] = {"event": input_event, "info": None}
+                _notify_compass(
+                    callback_url,
+                    team_lead_task_id,
+                    "TASK_STATE_INPUT_REQUIRED",
+                    prompts.INPUT_REQUIRED_PREAMBLE + question,
+                )
+                if not input_event.wait(timeout=INPUT_WAIT_TIMEOUT):
+                    task_store.update_state(team_lead_task_id, "TASK_STATE_FAILED",
+                                           "Timed out waiting for user input.")
+                    exit_handler.register(team_lead_task_id)
+                    _notify_compass(callback_url, team_lead_task_id, "TASK_STATE_FAILED",
+                                   "Timed out waiting for user input.")
+                    return
+                with _INPUT_EVENTS_LOCK:
+                    entry = _INPUT_EVENTS.pop(team_lead_task_id, {})
+                    new_info = entry.get("info") or ""
+                ctx.additional_info = (
+                    (ctx.additional_info + "\n" + new_info).strip() if ctx.additional_info else new_info
+                )
+                log(f"User provided additional info for planning: {new_info[:120]}")
+                # Re-derive unresolved after user input; if still unresolved, proceed anyway.
+                analysis["missing_info"] = []
+            else:
+                raise RuntimeError(
+                    "Cannot create implementation plan with unresolved missing information: "
+                    + "; ".join(unresolved_missing[:3])
+                )
 
         task_store.update_state(team_lead_task_id, "PLANNING", "Creating implementation plan…")
         log("Creating implementation plan")
@@ -2352,6 +2754,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 tech_stack_constraints=tech_stack_constraints,
                 acceptance_criteria=plan.get("acceptance_criteria") or [],
                 requires_tests=plan.get("requires_tests", False),
+                jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
                 design_context=ctx.design_info,
             ),
         }
@@ -2393,7 +2796,11 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             )
             log(f"Reviewing dev output (cycle {review_cycle + 1}/{MAX_REVIEW_CYCLES})")
 
-            review = _review_output(user_text, plan, dev_output, final_artifacts, design_info=ctx.design_info, workspace=workspace)
+            review = _review_output_with_timeout(
+                user_text, plan, dev_output, final_artifacts,
+                design_info=ctx.design_info, workspace=workspace,
+                timeout_seconds=300,
+            )
             ctx.review_result = review
             _save_workspace_file(
                 workspace,
@@ -2430,6 +2837,11 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             feedback = review.get("feedback_for_dev") or ""
             log(f"Review failed — sending revision request to dev agent: {feedback[:120]}")
 
+            # Post review feedback to the PR as a comment (best-effort)
+            _pr_url = _read_pr_url_from_workspace(workspace)
+            if _pr_url:
+                _post_pr_review_comment(_pr_url, feedback, workspace, team_lead_task_id)
+
             # Reuse the SAME dev agent container (it is still running, waiting for our ACK).
             # Do NOT call _acquire_dev_agent again — that would try to launch a new container
             # which may cause DNS / timing issues while the first container is still alive.
@@ -2458,6 +2870,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     tech_stack_constraints=tech_stack_constraints,
                     acceptance_criteria=plan.get("acceptance_criteria") or [],
                     requires_tests=plan.get("requires_tests", False),
+                    jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
                     is_revision=True,
                     revision_cycle=review_cycle + 1,
                     review_issues=review.get("issues") or [],
@@ -2527,6 +2940,10 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 "platform": (ctx.plan or {}).get("platform", "unknown"),
                 "reviewCycles": ctx.review_cycles,
                 "reviewPassed": (ctx.review_result or {}).get("passed", True),
+                # True when Team Lead exhausted all review cycles and accepted the output
+                # with noted issues. Compass must NOT trigger a completeness retry in this case
+                # because Team Lead has already made a deliberate accept-with-defects decision.
+                "reviewMaxCyclesReached": ctx.review_cycles >= MAX_REVIEW_CYCLES,
             },
         )
         all_artifacts = [final_summary_artifact] + (final_artifacts or [])
@@ -2795,9 +3212,11 @@ def _schedule_shutdown(delay_seconds: int = 5):
 def main():
     global _SERVER
     print(f"[{AGENT_ID}] Team Lead Agent starting on {HOST}:{PORT}")
-    reporter.start()
+    # Bind and listen BEFORE registering with the registry so that Compass can
+    # dispatch immediately after the instance appears without getting ECONNREFUSED.
     agent_directory.start()
     _SERVER = ThreadingHTTPServer((HOST, PORT), TeamLeadHandler)
+    reporter.start()
     _SERVER.serve_forever()
 
 

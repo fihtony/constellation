@@ -116,28 +116,54 @@ class Launcher:
             raise NotImplementedError(
                 f"Agent '{agent_definition['agent_id']}' does not define a launchSpec for on-demand startup."
             )
+        effective_launch_spec = dict(launch_spec)
 
-        container_prefix = launch_spec.get("namePrefix", agent_definition["agent_id"].replace("_", "-"))
+        container_prefix = effective_launch_spec.get("namePrefix", agent_definition["agent_id"].replace("_", "-"))
         # Add a short unique suffix to prevent name collisions when the same
         # internal task_id is reused across successive per-task containers.
         unique_suffix = uuid.uuid4().hex[:8]
         container_name = f"{container_prefix}-{task_id.lower()}-{unique_suffix}"
-        port = int(launch_spec.get("port", self.default_port))
+        port = int(effective_launch_spec.get("port", self.default_port))
         service_url = f"http://{container_name}:{port}"
-        image = launch_spec.get("image", self.runtime_image)
-        command = launch_spec.get("command") or ["python3", "android/app.py"]
+        image = effective_launch_spec.get("image", self.runtime_image)
+        command = effective_launch_spec.get("command") or ["python3", "android/app.py"]
 
         env = {}
-        env_file = launch_spec.get("envFile")
+        env_file = effective_launch_spec.get("envFile")
         if env_file:
             env.update(load_dotenv(env_file))
-        for key in launch_spec.get("passThroughEnv", []):
+        for key in effective_launch_spec.get("passThroughEnv", []):
             value = os.environ.get(key)
             if value is not None:
                 env[key] = value
         # Inline env vars defined directly in launchSpec (e.g. per-agent model selection)
-        for key, value in launch_spec.get("env", {}).items():
+        for key, value in effective_launch_spec.get("env", {}).items():
             env[str(key)] = str(value)
+
+        runtime_name = str(env.get("AGENT_RUNTIME") or os.environ.get("AGENT_RUNTIME") or "").strip()
+        runtime_contribution = None
+        if runtime_name:
+            try:
+                from common.runtime.provider_registry import get_launch_contribution
+
+                runtime_contribution = get_launch_contribution(
+                    runtime_name,
+                    {
+                        "agent_definition": agent_definition,
+                        "launch_spec": effective_launch_spec,
+                        "task_id": task_id,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[launcher] Failed to resolve runtime launch contribution for {runtime_name!r}: {exc}")
+
+        if runtime_contribution:
+            for key, value in (runtime_contribution.env or {}).items():
+                env[str(key)] = str(value)
+            if runtime_contribution.launcher_profile and not ((effective_launch_spec.get("security") or {}).get("launcherProfile")):
+                security = dict(effective_launch_spec.get("security") or {})
+                security["launcherProfile"] = runtime_contribution.launcher_profile
+                effective_launch_spec["security"] = security
 
         env.update({
             "HOST": "0.0.0.0",
@@ -151,7 +177,7 @@ class Launcher:
         })
 
         host_socket_path = ""
-        if launch_spec.get("mountDockerSocket", False) and os.path.exists(self.socket_path):
+        if effective_launch_spec.get("mountDockerSocket", False) and os.path.exists(self.socket_path):
             host_socket_path = self._discover_host_source(self.socket_path)
             env["DOCKER_SOCKET"] = _CHILD_SOCKET_PATH
 
@@ -175,6 +201,9 @@ class Launcher:
             },
         }
 
+        # Apply security launcher profile from launchSpec.security.launcherProfile
+        self._apply_launcher_profile(effective_launch_spec, payload)
+
         # Mount the artifacts volume so the launched agent can read/write workspace files.
         # The host path is discovered automatically by inspecting this container's mounts via
         # the Docker API; no separate ARTIFACT_ROOT_HOST variable is needed.
@@ -191,10 +220,18 @@ class Launcher:
             group_add = self._socket_group_add(self.socket_path)
             if group_add:
                 payload["HostConfig"]["GroupAdd"] = group_add
-        for bind in launch_spec.get("extraBinds", []) or []:
+        for bind in effective_launch_spec.get("extraBinds", []) or []:
             bind_text = str(bind or "").strip()
             if bind_text:
                 binds.append(bind_text)
+        if runtime_contribution:
+            for mount in runtime_contribution.mounts or []:
+                source = str(getattr(mount, "source", "") or "").strip()
+                target = str(getattr(mount, "target", "") or "").strip()
+                if not source or not target:
+                    continue
+                suffix = ":ro" if getattr(mount, "read_only", True) else ""
+                binds.append(f"{source}:{target}{suffix}")
         if binds:
             payload["HostConfig"]["Binds"] = binds
 
@@ -204,7 +241,7 @@ class Launcher:
             payload=payload,
         )
         self._request("POST", f"/v1.43/containers/{quote(container_name, safe='')}/start")
-        time.sleep(float(launch_spec.get("startupDelaySeconds", 1.0)))
+        time.sleep(float(effective_launch_spec.get("startupDelaySeconds", 1.0)))
         return {
             "container_name": container_name,
             "service_url": service_url,
@@ -274,6 +311,53 @@ class Launcher:
 
     def destroy_instance(self, agent_id, container_name):
         self._request("DELETE", f"/v1.43/containers/{quote(container_name, safe='')}?force=1")
+
+    # ------------------------------------------------------------------
+    # Security profile helpers
+    # ------------------------------------------------------------------
+
+    # Supported launcher profiles and their Docker security constraints.
+    _LAUNCHER_PROFILES = {
+        "default": {},
+        "docker-sandbox": {
+            "ReadonlyRootfs": True,
+            "CapDrop": ["ALL"],
+            "CapAdd": ["NET_BIND_SERVICE"],
+            "SecurityOpt": ["no-new-privileges"],
+        },
+        "docker-restricted": {
+            "ReadonlyRootfs": True,
+            "CapDrop": ["ALL"],
+            "SecurityOpt": ["no-new-privileges"],
+            "NetworkMode": "none",
+        },
+    }
+
+    @classmethod
+    def _apply_launcher_profile(cls, launch_spec: dict, payload: dict) -> None:
+        """Apply security constraints from launchSpec.security.launcherProfile.
+
+        Reads ``launch_spec["security"]["launcherProfile"]`` and merges the
+        corresponding Docker HostConfig restrictions into *payload*.
+        Unknown profiles are treated as ``"default"`` (no extra restrictions).
+        """
+        security = launch_spec.get("security") or {}
+        requested_profile = str(security.get("launcherProfile") or "default").strip()
+        profile = cls._LAUNCHER_PROFILES.get(requested_profile)
+        applied_profile = requested_profile
+        if profile is None:
+            print(f"[launcher] Unknown launcher profile {requested_profile!r}, falling back to 'default'")
+            profile = cls._LAUNCHER_PROFILES["default"]
+            applied_profile = "default"
+
+        host_config = payload.setdefault("HostConfig", {})
+        for key, value in profile.items():
+            host_config[key] = value
+
+        # Record the requested/applied profiles in container labels for observability.
+        labels = payload.setdefault("Labels", {})
+        labels["constellation.requested_launcher_profile"] = requested_profile
+        labels["constellation.launcher_profile"] = applied_profile
 
 
 def get_launcher():

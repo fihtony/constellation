@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "agent_test_targets.json")
@@ -57,6 +58,24 @@ def _parse_github_repo_url(url: str) -> tuple[str, str]:
     return "", ""
 
 
+def _is_bitbucket_url(url: str) -> bool:
+    """Return True if the URL is a Bitbucket Server project/repo browse URL."""
+    return "/projects/" in url and "/repos/" in url
+
+
+def _parse_bitbucket_repo_url(url: str) -> tuple[str, str, str]:
+    """Parse Bitbucket Server URL → (host, project_key, repo_slug).
+
+    e.g. https://bitbucket.example.com/projects/EMF/repos/android-test/browse
+         → ('https://bitbucket.example.com', 'EMF', 'android-test')
+    """
+    m = re.search(r'/projects/([^/]+)/repos/([^/]+)', url)
+    if m:
+        host = url.split('/projects/')[0].rstrip('/')
+        return host, m.group(1), m.group(2)
+    return '', '', ''
+
+
 CONFIG = _load_config()
 _TEST_ENV = _load_env_file()
 
@@ -86,21 +105,39 @@ else:
 
 # SCM config: prefer TEST_GITHUB_REPO_URL from tests/.env over agent_test_targets.json
 # This way the json file can stay PII-free (generic placeholders only).
-_github_repo_url = _TEST_ENV.get("TEST_GITHUB_REPO_URL", "").strip()
-if _github_repo_url:
-    _gh_owner, _gh_repo = _parse_github_repo_url(_github_repo_url)
-    if _gh_owner and _gh_repo:
-        _repo_url_clean = _github_repo_url.rstrip("/")
-        SCM_ALLOWED_REPO: dict = {
-            **CONFIG["scm"]["primaryRepo"],
-            "owner": _gh_owner,
-            "project": _gh_owner,
-            "repo": _gh_repo,
-            "browseUrl": _repo_url_clean,
-            "cloneUrl": _repo_url_clean + ".git",
-        }
+_scm_repo_url = _TEST_ENV.get("TEST_GITHUB_REPO_URL", "").strip()
+if _scm_repo_url:
+    if _is_bitbucket_url(_scm_repo_url):
+        _bb_host, _bb_project, _bb_repo = _parse_bitbucket_repo_url(_scm_repo_url)
+        if _bb_host and _bb_project and _bb_repo:
+            SCM_ALLOWED_REPO: dict = {
+                **CONFIG["scm"]["primaryRepo"],
+                "owner": _bb_project,
+                "project": _bb_project,
+                "repo": _bb_repo,
+                "browseUrl": _scm_repo_url.rstrip("/"),
+                "cloneUrl": f"{_bb_host}/scm/{_bb_project.lower()}/{_bb_repo}.git",
+                "_provider": "bitbucket",
+                "_baseUrl": _bb_host,
+            }
+        else:
+            SCM_ALLOWED_REPO = CONFIG["scm"]["primaryRepo"]
     else:
-        SCM_ALLOWED_REPO = CONFIG["scm"]["primaryRepo"]
+        _gh_owner, _gh_repo = _parse_github_repo_url(_scm_repo_url)
+        if _gh_owner and _gh_repo:
+            _repo_url_clean = _scm_repo_url.rstrip("/")
+            SCM_ALLOWED_REPO = {
+                **CONFIG["scm"]["primaryRepo"],
+                "owner": _gh_owner,
+                "project": _gh_owner,
+                "repo": _gh_repo,
+                "browseUrl": _repo_url_clean,
+                "cloneUrl": _repo_url_clean + ".git",
+                "_provider": "github",
+                "_baseUrl": "",
+            }
+        else:
+            SCM_ALLOWED_REPO = CONFIG["scm"]["primaryRepo"]
 else:
     SCM_ALLOWED_REPO = CONFIG["scm"]["primaryRepo"]
 
@@ -143,7 +180,27 @@ def scm_write_root() -> str:
     return SCM_ALLOWED_REPO["writeRoot"]
 
 
+def scm_provider() -> str:
+    """Return 'github' or 'bitbucket' based on TEST_GITHUB_REPO_URL."""
+    return SCM_ALLOWED_REPO.get("_provider", "github")
+
+
+def scm_base_url() -> str:
+    """Return the SCM server base URL (empty for github.com)."""
+    return SCM_ALLOWED_REPO.get("_baseUrl", "")
+
+
+def scm_default_project() -> str:
+    """Return the default project key (Bitbucket) or owner (GitHub)."""
+    return SCM_ALLOWED_REPO.get("project") or SCM_ALLOWED_REPO.get("owner", "")
+
+
 def scm_pr_url(pr_id: int) -> str:
+    if scm_provider() == "bitbucket":
+        base = scm_base_url()
+        project = scm_project_key()
+        repo = scm_repo_slug()
+        return f"{base}/projects/{project}/repos/{repo}/pull-requests/{int(pr_id)}"
     return f"https://github.com/{scm_owner()}/{scm_repo_slug()}/pull/{int(pr_id)}"
 
 
