@@ -1,22 +1,20 @@
 # Constellation
 
-Constellation is a multi-agent engineering system built on the [A2A (Agent-to-Agent) protocol](https://google.github.io/A2A/). It combines a control-plane entry point, a planning and review layer, and specialized execution and integration agents to coordinate complex software work through a consistent task interface. Its key strengths include fine-grained access control, enterprise-grade governance, automatic capability discovery, and a layered orchestration architecture that cleanly separates routing, coordination, and execution. Constellation is also adaptable by design and built to scale, using persistent integration agents alongside on-demand execution agents to support a wide range of engineering workflows efficiently and reliably.
-
-
+Constellation is a capability-driven multi-agent engineering system built on the [A2A (Agent-to-Agent) protocol](https://google.github.io/A2A/). Instead of collapsing routing, planning, integration, and execution into one service, it runs as a live agent topology where new skills can register at runtime, be discovered without restarting the platform, and scale independently. Compass serves as the control plane, Team Lead handles analysis, planning, and review, and specialized agents own external integrations or execution domains behind the same task contract. For each request, Constellation can choose a different workflow, inject task-specific instructions into the execution agent, and grant only the permissions that workflow requires. The result is an architecture built for real engineering work: parallel task handling, on-demand agent launch, resumable human-in-the-loop flows, shared workspaces, async callbacks, and a clean boundary between orchestration and delivery that is designed to grow with the system.
 
 ## Highlights
 
-- Clear orchestration model: Compass handles user entry, routing, and UI, while Team Lead handles planning, coordination, and review.
-- Mixed agent runtime: persistent boundary agents manage integrations, and on-demand execution agents are launched only when needed.
-- Consistent task contract: agents register capabilities, accept HTTP tasks, report progress, and return artifacts in the same way.
-
-## Differentiators
-
-- Separation of concerns: orchestration, external system access, and task execution are split into distinct agents instead of one large service.
-- A2A plus MCP: Constellation uses A2A agents for workflow boundaries and MCP tools for selected integrations, which keeps the system modular.
-- Built for engineering workflows: shared workspaces, async callbacks, and per-task agent launch make it suitable for longer-running development tasks.
+- Live capability discovery: agents register skills through the registry, and the runtime refreshes topology as new capabilities appear.
+- Elastic execution model: persistent boundary agents stay available for integrations, while per-task execution agents launch only when work actually arrives.
+- Workflow-aware dispatch: each request can follow a different path, with task-specific workflow instructions injected into the execution agent at runtime.
+- Least-privilege operation: agent dispatch and execution are shaped by role checks, tool restrictions, and launch-time isolation controls.
+- Parallel and multi-task ready: independent tasks can be routed, launched, and tracked concurrently without forcing a single shared worker model.
+- Review-driven delivery: Team Lead gathers context, plans the work, reviews downstream output, and can drive revision cycles before completion.
+- Resumable and auditable: shared workspaces, progress events, callbacks, command logs, and stage summaries preserve continuity across long-running jobs.
 
 ## Architecture
+
+![Architecture Diagram](./constellation-Architecture.png)
 
 ```
 Browser / API client
