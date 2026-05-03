@@ -7,6 +7,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+os.environ.setdefault(
+    "ARTIFACT_ROOT",
+    os.path.join(tempfile.gettempdir(), "constellation-test-artifacts"),
+)
+
 from compass import app as compass_app
 from common.task_store import TaskStore
 
@@ -120,19 +125,19 @@ class CompassDispatchTests(unittest.TestCase):
             "workflow": ["office.data.analyze"],
             "task_type": "office",
             "office_subtype": "analyze",
-            "target_paths": ["/Users/tony/Documents/sales.xlsx"],
+            "target_paths": ["/Users/example/Documents/sales.xlsx"],
             "needs_input": False,
             "input_question": None,
             "reasoning": "Local spreadsheet analysis belongs to Office Agent.",
         })):
             decision = compass_app._route_with_runtime(
-                "Please analyze /Users/tony/Documents/sales.xlsx and summarize the trends."
+                "Please analyze /Users/example/Documents/sales.xlsx and summarize the trends."
             )
 
         self.assertEqual(decision["workflow"], ["office.data.analyze"])
         self.assertEqual(decision["task_type"], "office")
         self.assertEqual(decision["office_subtype"], "analyze")
-        self.assertEqual(decision["target_paths"], ["/Users/tony/Documents/sales.xlsx"])
+        self.assertEqual(decision["target_paths"], ["/Users/example/Documents/sales.xlsx"])
         self.assertFalse(decision["needs_input"])
 
     def test_summarize_for_user_prefers_runtime_summary(self):
@@ -238,7 +243,7 @@ class CompassDispatchTests(unittest.TestCase):
         self.assertIn("Path must be absolute", error)
 
     def test_validate_office_target_paths_defers_missing_host_path_when_containerized(self):
-        host_path = "/Users/tony/projects/constellation/tests/data/csv/sales_data.csv"
+        host_path = "/Users/example/projects/constellation/tests/data/csv/sales_data.csv"
         # Simulate running inside a container by patching the helper directly.
         with mock.patch.object(compass_app, "_is_containerized", return_value=True), \
              mock.patch.object(compass_app.os.path, "exists", return_value=False):
@@ -285,7 +290,7 @@ class CompassDispatchTests(unittest.TestCase):
                 "awaitingStep": "output_mode",
                 "requestedCapability": "office.data.analyze",
                 "officeSubtype": "analyze",
-                "targetPaths": ["/Users/tony/Documents/sales.csv"],
+                "targetPaths": ["/Users/example/Documents/sales.csv"],
             }
 
             def fake_start(current_task, message, workflow):
@@ -303,7 +308,7 @@ class CompassDispatchTests(unittest.TestCase):
             self.assertEqual(resumed["id"], task.task_id)
             self.assertEqual(compass_app.task_store.get(task.task_id).state, "ROUTING")
             self.assertEqual(task.router_context["outputMode"], "workspace")
-            self.assertIn("/Users/tony/Documents", task.router_context["dispatch"]["mountRootHostPath"])
+            self.assertIn("/Users/example/Documents", task.router_context["dispatch"]["mountRootHostPath"])
             self.assertIn(":ro", task.router_context["dispatch"]["extraBinds"][0])
         finally:
             compass_app.task_store = original_store
@@ -322,7 +327,7 @@ class CompassDispatchTests(unittest.TestCase):
                 "awaitingStep": "output_mode",
                 "requestedCapability": "office.folder.organize",
                 "officeSubtype": "organize",
-                "targetPaths": ["/Users/tony/Documents/2026"],
+                "targetPaths": ["/Users/example/Documents/2026"],
             }
 
             with mock.patch.object(compass_app, "_interpret_office_reply", return_value={"action": "inplace", "clarification_question": None}):
@@ -352,7 +357,7 @@ class CompassDispatchTests(unittest.TestCase):
                 "awaitingStep": "confirm_write",
                 "requestedCapability": "office.folder.organize",
                 "officeSubtype": "organize",
-                "targetPaths": ["/Users/tony/Documents/2026"],
+                "targetPaths": ["/Users/example/Documents/2026"],
                 "outputMode": "inplace",
             }
 

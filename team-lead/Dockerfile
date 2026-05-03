@@ -2,13 +2,16 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install Node.js 22 (required for GitHub Copilot CLI)
+# Install system dependencies (tini for signal handling, git for SCM tools)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
-    && npm install -g @github/copilot \
+    && apt-get install -y --no-install-recommends ca-certificates tini git curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Import any corporate CA certificates placed in certs/ (supports .crt and .pem)
+COPY certs/ /usr/local/share/ca-certificates/
+RUN find /usr/local/share/ca-certificates/ -name "*.pem" \
+        -exec sh -c 'cp "$1" "${1%.pem}.crt"' _ {} \; \
+    && update-ca-certificates
 
 COPY common/      /app/common/
 COPY team-lead/   /app/team_lead/
@@ -29,4 +32,5 @@ RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
     && chown -R appuser:appuser /app
 USER appuser
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python3", "team-lead/app.py"]

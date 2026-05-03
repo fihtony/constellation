@@ -16,9 +16,9 @@ artifacts/
 docs/
 reference/
 certs/
-android/
 tests/data*
 teams-bot/
+.connect-agent/
 
 # SQLite database files (persisted in data/ directory, not committed)
 data/
@@ -29,6 +29,7 @@ data/
 # Reports are committed for audit (do not ignore reports/)
 
 # IDE
+.claude/
 .idea/
 .vscode/
 *.swp

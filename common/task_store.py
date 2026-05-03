@@ -118,10 +118,13 @@ class TaskStore:
         with self._lock:
             return self._tasks.get(task_id)
 
-    def list_tasks(self):
+    def list_tasks(self, owner_user_id=None):
         with self._lock:
+            tasks = self._tasks.values()
+            if owner_user_id:
+                tasks = [task for task in tasks if task.owner_user_id == owner_user_id]
             return sorted(
-                self._tasks.values(),
+                tasks,
                 key=lambda task: (task.created_at, task.task_id),
                 reverse=True,
             )

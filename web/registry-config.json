@@ -8,7 +8,7 @@
     "command": ["python3", "web/app.py"],
     "passThroughEnv": ["ARTIFACT_ROOT", "DYNAMIC_AGENT_NETWORK", "COPILOT_GITHUB_TOKEN", "TZ"],
     "env": {
-      "AGENT_RUNTIME": "copilot-cli",
+      "AGENT_RUNTIME": "connect-agent",
       "AGENT_MODEL": "gpt-5-mini"
     },
     "mountDockerSocket": false

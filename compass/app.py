@@ -61,7 +61,7 @@ launcher = get_launcher()
 policy = PolicyEvaluator()
 COMPASS_API_KEY = os.environ.get("COMPASS_API_KEY", "").strip()
 
-# Notification target registry (Teams Gateway or other webhook subscribers)
+# Notification target registry (IM Gateway or other webhook subscribers)
 _notification_targets_lock = threading.Lock()
 _notification_targets: list[dict] = []  # [{"url": "http://...", "registeredAt": ...}]
 
@@ -564,6 +564,27 @@ def _read_workspace_json(workspace_path, relative_path):
         return {}
 
 
+def _extract_pr_evidence_from_artifacts(artifacts: list) -> dict:
+    """Extract PR evidence (URL, branch, jiraInReview) from A2A artifacts.
+
+    Execution agents (android, web) embed prUrl and branch in their artifact
+    metadata and send them via A2A callback to Team Lead, which passes them
+    through to Compass.  Compass must NOT scan the shared workspace filesystem
+    to find these files — all evidence must come through A2A artifacts.
+    """
+    for artifact in artifacts or []:
+        metadata = artifact.get("metadata") or {}
+        pr_url = metadata.get("prUrl") or metadata.get("url") or ""
+        branch = metadata.get("branch") or ""
+        if pr_url:
+            return {
+                "url": pr_url,
+                "branch": branch,
+                "jiraInReview": bool(metadata.get("jiraInReview", False)),
+            }
+    return {}
+
+
 def _truncate_text(value, limit=180):
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if len(text) <= limit:
@@ -615,16 +636,6 @@ def _read_workspace_log_sections(workspace_path, max_lines=40, max_chars=12000):
     return sections
 
 
-def _has_jira_transition(jira_actions, target_status):
-    events = jira_actions.get("events") if isinstance(jira_actions.get("events"), list) else []
-    return any(
-        event.get("action") == "transition"
-        and event.get("status") == "completed"
-        and event.get("targetStatus") == target_status
-        for event in events
-    )
-
-
 def _refresh_task_card_metadata(task):
     workspace_path = getattr(task, "workspace_path", "")
     original_text = extract_text(task.original_message or {})
@@ -645,7 +656,6 @@ def _refresh_task_card_metadata(task):
     jira_context = {}
     plan = {}
     pr_evidence = {}
-    jira_actions = {}
 
     if workspace_path:
         stage_summary = _read_workspace_json(workspace_path, "team-lead/stage-summary.json")
@@ -654,8 +664,10 @@ def _refresh_task_card_metadata(task):
         design_context = _read_workspace_json(workspace_path, "team-lead/design-context.json")
         jira_context = _read_workspace_json(workspace_path, "team-lead/jira-context.json")
         plan = _read_workspace_json(workspace_path, "team-lead/plan.json")
-        pr_evidence = _read_workspace_json(workspace_path, "web-agent/pr-evidence.json")
-        jira_actions = _read_workspace_json(workspace_path, "web-agent/jira-actions.json")
+        # PR evidence comes from A2A artifacts delivered by the execution agent via Team Lead.
+        # We must NOT scan execution-agent subdirectories in the shared workspace — that would
+        # bypass the A2A protocol boundary.
+        pr_evidence = _extract_pr_evidence_from_artifacts(getattr(task, "artifacts", []))
 
         task.summary = _truncate_text(
             analysis.get("summary")
@@ -692,13 +704,12 @@ def _refresh_task_card_metadata(task):
         "jiraContext": jira_context,
         "plan": plan,
         "prEvidence": pr_evidence,
-        "jiraActions": jira_actions,
         "currentMajorStep": current_major_step,
         "commandLogSections": _read_workspace_log_sections(workspace_path),
     }
 
 
-def _task_card_status(task_state, pr_evidence, jira_actions):
+def _task_card_status(task_state, pr_evidence):
     failed_states = {
         "TASK_STATE_FAILED",
         "FAILED",
@@ -712,8 +723,11 @@ def _task_card_status(task_state, pr_evidence, jira_actions):
     if task_state in failed_states:
         return "failed", "Failed"
     if task_state == "TASK_STATE_COMPLETED":
-        if pr_evidence.get("url"):
-            if _has_jira_transition(jira_actions, "In Review"):
+        pr_url = pr_evidence.get("url") or pr_evidence.get("prUrl") or ""
+        if pr_url:
+            # jiraInReview flag is set by execution agents in their artifact metadata
+            # when they successfully transition the Jira ticket to "In Review".
+            if pr_evidence.get("jiraInReview"):
                 return "completed", "Completed / In Review"
             return "completed", "Completed / PR Raised"
         return "completed", "Completed"
@@ -723,8 +737,7 @@ def _task_card_status(task_state, pr_evidence, jira_actions):
 def _serialize_task_card(task):
     metadata = _refresh_task_card_metadata(task)
     pr_evidence = metadata["prEvidence"] if isinstance(metadata["prEvidence"], dict) else {}
-    jira_actions = metadata["jiraActions"] if isinstance(metadata["jiraActions"], dict) else {}
-    status_kind, status_label = _task_card_status(task.state, pr_evidence, jira_actions)
+    status_kind, status_label = _task_card_status(task.state, pr_evidence)
     design_context = metadata["designContext"] if isinstance(metadata["designContext"], dict) else {}
 
     steps = []
@@ -758,16 +771,21 @@ def _serialize_task_card(task):
         "progressSteps": steps,
         "commandLogSections": metadata["commandLogSections"],
         "pr": {
-            "url": pr_evidence.get("url") or "",
+            "url": pr_evidence.get("url") or pr_evidence.get("prUrl") or "",
             "branch": pr_evidence.get("branch") or "",
         },
     }
 
 
 def _extract_team_lead_completeness_issues(task, artifacts):
-    if not getattr(task, "workspace_path", ""):
-        return []
+    """Check whether Team Lead's deliverable satisfies completion criteria.
 
+    All evidence is read from the A2A artifacts that Team Lead delivered via
+    callback — never from the shared workspace filesystem.  Execution-agent
+    workspace files (pr-evidence.json, jira-actions.json, stage-summary.json)
+    are internal to the Team Lead ↔ dev-agent pipeline and must not be
+    accessed directly by Compass.
+    """
     issues = []
     summary_artifact = None
     for artifact in artifacts or []:
@@ -776,65 +794,42 @@ def _extract_team_lead_completeness_issues(task, artifacts):
             summary_artifact = artifact
             break
     summary_meta = (summary_artifact or {}).get("metadata") or {}
+
     if summary_meta.get("validationCheckpoint"):
+        # Intentional pre-dispatch stop — not a completeness failure.
         return issues
+
+    if summary_meta.get("reviewMaxCyclesReached"):
+        # Team Lead exhausted review cycles and deliberately accepted the output.
+        # Respect that decision and skip the completeness retry.
+        print("[compass] Team Lead reached max review cycles and accepted with issues — skipping retry.")
+        return issues
+
     if summary_meta.get("reviewPassed") is False:
         issues.append("Team Lead review did not pass.")
+
     if summary_meta.get("reviewPassed") is True:
-        # Team Lead reviewed and approved — trust the review, no further workspace checks needed
+        # Team Lead reviewed and approved — trust the review completely.
         return issues
 
-    team_lead_stage = _read_workspace_json(task.workspace_path, "team-lead/stage-summary.json")
-    team_lead_plan = _read_workspace_json(task.workspace_path, "team-lead/plan.json")
-    jira_context = _read_workspace_json(task.workspace_path, "team-lead/jira-context.json")
-    pr_evidence = _read_workspace_json(task.workspace_path, "web-agent/pr-evidence.json")
-    jira_actions = _read_workspace_json(task.workspace_path, "web-agent/jira-actions.json")
-    web_stage = _read_workspace_json(task.workspace_path, "web-agent/stage-summary.json")
-
-    analysis = team_lead_stage.get("analysis") if isinstance(team_lead_stage.get("analysis"), dict) else {}
-    target_repo_url = (team_lead_plan.get("target_repo_url") or analysis.get("target_repo_url") or "").strip()
-    jira_ticket_key = (
-        analysis.get("jira_ticket_key")
-        or jira_context.get("ticket_key")
-        or ""
-    )
-
-    if target_repo_url:
-        if not pr_evidence.get("url"):
-            issues.append("Pull request URL is missing from web-agent/pr-evidence.json.")
-        if not pr_evidence.get("branch"):
-            issues.append("Branch name is missing from web-agent/pr-evidence.json.")
-
-    if isinstance(web_stage, dict) and web_stage.get("buildPassed") is False:
-        issues.append("Web agent reported failing build or test status.")
-
-    jira_events = jira_actions.get("events") if isinstance(jira_actions.get("events"), list) else []
-    if jira_ticket_key:
-        has_in_progress = any(
-            event.get("action") == "transition"
-            and event.get("status") == "completed"
-            and event.get("targetStatus") == "In Progress"
-            for event in jira_events
-        )
-        if not has_in_progress:
-            issues.append("Jira transition to 'In Progress' is missing.")
+    # reviewPassed is None: Team Lead did not set the flag (should not happen in
+    # normal operation).  Fall back to artifact-based evidence checks only.
+    # We check Team Lead's own workspace files for target_repo_url and jira key
+    # (those are Team Lead's output, not execution-agent files).
+    workspace_path = getattr(task, "workspace_path", "")
+    if workspace_path:
+        team_lead_plan = _read_workspace_json(workspace_path, "team-lead/plan.json")
+        team_lead_stage = _read_workspace_json(workspace_path, "team-lead/stage-summary.json")
+        analysis = team_lead_stage.get("analysis") if isinstance(team_lead_stage.get("analysis"), dict) else {}
+        target_repo_url = (team_lead_plan.get("target_repo_url") or analysis.get("target_repo_url") or "").strip()
 
         if target_repo_url:
-            has_in_review = any(
-                event.get("action") == "transition"
-                and event.get("status") == "completed"
-                and event.get("targetStatus") == "In Review"
-                for event in jira_events
-            )
-            if not has_in_review:
-                issues.append("Jira transition to 'In Review' is missing.")
-
-            has_comment = any(
-                event.get("action") == "comment" and event.get("status") == "completed"
-                for event in jira_events
-            )
-            if not has_comment:
-                issues.append("Jira PR comment is missing.")
+            # PR evidence must come from A2A artifacts, not from filesystem scanning.
+            pr_evidence = _extract_pr_evidence_from_artifacts(artifacts)
+            if not (pr_evidence.get("url") or pr_evidence.get("prUrl")):
+                issues.append("Pull request URL is missing from execution agent artifacts.")
+            if not pr_evidence.get("branch"):
+                issues.append("Branch name is missing from execution agent artifacts.")
 
     return issues
 
@@ -1543,7 +1538,7 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
     task.design_url = design_url
     task.design_type = design_type
 
-    # Extract owner / channel metadata from message.metadata (Teams Gateway sets these)
+    # Extract owner / channel metadata from message.metadata (IM Gateway sets these)
     msg_meta = message.get("metadata") or {}
     task.owner_user_id = (msg_meta.get("ownerUserId") or "").strip()
     task.owner_display_name = (msg_meta.get("ownerDisplayName") or "").strip()
@@ -1606,10 +1601,57 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
     return _start_task_worker(task, message, workflow)
 
 
+def _is_team_lead_reachable(service_url: str) -> bool:
+    """Return True if the Team Lead service is accepting requests."""
+    if not service_url:
+        return False
+    try:
+        from urllib.request import urlopen
+        from urllib.error import URLError
+        with urlopen(f"{service_url.rstrip('/')}/health", timeout=3) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
 def _resume_input_required_task(body: dict, message: dict) -> dict | None:
     context_id = (body.get("contextId") or message.get("contextId") or "").strip()
+    auto_routed = False
     if not context_id:
-        return None
+        # No contextId supplied (e.g. page was refreshed). Auto-detect if there
+        # is exactly one outstanding INPUT_REQUIRED task that has a waiting
+        # downstream Team Lead — if so, treat this reply as belonging to it.
+        all_tasks = task_store.list_tasks()
+        pending_input = [
+            t for t in all_tasks
+            if t.state == "TASK_STATE_INPUT_REQUIRED"
+            and getattr(t, "downstream_task_id", None)
+        ]
+        if len(pending_input) == 1:
+            candidate = pending_input[0]
+            # Only auto-route if the downstream Team Lead is still reachable.
+            candidate_svc_url = getattr(candidate, "downstream_service_url", "") or ""
+            if _is_team_lead_reachable(candidate_svc_url):
+                context_id = candidate.task_id
+                auto_routed = True
+                print(
+                    f"[compass] Auto-routing reply to single pending INPUT_REQUIRED task: {context_id}"
+                )
+            else:
+                # Team Lead container is gone — mark stale task as failed and let a
+                # new task be created for this message.
+                print(
+                    f"[compass] Stale INPUT_REQUIRED task {candidate.task_id} — "
+                    f"downstream service {candidate_svc_url!r} is unreachable; creating new task"
+                )
+                task_store.update_state(
+                    candidate.task_id,
+                    "TASK_STATE_FAILED",
+                    "Task cancelled: the agent handling this task is no longer running.",
+                )
+                return None
+        else:
+            return None
 
     prior_task = task_store.get(context_id)
     if not prior_task or prior_task.state != "TASK_STATE_INPUT_REQUIRED":
@@ -1624,15 +1666,23 @@ def _resume_input_required_task(body: dict, message: dict) -> dict | None:
 
     if tl_task_id and not tl_service_url:
         try:
-            instances = registry.list_instances("team-lead-agent")
-            for inst in instances:
-                if inst.get("current_task_id") == tl_task_id:
-                    tl_service_url = inst.get("service_url", "")
+            # Discover the orchestrator agent dynamically via capability lookup
+            # so we never hardcode an agent ID here.
+            tl_agents = registry.find_by_capability("team-lead.task.analyze")
+            tl_agent_ids = [
+                a.get("agent_id") for a in (tl_agents or []) if a.get("agent_id")
+            ]
+            for tl_agent_id in tl_agent_ids:
+                for inst in registry.list_instances(tl_agent_id):
+                    if inst.get("current_task_id") == tl_task_id:
+                        tl_service_url = inst.get("service_url", "")
+                        break
+                if tl_service_url:
                     break
             if tl_service_url:
-                print(f"[compass] Recovered team-lead service URL from registry: {tl_service_url}")
+                print(f"[compass] Recovered orchestrator service URL from registry: {tl_service_url}")
         except Exception as lookup_err:
-            print(f"[compass] Could not look up team-lead service URL: {lookup_err}")
+            print(f"[compass] Could not look up orchestrator service URL: {lookup_err}")
 
     if tl_task_id and tl_service_url:
         print(
@@ -1764,7 +1814,10 @@ class CompassHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/tasks":
-            cards = [_serialize_task_card(task) for task in task_store.list_tasks()]
+            query = parse_qs(urlparse(self.path).query)
+            owner_filter = ((query.get("ownerUserId") or [""])[0] or "").strip()
+            all_tasks = task_store.list_tasks(owner_filter or None)
+            cards = [_serialize_task_card(task) for task in all_tasks]
             self._send_json(200, {"tasks": cards})
             return
 

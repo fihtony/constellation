@@ -397,6 +397,8 @@ When a workflow spans multiple agents, a shared workspace directory is passed vi
 - Write your outputs to `<sharedWorkspacePath>/<your-agent-id>/`
 - Never write outside the shared workspace path
 - Namespace your files to avoid conflicts with other agents
+- **A2A boundary rule**: An agent may only read workspace files written by agents it directly orchestrates. Compass may read `team-lead/` files (Team Lead is Compass's downstream). Team Lead may read `android-agent/`, `web-agent/` files (they are Team Lead's downstream). **Compass must NOT read execution-agent files** (android-agent, web-agent, etc.) directly — all evidence must reach Compass via Team Lead's A2A callback artifacts.
+- **Evidence propagation**: Execution agents must include key result fields (`prUrl`, `branch`, `jiraInReview`) in their A2A artifact **metadata** so that Compass can receive them through Team Lead's final callback without scanning the filesystem.
 
 ```python
 import os
@@ -474,9 +476,10 @@ artifacts = [
 ### 12. LLM Usage
 
 Use `common/runtime/adapter.py` for all agentic LLM/CLI calls. It handles:
-- `copilot-cli` as the primary production backend
+- `connect-agent` as the primary built-in production backend
+- `copilot-cli` as an optional compatible CLI backend
 - `claude-code` as an optional compatible backend
-- `copilot-connect` as the OpenAI-compatible fallback / local integration backend
+- `copilot-connect` as the legacy compatibility backend on top of the shared connect-agent transport
 - Mock fallback when no real backend is available (`ALLOW_MOCK_FALLBACK=1`)
 - Proper timeout and structured result handling
 
@@ -708,6 +711,8 @@ Before submitting a new agent, verify:
 | Jira prompts | `jira/prompts.py` | ALL LLM prompt strings for Jira Agent |
 | SCM prompts | `scm/prompts.py` | ALL LLM prompt strings for SCM Agent |
 | UI Design prompts | `ui-design/prompts.py` | ALL LLM prompt strings for UI Design Agent |
+| **Android Agent** | `android/` | Per-task Android execution agent | port 8000 |
+| Android prompts | `android/prompts.py` | ALL LLM prompt strings for Android Agent |
 | UI Design Agent | `ui-design/` | Figma REST API + Google Stitch MCP | port 8040 |
 | Office Agent | `office/` | Local office document execution agent | port 8060 |
 | Office prompts | `office/prompts.py` | ALL LLM prompt strings for Office Agent |
@@ -735,8 +740,8 @@ Before submitting a new agent, verify:
 
 ## Shared Runtime Notes
 
-- LLM-enabled agents (`team-lead`, `web`, `jira`, `scm`, `ui-design`, `office`) should load shared defaults from `common/.env` first, then apply their local `.env` overrides.
-- Team Lead and Web are the only current per-task agents that intentionally override the shared runtime baseline in `registry-config.json > launchSpec.env`: `AGENT_RUNTIME=copilot-cli` and `AGENT_MODEL=gpt-5-mini`. Other agents should stay on the shared `gpt-5-mini` default unless there is an explicit design change.
+- LLM-enabled agents (`team-lead`, `web`, `android`, `jira`, `scm`, `ui-design`, `office`) should load shared defaults from `common/.env` first, then apply their local `.env` overrides.
+- Team Lead, Web, and Android are the current per-task agents that intentionally pin the shared runtime baseline in `registry-config.json > launchSpec.env`: `AGENT_RUNTIME=connect-agent` and `AGENT_MODEL=gpt-5-mini`. Other agents should stay on the shared `gpt-5-mini` default unless there is an explicit design change.
 - Protected GitHub/SCM credential variables (`GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `SCM_TOKEN`, `SCM_USERNAME`, `SCM_PASSWORD`, `TEST_GITHUB_TOKEN`) are file-backed by default. Ambient host values must be ignored unless a launcher or test has already loaded its own `.env` and explicitly marks the child process with `CONSTELLATION_TRUSTED_ENV=1`.
 - Runtime Git commands must use the isolated helper environment from `common.env_utils.build_isolated_git_env()` so agent subprocesses never read host Git credential helpers, host keychains, or user-level `~/.gitconfig`.
 - `copilot-cli` runtime authentication is isolated as well: only `COPILOT_GITHUB_TOKEN` is supported for agent execution. Do not rely on `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth`, or system keychain fallbacks inside agents.
@@ -751,7 +756,7 @@ Before submitting a new agent, verify:
 - Team Lead intake/gathering should use the agentic runtime to emit structured pending actions, but the code must still execute boundary calls itself through Registry-discovered capabilities. Do not let runtime output bypass A2A boundaries or directly hardcode external system access.
 - Always construct `RegistryClient(REGISTRY_URL)` explicitly and pass it to `AgentDirectory(owner_id, registry_client)`. Never rely on the module-level `REGISTRY_URL` default inside `RegistryClient` — `load_dotenv` may not have run yet at import time.
 - Registry now exposes topology metadata (`/topology`, `/events?sinceVersion=`); agents that call other agents should cache capability lookups and refresh on cache miss or topology change.
-- Compass applies a final completeness gate to Team Lead results using shared-workspace evidence (review result, PR evidence, Jira workflow evidence) and may trigger a same-workspace follow-up cycle before marking the user task complete. The only exception is an explicit Team Lead validation checkpoint artifact (`metadata.validationCheckpoint=true`), which intentionally stops before dev dispatch and skips the completeness gate.
+- Compass applies a final completeness gate to Team Lead results **using only A2A artifacts from Team Lead's callback** — it must never scan execution-agent subdirectories in the shared workspace (e.g., `android-agent/pr-evidence.json`, `web-agent/jira-actions.json`). Those files are internal to the Team Lead ↔ dev-agent pipeline. Compass reads PR URL and branch from artifact metadata (`prUrl`, `branch`), and Jira "In Review" status from the `jiraInReview` boolean flag in the execution agent's artifact metadata. Compass may still read `team-lead/` workspace files (Team Lead's own output) for display and fallback purposes. Compass may trigger a same-workspace follow-up cycle before marking the user task complete. The only exception is an explicit Team Lead validation checkpoint artifact (`metadata.validationCheckpoint=true`), which intentionally stops before dev dispatch and skips the completeness gate.
 - **Per-task agent exit rule** (implemented in `common/per_task_exit.py`):
   - The parent agent embeds `"exitRule": {"type": "wait_for_parent_ack", "ack_timeout_seconds": 300}` in the child's message metadata.
   - The child agent calls `PerTaskExitHandler.parse(metadata)` to read the rule, and calls `exit_handler.apply(task_id, rule, shutdown_fn=_schedule_shutdown)` in its workflow `finally` block.

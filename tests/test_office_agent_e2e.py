@@ -114,13 +114,13 @@ def _ensure_stack(reporter: Reporter) -> bool:
         return False
 
     runtime, token = _resolve_runtime_inputs()
-    if runtime != "copilot-cli":
-        reporter.fail("common/.env does not set AGENT_RUNTIME=copilot-cli", f"current={runtime!r}")
+    if runtime != "connect-agent":
+        reporter.fail("common/.env does not set AGENT_RUNTIME=connect-agent", f"current={runtime!r}")
         return False
-    if not token:
+    if runtime == "copilot-cli" and not token:
         reporter.fail("COPILOT_GITHUB_TOKEN is not configured in common/.env or tests/.env")
         return False
-    reporter.ok("Copilot CLI runtime prerequisites are configured")
+    reporter.ok("Runtime prerequisites are configured")
 
     reporter.step("Build Office Agent image")
     if not _run_checked([str(PROJECT_ROOT / "build-agents.sh"), "office"], reporter, label="Office Agent image built"):
