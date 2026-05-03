@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import time
+from html.parser import HTMLParser
 
 # Ensure project root is on path
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,104 +48,33 @@ os.environ["AGENT_MODEL"] = os.environ.get("AGENT_MODEL", "gpt-5-mini")
 os.environ["OPENAI_BASE_URL"] = os.environ.get("OPENAI_BASE_URL", "http://localhost:1288/v1")
 os.environ["ALLOW_MOCK_FALLBACK"] = "0"
 
-_DESIGN_DIR = os.path.join(_REPO_ROOT, "reference", "stitch_open_english_study_hub")
+_DEFAULT_DESIGN_DIR = os.path.join(_REPO_ROOT, "reference", "stitch_open_english_study_hub")
 _TESTS_DATA_DIR = os.path.join(_REPO_ROOT, "tests", "data")
-_BASE_PROJECT_NAME = "open-english-study-hub"
-_REFERENCE_SCREENSHOT = os.path.join(_DESIGN_DIR, "screen.png")
 
 # Compiled Tailwind output for this small landing page should be present but not bloated.
 _MIN_CSS_SIZE_BYTES = 8_000
 _MAX_CSS_SIZE_BYTES = 120_000
-
-_STRUCTURE_RULES = {
-    "src/App.jsx": {
-        "required": [
-            "bg-background",
-            "text-on-background",
-            "font-body-ui",
-            "min-h-screen",
-            "flex flex-col",
-            "<NavBar />",
-            "<HeroSection />",
-            "<Footer />",
-        ],
-        "forbidden": ["dark:"],
-    },
-    "src/components/NavBar.jsx": {
-        "required": [
-            "<header",
-            "bg-white",
-            "border-b",
-            "border-gray-100",
-            "max-w-[1120px]",
-            "text-xl",
-            "font-bold",
-            "tracking-tighter",
-            "text-blue-900",
-            "font-['Work_Sans']",
-            "hidden md:flex items-center space-x-gutter",
-            "Lessons",
-            "Flashcards",
-            "Progress",
-            "Library",
-            "Sign In",
-        ],
-        "forbidden": ["dark:"],
-    },
-    "src/components/HeroSection.jsx": {
-        "required": [
-            "flex-grow flex flex-col items-center justify-center",
-            "px-margin-mobile",
-            "py-section-padding",
-            "font-h1",
-            "text-h1",
-            "text-primary",
-            "Master Academic English with Scholarly Precision.",
-            "bg-on-tertiary-container",
-            "text-on-tertiary",
-            "Start Learning Now",
-            "Advanced Grammar",
-            "Research Writing",
-            "Formal Vocabulary",
-            "arrow_forward",
-            "bg-outline-variant",
-        ],
-        "forbidden": ["dark:"],
-    },
-    "src/components/Footer.jsx": {
-        "required": [
-            "<footer",
-            "bg-slate-50",
-            "border-t",
-            "border-gray-200",
-            "max-w-[1120px]",
-            "© 2024 Linguist Library. Premium Academic English Study.",
-            "Terms of Service",
-            "Privacy Policy",
-            "Contact Support",
-            "font-semibold",
-            "text-slate-900",
-        ],
-        "forbidden": ["dark:"],
-    },
-}
-
-_TAILWIND_CONFIG_REQUIRED_SNIPPETS = [
-    "#002045",
-    "#13696a",
-    "#f57d32",
-    "#f9f9ff",
-    "Work Sans",
-    "Newsreader",
-    "section-padding",
-    "container-max",
-]
 
 _TAILWIND_CONFIG_FORBIDDEN_PATTERNS = [
     r"safelist\\s*:",
     r"pattern\\s*:\\s*/\\.\\*/",
     r"raw\\s*:",
 ]
+
+_UI_TAGS_TO_AUDIT = (
+    "header",
+    "nav",
+    "main",
+    "footer",
+    "form",
+    "label",
+    "button",
+    "a",
+    "input",
+    "h1",
+    "h2",
+    "h3",
+)
 
 
 def _read_file_safe(path: str) -> str:
@@ -155,18 +85,135 @@ def _read_file_safe(path: str) -> str:
         return ""
 
 
-def _load_design_content() -> dict[str, str]:
+def _normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "stitch-ui"
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+class _ReferenceHtmlParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._ignored_stack: list[str] = []
+        self._in_title = False
+        self.title = ""
+        self.visible_texts: list[str] = []
+        self.tag_counts = {tag: 0 for tag in _UI_TAGS_TO_AUDIT}
+        self.has_dark_classes = False
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._ignored_stack.append(tag)
+        elif tag == "title":
+            self._in_title = True
+
+        if self._ignored_stack:
+            return
+
+        if tag in self.tag_counts:
+            self.tag_counts[tag] += 1
+
+        attrs_dict = dict(attrs)
+        if "dark:" in str(attrs_dict.get("class", "")):
+            self.has_dark_classes = True
+
+    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+        tag = tag.lower()
+        if tag == "title":
+            self._in_title = False
+        if self._ignored_stack and tag == self._ignored_stack[-1]:
+            self._ignored_stack.pop()
+
+    def handle_data(self, data: str) -> None:  # type: ignore[override]
+        if self._ignored_stack:
+            return
+        text = _normalize_text(data)
+        if not text or re.fullmatch(r"[-–—|•·:]+", text):
+            return
+        if self._in_title:
+            self.title = text
+            return
+        self.visible_texts.append(text)
+
+
+def _extract_required_config_snippets(design_md: str, code_html: str) -> list[str]:
+    combined = f"{design_md}\n{code_html}"
+    snippets: list[str] = []
+    for color_name in ("primary", "secondary", "on-tertiary-container", "background"):
+        match = re.search(
+            rf"{re.escape(color_name)}\s*[:=]\s*['\"]?(#[0-9a-fA-F]{{6}})",
+            combined,
+            re.IGNORECASE,
+        )
+        if match:
+            snippets.append(match.group(1))
+
+    for font_name in ("Work Sans", "Newsreader"):
+        if font_name.lower() in combined.lower():
+            snippets.append(font_name)
+
+    for spacing_token in ("section-padding", "container-max"):
+        if spacing_token in combined:
+            snippets.append(spacing_token)
+
+    if len(snippets) < 4:
+        snippets.extend(re.findall(r"#[0-9a-fA-F]{6}", combined))
+    return _dedupe(snippets)[:8]
+
+
+def _build_design_profile(design_dir: str) -> dict:
+    design_md = _read_file_safe(os.path.join(design_dir, "DESIGN.md"))
+    code_html = _read_file_safe(os.path.join(design_dir, "code.html"))
+
+    parser = _ReferenceHtmlParser()
+    parser.feed(code_html)
+
+    page_title = parser.title or os.path.basename(os.path.normpath(design_dir))
+    design_name = os.path.basename(os.path.normpath(design_dir))
+    salient_texts = [text for text in _dedupe(parser.visible_texts) if len(text) >= 3][:18]
+
     return {
-        "design_md": _read_file_safe(os.path.join(_DESIGN_DIR, "DESIGN.md")),
-        "code_html": _read_file_safe(os.path.join(_DESIGN_DIR, "code.html")),
+        "design_dir": design_dir,
+        "design_name": design_name,
+        "page_title": page_title,
+        "base_project_name": _slugify(f"{design_name}-{page_title}")[:64],
+        "reference_screenshot": os.path.join(design_dir, "screen.png"),
+        "design_md": design_md,
+        "code_html": code_html,
+        "required_config_snippets": _extract_required_config_snippets(design_md, code_html),
+        "expected_texts": salient_texts,
+        "expected_tag_counts": {tag: count for tag, count in parser.tag_counts.items() if count > 0},
+        "reference_allows_dark_mode": parser.has_dark_classes,
     }
 
 
-def _save_reference_screenshot(project_dir: str) -> str | None:
-    if not os.path.isfile(_REFERENCE_SCREENSHOT):
+def _load_design_content(design_profile: dict) -> dict[str, str]:
+    return {
+        "design_md": design_profile.get("design_md", ""),
+        "code_html": design_profile.get("code_html", ""),
+    }
+
+
+def _save_reference_screenshot(project_dir: str, reference_screenshot: str) -> str | None:
+    if not os.path.isfile(reference_screenshot):
         return None
     reference_copy_path = os.path.join(project_dir, "reference-screenshot.png")
-    shutil.copy2(_REFERENCE_SCREENSHOT, reference_copy_path)
+    shutil.copy2(reference_screenshot, reference_copy_path)
     return reference_copy_path
 
 
@@ -174,7 +221,7 @@ def _save_reference_screenshot(project_dir: str) -> str | None:
 # Independent validation — do NOT trust agent self-report
 # ---------------------------------------------------------------------------
 
-def _validate_css_compilation(project_dir: str) -> dict:
+def _validate_css_compilation(project_dir: str, design_profile: dict) -> dict:
     """Check if Tailwind was properly compiled and kept minimal for this page."""
     dist_assets = os.path.join(project_dir, "dist", "assets")
     if not os.path.isdir(dist_assets):
@@ -213,7 +260,8 @@ def _validate_css_compilation(project_dir: str) -> dict:
         or "display: flex" in css_content
     )
     compiled = css_size >= _MIN_CSS_SIZE_BYTES and not has_raw_directives and has_real_utilities
-    has_required_tokens = all(snippet in tailwind_config for snippet in _TAILWIND_CONFIG_REQUIRED_SNIPPETS)
+    required_snippets = design_profile.get("required_config_snippets", [])
+    has_required_tokens = all(snippet in tailwind_config for snippet in required_snippets)
     forbidden_config_matches = [
         pattern for pattern in _TAILWIND_CONFIG_FORBIDDEN_PATTERNS if re.search(pattern, tailwind_config)
     ]
@@ -240,7 +288,7 @@ def _validate_css_compilation(project_dir: str) -> dict:
         )
     if forbidden_config_matches:
         reasons.append("tailwind.config.js contains broad safelist/raw content patterns")
-    if not has_required_tokens:
+    if required_snippets and not has_required_tokens:
         reasons.append("tailwind.config.js is missing required design tokens")
 
     reason = "OK" if not reasons else " | ".join(reasons)
@@ -254,28 +302,182 @@ def _validate_css_compilation(project_dir: str) -> dict:
         "has_raw_directives": has_raw_directives,
         "has_real_utilities": has_real_utilities,
         "has_required_tokens": has_required_tokens,
+        "required_snippets": required_snippets,
         "forbidden_config_matches": forbidden_config_matches,
         "css_file": css_files[0],
     }
 
 
-def _validate_structure(project_dir: str) -> dict:
-    issues: list[str] = []
-    files_checked: list[str] = []
+def _iter_ui_source_files(project_dir: str) -> list[str]:
+    src_dir = os.path.join(project_dir, "src")
+    rel_paths: list[str] = []
+    if not os.path.isdir(src_dir):
+        return rel_paths
+    for root, _, files in os.walk(src_dir):
+        for file_name in files:
+            if not file_name.endswith((".js", ".jsx", ".ts", ".tsx", ".css")):
+                continue
+            rel_paths.append(os.path.relpath(os.path.join(root, file_name), project_dir))
+    return sorted(rel_paths)
 
-    for rel_path, rule in _STRUCTURE_RULES.items():
-        file_path = os.path.join(project_dir, rel_path)
-        content = _read_file_safe(file_path)
-        files_checked.append(rel_path)
-        if not content:
-            issues.append(f"{rel_path}: file missing or empty")
-            continue
-        missing = [snippet for snippet in rule["required"] if snippet not in content]
-        forbidden = [snippet for snippet in rule["forbidden"] if snippet in content]
-        for snippet in missing:
-            issues.append(f"{rel_path}: missing `{snippet}`")
-        for snippet in forbidden:
-            issues.append(f"{rel_path}: contains forbidden `{snippet}`")
+
+def _page_snapshot_from_html(html: str) -> dict:
+    parser = _ReferenceHtmlParser()
+    parser.feed(html)
+    return {
+        "title": _normalize_text(parser.title),
+        "body_text": _normalize_text(" ".join(parser.visible_texts)),
+        "tag_counts": {tag: parser.tag_counts.get(tag, 0) for tag in _UI_TAGS_TO_AUDIT},
+    }
+
+
+def _find_browser_binary() -> str:
+    return (
+        shutil.which("chromium")
+        or shutil.which("chromium-browser")
+        or shutil.which("google-chrome")
+        or shutil.which("google-chrome-stable")
+        or ""
+    )
+
+
+def _capture_with_node_playwright(url: str, screenshot_path: str, project_dir: str) -> dict | None:
+    if not shutil.which("node"):
+        return None
+
+    script = r"""
+const { chromium } = require('playwright');
+
+(async () => {
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+  const page = await browser.newPage({ viewport: { width: 1600, height: 1280 } });
+  await page.goto(process.env.SNAPSHOT_URL, { waitUntil: 'networkidle', timeout: 15000 });
+  await page.waitForTimeout(2500);
+  const payload = await page.evaluate(() => {
+    const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+    const counts = {};
+    for (const tag of ['header', 'nav', 'main', 'footer', 'form', 'label', 'button', 'a', 'input', 'h1', 'h2', 'h3']) {
+      counts[tag] = document.querySelectorAll(tag).length;
+    }
+    return {
+      title: normalize(document.title),
+      bodyText: normalize(document.body.innerText),
+      tagCounts: counts,
+    };
+  });
+  await page.screenshot({ path: process.env.SNAPSHOT_OUT });
+  await browser.close();
+  process.stdout.write(JSON.stringify(payload));
+})().catch((error) => {
+  process.stderr.write(String(error && error.stack ? error.stack : error));
+  process.exit(1);
+});
+"""
+
+    env = os.environ.copy()
+    env["SNAPSHOT_URL"] = url
+    env["SNAPSHOT_OUT"] = screenshot_path
+    result = subprocess.run(
+        ["node", "-e", script],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+        timeout=45,
+        env=env,
+    )
+    if result.returncode != 0 or not os.path.isfile(screenshot_path):
+        return None
+
+    payload = json.loads((result.stdout or "{}").strip() or "{}")
+    return {
+        "screenshot_path": screenshot_path,
+        "page": {
+            "title": _normalize_text(str(payload.get("title", ""))),
+            "body_text": _normalize_text(str(payload.get("bodyText", ""))),
+            "tag_counts": payload.get("tagCounts", {}),
+        },
+    }
+
+
+def _capture_with_browser_binary(url: str, screenshot_path: str) -> dict | None:
+    browser_bin = _find_browser_binary()
+    if not browser_bin:
+        return None
+
+    screenshot_result = subprocess.run(
+        [
+            browser_bin,
+            "--headless",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--hide-scrollbars",
+            "--virtual-time-budget=5000",
+            f"--screenshot={screenshot_path}",
+            "--window-size=1600,1280",
+            url,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    if screenshot_result.returncode != 0 or not os.path.isfile(screenshot_path):
+        return None
+
+    dom_result = subprocess.run(
+        [
+            browser_bin,
+            "--headless",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--virtual-time-budget=5000",
+            "--dump-dom",
+            url,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    if dom_result.returncode != 0:
+        return None
+
+    return {
+        "screenshot_path": screenshot_path,
+        "page": _page_snapshot_from_html(dom_result.stdout),
+    }
+
+
+def _validate_structure(project_dir: str, design_profile: dict, rendered_page: dict) -> dict:
+    issues: list[str] = []
+    files_checked = _iter_ui_source_files(project_dir)
+    rendered_text = _normalize_text(rendered_page.get("body_text", ""))
+    rendered_counts = rendered_page.get("tag_counts", {}) or {}
+
+    if not rendered_text:
+        issues.append("Rendered page text could not be captured for audit")
+    else:
+        for expected_text in design_profile.get("expected_texts", []):
+            if expected_text not in rendered_text:
+                issues.append(f"Rendered page missing text `{expected_text}`")
+
+    expected_title = _normalize_text(str(design_profile.get("page_title", "")))
+    actual_title = _normalize_text(str(rendered_page.get("title", "")))
+    if expected_title and actual_title and expected_title not in actual_title:
+        issues.append(f"Document title `{actual_title}` does not match reference `{expected_title}`")
+
+    for tag_name, expected_count in (design_profile.get("expected_tag_counts", {}) or {}).items():
+        actual_count = int(rendered_counts.get(tag_name, 0) or 0)
+        if actual_count != expected_count:
+            issues.append(
+                f"Rendered page has {actual_count} `{tag_name}` element(s); expected {expected_count}"
+            )
+
+    if not design_profile.get("reference_allows_dark_mode"):
+        for rel_path in files_checked:
+            content = _read_file_safe(os.path.join(project_dir, rel_path))
+            if "dark:" in content:
+                issues.append(f"{rel_path}: contains unrequested `dark:` classes")
 
     return {
         "passed": not issues,
@@ -284,15 +486,15 @@ def _validate_structure(project_dir: str) -> dict:
     }
 
 
-def _capture_screenshot(project_dir: str, port: int = 17900) -> str | None:
-    """Serve dist/ with http.server and capture a screenshot via Playwright.
-
-    Returns the path to the screenshot PNG, or None on failure.
-    """
+def _capture_page_snapshot(project_dir: str, port: int = 17900) -> dict:
+    """Serve dist/ and capture both a screenshot and a minimal DOM audit."""
     dist_dir = os.path.join(project_dir, "dist")
     if not os.path.isdir(dist_dir):
         print("  [screenshot] dist/ not found — skipping screenshot")
-        return None
+        return {
+            "screenshot_path": None,
+            "page": {"title": "", "body_text": "", "tag_counts": {tag: 0 for tag in _UI_TAGS_TO_AUDIT}},
+        }
 
     screenshot_path = os.path.join(project_dir, "screenshot.png")
     server_proc = None
@@ -305,23 +507,69 @@ def _capture_screenshot(project_dir: str, port: int = 17900) -> str | None:
         )
         time.sleep(1.5)  # give server time to start
 
-        from playwright.sync_api import sync_playwright  # type: ignore[import]
+        url = f"http://127.0.0.1:{port}/"
 
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 1600, "height": 1280})
-            page.goto(f"http://127.0.0.1:{port}/", timeout=15000)
-            # Wait for fonts / layout to settle
-            page.wait_for_timeout(2500)
-            page.screenshot(path=screenshot_path, full_page=False)
-            browser.close()
+        try:
+            from playwright.sync_api import sync_playwright  # type: ignore[import]
 
-        print(f"  [screenshot] Saved to {screenshot_path}")
-        return screenshot_path
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"width": 1600, "height": 1280})
+                page.goto(url, timeout=15000)
+                page.wait_for_timeout(2500)
+                page_state = page.evaluate(
+                    r"""() => {
+                        const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+                        const counts = {};
+                        for (const tag of ['header', 'nav', 'main', 'footer', 'form', 'label', 'button', 'a', 'input', 'h1', 'h2', 'h3']) {
+                            counts[tag] = document.querySelectorAll(tag).length;
+                        }
+                        return {
+                            title: normalize(document.title),
+                            bodyText: normalize(document.body.innerText),
+                            tagCounts: counts,
+                        };
+                    }"""
+                )
+                page.screenshot(path=screenshot_path, full_page=False)
+                browser.close()
+
+            print(f"  [screenshot] Saved to {screenshot_path} (python playwright)")
+            return {
+                "screenshot_path": screenshot_path,
+                "page": {
+                    "title": _normalize_text(str(page_state.get("title", ""))),
+                    "body_text": _normalize_text(str(page_state.get("bodyText", ""))),
+                    "tag_counts": page_state.get("tagCounts", {}),
+                },
+            }
+        except ModuleNotFoundError:
+            pass
+        except Exception as exc:
+            print(f"  [screenshot] Python Playwright failed: {exc}")
+
+        node_snapshot = _capture_with_node_playwright(url, screenshot_path, project_dir)
+        if node_snapshot:
+            print(f"  [screenshot] Saved to {screenshot_path} (node playwright)")
+            return node_snapshot
+
+        browser_snapshot = _capture_with_browser_binary(url, screenshot_path)
+        if browser_snapshot:
+            print(f"  [screenshot] Saved to {screenshot_path} (browser binary)")
+            return browser_snapshot
+
+        print("  [screenshot] No supported screenshot backend available")
+        return {
+            "screenshot_path": None,
+            "page": {"title": "", "body_text": "", "tag_counts": {tag: 0 for tag in _UI_TAGS_TO_AUDIT}},
+        }
 
     except Exception as exc:
         print(f"  [screenshot] Failed: {exc}")
-        return None
+        return {
+            "screenshot_path": None,
+            "page": {"title": "", "body_text": "", "tag_counts": {tag: 0 for tag in _UI_TAGS_TO_AUDIT}},
+        }
     finally:
         if server_proc is not None:
             server_proc.terminate()
@@ -336,7 +584,7 @@ def _compare_screenshots(impl_path: str, reference_path: str) -> dict:
         return {"similarity": 0.0, "error": "reference screenshot missing"}
 
     try:
-        from PIL import Image, ImageChops  # type: ignore[import]
+        from PIL import Image, ImageChops, ImageStat  # type: ignore[import]
 
         # Resize both to a consistent size for comparison
         size = (800, 640)
@@ -344,9 +592,9 @@ def _compare_screenshots(impl_path: str, reference_path: str) -> dict:
         img2 = Image.open(reference_path).convert("RGB").resize(size)
 
         diff = ImageChops.difference(img1, img2)
-        pixels = list(diff.getdata())
-        total_diff = sum(r + g + b for r, g, b in pixels)
-        max_diff = 255 * 3 * len(pixels)
+        stat = ImageStat.Stat(diff)
+        total_diff = sum(stat.sum)
+        max_diff = 255 * 3 * size[0] * size[1]
         similarity = round(100.0 * (1.0 - total_diff / max_diff), 1)
 
         # Also sample dominant background color to detect "unstyled white page"
@@ -362,7 +610,12 @@ def _compare_screenshots(impl_path: str, reference_path: str) -> dict:
         return {"similarity": 0.0, "error": str(exc)}
 
 
-def _build_task_prompt(design: dict[str, str], project_dir: str, prev_validation: dict | None = None) -> str:
+def _build_task_prompt(
+    design_profile: dict,
+    design: dict[str, str],
+    project_dir: str,
+    prev_validation: dict | None = None,
+) -> str:
     """Build the task prompt. prev_validation is the validation report from the previous attempt."""
 
     feedback_block = ""
@@ -399,7 +652,7 @@ The main bugs in the previous attempt:
 2. **Wrong Tailwind version** — must be tailwindcss@3, NOT tailwindcss (which is v4).
 3. **Missing postcss.config.js** — run `npx tailwindcss init -p` to create it.
     4. **CSS bundle bloat** — broad `safelist`, `pattern: /.*/`, raw content padding, or fake filler CSS are NOT allowed.
-    5. **Light-theme fidelity** — for this test, `dark:` classes are redundant/wrong because the reference screenshot is the light theme only.
+    5. **Design fidelity gap** — the rendered output still differs from the supplied design source.
 
 ### MANDATORY FIXES
 1. NEVER write package.json — the Vite scaffold is already there
@@ -408,19 +661,35 @@ The main bugs in the previous attempt:
 4. Install React Vite plugin: `npm install -D @vitejs/plugin-react`
 5. Create vite.config.js with the React plugin (see Step 1 below)
     6. After build, VERIFY: `wc -c dist/assets/*.css` — for this page it should be in the low tens of KB, not under 8000 bytes and not over 120000 bytes
-    7. Remove every `dark:` utility unless the task explicitly asks for a dark theme (this test does not)
-    8. Compare each component against the reference HTML attribute by attribute until there are zero missing, redundant, or wrong items
+    7. Compare each component against the reference HTML attribute by attribute until there are zero missing, redundant, or wrong items
+    8. Regenerate the implementation screenshot inside the project directory and check it against the reference screenshot before reporting completion
 
 """
 
+    salient_texts = "\n".join(
+        f"- {text}" for text in design_profile.get("expected_texts", [])
+    ) or "- Preserve the visible text content from the reference HTML exactly."
+    theme_rule = (
+        "The reference HTML already includes theme-specific classes. Keep only what is necessary to match the supplied design source."
+        if design_profile.get("reference_allows_dark_mode")
+        else "Do not add dark-mode classes or alternate theme variants that are absent from the supplied design source."
+    )
+
     return f"""\
-You are building a React + Tailwind CSS landing page for "Linguist Library" — \
-a premium academic English study platform.
+You are building a React + Tailwind CSS page from a Google Stitch design export.
 
 ## Project Directory
 Work entirely inside this directory: {project_dir}
 All bash commands must be run inside this directory.
 {feedback_block}
+## Design Bundle
+- Design folder: {design_profile['design_dir']}
+- Page title: {design_profile['page_title']}
+- Base project name: {design_profile['base_project_name']}
+- Reference screenshot: {design_profile['reference_screenshot']}
+- Salient visible texts that MUST appear in the rendered page:
+{salient_texts}
+
 ## Design Specification
 {design["design_md"]}
 
@@ -470,7 +739,7 @@ npm install --no-fund --no-audit
 
 ### Step 2 — Configure Tailwind
 
-**IMPORTANT**: Copy the EXACT color/spacing/font values from the reference HTML's tailwind.config \
+**IMPORTANT**: Copy the EXACT color/spacing/font values from the reference HTML's `tailwind.config` \
 block above. Do NOT guess or add values not in the reference.
 
 Write tailwind.config.js (Tailwind v3 format — `module.exports = {{...}}`):
@@ -548,46 +817,12 @@ Write src/index.css with Google Fonts @import AND Tailwind directives:
 
 ### Step 3 — Implement Components
 
-Translate the reference HTML EXACTLY into React components. Match every class name, \
-every text, every structural element.
-
-**src/components/NavBar.jsx** — translate the `<header>` block:
-- White background, border-bottom, sticky top
-- Max-width 1120px centered container
-- Left: "Linguist Library" — `text-xl font-bold tracking-tighter text-blue-900 font-['Work_Sans']`
-- Center: nav links (Lessons, Flashcards, Progress, Library) hidden on mobile, flex on md
-- Right: "Sign In" text button
-- Match exact classes from reference HTML
-
-**src/components/HeroSection.jsx** — translate the `<main>` block:
-- `flex-grow flex flex-col items-center justify-center px-margin-mobile py-section-padding`
-- h1: exact text "Master Academic English with Scholarly Precision."
-- CTA button: `bg-on-tertiary-container text-on-tertiary` (orange #f57d32)
-- Three category links with Material Symbol `arrow_forward` icons
-- Vertical dividers between links on desktop
-
-**src/components/Footer.jsx** — translate the `<footer>` block:
-- `bg-slate-50 border-t border-gray-200`
-- Left: copyright text
-- Right: Terms of Service, Privacy Policy, Contact Support (bold) links
-
-**src/App.jsx** — assemble components:
-```jsx
-import React from 'react'
-import NavBar from './components/NavBar'
-import HeroSection from './components/HeroSection'
-import Footer from './components/Footer'
-
-export default function App() {{
-  return (
-    <div className="bg-background text-on-background font-body-ui min-h-screen flex flex-col">
-      <NavBar />
-      <HeroSection />
-      <Footer />
-    </div>
-  )
-}}
-```
+Translate the reference HTML EXACTLY into React components.
+- Match every class token, visible text, semantic tag, and structural grouping.
+- Match the reference HTML document title exactly in `index.html` or the final rendered document head.
+- Derive component/file names from the ACTUAL page structure in the reference HTML. Do not force the old landing-page component template onto a different page.
+- Preserve forms, labels, inputs, buttons, links, icons, and section order exactly as shown.
+- {theme_rule}
 
 ### Step 4 — Build
 
@@ -626,10 +861,9 @@ If CSS is not compiled or is bloated, fix the Tailwind setup and rebuild.
 ### Step 6 — Design Comparison
 
 After a successful build with compiled CSS:
-- Compare NavBar, HeroSection, and Footer to the reference HTML ONE COMPONENT AT A TIME.
-- For each component, compare: exact tag names, text content, href/button/icon attributes, class tokens, colors, spacing, typography, and child order.
+- Compare the page ONE COMPONENT / SECTION AT A TIME using the actual structure from the reference HTML.
+- For each component, compare: exact tag names, text content, href/button/icon/data attributes, class tokens, colors, spacing, typography, and child order.
 - Treat any redundant or wrong attribute/class as a failure — not just missing items.
-- Because this test targets the light-theme screenshot, remove all `dark:` classes and any dark-only styling.
 - List each design requirement: ✅ implemented / ❌ missing / ❌ redundant / ❌ wrong
 - Fix all missing items, rebuild
 - Repeat until there are ZERO missing, redundant, or wrong items
@@ -643,9 +877,9 @@ After a successful build with compiled CSS:
 ### Step 7 — Write README.md
 
 ```markdown
-# Linguist Library
+# {design_profile['page_title']}
 
-React + Tailwind CSS implementation of the Linguist Library landing page.
+React + Tailwind CSS implementation of the Stitch reference page.
 
 ## Tech Stack
 - React 18
@@ -670,13 +904,12 @@ npm run build
 - [ ] dist/assets/*.css is between 8KB and 120KB for this page (compiled and not bloated)
 - [ ] CSS contains NO literal `@tailwind` directives
 - [ ] tailwind.config.js contains the required design tokens and NO broad safelist/raw content shortcuts
-- [ ] NavBar with logo, nav links (Lessons/Flashcards/Progress/Library), Sign In button
-- [ ] HeroSection with h1, orange CTA button (#f57d32), three category links
-- [ ] Footer with light grey background, copyright and Terms/Privacy/Contact links
-- [ ] No `dark:` classes or dark-only styling remain in the implementation
+- [ ] All semantic sections, forms, buttons, links, headings, and other visible text from the reference HTML are present in the rendered page
+- [ ] The final rendered document title matches the reference HTML `<title>` exactly
+- [ ] Theme variants only exist when they are present in the supplied design source
 - [ ] Component-by-component audit finds zero missing, redundant, or wrong attributes/classes
 - [ ] tailwind.config.js has ALL design color tokens from reference HTML
-- [ ] Work Sans + Newsreader fonts loaded via Google Fonts @import
+- [ ] All fonts used by the supplied design are loaded correctly via CSS imports
 - [ ] Final screenshot saved to `{project_dir}/screenshot.png`
 - [ ] README.md written
 
@@ -744,7 +977,7 @@ def _print_separator(title: str = "") -> None:
         print(f"\n{'=' * 70}\n")
 
 
-def _validate_full(project_dir: str, attempt: int) -> dict:
+def _validate_full(project_dir: str, attempt: int, design_profile: dict) -> dict:
     """Run all independent validations after an agent attempt.
 
     This is the Copilot-side truth check — does NOT trust agent self-report.
@@ -760,31 +993,31 @@ def _validate_full(project_dir: str, attempt: int) -> dict:
     print(f"README.md:       {'✅' if state['has_readme'] else '❌'}")
 
     # CSS compilation check
-    css = _validate_css_compilation(project_dir)
+    css = _validate_css_compilation(project_dir, design_profile)
     css_icon = "✅" if css["valid"] else ("⚠️" if css["compiled"] else "❌")
     print(f"\nCSS compilation: {css_icon}")
     print(f"  CSS file: {css.get('css_file', 'N/A')}")
     print(f"  CSS size: {css.get('css_size_bytes', 0):,} bytes")
     print(f"  Reason:   {css.get('reason', 'N/A')}")
 
-    structure = _validate_structure(project_dir)
+    # Screenshot
+    print("\nCapturing screenshot of built page...")
+    reference_copy_path = _save_reference_screenshot(project_dir, design_profile["reference_screenshot"])
+    page_snapshot = _capture_page_snapshot(project_dir)
+    screenshot_path = page_snapshot.get("screenshot_path")
+    structure = _validate_structure(project_dir, design_profile, page_snapshot.get("page", {}))
     structure_icon = "✅" if structure["passed"] else "❌"
-    print(f"\nStructure audit: {structure_icon}")
+    print(f"\nRendered audit: {structure_icon}")
     if structure["passed"]:
-        print("  All required component attributes matched the test rules.")
+        print("  Rendered DOM and salient text matched the dynamic reference audit.")
     else:
         for issue in structure["issues"][:12]:
             print(f"  - {issue}")
 
-    # Screenshot
-    print("\nCapturing screenshot of built page...")
-    reference_copy_path = _save_reference_screenshot(project_dir)
-    screenshot_path = _capture_screenshot(project_dir)
-
     # Visual comparison
     comparison: dict = {}
     if screenshot_path:
-        comparison = _compare_screenshots(screenshot_path, _REFERENCE_SCREENSHOT)
+        comparison = _compare_screenshots(screenshot_path, design_profile["reference_screenshot"])
         sim = comparison.get("similarity", 0)
         sim_icon = "✅" if sim >= 70 else ("⚠️" if sim >= 40 else "❌")
         print(f"\nVisual similarity: {sim_icon} {sim}% (vs reference design screenshot)")
@@ -823,6 +1056,7 @@ def _validate_full(project_dir: str, attempt: int) -> dict:
         "structure": structure,
         "reference_screenshot_path": reference_copy_path,
         "screenshot_path": screenshot_path,
+        "rendered_page": page_snapshot.get("page", {}),
         "screenshot_comparison": comparison,
         "quality_score": quality_score,
     }
@@ -840,6 +1074,7 @@ def run_test(
     attempt: int,
     max_turns: int,
     timeout: int,
+    design_profile: dict,
     prev_validation: dict | None = None,
 ) -> tuple[bool, dict]:
     """Run one attempt of the stitch UI test.
@@ -847,7 +1082,7 @@ def run_test(
     Returns (is_complete, validation_report).
     prev_validation is the full validation dict from the previous iteration.
     """
-    project_name = f"{_BASE_PROJECT_NAME}_{attempt}"
+    project_name = f"{design_profile['base_project_name']}_{attempt}"
     project_dir = os.path.join(_TESTS_DATA_DIR, project_name)
     os.makedirs(project_dir, exist_ok=True)
 
@@ -856,7 +1091,7 @@ def run_test(
     print(f"Model: {os.environ['AGENT_MODEL']}")
     print(f"Max turns: {max_turns}, Timeout: {timeout}s")
 
-    design = _load_design_content()
+    design = _load_design_content(design_profile)
     print(f"Design spec: {len(design['design_md'])} chars")
     print(f"Reference HTML: {len(design['code_html'])} chars")
     if prev_validation:
@@ -905,7 +1140,7 @@ def run_test(
     runtime = get_runtime("connect-agent")
 
     # Build task prompt — includes feedback from previous attempt's validation
-    task_prompt = _build_task_prompt(design, project_dir, prev_validation=prev_validation)
+    task_prompt = _build_task_prompt(design_profile, design, project_dir, prev_validation=prev_validation)
 
     _print_separator("STARTING AGENTIC EXECUTION")
     start = time.time()
@@ -947,7 +1182,7 @@ def run_test(
     # -------------------------------------------------------------------
     # INDEPENDENT VALIDATION — Copilot validates, ignoring agent self-report
     # -------------------------------------------------------------------
-    validation = _validate_full(project_dir, attempt)
+    validation = _validate_full(project_dir, attempt, design_profile)
 
     # Save combined test report
     report = {
@@ -1007,10 +1242,20 @@ def run_test(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Stitch UI test — Linguist Library landing page")
+    parser = argparse.ArgumentParser(description="Stitch UI test — generic React + Tailwind page from a Stitch design folder")
     parser.add_argument(
-        "--attempt", type=int, default=2,
-        help="Starting attempt number (default: 2, since attempt 1 already exists)",
+        "--design-dir",
+        default="reference/stitch_open_english_study_hub",
+        help="Design folder path relative to repo root or absolute path",
+    )
+    parser.add_argument(
+        "--project-name",
+        default="",
+        help="Optional override for the tests/data project folder prefix",
+    )
+    parser.add_argument(
+        "--attempt", type=int, default=1,
+        help="Starting attempt number (default: 1)",
     )
     parser.add_argument(
         "--attempts", type=int, default=5,
@@ -1020,11 +1265,19 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=3600, help="Max total timeout in seconds per iteration")
     args = parser.parse_args()
 
+    design_dir = args.design_dir
+    if not os.path.isabs(design_dir):
+        design_dir = os.path.join(_REPO_ROOT, design_dir)
+    design_profile = _build_design_profile(os.path.abspath(design_dir))
+    if args.project_name:
+        design_profile["base_project_name"] = _slugify(args.project_name)[:64]
+
     print("=" * 70)
-    print("Stitch UI Test — Linguist Library landing page")
+    print(f"Stitch UI Test — {design_profile['page_title']}")
     print(f"Model:          {os.environ['AGENT_MODEL']}")
-    print(f"Design source:  {_DESIGN_DIR}")
-    print(f"Reference:      {_REFERENCE_SCREENSHOT}")
+    print(f"Design source:  {design_profile['design_dir']}")
+    print(f"Reference:      {design_profile['reference_screenshot']}")
+    print(f"Project prefix: {design_profile['base_project_name']}")
     print(f"Iterations:     {args.attempts} (starting from attempt {args.attempt})")
     print(f"Max turns/iter: {args.max_turns}, Timeout: {args.timeout}s")
     print("=" * 70)
@@ -1042,6 +1295,7 @@ def main() -> None:
                 attempt=attempt_num,
                 max_turns=args.max_turns,
                 timeout=args.timeout,
+                design_profile=design_profile,
                 prev_validation=prev_validation,
             )
             quality = validation["quality_score"]
@@ -1078,13 +1332,13 @@ def main() -> None:
     print(f"Best quality score: {best_quality}/100  (attempt {best_attempt})")
 
     if best_attempt >= 0:
-        project_dir = os.path.join(_TESTS_DATA_DIR, f"{_BASE_PROJECT_NAME}_{best_attempt}")
+        project_dir = os.path.join(_TESTS_DATA_DIR, f"{design_profile['base_project_name']}_{best_attempt}")
         print(f"Best project:  {project_dir}")
         screenshot = os.path.join(project_dir, "screenshot.png")
         if os.path.isfile(screenshot):
             print(f"Screenshot:    {screenshot}")
-            print(f"Reference:     {_REFERENCE_SCREENSHOT}")
-            print(f"  Compare: open {screenshot} {_REFERENCE_SCREENSHOT}")
+            print(f"Reference:     {design_profile['reference_screenshot']}")
+            print(f"  Compare: open {screenshot} {design_profile['reference_screenshot']}")
     print()
 
     if best_quality >= 75:

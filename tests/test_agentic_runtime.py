@@ -280,6 +280,31 @@ class ConnectAgentAgenticTests(unittest.TestCase):
         tool_names = [item["function"]["name"] for item in captured_payloads[0]["tools"]]
         self.assertIn("report_progress", tool_names)
 
+    def test_run_agentic_keeps_default_rules_when_custom_system_prompt_is_supplied(self):
+        captured_payloads = []
+
+        def _fake_urlopen(req, timeout=0):
+            captured_payloads.append(json.loads(req.data.decode("utf-8")))
+            return self._FakeResponse({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": "done"},
+                }],
+            })
+
+        with patch("common.runtime.connect_agent.transport.urlopen", side_effect=_fake_urlopen):
+            runtime = get_runtime()
+            result = runtime.run_agentic(
+                "do something",
+                system_prompt="CUSTOM TASK RULE: write the screenshot into the project folder.",
+                max_turns=1,
+            )
+
+        self.assertTrue(result.success)
+        system_prompt = captured_payloads[0]["messages"][0]["content"]
+        self.assertIn("Treat explicit task-specific requirements as hard requirements", system_prompt)
+        self.assertIn("CUSTOM TASK RULE: write the screenshot into the project folder.", system_prompt)
+
 
 class ProviderRegistryTests(unittest.TestCase):
     def test_all_backends_auto_registered(self):
