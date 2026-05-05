@@ -41,6 +41,7 @@ UI_DESIGN_URL = "http://localhost:8040"
 
 TASK_POLL_TIMEOUT = 120
 WORKFLOW_POLL_TIMEOUT = int(os.environ.get("WORKFLOW_POLL_TIMEOUT", "3600"))
+WORKFLOW_AUTO_REPLY_LIMIT = int(os.environ.get("WORKFLOW_AUTO_REPLY_LIMIT", "1"))
 
 VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
 SMOKE_ONLY = "--smoke-only" in sys.argv
@@ -218,7 +219,12 @@ def http_json(url: str, method: str = "GET", payload=None,
         return 0, {"error": str(e)}
 
 
-def send_message(text: str, requested_capability: str | None = None, timeout: int = 30):
+def send_message(
+    text: str,
+    requested_capability: str | None = None,
+    timeout: int = 30,
+    context_id: str | None = None,
+):
     payload = {
         "message": {
             "messageId": f"e2e-{int(time.time() * 1000)}",
@@ -228,6 +234,8 @@ def send_message(text: str, requested_capability: str | None = None, timeout: in
     }
     if requested_capability:
         payload["requestedCapability"] = requested_capability
+    if context_id:
+        payload["contextId"] = context_id
     return http_json(f"{COMPASS_URL}/message:send", method="POST",
                      payload=payload, timeout=timeout)
 
@@ -306,6 +314,35 @@ def _read_json_file(path: str):
         return json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _task_message_text(body: dict | None) -> str:
+    parts = (body or {}).get("task", {}).get("status", {}).get("message", {}).get("parts", [])
+    if not isinstance(parts, list):
+        return ""
+    return "\n".join(
+        str(part.get("text", ""))
+        for part in parts
+        if isinstance(part, dict) and part.get("text")
+    ).strip()
+
+
+def _auto_reply_for_input_required(body: dict | None) -> str:
+    question = _normalize_text(_task_message_text(body))
+    if not question:
+        return ""
+    if "sample items for contributions" in question or "mock-data json shape" in question:
+        return (
+            "No preferred backend contract is required for this task. Use local mock data only. "
+            "A Kotlin-friendly sample shape is: "
+            "["
+            '{"title":"RRSP contribution","date":"2026-04-15","amount":"$500.00","icon":"ic_contribution"}, '
+            '{"title":"Employer match","date":"2026-04-01","amount":"$250.00","icon":"ic_contribution"}, '
+            '{"title":"TFSA contribution","date":"2026-03-15","amount":"$300.00","icon":"ic_contribution"}'
+            "] "
+            "Optional subtitle/status fields are fine, but keep the UI aligned to the Figma design."
+        )
+    return ""
 
 
 # Non-execution agent directory names (never the dev-agent workspace dir).
@@ -856,8 +893,6 @@ def _validate_workflow_configuration() -> bool:
     missing: list[str] = []
     if not JIRA_TICKET_URL:
         missing.append("TEST_JIRA_TICKET_URL")
-    if not GITHUB_REPO_URL:
-        missing.append("TEST_GITHUB_REPO_URL")
     if missing:
         fail(
             "Workflow test configuration missing",
@@ -937,6 +972,26 @@ def test_ticket_full_workflow():  # noqa: C901
         fail(f"Task did not complete within {WORKFLOW_POLL_TIMEOUT}s")
     else:
         show_json("Final task", final)
+
+    auto_reply_count = 0
+    while final and t_state(final) == "TASK_STATE_INPUT_REQUIRED":
+        if auto_reply_count >= WORKFLOW_AUTO_REPLY_LIMIT:
+            break
+        auto_reply = _auto_reply_for_input_required(final)
+        if not auto_reply:
+            break
+        auto_reply_count += 1
+        step(f"a2. Resume task with automated clarification reply #{auto_reply_count}")
+        s, resumed = send_message(auto_reply, timeout=30, context_id=tid)
+        show_json("Resume response", resumed)
+        if s != 200:
+            fail("Compass rejected the automated clarification reply", f"HTTP {s}")
+            break
+        final = poll_task(tid, timeout=WORKFLOW_POLL_TIMEOUT, print_progress=True)
+        if not final:
+            fail(f"Task did not complete within {WORKFLOW_POLL_TIMEOUT}s after clarification")
+            break
+        show_json("Final task after clarification", final)
 
     final_state = t_state(final) if final else "TIMEOUT"
     input_required = final_state == "TASK_STATE_INPUT_REQUIRED"

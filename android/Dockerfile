@@ -5,7 +5,7 @@ WORKDIR /app
 # Install system dependencies (tini for signal handling, git for SCM tools)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-         ca-certificates tini git curl openjdk-21-jdk-headless \
+        ca-certificates tini git curl unzip openjdk-21-jdk-headless \
     && rm -rf /var/lib/apt/lists/*
 
 RUN java_home_dir="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")" \
@@ -19,6 +19,12 @@ RUN find /usr/local/share/ca-certificates/ -name "*.pem" \
         -exec sh -c 'cp "$1" "${1%.pem}.crt"' _ {} \; \
     && update-ca-certificates
 
+RUN mkdir -p /opt/android-sdk/cmdline-tools \
+    && curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/android-cmdline-tools.zip \
+    && unzip -q /tmp/android-cmdline-tools.zip -d /opt/android-sdk/cmdline-tools \
+    && mv /opt/android-sdk/cmdline-tools/cmdline-tools /opt/android-sdk/cmdline-tools/latest \
+    && rm -f /tmp/android-cmdline-tools.zip
+
 RUN pip install --no-cache-dir requests
 
 COPY common/          /app/common/
@@ -30,7 +36,13 @@ ENV PYTHONUNBUFFERED=1 \
     JAVA_HOME=/usr/lib/jvm/default-java \
     ANDROID_HOME=/opt/android-sdk \
     ANDROID_SDK_ROOT=/opt/android-sdk \
-    PATH=/usr/lib/jvm/default-java/bin:$PATH
+    PATH=/usr/lib/jvm/default-java/bin:/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:$PATH
+
+RUN yes | sdkmanager --sdk_root=/opt/android-sdk --licenses >/dev/null \
+    && sdkmanager --sdk_root=/opt/android-sdk \
+        "platform-tools" \
+        "platforms;android-36" \
+        "build-tools;35.0.0"
 
 LABEL constellation.agent_id="android-agent"
 LABEL constellation.agent_name="Android Agent"

@@ -967,15 +967,23 @@ def _build_and_test_android(build_dir: str, log_fn) -> tuple[bool, str, list[dic
     if not os.path.isfile(os.path.join(build_dir, "gradlew")) and not os.path.isfile(os.path.join(build_dir, "build.gradle")) and not os.path.isfile(os.path.join(build_dir, "build.gradle.kts")):
         return False, "No Gradle wrapper or build file found.", [{"attempt": 1, "success": False, "output": "No Gradle wrapper or build file found."}]
 
+    _prepare_android_local_properties(build_dir, log_fn)
     try:
         steps = _detect_android_build_steps(build_dir)
     except Exception as exc:
-        return False, f"Could not inspect Gradle tasks: {exc}", [{"attempt": 1, "success": False, "output": f"Could not inspect Gradle tasks: {exc}"}]
+        gradle_cmd = _ensure_gradle_wrapper_executable(build_dir)
+        if os.path.isfile(os.path.join(build_dir, "gradlew")):
+            log_fn(f"Gradle task discovery failed ({exc}); falling back to default Android build/test steps")
+            steps = [
+                {"cmd": [gradle_cmd, "testDebugUnitTest"], "label": "android:testDebugUnitTest"},
+                {"cmd": [gradle_cmd, "assembleDebug"], "label": "android:assembleDebug"},
+            ]
+        else:
+            return False, f"Could not inspect Gradle tasks: {exc}", [{"attempt": 1, "success": False, "output": f"Could not inspect Gradle tasks: {exc}"}]
 
     if not steps:
         return False, "No usable Gradle build/test tasks found.", [{"attempt": 1, "success": False, "output": "No usable Gradle build/test tasks found."}]
 
-    _prepare_android_local_properties(build_dir, log_fn)
     attempts: list[dict] = []
     outputs: list[str] = []
     for index, step in enumerate(steps, start=1):

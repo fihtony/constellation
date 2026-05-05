@@ -994,6 +994,29 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
 
         self.assertEqual(unresolved, [])
 
+    def test_team_lead_filters_defaultable_android_delivery_missing_info(self):
+        ctx = team_lead_app._TaskContext()
+        ctx.jira_info = {"content": "Jira ticket content is available."}
+        ctx.repo_info = {
+            "repo_url": "https://bitbucket.example.com/projects/mobile/repos/android-test/browse",
+            "content": "Repository context is available.",
+        }
+        ctx.design_info = {"content": "Figma node context is available."}
+
+        unresolved = team_lead_app._filter_unresolved_missing_info(
+            {
+                "platform": "android",
+                "missing_info": [
+                    "Target app module / package path and navigation graph/menu IDs to wire the Favorites bottom-nav action to the new Fragment",
+                    "Preferred test runner / CI job names where instrumentation tests should run and where SDK install/license acceptance must be configured",
+                    "Any required mock data schema or sample payloads if different from the design's visible fields",
+                ],
+            },
+            ctx,
+        )
+
+        self.assertEqual(unresolved, [])
+
     def test_team_lead_suppresses_defaultable_web_ui_questions_with_full_context(self):
         ctx = team_lead_app._TaskContext()
         ctx.jira_info = {"content": "Jira ticket content is available."}
