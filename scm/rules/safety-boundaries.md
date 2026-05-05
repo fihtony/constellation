@@ -8,7 +8,7 @@
 
 ## Forbidden Actions
 
-- Force-push, branch deletion, or default-branch mutation without explicit approval.
+- Force-push, branch deletion, or protected-branch mutation without explicit approval. Protected branches are defined by the task permission policy regex list, not hardcoded in the handler.
 - Writing to repositories that were not explicitly selected.
 - Hiding provider-side permission or policy failures.
 

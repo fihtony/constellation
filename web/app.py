@@ -35,6 +35,11 @@ from common.per_task_exit import PerTaskExitHandler
 from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt, load_rules
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.task_permissions import (
+    PermissionEscalationRequired,
+    build_permission_denied_artifact,
+    extract_permission_denial,
+)
 from common.task_store import TaskStore
 from common.time_utils import local_clock_time, local_iso_timestamp
 from web import prompts
@@ -174,6 +179,35 @@ def _append_workspace_event(workspace_path: str, relative_name: str, event: dict
         relative_name,
         json.dumps(payload, ensure_ascii=False, indent=2),
     )
+
+
+def _is_path_within(root_path: str, candidate_path: str) -> bool:
+    """Return True when *candidate_path* resolves under *root_path*."""
+    if not root_path or not candidate_path:
+        return False
+    try:
+        root_real = os.path.realpath(root_path)
+        candidate_real = os.path.realpath(candidate_path)
+        return os.path.commonpath([root_real, candidate_real]) == root_real
+    except (OSError, ValueError):
+        return False
+
+
+def _require_shared_workspace_for_repo_task(repo_url: str, workspace: str) -> None:
+    """Repo-backed tasks must use the shared workspace so SCM can clone into it."""
+    if repo_url and not workspace:
+        raise RuntimeError(
+            "Shared workspace path is required for repo-backed development tasks so the SCM agent "
+            "can clone the target repository into the task workspace."
+        )
+
+
+def _ensure_clone_path_in_workspace(workspace: str, clone_path: str) -> None:
+    """Reject clone paths that do not resolve under the shared workspace."""
+    if workspace and clone_path and not _is_path_within(workspace, clone_path):
+        raise RuntimeError(
+            f"Repository clone path must stay inside the shared workspace. workspace={workspace} clone={clone_path}"
+        )
 
 
 def _resolve_agent_service_url(capability: str) -> str:
@@ -337,43 +371,94 @@ def _jira_request_json(
     path: str,
     *,
     payload: dict | None = None,
+    permissions: dict | None = None,
     workspace: str = "",
     task_id: str = "",
+    compass_task_id: str = "",
     timeout: int = 30,
 ) -> dict:
-    headers = {"Accept": "application/json"}
-    if payload is not None:
-        headers["Content-Type"] = "application/json; charset=utf-8"
-    if workspace:
-        headers["X-Shared-Workspace-Path"] = workspace
-    if task_id:
-        headers["X-Orchestrator-Task-Id"] = task_id
-    headers["X-Agent-Id"] = AGENT_ID
-    service_url = _resolve_agent_service_url(capability)
-    request = Request(
-        f"{service_url}{path}",
-        data=(json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None),
-        headers=headers,
-        method=method,
+    request_payload = dict(payload) if isinstance(payload, dict) else {}
+    normalized_path = urlparse(path).path
+    ticket_match = re.search(r"/jira/(?:tickets|transitions|comments|assignee)/([A-Z][A-Z0-9]+-\d+)", normalized_path)
+    ticket_key = ticket_match.group(1) if ticket_match else ""
+    extra_metadata: dict = {}
+    if ticket_key:
+        extra_metadata["ticketKey"] = ticket_key
+
+    if capability == "jira.ticket.fetch":
+        message_text = f"Fetch Jira ticket {ticket_key}".strip()
+    elif capability == "jira.user.myself":
+        message_text = "Get current Jira user"
+    elif capability == "jira.ticket.transition":
+        transition = str(request_payload.get("transition") or "").strip()
+        if transition:
+            extra_metadata["transition"] = transition
+        message_text = f"Transition ticket {ticket_key} to {transition}".strip()
+    elif capability == "jira.ticket.assignee":
+        account_id = str(request_payload.get("accountId") or "").strip()
+        if account_id:
+            extra_metadata["accountId"] = account_id
+        message_text = f"Assign ticket {ticket_key} to accountId {account_id}".strip()
+    elif capability == "jira.comment.add":
+        adf_body = request_payload.get("adf") if isinstance(request_payload.get("adf"), dict) else None
+        if adf_body:
+            extra_metadata["adf"] = adf_body
+            message_text = f"Add structured comment to ticket {ticket_key}".strip()
+        else:
+            comment_text = str(request_payload.get("text") or request_payload.get("comment") or "").strip()
+            if comment_text:
+                extra_metadata["commentText"] = comment_text
+            message_text = f"Add comment to ticket {ticket_key}: {comment_text}".strip()
+    else:
+        raise RuntimeError(f"Unsupported Jira A2A capability: {capability}")
+
+    result = _call_sync_agent(
+        capability,
+        message_text,
+        task_id,
+        workspace,
+        compass_task_id or task_id,
+        permissions=permissions,
+        extra_metadata=extra_metadata,
     )
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-            return json.loads(raw) if raw.strip() else {}
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {body[:300]}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"network error: {exc.reason}") from exc
+    state = str((result.get("status") or {}).get("state") or "").strip()
+    if state in {"TASK_STATE_FAILED", "FAILED"}:
+        status_text = extract_text((result.get("status") or {}).get("message") or {}).strip()
+        raise RuntimeError(status_text or f"{capability} failed")
+
+    for artifact in result.get("artifacts", []):
+        text = artifact_text(artifact)
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if capability == "jira.ticket.fetch":
+            if artifact.get("name") == "jira-raw-payload":
+                return {"issue": data}
+            if isinstance(data, dict) and "issue" in data:
+                return data
+            continue
+        if isinstance(data, dict):
+            return data
+    return {"issue": {}} if capability == "jira.ticket.fetch" else {}
 
 
-def _get_jira_account_id(workspace: str, task_id: str) -> str:
+def _get_jira_account_id(
+    workspace: str,
+    task_id: str,
+    permissions: dict | None = None,
+    compass_task_id: str = "",
+) -> str:
     response = _jira_request_json(
         "jira.user.myself",
         "GET",
         "/jira/myself",
+        permissions=permissions,
         workspace=workspace,
         task_id=task_id,
+        compass_task_id=compass_task_id,
     )
     user = response.get("user") or {}
     account_id = user.get("accountId") or ""
@@ -486,6 +571,8 @@ def _call_sync_agent(
     task_id: str,
     workspace_path: str,
     compass_task_id: str,
+    permissions: dict | None = None,
+    extra_metadata: dict | None = None,
 ) -> dict:
     """Call a synchronous agent and wait for its result."""
     agent_url = _resolve_agent_service_url(capability)
@@ -499,17 +586,28 @@ def _call_sync_agent(
             "sharedWorkspacePath": workspace_path,
         },
     }
+    if isinstance(permissions, dict) and permissions:
+        message["metadata"]["permissions"] = permissions
+    if isinstance(extra_metadata, dict) and extra_metadata:
+        message["metadata"].update(extra_metadata)
     downstream = _a2a_send(agent_url, message)
     task_id_ds = downstream.get("id", "")
     state = downstream.get("status", {}).get("state", "")
 
     terminal = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED"}
     if state in terminal:
+        details = extract_permission_denial(downstream)
+        if state in {"TASK_STATE_FAILED", "FAILED"} and details is not None:
+            raise PermissionEscalationRequired(details)
         return downstream
 
     if task_id_ds:
         result = _poll_task(agent_url, task_id_ds, timeout=SYNC_AGENT_TIMEOUT)
         if result:
+            details = extract_permission_denial(result)
+            result_state = result.get("status", {}).get("state", "")
+            if result_state in {"TASK_STATE_FAILED", "FAILED"} and details is not None:
+                raise PermissionEscalationRequired(details)
             return result
 
     return downstream
@@ -1050,7 +1148,13 @@ def _generate_summary(
 # SCM / Jira helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_task_id: str) -> str:
+def _fetch_jira_context(
+    task_id: str,
+    ticket_key: str,
+    workspace: str,
+    compass_task_id: str,
+    permissions: dict | None = None,
+) -> str:
     """Fetch Jira ticket content via Jira Agent."""
     workflow_task_id = compass_task_id or task_id
     try:
@@ -1058,8 +1162,10 @@ def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_t
             "jira.ticket.fetch",
             "GET",
             f"/jira/tickets/{ticket_key}",
+            permissions=permissions,
             workspace=workspace,
             task_id=task_id,
+            compass_task_id=compass_task_id,
         )
         issue = result.get("issue") or {}
         content = json.dumps(issue, ensure_ascii=False, indent=2) if issue else ""
@@ -1087,7 +1193,14 @@ def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_t
         return ""
 
 
-def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspace: str, compass_task_id: str):
+def _jira_transition(
+    ticket_key: str,
+    target_status: str,
+    task_id: str,
+    workspace: str,
+    compass_task_id: str,
+    permissions: dict | None = None,
+):
     """Transition a Jira ticket to a new status (best-effort, non-blocking)."""
     workflow_task_id = compass_task_id or task_id
     try:
@@ -1096,8 +1209,10 @@ def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspac
             "POST",
             f"/jira/transitions/{ticket_key}",
             payload={"transition": target_status},
+            permissions=permissions,
             workspace=workspace,
             task_id=task_id,
+            compass_task_id=compass_task_id,
         )
         print(f"[{AGENT_ID}] Jira {ticket_key} transitioned to '{target_status}'")
         _record_jira_action(
@@ -1124,18 +1239,31 @@ def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspac
         )
 
 
-def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_task_id: str):
+def _jira_assign_self(
+    ticket_key: str,
+    task_id: str,
+    workspace: str,
+    compass_task_id: str,
+    permissions: dict | None = None,
+):
     """Assign the Jira ticket to the bot (service account) that owns the credentials (best-effort)."""
     workflow_task_id = compass_task_id or task_id
     try:
-        account_id = _get_jira_account_id(workspace, task_id)
+        account_id = _get_jira_account_id(
+            workspace,
+            task_id,
+            permissions=permissions,
+            compass_task_id=compass_task_id,
+        )
         result = _jira_request_json(
             "jira.ticket.assignee",
             "PUT",
             f"/jira/assignee/{ticket_key}",
             payload={"accountId": account_id},
+            permissions=permissions,
             workspace=workspace,
             task_id=task_id,
+            compass_task_id=compass_task_id,
         )
         print(f"[{AGENT_ID}] Jira {ticket_key} assigned to service account")
         _record_jira_action(
@@ -1167,6 +1295,7 @@ def _jira_add_comment(
     task_id: str,
     workspace: str,
     compass_task_id: str,
+    permissions: dict | None = None,
     *,
     adf_body: dict | None = None,
     comment_preview: str = "",
@@ -1180,8 +1309,10 @@ def _jira_add_comment(
             "POST",
             f"/jira/comments/{ticket_key}",
             payload=payload,
+            permissions=permissions,
             workspace=workspace,
             task_id=task_id,
+            compass_task_id=compass_task_id,
         )
         preview = comment_preview or comment or _adf_plain_text(adf_body)
         print(f"[{AGENT_ID}] Jira {ticket_key} comment added")
@@ -1211,7 +1342,13 @@ def _jira_add_comment(
         )
 
 
-def _clone_repo(task_id: str, repo_url: str, workspace: str, compass_task_id: str) -> str:
+def _clone_repo(
+    task_id: str,
+    repo_url: str,
+    workspace: str,
+    compass_task_id: str,
+    permissions: dict | None = None,
+) -> str:
     """Clone repository via SCM Agent and return the clone path."""
     result = _call_sync_agent(
         "scm.git.clone",
@@ -1219,6 +1356,7 @@ def _clone_repo(task_id: str, repo_url: str, workspace: str, compass_task_id: st
         task_id,
         workspace,
         compass_task_id,
+        permissions=permissions,
     )
     # Primary: extract clone path from artifacts (JSON)
     for art in result.get("artifacts", []):
@@ -1246,7 +1384,15 @@ def _clone_repo(task_id: str, repo_url: str, workspace: str, compass_task_id: st
     raise RuntimeError(f"SCM clone did not reach terminal success state for {repo_url} (state={state or 'unknown'})")
 
 
-def _create_branch(task_id: str, repo_url: str, branch_name: str, base_branch: str, workspace: str, compass_task_id: str) -> bool:
+def _create_branch(
+    task_id: str,
+    repo_url: str,
+    branch_name: str,
+    base_branch: str,
+    workspace: str,
+    compass_task_id: str,
+    permissions: dict | None = None,
+) -> bool:
     """Create a feature branch via SCM Agent."""
     try:
         result = _call_sync_agent(
@@ -1255,6 +1401,7 @@ def _create_branch(task_id: str, repo_url: str, branch_name: str, base_branch: s
             task_id,
             workspace,
             compass_task_id,
+            permissions=permissions,
         )
         state = result.get("status", {}).get("state", "")
         return state in ("TASK_STATE_COMPLETED", "COMPLETED")
@@ -1271,6 +1418,7 @@ def _push_files(
     commit_message: str,
     workspace: str,
     compass_task_id: str,
+    permissions: dict | None = None,
     base_branch: str = "main",
 ) -> bool:
     """Push generated files to feature branch via SCM Agent.
@@ -1304,6 +1452,8 @@ def _push_files(
                 },
             },
         }
+        if isinstance(permissions, dict) and permissions:
+            message["metadata"]["permissions"] = permissions
         downstream = _a2a_send(scm_service_url, message)
         task_id_ds = downstream.get("id", "")
         state = downstream.get("status", {}).get("state", "")
@@ -1329,7 +1479,7 @@ def _sanitize_base_branch(branch: str) -> str:
     like a Jira ticket key or other non-branch string."""
     if not branch:
         return "main"
-    # Reject patterns like PROJ-123, CSTL-1/landing-page, jira-key/foo
+    # Reject patterns like PROJ-123, PROJ-1/landing-page, jira-key/foo
     if re.match(r"^[A-Z][A-Z0-9]+-\d+", branch):
         return "main"
     # Also reject if it contains characters not valid in branch names
@@ -1347,6 +1497,7 @@ def _create_pr(
     pr_body: str,
     workspace: str,
     compass_task_id: str,
+    permissions: dict | None = None,
 ) -> str:
     """Create a pull request via SCM Agent. Returns PR URL.
     Passes structured prPayload in metadata to avoid unreliable text parsing.
@@ -1386,6 +1537,8 @@ def _create_pr(
                 },
             },
         }
+        if isinstance(permissions, dict) and permissions:
+            message["metadata"]["permissions"] = permissions
         downstream = _a2a_send(scm_service_url, message)
         task_id_ds = downstream.get("id", "")
         state = downstream.get("status", {}).get("state", "")
@@ -1730,11 +1883,21 @@ def _classify_branch_kind(
     return "feature"
 
 
+def _resolve_ticket_key(task_instruction: str, metadata: dict | None = None) -> str:
+    ticket_key_from_meta = str((metadata or {}).get("jiraTicketKey") or "").strip()
+    if ticket_key_from_meta:
+        return ticket_key_from_meta
+
+    ticket_match = re.search(r"\b([A-Z][A-Z0-9]+-\d{2,})\b", task_instruction or "")
+    return ticket_match.group(1) if ticket_match else ""
+
+
 def _list_remote_branches(
     task_id: str,
     repo_url: str,
     workspace: str,
     compass_task_id: str,
+    permissions: dict | None = None,
 ) -> set[str]:
     try:
         result = _call_sync_agent(
@@ -1743,6 +1906,7 @@ def _list_remote_branches(
             task_id,
             workspace,
             compass_task_id,
+            permissions=permissions,
         )
     except Exception:
         return set()
@@ -1774,10 +1938,17 @@ def _select_branch_name(
     clone_path: str,
     workspace: str,
     compass_task_id: str,
+    permissions: dict | None = None,
 ) -> tuple[str, str]:
     branch_kind = _classify_branch_kind(task_instruction, analysis, planned_paths, ticket_key)
     workflow_task_id = _sanitize_branch_component(compass_task_id or task_id)
-    remote_branches = _list_remote_branches(task_id, repo_url, workspace, compass_task_id)
+    remote_branches = _list_remote_branches(
+        task_id,
+        repo_url,
+        workspace,
+        compass_task_id,
+        permissions=permissions,
+    )
 
     if branch_kind == "chore":
         branch_base = f"chore/{workflow_task_id}"
@@ -2286,7 +2457,7 @@ def _detect_ui_launch_plan(build_dir: str, analysis: dict, port: int) -> dict | 
         urls: list[str] = []
         seen: set[str] = set()
         for item_port in ports:
-            for suffix in ("/", "/cstl-4"):
+            for suffix in ("/", "/proj-4"):
                 url = f"http://127.0.0.1:{item_port}{suffix}"
                 if url not in seen:
                     seen.add(url)
@@ -2600,6 +2771,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
     callback_url = metadata.get("orchestratorCallbackUrl", "")
     compass_url = metadata.get("compassUrl") or COMPASS_URL
     workspace = metadata.get("sharedWorkspacePath", "")
+    permissions = metadata.get("permissions") if isinstance(metadata.get("permissions"), dict) else None
     acceptance_criteria: list = metadata.get("acceptanceCriteria") or []
     is_revision: bool = metadata.get("isRevision", False)
     review_issues: list = metadata.get("reviewIssues") or []
@@ -2729,16 +2901,16 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         # Extract Jira ticket key: prefer explicit metadata field from Team Lead,
         # then fall back to regex.  Require at least 2 digits to avoid matching
         # technical terms like "UTF-8", "ISO-8", "HTTP-2", etc.
-        ticket_key_from_meta = str(metadata.get("jiraTicketKey") or "").strip()
-        ticket_match = None
-        if ticket_key_from_meta:
-            ticket_key = ticket_key_from_meta
-        else:
-            ticket_match = re.search(r"\b([A-Z][A-Z0-9]+-\d{2,})\b", task_instruction)
-            ticket_key = ticket_match.group(1) if ticket_match else ""
+        ticket_key = _resolve_ticket_key(task_instruction, metadata)
         if ticket_key and workspace:
             log(f"Fetching Jira context for {ticket_key}")
-            jira_content = _fetch_jira_context(task_id, ticket_key, workspace, compass_task_id)
+            jira_content = _fetch_jira_context(
+                task_id,
+                ticket_key,
+                workspace,
+                compass_task_id,
+                permissions=permissions,
+            )
             if jira_content:
                 log(f"Jira ticket {ticket_key} fetched ({len(jira_content)} chars)")
                 # Enrich task instruction with Jira context
@@ -2750,8 +2922,21 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             # ── Dev Workflow Step 1: Mark ticket In Progress ─────────────────
             if not is_revision:
                 log(f"Updating Jira ticket {ticket_key}: In Progress → assign self → comment")
-                _jira_transition(ticket_key, "In Progress", task_id, workspace, compass_task_id)
-                _jira_assign_self(ticket_key, task_id, workspace, compass_task_id)
+                _jira_transition(
+                    ticket_key,
+                    "In Progress",
+                    task_id,
+                    workspace,
+                    compass_task_id,
+                    permissions=permissions,
+                )
+                _jira_assign_self(
+                    ticket_key,
+                    task_id,
+                    workspace,
+                    compass_task_id,
+                    permissions=permissions,
+                )
                 _jira_add_comment(
                     ticket_key,
                     f"🤖 **Web Agent** (`{AGENT_ID}`) has picked up this ticket and started development.\n"
@@ -2759,6 +2944,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     task_id,
                     workspace,
                     compass_task_id,
+                    permissions=permissions,
                 )
             else:
                 rev_cycle = metadata.get("revisionCycle", 1)
@@ -2770,6 +2956,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     task_id,
                     workspace,
                     compass_task_id,
+                    permissions=permissions,
                 )
 
         repo_url = metadata_repo_url or analysis.get("repo_url") or ""
@@ -2781,8 +2968,11 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             if url_match:
                 repo_url = url_match.group().rstrip("/.,;)")
 
+        _require_shared_workspace_for_repo_task(repo_url, workspace)
+
         if repo_url and workspace:
             if clone_path:
+                _ensure_clone_path_in_workspace(workspace, clone_path)
                 # Revision: reuse existing clone, just refresh snapshot and re-analyse
                 log(f"Revision: refreshing snapshot from existing clone {clone_path}")
                 repo_snapshot = _read_repo_snapshot(clone_path)
@@ -2793,7 +2983,14 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             else:
                 log(f"Cloning repository: {repo_url}")
                 try:
-                    clone_path = _clone_repo(task_id, repo_url, workspace, compass_task_id)
+                    clone_path = _clone_repo(
+                        task_id,
+                        repo_url,
+                        workspace,
+                        compass_task_id,
+                        permissions=permissions,
+                    )
+                    _ensure_clone_path_in_workspace(workspace, clone_path)
                 except Exception as err:
                     _save_workspace_file(
                         workspace,
@@ -2941,7 +3138,6 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             raise RuntimeError("LLM returned an empty file plan — cannot proceed.")
 
         planned_paths = [file_info.get("path", "") for file_info in files_to_implement]
-        ticket_key = ticket_match.group(1) if ticket_match else ""
         if repo_url and clone_path:
             if not branch_name:
                 branch_name, branch_kind = _select_branch_name(
@@ -2954,6 +3150,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     clone_path,
                     workspace,
                     compass_task_id,
+                    permissions=permissions,
                 )
             else:
                 log(f"Revision: reusing branch {branch_name}")
@@ -3395,7 +3592,14 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     for gf in generated_files
                 ]
                 pushed = _push_files(
-                    task_id, repo_url, branch_name, push_files, commit_msg, workspace, compass_task_id,
+                    task_id,
+                    repo_url,
+                    branch_name,
+                    push_files,
+                    commit_msg,
+                    workspace,
+                    compass_task_id,
+                    permissions=permissions,
                     base_branch=base_branch,
                 )
                 if pushed:
@@ -3431,8 +3635,15 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                         log(f"Revision: pushing to existing PR {pr_url}")
                     else:
                         pr_url = _create_pr(
-                            task_id, repo_url, branch_name, base_branch,
-                            pr_title, pr_body, workspace, compass_task_id
+                            task_id,
+                            repo_url,
+                            branch_name,
+                            base_branch,
+                            pr_title,
+                            pr_body,
+                            workspace,
+                            compass_task_id,
+                            permissions=permissions,
                         )
                     _save_pr_evidence(
                         workspace,
@@ -3475,12 +3686,15 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     if pr_url:
                         log(f"{'PR updated' if is_revision else 'PR created'}: {pr_url}")
                         # ── Dev Workflow Step 2: Update Jira after PR ────────
-                        if ticket_match:
-                            ticket_key = ticket_match.group(1)
+                        if ticket_key:
                             if not is_revision:
                                 _jira_transition(
-                                    ticket_key, "In Review",
-                                    task_id, workspace, compass_task_id,
+                                    ticket_key,
+                                    "In Review",
+                                    task_id,
+                                    workspace,
+                                    compass_task_id,
+                                    permissions=permissions,
                                 )
                             test_status = "✅ Build/tests passed" if build_ok else "⚠️ Build/tests had issues"
                             _jira_add_comment(
@@ -3489,6 +3703,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                                 task_id,
                                 workspace,
                                 compass_task_id,
+                                permissions=permissions,
                                 adf_body=_build_pr_jira_comment_adf(
                                     pr_url,
                                     branch_name,
@@ -3592,8 +3807,14 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
 
     except Exception as err:
         error_text = str(err)
+        failure_artifacts = []
+        if isinstance(err, PermissionEscalationRequired):
+            failure_artifacts = [build_permission_denied_artifact(err.details, agent_id=AGENT_ID)]
         print(f"[{AGENT_ID}][{task_id}] FAILED: {error_text}")
         task_store.update_state(task_id, "TASK_STATE_FAILED", f"Web Agent failed: {error_text[:500]}")
+        task = task_store.get(task_id)
+        if task:
+            task.artifacts = failure_artifacts
         _save_workspace_file(
             workspace,
             f"{AGENT_ID}/review-notes.json",
@@ -3612,7 +3833,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         audit_log("TASK_FAILED", task_id=task_id, error=error_text[:300])
         _notify_callback(
             callback_url, task_id, "TASK_STATE_FAILED",
-            f"Web Agent failed: {error_text[:500]}", []
+            f"Web Agent failed: {error_text[:500]}", failure_artifacts
         )
     finally:
         _apply_task_exit_rule(task_id, exit_rule)

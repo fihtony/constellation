@@ -13,13 +13,13 @@ class JiraMCPProviderUnitTests(unittest.TestCase):
         provider._rest.add_comment.return_value = ("123", "added")
 
         result = provider.add_comment(
-            "CSTL-1",
+            "PROJ-1",
             "plain text",
             adf_body={"type": "doc", "version": 1, "content": []},
         )
 
         provider._rest.add_comment.assert_called_once_with(
-            "CSTL-1",
+            "PROJ-1",
             "plain text",
             {"type": "doc", "version": 1, "content": []},
         )
@@ -31,14 +31,14 @@ class JiraMCPProviderUnitTests(unittest.TestCase):
         provider._rest.update_comment.return_value = ("456", "updated")
 
         result = provider.update_comment(
-            "CSTL-1",
+            "PROJ-1",
             "456",
             "plain text",
             adf_body={"type": "doc", "version": 1, "content": []},
         )
 
         provider._rest.update_comment.assert_called_once_with(
-            "CSTL-1",
+            "PROJ-1",
             "456",
             "plain text",
             {"type": "doc", "version": 1, "content": []},

@@ -29,6 +29,8 @@ user-invocable: false
 - Preserve auth, permission, and tenant boundaries already enforced by the system.
 - Capture operational evidence for important side effects so Team Lead and Compass can review outcomes.
 - Avoid silent fallbacks that hide degraded behavior; surface warnings in summaries or artifacts.
+- Fail closed on permission input. Missing or malformed permission snapshots must reject boundary reads and writes in `strict` mode; do not preserve compatibility shortcuts in pre-release code.
+- For SCM branch authorization, derive protected branches from regex-configured policy, not hardcoded names spread across handlers.
 
 ## Review Standards
 
