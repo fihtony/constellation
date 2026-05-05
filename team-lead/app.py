@@ -2133,6 +2133,41 @@ def _filter_unresolved_missing_info(
             item for item in unresolved_missing
             if not any(kw in item.lower() for kw in defaultable_ui_ticket_kws)
         ]
+    if (
+        str(analysis.get("platform") or "").strip().lower() == "android"
+        and _jira_fetch_succeeded(ctx)
+        and repo_url_known
+    ):
+        defaultable_android_kws = {
+            "app module",
+            "module / package",
+            "package path",
+            "package name",
+            "navigation graph",
+            "menu id",
+            "menu ids",
+            "bottom-nav",
+            "bottom nav",
+            "test runner",
+            "ci job",
+            "ci jobs",
+            "instrumentation tests should run",
+            "sdk install/license acceptance",
+            "sdk license",
+            "mock data schema",
+            "sample payload",
+            "sample payloads",
+        }
+        if ctx.design_info and ctx.design_info.get("content"):
+            defaultable_android_kws.update({
+                "mock data",
+                "sample items",
+                "visible fields",
+            })
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in defaultable_android_kws)
+        ]
     # Organisational conventions and preferences (README templates, PR reviewer
     # assignments, code-owner preferences) are always resolvable by the dev
     # agent using project defaults or industry best practice.  Filter them out
