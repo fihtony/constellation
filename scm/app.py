@@ -28,6 +28,13 @@ from common.instance_reporter import InstanceReporter
 from common.message_utils import build_text_artifact, extract_text
 from common.rules_loader import build_system_prompt, load_rules
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.task_permissions import (
+    PermissionDeniedError,
+    audit_permission_check,
+    build_permission_denied_artifact,
+    build_permission_denied_details,
+    parse_permission_grant,
+)
 from scm import prompts
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -254,6 +261,14 @@ def _extract_owner_repo(text: str) -> tuple[str, str]:
     m2 = re.search(r"/projects/([^/\s]+)/repos/([^/\s?#]+)", text or "")
     if m2:
         return m2.group(1), m2.group(2)
+    # Bitbucket personal repo browse URL
+    m3 = re.search(r"/users/([^/\s]+)/repos/([^/\s?#]+)", text or "")
+    if m3:
+        return f"~{m3.group(1)}", m3.group(2)
+    # Bitbucket clone URL
+    m4 = re.search(r"/scm/([^/\s]+)/([^/\s?#]+?)(?:\.git)?(?=[\s/?#]|$)", text or "")
+    if m4:
+        return m4.group(1), m4.group(2)
     return "", ""
 
 
@@ -298,6 +313,140 @@ def _runtime_config_summary() -> dict:
         "provider": _provider.provider_name,
         "backend": _SCM_BACKEND,
     }
+
+
+def _permission_enforcement_mode() -> str:
+    return os.environ.get("PERMISSION_ENFORCEMENT", "strict").strip().lower() or "strict"
+
+
+def _request_permissions(payload_permissions: dict | None = None, headers=None) -> tuple[dict | None, str]:
+    if payload_permissions is not None:
+        return payload_permissions, ""
+    raw = ((headers or {}).get("X-Task-Permissions") or "").strip() if headers else ""
+    if not raw:
+        return None, "No permissions attached to request. Explicit permission grant required."
+    try:
+        return json.loads(raw), ""
+    except json.JSONDecodeError:
+        return None, "Invalid X-Task-Permissions header. Explicit permission grant required."
+
+
+def _check_scm_permission(
+    *,
+    action: str,
+    target: str,
+    scope: str = "*",
+    message: dict | None = None,
+    payload_permissions: dict | None = None,
+    headers=None,
+) -> tuple[bool, str, str]:
+    if _permission_enforcement_mode() == "off":
+        return True, "allowed", ""
+
+    metadata = (message or {}).get("metadata") or {}
+    request_agent = (
+        (metadata.get("requestAgent") or "").strip()
+        or ((headers or {}).get("X-Request-Agent") or "").strip()
+    )
+    task_id = (
+        (metadata.get("orchestratorTaskId") or "").strip()
+        or ((headers or {}).get("X-Orchestrator-Task-Id") or "").strip()
+    )
+    permissions_data, missing_reason = _request_permissions(
+        payload_permissions if payload_permissions is not None else metadata.get("permissions"),
+        headers=headers,
+    )
+    grant = parse_permission_grant(permissions_data)
+    if grant:
+        allowed, reason = grant.check("scm", action, scope)
+        escalation = grant.escalation_for("scm", action, scope)
+    else:
+        allowed = False
+        reason = missing_reason or "No permissions attached to request. Explicit permission grant required."
+        escalation = "require_user_approval"
+
+    audit_permission_check(
+        task_id=task_id,
+        orchestrator_task_id=task_id,
+        request_agent=request_agent,
+        target_agent=AGENT_ID,
+        action=action,
+        target=target,
+        decision="allowed" if allowed else "denied",
+        reason=reason,
+        agent_id=AGENT_ID,
+    )
+    return allowed, reason, escalation
+
+
+def _require_scm_permission(
+    *,
+    action: str,
+    target: str,
+    scope: str = "*",
+    message: dict | None = None,
+    payload_permissions: dict | None = None,
+    headers=None,
+) -> None:
+    allowed, reason, escalation = _check_scm_permission(
+        action=action,
+        target=target,
+        scope=scope,
+        message=message,
+        payload_permissions=payload_permissions,
+        headers=headers,
+    )
+    if allowed:
+        return
+    if _permission_enforcement_mode() == "strict":
+        metadata = (message or {}).get("metadata") or {}
+        raise PermissionDeniedError(
+            build_permission_denied_details(
+                permission_agent="scm",
+                target_agent=AGENT_ID,
+                action=action,
+                target=target,
+                reason=reason,
+                escalation=escalation or "require_user_approval",
+                scope=scope,
+                request_agent=str(metadata.get("requestAgent") or "").strip(),
+                task_id=str(metadata.get("taskId") or ""),
+                orchestrator_task_id=str(metadata.get("orchestratorTaskId") or ""),
+            )
+        )
+    print(f"[{AGENT_ID}] WARN: permission check failed but enforcement={_permission_enforcement_mode()}: {reason}")
+
+
+def _enforce_http_scm_permission(
+    handler: BaseHTTPRequestHandler,
+    *,
+    action: str,
+    target: str,
+    scope: str = "*",
+    payload_permissions: dict | None = None,
+) -> bool:
+    allowed, reason, escalation = _check_scm_permission(
+        action=action,
+        target=target,
+        scope=scope,
+        payload_permissions=payload_permissions,
+        headers=handler.headers,
+    )
+    if allowed:
+        return True
+    if _permission_enforcement_mode() == "strict":
+        handler._send_json(
+            403,
+            {
+                "error": "permission_denied",
+                "action": action,
+                "reason": reason,
+                "escalation": escalation or "require_user_approval",
+            },
+        )
+        return False
+    print(f"[{AGENT_ID}] WARN: permission check failed but enforcement={_permission_enforcement_mode()}: {reason}")
+    return True
 
 
 def _clone_to_workspace(
@@ -474,22 +623,53 @@ def process_message(message: dict) -> tuple[str, list]:
 
     # Route by requested capability
     if capability == "scm.repo.search":
+        _require_scm_permission(action="repo.search", target=text or "repo-search", message=message)
         return _handle_repo_search(text)
     if capability in ("scm.repo.inspect", "scm.repo.resolve"):
+        owner, repo = _parse_owner_repo(text)
+        _require_scm_permission(
+            action="repo.inspect",
+            target=f"{owner}/{repo}" if owner and repo else text or capability,
+            message=message,
+        )
         return _handle_repo_inspect(text)
     if capability == "scm.branch.create":
         return _handle_branch_create(text, message)
     if capability == "scm.branch.list":
+        owner, repo = _parse_owner_repo(text)
+        _require_scm_permission(
+            action="branch.list",
+            target=f"{owner}/{repo}" if owner and repo else text or capability,
+            message=message,
+        )
         return _handle_branch_list(text)
     if capability == "scm.pr.create":
         return _handle_pr_create(text, message)
     if capability in ("scm.pr.get", "scm.pr.inspect"):
+        owner, repo = _parse_owner_repo(text)
+        _require_scm_permission(
+            action="pr.get",
+            target=f"{owner}/{repo}" if owner and repo else text or capability,
+            message=message,
+        )
         return _handle_pr_get(text)
     if capability == "scm.pr.list":
+        owner, repo = _parse_owner_repo(text)
+        _require_scm_permission(
+            action="pr.list",
+            target=f"{owner}/{repo}" if owner and repo else text or capability,
+            message=message,
+        )
         return _handle_pr_list(text)
     if capability == "scm.pr.comment":
         return _handle_pr_comment(text, message)
     if capability == "scm.pr.comment.list":
+        owner, repo = _parse_owner_repo(text)
+        _require_scm_permission(
+            action="pr.comment.list",
+            target=f"{owner}/{repo}" if owner and repo else text or capability,
+            message=message,
+        )
         return _handle_pr_comment_list(text)
     if capability == "scm.git.push":
         return _handle_git_push(text, message)
@@ -568,6 +748,12 @@ def _handle_branch_create(text: str, message: dict) -> tuple[str, list]:
     from_ref = from_m.group(1) if from_m else "main"
     if not owner or not repo or not branch:
         return "Could not parse owner/repo/branch from request.", []
+    _require_scm_permission(
+        action="branch.create",
+        target=f"{owner}/{repo}:{branch}",
+        scope=branch,
+        message=message,
+    )
     result, status = _provider.create_branch(owner, repo, branch, from_ref)
     if status not in ("created",):
         return f"Branch creation failed: {status} — {result}", []
@@ -634,11 +820,16 @@ def _handle_pr_create(text: str, message: dict) -> tuple[str, list]:
         to_branch = to_m.group(1) if to_m else "main"
         title = title_m.group(1).strip() if title_m else f"PR from {from_branch}"
         description = ""
-        # Reject to_branch values that look like Jira keys (e.g. CSTL-1/feature)
+        # Reject to_branch values that look like Jira keys (e.g. PROJ-1/feature)
         if re.match(r"^[A-Z][A-Z0-9]+-\d+", to_branch or ""):
             to_branch = "main"
     if not owner or not repo or not from_branch:
         return "Could not parse owner/repo/from_branch from request.", []
+    _require_scm_permission(
+        action="pr.create",
+        target=f"{owner}/{repo}:{from_branch}->{to_branch}",
+        message=message,
+    )
     pr, status = _provider.create_pr(owner, repo, from_branch, to_branch, title, description)
     if status not in ("created", "already_exists"):
         return f"PR creation failed: {status} — {pr}", []
@@ -660,6 +851,12 @@ def _handle_pr_comment(text: str, message: dict) -> tuple[str, list]:
     comment_text = comment_m.group(1).strip() if comment_m else text
     if not owner or not repo or not pr_id:
         return "Could not parse owner/repo/PR number from request.", []
+    _require_scm_permission(
+        action="pr.comment",
+        target=f"{owner}/{repo}#{pr_id}",
+        scope="self",
+        message=message,
+    )
     result, status = _provider.add_pr_comment(owner, repo, pr_id, comment_text)
     if status not in ("created",):
         return f"PR comment failed: {status} — {result}", []
@@ -705,6 +902,12 @@ def _handle_git_push(text: str, message: dict) -> tuple[str, list]:
     files_to_delete = payload.get("filesToDelete", [])
     if not owner or not repo or not branch or not files:
         return "Missing owner/repo/branch/files for git push.", []
+    _require_scm_permission(
+        action="branch.push",
+        target=f"{owner}/{repo}:{branch}",
+        scope=branch,
+        message=message,
+    )
     result, status = _provider.push_files(owner, repo, branch, base_branch, files, commit_msg, files_to_delete)
     if status not in ("pushed",):
         return f"Git push failed: {status} — {result}", []
@@ -780,7 +983,10 @@ def _run_task_async(task_id: str, message: dict):
     except Exception as error:
         print(f"[{AGENT_ID}] Task {task_id} failed: {error}")
         failure_text = f"SCM agent failed: {error}"
-        _update_task(task_id, state="TASK_STATE_FAILED", message=failure_text, artifacts=[])
+        artifacts = []
+        if isinstance(error, PermissionDeniedError):
+            artifacts = [build_permission_denied_artifact(error.details, agent_id=AGENT_ID)]
+        _update_task(task_id, state="TASK_STATE_FAILED", message=failure_text, artifacts=artifacts)
         if workspace_path:
             record_workspace_stage(
                 workspace_path,
@@ -789,7 +995,7 @@ def _run_task_async(task_id: str, message: dict):
                 task_id=task_id,
                 extra={"error": str(error), "runtimeConfig": _runtime_config_summary()},
             )
-        _notify_completion(message, task_id, "TASK_STATE_FAILED", failure_text, [])
+        _notify_completion(message, task_id, "TASK_STATE_FAILED", failure_text, artifacts)
 
 
 def _dispatch_clone(task_id: str, message: dict):
@@ -816,6 +1022,12 @@ def _dispatch_clone(task_id: str, message: dict):
                 },
             )
         return
+    _require_scm_permission(
+        action="repo.clone",
+        target=f"{owner}/{repo}",
+        scope=branch_name,
+        message=message,
+    )
     # Run the actual clone in a background thread
     t = threading.Thread(
         target=_clone_async_worker,
@@ -881,6 +1093,8 @@ class Handler(BaseHTTPRequestHandler):
             if not owner or not repo:
                 self._send_json(400, {"error": "missing owner/repo"})
                 return
+            if not _enforce_http_scm_permission(self, action="repo.inspect", target=f"{owner}/{repo}"):
+                return
             info, status = _provider.get_repo(owner, repo)
             branches, _ = _provider.list_branches(owner, repo)
             result = {**info, "branches": branches[:20]}
@@ -895,6 +1109,8 @@ class Handler(BaseHTTPRequestHandler):
             if not effective_owner or not repo:
                 self._send_json(400, {"error": "missing owner/repo"})
                 return
+            if not _enforce_http_scm_permission(self, action="branch.list", target=f"{effective_owner}/{repo}"):
+                return
             branches, status = _provider.list_branches(effective_owner, repo)
             self._send_json(200 if status == "ok" else 500, {"branches": branches, "status": status})
             return
@@ -903,6 +1119,8 @@ class Handler(BaseHTTPRequestHandler):
             owner = qs.get("owner", qs.get("project", [""]))[0]
             repo = qs.get("repo", [""])[0]
             state = qs.get("state", ["open"])[0]
+            if not _enforce_http_scm_permission(self, action="pr.list", target=f"{owner}/{repo}"):
+                return
             prs, status = _provider.list_prs(owner, repo, state)
             self._send_json(200 if status == "ok" else 500, {"pullRequests": prs, "status": status})
             return
@@ -911,6 +1129,8 @@ class Handler(BaseHTTPRequestHandler):
             pr_id = int(path.split("/")[3])
             owner = qs.get("owner", qs.get("project", [""]))[0]
             repo = qs.get("repo", [""])[0]
+            if not _enforce_http_scm_permission(self, action="pr.comment.list", target=f"{owner}/{repo}#{pr_id}"):
+                return
             comments, status = _provider.list_pr_comments(owner, repo, pr_id)
             self._send_json(200 if status == "ok" else 500, {"comments": comments, "status": status})
             return
@@ -919,6 +1139,8 @@ class Handler(BaseHTTPRequestHandler):
             pr_id = int(path.rsplit("/", 1)[-1])
             owner = qs.get("owner", qs.get("project", [""]))[0]
             repo = qs.get("repo", [""])[0]
+            if not _enforce_http_scm_permission(self, action="pr.get", target=f"{owner}/{repo}#{pr_id}"):
+                return
             pr, status = _provider.get_pr(owner, repo, pr_id)
             self._send_json(200 if status == "ok" else 404, {"pr": pr, "status": status})
             return
@@ -929,6 +1151,8 @@ class Handler(BaseHTTPRequestHandler):
             if not clone_path or not os.path.isdir(clone_path):
                 self._send_json(400, {"error": "invalid clone path"})
                 return
+            if not _enforce_http_scm_permission(self, action="repo.tree", target=clone_path):
+                return
             tree = _repo_tree(clone_path, max_depth=depth)
             self._send_json(200, {"tree": tree})
             return
@@ -938,6 +1162,8 @@ class Handler(BaseHTTPRequestHandler):
             file_path = qs.get("file", [""])[0]
             if not clone_path or not file_path:
                 self._send_json(400, {"error": "missing path or file"})
+                return
+            if not _enforce_http_scm_permission(self, action="repo.file", target=f"{clone_path}:{file_path}"):
                 return
             content, status = _repo_file(clone_path, file_path)
             if status != "ok":
@@ -971,6 +1197,14 @@ class Handler(BaseHTTPRequestHandler):
             if not owner or not repo or not branch:
                 self._send_json(400, {"error": "missing owner/repo/branch"})
                 return
+            if not _enforce_http_scm_permission(
+                self,
+                action="branch.create",
+                target=f"{owner}/{repo}:{branch}",
+                scope=branch,
+                payload_permissions=body.get("permissions"),
+            ):
+                return
             result, status = _provider.create_branch(owner, repo, branch, from_ref)
             self._send_json(201 if status == "created" else 400, {"result": result, "status": status})
             return
@@ -985,6 +1219,13 @@ class Handler(BaseHTTPRequestHandler):
             description = body.get("description", "")
             if not owner or not repo or not from_branch or not title:
                 self._send_json(400, {"error": "missing owner/repo/from_branch/title"})
+                return
+            if not _enforce_http_scm_permission(
+                self,
+                action="pr.create",
+                target=f"{owner}/{repo}:{from_branch}->{to_branch}",
+                payload_permissions=body.get("permissions"),
+            ):
                 return
             pr, status = _provider.create_pr(owner, repo, from_branch, to_branch, title, description)
             self._send_json(201 if status == "created" else 400, {"pr": pr, "status": status})
@@ -1001,6 +1242,14 @@ class Handler(BaseHTTPRequestHandler):
             if not owner or not repo or not pr_id or not text:
                 self._send_json(400, {"error": "missing owner/repo/prId/text"})
                 return
+            if not _enforce_http_scm_permission(
+                self,
+                action="pr.comment",
+                target=f"{owner}/{repo}#{pr_id}",
+                scope="self",
+                payload_permissions=body.get("permissions"),
+            ):
+                return
             result, status = _provider.add_pr_comment(owner, repo, pr_id, text, file_path, line)
             self._send_json(201 if status == "created" else 400, {"result": result, "status": status})
             return
@@ -1014,6 +1263,14 @@ class Handler(BaseHTTPRequestHandler):
             callback_url = body.get("callbackUrl", "")
             if not owner or not repo or not target_path:
                 self._send_json(400, {"error": "missing owner/repo/targetPath"})
+                return
+            if not _enforce_http_scm_permission(
+                self,
+                action="repo.clone",
+                target=f"{owner}/{repo}",
+                scope=branch,
+                payload_permissions=body.get("permissions"),
+            ):
                 return
             task_id = _create_task("TASK_STATE_WORKING", f"Cloning {owner}/{repo} …")
             t = threading.Thread(
@@ -1036,6 +1293,14 @@ class Handler(BaseHTTPRequestHandler):
             files_to_delete = body.get("filesToDelete", [])
             if not owner or not repo or not branch or not files:
                 self._send_json(400, {"error": "missing owner/repo/branch/files"})
+                return
+            if not _enforce_http_scm_permission(
+                self,
+                action="branch.push",
+                target=f"{owner}/{repo}:{branch}",
+                scope=branch,
+                payload_permissions=body.get("permissions"),
+            ):
                 return
             result, status = _provider.push_files(owner, repo, branch, base_branch, files, commit_msg, files_to_delete)
             self._send_json(200 if status == "pushed" else 500, {"result": result, "status": status})

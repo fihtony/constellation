@@ -2,10 +2,10 @@
 """Constellation multi-agent end-to-end validation.
 
 Usage:
-  python3 tests/test_e2e.py              # run all tests including CSTL-1 workflow
-  python3 tests/test_e2e.py -v           # verbose JSON output
-  python3 tests/test_e2e.py --smoke-only # prerequisites + registry only (fast)
-  python3 tests/test_e2e.py --cstl-only  # only run the full CSTL-1 workflow test
+    python3 tests/test_e2e.py                  # run all tests including the configured workflow
+    python3 tests/test_e2e.py -v               # verbose JSON output
+    python3 tests/test_e2e.py --smoke-only     # prerequisites + registry only (fast)
+    python3 tests/test_e2e.py --workflow-only  # only run the configured ticket workflow test
 """
 
 from __future__ import annotations
@@ -20,10 +20,16 @@ import time
 from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from common.task_permissions import load_permission_grant
+
 TESTS_ENV = PROJECT_ROOT / "tests" / ".env"
 COMMON_ENV = PROJECT_ROOT / "common" / ".env"
 
@@ -38,7 +44,7 @@ WORKFLOW_POLL_TIMEOUT = int(os.environ.get("WORKFLOW_POLL_TIMEOUT", "3600"))
 
 VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
 SMOKE_ONLY = "--smoke-only" in sys.argv
-CSTL_ONLY = "--cstl-only" in sys.argv
+WORKFLOW_ONLY = "--workflow-only" in sys.argv
 
 
 # ---------------------------------------------------------------------------
@@ -59,21 +65,66 @@ def _load_env_file(path: Path) -> dict:
     return env
 
 
+def _parse_scm_target(repo_url: str) -> dict:
+    repo_url = str(repo_url or "").strip().rstrip("/")
+    if not repo_url:
+        return {"provider": "", "owner": "", "repo": "", "base_url": ""}
+
+    bitbucket_match = re.search(r"^(https?://[^/]+)/projects/([^/]+)/repos/([^/?#]+)", repo_url)
+    if bitbucket_match:
+        repo = bitbucket_match.group(3)
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        return {
+            "provider": "bitbucket",
+            "owner": bitbucket_match.group(2),
+            "repo": repo,
+            "base_url": bitbucket_match.group(1),
+        }
+
+    github_match = re.search(r"^https?://github\.com/([^/]+)/([^/?#]+)", repo_url)
+    if github_match:
+        repo = github_match.group(2)
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        return {
+            "provider": "github",
+            "owner": github_match.group(1),
+            "repo": repo,
+            "base_url": "https://github.com",
+        }
+
+    return {"provider": "", "owner": "", "repo": "", "base_url": ""}
+
+
 _ENV = _load_env_file(TESTS_ENV)
 _COMMON_ENV = _load_env_file(COMMON_ENV)
+_DEVELOPMENT_PERMISSION_HEADERS = {
+    "X-Task-Permissions": json.dumps(load_permission_grant("development").to_dict(), ensure_ascii=False)
+}
 
-JIRA_TICKET_URL = _ENV.get("TEST_JIRA_TICKET_URL", "https://tarch.atlassian.net/browse/CSTL-1")
-JIRA_TICKET_KEY = JIRA_TICKET_URL.rstrip("/").split("/")[-1]
-JIRA_BASE_URL   = "/".join(JIRA_TICKET_URL.split("/")[:3])
-JIRA_API_BASE   = f"{JIRA_BASE_URL}/rest/api/3"
-JIRA_TOKEN      = _ENV.get("TEST_JIRA_TOKEN", "")
-JIRA_EMAIL      = _ENV.get("TEST_JIRA_EMAIL", "")
+JIRA_TICKET_URL = _ENV.get("TEST_JIRA_TICKET_URL", "").strip()
+JIRA_TICKET_KEY = JIRA_TICKET_URL.rstrip("/").split("/")[-1] if JIRA_TICKET_URL else ""
+JIRA_BASE_URL   = "/".join(JIRA_TICKET_URL.split("/")[:3]) if JIRA_TICKET_URL else ""
+JIRA_API_BASE   = f"{JIRA_BASE_URL}/rest/api/3" if JIRA_BASE_URL else ""
+JIRA_TOKEN      = _ENV.get("TEST_JIRA_TOKEN", "").strip()
+JIRA_EMAIL      = _ENV.get("TEST_JIRA_EMAIL", "").strip()
 
-GITHUB_REPO_URL = _ENV.get("TEST_GITHUB_REPO_URL", "https://github.com/example-org/english-study-hub")
-GITHUB_TOKEN    = _ENV.get("TEST_GITHUB_TOKEN", "")
-_gh = GITHUB_REPO_URL.rstrip("/").split("/")
-GITHUB_OWNER    = _gh[-2] if len(_gh) >= 2 else ""
-GITHUB_REPO     = _gh[-1] if _gh else ""
+GITHUB_REPO_URL = _ENV.get("TEST_GITHUB_REPO_URL", "").strip()
+GITHUB_TOKEN    = _ENV.get("TEST_GITHUB_TOKEN", "").strip()
+DESIGN_URL      = (
+    _ENV.get("TEST_DESIGN_URL", "")
+    or _ENV.get("TEST_FIGMA_FILE_URL", "")
+    or _ENV.get("TEST_STITCH_PROJECT_URL", "")
+).strip()
+SCM_REPO_URL    = GITHUB_REPO_URL.strip()
+SCM_TOKEN       = GITHUB_TOKEN.strip()
+SCM_TARGET      = _parse_scm_target(SCM_REPO_URL)
+SCM_PROVIDER    = SCM_TARGET.get("provider", "")
+SCM_PROVIDER_LABEL = {"github": "GitHub", "bitbucket": "Bitbucket"}.get(SCM_PROVIDER, "SCM")
+SCM_OWNER       = SCM_TARGET.get("owner", "")
+SCM_REPO        = SCM_TARGET.get("repo", "")
+SCM_BASE_URL    = SCM_TARGET.get("base_url", "")
 
 HOST_ARTIFACT_ROOT = str(PROJECT_ROOT / "artifacts")
 LOCAL_TIMEZONE = (
@@ -480,7 +531,7 @@ def jira_get_issue(key: str) -> dict | None:
                          headers=_jira_h())
         if s == 200:
             return b
-    s, b = http_json(f"{JIRA_URL}/jira/tickets/{key}")
+    s, b = http_json(f"{JIRA_URL}/jira/tickets/{key}", headers=_DEVELOPMENT_PERMISSION_HEADERS)
     issue = b.get("issue") if isinstance(b, dict) else None
     return issue if s == 200 and isinstance(issue, dict) else None
 
@@ -493,22 +544,58 @@ def jira_get_comments(key: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# GitHub API helpers
+# SCM API helpers
 # ---------------------------------------------------------------------------
 
-def _gh_h() -> dict:
-    return {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+def _scm_h() -> dict:
+    if not SCM_TOKEN:
+        return {}
+    if SCM_PROVIDER == "bitbucket":
+        return {"Authorization": f"Bearer {SCM_TOKEN}"}
+    return {"Authorization": f"token {SCM_TOKEN}"}
 
 
-def github_prs(owner: str, repo: str, state: str = "open") -> list:
-    s, b = http_json(f"https://api.github.com/repos/{owner}/{repo}/pulls?state={state}&per_page=30",
-                     headers=_gh_h())
+def scm_prs(owner: str, repo: str, state: str = "open") -> list:
+    if SCM_PROVIDER == "bitbucket":
+        bb_state = "OPEN" if state.lower() == "open" else "MERGED" if state.lower() in ("merged", "closed") else "ALL"
+        s, b = http_json(
+            f"{SCM_BASE_URL}/rest/api/1.0/projects/{owner}/repos/{quote(repo)}/pull-requests?state={bb_state}&limit=30",
+            headers=_scm_h(),
+        )
+        if s == 200 and isinstance(b, dict):
+            result = []
+            for pr in b.get("values", []):
+                pr_id = pr.get("id")
+                if pr_id is None:
+                    continue
+                result.append({
+                    "number": pr_id,
+                    "title": pr.get("title", ""),
+                    "html_url": f"{SCM_BASE_URL}/projects/{owner}/repos/{repo}/pull-requests/{pr_id}",
+                    "body": pr.get("description") or "",
+                })
+            return result
+        return []
+
+    s, b = http_json(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls?state={state}&per_page=30",
+        headers=_scm_h(),
+    )
     return b if (s == 200 and isinstance(b, list)) else []
 
 
-def github_branches(owner: str, repo: str) -> list:
-    s, b = http_json(f"https://api.github.com/repos/{owner}/{repo}/branches?per_page=100",
-                     headers=_gh_h())
+def scm_branches(owner: str, repo: str) -> list:
+    if SCM_PROVIDER == "bitbucket":
+        s, b = http_json(
+            f"{SCM_BASE_URL}/rest/api/1.0/projects/{owner}/repos/{quote(repo)}/branches?limit=100",
+            headers=_scm_h(),
+        )
+        return [x.get("displayId", "") for x in b.get("values", [])] if (s == 200 and isinstance(b, dict)) else []
+
+    s, b = http_json(
+        f"https://api.github.com/repos/{owner}/{repo}/branches?per_page=100",
+        headers=_scm_h(),
+    )
     return [x["name"] for x in b] if (s == 200 and isinstance(b, list)) else []
 
 
@@ -765,10 +852,29 @@ def _ws_file_ok_or_warn(ws_host: str, rel: str, label: str) -> bool:
     return False
 
 
-def test_cstl1_full_workflow():  # noqa: C901
-    section(f"{JIRA_TICKET_KEY} Full E2E Workflow Validation")
+def _validate_workflow_configuration() -> bool:
+    missing: list[str] = []
+    if not JIRA_TICKET_URL:
+        missing.append("TEST_JIRA_TICKET_URL")
+    if not GITHUB_REPO_URL:
+        missing.append("TEST_GITHUB_REPO_URL")
+    if missing:
+        fail(
+            "Workflow test configuration missing",
+            "Set the following keys in tests/.env: " + ", ".join(missing),
+        )
+        return False
+    return True
+
+
+def test_ticket_full_workflow():  # noqa: C901
+    if not _validate_workflow_configuration():
+        return
+
+    section(f"{JIRA_TICKET_KEY or 'Configured Ticket'} Full E2E Workflow Validation")
     print(f"\n  Ticket:  {JIRA_TICKET_URL}")
     print(f"  Repo:    {GITHUB_REPO_URL}")
+    print(f"  Design:  {DESIGN_URL or '(none)'}")
     print(f"  Timeout: {WORKFLOW_POLL_TIMEOUT}s\n")
 
     # ── Baseline ──────────────────────────────────────────────────────────
@@ -791,22 +897,25 @@ def test_cstl1_full_workflow():  # noqa: C901
         warn("Could not fetch Jira baseline (check TEST_JIRA_TOKEN in tests/.env)")
     expected_constraints = _ticket_stack_expectations(j_before)
 
-    step("Record GitHub PRs/branches BEFORE test")
+    step(f"Record {SCM_PROVIDER_LABEL} PRs/branches BEFORE test")
     prs_before: list = []
     branches_before: list = []
-    if GITHUB_OWNER and GITHUB_REPO and GITHUB_TOKEN:
-        prs_before = [str(p.get("number")) for p in github_prs(GITHUB_OWNER, GITHUB_REPO)]
-        branches_before = github_branches(GITHUB_OWNER, GITHUB_REPO)
-        info(f"GitHub before: {len(prs_before)} open PRs, {len(branches_before)} branches")
+    if SCM_OWNER and SCM_REPO and SCM_TOKEN:
+        prs_before = [str(p.get("number")) for p in scm_prs(SCM_OWNER, SCM_REPO)]
+        branches_before = scm_branches(SCM_OWNER, SCM_REPO)
+        info(f"{SCM_PROVIDER_LABEL} before: {len(prs_before)} open PRs, {len(branches_before)} branches")
     else:
-        warn("GitHub credentials missing -- PR verification skipped")
+        warn("SCM repo URL or token missing -- PR verification skipped")
 
     # ── a. Submit task ────────────────────────────────────────────────────
     # Build rich request including repo + basic acceptance criteria so team-lead
     # can proceed without asking the user for clarification.
+    _repo_hint = f" using repository {GITHUB_REPO_URL}" if GITHUB_REPO_URL else ""
+    _design_hint = f" The design reference is: {DESIGN_URL}." if DESIGN_URL else ""
     _request_text = (
         f"implement jira ticket {JIRA_TICKET_URL}"
-        f" using repository {GITHUB_REPO_URL}."
+        f"{_repo_hint}."
+        f"{_design_hint}"
         f" Use the Jira ticket and linked design context as the source of truth."
         f" If the repository is sparse, scaffold the required implementation in place instead of switching stacks."
     )
@@ -830,9 +939,10 @@ def test_cstl1_full_workflow():  # noqa: C901
         show_json("Final task", final)
 
     final_state = t_state(final) if final else "TIMEOUT"
+    input_required = final_state == "TASK_STATE_INPUT_REQUIRED"
     if final_state == "TASK_STATE_COMPLETED":
         ok(f"Task completed (state={final_state})")
-    elif final_state == "TASK_STATE_INPUT_REQUIRED":
+    elif input_required:
         warn("Task needs user input -- partial validation follows")
     elif final_state == "TASK_STATE_FAILED":
         parts = (final or {}).get("task", {}).get("status", {}).get("message", {}).get("parts", [{}])
@@ -893,10 +1003,22 @@ def test_cstl1_full_workflow():  # noqa: C901
         warn("Design context not in workspace (Stitch may be unavailable or page not needed)")
 
     # Team Lead plan
-    _ws_file_ok(host_ws, "team-lead/plan.json", "Team Lead implementation plan")
     _ws_file_ok(host_ws, "team-lead/stage-summary.json", "Team Lead stage summary")
     _ws_file_ok(host_ws, "team-lead/command-log.txt", "Team Lead command log")
-    _ws_file_ok(host_ws, "team-lead/review-notes.json", "Team Lead review notes")
+    plan_path = os.path.join(host_ws, "team-lead/plan.json")
+    review_notes_path = os.path.join(host_ws, "team-lead/review-notes.json")
+    if input_required:
+        if os.path.isfile(plan_path):
+            ok("Team Lead implementation plan saved before clarification")
+        else:
+            warn("Team Lead implementation plan not created yet (expected while waiting for clarification)")
+        if os.path.isfile(review_notes_path):
+            warn("Team Lead review notes exist before dev dispatch")
+        else:
+            ok("No Team Lead review notes yet (expected before dev dispatch)")
+    else:
+        _ws_file_ok(host_ws, "team-lead/plan.json", "Team Lead implementation plan")
+        _ws_file_ok(host_ws, "team-lead/review-notes.json", "Team Lead review notes")
 
     step("b3. Verify Team Lead runtime target and skill playbooks")
     team_lead_stage_payload = _read_json_file(os.path.join(host_ws, "team-lead/stage-summary.json"))
@@ -913,7 +1035,7 @@ def test_cstl1_full_workflow():  # noqa: C901
         fail("Team Lead runtime config unreadable", os.path.join(host_ws, "team-lead/stage-summary.json"))
 
     step("b2. Verify Jira-derived stack constraints propagated into the Team Lead plan")
-    plan_payload = _read_json_file(os.path.join(host_ws, "team-lead/plan.json"))
+    plan_payload = _read_json_file(plan_path)
     plan_constraints: dict = {}
     if isinstance(plan_payload, dict):
         plan_constraints = plan_payload.get("tech_stack_constraints") or {}
@@ -924,14 +1046,42 @@ def test_cstl1_full_workflow():  # noqa: C901
         else:
             warn("Team Lead plan has no tech stack constraints (ticket implies no specific stack — OK)")
         _assert_expected_stack_constraints(plan_constraints, expected_constraints, "Team Lead plan")
+    elif input_required:
+        warn("Team Lead plan not available yet because the workflow is waiting for user clarification")
     else:
-        fail("Team Lead plan JSON unreadable", os.path.join(host_ws, "team-lead/plan.json"))
+        fail("Team Lead plan JSON unreadable", plan_path)
+
+    if input_required:
+        step("d. Verify workflow paused before dev dispatch")
+        exec_agent_dirs = [
+            sub.name
+            for sub in Path(host_ws).iterdir()
+            if sub.is_dir() and sub.name not in _NON_EXEC_AGENT_DIRS and not (sub / ".git").is_dir()
+        ]
+        if exec_agent_dirs:
+            warn(f"Execution agent artifacts already exist before clarification: {sorted(exec_agent_dirs)}")
+        else:
+            ok("No execution agent dispatched before required clarification was provided")
+
+        for rel, label in (
+            ("compass/command-log.txt", "Compass command log"),
+            ("compass/stage-summary.json", "Compass stage summary"),
+            ("jira/command-log.txt", "Jira Agent command log"),
+            ("jira/stage-summary.json", "Jira Agent stage summary"),
+            ("scm/command-log.txt", "SCM Agent command log"),
+            ("scm/stage-summary.json", "SCM Agent stage summary"),
+        ):
+            _ws_file_ok(host_ws, rel, label)
+        if DESIGN_URL:
+            _ws_file_ok(host_ws, "ui-design/command-log.txt", "UI Design Agent command log")
+            _ws_file_ok(host_ws, "ui-design/stage-summary.json", "UI Design Agent stage summary")
+        return
 
     # ── d. Code/repo ──────────────────────────────────────────────────────
     step("d. Verify cloned repo exists in workspace")
     ws_path = Path(host_ws)
     # Primary check: cloned repo directory contains .git
-    repo_name = GITHUB_REPO_URL.rstrip("/").split("/")[-1].rstrip(".git") if GITHUB_REPO_URL else ""
+    repo_name = SCM_REPO
     clone_dir = ws_path / repo_name if repo_name else None
     git_dirs = list(ws_path.rglob(".git"))
     if clone_dir and (clone_dir / ".git").is_dir():
@@ -1170,13 +1320,13 @@ def _verify_external(j_status_before, j_comments_before, prs_before,
         _assert_local_timestamp_field(host_ws, f"{exec_agent_dir}/pr-evidence.json", "ts", f"{agent_label} PR evidence")
 
     # ── g. Pull Request ───────────────────────────────────────────────────
-    step("g. Verify GitHub Pull Request created")
-    if not GITHUB_TOKEN:
-        warn("GitHub token missing -- skipping PR verification")
-    elif not GITHUB_OWNER:
-        warn("Could not parse owner/repo from GITHUB_REPO_URL")
+    step(f"g. Verify {SCM_PROVIDER_LABEL} Pull Request created")
+    if not SCM_TOKEN:
+        warn("SCM token missing -- skipping PR verification")
+    elif not SCM_OWNER or not SCM_REPO:
+        warn("Could not parse project/owner and repo from TEST_GITHUB_REPO_URL")
     else:
-        prs_after = github_prs(GITHUB_OWNER, GITHUB_REPO)
+        prs_after = scm_prs(SCM_OWNER, SCM_REPO)
         new_numbers = {str(p["number"]) for p in prs_after} - set(prs_before)
         if new_numbers:
             ok(f"New PR(s) created: #{', #'.join(sorted(new_numbers))}")
@@ -1189,7 +1339,7 @@ def _verify_external(j_status_before, j_comments_before, prs_before,
                     else:
                         warn("PR description is empty")
         else:
-            branches_after = github_branches(GITHUB_OWNER, GITHUB_REPO)
+            branches_after = scm_branches(SCM_OWNER, SCM_REPO)
             new_branches = set(branches_after) - set(branches_before)
             if new_branches:
                 ok(f"New branch created: {sorted(new_branches)}")
@@ -1198,7 +1348,7 @@ def _verify_external(j_status_before, j_comments_before, prs_before,
                 warn("No new PRs or branches (workflow may not have reached SCM step)")
 
     # ── Summary ───────────────────────────────────────────────────────────
-    step("CSTL-1 Summary")
+    step("Configured Workflow Summary")
     info(f"Task ID:     {tid}")
     info(f"Final state: {final_state}")
     if host_ws:
@@ -1222,16 +1372,17 @@ def run_all():
     print(f"  Artifacts: {HOST_ARTIFACT_ROOT}")
     print(f"  Ticket:    {JIRA_TICKET_URL}")
     print(f"  Repo:      {GITHUB_REPO_URL}")
+    print(f"  SCM:       {SCM_PROVIDER_LABEL}")
     print(f"  Timeout:   {WORKFLOW_POLL_TIMEOUT}s")
     print(f"  Local TZ:  {LOCAL_TIMEZONE or '(not configured)'}")
     print(f"  Verbose:   {VERBOSE}")
     print(f"  Time:      {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    if CSTL_ONLY:
+    if WORKFLOW_ONLY:
         if not test_0_prerequisites():
             print(f"\n{Colors.RED}ABORTED: core services not running{Colors.RESET}")
             sys.exit(1)
-        test_cstl1_full_workflow()
+        test_ticket_full_workflow()
     elif SMOKE_ONLY:
         if not test_0_prerequisites():
             sys.exit(1)
@@ -1248,7 +1399,7 @@ def run_all():
         test_5_missing_capability()
         test_6_browser_ui()
         test_7_malformed_request()
-        test_cstl1_full_workflow()
+        test_ticket_full_workflow()
 
     total = passed + failed
     print(f"\n{Colors.BOLD}{'=' * 64}{Colors.RESET}")

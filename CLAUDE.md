@@ -39,7 +39,7 @@ python3 tests/test_web_agent.py
 python3 tests/test_web_agent.py --agent-url http://localhost:8050
 ```
 
-Test credentials and target resources (Jira tickets, GitHub repos) are configured in `tests/.env` and `tests/agent_test_targets.json`.
+Test credentials and target resources are configured in `tests/.env` only. Test scripts must not hardcode Jira ticket URLs/keys, GitHub or Bitbucket repo URLs, Figma URLs, or Stitch URLs; if a test needs one of those targets, it must read it from `tests/.env` (or a helper that reads `tests/.env`).
 
 ## Architecture
 

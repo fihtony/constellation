@@ -15,6 +15,13 @@ from common.instance_reporter import InstanceReporter
 from common.message_utils import build_text_artifact, extract_text
 from common.rules_loader import build_system_prompt
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.task_permissions import (
+    PermissionDeniedError,
+    audit_permission_check,
+    build_permission_denied_artifact,
+    build_permission_denied_details,
+    parse_permission_grant,
+)
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -44,6 +51,110 @@ def _runtime_config_summary() -> dict:
         "runtime": summarize_runtime_configuration(),
         "provider": "figma+stitch",
     }
+
+
+def _permission_enforcement_mode() -> str:
+    return os.environ.get("PERMISSION_ENFORCEMENT", "strict").strip().lower() or "strict"
+
+
+def _request_permissions(headers=None, permissions_data: dict | None = None) -> tuple[dict | None, str]:
+    if permissions_data is not None:
+        return permissions_data, ""
+    raw = ((headers or {}).get("X-Task-Permissions") or "").strip() if headers else ""
+    if not raw:
+        return None, "No permissions attached to request. Explicit permission grant required."
+    try:
+        return json.loads(raw), ""
+    except json.JSONDecodeError:
+        return None, "Invalid X-Task-Permissions header. Explicit permission grant required."
+
+
+def _check_ui_permission(
+    *,
+    action: str,
+    target: str,
+    message: dict | None = None,
+    headers=None,
+    permissions_data: dict | None = None,
+) -> tuple[bool, str, str]:
+    if _permission_enforcement_mode() == "off":
+        return True, "allowed", ""
+
+    metadata = (message or {}).get("metadata") or {}
+    request_agent = (
+        (metadata.get("requestAgent") or "").strip()
+        or ((headers or {}).get("X-Request-Agent") or "").strip()
+    )
+    task_id = (
+        (metadata.get("orchestratorTaskId") or "").strip()
+        or ((headers or {}).get("X-Orchestrator-Task-Id") or "").strip()
+    )
+    raw_permissions, missing_reason = _request_permissions(
+        headers=headers,
+        permissions_data=permissions_data if permissions_data is not None else metadata.get("permissions"),
+    )
+    grant = parse_permission_grant(raw_permissions)
+    if grant:
+        allowed, reason = grant.check("ui-design", action)
+        escalation = grant.escalation_for("ui-design", action)
+    else:
+        allowed = False
+        reason = missing_reason or "No permissions attached to request. Explicit permission grant required."
+        escalation = "require_user_approval"
+
+    audit_permission_check(
+        task_id=task_id,
+        orchestrator_task_id=task_id,
+        request_agent=request_agent,
+        target_agent=AGENT_ID,
+        action=action,
+        target=target,
+        decision="allowed" if allowed else "denied",
+        reason=reason,
+        agent_id=AGENT_ID,
+    )
+    return allowed, reason, escalation
+
+
+def _require_ui_permission(*, action: str, target: str, message: dict) -> None:
+    allowed, reason, escalation = _check_ui_permission(action=action, target=target, message=message)
+    if allowed:
+        return
+    if _permission_enforcement_mode() == "strict":
+        metadata = (message or {}).get("metadata") or {}
+        raise PermissionDeniedError(
+            build_permission_denied_details(
+                permission_agent="ui-design",
+                target_agent=AGENT_ID,
+                action=action,
+                target=target,
+                reason=reason,
+                escalation=escalation or "require_user_approval",
+                request_agent=str(metadata.get("requestAgent") or "").strip(),
+                task_id=str(metadata.get("taskId") or ""),
+                orchestrator_task_id=str(metadata.get("orchestratorTaskId") or ""),
+            )
+        )
+    print(f"[{AGENT_ID}] WARN: permission check failed but enforcement={_permission_enforcement_mode()}: {reason}")
+
+
+def _enforce_http_ui_permission(handler: BaseHTTPRequestHandler, *, action: str, target: str) -> bool:
+    allowed, reason, escalation = _check_ui_permission(action=action, target=target, headers=handler.headers)
+    if allowed:
+        return True
+    if _permission_enforcement_mode() == "strict":
+        handler._send_json(
+            403,
+            {
+                "error": "permission_denied",
+                "action": action,
+                "reason": reason,
+                "escalation": escalation or "require_user_approval",
+            },
+        )
+        return False
+    print(f"[{AGENT_ID}] WARN: permission check failed but enforcement={_permission_enforcement_mode()}: {reason}")
+    return True
 
 
 def _load_agent_card() -> dict:
@@ -120,7 +231,7 @@ def _run_agentic(
 # Figma handler
 # ---------------------------------------------------------------------------
 
-def _handle_figma_message(user_text: str, capability: str) -> tuple[str, list]:
+def _handle_figma_message(user_text: str, capability: str, workspace_path: str = "") -> tuple[str, list]:
     import re
 
     url_match = re.search(r"https?://www\.figma\.com/[^\s\"']+", user_text)
@@ -133,46 +244,101 @@ def _handle_figma_message(user_text: str, capability: str) -> tuple[str, list]:
     page_name = page_match.group(1).strip(" :") if page_match else ""
 
     summary_parts: list[str] = []
+    figma_data_cache: dict = {}
 
     if figma_url:
-        file_key, node_id = figma_client.parse_figma_url(figma_url)
-        if file_key:
-            meta, meta_status = figma_client.fetch_file_meta(file_key)
-            if meta_status == "ok":
+        # --- Workspace cache check: serve from workspace if available ---
+        ws_filename = figma_client.workspace_cache_filename(figma_url, page_name)
+        cached = figma_client.load_from_workspace(workspace_path, ws_filename) if workspace_path else None
+        if cached:
+            figma_data_cache = cached
+            summary_parts.append("Figma data served from workspace cache (no API call needed).")
+            if cached.get("fileMeta", {}).get("name"):
+                meta = cached["fileMeta"]
                 summary_parts.append(
                     f"Figma file: {meta.get('name')} "
                     f"(last modified: {meta.get('lastModified')})"
                 )
-            else:
-                summary_parts.append(f"Figma file metadata fetch status: {meta_status}")
-            # Explicit element-spec request
-            if capability == "figma.node.get" or node_id:
-                node_result, node_status = figma_client.fetch_nodes(file_key, [node_id]) if node_id else ({}, "no_node_id")
-                if node_status == "ok":
-                    summary_parts.append(f"Element spec for node {node_id} fetched successfully.")
-                else:
-                    summary_parts.append(f"Node {node_id} fetch status: {node_status}")
-            elif page_name:
-                page_result, page_status = figma_client.fetch_page_by_name(
-                    file_key, page_name
-                )
-                if page_status == "ok":
-                    matched_page = page_result.get("page", {})
-                    summary_parts.append(
-                        f"Page matched: '{matched_page.get('name')}' "
-                        f"(id: {matched_page.get('id')})"
-                    )
-                elif page_status == "page_not_found":
-                    available = page_result.get("availablePages", [])
-                    summary_parts.append(
-                        f"Page '{page_name}' not found. Available: {available}"
-                    )
-                else:
-                    summary_parts.append(
-                        f"Figma page fetch status: {page_status}"
-                    )
+            if cached.get("pageName"):
+                summary_parts.append(f"Page (cached): {cached['pageName']}")
+            # Also include pages list and design tokens if available
+            if cached.get("pages"):
+                summary_parts.append(f"Available pages: {[p.get('name') for p in cached['pages']]}")
+            if cached.get("designTokens"):
+                summary_parts.append("Design tokens: available in cache")
         else:
-            summary_parts.append("Could not parse the Figma file key from the provided URL.")
+            # --- Fetch from Figma API using cached methods ---
+            file_key, node_id = figma_client.parse_figma_url(figma_url)
+            if file_key:
+                # Strategy: meta (1 call) + targeted node/page (1 call) = 2 API calls max
+                meta, meta_status = figma_client.fetch_file_meta_cached(file_key)
+                figma_data_cache["fileMeta"] = meta
+                figma_data_cache["fileMetaStatus"] = meta_status
+                figma_data_cache["figmaUrl"] = figma_url
+                figma_data_cache["fileKey"] = file_key
+
+                if meta_status == "ok":
+                    summary_parts.append(
+                        f"Figma file: {meta.get('name')} "
+                        f"(last modified: {meta.get('lastModified')})"
+                    )
+                else:
+                    summary_parts.append(f"Figma file metadata fetch status: {meta_status}")
+
+                # Fetch pages list (reuses the depth=1 call from meta — cached)
+                pages, pages_status = figma_client.fetch_pages_cached(file_key)
+                if pages_status == "ok":
+                    figma_data_cache["pages"] = pages
+                    summary_parts.append(f"Available pages ({len(pages)}): {[p.get('name') for p in pages]}")
+
+                # Specific node request
+                if capability == "figma.node.get" or node_id:
+                    nid = node_id or ""
+                    if nid:
+                        node_result, node_status = figma_client.fetch_nodes_cached(file_key, [nid])
+                        figma_data_cache["nodeId"] = nid
+                        figma_data_cache["nodes"] = node_result
+                        figma_data_cache["nodesStatus"] = node_status
+                        if node_status == "ok":
+                            summary_parts.append(f"Element spec for node {nid} fetched successfully.")
+                            # Extract UI specs for the node
+                            nodes_map = node_result.get("nodes", {})
+                            for _nid, _ndata in nodes_map.items():
+                                doc = _ndata.get("document", {})
+                                if doc:
+                                    ui_specs = figma_client.traverse_and_extract(doc, max_depth=5)
+                                    figma_data_cache["uiSpecs"] = ui_specs
+                                    summary_parts.append(f"UI specs extracted: {len(ui_specs)} elements")
+                        else:
+                            summary_parts.append(f"Node {nid} fetch status: {node_status}")
+                    else:
+                        summary_parts.append("No node_id available for element spec request.")
+                elif page_name:
+                    # Page by name — uses pages list (cached) + node fetch (1 call)
+                    page_result, page_status = figma_client.fetch_page_by_name(file_key, page_name)
+                    figma_data_cache["pageResult"] = page_result
+                    figma_data_cache["pageStatus"] = page_status
+                    figma_data_cache["pageName"] = page_name
+                    if page_status == "ok":
+                        matched_page = page_result.get("page", {})
+                        summary_parts.append(
+                            f"Page matched: '{matched_page.get('name')}' "
+                            f"(id: {matched_page.get('id')})"
+                        )
+                    elif page_status == "page_not_found":
+                        available = page_result.get("availablePages", [])
+                        summary_parts.append(
+                            f"Page '{page_name}' not found. Available: {available}"
+                        )
+                    else:
+                        summary_parts.append(f"Figma page fetch status: {page_status}")
+
+                # Save to workspace for reuse by downstream agents
+                if meta_status == "ok" and workspace_path:
+                    figma_client.save_to_workspace(workspace_path, ws_filename, figma_data_cache)
+                    print(f"[{AGENT_ID}] Figma data saved to workspace: {ws_filename}", flush=True)
+            else:
+                summary_parts.append("Could not parse the Figma file key from the provided URL.")
     else:
         summary_parts.append("No Figma URL found in the request.")
 
@@ -402,9 +568,20 @@ def _dispatch_message(message: dict) -> tuple[str, list]:
         )
 
     if capability.startswith("figma.") or _looks_like_figma_request(user_text):
-        return _handle_figma_message(user_text, capability)
+        action = "element.inspect" if capability == "figma.node.get" else "figma.read"
+        _require_ui_permission(
+            action=action,
+            target=capability or "figma-request",
+            message=message,
+        )
+        return _handle_figma_message(user_text, capability, workspace_path=workspace_path)
 
     if capability.startswith("stitch.") or _looks_like_stitch_request(user_text):
+        _require_ui_permission(
+            action="stitch.read",
+            target=capability or "stitch-request",
+            message=message,
+        )
         return _handle_stitch_message(user_text, capability, workspace_path=workspace_path)
 
     return _handle_generic_message(user_text)
@@ -475,6 +652,9 @@ def _run_task_background(
             )
     except Exception as exc:
         print(f"[{AGENT_ID}] Task {task_id} failed: {exc}", flush=True)
+        artifacts = []
+        if isinstance(exc, PermissionDeniedError):
+            artifacts = [build_permission_denied_artifact(exc.details, agent_id=AGENT_ID)]
         if workspace_path:
             record_workspace_stage(
                 workspace_path,
@@ -490,7 +670,7 @@ def _run_task_background(
                 "state": "TASK_STATE_FAILED",
                 "message": {"role": "ROLE_AGENT", "parts": [{"text": str(exc)}]},
             },
-            "artifacts": [],
+            "artifacts": artifacts,
         }
 
 
@@ -552,11 +732,13 @@ class UIDesignHandler(BaseHTTPRequestHandler):
             if not figma_url:
                 self._send_json(400, {"error": "missing url parameter"})
                 return
+            if not _enforce_http_ui_permission(self, action="figma.read", target=figma_url):
+                return
             file_key, _ = figma_client.parse_figma_url(figma_url)
             if not file_key:
                 self._send_json(400, {"error": "could_not_parse_figma_url"})
                 return
-            meta, status = figma_client.fetch_file_meta(file_key)
+            meta, status = figma_client.fetch_file_meta_cached(file_key)
             self._send_json(
                 200 if status == "ok" else 502,
                 {"fileKey": file_key, "status": status, "meta": meta},
@@ -568,11 +750,13 @@ class UIDesignHandler(BaseHTTPRequestHandler):
             if not figma_url:
                 self._send_json(400, {"error": "missing url parameter"})
                 return
+            if not _enforce_http_ui_permission(self, action="figma.read", target=figma_url):
+                return
             file_key, _ = figma_client.parse_figma_url(figma_url)
             if not file_key:
                 self._send_json(400, {"error": "could_not_parse_figma_url"})
                 return
-            pages, status = figma_client.fetch_pages(file_key)
+            pages, status = figma_client.fetch_pages_cached(file_key)
             self._send_json(
                 200 if status == "ok" else 502,
                 {"fileKey": file_key, "status": status, "pages": pages},
@@ -584,6 +768,8 @@ class UIDesignHandler(BaseHTTPRequestHandler):
             page_name = (qs.get("name") or [""])[0]
             if not figma_url or not page_name:
                 self._send_json(400, {"error": "missing url or name parameter"})
+                return
+            if not _enforce_http_ui_permission(self, action="figma.read", target=figma_url):
                 return
             file_key, _ = figma_client.parse_figma_url(figma_url)
             if not file_key:
@@ -607,6 +793,8 @@ class UIDesignHandler(BaseHTTPRequestHandler):
             if not figma_url:
                 self._send_json(400, {"error": "missing url parameter"})
                 return
+            if not _enforce_http_ui_permission(self, action="element.inspect", target=figma_url):
+                return
             file_key, url_node_id = figma_client.parse_figma_url(figma_url)
             if not file_key:
                 self._send_json(400, {"error": "could_not_parse_figma_url"})
@@ -615,7 +803,7 @@ class UIDesignHandler(BaseHTTPRequestHandler):
             if not node_id:
                 self._send_json(400, {"error": "node_id required (pass as ?node_id= or embed in Figma URL)"})
                 return
-            result, status = figma_client.fetch_nodes(file_key, [node_id])
+            result, status = figma_client.fetch_nodes_cached(file_key, [node_id])
             self._send_json(
                 200 if status == "ok" else 502,
                 {"fileKey": file_key, "nodeId": node_id, "status": status, **result},
@@ -625,6 +813,8 @@ class UIDesignHandler(BaseHTTPRequestHandler):
         # --- Stitch MCP ---
 
         if path == "/stitch/tools":
+            if not _enforce_http_ui_permission(self, action="stitch.read", target="stitch/tools"):
+                return
             tools, status = stitch_client.list_tools()
             self._send_json(
                 200 if status == "ok" else 502,
@@ -636,6 +826,8 @@ class UIDesignHandler(BaseHTTPRequestHandler):
             project_id = (qs.get("id") or [""])[0]
             if not project_id:
                 self._send_json(400, {"error": "missing id parameter"})
+                return
+            if not _enforce_http_ui_permission(self, action="stitch.read", target=project_id):
                 return
             result, status = stitch_client.get_project(project_id)
             self._send_json(
@@ -649,6 +841,8 @@ class UIDesignHandler(BaseHTTPRequestHandler):
             screen_id = (qs.get("screen_id") or [""])[0]
             if not project_id or not screen_id:
                 self._send_json(400, {"error": "missing project_id or screen_id"})
+                return
+            if not _enforce_http_ui_permission(self, action="stitch.read", target=f"{project_id}/{screen_id}"):
                 return
             result, status = stitch_client.get_screen(project_id, screen_id)
             self._send_json(
@@ -667,6 +861,8 @@ class UIDesignHandler(BaseHTTPRequestHandler):
             screen_id = (qs.get("screen_id") or [""])[0]
             if not project_id or not screen_id:
                 self._send_json(400, {"error": "missing project_id or screen_id"})
+                return
+            if not _enforce_http_ui_permission(self, action="stitch.read", target=f"{project_id}/{screen_id}/image"):
                 return
             result, status = stitch_client.get_screen_image(project_id, screen_id)
             self._send_json(

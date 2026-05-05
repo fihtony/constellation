@@ -18,6 +18,13 @@ from common.message_utils import build_text_artifact, extract_text
 from common.per_task_exit import PerTaskExitHandler
 from common.rules_loader import build_system_prompt
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.task_permissions import (
+    PermissionDeniedError,
+    audit_permission_check,
+    build_permission_denied_artifact,
+    build_permission_denied_details,
+    parse_permission_grant,
+)
 from common.task_store import TaskStore
 from common.time_utils import local_iso_timestamp
 from office import prompts
@@ -76,6 +83,107 @@ def _runtime_config_summary() -> dict:
         "maxDirTotalBytes": MAX_DIR_TOTAL_BYTES,
         "runtimeConfig": summarize_runtime_configuration(),
     }
+
+
+def _permission_enforcement_mode() -> str:
+    return os.environ.get("PERMISSION_ENFORCEMENT", "strict").strip().lower() or "strict"
+
+
+def _check_office_permission(
+    *,
+    action: str,
+    target: str,
+    metadata: dict,
+    scope: str = "*",
+) -> tuple[bool, str, str]:
+    if _permission_enforcement_mode() == "off":
+        return True, "allowed", ""
+
+    request_agent = str(metadata.get("requestAgent") or "compass-agent").strip() or "compass-agent"
+    task_id = str(metadata.get("orchestratorTaskId") or metadata.get("taskId") or "").strip()
+    permissions_data = metadata.get("permissions") if isinstance(metadata.get("permissions"), dict) else None
+    grant = parse_permission_grant(permissions_data)
+    if grant:
+        allowed, reason = grant.check("office", action, scope)
+        escalation = grant.escalation_for("office", action, scope)
+    else:
+        allowed = False
+        reason = "No permissions attached to request. Explicit permission grant required."
+        escalation = "require_user_approval"
+
+    audit_permission_check(
+        task_id=task_id,
+        orchestrator_task_id=task_id,
+        request_agent=request_agent,
+        target_agent=AGENT_ID,
+        action=action,
+        target=target,
+        decision="allowed" if allowed else "denied",
+        reason=reason,
+        agent_id=AGENT_ID,
+    )
+    return allowed, reason, escalation
+
+
+def _require_office_permission(
+    *,
+    action: str,
+    target: str,
+    metadata: dict,
+    scope: str = "*",
+) -> None:
+    allowed, reason, escalation = _check_office_permission(
+        action=action,
+        target=target,
+        metadata=metadata,
+        scope=scope,
+    )
+    if allowed:
+        return
+    if _permission_enforcement_mode() == "strict":
+        raise PermissionDeniedError(
+            build_permission_denied_details(
+                permission_agent="office",
+                target_agent=AGENT_ID,
+                action=action,
+                target=target,
+                reason=reason,
+                escalation=escalation or "require_user_approval",
+                scope=scope,
+                request_agent=str(metadata.get("requestAgent") or "compass-agent").strip() or "compass-agent",
+                task_id=str(metadata.get("taskId") or ""),
+                orchestrator_task_id=str(metadata.get("orchestratorTaskId") or ""),
+            )
+        )
+
+    print(f"[{AGENT_ID}] WARN: permission check failed but enforcement={_permission_enforcement_mode()}: {reason}")
+
+
+def _enforce_office_task_permissions(metadata: dict, target_paths: list[str], input_root: str, output_mode: str) -> None:
+    for path in target_paths:
+        if not _path_within_base(path, input_root):
+            _require_office_permission(
+                action="access_outside_root",
+                target=path,
+                metadata=metadata,
+                scope="*",
+            )
+            raise RuntimeError(f"Target path escapes mounted input root: {path}")
+
+    root_target = os.path.commonpath(target_paths)
+    _require_office_permission(
+        action="read",
+        target=root_target,
+        metadata=metadata,
+        scope="task_root",
+    )
+    if output_mode == "inplace":
+        _require_office_permission(
+            action="write",
+            target=root_target,
+            metadata=metadata,
+            scope="task_root",
+        )
 
 
 def _parse_json(text: str) -> dict:
@@ -974,6 +1082,7 @@ def _execute_organize(capability: str, user_text: str, metadata: dict, task_id: 
 
 def _execute_capability(task_id: str, message: dict) -> dict:
     metadata = dict(message.get("metadata") or {})
+    metadata.setdefault("taskId", task_id)
     capability = str(metadata.get("requestedCapability") or "").strip()
     user_text = extract_text(message)
     input_root = str(metadata.get("officeInputRoot") or INPUT_ROOT).strip() or INPUT_ROOT
@@ -984,11 +1093,9 @@ def _execute_capability(task_id: str, message: dict) -> dict:
     target_paths = [os.path.realpath(path) for path in (metadata.get("officeTargetPaths") or []) if str(path).strip()]
     if not target_paths:
         raise RuntimeError("Office task is missing officeTargetPaths metadata.")
-    for path in target_paths:
-        if not _path_within_base(path, input_root):
-            raise RuntimeError(f"Target path escapes mounted input root: {path}")
 
     metadata["officeTargetPaths"] = target_paths
+    _enforce_office_task_permissions(metadata, target_paths, input_root, output_mode)
     write_root = ""
     if output_mode == "inplace":
         write_root = _target_output_dir(metadata, target_paths, output_mode)
@@ -1039,11 +1146,15 @@ def _run_workflow(task_id: str, message: dict):
         audit_log("TASK_COMPLETED", task_id=task_id, capability=metadata.get("requestedCapability"))
     except Exception as err:
         failure = f"Office task failed: {err}"
+        artifacts = []
+        if isinstance(err, PermissionDeniedError):
+            artifacts = [build_permission_denied_artifact(err.details, agent_id=AGENT_ID)]
         task_store.update_state(task_id, "TASK_STATE_FAILED", failure)
+        task.artifacts = artifacts
         _save_audit_file(metadata, "failure.txt", failure + "\n")
         _update_stage_summary(metadata, task_id, "failed", error=str(err))
         _report_progress(compass_url, compass_task_id, failure)
-        _notify_callback(callback_url, task_id, "TASK_STATE_FAILED", failure, [])
+        _notify_callback(callback_url, task_id, "TASK_STATE_FAILED", failure, artifacts)
         audit_log("TASK_FAILED", task_id=task_id, error=str(err))
     finally:
         _apply_task_exit_rule(task_id, exit_rule)

@@ -22,6 +22,13 @@ from common.instance_reporter import InstanceReporter
 from common.message_utils import build_text_artifact, extract_text
 from common.rules_loader import build_system_prompt
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.task_permissions import (
+    PermissionDeniedError,
+    audit_permission_check,
+    build_permission_denied_artifact,
+    build_permission_denied_details,
+    parse_permission_grant,
+)
 from common.time_utils import local_iso_timestamp
 from jira import prompts
 
@@ -173,6 +180,147 @@ def _record_workspace_phase(workspace_path: str, task_id: str, phase: str, **ext
     )
 
 
+def _permission_enforcement_mode() -> str:
+    return os.environ.get("PERMISSION_ENFORCEMENT", "strict").strip().lower() or "strict"
+
+
+def _request_permissions(
+    headers=None,
+    payload_permissions: dict | None = None,
+) -> tuple[dict | None, str]:
+    if payload_permissions is not None:
+        return payload_permissions, ""
+    raw = ((headers or {}).get("X-Task-Permissions") or "").strip()
+    if not raw:
+        return None, "No permissions attached to request. Explicit permission grant required."
+    try:
+        return json.loads(raw), ""
+    except json.JSONDecodeError:
+        return None, "Invalid X-Task-Permissions header. Explicit permission grant required."
+
+
+def _check_jira_permission(
+    *,
+    action: str,
+    target: str,
+    payload_permissions: dict | None = None,
+    headers=None,
+    message: dict | None = None,
+    scope: str = "*",
+) -> tuple[bool, str]:
+    if _permission_enforcement_mode() == "off":
+        return True, "allowed"
+
+    metadata = (message or {}).get("metadata") or {}
+    request_agent = (
+        (metadata.get("requestAgent") or "").strip()
+        or ((headers or {}).get("X-Request-Agent") or "").strip()
+    )
+    task_id_hdr = (
+        (metadata.get("orchestratorTaskId") or "").strip()
+        or ((headers or {}).get("X-Orchestrator-Task-Id") or "").strip()
+    )
+    permissions_data, missing_reason = _request_permissions(
+        headers=headers,
+        payload_permissions=(payload_permissions if payload_permissions is not None else metadata.get("permissions")),
+    )
+    grant = parse_permission_grant(permissions_data)
+    if grant:
+        allowed, reason = grant.check("jira", action, scope)
+        escalation = grant.escalation_for("jira", action, scope)
+    else:
+        allowed = False
+        reason = missing_reason or "No permissions attached to request. Explicit permission grant required."
+        escalation = "require_user_approval"
+
+    audit_permission_check(
+        task_id=task_id_hdr,
+        orchestrator_task_id=task_id_hdr,
+        request_agent=request_agent,
+        target_agent=AGENT_ID,
+        action=action,
+        target=target,
+        decision="allowed" if allowed else "denied",
+        reason=reason,
+        agent_id=AGENT_ID,
+    )
+    return allowed, reason, escalation
+
+
+def _require_jira_permission(
+    *,
+    action: str,
+    target: str,
+    message: dict,
+    payload_permissions: dict | None = None,
+    scope: str = "*",
+) -> None:
+    allowed, reason, escalation = _check_jira_permission(
+        action=action,
+        target=target,
+        payload_permissions=payload_permissions,
+        message=message,
+        scope=scope,
+    )
+    if allowed:
+        return
+    if _permission_enforcement_mode() == "strict":
+        metadata = (message or {}).get("metadata") or {}
+        raise PermissionDeniedError(
+            build_permission_denied_details(
+                permission_agent="jira",
+                target_agent=AGENT_ID,
+                action=action,
+                target=target,
+                reason=reason,
+                escalation=escalation or "require_user_approval",
+                scope=scope,
+                request_agent=str(metadata.get("requestAgent") or "").strip(),
+                task_id=str(metadata.get("taskId") or ""),
+                orchestrator_task_id=str(metadata.get("orchestratorTaskId") or ""),
+            )
+        )
+
+    print(
+        f"[{AGENT_ID}] WARN: permission check failed but enforcement={_permission_enforcement_mode()}: {reason}"
+    )
+
+
+def _enforce_jira_permission(
+    handler: BaseHTTPRequestHandler,
+    *,
+    action: str,
+    target: str,
+    payload_permissions: dict | None = None,
+    scope: str = "*",
+    response_key: str = "action",
+    response_value: str | None = None,
+) -> bool:
+    allowed, reason, escalation = _check_jira_permission(
+        action=action,
+        target=target,
+        payload_permissions=payload_permissions,
+        headers=handler.headers,
+        scope=scope,
+    )
+    if allowed:
+        return True
+    if _permission_enforcement_mode() == "strict":
+        error_body = {
+            "error": "permission_denied",
+            response_key: response_value or action,
+            "reason": reason,
+            "escalation": escalation or "require_user_approval",
+        }
+        handler._send_json(403, error_body)
+        return False
+
+    print(
+        f"[{AGENT_ID}] WARN: permission check failed but enforcement={_permission_enforcement_mode()}: {reason}"
+    )
+    return True
+
+
 
 
 def next_task_id():
@@ -308,18 +456,21 @@ def _run_task_async(task_id, message):
     except Exception as error:
         debug_log(AGENT_ID, "jira.workflow.failed", taskId=task_id, error=str(error))
         failure_text = f"Jira agent failed: {error}"
+        artifacts = []
+        if isinstance(error, PermissionDeniedError):
+            artifacts = [build_permission_denied_artifact(error.details, agent_id=AGENT_ID)]
         _update_task_record(
             task_id,
             state="TASK_STATE_FAILED",
             message=failure_text,
-            artifacts=[],
+            artifacts=artifacts,
         )
         _notify_orchestrator_completion(
             message,
             task_id,
             "TASK_STATE_FAILED",
             failure_text,
-            [],
+            artifacts,
         )
 
 
@@ -333,21 +484,132 @@ def extract_ticket_url(text):
     return match.group(1).split("?", 1)[0] if match else ""
 
 
-def process_message(message):
-    user_text = extract_text(message)
-    metadata = message.get("metadata", {})
-    workspace_path = (metadata.get("sharedWorkspacePath") or "").strip()
-    task_id = (metadata.get("orchestratorTaskId") or "").strip()
-    trusted_ticket_key = (metadata.get("ticketKey") or "").strip()
+def _message_workspace_context(message: dict) -> tuple[str, str]:
+    metadata = message.get("metadata") or {}
+    workspace_path = str(metadata.get("sharedWorkspacePath") or "").strip()
+    task_id = str(metadata.get("orchestratorTaskId") or "").strip()
+    return workspace_path, task_id
+
+
+def _parse_message_payload(text: str) -> dict:
+    text = (text or "").strip()
+    if not text.startswith("{"):
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _message_string(metadata: dict, payload: dict, *keys: str) -> str:
+    for key in keys:
+        for source in (metadata, payload):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _message_object(metadata: dict, payload: dict, *keys: str) -> dict:
+    for key in keys:
+        for source in (metadata, payload):
+            value = source.get(key)
+            if isinstance(value, dict):
+                return value
+    return {}
+
+
+def _message_int(metadata: dict, payload: dict, *keys: str, default: int = 0) -> int:
+    for key in keys:
+        for source in (metadata, payload):
+            value = source.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.strip().isdigit():
+                return int(value.strip())
+    return default
+
+
+def _message_fields(metadata: dict, payload: dict) -> dict:
+    for key in ("fields", "additionalFields", "issueFields"):
+        for source in (metadata, payload):
+            value = source.get(key)
+            if isinstance(value, dict):
+                return value
+    return {}
+
+
+def _build_json_artifact(name: str, payload: dict, capability: str, **metadata) -> dict:
+    return build_text_artifact(
+        name,
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        artifact_type="application/json",
+        metadata={
+            "agentId": AGENT_ID,
+            "capability": capability,
+            **metadata,
+        },
+    )
+
+
+def _extract_transition_name(text: str) -> str:
+    patterns = (
+        r"transition(?:\s+ticket)?\s+[A-Z][A-Z0-9]+-\d+\s+to\s+(.+)$",
+        r"transition\s+to\s+(.+)$",
+        r"to\s+(.+)$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text or "", re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).strip().strip("\"'")
+    return ""
+
+
+def _extract_comment_text(text: str) -> str:
+    patterns = (
+        r"Add comment to ticket\s+[A-Z][A-Z0-9]+-\d+\s*:\s*(.+)$",
+        r"comment\s*:\s*(.+)$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text or "", re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _extract_account_id(text: str) -> str:
+    match = re.search(r"accountId\s*[:=]\s*([^\s,]+)", text or "", re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def _extract_comment_id(text: str) -> str:
+    patterns = (
+        r"comment\s+[A-Z][A-Z0-9]+-\d+/(\w+)",
+        r"commentId\s*[:=]\s*(\w+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text or "", re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _handle_ticket_fetch_message(message: dict, user_text: str, metadata: dict, payload: dict) -> tuple[str, list]:
+    workspace_path, task_id = _message_workspace_context(message)
+    trusted_ticket_key = _message_string(metadata, payload, "ticketKey", "ticket_key")
     browse_url = (
-        metadata.get("ticketUrl")
-        or metadata.get("browseUrl")
+        _message_string(metadata, payload, "ticketUrl", "ticket_url", "browseUrl", "browse_url")
         or extract_ticket_url(user_text)
     )
     ticket_key = trusted_ticket_key or extract_ticket_key(browse_url) or extract_ticket_key(user_text)
-    browse_url = (browse_url or "").strip()
     skill_guide = _load_skill_guide()
-    debug_log(AGENT_ID, "jira.message.received", ticketKey=ticket_key, userText=user_text)
+    _require_jira_permission(
+        action="read",
+        target=ticket_key or browse_url or "jira-request",
+        message=message,
+    )
+    debug_log(AGENT_ID, "jira.message.received", capability="jira.ticket.fetch", ticketKey=ticket_key, userText=user_text)
     _record_workspace_phase(workspace_path, task_id, "Received Jira request", ticketKey=ticket_key)
     issue_payload = None
     fetch_status = "missing_explicit_ticket_url"
@@ -398,6 +660,7 @@ def process_message(message):
             artifact_type="application/vnd.multi-agent.summary",
             metadata={
                 "agentId": AGENT_ID,
+                "capability": "jira.ticket.fetch",
                 "ticketKey": ticket_key,
                 "browseUrl": browse_url,
                 "ticketUrl": browse_url,
@@ -414,6 +677,7 @@ def process_message(message):
                 artifact_type="application/json",
                 metadata={
                     "agentId": AGENT_ID,
+                    "capability": "jira.ticket.fetch",
                     "ticketKey": ticket_key,
                     "browseUrl": browse_url,
                     "ticketUrl": browse_url,
@@ -447,10 +711,234 @@ def process_message(message):
         updatedAt=local_iso_timestamp(),
     )
     debug_log(
-        AGENT_ID, "jira.message.completed",
-        ticketKey=ticket_key, fetchStatus=fetch_status, browseUrl=browse_url,
+        AGENT_ID,
+        "jira.message.completed",
+        capability="jira.ticket.fetch",
+        ticketKey=ticket_key,
+        fetchStatus=fetch_status,
+        browseUrl=browse_url,
     )
     return status_text, artifacts
+
+
+def _handle_user_myself_message(message: dict, metadata: dict, payload: dict) -> tuple[str, list]:
+    workspace_path, task_id = _message_workspace_context(message)
+    _require_jira_permission(action="read", target="myself", message=message)
+    user, result = PROVIDER.get_myself()
+    if result != "ok":
+        raise RuntimeError(f"Current user lookup failed: {result}")
+    _record_workspace_phase(workspace_path, task_id, "Resolved Jira current user", result=result)
+    response = {"result": result, "user": user}
+    return "Resolved Jira current user.", [
+        _build_json_artifact("jira-myself", response, "jira.user.myself")
+    ]
+
+
+def _handle_ticket_transition_message(message: dict, user_text: str, metadata: dict, payload: dict) -> tuple[str, list]:
+    workspace_path, task_id = _message_workspace_context(message)
+    ticket_key = _message_string(metadata, payload, "ticketKey", "ticket_key") or extract_ticket_key(user_text)
+    transition_name = _message_string(metadata, payload, "transition", "targetStatus", "status") or _extract_transition_name(user_text)
+    if not ticket_key or not transition_name:
+        raise RuntimeError("jira.ticket.transition requires ticketKey and transition name.")
+    _require_jira_permission(action="transition", target=ticket_key, message=message)
+    transition_id, result = PROVIDER.transition_issue(ticket_key, transition_name)
+    if not transition_id:
+        raise RuntimeError(f"Transition failed for {ticket_key}: {result}")
+    _record_workspace_phase(
+        workspace_path,
+        task_id,
+        f"Transitioned Jira ticket {ticket_key} to {transition_name}",
+        ticketKey=ticket_key,
+        result=result,
+    )
+    response = {
+        "ticketKey": ticket_key,
+        "transition": transition_name,
+        "transitionId": transition_id,
+        "result": result,
+    }
+    return f"Transitioned {ticket_key} to {transition_name}.", [
+        _build_json_artifact("jira-transition", response, "jira.ticket.transition", ticketKey=ticket_key)
+    ]
+
+
+def _handle_comment_add_message(message: dict, user_text: str, metadata: dict, payload: dict) -> tuple[str, list]:
+    workspace_path, task_id = _message_workspace_context(message)
+    ticket_key = _message_string(metadata, payload, "ticketKey", "ticket_key") or extract_ticket_key(user_text)
+    adf = _message_object(metadata, payload, "adf", "adfBody")
+    comment_text = _message_string(metadata, payload, "commentText", "comment", "text") or _extract_comment_text(user_text)
+    if not ticket_key or (not comment_text and not adf):
+        raise RuntimeError("jira.comment.add requires ticketKey and comment text or adf body.")
+    _require_jira_permission(action="comment.add", target=ticket_key, message=message)
+    comment_id, result = PROVIDER.add_comment(ticket_key, comment_text, adf_body=adf or None)
+    if not comment_id:
+        raise RuntimeError(f"Comment add failed for {ticket_key}: {result}")
+    _record_workspace_phase(
+        workspace_path,
+        task_id,
+        f"Added Jira comment to {ticket_key}",
+        ticketKey=ticket_key,
+        commentId=comment_id,
+        result=result,
+    )
+    response = {"ticketKey": ticket_key, "commentId": comment_id, "result": result}
+    return f"Added comment to {ticket_key}.", [
+        _build_json_artifact("jira-comment-add", response, "jira.comment.add", ticketKey=ticket_key)
+    ]
+
+
+def _handle_assignee_message(message: dict, user_text: str, metadata: dict, payload: dict) -> tuple[str, list]:
+    workspace_path, task_id = _message_workspace_context(message)
+    ticket_key = _message_string(metadata, payload, "ticketKey", "ticket_key") or extract_ticket_key(user_text)
+    account_id = _message_string(metadata, payload, "accountId", "assigneeAccountId") or _extract_account_id(user_text)
+    if not ticket_key or not account_id:
+        raise RuntimeError("jira.ticket.assignee requires ticketKey and accountId.")
+    _require_jira_permission(action="assignee.update", target=ticket_key, message=message)
+    assigned_account, result = PROVIDER.change_assignee(ticket_key, account_id)
+    if result != "assigned":
+        raise RuntimeError(f"Assignee update failed for {ticket_key}: {result}")
+    _record_workspace_phase(
+        workspace_path,
+        task_id,
+        f"Assigned Jira ticket {ticket_key}",
+        ticketKey=ticket_key,
+        accountId=assigned_account,
+        result=result,
+    )
+    response = {"ticketKey": ticket_key, "accountId": assigned_account, "result": result}
+    return f"Assigned {ticket_key} to {assigned_account}.", [
+        _build_json_artifact("jira-assignee", response, "jira.ticket.assignee", ticketKey=ticket_key)
+    ]
+
+
+def _handle_issue_search_message(message: dict, user_text: str, metadata: dict, payload: dict) -> tuple[str, list]:
+    jql = _message_string(metadata, payload, "jql", "query") or (user_text or "").strip()
+    fields_value = metadata.get("fields", payload.get("fields", []))
+    if isinstance(fields_value, str):
+        fields = [item.strip() for item in fields_value.split(",") if item.strip()]
+    elif isinstance(fields_value, list):
+        fields = [str(item).strip() for item in fields_value if str(item).strip()]
+    else:
+        fields = []
+    max_results = _message_int(metadata, payload, "maxResults", "max_results", default=10) or 10
+    _require_jira_permission(action="read", target=jql or "search", message=message)
+    search_body, result = PROVIDER.search_issues(jql, max_results=max_results, fields=fields or None)
+    if result != "ok":
+        raise RuntimeError(f"Issue search failed: {result}")
+    response = {"result": result, "jql": jql, "search": search_body}
+    return f"Search returned {len((search_body or {}).get('issues') or [])} issues.", [
+        _build_json_artifact("jira-search", response, "jira.issue.search")
+    ]
+
+
+def _handle_issue_create_message(message: dict, user_text: str, metadata: dict, payload: dict) -> tuple[str, list]:
+    project_key = _message_string(metadata, payload, "projectKey", "project_key")
+    summary = _message_string(metadata, payload, "summary")
+    issue_type = _message_string(metadata, payload, "issueType", "issue_type") or "Task"
+    description = _message_string(metadata, payload, "description")
+    fields = _message_fields(metadata, payload)
+    if not project_key or not summary:
+        raise RuntimeError("jira.issue.create requires projectKey and summary.")
+    _require_jira_permission(action="issue.create", target=project_key, message=message)
+    issue_body, result = PROVIDER.create_issue(project_key, summary, issue_type, description, fields)
+    if result != "created":
+        raise RuntimeError(f"Issue creation failed: {result}")
+    response = {"result": result, "ticketKey": issue_body.get("key"), "issue": issue_body}
+    return f"Created Jira issue {issue_body.get('key') or ''}.".strip(), [
+        _build_json_artifact("jira-issue-create", response, "jira.issue.create")
+    ]
+
+
+def _handle_issue_update_message(message: dict, user_text: str, metadata: dict, payload: dict) -> tuple[str, list]:
+    ticket_key = _message_string(metadata, payload, "ticketKey", "ticket_key") or extract_ticket_key(user_text)
+    fields = _message_fields(metadata, payload)
+    if not ticket_key or not fields:
+        raise RuntimeError("jira.issue.update requires ticketKey and fields.")
+    for field_name in fields:
+        _require_jira_permission(
+            action=f"issue.update.{field_name}",
+            target=ticket_key,
+            message=message,
+        )
+    result_body, result = PROVIDER.update_issue_fields(ticket_key, fields)
+    if result != "updated":
+        raise RuntimeError(f"Issue update failed for {ticket_key}: {result}")
+    response = {"ticketKey": ticket_key, "result": result, "detail": result_body}
+    return f"Updated Jira issue {ticket_key}.", [
+        _build_json_artifact("jira-issue-update", response, "jira.issue.update", ticketKey=ticket_key)
+    ]
+
+
+def _handle_comment_update_message(message: dict, user_text: str, metadata: dict, payload: dict) -> tuple[str, list]:
+    ticket_key = _message_string(metadata, payload, "ticketKey", "ticket_key") or extract_ticket_key(user_text)
+    comment_id = _message_string(metadata, payload, "commentId", "comment_id") or _extract_comment_id(user_text)
+    comment_text = _message_string(metadata, payload, "commentText", "comment", "text") or _extract_comment_text(user_text)
+    if not ticket_key or not comment_id or not comment_text:
+        raise RuntimeError("jira.comment.update requires ticketKey, commentId, and comment text.")
+    _require_jira_permission(
+        action="comment.update",
+        target=f"{ticket_key}/{comment_id}",
+        message=message,
+        scope="self",
+    )
+    updated_comment_id, result = PROVIDER.update_comment(ticket_key, comment_id, comment_text)
+    if not updated_comment_id:
+        raise RuntimeError(f"Comment update failed for {ticket_key}/{comment_id}: {result}")
+    response = {"ticketKey": ticket_key, "commentId": updated_comment_id, "result": result}
+    return f"Updated comment {updated_comment_id} on {ticket_key}.", [
+        _build_json_artifact("jira-comment-update", response, "jira.comment.update", ticketKey=ticket_key)
+    ]
+
+
+def _handle_comment_delete_message(message: dict, user_text: str, metadata: dict, payload: dict) -> tuple[str, list]:
+    ticket_key = _message_string(metadata, payload, "ticketKey", "ticket_key") or extract_ticket_key(user_text)
+    comment_id = _message_string(metadata, payload, "commentId", "comment_id") or _extract_comment_id(user_text)
+    if not ticket_key or not comment_id:
+        raise RuntimeError("jira.comment.delete requires ticketKey and commentId.")
+    _require_jira_permission(
+        action="comment.delete",
+        target=f"{ticket_key}/{comment_id}",
+        message=message,
+        scope="self",
+    )
+    deleted_comment_id, result = PROVIDER.delete_comment(ticket_key, comment_id)
+    if not deleted_comment_id:
+        raise RuntimeError(f"Comment delete failed for {ticket_key}/{comment_id}: {result}")
+    response = {"ticketKey": ticket_key, "commentId": deleted_comment_id, "result": result}
+    return f"Deleted comment {deleted_comment_id} from {ticket_key}.", [
+        _build_json_artifact("jira-comment-delete", response, "jira.comment.delete", ticketKey=ticket_key)
+    ]
+
+
+def process_message(message):
+    user_text = extract_text(message)
+    metadata = message.get("metadata", {})
+    payload = _parse_message_payload(user_text)
+    capability = str(metadata.get("requestedCapability") or "").strip()
+
+    if capability in ("", "jira.ticket.fetch"):
+        return _handle_ticket_fetch_message(message, user_text, metadata, payload)
+    if capability == "jira.user.myself":
+        return _handle_user_myself_message(message, metadata, payload)
+    if capability == "jira.ticket.transition":
+        return _handle_ticket_transition_message(message, user_text, metadata, payload)
+    if capability == "jira.comment.add":
+        return _handle_comment_add_message(message, user_text, metadata, payload)
+    if capability == "jira.ticket.assignee":
+        return _handle_assignee_message(message, user_text, metadata, payload)
+    if capability == "jira.issue.search":
+        return _handle_issue_search_message(message, user_text, metadata, payload)
+    if capability == "jira.issue.create":
+        return _handle_issue_create_message(message, user_text, metadata, payload)
+    if capability == "jira.issue.update":
+        return _handle_issue_update_message(message, user_text, metadata, payload)
+    if capability == "jira.comment.update":
+        return _handle_comment_update_message(message, user_text, metadata, payload)
+    if capability == "jira.comment.delete":
+        return _handle_comment_delete_message(message, user_text, metadata, payload)
+
+    debug_log(AGENT_ID, "jira.message.unsupported_capability", capability=capability, preview=preview_data(user_text, 200))
+    return _handle_ticket_fetch_message(message, user_text, metadata, payload)
 
 
 class JiraHandler(BaseHTTPRequestHandler):
@@ -495,6 +983,8 @@ class JiraHandler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/jira/tickets/([A-Z][A-Z0-9]+-\d+)", path)
         if m:
             key = m.group(1)
+            if not _enforce_jira_permission(self, action="read", target=key):
+                return
             issue, status = PROVIDER.fetch_issue(key)
             self._send_json(
                 200 if status == "fetched" else 502,
@@ -506,6 +996,8 @@ class JiraHandler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/jira/transitions/([A-Z][A-Z0-9]+-\d+)", path)
         if m:
             key = m.group(1)
+            if not _enforce_jira_permission(self, action="read", target=f"{key}/transitions"):
+                return
             transitions, result = PROVIDER.get_transitions(key)
             self._send_json(
                 200 if result == "ok" else 502,
@@ -515,6 +1007,8 @@ class JiraHandler(BaseHTTPRequestHandler):
 
         # GET /jira/myself
         if path == "/jira/myself":
+            if not _enforce_jira_permission(self, action="read", target="myself"):
+                return
             user, result = PROVIDER.get_myself()
             workspace_path, task_id = _workspace_headers(self)
             _record_workspace_phase(workspace_path, task_id, "Resolved Jira current user", result=result)
@@ -534,6 +1028,8 @@ class JiraHandler(BaseHTTPRequestHandler):
             except ValueError:
                 max_results = 10
             fields = [item.strip() for item in fields_param.split(",") if item.strip()]
+            if not _enforce_jira_permission(self, action="read", target=jql or "search"):
+                return
             body, result = PROVIDER.search_issues(jql, max_results=max_results, fields=fields or None)
             self._send_json(
                 200 if result == "ok" else 502,
@@ -589,6 +1085,13 @@ class JiraHandler(BaseHTTPRequestHandler):
             if not name:
                 self._send_json(400, {"error": "missing transition name"})
                 return
+            if not _enforce_jira_permission(
+                self,
+                action="transition",
+                target=key,
+                payload_permissions=body.get("permissions"),
+            ):
+                return
             tid, result = PROVIDER.transition_issue(key, name)
             _record_workspace_phase(
                 workspace_path,
@@ -613,6 +1116,13 @@ class JiraHandler(BaseHTTPRequestHandler):
             workspace_path, task_id = _workspace_headers(self)
             if not adf and not text:
                 self._send_json(400, {"error": "missing comment text or adf"})
+                return
+            if not _enforce_jira_permission(
+                self,
+                action="comment.add",
+                target=key,
+                payload_permissions=body.get("permissions"),
+            ):
                 return
             cid, result = PROVIDER.add_comment(key, text, adf_body=adf)
             _record_workspace_phase(
@@ -643,6 +1153,13 @@ class JiraHandler(BaseHTTPRequestHandler):
             if not summary:
                 self._send_json(400, {"error": "missing summary"})
                 return
+            if not _enforce_jira_permission(
+                self,
+                action="issue.create",
+                target=project_key,
+                payload_permissions=body.get("permissions"),
+            ):
+                return
             issue_body, result = PROVIDER.create_issue(
                 project_key, summary, issue_type, description, fields
             )
@@ -661,11 +1178,24 @@ class JiraHandler(BaseHTTPRequestHandler):
             key = m.group(1)
             body = self._read_body()
             fields = body.get("fields") if isinstance(body.get("fields"), dict) else {
-                k: v for k, v in body.items() if k not in {"ticketKey"}
+                k: v for k, v in body.items() if k not in {"ticketKey", "permissions"}
             }
             if not fields:
                 self._send_json(400, {"error": "missing fields"})
                 return
+
+            for field_name in fields:
+                action = f"issue.update.{field_name}"
+                if not _enforce_jira_permission(
+                    self,
+                    action=action,
+                    target=key,
+                    payload_permissions=body.get("permissions"),
+                    response_key="field",
+                    response_value=field_name,
+                ):
+                    return
+
             result_body, result = PROVIDER.update_issue_fields(key, fields)
             self._send_json(
                 200 if result == "updated" else 502,
@@ -681,6 +1211,14 @@ class JiraHandler(BaseHTTPRequestHandler):
             text = body.get("text", "")
             if not text:
                 self._send_json(400, {"error": "missing comment text"})
+                return
+            if not _enforce_jira_permission(
+                self,
+                action="comment.update",
+                target=f"{key}/{cid_in}",
+                payload_permissions=body.get("permissions"),
+                scope="self",
+            ):
                 return
             cid, result = PROVIDER.update_comment(key, cid_in, text)
             self._send_json(
@@ -699,6 +1237,13 @@ class JiraHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "missing accountId"})
                 return
             account_id = body.get("accountId")
+            if not _enforce_jira_permission(
+                self,
+                action="assignee.update",
+                target=key,
+                payload_permissions=body.get("permissions"),
+            ):
+                return
             aid, result = PROVIDER.change_assignee(key, account_id)
             _record_workspace_phase(
                 workspace_path,
@@ -722,6 +1267,12 @@ class JiraHandler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/jira/comments/([A-Z][A-Z0-9]+-\d+)/(\w+)", path)
         if m:
             key, cid_in = m.group(1), m.group(2)
+            if not _enforce_jira_permission(
+                self,
+                action="comment.delete",
+                target=f"{key}/{cid_in}",
+            ):
+                return
             cid, result = PROVIDER.delete_comment(key, cid_in)
             self._send_json(
                 200 if cid else 502,

@@ -1,0 +1,25 @@
+{
+  "taskType": "office",
+  "version": "1.0",
+  "description": "Default permissions for office/document tasks (summarize, analyze, organize files).",
+  "allowed": [
+    {
+      "agent": "office",
+      "operations": [
+        {"action": "read", "scope": "task_root", "description": "Read files in the user-specified folder root and its subfolders"}
+      ]
+    }
+  ],
+  "denied": [
+    {
+      "agent": "office",
+      "operations": [
+        {"action": "write", "description": "Write or modify files in the folder"},
+        {"action": "delete", "description": "Delete files or directories"},
+        {"action": "access_outside_root", "description": "Access paths outside the specified folder root"}
+      ],
+      "escalation": "require_user_approval"
+    }
+  ],
+  "fallback": "deny_and_escalate"
+}

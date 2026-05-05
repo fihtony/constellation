@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +35,11 @@ from common.per_task_exit import PerTaskExitHandler
 from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt, load_rules
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.task_permissions import (
+    PermissionEscalationRequired,
+    build_permission_denied_artifact,
+    extract_permission_denial,
+)
 from common.task_store import TaskStore
 from common.time_utils import local_clock_time, local_iso_timestamp
 from android import prompts
@@ -133,7 +140,8 @@ def _read_workspace_json(workspace_path: str, relative_name: str) -> dict:
 
 def _append_workspace_event(workspace_path: str, relative_name: str, event: dict) -> None:
     payload = _read_workspace_json(workspace_path, relative_name)
-    events = payload.get("events") if isinstance(payload.get("events"), list) else []
+    raw_events = payload.get("events")
+    events = raw_events if isinstance(raw_events, list) else []
     events.append(event)
     payload["events"] = events
     _save_workspace_file(
@@ -207,6 +215,8 @@ def _call_sync_agent(
     task_id: str,
     workspace_path: str,
     compass_task_id: str,
+    permissions: dict | None = None,
+    extra_metadata: dict | None = None,
 ) -> dict:
     agent_url = _resolve_agent_service_url(capability)
     message = {
@@ -219,15 +229,26 @@ def _call_sync_agent(
             "sharedWorkspacePath": workspace_path,
         },
     }
+    if isinstance(permissions, dict) and permissions:
+        message["metadata"]["permissions"] = permissions
+    if isinstance(extra_metadata, dict) and extra_metadata:
+        message["metadata"].update(extra_metadata)
     downstream = _a2a_send(agent_url, message)
     task_id_ds = downstream.get("id", "")
     state = downstream.get("status", {}).get("state", "")
     terminal = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED"}
     if state in terminal:
+        details = extract_permission_denial(downstream)
+        if state in {"TASK_STATE_FAILED", "FAILED"} and details is not None:
+            raise PermissionEscalationRequired(details)
         return downstream
     if task_id_ds:
         result = _poll_task(agent_url, task_id_ds, timeout=SYNC_AGENT_TIMEOUT)
         if result:
+            details = extract_permission_denial(result)
+            result_state = result.get("status", {}).get("state", "")
+            if result_state in {"TASK_STATE_FAILED", "FAILED"} and details is not None:
+                raise PermissionEscalationRequired(details)
             return result
     return downstream
 
@@ -240,32 +261,76 @@ def _jira_request_json(
     payload: dict | None = None,
     workspace: str = "",
     task_id: str = "",
+    compass_task_id: str = "",
     timeout: int = 30,
+    permissions: dict | None = None,
 ) -> dict:
-    headers = {"Accept": "application/json"}
-    if payload is not None:
-        headers["Content-Type"] = "application/json; charset=utf-8"
-    if workspace:
-        headers["X-Shared-Workspace-Path"] = workspace
-    if task_id:
-        headers["X-Orchestrator-Task-Id"] = task_id
-    headers["X-Agent-Id"] = AGENT_ID
-    service_url = _resolve_agent_service_url(capability)
-    request = Request(
-        f"{service_url}{path}",
-        data=(json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None),
-        headers=headers,
-        method=method,
+    request_payload = dict(payload) if isinstance(payload, dict) else {}
+    normalized_path = urlparse(path).path
+    ticket_match = re.search(r"/jira/(?:tickets|transitions|comments|assignee)/([A-Z][A-Z0-9]+-\d+)", normalized_path)
+    ticket_key = ticket_match.group(1) if ticket_match else ""
+    extra_metadata: dict = {}
+    if ticket_key:
+        extra_metadata["ticketKey"] = ticket_key
+
+    if capability == "jira.ticket.fetch":
+        message_text = f"Fetch Jira ticket {ticket_key}".strip()
+    elif capability == "jira.user.myself":
+        message_text = "Get current Jira user"
+    elif capability == "jira.ticket.transition":
+        transition = str(request_payload.get("transition") or "").strip()
+        if transition:
+            extra_metadata["transition"] = transition
+        message_text = f"Transition ticket {ticket_key} to {transition}".strip()
+    elif capability == "jira.ticket.assignee":
+        account_id = str(request_payload.get("accountId") or "").strip()
+        if account_id:
+            extra_metadata["accountId"] = account_id
+        message_text = f"Assign ticket {ticket_key} to accountId {account_id}".strip()
+    elif capability == "jira.comment.add":
+        adf_body = request_payload.get("adf") if isinstance(request_payload.get("adf"), dict) else None
+        if adf_body:
+            extra_metadata["adf"] = adf_body
+            message_text = f"Add structured comment to ticket {ticket_key}".strip()
+        else:
+            comment_text = str(request_payload.get("text") or request_payload.get("comment") or "").strip()
+            if comment_text:
+                extra_metadata["commentText"] = comment_text
+            message_text = f"Add comment to ticket {ticket_key}: {comment_text}".strip()
+    else:
+        raise RuntimeError(f"Unsupported Jira A2A capability: {capability}")
+
+    result = _call_sync_agent(
+        capability,
+        message_text,
+        task_id,
+        workspace,
+        compass_task_id or task_id,
+        permissions=permissions,
+        extra_metadata=extra_metadata,
     )
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-            return json.loads(raw) if raw.strip() else {}
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {body[:300]}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"network error: {exc.reason}") from exc
+    state = str((result.get("status") or {}).get("state") or "").strip()
+    if state in {"TASK_STATE_FAILED", "FAILED"}:
+        status_text = extract_text((result.get("status") or {}).get("message") or {}).strip()
+        raise RuntimeError(status_text or f"{capability} failed")
+
+    for artifact in result.get("artifacts", []):
+        text = artifact_text(artifact)
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if capability == "jira.ticket.fetch":
+            if artifact.get("name") == "jira-raw-payload":
+                return {"issue": data}
+            if isinstance(data, dict) and "issue" in data:
+                return data
+            continue
+        if isinstance(data, dict):
+            return data
+    return {"issue": {}} if capability == "jira.ticket.fetch" else {}
 
 
 def _notify_callback(
@@ -320,7 +385,8 @@ def _apply_task_exit_rule(task_id: str, exit_rule: dict) -> None:
 # Jira helpers (via boundary Jira Agent)
 # ---------------------------------------------------------------------------
 
-def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_task_id: str) -> str:
+def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_task_id: str,
+                        permissions: dict | None = None) -> str:
     try:
         result = _jira_request_json(
             "jira.ticket.fetch",
@@ -328,6 +394,8 @@ def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_t
             f"/jira/tickets/{ticket_key}",
             workspace=workspace,
             task_id=task_id,
+            compass_task_id=compass_task_id,
+            permissions=permissions,
         )
         issue = result.get("issue") or {}
         content = json.dumps(issue, ensure_ascii=False, indent=2) if issue else ""
@@ -341,7 +409,8 @@ def _fetch_jira_context(task_id: str, ticket_key: str, workspace: str, compass_t
         return ""
 
 
-def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspace: str, compass_task_id: str):
+def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspace: str, compass_task_id: str,
+                     permissions: dict | None = None):
     try:
         _jira_request_json(
             "jira.ticket.transition",
@@ -350,6 +419,8 @@ def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspac
             payload={"transition": target_status},
             workspace=workspace,
             task_id=task_id,
+            compass_task_id=compass_task_id,
+            permissions=permissions,
         )
         print(f"[{AGENT_ID}] Jira {ticket_key} transitioned to '{target_status}'")
         _record_jira_action(workspace, compass_task_id or task_id, ticket_key, "transition", "completed",
@@ -360,7 +431,8 @@ def _jira_transition(ticket_key: str, target_status: str, task_id: str, workspac
                             agent_task_id=task_id, targetStatus=target_status, error=str(err))
 
 
-def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_task_id: str):
+def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_task_id: str,
+                      permissions: dict | None = None):
     try:
         response = _jira_request_json(
             "jira.user.myself",
@@ -368,6 +440,8 @@ def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_tas
             "/jira/myself",
             workspace=workspace,
             task_id=task_id,
+            compass_task_id=compass_task_id,
+            permissions=permissions,
         )
         user = response.get("user") or {}
         account_id = user.get("accountId") or ""
@@ -380,6 +454,8 @@ def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_tas
             payload={"accountId": account_id},
             workspace=workspace,
             task_id=task_id,
+            compass_task_id=compass_task_id,
+            permissions=permissions,
         )
         print(f"[{AGENT_ID}] Jira {ticket_key} assigned to service account")
         _record_jira_action(workspace, compass_task_id or task_id, ticket_key, "assign", "completed",
@@ -390,7 +466,8 @@ def _jira_assign_self(ticket_key: str, task_id: str, workspace: str, compass_tas
                             agent_task_id=task_id, error=str(err))
 
 
-def _jira_add_comment(ticket_key: str, comment: str, task_id: str, workspace: str, compass_task_id: str):
+def _jira_add_comment(ticket_key: str, comment: str, task_id: str, workspace: str, compass_task_id: str,
+                      permissions: dict | None = None):
     try:
         _jira_request_json(
             "jira.comment.add",
@@ -399,6 +476,8 @@ def _jira_add_comment(ticket_key: str, comment: str, task_id: str, workspace: st
             payload={"text": comment},
             workspace=workspace,
             task_id=task_id,
+            compass_task_id=compass_task_id,
+            permissions=permissions,
         )
         print(f"[{AGENT_ID}] Jira {ticket_key} comment added")
         _record_jira_action(workspace, compass_task_id or task_id, ticket_key, "comment", "completed",
@@ -426,13 +505,15 @@ def _record_jira_action(workspace_path, workflow_task_id, ticket_key, action, st
 # SCM helpers (via boundary SCM Agent)
 # ---------------------------------------------------------------------------
 
-def _clone_repo(task_id: str, repo_url: str, workspace: str, compass_task_id: str) -> str:
+def _clone_repo(task_id: str, repo_url: str, workspace: str, compass_task_id: str,
+                permissions: dict | None = None) -> str:
     result = _call_sync_agent(
         "scm.git.clone",
         f"Clone repository {repo_url} to {workspace}",
         task_id,
         workspace,
         compass_task_id,
+        permissions=permissions,
     )
     for art in result.get("artifacts", []):
         text = artifact_text(art)
@@ -455,7 +536,8 @@ def _clone_repo(task_id: str, repo_url: str, workspace: str, compass_task_id: st
     raise RuntimeError(f"SCM clone did not return a clone path for {repo_url}")
 
 
-def _list_remote_branches(task_id: str, repo_url: str, workspace: str, compass_task_id: str) -> set:
+def _list_remote_branches(task_id: str, repo_url: str, workspace: str, compass_task_id: str,
+                          permissions: dict | None = None) -> set:
     """Return the set of remote branch names from the SCM agent (best-effort)."""
     try:
         result = _call_sync_agent(
@@ -464,6 +546,7 @@ def _list_remote_branches(task_id: str, repo_url: str, workspace: str, compass_t
             task_id,
             workspace,
             compass_task_id,
+            permissions=permissions,
         )
         for art in result.get("artifacts", []):
             text = artifact_text(art)
@@ -496,7 +579,8 @@ def _unique_branch_name(base: str, remote_branches: set) -> str:
 
 
 def _create_branch(task_id: str, repo_url: str, branch_name: str, base_branch: str,
-                    workspace: str, compass_task_id: str) -> bool:
+                    workspace: str, compass_task_id: str,
+                    permissions: dict | None = None) -> bool:
     try:
         result = _call_sync_agent(
             "scm.branch.create",
@@ -504,6 +588,7 @@ def _create_branch(task_id: str, repo_url: str, branch_name: str, base_branch: s
             task_id,
             workspace,
             compass_task_id,
+            permissions=permissions,
         )
         state = result.get("status", {}).get("state", "")
         return state in ("TASK_STATE_COMPLETED", "COMPLETED")
@@ -521,6 +606,7 @@ def _push_files(
     workspace: str,
     compass_task_id: str,
     base_branch: str = "main",
+    permissions: dict | None = None,
 ) -> bool:
     # Extract owner/repo for structured payload
     owner, repo = "", ""
@@ -554,6 +640,8 @@ def _push_files(
                 },
             },
         }
+        if isinstance(permissions, dict) and permissions:
+            message["metadata"]["permissions"] = permissions
         downstream = _a2a_send(scm_service_url, message)
         task_id_ds = downstream.get("id", "")
         state = downstream.get("status", {}).get("state", "")
@@ -583,18 +671,53 @@ def _create_pr(
     pr_body: str,
     workspace: str,
     compass_task_id: str,
+    permissions: dict | None = None,
 ) -> str:
     safe_base = _sanitize_base_branch(base_branch)
     owner, repo = "", ""
     m = re.search(r"github\.com/([^/\s]+)/([^/\s?#]+)", repo_url or "")
     if m:
         owner = m.group(1)
-        repo = m.group(2).rstrip(".git")
+        repo = m.group(2)
+        if repo.endswith(".git"):
+            repo = repo[:-4]
     if not owner:
         m = re.search(r"/projects/([^/]+)/repos/([^/\s?#]+)", repo_url or "")
         if m:
             owner = m.group(1)
             repo = m.group(2)
+
+    def _extract_pr_url_from_payload(payload: dict | None) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else payload
+        if not isinstance(detail, dict):
+            return ""
+        links = detail.get("links") or {}
+        self_links = links.get("self") or []
+        if isinstance(self_links, list) and self_links and isinstance(self_links[0], dict):
+            href = str(self_links[0].get("href") or "").strip()
+            if href:
+                return href
+        return str(
+            detail.get("htmlUrl")
+            or detail.get("html_url")
+            or detail.get("pr_url")
+            or detail.get("prUrl")
+            or detail.get("url")
+            or ""
+        ).strip()
+
+    def _extract_pr_url_from_text(text: str) -> str:
+        if not text:
+            return ""
+        try:
+            return _extract_pr_url_from_payload(json.loads(text))
+        except Exception:
+            pass
+        url_match = re.search(r"https?://[^\s)>'\"]+", text)
+        return url_match.group(0) if url_match else ""
+
     try:
         scm_service_url = _resolve_agent_service_url("scm.pr.create")
         message = {
@@ -620,6 +743,8 @@ def _create_pr(
                 },
             },
         }
+        if isinstance(permissions, dict) and permissions:
+            message["metadata"]["permissions"] = permissions
         downstream = _a2a_send(scm_service_url, message)
         task_id_ds = downstream.get("id", "")
         state = downstream.get("status", {}).get("state", "")
@@ -628,22 +753,17 @@ def _create_pr(
             result = _poll_task(scm_service_url, task_id_ds, timeout=SYNC_AGENT_TIMEOUT)
             if result:
                 downstream = result
+        status_text = extract_text((downstream.get("status") or {}).get("message") or {})
+        status_url = _extract_pr_url_from_text(status_text)
+        if status_url:
+            return status_url
         for art in (downstream.get("artifacts") or []):
-            text = artifact_text(art)
-            if text:
-                try:
-                    data = json.loads(text)
-                    url = (
-                        data.get("htmlUrl") or data.get("html_url")
-                        or data.get("pr_url") or data.get("prUrl")
-                        or data.get("url") or ""
-                    )
-                    if url:
-                        return url
-                except Exception:
-                    url_match = re.search(r"https?://\S+", text)
-                    if url_match:
-                        return url_match.group()
+            metadata_url = _extract_pr_url_from_payload(art.get("metadata") or {})
+            if metadata_url:
+                return metadata_url
+            text_url = _extract_pr_url_from_text(artifact_text(art))
+            if text_url:
+                return text_url
         return ""
     except Exception as err:
         print(f"[{AGENT_ID}] Could not create PR: {err}")
@@ -658,6 +778,230 @@ def _sanitize_base_branch(branch: str) -> str:
     if re.search(r"[\s~^:?*\[\\]", branch):
         return "main"
     return branch
+
+
+def _run_local_git(repo_dir: str, args: list[str], *, check: bool = True) -> tuple[bool, str]:
+    env = build_isolated_git_env(scope=f"{AGENT_ID}-local-git")
+    result = subprocess.run(
+        ["git", "-c", "credential.helper=", *args],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    output = (result.stdout or result.stderr or "").strip()
+    if check and result.returncode != 0:
+        raise RuntimeError(output or f"git {' '.join(args)} failed")
+    return result.returncode == 0, output
+
+
+def _local_branch_exists(repo_dir: str, branch_name: str) -> bool:
+    ok, _ = _run_local_git(
+        repo_dir,
+        ["show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+        check=False,
+    )
+    return ok
+
+
+def _detect_local_default_branch(repo_dir: str) -> str:
+    ok, output = _run_local_git(
+        repo_dir,
+        ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        check=False,
+    )
+    if ok and output and "/" in output:
+        return output.rsplit("/", 1)[-1].strip() or "main"
+    return "main"
+
+
+def _checkout_local_branch(repo_dir: str, branch_name: str, base_branch: str, log_fn) -> None:
+    if _local_branch_exists(repo_dir, branch_name):
+        _run_local_git(repo_dir, ["checkout", branch_name])
+        log_fn(f"Checked out existing local branch: {branch_name}")
+        return
+
+    ok, output = _run_local_git(repo_dir, ["checkout", "-B", branch_name, base_branch], check=False)
+    if not ok:
+        ok, output = _run_local_git(repo_dir, ["checkout", "-b", branch_name], check=False)
+    if not ok:
+        raise RuntimeError(output or f"Could not create local branch {branch_name}")
+    log_fn(f"Created local branch: {branch_name}")
+
+
+def _commit_local_changes(repo_dir: str, branch_name: str, files: list[dict], commit_message: str, log_fn) -> str:
+    _run_local_git(repo_dir, ["config", "user.email", "android-agent@local"], check=False)
+    _run_local_git(repo_dir, ["config", "user.name", "Android Agent"], check=False)
+
+    staged_any = False
+    for file_info in files:
+        rel_path = file_info.get("path", "").lstrip("/")
+        if not rel_path:
+            continue
+        _run_local_git(repo_dir, ["add", "--", rel_path], check=False)
+        staged_any = True
+
+    if not staged_any:
+        return ""
+
+    ok, status_output = _run_local_git(repo_dir, ["status", "--porcelain"], check=False)
+    if not ok or not status_output.strip():
+        ok, head_output = _run_local_git(repo_dir, ["rev-parse", "HEAD"], check=False)
+        return head_output.strip() if ok else ""
+
+    _run_local_git(repo_dir, ["commit", "-m", commit_message])
+    _, head_output = _run_local_git(repo_dir, ["rev-parse", "HEAD"])
+    commit_sha = head_output.strip()
+    log_fn(f"Committed local changes on {branch_name}: {commit_sha[:12]}")
+    return commit_sha
+
+
+def _write_files_to_directory(base_dir: str, files: list[dict]) -> list[str]:
+    if not base_dir:
+        return []
+    os.makedirs(base_dir, exist_ok=True)
+    written: list[str] = []
+    for file_info in files:
+        rel_path = file_info.get("path", "output.txt").lstrip("/")
+        full_path = os.path.join(base_dir, rel_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        content = file_info.get("content", "")
+        with open(full_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        written.append(full_path)
+    return written
+
+
+def _ensure_gradle_wrapper_executable(build_dir: str) -> str:
+    wrapper = os.path.join(build_dir, "gradlew")
+    if os.path.isfile(wrapper):
+        current_mode = os.stat(wrapper).st_mode
+        os.chmod(wrapper, current_mode | 0o111)
+        return "./gradlew"
+    return "gradle"
+
+
+def _resolve_android_sdk_dir() -> str:
+    for key in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _android_gradle_env() -> dict[str, str]:
+    env = dict(os.environ)
+    sdk_dir = _resolve_android_sdk_dir()
+    if sdk_dir:
+        env.setdefault("ANDROID_HOME", sdk_dir)
+        env.setdefault("ANDROID_SDK_ROOT", sdk_dir)
+    env["CI"] = "true"
+    return env
+
+
+def _prepare_android_local_properties(build_dir: str, log_fn) -> str:
+    sdk_dir = _resolve_android_sdk_dir()
+    if not sdk_dir:
+        log_fn("ANDROID_HOME/ANDROID_SDK_ROOT is not configured; Gradle may not find the Android SDK")
+        return ""
+
+    local_properties_path = os.path.join(build_dir, "local.properties")
+    desired_line = f"sdk.dir={sdk_dir}"
+    existing = ""
+    if os.path.isfile(local_properties_path):
+        try:
+            with open(local_properties_path, encoding="utf-8") as fh:
+                existing = fh.read().strip()
+        except OSError:
+            existing = ""
+        if desired_line in existing.splitlines():
+            return sdk_dir
+
+    with open(local_properties_path, "w", encoding="utf-8") as fh:
+        fh.write(f"{desired_line}\n")
+    log_fn(f"Prepared Android SDK local.properties using {sdk_dir}")
+    return sdk_dir
+
+
+def _detect_android_build_steps(build_dir: str) -> list[dict]:
+    gradle_cmd = _ensure_gradle_wrapper_executable(build_dir)
+    tasks_result = subprocess.run(
+        [gradle_cmd, "tasks", "--all"],
+        cwd=build_dir,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+        env=_android_gradle_env(),
+    )
+    tasks_text = f"{tasks_result.stdout}\n{tasks_result.stderr}".lower()
+    steps: list[dict] = []
+
+    if "testdebugunittest" in tasks_text:
+        steps.append({"cmd": [gradle_cmd, "testDebugUnitTest"], "label": "android:testDebugUnitTest"})
+    elif re.search(r"(?m)^test\b", tasks_text):
+        steps.append({"cmd": [gradle_cmd, "test"], "label": "android:test"})
+    elif re.search(r"(?m)^check\b", tasks_text):
+        steps.append({"cmd": [gradle_cmd, "check"], "label": "android:check"})
+
+    if "assembledebug" in tasks_text:
+        steps.append({"cmd": [gradle_cmd, "assembleDebug"], "label": "android:assembleDebug"})
+    elif re.search(r"(?m)^assemble\b", tasks_text):
+        steps.append({"cmd": [gradle_cmd, "assemble"], "label": "android:assemble"})
+    elif re.search(r"(?m)^build\b", tasks_text):
+        steps.append({"cmd": [gradle_cmd, "build"], "label": "android:build"})
+
+    if not steps and os.path.isfile(os.path.join(build_dir, "gradlew")):
+        steps = [
+            {"cmd": [gradle_cmd, "testDebugUnitTest"], "label": "android:testDebugUnitTest"},
+            {"cmd": [gradle_cmd, "assembleDebug"], "label": "android:assembleDebug"},
+        ]
+    return steps
+
+
+def _build_and_test_android(build_dir: str, log_fn) -> tuple[bool, str, list[dict]]:
+    if not os.path.isdir(build_dir):
+        return False, "Build directory is missing.", [{"attempt": 1, "success": False, "output": "Build directory is missing."}]
+
+    if not os.path.isfile(os.path.join(build_dir, "gradlew")) and not os.path.isfile(os.path.join(build_dir, "build.gradle")) and not os.path.isfile(os.path.join(build_dir, "build.gradle.kts")):
+        return False, "No Gradle wrapper or build file found.", [{"attempt": 1, "success": False, "output": "No Gradle wrapper or build file found."}]
+
+    try:
+        steps = _detect_android_build_steps(build_dir)
+    except Exception as exc:
+        return False, f"Could not inspect Gradle tasks: {exc}", [{"attempt": 1, "success": False, "output": f"Could not inspect Gradle tasks: {exc}"}]
+
+    if not steps:
+        return False, "No usable Gradle build/test tasks found.", [{"attempt": 1, "success": False, "output": "No usable Gradle build/test tasks found."}]
+
+    _prepare_android_local_properties(build_dir, log_fn)
+    attempts: list[dict] = []
+    outputs: list[str] = []
+    for index, step in enumerate(steps, start=1):
+        log_fn(f"Build/test step {index}/{len(steps)}: {step['label']}")
+        result = subprocess.run(
+            step["cmd"],
+            cwd=build_dir,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+            env=_android_gradle_env(),
+        )
+        output = (result.stdout + "\n" + result.stderr).strip()
+        outputs.append(f"$ {' '.join(step['cmd'])}\n{output}".strip())
+        attempts.append(
+            {
+                "attempt": index,
+                "label": step["label"],
+                "success": result.returncode == 0,
+                "output": output[:4000],
+            }
+        )
+        if result.returncode != 0:
+            return False, "\n\n".join(outputs), attempts
+    return True, "\n\n".join(outputs), attempts
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +1223,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
     design_context_meta: dict = metadata.get("designContext") or {}
     metadata_repo_url: str = metadata.get("targetRepoUrl", "")
     exit_rule = PerTaskExitHandler.parse(metadata)
+    permissions: dict | None = metadata.get("permissions") if isinstance(metadata.get("permissions"), dict) else None
 
     task_instruction = extract_text(message) or ""
     final_artifacts: list = []
@@ -886,6 +1231,9 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
     clone_path = ""
     branch_name = ""
     pr_url = ""
+    local_commit_sha = ""
+    build_ok: bool | None = None
+    build_output = ""
     agent_workspace = os.path.join(workspace, AGENT_ID) if workspace else ""
     runtime_config = {
         "runtime": summarize_runtime_configuration(),
@@ -909,7 +1257,9 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     "repoUrl": repo_url,
                     "clonePath": clone_path,
                     "branch": branch_name,
+                    "localCommit": local_commit_sha,
                     "prUrl": pr_url,
+                    "buildPassed": build_ok,
                     "runtimeConfig": runtime_config,
                     "updatedAt": local_iso_timestamp(),
                 },
@@ -962,7 +1312,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                 ticket_key = ticket_match.group(1)
         if ticket_key and workspace:
             log(f"Fetching Jira context for {ticket_key}")
-            jira_content = _fetch_jira_context(task_id, ticket_key, workspace, compass_task_id)
+            jira_content = _fetch_jira_context(task_id, ticket_key, workspace, compass_task_id, permissions=permissions)
             if jira_content:
                 log(f"Jira ticket {ticket_key} fetched ({len(jira_content)} chars)")
                 task_instruction = (
@@ -972,8 +1322,8 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             # Mark ticket In Progress
             if not is_revision:
                 log(f"Updating Jira ticket {ticket_key}: In Progress")
-                _jira_transition(ticket_key, "In Progress", task_id, workspace, compass_task_id)
-                _jira_assign_self(ticket_key, task_id, workspace, compass_task_id)
+                _jira_transition(ticket_key, "In Progress", task_id, workspace, compass_task_id, permissions=permissions)
+                _jira_assign_self(ticket_key, task_id, workspace, compass_task_id, permissions=permissions)
                 _jira_add_comment(
                     ticket_key,
                     f"[Android Agent] ({AGENT_ID}) has picked up this ticket and started development.\n"
@@ -981,6 +1331,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
                     task_id,
                     workspace,
                     compass_task_id,
+                    permissions=permissions,
                 )
 
         # Extract repo URL from instruction or metadata
@@ -1000,7 +1351,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         if repo_url and workspace and not clone_path:
             log(f"Cloning repository: {repo_url}")
             try:
-                clone_path = _clone_repo(task_id, repo_url, workspace, compass_task_id)
+                clone_path = _clone_repo(task_id, repo_url, workspace, compass_task_id, permissions=permissions)
             except Exception as err:
                 _save_workspace_file(
                     workspace,
@@ -1130,16 +1481,17 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
 
         log(f"Generated {len(impl_files)} file(s), {len(impl_files_to_delete)} deletion(s)")
 
-        # ── Phase 4: Push files and create PR ────────────────────────────────
-        task_store.update_state(task_id, "PUSHING", "Pushing files and creating PR…")
+        # ── Phase 4: Prepare local branch, validate, push, and create PR ────
+        task_store.update_state(task_id, "PUSHING", "Preparing local branch, validating, and creating PR…")
 
         # Determine branch name
         if not branch_name:
-            branch_name = f"agent/feature/{ticket_key or f'android-task-{task_id}'}"
+            branch_seed = re.sub(r"[^A-Za-z0-9._-]+", "-", ticket_key or f"android-task-{workflow_task_id}").strip("-._")
+            branch_name = f"feature/{branch_seed or workflow_task_id}"
 
         # Determine base branch from repo or use main
-        base_branch = "main"
-        if repo_snapshot:
+        base_branch = _detect_local_default_branch(clone_path) if clone_path else "main"
+        if base_branch == "main" and repo_snapshot:
             for line in repo_snapshot.split("\n"):
                 if "defaultBranch" in line:
                     parts = line.split(":")
@@ -1152,19 +1504,80 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         # Deduplicate: append _<n> if the branch already exists remotely.
         # Skip this in revision mode — the branch was already created; reuse it.
         if not is_revision:
-            remote_branches = _list_remote_branches(task_id, repo_url, workspace, compass_task_id)
+            remote_branches = _list_remote_branches(task_id, repo_url, workspace, compass_task_id, permissions=permissions)
             branch_name = _unique_branch_name(branch_name, remote_branches)
 
         log(f"Branch: {branch_name} (base: {base_branch})")
 
+        local_branch_prepared = False
+        if clone_path:
+            _checkout_local_branch(clone_path, branch_name, base_branch, log)
+            local_branch_prepared = True
+            written_clone_paths = _write_files_to_directory(clone_path, impl_files)
+            log(f"Wrote {len(written_clone_paths)} file(s) into cloned repository")
+
         # Create branch
-        _create_branch(task_id, repo_url, branch_name, base_branch, workspace, compass_task_id)
+        _create_branch(task_id, repo_url, branch_name, base_branch, workspace, compass_task_id, permissions=permissions)
+
+        _save_workspace_file(
+            workspace,
+            f"{AGENT_ID}/branch-info.json",
+            json.dumps(
+                {
+                    "taskId": workflow_task_id,
+                    "agentTaskId": task_id,
+                    "agentId": AGENT_ID,
+                    "branch": branch_name,
+                    "baseBranch": base_branch,
+                    "repoUrl": repo_url,
+                    "clonePath": clone_path,
+                    "localBranchPrepared": local_branch_prepared,
+                    "localCommit": local_commit_sha,
+                    "prUrl": pr_url,
+                    "buildPassed": build_ok,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
+        task_store.update_state(task_id, "BUILDING", "Running Android build and tests…")
+        if clone_path:
+            build_ok, build_output, build_attempts = _build_and_test_android(clone_path, log)
+        else:
+            build_ok, build_output, build_attempts = False, "No cloned repository available for build/test.", [
+                {"attempt": 1, "success": False, "output": "No cloned repository available for build/test."}
+            ]
+        _save_workspace_file(
+            workspace,
+            f"{AGENT_ID}/test-results.json",
+            json.dumps(
+                {
+                    "taskId": workflow_task_id,
+                    "agentTaskId": task_id,
+                    "agentId": AGENT_ID,
+                    "buildDir": clone_path,
+                    "passed": build_ok,
+                    "attempts": build_attempts,
+                    "finalOutput": (build_output or "")[:4000],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        if build_ok:
+            log("Build/tests passed")
+        else:
+            log(f"Build/tests failed or were incomplete: {(build_output or '')[:200]}")
 
         # Push files
         commit_msg = f"feat({ticket_key}): {impl_goal} [android-agent]"
+        if clone_path and local_branch_prepared:
+            local_commit_sha = _commit_local_changes(clone_path, branch_name, impl_files, commit_msg, log)
         push_ok = _push_files(
             task_id, repo_url, branch_name, impl_files,
             commit_msg, workspace, compass_task_id, base_branch,
+            permissions=permissions,
         )
         if not push_ok:
             raise RuntimeError(f"Failed to push files to {branch_name}")
@@ -1176,18 +1589,32 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             workspace,
             f"{AGENT_ID}/branch-info.json",
             json.dumps(
-                {"taskId": workflow_task_id, "agentId": AGENT_ID,
-                 "branch": branch_name, "baseBranch": base_branch,
-                 "repoUrl": repo_url},
+                {
+                    "taskId": workflow_task_id,
+                    "agentTaskId": task_id,
+                    "agentId": AGENT_ID,
+                    "branch": branch_name,
+                    "baseBranch": base_branch,
+                    "repoUrl": repo_url,
+                    "clonePath": clone_path,
+                    "localBranchPrepared": local_branch_prepared,
+                    "localCommit": local_commit_sha,
+                    "prUrl": pr_url,
+                    "buildPassed": build_ok,
+                },
                 ensure_ascii=False, indent=2,
             ),
         )
 
         # Create PR
         pr_title = f"[{ticket_key}] {impl_goal}" if ticket_key else impl_goal
+        test_status = "✅ Build/tests passed" if build_ok else f"⚠️ Build/tests had issues\n{(build_output or '')[:800]}"
+        if "## Testing" not in impl_pr_desc:
+            impl_pr_desc = f"{impl_pr_desc}\n\n## Testing\n- {test_status}"
         pr_url = _create_pr(
             task_id, repo_url, branch_name, base_branch,
             pr_title, impl_pr_desc, workspace, compass_task_id,
+            permissions=permissions,
         )
         log(f"PR created: {pr_url or '(URL not captured)'}")
 
@@ -1201,9 +1628,13 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             repoUrl=repo_url,
             branch=branch_name,
             baseBranch=base_branch,
+            clonePath=clone_path,
+            localCommit=local_commit_sha,
+            buildPassed=build_ok,
             prUrl=pr_url,
             url=pr_url,          # alias expected by review evidence loader
             prTitle=pr_title,
+            prBody=impl_pr_desc,
             filesChanged=changed_files,
             generatedFiles=changed_files,  # alias expected by review evidence loader
             filesDeleted=impl_files_to_delete,
@@ -1214,15 +1645,16 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
 
         jira_in_review = False
         if ticket_key:
-            _jira_transition(ticket_key, "In Review", task_id, workspace, compass_task_id)
+            _jira_transition(ticket_key, "In Review", task_id, workspace, compass_task_id, permissions=permissions)
             jira_in_review = True
             _jira_add_comment(
                 ticket_key,
                 f"[Android Agent] Implementation complete — PR raised.\n"
-                f"Branch: {branch_name}\nPR: {pr_url or '(pending)'}",
+                f"Branch: {branch_name}\nPR: {pr_url or '(pending)'}\n{test_status}",
                 task_id,
                 workspace,
                 compass_task_id,
+                permissions=permissions,
             )
 
         # Build summary
@@ -1273,8 +1705,15 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         print(f"[{AGENT_ID}] {error_msg}")
         audit_log("TASK_FAILED", task_id=task_id, error=str(exc))
 
+        failure_artifacts = []
+        if isinstance(exc, PermissionEscalationRequired):
+            failure_artifacts = [build_permission_denied_artifact(exc.details, agent_id=AGENT_ID)]
+
         task_store.update_state(task_id, "TASK_STATE_FAILED", error_msg)
-        _notify_callback(callback_url, task_id, "TASK_STATE_FAILED", error_msg)
+        task = task_store.get(task_id)
+        if task:
+            task.artifacts = failure_artifacts
+        _notify_callback(callback_url, task_id, "TASK_STATE_FAILED", error_msg, failure_artifacts)
 
     finally:
         if exit_rule:

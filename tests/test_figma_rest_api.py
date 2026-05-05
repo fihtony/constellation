@@ -40,7 +40,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 
 
 def _env(key: str, fallback: str = "") -> str:
-    return os.environ.get(key) or _ENV.get(key, fallback)
+    return _ENV.get(key, fallback)
 
 
 def _parse_figma_file_url(url: str) -> str:
@@ -53,8 +53,8 @@ def _parse_figma_file_url(url: str) -> str:
 
 
 _figma_file_url = _env("TEST_FIGMA_FILE_URL")
-FIGMA_FILE_URL = _figma_file_url or "https://www.figma.com/design/your-file-key/Test-File"
-FIGMA_FILE_KEY = _parse_figma_file_url(_figma_file_url) if _figma_file_url else "your-file-key"
+FIGMA_FILE_URL = _figma_file_url
+FIGMA_FILE_KEY = _parse_figma_file_url(_figma_file_url) if _figma_file_url else ""
 FIGMA_API_BASE = "https://api.figma.com/v1"
 
 
@@ -64,7 +64,7 @@ FIGMA_API_BASE = "https://api.figma.com/v1"
 
 def _figma_token() -> str:
     # ONLY from tests/.env — raise if missing
-    token = _env("TEST_FIGMA_TOKEN") or os.environ.get("FIGMA_TOKEN", "")
+    token = _env("TEST_FIGMA_TOKEN")
     if not token:
         raise SystemExit("ERROR: TEST_FIGMA_TOKEN not set in tests/.env — cannot run tests")
     return token
@@ -100,7 +100,7 @@ def _figma_get(path: str, token: str, timeout: int = 20):
 # ---------------------------------------------------------------------------
 
 def test_figma_url_parseable(reporter: Reporter) -> None:
-    assert FIGMA_FILE_KEY not in ("", "your-file-key"), \
+    assert FIGMA_FILE_KEY, \
         "FIGMA_FILE_KEY not configured — set TEST_FIGMA_FILE_URL in tests/.env"
     assert FIGMA_FILE_KEY in FIGMA_FILE_URL, "file key not found in Figma URL"
     reporter.ok(f"Figma file URL is well-formed — file key: {FIGMA_FILE_KEY}")
@@ -244,7 +244,7 @@ def main(argv=None):
     print(f"  File key : {FIGMA_FILE_KEY}")
 
     reporter.section("Static / dry-run checks")
-    if FIGMA_FILE_KEY not in ("", "your-file-key"):
+    if FIGMA_FILE_KEY:
         test_figma_url_parseable(reporter)
     else:
         reporter.skip("Figma URL check", "TEST_FIGMA_FILE_URL not set in tests/.env")

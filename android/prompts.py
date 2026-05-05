@@ -95,6 +95,8 @@ Additional context from upstream agents:
 YOUR TASK
 ---------
 Implement EXACTLY what the Jira ticket asks for — nothing more, nothing less.
+Treat the additional context from upstream agents as HARD REQUIREMENTS for workflow,
+acceptance criteria, testing, screenshots, PR description content, and repo handling.
 
 Step 1: Identify the precise deliverable from the ticket description.
   - Read the ticket title and description carefully.
@@ -102,8 +104,11 @@ Step 1: Identify the precise deliverable from the ticket description.
     the REPOSITORY ROOT (path = "README.md", not "docs/README.md" or any subdirectory).
   - If the ticket describes a feature or bug fix -> identify the correct source files to change.
   - Never substitute a plan document for the real deliverable.
-  - NEVER add files that were not explicitly requested in the ticket (no test files, no CI/CD
-    pipelines, no dependency files, no setup scripts) unless the ticket explicitly asks for them.
+  - If upstream context says tests are required, treat those tests as part of the deliverable even
+    when the Jira text is brief.
+  - If the repo is sparse or missing required Android scaffolding, add only the minimum Android/
+    Gradle files needed to make the requested implementation buildable and testable in-place.
+  - NEVER add unrelated files that are not required by the ticket or upstream workflow contract.
 
 Step 2: Generate ONLY the required files with COMPLETE, production-quality content.
   - No placeholders, no "TODO: fill in", no ellipsis -- write the real content.
@@ -112,14 +117,17 @@ Step 2: Generate ONLY the required files with COMPLETE, production-quality conte
     * Folder / module structure (based on the actual DIRECTORY STRUCTURE above)
     * Build & run instructions (gradlew commands or equivalent from actual build files)
     * Support / contact information if requested
-  - DO NOT create test files (e.g. test_readme.py, ReadmeTest.kt) unless the ticket
-    explicitly says "add tests" or "create test file".
+  - For feature, bug-fix, or UI work where upstream context requires tests, create the minimal
+    meaningful Kotlin/Java test coverage needed to validate the change.
+  - Documentation-only work should not create test files unless upstream context explicitly requires it.
   - DO NOT create CI/CD pipeline files (bitbucket-pipelines.yml, .github/workflows/*.yml,
     Jenkinsfile, etc.) unless the ticket explicitly says so.
   - DO NOT create requirements files, Gemfiles, package.json additions, etc. unless the
     ticket explicitly says so.
   - For an Android repository, any test files MUST use Kotlin/Java with JUnit or Espresso,
     NOT Python. Never use Python test frameworks (pytest, unittest) in an Android project.
+  - For UI tasks with design context, ensure the implementation is compatible with the expected
+    screenshot/design-evidence workflow and keep screenshot artifact paths PR-safe under `docs/evidence/`.
 
 Step 2b: If the ticket asks you to DELETE files (e.g. "remove", "delete"), list those in the
   "files_to_delete" array by their EXACT relative path. Do NOT include deleted files in "files".
@@ -151,9 +159,13 @@ RULES
 * If the ticket asks to REMOVE a file, put its path in "files_to_delete" -- NOT in "files".
 * NEVER create plan documents, implementation notes, or files in agent-plan directories
   (e.g. docs/agent-plans/, docs/plans/). Only deliver what the ticket explicitly asks for.
-* NEVER add extra files (tests, CI pipelines, dependency manifests) not requested by the ticket.
+* Tests required by upstream acceptance criteria are not "extra files"; include them when needed.
+* Keep the result buildable/testable inside the cloned repo. If the repo lacks essential Android
+  build files, add the minimum needed scaffold in-place instead of failing silently.
 * Use the actual directory structure and build file content shown above, not assumed defaults.
 * This is an Android repository -- if tests are requested, use Kotlin/Java with JUnit/Espresso.
   Never use Python test frameworks in an Android project.
+* If upstream context requires screenshots or design evidence, the PR description must include a
+  screenshots section that references the expected `docs/evidence/` paths.
 """
 

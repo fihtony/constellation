@@ -13,7 +13,9 @@ import time
 from unittest import mock
 
 from web import app as web_app
+from web import prompts as web_prompts
 from common.task_store import TaskStore
+from common.runtime.connect_agent.adapter import DEFAULT_AGENTIC_SYSTEM
 
 
 _TEAM_LEAD_DIR = Path(__file__).resolve().parents[1] / "team-lead"
@@ -79,11 +81,11 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
     def test_team_lead_enriches_analysis_from_jira_raw_payload(self):
         analysis = {"target_repo_url": "", "design_url": None, "needs_design_context": False}
         jira_info = {
-            "ticket_key": "CSTL-1",
+            "ticket_key": "PROJ-1",
             "content": json.dumps(
                 {
                     "fields": {
-                        "customfield_repo": "https://github.com/example/english-study-hub",
+                        "customfield_repo": "https://github.com/example/example-app",
                         "customfield_design": "https://www.figma.com/file/abc123/landing-page",
                     }
                 },
@@ -93,7 +95,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
 
         enriched = team_lead_app._enrich_analysis_from_context(analysis, jira_info, None, "")
 
-        self.assertEqual(enriched["target_repo_url"], "https://github.com/example/english-study-hub")
+        self.assertEqual(enriched["target_repo_url"], "https://github.com/example/example-app")
         self.assertEqual(enriched["design_url"], "https://www.figma.com/file/abc123/landing-page")
         self.assertEqual(enriched["design_type"], "figma")
         self.assertTrue(enriched["needs_design_context"])
@@ -118,16 +120,16 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 "jira_ticket_key": None,
                 "needs_jira_fetch": False,
             },
-            "Implement https://tarch.atlassian.net/browse/CSTL-2 in the target repo.",
+            "Implement https://example.atlassian.net/browse/PROJ-2 in the target repo.",
         )
 
-        self.assertEqual(updated["jira_ticket_key"], "CSTL-2")
+        self.assertEqual(updated["jira_ticket_key"], "PROJ-2")
         self.assertTrue(updated["needs_jira_fetch"])
 
     def test_team_lead_builds_design_fetch_request_from_page_name(self):
         capability, message_text, page_name = team_lead_app._build_design_fetch_request(
             {
-                "design_url": "https://www.figma.com/design/abc123/English-Study-Hub",
+                "design_url": "https://www.figma.com/design/abc123/Example-App",
                 "design_type": "figma",
                 "design_page_name": "Practice Quiz",
             }
@@ -140,22 +142,22 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
     def test_team_lead_skips_redundant_figma_fetch_for_equivalent_node_labels(self):
         ctx = team_lead_app._TaskContext()
         ctx.design_info = {
-            "url": "https://www.figma.com/design/gxd2LNayM2hh3V3qTlcyPF?node-id=1-470",
+            "url": "https://www.figma.com/design/mockDesign123?node-id=1-470",
             "type": "figma",
             "content": "Summary (fetch failed — rate limited)",
             "page_name": "node_id=1-470",
             "fetchedBy": "figma.page.fetch",
-            "request": "Fetch design from https://www.figma.com/design/gxd2LNayM2hh3V3qTlcyPF?node-id=1-470",
+            "request": "Fetch design from https://www.figma.com/design/mockDesign123?node-id=1-470",
         }
         analysis = {
-            "design_url": "https://www.figma.com/design/gxd2LNayM2hh3V3qTlcyPF?node-id=1-470",
+            "design_url": "https://www.figma.com/design/mockDesign123?node-id=1-470",
             "design_type": "figma",
             "design_page_name": "node 1-470",
         }
         action = {
             "action": "fetch_agent_context",
             "capability": "figma.page.fetch",
-            "message": "Fetch design from https://www.figma.com/design/gxd2LNayM2hh3V3qTlcyPF?node-id=1-470 page: node 1-470",
+            "message": "Fetch design from https://www.figma.com/design/mockDesign123?node-id=1-470 page: node 1-470",
             "reason": "Need the design specification before planning.",
         }
 
@@ -178,12 +180,12 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             {
                 "task_type": "feature",
                 "platform": "web",
-                "jira_ticket_key": "CSTL-2",
+                "jira_ticket_key": "PROJ-2",
                 "missing_info": [],
                 "question_for_user": None,
             },
             {},
-            "Implement CSTL-2.",
+            "Implement PROJ-2.",
         )
 
         self.assertIn("confirmed web tech stack", updated["missing_info"])
@@ -191,9 +193,9 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
 
     def test_team_lead_filters_defaultable_web_styling_questions(self):
         ctx = team_lead_app._TaskContext()
-        ctx.jira_info = {"ticket_key": "CSTL-4", "content": "Jira ticket content."}
+        ctx.jira_info = {"ticket_key": "PROJ-4", "content": "Jira ticket content."}
         ctx.repo_info = {
-            "repo_url": "https://github.com/example-org/english-study-hub",
+            "repo_url": "https://github.com/example-org/example-app",
             "content": "Repo uses React app routing and CSS modules.",
         }
 
@@ -210,12 +212,30 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
 
         self.assertEqual(unresolved, ["Exact analytics event names."])
 
+    def test_team_lead_platform_stays_unknown_without_direct_evidence(self):
+        updated = team_lead_app._apply_platform_evidence_policy(
+            {"platform": "web"},
+            "Implement PROJ-2 from the Jira ticket.",
+            "",
+        )
+
+        self.assertEqual(updated["platform"], "unknown")
+
+    def test_team_lead_platform_infers_android_from_repo_signals(self):
+        updated = team_lead_app._apply_platform_evidence_policy(
+            {"platform": "unknown"},
+            "Implement PROJ-4.",
+            "app/build.gradle.kts uses compileSdk 36 and Kotlin 2.0.21 with Jetpack Compose.",
+        )
+
+        self.assertEqual(updated["platform"], "android")
+
     def test_team_lead_clears_tech_stack_question_after_user_confirms_stack(self):
         updated = team_lead_app._apply_tech_stack_confirmation_policy(
             {
                 "task_type": "feature",
                 "platform": "web",
-                "jira_ticket_key": "CSTL-2",
+                "jira_ticket_key": "PROJ-2",
                 "missing_info": ["preferred framework"],
                 "question_for_user": "Which framework should I use?",
             },
@@ -231,7 +251,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         ctx.repo_info = {
             "repo_url": "",
             "content": "",
-            "request": "queries=[\"CSTL-2\",\"lesson-library\"]",
+            "request": "queries=[\"PROJ-2\",\"lesson-library\"]",
         }
 
         analysis = {
@@ -254,7 +274,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
             ctx.compass_url = "http://compass.local"
             ctx.shared_workspace_path = workspace
-            ctx.user_text = "Implement https://tarch.atlassian.net/browse/CSTL-2"
+            ctx.user_text = "Implement https://example.atlassian.net/browse/PROJ-2"
 
             analyze_calls: list[str] = []
             agent_calls: list[tuple[str, str]] = []
@@ -267,41 +287,41 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                         "task_type": "feature",
                         "platform": "web",
                         "needs_jira_fetch": True,
-                        "jira_ticket_key": "CSTL-2",
+                        "jira_ticket_key": "PROJ-2",
                         "needs_design_context": False,
                         "missing_info": [],
                         "question_for_user": None,
-                        "summary": "Implement CSTL-2.",
+                        "summary": "Implement PROJ-2.",
                     }
                 if len(analyze_calls) == 2:
                     return {
                         "task_type": "feature",
                         "platform": "web",
                         "needs_jira_fetch": True,
-                        "jira_ticket_key": "CSTL-2",
+                        "jira_ticket_key": "PROJ-2",
                         "needs_design_context": True,
-                        "design_url": "https://www.figma.com/design/abc123/English-Study-Hub",
+                        "design_url": "https://www.figma.com/design/abc123/Example-App",
                         "design_type": "figma",
                         "design_page_name": "Practice Quiz",
                         "target_repo_url": "",
                         "missing_info": [],
                         "question_for_user": None,
-                        "summary": "Implement CSTL-2 from Figma.",
+                        "summary": "Implement PROJ-2 from Figma.",
                     }
                 if len(analyze_calls) == 3:
                     return {
                         "task_type": "feature",
                         "platform": "web",
                         "needs_jira_fetch": True,
-                        "jira_ticket_key": "CSTL-2",
+                        "jira_ticket_key": "PROJ-2",
                         "needs_design_context": True,
-                        "design_url": "https://www.figma.com/design/abc123/English-Study-Hub",
+                        "design_url": "https://www.figma.com/design/abc123/Example-App",
                         "design_type": "figma",
                         "design_page_name": "Practice Quiz",
                         "target_repo_url": "",
                         "missing_info": [],
                         "question_for_user": None,
-                        "summary": "Implement CSTL-2 from Figma.",
+                        "summary": "Implement PROJ-2 from Figma.",
                     }
 
                 self.assertIn("python 3.12", additional_info.lower())
@@ -310,26 +330,26 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                     "task_type": "feature",
                     "platform": "web",
                     "needs_jira_fetch": True,
-                    "jira_ticket_key": "CSTL-2",
+                    "jira_ticket_key": "PROJ-2",
                     "needs_design_context": True,
-                    "design_url": "https://www.figma.com/design/abc123/English-Study-Hub",
+                    "design_url": "https://www.figma.com/design/abc123/Example-App",
                     "design_type": "figma",
                     "design_page_name": "Practice Quiz",
                     "target_repo_url": "",
                     "missing_info": [],
                     "question_for_user": None,
-                    "summary": "Implement CSTL-2 from Figma in Flask.",
+                    "summary": "Implement PROJ-2 from Figma in Flask.",
                 }
 
             def fake_plan_information_gathering(_user_text: str, analysis: dict, workflow_ctx, **_kwargs) -> dict:
                 if analysis.get("needs_jira_fetch") and workflow_ctx.jira_info is None:
                     return {
-                        "pending_tasks": ["Fetch Jira ticket CSTL-2"],
+                        "pending_tasks": ["Fetch Jira ticket PROJ-2"],
                         "actions": [
                             {
                                 "action": "fetch_agent_context",
                                 "capability": "jira.ticket.fetch",
-                                "message": "Fetch ticket CSTL-2",
+                                "message": "Fetch ticket PROJ-2",
                                 "reason": "Need the Jira ticket details before planning.",
                             }
                         ],
@@ -374,7 +394,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                     ],
                 }
 
-            def fake_call_sync_agent(capability: str, message_text: str, *_args) -> dict:
+            def fake_call_sync_agent(capability: str, message_text: str, *_args, **_kwargs) -> dict:
                 agent_calls.append((capability, message_text))
                 if capability == "jira.ticket.fetch":
                     return {
@@ -382,7 +402,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                             {
                                 "parts": [
                                     {
-                                        "text": "Ticket content with Figma https://www.figma.com/design/abc123/English-Study-Hub and page Practice Quiz."
+                                        "text": "Ticket content with Figma https://www.figma.com/design/abc123/Example-App and page Practice Quiz."
                                     }
                                 ]
                             }
@@ -460,7 +480,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 self.assertIsNotNone(current)
                 self.assertIn("tech stack", current.status_message.lower())
                 self.assertIn(
-                    ("figma.page.fetch", "Fetch design from https://www.figma.com/design/abc123/English-Study-Hub page: Practice Quiz"),
+                    ("figma.page.fetch", "Fetch design from https://www.figma.com/design/abc123/Example-App page: Practice Quiz"),
                     agent_calls,
                 )
 
@@ -489,12 +509,12 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
             ctx.compass_url = "http://compass.local"
             ctx.shared_workspace_path = workspace
-            ctx.user_text = "Implement CSTL-2."
+            ctx.user_text = "Implement PROJ-2."
             ctx.original_message = {"metadata": {"stopBeforeDevDispatch": True}}
             ctx.jira_info = {
-                "ticket_key": "CSTL-2",
+                "ticket_key": "PROJ-2",
                 "content": "Existing Jira ticket content.",
-                "request": "Fetch ticket CSTL-2",
+                "request": "Fetch ticket PROJ-2",
             }
 
             def fake_analyze(_user_text: str, additional_info: str = "") -> dict:
@@ -503,34 +523,34 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                         "task_type": "feature",
                         "platform": "web",
                         "needs_jira_fetch": True,
-                        "jira_ticket_key": "CSTL-2",
+                        "jira_ticket_key": "PROJ-2",
                         "needs_design_context": False,
                         "missing_info": ["confirmed web tech stack"],
                         "question_for_user": "Please confirm the web tech stack.",
-                        "summary": "Implement CSTL-2.",
+                        "summary": "Implement PROJ-2.",
                     }
                 return {
                     "task_type": "feature",
                     "platform": "web",
                     "needs_jira_fetch": True,
-                    "jira_ticket_key": "CSTL-2",
+                    "jira_ticket_key": "PROJ-2",
                     "needs_design_context": False,
                     "missing_info": [],
                     "question_for_user": None,
-                    "summary": "Implement CSTL-2 in Flask.",
+                    "summary": "Implement PROJ-2 in Flask.",
                 }
 
             def fake_plan_information_gathering(_user_text: str, _analysis: dict, _workflow_ctx, **_kwargs) -> dict:
                 return {
                     "pending_tasks": [
-                        "Refresh Jira ticket CSTL-2",
+                        "Refresh Jira ticket PROJ-2",
                         "Ask user: Please confirm the web tech stack.",
                     ],
                     "actions": [
                         {
                             "action": "fetch_agent_context",
                             "capability": "jira.ticket.fetch",
-                            "message": "Fetch ticket CSTL-2",
+                            "message": "Fetch ticket PROJ-2",
                             "reason": "Need the latest Jira ticket content before planning.",
                         }
                     ],
@@ -610,60 +630,60 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
             ctx.compass_url = "http://compass.local"
             ctx.shared_workspace_path = workspace
-            ctx.user_text = "Implement CSTL-4."
+            ctx.user_text = "Implement PROJ-4."
             ctx.additional_info = "Use React with an Express backend."
             ctx.original_message = {"metadata": {"stopBeforeDevDispatch": True}}
             ctx.jira_info = {
-                "ticket_key": "CSTL-4",
+                "ticket_key": "PROJ-4",
                 "content": "Ticket content with linked Figma design.",
-                "request": "Fetch ticket CSTL-4",
+                "request": "Fetch ticket PROJ-4",
             }
             ctx.repo_info = {
-                "repo_url": "https://github.com/example-org/english-study-hub",
+                "repo_url": "https://github.com/example-org/example-app",
                 "content": "Repository metadata already fetched.",
-                "request": "Inspect repository https://github.com/example-org/english-study-hub",
+                "request": "Inspect repository https://github.com/example-org/example-app",
             }
 
             analysis = {
                 "task_type": "feature",
                 "platform": "web",
                 "needs_jira_fetch": True,
-                "jira_ticket_key": "CSTL-4",
+                "jira_ticket_key": "PROJ-4",
                 "needs_design_context": True,
-                "design_url": "https://www.figma.com/design/abc123/English-Study-Hub",
+                "design_url": "https://www.figma.com/design/abc123/Example-App",
                 "design_type": "figma",
                 "design_page_name": "Practice Quiz",
-                "target_repo_url": "https://github.com/example-org/english-study-hub",
+                "target_repo_url": "https://github.com/example-org/example-app",
                 "missing_info": [],
                 "question_for_user": None,
-                "summary": "Implement CSTL-4.",
+                "summary": "Implement PROJ-4.",
             }
             expected_capability, expected_message, _ = team_lead_app._build_design_fetch_request(analysis)
 
             def fake_plan_information_gathering(_user_text: str, _analysis: dict, _workflow_ctx, **_kwargs) -> dict:
                 return {
                     "pending_tasks": [
-                        "Fetch the full Jira issue CSTL-4 (all fields, AC, links, attachments, comments, sprint/epic context).",
-                        "Inspect the target repository example-org/english-study-hub (branch, file tree, manifests, README, CI, infer tech stack).",
+                        "Fetch the full Jira issue PROJ-4 (all fields, AC, links, attachments, comments, sprint/epic context).",
+                        "Inspect the target repository example-org/example-app (branch, file tree, manifests, README, CI, infer tech stack).",
                         "Fetch the referenced Figma design node/page from the provided Figma URL (capture images, node structure, styles, and page name).",
                     ],
                     "actions": [
                         {
                             "action": "fetch_agent_context",
                             "capability": "jira.ticket.fetch",
-                            "message": "Fetch ticket CSTL-4",
+                            "message": "Fetch ticket PROJ-4",
                             "reason": "Need the latest Jira issue details.",
                         },
                         {
                             "action": "fetch_agent_context",
                             "capability": "scm.repo.inspect",
-                            "message": "Inspect repository https://github.com/example-org/english-study-hub",
+                            "message": "Inspect repository https://github.com/example-org/example-app",
                             "reason": "Need the latest repository metadata.",
                         },
                     ],
                 }
 
-            def fake_call_sync_agent(capability: str, message_text: str, *_args) -> dict:
+            def fake_call_sync_agent(capability: str, message_text: str, *_args, **_kwargs) -> dict:
                 self.assertEqual(capability, expected_capability)
                 self.assertEqual(message_text, expected_message)
                 return {"artifacts": [{"parts": [{"text": "Practice Quiz design context"}]}]}
@@ -671,7 +691,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             fake_plan = {
                 "platform": "web",
                 "dev_capability": "web.task.execute",
-                "target_repo_url": "https://github.com/example-org/english-study-hub",
+                "target_repo_url": "https://github.com/example-org/example-app",
                 "dev_instruction": "Implement the requested page in the target repository.",
                 "acceptance_criteria": ["Practice Quiz screen matches the design."],
                 "requires_tests": True,
@@ -723,6 +743,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 task.task_id,
                 workspace,
                 "compass-task-1",
+                permissions=None,
             )
             self.assertIsNotNone(ctx.design_info)
             self.assertEqual(ctx.design_info["fetchedBy"], expected_capability)
@@ -739,7 +760,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
             ctx.compass_url = "http://compass.local"
             ctx.shared_workspace_path = workspace
-            ctx.user_text = "Implement CSTL-2."
+            ctx.user_text = "Implement PROJ-2."
             ctx.original_message = {"metadata": {}}
 
             analysis = {
@@ -749,7 +770,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 "needs_design_context": False,
                 "missing_info": ["Exact Stitch screen ID is still missing"],
                 "question_for_user": None,
-                "summary": "Implement CSTL-2.",
+                "summary": "Implement PROJ-2.",
             }
 
             with mock.patch.object(team_lead_app, "_analyze_task", return_value=analysis), mock.patch.object(
@@ -790,15 +811,15 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
             ctx.compass_url = "http://compass.local"
             ctx.shared_workspace_path = workspace
-            ctx.user_text = "Implement CSTL-2."
+            ctx.user_text = "Implement PROJ-2."
             ctx.original_message = {"metadata": {"stopBeforeDevDispatch": True}}
             ctx.jira_info = {
-                "ticket_key": "CSTL-2",
+                "ticket_key": "PROJ-2",
                 "content": "Jira content with the Stitch URL and no repo URL.",
-                "request": "Fetch ticket CSTL-2",
+                "request": "Fetch ticket PROJ-2",
             }
             ctx.design_info = {
-                "url": "https://stitch.withgoogle.com/projects/13629074018280446337?pli=1",
+                "url": "https://stitch.withgoogle.com/projects/mock-project-id?pli=1",
                 "type": "stitch",
                 "content": "Lesson Library screen metadata already fetched.",
                 "page_name": "Lesson Library page",
@@ -811,9 +832,9 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                     "task_type": "feature",
                     "platform": "web",
                     "needs_jira_fetch": True,
-                    "jira_ticket_key": "CSTL-2",
+                    "jira_ticket_key": "PROJ-2",
                     "needs_design_context": True,
-                    "design_url": "https://stitch.withgoogle.com/projects/13629074018280446337?pli=1",
+                    "design_url": "https://stitch.withgoogle.com/projects/mock-project-id?pli=1",
                     "design_type": "stitch",
                     "design_page_name": "Lesson Library page",
                     "target_repo_url": None,
@@ -844,7 +865,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                         {
                             "action": "fetch_agent_context",
                             "capability": "jira.ticket.fetch",
-                            "message": "Fetch ticket CSTL-2 again",
+                            "message": "Fetch ticket PROJ-2 again",
                             "reason": "Gather more details.",
                         }
                     ],
@@ -882,7 +903,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Required capability 'jira.ticket.fetch' is unavailable"):
                 team_lead_app._call_sync_agent(
                     "jira.ticket.fetch",
-                    "Fetch ticket CSTL-2",
+                    "Fetch ticket PROJ-2",
                     "task-1",
                     "/tmp/workspace",
                     "compass-task-1",
@@ -932,7 +953,10 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
     def test_team_lead_filters_defaultable_web_ui_missing_info(self):
         ctx = team_lead_app._TaskContext()
         ctx.jira_info = {"content": "Jira ticket content is available."}
-        ctx.repo_info = {"content": "Repository context is available."}
+        ctx.repo_info = {
+            "repo_url": "https://bitbucket.example.com/users/demo/repos/web-ui-test/browse",
+            "content": "Repository context is available.",
+        }
         ctx.design_info = {"content": "Figma fetch returned rate-limit details."}
 
         unresolved = team_lead_app._filter_unresolved_missing_info(
@@ -942,6 +966,27 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                     "Desired route/path and integration point in the repo (where page should be mounted)",
                     "Any required dynamic data or API endpoints / mock data contracts",
                     "Responsive breakpoints and browser support expectations",
+                ],
+            },
+            ctx,
+        )
+
+        self.assertEqual(unresolved, [])
+
+    def test_team_lead_filters_backend_api_vs_static_data_question_for_web_ui(self):
+        ctx = team_lead_app._TaskContext()
+        ctx.jira_info = {"content": "Jira ticket content is available."}
+        ctx.repo_info = {
+            "repo_url": "https://bitbucket.example.com/users/demo/repos/web-ui-test/browse",
+            "content": "Repository context is available.",
+        }
+        ctx.design_info = {"content": "Figma node context is available."}
+
+        unresolved = team_lead_app._filter_unresolved_missing_info(
+            {
+                "platform": "web",
+                "missing_info": [
+                    "Whether the page requires real backend APIs (endpoints/specs) or can use mocked/static data for initial delivery.",
                 ],
             },
             ctx,
@@ -962,7 +1007,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                     "Explicit acceptance criteria (pass/fail conditions, pages/components to implement, responsive breakpoints, test/QA steps).",
                     "Desired assignment and any reviewer/owner to set on the Jira ticket before implementation.",
                 ],
-                "question_for_user": "Please provide explicit acceptance criteria for CSTL-4 and the desired reviewer.",
+                "question_for_user": "Please provide explicit acceptance criteria for PROJ-4 and the desired reviewer.",
             },
             ctx,
         )
@@ -976,11 +1021,11 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             "task_type": "feature",
             "platform": "web",
             "needs_jira_fetch": True,
-            "jira_ticket_key": "CSTL-2",
+            "jira_ticket_key": "PROJ-2",
             "needs_design_context": False,
             "missing_info": ["jira ticket content"],
             "question_for_user": "Please paste the Jira ticket details.",
-            "summary": "Implement CSTL-2.",
+            "summary": "Implement PROJ-2.",
         }
 
         runtime_plan = {
@@ -994,7 +1039,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 {
                     "action": "fetch_agent_context",
                     "capability": "jira.ticket.fetch",
-                    "message": "Fetch ticket CSTL-2",
+                    "message": "Fetch ticket PROJ-2",
                     "reason": "Need the Jira ticket body before planning.",
                 },
             ],
@@ -1013,7 +1058,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             ],
         ), mock.patch.object(team_lead_app, "_run_agentic", return_value=json.dumps(runtime_plan)):
             gather_plan = team_lead_app._plan_information_gathering(
-                "Implement CSTL-2.",
+                "Implement PROJ-2.",
                 analysis,
                 ctx,
             )
@@ -1067,7 +1112,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Required capability 'jira.ticket.fetch' is unavailable"):
                 team_lead_app._call_sync_agent(
                     "jira.ticket.fetch",
-                    "Fetch ticket CSTL-2",
+                    "Fetch ticket PROJ-2",
                     "task-1",
                     "/tmp/workspace",
                     "compass-task-1",
@@ -1075,7 +1120,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
 
             result = team_lead_app._call_sync_agent(
                 "jira.ticket.fetch",
-                "Fetch ticket CSTL-2",
+                "Fetch ticket PROJ-2",
                 "task-1",
                 "/tmp/workspace",
                 "compass-task-1",
@@ -1090,6 +1135,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             team_lead_task_id="task-1",
             workspace="/tmp/workspace",
             target_repo_url="https://github.com/example/repo",
+            permissions={"taskType": "development", "allowed": [], "denied": [], "fallback": "deny_and_escalate"},
             tech_stack_constraints={
                 "language": "python",
                 "python_version": "3.12",
@@ -1097,6 +1143,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             },
             acceptance_criteria=["Tests pass."],
             requires_tests=True,
+            screenshot_requirements="Include design-reference.png and screenshot-1280x900.png in the PR.",
             is_revision=True,
             revision_cycle=2,
             review_issues=["Re-run pytest and attach evidence."],
@@ -1106,10 +1153,157 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         self.assertEqual(metadata["techStackConstraints"]["backend_framework"], "flask")
         self.assertEqual(metadata["acceptanceCriteria"], ["Tests pass."])
         self.assertTrue(metadata["requiresTests"])
+        self.assertEqual(
+            metadata["screenshotRequirements"],
+            "Include design-reference.png and screenshot-1280x900.png in the PR.",
+        )
         self.assertTrue(metadata["isRevision"])
         self.assertEqual(metadata["revisionCycle"], 2)
         self.assertEqual(metadata["reviewIssues"], ["Re-run pytest and attach evidence."])
+        self.assertEqual(metadata["permissions"]["taskType"], "development")
         self.assertIn("transition the Jira ticket to 'In Progress'", metadata["devWorkflowInstructions"])
+
+    def test_team_lead_sync_agent_forwards_permissions_snapshot(self):
+        captured: dict = {}
+        permissions = {
+            "taskType": "development",
+            "allowed": [],
+            "denied": [],
+            "fallback": "deny_and_escalate",
+        }
+
+        def fake_send(agent_url: str, message: dict, context_id: str | None = None) -> dict:
+            captured["agent_url"] = agent_url
+            captured["message"] = message
+            captured["context_id"] = context_id
+            return {
+                "id": "jira-task-1",
+                "status": {"state": "TASK_STATE_COMPLETED"},
+                "artifacts": [],
+            }
+
+        with mock.patch.object(
+            team_lead_app.agent_directory,
+            "resolve_capability",
+            return_value=(
+                {"agent_id": "jira-agent"},
+                {"service_url": "http://jira:8010"},
+            ),
+        ), mock.patch.object(team_lead_app, "_a2a_send", side_effect=fake_send):
+            result = team_lead_app._call_sync_agent(
+                "jira.ticket.fetch",
+                "Fetch ticket PROJ-2",
+                "task-1",
+                "/tmp/workspace",
+                "compass-task-1",
+                permissions=permissions,
+            )
+
+        self.assertEqual(result["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual(captured["agent_url"], "http://jira:8010")
+        self.assertEqual(captured["message"]["metadata"]["permissions"], permissions)
+
+    def test_web_sync_agent_forwards_permissions_snapshot(self):
+        captured: dict = {}
+        permissions = {
+            "taskType": "development",
+            "allowed": [],
+            "denied": [],
+            "fallback": "deny_and_escalate",
+        }
+
+        def fake_send(agent_url: str, message: dict) -> dict:
+            captured["agent_url"] = agent_url
+            captured["message"] = message
+            return {
+                "id": "scm-task-1",
+                "status": {"state": "TASK_STATE_COMPLETED"},
+                "artifacts": [],
+            }
+
+        with mock.patch.object(web_app, "_resolve_agent_service_url", return_value="http://scm:8020"), mock.patch.object(
+            web_app,
+            "_a2a_send",
+            side_effect=fake_send,
+        ):
+            result = web_app._call_sync_agent(
+                "scm.branch.list",
+                "List branches in https://github.com/example/repo",
+                "task-1",
+                "/tmp/workspace",
+                "compass-task-1",
+                permissions=permissions,
+            )
+
+        self.assertEqual(result["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual(captured["agent_url"], "http://scm:8020")
+        self.assertEqual(captured["message"]["metadata"]["permissions"], permissions)
+
+    def test_web_jira_request_json_transports_permissions_for_get_and_post(self):
+        captured_requests: list[dict] = []
+        permissions = {
+            "taskType": "development",
+            "allowed": [],
+            "denied": [],
+            "fallback": "deny_and_escalate",
+        }
+
+        def fake_call_sync(capability, message_text, task_id, workspace_path, compass_task_id, permissions=None, extra_metadata=None):
+            captured_requests.append(
+                {
+                    "capability": capability,
+                    "message_text": message_text,
+                    "task_id": task_id,
+                    "workspace": workspace_path,
+                    "compass_task_id": compass_task_id,
+                    "permissions": permissions,
+                    "extra_metadata": extra_metadata or {},
+                }
+            )
+            if capability == "jira.ticket.fetch":
+                return {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [
+                        {"name": "jira-raw-payload", "parts": [{"text": json.dumps({"key": "PROJ-2"})}]}
+                    ],
+                }
+            return {
+                "status": {"state": "TASK_STATE_COMPLETED"},
+                "artifacts": [
+                    {"name": "jira-comment-add", "parts": [{"text": json.dumps({"result": "created"})}]}
+                ],
+            }
+
+        with mock.patch.object(web_app, "_call_sync_agent", side_effect=fake_call_sync):
+            web_app._jira_request_json(
+                "jira.ticket.fetch",
+                "GET",
+                "/jira/tickets/PROJ-2",
+                permissions=permissions,
+                workspace="/tmp/workspace",
+                task_id="task-1",
+                compass_task_id="compass-1",
+            )
+            web_app._jira_request_json(
+                "jira.comment.add",
+                "POST",
+                "/jira/comments/PROJ-2",
+                payload={"text": "hello"},
+                permissions=permissions,
+                workspace="/tmp/workspace",
+                task_id="task-1",
+                compass_task_id="compass-1",
+            )
+
+        self.assertEqual(captured_requests[0]["capability"], "jira.ticket.fetch")
+        self.assertEqual(captured_requests[0]["permissions"], permissions)
+        self.assertEqual(captured_requests[0]["extra_metadata"]["ticketKey"], "PROJ-2")
+        self.assertEqual(captured_requests[0]["compass_task_id"], "compass-1")
+
+        self.assertEqual(captured_requests[1]["capability"], "jira.comment.add")
+        self.assertEqual(captured_requests[1]["permissions"], permissions)
+        self.assertEqual(captured_requests[1]["extra_metadata"]["ticketKey"], "PROJ-2")
+        self.assertEqual(captured_requests[1]["extra_metadata"]["commentText"], "hello")
 
     def test_web_analysis_constraints_override_frontend_guess(self):
         analysis = {
@@ -1133,13 +1327,13 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         with mock.patch.object(
             web_app,
             "_list_remote_branches",
-            return_value={"feature/CSTL-1_task-0003_1"},
+            return_value={"feature/PROJ-1_task-0003_1"},
         ):
             branch_name, branch_kind = web_app._select_branch_name(
                 "Implement the landing page",
                 {"task_summary": "Build the first landing page"},
                 ["app/routes.py", "tests/test_landing.py"],
-                "CSTL-1",
+                "PROJ-1",
                 "task-0006",
                 "https://github.com/example/repo",
                 "",
@@ -1148,7 +1342,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             )
 
         self.assertEqual(branch_kind, "feature")
-        self.assertEqual(branch_name, "feature/CSTL-1_task-0003_2")
+        self.assertEqual(branch_name, "feature/PROJ-1_task-0003_2")
 
     def test_docs_and_tests_only_tasks_can_use_chore_branch_without_ticket(self):
         with mock.patch.object(web_app, "_list_remote_branches", return_value=set()):
@@ -1180,6 +1374,14 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 "/tmp/workspace",
                 "task-0003",
             )
+
+    def test_web_agent_resolves_ticket_key_from_metadata_when_instruction_lacks_one(self):
+        ticket_key = web_app._resolve_ticket_key(
+            "Implement the dashboard in the target repository.",
+            {"jiraTicketKey": "PROJ-2903"},
+        )
+
+        self.assertEqual(ticket_key, "PROJ-2903")
 
     def test_team_lead_launches_fresh_instance_for_per_task_capability(self):
         with mock.patch.object(
@@ -1312,7 +1514,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             web_app._record_jira_action(
                 workspace,
                 "task-1",
-                "CSTL-1",
+                "PROJ-1",
                 "transition",
                 "completed",
                 agent_task_id="web-task-9",
@@ -1321,7 +1523,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             web_app._record_jira_action(
                 workspace,
                 "task-1",
-                "CSTL-1",
+                "PROJ-1",
                 "comment",
                 "completed",
                 agent_task_id="web-task-9",
@@ -1342,7 +1544,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
     def test_pr_jira_comment_adf_uses_clickable_link(self):
         adf = web_app._build_pr_jira_comment_adf(
             "https://github.com/example/repo/pull/13",
-            "feature/CSTL-1_task-0001_1",
+            "feature/PROJ-1_task-0001_1",
             "✅ Build/tests passed",
             [{"path": "requirements.txt"}, {"path": "run.py"}],
             "Landing page implemented.",
@@ -1431,7 +1633,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             ],
         ) as run_mock:
             plan = web_app._plan_implementation(
-                "Implement CSTL-1 in Flask.",
+                "Implement PROJ-1 in Flask.",
                 ["GET / returns English Study Hub."],
                 {"backend_framework": "flask", "frontend_framework": "none"},
                 "README.md exists",
@@ -1464,7 +1666,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             return_value=json.dumps(valid_plan),
         ) as run_mock:
             plan = web_app._plan_implementation(
-                "Implement CSTL-4 in React/Express.",
+                "Implement PROJ-4 in React/Express.",
                 ["Render /study."],
                 {"backend_framework": "express", "frontend_framework": "react"},
                 "README.md exists",
@@ -1582,7 +1784,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             clone_dir = Path(temp_dir, "repo")
             artifact_dir = clone_dir / "artifacts" / "figma" / "file123" / "1_470"
             artifact_dir.mkdir(parents=True, exist_ok=True)
-            screenshot_path = artifact_dir / "cstl4_desktop.png"
+            screenshot_path = artifact_dir / "design_desktop.png"
             screenshot_path.write_bytes(b"png-data")
             generated_files: list[dict] = []
 
@@ -1594,7 +1796,124 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             )
 
         self.assertEqual(registered_count, 1)
-        self.assertEqual(generated_files[0]["path"], "artifacts/figma/file123/1_470/cstl4_desktop.png")
+        self.assertEqual(generated_files[0]["path"], "artifacts/figma/file123/1_470/design_desktop.png")
+
+    def test_web_agent_requires_shared_workspace_for_repo_tasks(self):
+        with self.assertRaisesRegex(RuntimeError, "Shared workspace path is required"):
+            web_app._require_shared_workspace_for_repo_task(
+                "https://github.com/example-org/example-app",
+                "",
+            )
+
+    def test_web_agent_rejects_clone_outside_shared_workspace(self):
+        with tempfile.TemporaryDirectory(prefix="web_workspace_") as workspace, tempfile.TemporaryDirectory(prefix="web_clone_") as outside:
+            with self.assertRaisesRegex(RuntimeError, "must stay inside the shared workspace"):
+                web_app._ensure_clone_path_in_workspace(workspace, outside)
+
+    def test_team_lead_review_evidence_includes_clone_branch_and_pr_metadata(self):
+        with tempfile.TemporaryDirectory(prefix="review_evidence_") as workspace:
+            agent_dir = Path(workspace) / "web-agent"
+            agent_dir.mkdir(parents=True, exist_ok=True)
+            (agent_dir / "clone-info.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "repoUrl": "https://github.com/example-org/example-app",
+                        "clonePath": f"{workspace}/example-app",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (agent_dir / "branch-info.json").write_text(
+                json.dumps({"branch": "feature/proj-2", "baseBranch": "main"}),
+                encoding="utf-8",
+            )
+            (agent_dir / "pr-evidence.json").write_text(
+                json.dumps(
+                    {
+                        "prUrl": "https://github.com/example-org/example-app/pull/1",
+                        "branch": "feature/proj-2",
+                        "buildPassed": True,
+                        "generatedFiles": ["src/App.tsx"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            evidence = team_lead_app._load_workspace_review_evidence(workspace)
+
+        self.assertIn("Clone status: completed", evidence)
+        self.assertIn("Branch evidence: branch=feature/proj-2, base=main", evidence)
+        self.assertIn("PR URL: https://github.com/example-org/example-app/pull/1", evidence)
+
+    def test_team_lead_keeps_repo_and_stack_missing_when_repo_search_failed(self):
+        ctx = team_lead_app._TaskContext()
+        ctx.jira_info = {"content": "Fetched Jira ticket."}
+        ctx.repo_info = {
+            "content": "Repository search failed: missing_default_project",
+            "repo_url": "",
+        }
+        analysis = {
+            "platform": "web",
+            "missing_info": ["target repository URL", "confirmed tech stack / framework"],
+        }
+
+        unresolved = team_lead_app._filter_unresolved_missing_info(analysis, ctx, tech_stack_constraints={})
+
+        self.assertIn("target repository URL", unresolved)
+        self.assertIn("confirmed tech stack / framework", unresolved)
+
+    def test_team_lead_does_not_suppress_stack_question_when_repo_url_missing(self):
+        ctx = team_lead_app._TaskContext()
+        ctx.jira_info = {"content": "Fetched Jira ticket."}
+        ctx.repo_info = {
+            "content": "Repository search failed: missing_default_project",
+            "repo_url": "",
+        }
+        analysis = {
+            "platform": "web",
+            "question_for_user": (
+                "The Jira ticket does not specify the web tech stack. Please confirm the stack to use, "
+                "for example Python Flask or Node.js/Express."
+            ),
+            "missing_info": ["confirmed tech stack / framework"],
+        }
+
+        updated = team_lead_app._suppress_redundant_questions(analysis, ctx)
+
+        self.assertEqual(updated["question_for_user"], analysis["question_for_user"])
+
+
+class AgentPromptBoundaryTests(unittest.TestCase):
+    def test_connect_agent_default_prompt_stays_runtime_generic(self):
+        lowered = DEFAULT_AGENTIC_SYSTEM.lower()
+
+        self.assertIn("task-specific system prompt", lowered)
+        self.assertNotIn("tailwind", lowered)
+        self.assertNotIn("react", lowered)
+        self.assertNotIn("figma", lowered)
+        self.assertNotIn("jira comment", lowered)
+
+    def test_team_lead_prompts_enforce_planning_and_repo_clone_boundary(self):
+        plan_lower = team_lead_prompts.PLAN_SYSTEM.lower()
+        review_lower = team_lead_prompts.REVIEW_SYSTEM.lower()
+
+        self.assertIn("you do not write implementation code yourself", plan_lower)
+        self.assertIn("clone the target repository", plan_lower)
+        self.assertIn("shared workspace", plan_lower)
+        self.assertIn("missing scm evidence is a delivery failure", review_lower)
+
+    def test_web_prompts_require_cloned_repo_and_explicit_section_surfaces(self):
+        analyze_lower = web_prompts.ANALYZE_SYSTEM.lower()
+        plan_lower = web_prompts.PLAN_SYSTEM.lower()
+        codegen_lower = web_prompts.CODEGEN_SYSTEM.lower()
+        design_lower = web_prompts.DESIGN_COMPARE_SYSTEM.lower()
+
+        self.assertIn("team lead", analyze_lower)
+        self.assertIn("cloned repository tree", plan_lower)
+        self.assertIn("headers, title/hero wrappers, footers", codegen_lower)
+        self.assertIn("never apply black (#000000)", codegen_lower)
+        self.assertIn("unexpected black/default backgrounds", design_lower)
 
 
 if __name__ == "__main__":

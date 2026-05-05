@@ -56,16 +56,22 @@ from tests.agent_test_support import (
     load_env_file,
     summary_exit_code,
 )
+from common.task_permissions import load_permission_grant
 
 # ---------------------------------------------------------------------------
 # Configuration — loaded from tests/.env
 # ---------------------------------------------------------------------------
 
 _ENV = load_env_file("tests/.env")
+_DEVELOPMENT_PERMISSIONS = load_permission_grant("development").to_dict()
+
+
+def _permission_headers() -> dict:
+    return {"X-Task-Permissions": json.dumps(_DEVELOPMENT_PERMISSIONS, ensure_ascii=False)}
 
 
 def _env(key: str, fallback: str = "") -> str:
-    return os.environ.get(key) or _ENV.get(key, fallback)
+    return _ENV.get(key, fallback)
 
 
 def _parse_figma_file_url(url: str) -> str:
@@ -84,15 +90,15 @@ def _parse_stitch_project_url(url: str) -> str:
 
 
 _figma_file_url = _env("TEST_FIGMA_FILE_URL")
-FIGMA_URL = _figma_file_url or "https://www.figma.com/design/your-file-key/Test-File"
-FIGMA_FILE_KEY = _parse_figma_file_url(_figma_file_url) if _figma_file_url else "your-file-key"
+FIGMA_URL = _figma_file_url
+FIGMA_FILE_KEY = _parse_figma_file_url(_figma_file_url) if _figma_file_url else ""
 
 _stitch_project_url = _env("TEST_STITCH_PROJECT_URL")
 STITCH_PROJECT_ID = (
     _parse_stitch_project_url(_stitch_project_url) if _stitch_project_url
-    else "your-project-id"
+    else ""
 )
-STITCH_SCREEN_ID = _env("TEST_STITCH_SCREEN_ID", "your-screen-id")
+STITCH_SCREEN_ID = _env("TEST_STITCH_SCREEN_ID", "")
 
 LOCAL_AGENT_URL = "http://127.0.0.1:8040"
 CONTAINER_AGENT_URL = "http://127.0.0.1:8040"
@@ -104,7 +110,7 @@ CONTAINER_AGENT_URL = "http://127.0.0.1:8040"
 
 def _load_figma_token() -> str:
     # ONLY from tests/.env
-    token = _env("TEST_FIGMA_TOKEN") or os.environ.get("FIGMA_TOKEN", "")
+    token = _env("TEST_FIGMA_TOKEN")
     if not token:
         raise SystemExit("ERROR: TEST_FIGMA_TOKEN not set in tests/.env — cannot run tests")
     return token
@@ -112,7 +118,7 @@ def _load_figma_token() -> str:
 
 def _load_stitch_key() -> str:
     # ONLY from tests/.env
-    key = _env("TEST_STITCH_API_KEY") or os.environ.get("STITCH_API_KEY", "")
+    key = _env("TEST_STITCH_API_KEY")
     if not key:
         raise SystemExit("ERROR: TEST_STITCH_API_KEY not set in tests/.env — cannot run tests")
     return key
@@ -126,15 +132,15 @@ def run_static_checks(reporter: Reporter) -> None:
     reporter.section("Static / dry-run checks")
 
     reporter.step("Figma URL configured")
-    if FIGMA_FILE_KEY not in ("", "your-file-key"):
+    if FIGMA_FILE_KEY:
         reporter.ok(f"Figma file key: {FIGMA_FILE_KEY}")
     else:
         reporter.skip("Figma file key", "TEST_FIGMA_FILE_URL not set in tests/.env")
 
     reporter.step("Stitch IDs configured")
-    if STITCH_PROJECT_ID not in ("", "your-project-id"):
+    if STITCH_PROJECT_ID:
         reporter.ok(f"Stitch project ID: {STITCH_PROJECT_ID}")
-        if STITCH_SCREEN_ID not in ("", "your-screen-id"):
+        if STITCH_SCREEN_ID:
             reporter.ok(f"Stitch screen ID: {STITCH_SCREEN_ID}")
         else:
             reporter.skip("Stitch screen ID", "TEST_STITCH_SCREEN_ID not set in tests/.env")
@@ -189,7 +195,10 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
 
     reporter.step(f"GET /figma/meta — file {FIGMA_FILE_KEY}")
     query = urlencode({"url": FIGMA_URL})
-    status, body, _ = http_request(f"{agent_url}/figma/meta?{query}")
+    status, body, _ = http_request(
+        f"{agent_url}/figma/meta?{query}",
+        headers=_permission_headers(),
+    )
     reporter.show("Figma meta", body)
     meta = body.get("meta", {}) if isinstance(body, dict) else {}
     body_status = body.get("status", "") if isinstance(body, dict) else ""
@@ -203,7 +212,10 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
         reporter.fail(f"Agent /figma/meta failed (status {status})", str(body)[:200])
 
     reporter.step(f"GET /figma/pages — file {FIGMA_FILE_KEY}")
-    status, body, _ = http_request(f"{agent_url}/figma/pages?{query}")
+    status, body, _ = http_request(
+        f"{agent_url}/figma/pages?{query}",
+        headers=_permission_headers(),
+    )
     reporter.show("Figma pages", body)
     pages = body.get("pages", []) if isinstance(body, dict) else []
     body_status = body.get("status", "") if isinstance(body, dict) else ""
@@ -221,7 +233,10 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
         first_page_name = pages[0].get("name", "")
         reporter.step(f"GET /figma/page — page '{first_page_name}'")
         query_page = urlencode({"url": FIGMA_URL, "name": first_page_name})
-        status, body, _ = http_request(f"{agent_url}/figma/page?{query_page}")
+        status, body, _ = http_request(
+            f"{agent_url}/figma/page?{query_page}",
+            headers=_permission_headers(),
+        )
         reporter.show("Figma page", body)
         body_status = body.get("status", "") if isinstance(body, dict) else ""
         if status == 200 and body_status == "ok":
@@ -236,7 +251,10 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
     api_key = _load_stitch_key()
 
     reporter.step("GET /stitch/tools")
-    status, body, _ = http_request(f"{agent_url}/stitch/tools")
+    status, body, _ = http_request(
+        f"{agent_url}/stitch/tools",
+        headers=_permission_headers(),
+    )
     reporter.show("Stitch tools", body)
     tools = body.get("tools", []) if isinstance(body, dict) else []
     if status == 200 and body.get("status") == "ok" and isinstance(tools, list):
@@ -247,10 +265,11 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
     else:
         reporter.fail(f"Agent /stitch/tools failed (status {status})", str(body)[:200])
 
-    if STITCH_PROJECT_ID not in ("", "your-project-id"):
+    if STITCH_PROJECT_ID:
         reporter.step(f"GET /stitch/project — id={STITCH_PROJECT_ID}")
         status, body, _ = http_request(
-            f"{agent_url}/stitch/project?{urlencode({'id': STITCH_PROJECT_ID})}"
+            f"{agent_url}/stitch/project?{urlencode({'id': STITCH_PROJECT_ID})}",
+            headers=_permission_headers(),
         )
         reporter.show("Stitch project", body)
         if status == 200 and body.get("status") == "ok":
@@ -260,11 +279,14 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
         else:
             reporter.fail(f"Agent /stitch/project failed (status {status})", str(body)[:200])
 
-    if STITCH_SCREEN_ID not in ("", "your-screen-id"):
+    if STITCH_SCREEN_ID:
         query_scr = urlencode({"project_id": STITCH_PROJECT_ID, "screen_id": STITCH_SCREEN_ID})
 
         reporter.step(f"GET /stitch/screen — screen {STITCH_SCREEN_ID}")
-        status, body, _ = http_request(f"{agent_url}/stitch/screen?{query_scr}")
+        status, body, _ = http_request(
+            f"{agent_url}/stitch/screen?{query_scr}",
+            headers=_permission_headers(),
+        )
         reporter.show("Stitch screen", body)
         if status == 200 and body.get("status") == "ok":
             image_urls = body.get("imageUrls", [])
@@ -275,7 +297,10 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
             reporter.fail(f"Agent /stitch/screen failed (status {status})", str(body)[:200])
 
         reporter.step("GET /stitch/screen/image")
-        status, body, _ = http_request(f"{agent_url}/stitch/screen/image?{query_scr}")
+        status, body, _ = http_request(
+            f"{agent_url}/stitch/screen/image?{query_scr}",
+            headers=_permission_headers(),
+        )
         reporter.show("Stitch screen/image", body)
         if status == 200:
             image_urls = body.get("imageUrls", [])
@@ -298,7 +323,10 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
                 "messageId": "ui-design-test-figma",
                 "role": "ROLE_USER",
                 "parts": [{"text": f"Fetch Figma file metadata for {FIGMA_URL}"}],
-                "metadata": {"requestedCapability": "figma.file.meta"},
+                "metadata": {
+                    "requestedCapability": "figma.file.meta",
+                    "permissions": _DEVELOPMENT_PERMISSIONS,
+                },
             }
         },
     )
@@ -320,7 +348,7 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
     else:
         reporter.fail(f"Figma A2A /message:send failed (status {status})", str(body)[:200])
 
-    if STITCH_SCREEN_ID not in ("", "your-screen-id"):
+    if STITCH_SCREEN_ID:
         reporter.step("POST /message:send — Stitch task")
         status, body, _ = http_request(
             f"{agent_url}/message:send",
@@ -335,7 +363,10 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
                             f"screen {STITCH_SCREEN_ID}"
                         )
                     }],
-                    "metadata": {"requestedCapability": "stitch.screen.fetch"},
+                    "metadata": {
+                        "requestedCapability": "stitch.screen.fetch",
+                        "permissions": _DEVELOPMENT_PERMISSIONS,
+                    },
                 }
             },
         )

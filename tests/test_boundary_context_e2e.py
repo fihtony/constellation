@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""CSTL-4 End-to-End Test Suite
+"""Boundary context end-to-end test suite.
 
-Tests the complete workflow for CSTL-4 ticket, validating:
+Tests the configured external context, validating:
 - Jira REST API integration (fetch ticket, comments, transitions)
 - GitHub REST API integration (repo inspection, branches, PRs)
 - Figma REST API integration (file metadata, pages, nodes)
 
 Usage:
-  python3 tests/test_cstl4_e2e.py              # run all tests
-  python3 tests/test_cstl4_e2e.py -v           # verbose output
-  python3 tests/test_cstl4_e2e.py --fix        # fix issues and retest
+    python3 tests/test_boundary_context_e2e.py       # run all tests
+    python3 tests/test_boundary_context_e2e.py -v    # verbose output
+    python3 tests/test_boundary_context_e2e.py --fix # fix issues and retest
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from agent_test_support import (
     http_request,
     load_env_file,
 )
+from common.task_permissions import load_permission_grant
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -41,10 +42,10 @@ from agent_test_support import (
 _ENV = load_env_file("tests/.env")
 
 def _env(key: str, fallback: str = "") -> str:
-    return os.environ.get(key) or _ENV.get(key, fallback)
+    return _ENV.get(key, fallback)
 
-# CSTL-4 specific configuration
-JIRA_TICKET_URL = _env("TEST_JIRA_TICKET_URL", "https://tarch.atlassian.net/browse/CSTL-4")
+# Configured test context
+JIRA_TICKET_URL = _env("TEST_JIRA_TICKET_URL", "").strip()
 JIRA_TICKET_KEY = JIRA_TICKET_URL.rstrip("/").split("/")[-1]
 JIRA_BASE_URL = "/".join(JIRA_TICKET_URL.split("/")[:3])
 JIRA_API_BASE = f"{JIRA_BASE_URL}/rest/api/3"
@@ -76,6 +77,9 @@ FIGMA_API_BASE = "https://api.figma.com/v1"
 JIRA_AGENT_URL = "http://localhost:8010"
 SCM_AGENT_URL = "http://localhost:8020"
 UI_DESIGN_AGENT_URL = "http://localhost:8040"
+_DEVELOPMENT_PERMISSION_HEADERS = {
+    "X-Task-Permissions": json.dumps(load_permission_grant("development").to_dict(), ensure_ascii=False)
+}
 
 # ---------------------------------------------------------------------------
 # HTTP Helpers
@@ -125,6 +129,9 @@ def test_jira_rest_api(reporter: Reporter) -> dict:
     if not JIRA_TOKEN or not JIRA_EMAIL:
         reporter.fail("Jira credentials missing", "Set TEST_JIRA_TOKEN and TEST_JIRA_EMAIL in tests/.env")
         return results
+    if not JIRA_TICKET_KEY:
+        reporter.fail("Jira ticket not configured", "Set TEST_JIRA_TICKET_URL in tests/.env")
+        return results
     
     # Test 1: Health check
     reporter.step("Test Jira Agent health endpoint")
@@ -138,7 +145,7 @@ def test_jira_rest_api(reporter: Reporter) -> dict:
     
     # Test 2: Myself endpoint
     reporter.step("Test GET /jira/myself")
-    status, body = http_json(f"{JIRA_AGENT_URL}/jira/myself")
+    status, body = http_json(f"{JIRA_AGENT_URL}/jira/myself", headers=_DEVELOPMENT_PERMISSION_HEADERS)
     reporter.show("myself", body)
     user = body.get("user", {})
     if status == 200 and body.get("result") == "ok" and user.get("accountId"):
@@ -149,7 +156,10 @@ def test_jira_rest_api(reporter: Reporter) -> dict:
     
     # Test 3: Fetch ticket
     reporter.step(f"Test GET /jira/tickets/{JIRA_TICKET_KEY}")
-    status, body = http_json(f"{JIRA_AGENT_URL}/jira/tickets/{JIRA_TICKET_KEY}")
+    status, body = http_json(
+        f"{JIRA_AGENT_URL}/jira/tickets/{JIRA_TICKET_KEY}",
+        headers=_DEVELOPMENT_PERMISSION_HEADERS,
+    )
     reporter.show("ticket-fetch", body)
     issue = body.get("issue") or {}
     fields = issue.get("fields") or {}
@@ -162,7 +172,10 @@ def test_jira_rest_api(reporter: Reporter) -> dict:
     
     # Test 4: Get transitions
     reporter.step(f"Test GET /jira/transitions/{JIRA_TICKET_KEY}")
-    status, body = http_json(f"{JIRA_AGENT_URL}/jira/transitions/{JIRA_TICKET_KEY}")
+    status, body = http_json(
+        f"{JIRA_AGENT_URL}/jira/transitions/{JIRA_TICKET_KEY}",
+        headers=_DEVELOPMENT_PERMISSION_HEADERS,
+    )
     reporter.show("transitions", body)
     transitions = body.get("transitions", [])
     if status == 200 and body.get("result") == "ok" and transitions:
@@ -176,7 +189,8 @@ def test_jira_rest_api(reporter: Reporter) -> dict:
     reporter.step(f"Test GET /jira/search?jql=key={JIRA_TICKET_KEY}")
     from urllib.parse import urlencode
     status, body = http_json(
-        f"{JIRA_AGENT_URL}/jira/search?{urlencode({'jql': f'key = {JIRA_TICKET_KEY}', 'maxResults': '1'})}"
+        f"{JIRA_AGENT_URL}/jira/search?{urlencode({'jql': f'key = {JIRA_TICKET_KEY}', 'maxResults': '1'})}",
+        headers=_DEVELOPMENT_PERMISSION_HEADERS,
     )
     reporter.show("search", body)
     search_result = body.get("search", {})
@@ -424,7 +438,7 @@ def main(argv=None):
     reporter = Reporter(verbose=args.verbose)
     
     print("\n" + "=" * 70)
-    print("  CSTL-4 End-to-End Test Suite")
+    print("  Boundary Context End-to-End Test Suite")
     print("=" * 70)
     print(f"  Jira Ticket:  {JIRA_TICKET_URL}")
     print(f"  GitHub Repo:  {GITHUB_REPO_URL}")

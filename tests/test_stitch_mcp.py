@@ -37,7 +37,7 @@ _ENV = load_env_file("tests/.env")
 
 
 def _env(key: str, fallback: str = "") -> str:
-    return os.environ.get(key) or _ENV.get(key, fallback)
+    return _ENV.get(key, fallback)
 
 
 def _parse_stitch_project_url(url: str) -> str:
@@ -51,10 +51,10 @@ def _parse_stitch_project_url(url: str) -> str:
 _stitch_project_url = _env("TEST_STITCH_PROJECT_URL")
 STITCH_PROJECT_ID = (
     _parse_stitch_project_url(_stitch_project_url) if _stitch_project_url
-    else "your-project-id"
+    else ""
 )
-STITCH_PROJECT_URL = _stitch_project_url or f"https://stitch.withgoogle.com/projects/{STITCH_PROJECT_ID}"
-STITCH_SCREEN_ID = _env("TEST_STITCH_SCREEN_ID", "your-screen-id")
+STITCH_PROJECT_URL = _stitch_project_url
+STITCH_SCREEN_ID = _env("TEST_STITCH_SCREEN_ID", "")
 STITCH_MCP_URL = "https://stitch.googleapis.com/mcp"
 STITCH_CLIENT_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ui-design", "stitch_client.py")
 
@@ -108,12 +108,12 @@ def _stitch_post(method: str, params: dict, api_key: str, timeout: int = 30):
 # ---------------------------------------------------------------------------
 
 def test_stitch_ids_parseable(reporter: Reporter) -> None:
-    assert STITCH_PROJECT_ID not in ("", "your-project-id"), \
+    assert STITCH_PROJECT_ID, \
         "STITCH_PROJECT_ID not configured — set TEST_STITCH_PROJECT_URL in tests/.env"
     assert len(STITCH_PROJECT_ID) >= 10, f"Stitch project ID too short: {STITCH_PROJECT_ID!r}"
     reporter.ok(f"Stitch project URL is well-formed: project {STITCH_PROJECT_ID}")
 
-    if STITCH_SCREEN_ID not in ("", "your-screen-id"):
+    if STITCH_SCREEN_ID:
         assert len(STITCH_SCREEN_ID) == 32, \
             f"Expected 32-char screen ID, got {len(STITCH_SCREEN_ID)}: {STITCH_SCREEN_ID!r}"
         reporter.ok(f"Stitch screen ID is well-formed: {STITCH_SCREEN_ID}")
@@ -177,7 +177,7 @@ def test_stitch_mcp_get_screen(reporter: Reporter) -> None:
     if not api_key:
         reporter.skip("Stitch MCP get_screen", "TEST_STITCH_API_KEY not set in tests/.env")
         return
-    if STITCH_SCREEN_ID in ("", "your-screen-id"):
+    if not STITCH_SCREEN_ID:
         reporter.skip("Stitch MCP get_screen", "TEST_STITCH_SCREEN_ID not set in tests/.env")
         return
 
@@ -221,7 +221,7 @@ def test_stitch_mcp_get_screen_image(reporter: Reporter) -> None:
     if not api_key:
         reporter.skip("Stitch MCP get_screen_image", "TEST_STITCH_API_KEY not set in tests/.env")
         return
-    if STITCH_SCREEN_ID in ("", "your-screen-id"):
+    if not STITCH_SCREEN_ID:
         reporter.skip("Stitch MCP get_screen_image", "TEST_STITCH_SCREEN_ID not set in tests/.env")
         return
 
@@ -424,7 +424,7 @@ def main(argv=None):
     print(f"  MCP URL : {STITCH_MCP_URL}")
 
     reporter.section("Static / dry-run checks")
-    if STITCH_PROJECT_ID not in ("", "your-project-id"):
+    if STITCH_PROJECT_ID:
         test_stitch_ids_parseable(reporter)
     else:
         reporter.skip("Stitch ID checks", "TEST_STITCH_PROJECT_URL not set in tests/.env")
