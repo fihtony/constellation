@@ -86,12 +86,14 @@ COPY .github/skills/  /app/.github/skills/
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
-# Gradle CI defaults — applied automatically to every ./gradlew invocation in this container.
-# These settings disable the daemon and cap memory to keep builds stable on emulated amd64.
-#   ANDROID_GRADLE_JVM_ARGS — read by android/app.py _android_gradle_base_args()
-#   ANDROID_GRADLE_MAX_WORKERS — read by android/app.py _android_gradle_base_args()
-#   GRADLE_OPTS — parsed by the Gradle launcher itself (--no-daemon, vfs.watch off)
-ENV ANDROID_GRADLE_JVM_ARGS="-Xmx1024m -Dfile.encoding=UTF-8" \
+# Gradle CI defaults for memory-constrained per-task containers.
+# ANDROID_GRADLE_JVM_ARGS: Gradle daemon heap. Kotlin 2.0 + Compose IR compilation
+#   requires at least 2g; lower values cause daemon OOM-kill at compileDebugKotlin.
+#   The container is launched with memory=4g (see registry-config.json launchSpec.memory).
+#   The host VM (Rancher Desktop / Docker Desktop) must be configured with >=6GB RAM.
+# android.dexBuilderWorkerCount=1 is written to GRADLE_USER_HOME/gradle.properties
+#   by the agent before each build to serialize D8 dexing and cap peak memory.
+ENV ANDROID_GRADLE_JVM_ARGS="-Xmx2g -Dfile.encoding=UTF-8" \
     ANDROID_GRADLE_MAX_WORKERS="1" \
     GRADLE_OPTS="-Dorg.gradle.daemon=false -Dorg.gradle.workers.max=1 -Dorg.gradle.vfs.watch=false -Dkotlin.daemon.enabled=false"
 

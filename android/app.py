@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import threading
@@ -934,16 +935,18 @@ def _prepare_gradle_user_home_properties(build_dir: str, log_fn) -> None:
     gradle_home = env.get("GRADLE_USER_HOME", "")
     if not gradle_home:
         return
-    jvm_args = os.environ.get("ANDROID_GRADLE_JVM_ARGS", "-Xmx1024m -Dfile.encoding=UTF-8").strip()
+    jvm_args = os.environ.get("ANDROID_GRADLE_JVM_ARGS", "-Xmx2g -Dfile.encoding=UTF-8").strip()
     if not jvm_args:
         return
     try:
         os.makedirs(gradle_home, exist_ok=True)
         props_path = os.path.join(gradle_home, "gradle.properties")
         with open(props_path, "w", encoding="utf-8") as fh:
-            fh.write(f"# Written by Android Agent — overrides project gradle.properties JVM heap\n")
+            fh.write("# Written by Android Agent — overrides project gradle.properties JVM heap\n")
             fh.write(f"org.gradle.jvmargs={jvm_args}\n")
             fh.write("org.gradle.daemon=false\n")
+            # Serialize D8 dex compilation to reduce peak memory in constrained containers
+            fh.write("android.dexBuilderWorkerCount=1\n")
         log_fn(f"Wrote GRADLE_USER_HOME/gradle.properties: org.gradle.jvmargs={jvm_args}")
     except OSError as exc:
         log_fn(f"Could not write GRADLE_USER_HOME/gradle.properties: {exc}")
@@ -1195,6 +1198,94 @@ def _clear_stale_gradle_locks(build_dir: str, log_fn) -> None:
                 log_fn(f"Could not remove stale Gradle lock {lock_path}: {exc}")
 
 
+def _terminate_subprocess(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _run_streaming_command(
+    cmd: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout_seconds: int,
+    label: str,
+    log_fn,
+) -> tuple[int, str]:
+    """Run a command with live log streaming and quiet-period heartbeats."""
+    heartbeat_seconds = max(5, int(os.environ.get("ANDROID_GRADLE_HEARTBEAT_SECONDS", "20")))
+    started_at = time.monotonic()
+    last_output_at = started_at
+    output_chunks: list[str] = []
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+
+    def _record_text(raw_text: str) -> None:
+        if not raw_text:
+            return
+        output_chunks.append(raw_text)
+        for line in raw_text.splitlines():
+            stripped = line.rstrip()
+            if stripped:
+                log_fn(f"[{label}] {stripped}")
+
+    try:
+        stream = process.stdout
+        if stream is None:
+            return_code = process.wait(timeout=timeout_seconds)
+            return return_code, ""
+
+        while True:
+            now = time.monotonic()
+            elapsed = now - started_at
+            if elapsed >= timeout_seconds:
+                timeout_message = f"[{label}] timed out after {timeout_seconds}s"
+                log_fn(timeout_message)
+                output_chunks.append(timeout_message + "\n")
+                _terminate_subprocess(process)
+                break
+
+            ready, _, _ = select.select([stream], [], [], 1.0)
+            if ready:
+                line = stream.readline()
+                if line == "":
+                    if process.poll() is not None:
+                        break
+                    continue
+                _record_text(line)
+                last_output_at = time.monotonic()
+                continue
+
+            if process.poll() is not None:
+                trailing = stream.read()
+                _record_text(trailing)
+                break
+
+            quiet_for = time.monotonic() - last_output_at
+            if quiet_for >= heartbeat_seconds:
+                log_fn(f"[{label}] still running after {int(elapsed)}s with no new output")
+                last_output_at = time.monotonic()
+
+        return_code = process.wait(timeout=10)
+        return return_code, "".join(output_chunks).strip()
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+
+
 def _build_and_test_android(build_dir: str, log_fn) -> tuple[bool, str, list[dict]]:
     if not os.path.isdir(build_dir):
         return False, "Build directory is missing.", [{"attempt": 1, "success": False, "output": "Build directory is missing."}]
@@ -1225,26 +1316,25 @@ def _build_and_test_android(build_dir: str, log_fn) -> tuple[bool, str, list[dic
     outputs: list[str] = []
     for index, step in enumerate(steps, start=1):
         log_fn(f"Build/test step {index}/{len(steps)}: {step['label']}")
-        result = subprocess.run(
+        step_env = _android_gradle_env(build_dir)
+        return_code, output = _run_streaming_command(
             step["cmd"],
             cwd=build_dir,
-            capture_output=True,
-            text=True,
-            timeout=int(os.environ.get("ANDROID_GRADLE_STEP_TIMEOUT_SECONDS", "1800")),
-            check=False,
-            env=_android_gradle_env(build_dir),
+            env=step_env,
+            timeout_seconds=int(os.environ.get("ANDROID_GRADLE_STEP_TIMEOUT_SECONDS", "1800")),
+            label=step["label"],
+            log_fn=log_fn,
         )
-        output = (result.stdout + "\n" + result.stderr).strip()
         outputs.append(f"$ {' '.join(step['cmd'])}\n{output}".strip())
         attempts.append(
             {
                 "attempt": index,
                 "label": step["label"],
-                "success": result.returncode == 0,
+                "success": return_code == 0,
                 "output": output[:4000],
             }
         )
-        if result.returncode != 0:
+        if return_code != 0:
             return False, "\n\n".join(outputs), attempts
     return True, "\n\n".join(outputs), attempts
 
