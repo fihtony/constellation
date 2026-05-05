@@ -204,6 +204,16 @@ class Launcher:
         if platform:
             payload["Platform"] = platform
 
+        # Optional memory limit from launchSpec.memory (e.g. "4g", "2048m").
+        # Parsed into bytes and applied to HostConfig.Memory and HostConfig.MemorySwap.
+        # Set MemorySwap equal to Memory to disable swap — keeps OOM behaviour predictable.
+        memory_str = str(effective_launch_spec.get("memory") or "").strip().lower()
+        if memory_str:
+            memory_bytes = _parse_memory_bytes(memory_str)
+            if memory_bytes > 0:
+                payload["HostConfig"]["Memory"] = memory_bytes
+                payload["HostConfig"]["MemorySwap"] = memory_bytes
+
         # Apply security launcher profile from launchSpec.security.launcherProfile
         self._apply_launcher_profile(effective_launch_spec, payload)
 
@@ -361,6 +371,28 @@ class Launcher:
         labels = payload.setdefault("Labels", {})
         labels["constellation.requested_launcher_profile"] = requested_profile
         labels["constellation.launcher_profile"] = applied_profile
+
+
+def _parse_memory_bytes(memory_str: str) -> int:
+    """Parse a human-readable memory string into bytes.
+
+    Accepted suffixes: g/gb (gigabytes), m/mb (megabytes), k/kb (kilobytes).
+    A bare integer is treated as bytes.  Returns 0 on parse failure.
+
+    Examples: "4g" -> 4294967296, "512m" -> 536870912, "0" -> 0
+    """
+    s = memory_str.strip().lower().rstrip("b")  # strip trailing 'b' so "gb","mb","kb" work
+    multipliers = {"g": 1024 ** 3, "m": 1024 ** 2, "k": 1024}
+    for suffix, mult in multipliers.items():
+        if s.endswith(suffix):
+            try:
+                return int(s[:-1]) * mult
+            except ValueError:
+                return 0
+    try:
+        return int(s)
+    except ValueError:
+        return 0
 
 
 def get_launcher():
