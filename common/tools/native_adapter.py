@@ -1,7 +1,7 @@
 """Native (function_calling) adapter.
 
 Exposes all registered ``ConstellationTool`` instances as OpenAI-compatible
-function definitions for use with the copilot-connect ``run_agentic()`` loop.
+function definitions for use with the connect-agent ``run_agentic()`` loop.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def get_function_definitions(tool_names: list[str] | None = None) -> list[dict]:
 def dispatch_function_call(name: str, args: dict) -> str:
     """Execute a function call and return its text result.
 
-    Used by the copilot-connect multi-turn loop to feed tool results back
+    Used by the connect-agent multi-turn loop to feed tool results back
     into the conversation.
     """
     tool = get_tool(name)

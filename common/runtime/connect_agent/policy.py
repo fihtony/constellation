@@ -22,7 +22,7 @@ class PolicyProfile:
     )
     allow_mcp_servers: list[str] = field(default_factory=list)
     require_approval: bool = False
-    max_turns: int = 50
+    max_turns: int = 75
     max_timeout_seconds: int = 1800
     allow_subagent: bool = True
     subagent_profile: str | None = None
@@ -111,7 +111,7 @@ _BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
             "> /dev/", "chown root", "> ~/.ssh/", "> /etc/",
         ],
         "allow_network": False,
-        "max_turns": 50,
+        "max_turns": 75,
         "max_timeout_seconds": 1800,
         "subagent_profile": "workspace-write",
     },

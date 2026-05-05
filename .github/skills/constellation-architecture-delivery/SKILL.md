@@ -22,6 +22,7 @@ user-invocable: false
 - Identify the smallest owning abstraction for the change: route/controller, workflow step, service, persistence adapter, or shared utility.
 - Keep cross-agent boundaries explicit. Fetch external context through boundary agents or MCP integrations already defined by the system; do not bypass them.
 - Preserve existing runtime constraints: audit artifacts, stage summaries, deterministic workspaces, and reviewability.
+- Keep permission policy centralized. If SCM branch protection changes, update `common/permissions/*.json` and the design docs instead of hardcoding new branch names or prefixes in handlers.
 
 ## Decision Heuristics
 
@@ -29,6 +30,7 @@ user-invocable: false
 - Keep contracts narrow and observable: explicit JSON fields, stable artifact names, and deterministic status transitions.
 - If a change adds new information flow, specify where it is fetched, where it is persisted, and which agent owns the decision.
 - Optimize for reversibility: choose small edits, local validation, and clear rollback points.
+- For branch-protection decisions, prefer regex-configured protected-branch policy over string-prefix heuristics. The default protected set is `main`, `master`, `develop`, and `release/*`; everything else is a development branch unless policy says otherwise.
 
 ## Review Standards
 

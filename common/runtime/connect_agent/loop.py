@@ -167,6 +167,7 @@ def agent_loop(
     start_time = time.time()
     loop_detector = LoopDetector()
     checkpoint_id = None
+    stop_with_pending_todos = 0
 
     if checkpoint_manager is not None:
         checkpoint_id = checkpoint_manager.save(
@@ -253,6 +254,27 @@ def agent_loop(
 
         if finish_reason == "stop" or not tool_calls_raw:
             final_content = str(content).strip()
+            pending_todos = [item.content for item in todo_manager.items if item.status != "completed"]
+            if pending_todos:
+                stop_with_pending_todos += 1
+                audit_log(
+                    "LOOP_STOP_WITH_PENDING_TODOS",
+                    turns=turns_used,
+                    pending=len(pending_todos),
+                    attempt=stop_with_pending_todos,
+                )
+                if final_content:
+                    messages.append({"role": "assistant", "content": final_content})
+                if stop_with_pending_todos < 3 and turns_used < max_turns:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "<unfinished_work>You tried to stop, but your todo list still has unfinished items:\n- "
+                            + "\n- ".join(pending_todos)
+                            + "\nContinue autonomously. Do not ask for confirmation unless external input is genuinely missing.</unfinished_work>"
+                        ),
+                    })
+                    continue
             if on_progress:
                 on_progress(final_content[:300])
             audit_log("LOOP_COMPLETE", turns=turns_used, reason=finish_reason)

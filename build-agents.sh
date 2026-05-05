@@ -22,6 +22,7 @@ build_android() {
     fi
     echo "==> Building android agent image: constellation-android-agent:latest"
     docker build \
+        --platform linux/amd64 \
         -t constellation-android-agent:latest \
         -f "${SCRIPT_DIR}/android/Dockerfile" \
         "${SCRIPT_DIR}"

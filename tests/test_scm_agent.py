@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
 import os
 import re
 import socket
@@ -68,9 +69,15 @@ from agent_test_targets import (
     scm_repo_slug,
     scm_write_root,
 )
+from common.task_permissions import load_permission_grant
 
 DEFAULT_LOCAL_PORT = 18020
 CONTAINER_AGENT_URL = "http://127.0.0.1:8020"
+_DEVELOPMENT_PERMISSIONS = load_permission_grant("development").to_dict()
+
+
+def _permission_headers() -> dict:
+    return {"X-Task-Permissions": json.dumps(_DEVELOPMENT_PERMISSIONS, ensure_ascii=False)}
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +277,8 @@ def main(argv=None):
         # TC-04 — Repo inspect ----------------------------------------------
         reporter.step(f"TC-04  GET /scm/repo?owner={owner}&repo={repo}")
         status, body, _ = http_request(
-            f"{agent_url}/scm/repo?{urlencode({'owner': owner, 'repo': repo})}"
+            f"{agent_url}/scm/repo?{urlencode({'owner': owner, 'repo': repo})}",
+            headers=_permission_headers(),
         )
         reporter.show("Repo inspect", body)
         repo_info = body.get("repo", {})
@@ -286,7 +294,8 @@ def main(argv=None):
         # TC-05 — Branch list -----------------------------------------------
         reporter.step(f"TC-05  GET /scm/branches?owner={owner}&repo={repo}")
         status, body, _ = http_request(
-            f"{agent_url}/scm/branches?{urlencode({'owner': owner, 'repo': repo})}"
+            f"{agent_url}/scm/branches?{urlencode({'owner': owner, 'repo': repo})}",
+            headers=_permission_headers(),
         )
         reporter.show("Branch list", body)
         branches = body.get("branches", [])
@@ -314,6 +323,7 @@ def main(argv=None):
                 "repo": repo,
                 "branch": feature_branch,
                 "from_branch": base_branch,
+                "permissions": _DEVELOPMENT_PERMISSIONS,
             },
         )
         reporter.show("Branch create", body)
@@ -342,6 +352,7 @@ def main(argv=None):
                 "baseBranch": base_branch,
                 "commitMessage": f"[Agent Test] Add {file_path}",
                 "files": [{"path": file_path, "content": file_content}],
+                "permissions": _DEVELOPMENT_PERMISSIONS,
             },
             timeout=180,
         )
@@ -370,6 +381,7 @@ def main(argv=None):
                     "Automated PR created by the SCM agent integration test. "
                     f"Contains a single test file under {scm_write_root()}."
                 ),
+                "permissions": _DEVELOPMENT_PERMISSIONS,
             },
             timeout=120,
         )
@@ -388,6 +400,7 @@ def main(argv=None):
         reporter.step(f"TC-09  GET /scm/pull-requests/{pr_id}")
         status, body, _ = http_request(
             f"{agent_url}/scm/pull-requests/{pr_id}?{urlencode({'owner': owner, 'repo': repo})}",
+            headers=_permission_headers(),
             timeout=60,
         )
         reporter.show("PR get", body)
@@ -406,6 +419,7 @@ def main(argv=None):
         reporter.step("TC-10  GET /scm/pull-requests (state=open)")
         status, body, _ = http_request(
             f"{agent_url}/scm/pull-requests?{urlencode({'owner': owner, 'repo': repo, 'state': 'open'})}",
+            headers=_permission_headers(),
             timeout=60,
         )
         reporter.show("PR list", body)
@@ -427,6 +441,7 @@ def main(argv=None):
                 "repo": repo,
                 "prId": pr_id,
                 "text": comment_text,
+                "permissions": _DEVELOPMENT_PERMISSIONS,
             },
             timeout=60,
         )
@@ -442,6 +457,7 @@ def main(argv=None):
         reporter.step(f"TC-12  GET /scm/pull-requests/{pr_id}/comments")
         status, body, _ = http_request(
             f"{agent_url}/scm/pull-requests/{pr_id}/comments?{urlencode({'owner': owner, 'repo': repo})}",
+            headers=_permission_headers(),
             timeout=60,
         )
         reporter.show("PR comment list", body)

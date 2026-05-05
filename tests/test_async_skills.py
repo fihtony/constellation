@@ -22,6 +22,13 @@ import time
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
+from common.task_permissions import load_permission_grant
+from tests.agent_test_support import load_env_file
+
+
+_DEVELOPMENT_PERMISSIONS = load_permission_grant("development").to_dict()
+_ENV = load_env_file("tests/.env")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -46,8 +53,15 @@ def _post(url, payload, timeout=30):
         return 0, {"error": str(exc)}
 
 
-def _get(url, timeout=30):
-    req = Request(url, headers={"Accept": "application/json"}, method="GET")
+def _permission_headers() -> dict:
+    return {"X-Task-Permissions": json.dumps(_DEVELOPMENT_PERMISSIONS, ensure_ascii=False)}
+
+
+def _get(url, timeout=30, headers=None):
+    request_headers = {"Accept": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    req = Request(url, headers=request_headers, method="GET")
     try:
         with urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
@@ -159,6 +173,7 @@ def test_clone_endpoint_accepts_and_returns_task_id(bb_url, project, repo, repor
                 "repo": repo,
                 "branch": "develop",
                 "targetPath": target,
+                "permissions": _DEVELOPMENT_PERMISSIONS,
                 # No callbackUrl: testing poll-only mode
             },
             timeout=15,
@@ -203,7 +218,10 @@ def test_repo_tree_endpoint(bb_url, clone_path, report):
     if not clone_path or not os.path.isdir(clone_path):
         report.fail("repo_tree_returns_content", f"clone_path not available: {clone_path!r}")
         return
-    status, body = _get(f"{bb_url}/scm/repo/tree?path={clone_path}&depth=3")
+    status, body = _get(
+        f"{bb_url}/scm/repo/tree?path={clone_path}&depth=3",
+        headers=_permission_headers(),
+    )
     if status != 200:
         report.fail("repo_tree_returns_content", f"status={status}")
         return
@@ -231,7 +249,10 @@ def test_repo_file_endpoint(bb_url, clone_path, report):
     if not found_file:
         report.ok("repo_file_returns_content", "skip — no known root file exists in repo")
         return
-    status, body = _get(f"{bb_url}/scm/repo/file?path={clone_path}&file={found_file}")
+    status, body = _get(
+        f"{bb_url}/scm/repo/file?path={clone_path}&file={found_file}",
+        headers=_permission_headers(),
+    )
     if status != 200:
         report.fail("repo_file_returns_content", f"status={status} file={found_file}")
         return
@@ -302,13 +323,13 @@ def _parse_github_repo_url(url: str) -> tuple:
 
 
 def _default_github_owner_repo():
-    """Return (owner, repo) from TEST_GITHUB_REPO_URL or individual env vars."""
-    repo_url = os.environ.get("TEST_GITHUB_REPO_URL", "")
+    """Return (owner, repo) from TEST_GITHUB_REPO_URL in tests/.env."""
+    repo_url = _ENV.get("TEST_GITHUB_REPO_URL", "")
     if repo_url:
         return _parse_github_repo_url(repo_url)
     return (
-        os.environ.get("TEST_GITHUB_OWNER", "your-username"),
-        os.environ.get("TEST_GITHUB_REPO", "test-repo"),
+        _ENV.get("TEST_GITHUB_OWNER", ""),
+        _ENV.get("TEST_GITHUB_REPO", ""),
     )
 
 

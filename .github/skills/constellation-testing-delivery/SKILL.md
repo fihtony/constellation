@@ -30,6 +30,7 @@ user-invocable: false
 - Test the full request-response cycle for each API endpoint: 200/201, 400, 404, 500.
 - For external service calls (Jira, SCM, Figma), verify the agent correctly handles success, partial data, and error responses.
 - Integration tests may use real services with test credentials or a reliable local mock (not random/flaky stubs).
+- For permission-gated boundary endpoints, include explicit tests for: missing snapshot → 403, malformed snapshot → 403, allowed operation → success, denied operation → 403, and direct HTTP GET endpoints carrying `X-Task-Permissions`.
 
 ### Tier 3 — End-to-End / Acceptance Tests (Required for user-visible flows)
 
@@ -44,6 +45,11 @@ user-invocable: false
 - Do not pad tests with trivial assertions (`assert isinstance(x, list)`) that inflate counts without catching bugs.
 - Use `pytest` for Python code and follow the existing test runner patterns in the repository.
 - Every test must import and call actual project code — no placeholder `pass` bodies.
+- Any test that needs a Jira ticket URL/key, GitHub or Bitbucket repo URL, Figma URL, or Stitch URL must load that target from `tests/.env` (directly or through a helper). Do not hardcode real ticket IDs, repo URLs, or design URLs in test scripts.
+- When branch authorization depends on policy, add at least one test for default protected branches (`main`, `master`, `develop`, `release/*`) and one test for a custom regex override.
+- For execution agents, a failing local validation command is not the end of the workflow: run a bounded local self-repair loop, re-run the same focused validation, and persist each attempt before escalating the remaining defect to Team Lead.
+- For Team Lead → dev-agent workflows, add or update tests so prefetched `jiraContext` / `designContext` metadata is consumed before any duplicate boundary fetch is attempted.
+- For Android or other container-sensitive execution agents, validate the required build and unit-test commands inside the actual agent image with the repository bind-mounted. If the container cannot run the validation command, fix the image or repo state and rerun until the environment is ready or the remaining failure is a real product defect.
 
 ## Coverage Targets
 
@@ -61,6 +67,7 @@ user-invocable: false
 - [ ] Each acceptance criterion maps to at least one test that could fail if the criterion is not met.
 - [ ] Error paths (invalid input, missing resource, service failure) have at least one test each.
 - [ ] Test file runs cleanly with `pytest -v` (or equivalent) from the project root.
+- [ ] A2A integration tests use `message.metadata.permissions`, and any retained direct HTTP convenience-endpoint tests use the matching debug transport (`X-Task-Permissions`) only for those non-production paths.
 
 ## Review Standard for Tests
 

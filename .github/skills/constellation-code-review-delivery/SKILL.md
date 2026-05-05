@@ -44,6 +44,12 @@ Check for the following in all changed code:
 
 Flag any finding with severity: CRITICAL / HIGH / MEDIUM. Do not auto-apply fixes — flag for human review.
 
+Additional Constellation-specific checks:
+
+- Verify every boundary-agent read/write path enforces the task permission snapshot, including direct HTTP convenience endpoints.
+- Reject compatibility fallbacks that silently allow missing or malformed permission snapshots in `strict` mode.
+- For SCM changes, verify protected-branch logic comes from central regex policy (`common/permissions/*.json`) rather than scattered hardcoded branch names.
+
 ### Pass 3 — Edge Cases and Reliability
 
 - What happens when required inputs are None, empty, or malformed?
@@ -64,6 +70,7 @@ Flag any finding with severity: CRITICAL / HIGH / MEDIUM. Do not auto-apply fixe
 - Do not suggest style changes — only flag things that are incorrect, insecure, or incomplete.
 - For every CRITICAL/HIGH security finding, propose a concrete fix alongside the finding.
 - A deliverable passes review when: all acceptance criteria are demonstrably met, no CRITICAL/HIGH security issues remain, and key error paths have test coverage.
+- Treat missing tests for protected-branch regex overrides, permission-header handling on GET endpoints, or fail-closed enforcement as review gaps, not optional follow-ups.
 
 ## Refactoring Guidance
 

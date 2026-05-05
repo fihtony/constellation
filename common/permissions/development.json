@@ -1,0 +1,81 @@
+{
+  "taskType": "development",
+  "version": "1.1",
+  "description": "Default permissions for development tasks (implement Jira tickets, code changes, PRs).",
+  "scopeConfig": {
+    "scm": {
+      "protectedBranchPatterns": [
+        "^main$",
+        "^master$",
+        "^develop$",
+        "^release/.*$"
+      ]
+    }
+  },
+  "allowed": [
+    {
+      "agent": "jira",
+      "operations": [
+        {"action": "read", "scope": "*", "description": "Read all ticket fields (summary, description, assignee, status, history, labels, etc.)"},
+        {"action": "comment.add", "scope": "*", "description": "Add a comment to the ticket"},
+        {"action": "comment.update", "scope": "self", "description": "Update a comment added by this task"},
+        {"action": "issue.update.labels", "scope": "*", "description": "Update ticket labels for workflow metadata"},
+        {"action": "transition", "scope": "*", "description": "Change ticket status (e.g. To Do -> In Progress -> In Review)"},
+        {"action": "assignee.update", "scope": "*", "description": "Change ticket assignee"}
+      ]
+    },
+    {
+      "agent": "scm",
+      "operations": [
+        {"action": "repo.search", "scope": "*", "description": "Search repositories by query text"},
+        {"action": "repo.inspect", "scope": "*", "description": "Read repository metadata and branch overview"},
+        {"action": "repo.tree", "scope": "*", "description": "Read the tree of an already-cloned repository"},
+        {"action": "repo.file", "scope": "*", "description": "Read a file from an already-cloned repository"},
+        {"action": "repo.clone", "scope": "*", "description": "Clone a repository into shared workspace"},
+        {"action": "repo.pull", "scope": "*", "description": "Pull or fetch remote repo to sync"},
+        {"action": "branch.list", "scope": "*", "description": "List repository branches"},
+        {"action": "branch.create", "scope": "branch:development", "description": "Create a non-protected development branch"},
+        {"action": "branch.push", "scope": "branch:development", "description": "Push a non-protected development branch to remote"},
+        {"action": "branch.update", "scope": "branch:development", "description": "Update (force-push) a non-protected development branch"},
+        {"action": "pr.create", "scope": "*", "description": "Create a PR from dev branch to default/release branch"},
+        {"action": "pr.get", "scope": "*", "description": "Read pull request details"},
+        {"action": "pr.list", "scope": "*", "description": "List pull requests"},
+        {"action": "pr.comment", "scope": "self", "description": "Add comments to a PR created or owned by this task"},
+        {"action": "pr.comment.list", "scope": "*", "description": "List pull request comments"},
+        {"action": "pr.update", "scope": "self", "description": "Update a PR created by this task"}
+      ]
+    },
+    {
+      "agent": "ui-design",
+      "operations": [
+        {"action": "figma.read", "scope": "*", "description": "Fetch Figma design content (pages, nodes, specs)"},
+        {"action": "stitch.read", "scope": "*", "description": "Fetch Google Stitch design content (screens, code)"},
+        {"action": "element.inspect", "scope": "*", "description": "Inspect UI element specs from design tool"}
+      ]
+    }
+  ],
+  "denied": [
+    {
+      "agent": "jira",
+      "operations": [
+        {"action": "issue.update.summary", "description": "Modify ticket title/summary"},
+        {"action": "issue.update.description", "description": "Modify ticket body/description"},
+        {"action": "issue.delete", "description": "Delete a Jira ticket"},
+        {"action": "comment.delete", "description": "Delete a comment"}
+      ],
+      "escalation": "require_user_approval"
+    },
+    {
+      "agent": "scm",
+      "operations": [
+        {"action": "repo.delete", "description": "Delete a repository"},
+        {"action": "branch.create", "scope": "branch:protected", "description": "Create a protected branch name such as main/master/develop/release/*"},
+        {"action": "branch.push", "scope": "branch:protected", "description": "Push directly to a protected branch"},
+        {"action": "branch.update", "scope": "branch:protected", "description": "Force-update a protected branch"},
+        {"action": "branch.delete", "scope": "branch:protected", "description": "Delete a protected branch"}
+      ],
+      "escalation": "require_user_approval"
+    }
+  ],
+  "fallback": "deny_and_escalate"
+}

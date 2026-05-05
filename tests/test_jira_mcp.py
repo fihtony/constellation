@@ -37,7 +37,7 @@ _ENV = load_env_file("tests/.env")
 
 
 def _env(key: str, fallback: str = "") -> str:
-    return os.environ.get(key) or _ENV.get(key, fallback)
+    return _ENV.get(key, fallback)
 
 
 def _parse_jira_ticket_url(url: str) -> tuple[str, str]:
@@ -54,10 +54,10 @@ _jira_url = _env("TEST_JIRA_TICKET_URL")
 if _jira_url:
     JIRA_BASE_URL, JIRA_TICKET_KEY = _parse_jira_ticket_url(_jira_url)
 else:
-    JIRA_BASE_URL = "https://your-org.atlassian.net"
-    JIRA_TICKET_KEY = "PROJ-1"
+    JIRA_BASE_URL = ""
+    JIRA_TICKET_KEY = ""
 
-JIRA_TICKET_URL = f"{JIRA_BASE_URL}/browse/{JIRA_TICKET_KEY}"
+JIRA_TICKET_URL = f"{JIRA_BASE_URL}/browse/{JIRA_TICKET_KEY}" if JIRA_BASE_URL and JIRA_TICKET_KEY else ""
 JIRA_CLOUD_HOST = JIRA_BASE_URL.replace("https://", "").replace("http://", "")
 JIRA_TENANT_INFO_URL = f"https://{JIRA_CLOUD_HOST}/_edge/tenant_info"
 ATLASSIAN_MCP_URL = "https://mcp.atlassian.com/v1/mcp"

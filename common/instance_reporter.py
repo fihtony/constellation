@@ -6,7 +6,7 @@ import atexit
 import json
 import os
 import threading
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 _DISABLED_VALUES = {
@@ -27,10 +27,27 @@ def _post_json(url, payload, method="POST"):
     )
     try:
         with urlopen(request, timeout=5) as response:
-            return json.loads(response.read().decode("utf-8"))
+            body = response.read().decode("utf-8")
+            parsed = json.loads(body) if body else None
+            return {
+                "ok": True,
+                "status": getattr(response, "status", 200),
+                "body": parsed,
+            }
+    except HTTPError as error:
+        print(f"[reporter] Failed to reach registry: {error}")
+        return {
+            "ok": False,
+            "status": error.code,
+            "body": None,
+        }
     except (URLError, OSError) as error:
         print(f"[reporter] Failed to reach registry: {error}")
-        return None
+        return {
+            "ok": False,
+            "status": None,
+            "body": None,
+        }
 
 
 class InstanceReporter:
@@ -88,7 +105,7 @@ class InstanceReporter:
             self._remove()
 
     def _register(self):
-        return _post_json(
+        result = _post_json(
             f"{self.registry_url}/agents/{self.agent_id}/instances",
             {
                 "serviceUrl": self.service_url,
@@ -96,6 +113,9 @@ class InstanceReporter:
                 "containerId": self.container_id,
             },
         )
+        if result.get("ok"):
+            return result.get("body") or {}
+        return None
 
     def _remove(self):
         try:
@@ -111,8 +131,20 @@ class InstanceReporter:
     def _heartbeat_loop(self):
         while not self._stop.wait(self.heartbeat_interval):
             if self.instance_id:
-                _post_json(
+                self._heartbeat_once()
+
+    def _heartbeat_once(self):
+        result = _post_json(
                     f"{self.registry_url}/agents/{self.agent_id}/instances/{self.instance_id}",
                     {"heartbeat": True},
                     method="PUT",
                 )
+        if result.get("ok"):
+            return
+        if result.get("status") != 404:
+            return
+
+        recovered = self._register()
+        if recovered and recovered.get("instance_id"):
+            self.instance_id = recovered["instance_id"]
+            print(f"[reporter] Re-registered instance {self.instance_id} for {self.agent_id}")

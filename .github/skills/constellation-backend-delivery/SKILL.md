@@ -22,6 +22,7 @@ user-invocable: false
 - Validate inputs at the boundary and fail with actionable messages.
 - Keep orchestration separate from side-effect execution where practical.
 - Prefer idempotent operations and deterministic retries when workflows touch external systems.
+- When Team Lead has already fetched Jira or design context, pass bounded copies downstream through A2A metadata instead of forcing the dev agent to re-fetch the same payload. Downstream agents should consume `jiraContext` / `designContext` first and call boundary agents again only for incremental detail.
 
 ## Security And Reliability
 
@@ -29,6 +30,8 @@ user-invocable: false
 - Preserve auth, permission, and tenant boundaries already enforced by the system.
 - Capture operational evidence for important side effects so Team Lead and Compass can review outcomes.
 - Avoid silent fallbacks that hide degraded behavior; surface warnings in summaries or artifacts.
+- Fail closed on permission input. Missing or malformed permission snapshots must reject boundary reads and writes in `strict` mode; do not preserve compatibility shortcuts in pre-release code.
+- For SCM branch authorization, derive protected branches from regex-configured policy, not hardcoded names spread across handlers.
 
 ## Review Standards
 

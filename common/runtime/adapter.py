@@ -1,11 +1,12 @@
-"""Unified agentic runtime contract and backend factory.
+"""Unified runtime contract and backend factory.
 
-All agents that need agentic reasoning should call ``get_runtime().run(...)``
+All agents that need runtime-managed reasoning should call ``get_runtime().run(...)``
 instead of invoking a raw LLM or CLI command directly.
 
 Supports two execution modes:
-- ``run()``:         Single structured prompt → response (existing mode).
-- ``run_agentic()``: Autonomous multi-turn execution with tools (new mode).
+- ``run()``: single structured prompt → response.
+- ``run_agentic()``: autonomous multi-turn execution with tools for backends
+    that implement agentic control, such as ``connect-agent``.
 """
 
 from __future__ import annotations
@@ -102,7 +103,7 @@ class AgentRuntimeAdapter(ABC):
         del max_turns, timeout, on_progress, continuation
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support run_agentic(). "
-            "Use a backend that supports agentic mode (e.g. claude-code, copilot-cli)."
+            "Use a backend that supports agentic mode (e.g. connect-agent, claude-code)."
         )
 
     def supports_mcp(self) -> bool:
