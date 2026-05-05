@@ -188,6 +188,18 @@ class RancherLauncher:
                 }
             },
         }
+        platform = str(launch_spec.get("platform") or "").strip()
+        if platform:
+            payload["Platform"] = platform
+
+        # Optional memory limit from launchSpec.memory (e.g. "4g", "2048m").
+        memory_str = str(launch_spec.get("memory") or "").strip().lower()
+        if memory_str:
+            from common.launcher import _parse_memory_bytes
+            memory_bytes = _parse_memory_bytes(memory_str)
+            if memory_bytes > 0:
+                payload["HostConfig"]["Memory"] = memory_bytes
+                payload["HostConfig"]["MemorySwap"] = memory_bytes
 
         artifact_root_container = os.environ.get("ARTIFACT_ROOT", "/app/artifacts")
         artifact_root_host = self._discover_host_source(artifact_root_container)

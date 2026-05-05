@@ -55,6 +55,44 @@ _TESTS_DATA_DIR = os.path.join(_REPO_ROOT, "tests", "data")
 _MIN_CSS_SIZE_BYTES = 8_000
 _MAX_CSS_SIZE_BYTES = 120_000
 
+
+def _load_prompt_file(path: str) -> str:
+    """Load a prompt/workflow markdown file relative to repo root."""
+    full = os.path.join(_REPO_ROOT, path)
+    if os.path.isfile(full):
+        with open(full, encoding="utf-8") as fh:
+            return fh.read().strip()
+    return ""
+
+
+def _build_design_to_code_system_prompt() -> str:
+    """Compose design-to-code system prompt from external workflow files.
+
+    Generic workflow lives in team-lead/workflows/design-to-code-workflow.md.
+    React + Tailwind specifics live in web/prompts/react-tailwind-workflow.md.
+    The test adds a thin preamble for agent identity.
+    """
+    preamble = (
+        "You are an expert frontend developer and design engineer working "
+        "autonomously on design-to-code tasks.\n"
+        "Implement the requested UI faithfully from the design inputs "
+        "provided in the task prompt.\n"
+        "You have access to shell (bash), file, and search tools.\n"
+        "You MUST complete the full implementation and verification cycle "
+        "before stopping."
+    )
+    generic = _load_prompt_file("team-lead/workflows/design-to-code-workflow.md")
+    web_specific = _load_prompt_file("web/prompts/react-tailwind-workflow.md")
+    parts = [preamble]
+    if generic:
+        parts.append(generic)
+    if web_specific:
+        parts.append(web_specific)
+    return "\n\n".join(parts)
+
+
+DESIGN_TO_CODE_SYSTEM_PROMPT = _build_design_to_code_system_prompt()
+
 _TAILWIND_CONFIG_FORBIDDEN_PATTERNS = [
     r"safelist\\s*:",
     r"pattern\\s*:\\s*/\\.\\*/",
@@ -1135,7 +1173,6 @@ def run_test(
     os.environ["CONNECT_AGENT_PROFILE"] = "design-to-code"
 
     from common.runtime.adapter import get_runtime
-    from common.runtime.connect_agent.adapter import DESIGN_TO_CODE_AGENTIC_SYSTEM
 
     runtime = get_runtime("connect-agent")
 
@@ -1153,7 +1190,7 @@ def run_test(
 
     result = runtime.run_agentic(
         task=task_prompt,
-        system_prompt=DESIGN_TO_CODE_AGENTIC_SYSTEM,
+        system_prompt=DESIGN_TO_CODE_SYSTEM_PROMPT,
         cwd=project_dir,
         max_turns=max_turns,
         timeout=timeout,

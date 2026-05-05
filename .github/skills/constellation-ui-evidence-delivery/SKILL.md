@@ -3,10 +3,11 @@
 Adapted from [web-design-reviewer](https://github.com/github/awesome-copilot/tree/main/skills/web-design-reviewer)
 in the github/awesome-copilot collection.
 
-This skill guides the Web Agent when capturing visual evidence of UI implementations
-and comparing them against the design reference. It defines viewport standards,
-screenshot naming conventions, and the structured evidence report expected in every
-PR that includes a UI component.
+This skill guides execution agents when capturing visual evidence of UI implementations
+and comparing them against the design reference. It defines screenshot naming conventions,
+evidence expectations, and the structured PR/report contract for any UI task. Web Agent is
+the most complete current implementation, but Android / iOS style UI agents should follow the
+same evidence contract whenever they can produce real screenshots.
 
 ---
 
@@ -19,6 +20,7 @@ Apply whenever a completed task includes any of:
 - A fullstack implementation with at least one rendered page
 
 Backend-only tasks (REST APIs, workers, scripts) do **not** require UI screenshots.
+Repo-backed UI tasks do require the screenshots to be tied to the active local branch / PR evidence.
 
 ---
 
@@ -49,6 +51,14 @@ Additional viewports (e.g., 768×1024 for tablet) may be added by updating
 
 ## Capture Procedure
 
+Before capture, the execution agent should already have:
+
+1. Cloned the repo into the shared workspace.
+2. Created or reused the local development branch inside that clone.
+3. Implemented the UI and run the required local build/test validation.
+
+Then capture evidence using the platform-appropriate mechanism.
+
 1. **Start the application locally** on a free port using a headless subprocess.
    - For Flask/FastAPI: `python -m flask run --host=127.0.0.1 --port={PORT}`
    - For Node.js SPA: `npm run preview -- --port {PORT}` or `npm start`
@@ -64,6 +74,8 @@ Additional viewports (e.g., 768×1024 for tablet) may be added by updating
 
 4. **Register artifact** in `generated_files` so it is committed and pushed
    alongside the implementation code.
+5. **Persist workspace evidence** in the agent evidence directory (for example
+   `web-agent/design-reference.png`, `web-agent/screenshot-1280x900.png`).
 
 ---
 
@@ -106,8 +118,8 @@ The `## Screenshots` section of every PR must include:
 ![Screenshot 375x812](https://raw.githubusercontent.com/{owner}/{repo}/{branch}/docs/evidence/screenshot-375x812.png)
 ```
 
-3. If screenshots could not be captured (no Chromium, server did not start),
-   note this explicitly — do not omit the section.
+3. If screenshots could not be captured (no Chromium, emulator/simulator unavailable,
+   server did not start), note this explicitly — do not omit the section.
 
 ---
 
@@ -137,7 +149,9 @@ Team Lead review should verify the following when screenshots are present:
 ## Best Practices
 
 - **Capture first, commit together**: take screenshots in the same phase as
-  code generation, before the git commit, so all evidence travels with the code.
+   code generation, before the git commit, so all evidence travels with the code.
+- **Keep workflow evidence aligned**: screenshot evidence should match the same
+   local branch / PR / Jira update cycle used for the code changes.
 - **Use real app startup, not static files**: screenshots taken from a running
   server catch runtime rendering issues that static HTML does not.
 - **Skip gracefully**: if Chromium is unavailable or the server does not start,

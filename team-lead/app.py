@@ -37,6 +37,12 @@ from common.per_task_exit import PerTaskExitHandler
 from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt, load_rules
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.task_permissions import (
+    PermissionEscalationRequired,
+    build_permission_denied_artifact,
+    extract_permission_denial,
+    grant_permission,
+)
 from common.task_store import TaskStore
 from common.time_utils import local_clock_time, local_iso_timestamp
 from team_lead import prompts
@@ -57,11 +63,19 @@ INPUT_WAIT_TIMEOUT = int(os.environ.get("INPUT_WAIT_TIMEOUT_SECONDS", "7200"))  
 MAX_REVIEW_CYCLES = int(os.environ.get("MAX_REVIEW_CYCLES", "2"))
 MAX_GATHER_ROUNDS = int(os.environ.get("MAX_GATHER_ROUNDS", "6"))
 MAX_INPUT_ROUNDS = int(os.environ.get("MAX_INPUT_ROUNDS", "2"))
-SYNC_AGENT_TIMEOUT = int(os.environ.get("SYNC_AGENT_TIMEOUT_SECONDS", "120"))
+SYNC_AGENT_TIMEOUT = int(os.environ.get("SYNC_AGENT_TIMEOUT_SECONDS", "300"))
 DEV_AGENT_ACK_TIMEOUT = int(os.environ.get("DEV_AGENT_ACK_TIMEOUT_SECONDS", "3600"))
 COMPASS_ACK_TIMEOUT = int(os.environ.get("COMPASS_ACK_TIMEOUT_SECONDS", "300"))
 
 _AGENT_CARD_PATH = os.path.join(os.path.dirname(__file__), "agent-card.json")
+
+_WORKFLOWS_DIR = os.path.join(os.path.dirname(__file__), "workflows")
+
+
+def _read_team_lead_workflow(filename: str) -> str:
+    path = os.path.join(_WORKFLOWS_DIR, filename)
+    with open(path, encoding="utf-8") as handle:
+        return handle.read().strip()
 
 registry = RegistryClient()
 agent_directory = AgentDirectory(AGENT_ID, registry)
@@ -91,6 +105,37 @@ _JIRA_TICKET_KEY_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]+-\d+)\b")
 _REPO_URL_RE = re.compile(r"https?://[^\s\"'\}]*?(?:github\.com|bitbucket)[^\s\"'\}]*", re.IGNORECASE)
 _FIGMA_URL_RE = re.compile(r"https?://[^\s\"'\}]*figma\.com/[^\s\"'\}]+", re.IGNORECASE)
 _STITCH_URL_RE = re.compile(r"https?://[^\s\"'\}]*(?:stitch\.withgoogle\.com|stitch\.googleapis\.com)/[^\s\"'\}]+", re.IGNORECASE)
+_ANDROID_PLATFORM_HINTS = (
+    "android",
+    "jetpack compose",
+    "androidmanifest",
+    "compilesdk",
+    "targetsdk",
+    "minsdk",
+    "gradle/libs.versions.toml",
+)
+_IOS_PLATFORM_HINTS = (
+    "ios",
+    "swiftui",
+    "xcode",
+    "cocoapods",
+    "podfile",
+    "uikit",
+)
+_WEB_PLATFORM_HINTS = (
+    "web",
+    "frontend",
+    "browser",
+    "react",
+    "next.js",
+    "nextjs",
+    "vue",
+    "tailwind",
+    "html",
+    "css",
+    "javascript",
+    "typescript",
+)
 
 NON_TERMINAL_STATES = {
     "SUBMITTED",
@@ -157,6 +202,7 @@ class _TaskContext:
         "compass_callback_url",
         "compass_url",
         "shared_workspace_path",
+        "permissions",
         "original_message",
         "user_text",
         "analysis",
@@ -173,6 +219,7 @@ class _TaskContext:
         "review_cycles",
         "phases_log",
         "pending_tasks",
+        "pending_permission_request",
     )
 
     def __init__(self):
@@ -180,6 +227,7 @@ class _TaskContext:
         self.compass_callback_url: str = ""
         self.compass_url: str = COMPASS_URL
         self.shared_workspace_path: str = ""
+        self.permissions: dict | None = None
         self.original_message: dict = {}
         self.user_text: str = ""
         self.analysis: dict = {}
@@ -196,6 +244,7 @@ class _TaskContext:
         self.review_cycles: int = 0
         self.phases_log: list[str] = []
         self.pending_tasks: list[str] = []
+        self.pending_permission_request: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +302,13 @@ def _read_pr_url_from_workspace(workspace: str) -> str:
     return ""
 
 
-def _post_pr_review_comment(pr_url: str, feedback: str, workspace: str, task_id: str) -> None:
+def _post_pr_review_comment(
+    pr_url: str,
+    feedback: str,
+    workspace: str,
+    task_id: str,
+    permissions: dict | None = None,
+) -> None:
     """Best-effort: post review feedback as a comment on the PR via SCM agent."""
     if not pr_url or not feedback:
         return
@@ -268,11 +323,21 @@ def _post_pr_review_comment(pr_url: str, feedback: str, workspace: str, task_id:
             "parts": [{"text": f"Please add this review comment to PR {pr_url}:\n\n{feedback}"}],
             "metadata": {"prUrl": pr_url, "commentText": feedback},
         }
+        if isinstance(permissions, dict) and permissions:
+            msg["metadata"]["permissions"] = permissions
         rev_task = _a2a_send(scm_url, msg)
         _poll_agent_task(scm_url, rev_task.get("id", ""), timeout=30)
         print(f"[{AGENT_ID}] Posted review comment to PR {pr_url}")
     except Exception as exc:
         print(f"[{AGENT_ID}] Could not post PR review comment: {exc}")
+
+
+def _resolve_agent_service_url(capability: str) -> str:
+    try:
+        _, instance = agent_directory.resolve_capability(capability)
+    except Exception:
+        return ""
+    return str((instance or {}).get("service_url") or "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +411,13 @@ def _extract_tech_stack_constraints(*texts: str) -> dict:
     lower = combined.lower()
     constraints: dict[str, str] = {}
 
+    if "kotlin" in lower:
+        constraints["language"] = "kotlin"
+    elif re.search(r"\bjava\b", lower):
+        constraints["language"] = "java"
+    elif "swift" in lower:
+        constraints["language"] = "swift"
+
     python_version = re.search(r"python\s*(3(?:\.\d+)*)", lower)
     if python_version:
         constraints["language"] = "python"
@@ -371,7 +443,64 @@ def _extract_tech_stack_constraints(*texts: str) -> dict:
     elif "vue" in lower:
         constraints["frontend_framework"] = "vue"
 
+    if "gradle" in lower or "build.gradle" in lower:
+        constraints["build_tool"] = "gradle"
+    elif "xcode" in lower:
+        constraints["build_tool"] = "xcode"
+
+    if any(hint in lower for hint in _ANDROID_PLATFORM_HINTS):
+        constraints["platform"] = "android"
+    elif any(hint in lower for hint in _IOS_PLATFORM_HINTS):
+        constraints["platform"] = "ios"
+    elif any(hint in lower for hint in _WEB_PLATFORM_HINTS):
+        constraints["platform"] = "web"
+
     return constraints
+
+
+def _infer_platform_from_sources(*texts: str, constraints: dict | None = None) -> str:
+    data = dict(constraints or {})
+    platform = str(data.get("platform") or "").strip().lower()
+    if platform in {"android", "ios", "web"}:
+        return platform
+
+    language = str(data.get("language") or "").strip().lower()
+    build_tool = str(data.get("build_tool") or "").strip().lower()
+    backend_framework = str(data.get("backend_framework") or "").strip().lower()
+    frontend_framework = str(data.get("frontend_framework") or "").strip().lower()
+
+    if language == "kotlin":
+        return "android"
+    if language == "swift" or build_tool == "xcode":
+        return "ios"
+    if frontend_framework or backend_framework or language in {"python", "javascript", "typescript"}:
+        return "web"
+
+    combined = "\n".join(text for text in texts if text).lower()
+    if any(hint in combined for hint in _ANDROID_PLATFORM_HINTS):
+        return "android"
+    if any(hint in combined for hint in _IOS_PLATFORM_HINTS):
+        return "ios"
+    if any(hint in combined for hint in _WEB_PLATFORM_HINTS):
+        return "web"
+    return ""
+
+
+def _apply_platform_evidence_policy(
+    analysis: dict,
+    *texts: str,
+    tech_stack_constraints: dict | None = None,
+) -> dict:
+    updated = dict(analysis or {})
+    inferred_platform = _infer_platform_from_sources(*texts, constraints=tech_stack_constraints)
+    if inferred_platform:
+        updated["platform"] = inferred_platform
+        return updated
+
+    current_platform = str(updated.get("platform") or "").strip().lower()
+    if current_platform in {"android", "ios", "web"}:
+        updated["platform"] = "unknown"
+    return updated
 
 
 def _has_tech_stack_signal(text: str) -> bool:
@@ -519,13 +648,19 @@ def _render_tech_stack_constraints(constraints: dict | None) -> str:
     if not constraints:
         return "None detected."
     lines = []
+    if constraints.get("platform"):
+        lines.append(f"- Target platform: {constraints['platform']}")
     if constraints.get("language") == "python":
         version = constraints.get("python_version")
         lines.append(f"- Language: Python{f' {version}' if version else ''}")
+    elif constraints.get("language"):
+        lines.append(f"- Language: {constraints['language']}")
     if constraints.get("backend_framework"):
         lines.append(f"- Backend framework: {constraints['backend_framework']}")
     if constraints.get("frontend_framework"):
         lines.append(f"- Frontend framework: {constraints['frontend_framework']}")
+    if constraints.get("build_tool"):
+        lines.append(f"- Build tool: {constraints['build_tool']}")
     lines.append("- These constraints override guesses derived from a sparse repo or design context.")
     lines.append("- If the target repo is empty or nearly empty, scaffold the required stack in-place.")
     return "\n".join(lines)
@@ -534,6 +669,10 @@ def _render_tech_stack_constraints(constraints: dict | None) -> str:
 def _enforce_plan_constraints(plan: dict, constraints: dict | None) -> dict:
     if not constraints:
         return plan
+
+    inferred_platform = _infer_platform_from_sources(constraints=constraints)
+    if inferred_platform:
+        plan["platform"] = inferred_platform
 
     hard_rules = [line for line in _render_tech_stack_constraints(constraints).splitlines() if line.strip()]
     hard_block = "HARD TECH STACK CONSTRAINTS:\n" + "\n".join(hard_rules)
@@ -554,20 +693,7 @@ def _enforce_plan_constraints(plan: dict, constraints: dict | None) -> dict:
     return plan
 
 
-_DEV_WORKFLOW_INSTRUCTIONS = (
-    "MANDATORY development workflow — follow these steps in order:\n"
-    "1. When you start development: transition the Jira ticket to 'In Progress', "
-    "assign it to the service account, and add a comment saying you started.\n"
-    "2. Implement the feature following the acceptance criteria.\n"
-    "3. Write and run tests. Install any missing dependencies at runtime.\n"
-    "4. Push your implementation to a feature branch and create a Pull Request "
-    "targeting the default branch. Before creating the branch, list existing remote "
-    "branches via the SCM agent (scm.branch.list). If the desired branch name already "
-    "exists, append '_2', '_3', etc. until a unique name is found.\n"
-    "5. After the PR is created: transition the Jira ticket to 'In Review' and "
-    "add a comment that includes the PR URL, test status, and a brief summary.\n"
-    "All steps are required. Skipping Jira/PR steps is not acceptable."
-)
+_DEV_WORKFLOW_INSTRUCTIONS = _read_team_lead_workflow("dev-workflow-instructions.md")
 
 
 def _build_dev_task_metadata(
@@ -577,10 +703,13 @@ def _build_dev_task_metadata(
     team_lead_task_id: str,
     workspace: str,
     target_repo_url: str,
+    permissions: dict | None,
     tech_stack_constraints: dict | None,
     acceptance_criteria: list | None,
     requires_tests: bool,
+    screenshot_requirements: str | None = None,
     jira_ticket_key: str = "",
+    jira_context: dict | None = None,
     is_revision: bool = False,
     revision_cycle: int = 0,
     review_issues: list | None = None,
@@ -598,6 +727,7 @@ def _build_dev_task_metadata(
         "techStackConstraints": tech_stack_constraints or {},
         "acceptanceCriteria": acceptance_criteria or [],
         "requiresTests": requires_tests,
+        "screenshotRequirements": screenshot_requirements or "",
         "jiraTicketKey": jira_ticket_key,
         "devWorkflowInstructions": _DEV_WORKFLOW_INSTRUCTIONS,
         # Exit rule: dev agent must wait for our ACK before shutting down
@@ -606,6 +736,13 @@ def _build_dev_task_metadata(
             ack_timeout_seconds=DEV_AGENT_ACK_TIMEOUT,
         ),
     }
+    if isinstance(permissions, dict) and permissions:
+        metadata["permissions"] = permissions
+    if jira_context and jira_context.get("content"):
+        metadata["jiraContext"] = {
+            "ticketKey": jira_ticket_key or jira_context.get("ticket_key", ""),
+            "content": (jira_context.get("content") or "")[:30000],
+        }
     if design_context and (design_context.get("content") or design_context.get("url")):
         # Only use the Stitch thumbnail URL when the stitch-design.json came from a
         # get_screen call (identified by the presence of a "screenId" key at the top level).
@@ -775,12 +912,132 @@ def _task_artifact_text(task: dict) -> str:
     return _task_status_text(task)
 
 
+def _interpret_permission_reply(reply_text: str) -> str:
+    lowered = str(reply_text or "").strip().lower()
+    if not lowered:
+        return "unclear"
+    approve_tokens = (
+        "yes",
+        "y",
+        "approve",
+        "approved",
+        "allow",
+        "go ahead",
+        "continue",
+        "ok",
+        "okay",
+        "accept",
+        "accepted",
+        "proceed",
+    )
+    deny_tokens = (
+        "no",
+        "n",
+        "deny",
+        "denied",
+        "reject",
+        "stop",
+        "cancel",
+        "decline",
+        "declined",
+    )
+    if any(token in lowered for token in approve_tokens):
+        return "approve"
+    if any(token in lowered for token in deny_tokens):
+        return "deny"
+    return "unclear"
+
+
+def _build_permission_approval_question(details) -> str:
+    return (
+        "The task requires an additional permission before it can continue.\n"
+        f"Target agent: {details.target_agent}\n"
+        f"Action: {details.action}\n"
+        f"Target: {details.target or '(unspecified)'}\n"
+        f"Reason: {details.reason}\n\n"
+        "Approve this additional permission and continue the task? Reply yes or no."
+    )
+
+
+def _request_permission_approval(
+    team_lead_task_id: str,
+    callback_url: str,
+    workspace: str,
+    ctx: _TaskContext,
+    details,
+) -> bool:
+    artifact = build_permission_denied_artifact(details, agent_id=AGENT_ID)
+    follow_up = _build_permission_approval_question(details)
+    clarification = "Please reply with yes or no only."
+    ctx.pending_permission_request = details.to_dict()
+    _save_workspace_file(
+        workspace,
+        "team-lead/pending-permission-request.json",
+        json.dumps(ctx.pending_permission_request, ensure_ascii=False, indent=2),
+    )
+
+    for attempt in range(2):
+        question = follow_up if attempt == 0 else clarification
+        task_store.update_state(team_lead_task_id, "TASK_STATE_INPUT_REQUIRED", question)
+        input_event = threading.Event()
+        with _INPUT_EVENTS_LOCK:
+            _INPUT_EVENTS[team_lead_task_id] = {"event": input_event, "info": None}
+
+        _notify_compass(
+            callback_url,
+            team_lead_task_id,
+            "TASK_STATE_INPUT_REQUIRED",
+            prompts.INPUT_REQUIRED_PREAMBLE + question,
+            [artifact],
+        )
+
+        if not input_event.wait(timeout=INPUT_WAIT_TIMEOUT):
+            raise RuntimeError("Timed out waiting for user approval.")
+
+        with _INPUT_EVENTS_LOCK:
+            entry = _INPUT_EVENTS.pop(team_lead_task_id, {})
+            reply_text = str(entry.get("info") or "")
+
+        decision = _interpret_permission_reply(reply_text)
+        if decision == "approve":
+            updated = grant_permission(
+                ctx.permissions,
+                agent=details.permission_agent,
+                action=details.action,
+                scope=details.scope or "*",
+                description=f"User-approved during Team Lead task {team_lead_task_id}",
+            )
+            if not isinstance(updated, dict):
+                raise RuntimeError("Cannot extend task permissions because no mutable permission snapshot is attached.")
+            ctx.permissions = updated
+            ctx.pending_permission_request = None
+            _save_workspace_file(
+                workspace,
+                "team-lead/pending-permission-request.json",
+                json.dumps({"resolved": "approved", "request": details.to_dict()}, ensure_ascii=False, indent=2),
+            )
+            return True
+        if decision == "deny":
+            ctx.pending_permission_request = None
+            _save_workspace_file(
+                workspace,
+                "team-lead/pending-permission-request.json",
+                json.dumps({"resolved": "denied", "request": details.to_dict()}, ensure_ascii=False, indent=2),
+            )
+            return False
+
+    raise RuntimeError("User reply did not clearly approve or deny the permission request.")
+
+
 def _require_successful_sync_task(capability: str, task: dict, *, timeout_seconds: int) -> dict:
     state = str((task.get("status") or {}).get("state") or "").strip()
     status_text = _task_status_text(task)
     if state in {"TASK_STATE_COMPLETED", "COMPLETED"}:
         return task
     if state in {"TASK_STATE_FAILED", "FAILED"}:
+        permission_denial = extract_permission_denial(task)
+        if permission_denial is not None:
+            raise PermissionEscalationRequired(permission_denial)
         detail = f": {status_text}" if status_text else ""
         raise RuntimeError(f"Required capability '{capability}' failed{detail}")
     detail = f" Last status: {status_text}" if status_text else ""
@@ -795,6 +1052,9 @@ def _call_sync_agent(
     team_lead_task_id: str,
     workspace_path: str,
     compass_task_id: str,
+    permissions: dict | None = None,
+    ctx: _TaskContext | None = None,
+    callback_url: str = "",
 ) -> dict:
     """Call a sync agent (Jira, UI Design) and wait for its result."""
     try:
@@ -815,36 +1075,70 @@ def _call_sync_agent(
             f"Capability '{capability}' is registered but has no routable service URL."
         )
 
-    message = {
-        "messageId": f"tl-{team_lead_task_id}-{capability}-{int(time.time())}",
-        "role": "ROLE_USER",
-        "parts": [{"text": message_text}],
-        "metadata": {
-            "requestedCapability": capability,
-            "orchestratorTaskId": compass_task_id,
-            "sharedWorkspacePath": workspace_path,
-        },
-    }
-    downstream_task = _a2a_send(agent_url, message)
-    task_id = downstream_task.get("id", "")
-    state = downstream_task.get("status", {}).get("state", "")
+    approved_requests: set[tuple[str, str, str, str]] = set()
+    current_permissions = permissions
 
-    terminal_states = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED"}
-    if state in terminal_states:
-        return _require_successful_sync_task(capability, downstream_task, timeout_seconds=0)
+    while True:
+        message = {
+            "messageId": f"tl-{team_lead_task_id}-{capability}-{int(time.time())}",
+            "role": "ROLE_USER",
+            "parts": [{"text": message_text}],
+            "metadata": {
+                "requestedCapability": capability,
+                "orchestratorTaskId": compass_task_id,
+                "sharedWorkspacePath": workspace_path,
+            },
+        }
+        if isinstance(current_permissions, dict) and current_permissions:
+            message["metadata"]["permissions"] = current_permissions
 
-    if task_id:
-        result = _poll_agent_task(agent_url, task_id, timeout=SYNC_AGENT_TIMEOUT)
-        if result:
-            return _require_successful_sync_task(
-                capability,
-                result,
-                timeout_seconds=SYNC_AGENT_TIMEOUT,
+        try:
+            downstream_task = _a2a_send(agent_url, message)
+            task_id = downstream_task.get("id", "")
+            state = downstream_task.get("status", {}).get("state", "")
+
+            terminal_states = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED"}
+            if state in terminal_states:
+                return _require_successful_sync_task(capability, downstream_task, timeout_seconds=0)
+
+            if task_id:
+                result = _poll_agent_task(agent_url, task_id, timeout=SYNC_AGENT_TIMEOUT)
+                if result:
+                    return _require_successful_sync_task(
+                        capability,
+                        result,
+                        timeout_seconds=SYNC_AGENT_TIMEOUT,
+                    )
+
+            raise RuntimeError(
+                f"Required capability '{capability}' did not complete within sync timeout ({SYNC_AGENT_TIMEOUT}s)."
             )
-
-    raise RuntimeError(
-        f"Required capability '{capability}' did not complete within sync timeout ({SYNC_AGENT_TIMEOUT}s)."
-    )
+        except PermissionEscalationRequired as escalation:
+            if ctx is None or not callback_url:
+                raise
+            request_key = (
+                escalation.details.permission_agent,
+                escalation.details.action,
+                escalation.details.scope or "*",
+                escalation.details.target or "",
+            )
+            if request_key in approved_requests:
+                raise RuntimeError(
+                    f"Permission for '{escalation.details.action}' was already approved once but the downstream agent still rejected it."
+                )
+            approved = _request_permission_approval(
+                team_lead_task_id,
+                callback_url,
+                workspace_path,
+                ctx,
+                escalation.details,
+            )
+            if not approved:
+                raise RuntimeError(
+                    f"User denied permission request for '{escalation.details.action}' on '{escalation.details.target}'."
+                )
+            approved_requests.add(request_key)
+            current_permissions = ctx.permissions
 
 
 # ---------------------------------------------------------------------------
@@ -1079,7 +1373,11 @@ def _analyze_task(user_text: str, additional_info: str = "") -> dict:
     )
     system = _build_team_lead_system_prompt(prompts.ANALYZE_SYSTEM)
     response = _run_agentic(prompt, f"[{AGENT_ID}] analyze", system_prompt=system)
-    return _parse_json_from_llm(response)
+    return _apply_platform_evidence_policy(
+        _parse_json_from_llm(response),
+        user_text,
+        additional_info,
+    )
 
 
 def _extract_repo_url(text: str) -> str:
@@ -1185,6 +1483,9 @@ def _inspect_target_repo(
     repo_url: str,
     workspace_path: str,
     compass_task_id: str,
+    ctx: _TaskContext | None = None,
+    callback_url: str = "",
+    permissions: dict | None = None,
 ) -> dict | None:
     repo_task = _call_sync_agent(
         "scm.repo.inspect",
@@ -1192,6 +1493,9 @@ def _inspect_target_repo(
         team_lead_task_id,
         workspace_path,
         compass_task_id,
+        permissions=permissions,
+        ctx=ctx,
+        callback_url=callback_url,
     )
     content = "\n".join(artifact_text(art) for art in repo_task.get("artifacts", []))
     if not content:
@@ -1514,10 +1818,19 @@ def _suppress_redundant_questions(
 ) -> dict:
     updated = dict(analysis or {})
     question = str(updated.get("question_for_user") or "")
+    question_lower = question.lower()
 
     if _jira_fetch_succeeded(ctx):
-        jira_keywords = ("jira", "ticket", "url", "browse", "atlassian", "issue", "story", "key")
-        if any(keyword in question.lower() for keyword in jira_keywords):
+        # Only suppress questions that are specifically asking for the Jira ticket itself.
+        # "url", "issue", "key" are too broad and would suppress legitimate questions about
+        # Figma/design URLs or repo URLs that have not yet been fetched.
+        jira_keywords = ("jira ticket", "jira browse", "atlassian.net", "browse/", "jira url")
+        repo_keywords = ("repo", "repository", "github", "bitbucket", "clone", "git url", "codebase")
+        if (
+            any(keyword in question_lower for keyword in jira_keywords)
+            and not _has_tech_stack_signal(question)
+            and not any(keyword in question_lower for keyword in repo_keywords)
+        ):
             if log_fn:
                 log_fn(f"Suppressing Jira-related question (ticket already fetched): {question}")
             updated["question_for_user"] = None
@@ -1526,8 +1839,7 @@ def _suppress_redundant_questions(
                 if not any(keyword in str(item).lower() for keyword in jira_keywords)
             ]
 
-        repo_keywords = ("repo", "repository", "github", "bitbucket", "clone", "git url", "codebase")
-        jira_lower = str(ctx.jira_info.get("content") or "").lower()
+        jira_lower = str((ctx.jira_info or {}).get("content") or "").lower()
         question = str(updated.get("question_for_user") or "")
         if any(keyword in question.lower() for keyword in repo_keywords):
             if any(host in jira_lower for host in ("github.com", "bitbucket")):
@@ -1539,11 +1851,16 @@ def _suppress_redundant_questions(
                     if not any(keyword in str(item).lower() for keyword in repo_keywords)
                 ]
 
-        preference_keywords = ("framework", "prefer", "flask", "fastapi", "react", "vue", "which")
+        preference_keywords = ("framework", "tech stack", "prefer", "flask", "fastapi", "react", "vue")
         question = str(updated.get("question_for_user") or "")
         if any(keyword in question.lower() for keyword in preference_keywords):
+            import re as _re
             for framework in ("flask", "fastapi", "react", "next.js", "vue", "django", "express"):
-                if framework in jira_lower:
+                # Require the framework name to appear as a standalone word or in a
+                # tech context (e.g. "using express", "express.js"), not just any
+                # substring.  "express" is too common a word to match naively.
+                _pattern = rf"\b{_re.escape(framework)}(\b|\.js)"
+                if _re.search(_pattern, jira_lower):
                     if log_fn:
                         log_fn(f"Suppressing framework question ('{framework}' found in ticket): {question}")
                     updated["question_for_user"] = None
@@ -1563,8 +1880,8 @@ def _suppress_redundant_questions(
 
     if (
         str(updated.get("platform") or "").strip().lower() == "web"
-        and ctx.jira_info and ctx.jira_info.get("content")
-        and ctx.repo_info and ctx.repo_info.get("content")
+        and _jira_fetch_succeeded(ctx)
+        and _repo_url_known(updated, ctx)
         and ctx.design_info and ctx.design_info.get("content")
     ):
         defaultable_ui_keywords = (
@@ -1611,18 +1928,37 @@ def _build_analysis_context(ctx: _TaskContext) -> str:
     return "\n\n".join(part for part in parts if part)
 
 
+def _repo_url_known(analysis: dict, ctx: _TaskContext) -> bool:
+    repo_url = str((analysis.get("target_repo_url") if analysis else "") or "").strip()
+    if repo_url:
+        return True
+    repo_info = ctx.repo_info or {}
+    return bool(str(repo_info.get("repo_url") or "").strip())
+
+
 def _should_prioritize_stack_question(analysis: dict, ctx: _TaskContext) -> bool:
     question = str(analysis.get("question_for_user") or "").strip().lower()
     if not question or "stack" not in question:
         return False
-    if str(analysis.get("target_repo_url") or "").strip():
+    if _repo_url_known(analysis, ctx):
         return False
     repo_info = ctx.repo_info or {}
     if not repo_info:
         return False
-    if str(repo_info.get("content") or "").strip():
-        return False
-    return True
+    repo_content = str(repo_info.get("content") or "").strip()
+    if not repo_content:
+        return True
+    # Treat SCM failure responses as empty — they carry no useful repo information.
+    _SCM_FAILURE_MARKERS = (
+        "repository search failed",
+        "missing_default_project",
+        "no repositories found",
+        "no repos found",
+        "unable to search",
+    )
+    if any(m in repo_content.lower() for m in _SCM_FAILURE_MARKERS):
+        return True
+    return False
 
 
 def _refresh_analysis_with_known_context(
@@ -1655,7 +1991,15 @@ def _filter_unresolved_missing_info(
     # Filter out missing_info entries for context already gathered during the
     # gather loop. The LLM may still report e.g. "need Stitch layer tree" even
     # though we already have design context in hand.
-    if ctx.design_info and ctx.design_info.get("content"):
+    _design_url_known = (
+        (ctx.design_info and ctx.design_info.get("content"))
+        or str(analysis.get("design_url") or "").strip()
+        or any(
+            kw in str(ctx.additional_info or "").lower()
+            for kw in ("figma.com", "stitch.", "figma.design", "figma/design", "node-id")
+        )
+    )
+    if _design_url_known:
         design_kws = {"stitch", "figma", "design", "screen", "layer", "asset",
                       "png", "svg", "export", "thumbnail", "permission"}
         unresolved_missing = [
@@ -1669,7 +2013,8 @@ def _filter_unresolved_missing_info(
             item for item in unresolved_missing
             if not any(kw in item.lower() for kw in jira_kws)
         ]
-    if ctx.repo_info and ctx.repo_info.get("content"):
+    repo_url_known = _repo_url_known(analysis, ctx)
+    if repo_url_known and ctx.repo_info and ctx.repo_info.get("content"):
         repo_kws = {"repo", "repository", "branch", "stack", "github",
                     "bitbucket", "language", "manifest"}
         unresolved_missing = [
@@ -1710,8 +2055,8 @@ def _filter_unresolved_missing_info(
             if not any(kw in item.lower() for kw in platform_kws)
         ]
     elif (
-        ctx.jira_info and ctx.jira_info.get("content")
-        and ctx.repo_info and ctx.repo_info.get("content")
+        _jira_fetch_succeeded(ctx)
+        and repo_url_known
     ):
         # Both Jira and repo have been inspected and the agentic inference
         # still returned no constraints — the "confirmed tech stack" item in
@@ -1731,14 +2076,22 @@ def _filter_unresolved_missing_info(
     # the repo and ticket context without blocking plan creation.
     if (
         str(analysis.get("platform") or "").strip().lower() == "web"
-        and ctx.jira_info and ctx.jira_info.get("content")
-        and ctx.repo_info and ctx.repo_info.get("content")
+        and _jira_fetch_succeeded(ctx)
+        and repo_url_known
     ):
         defaultable_web_kws = {
             "dynamic data",
+            "real backend api",
+            "real backend apis",
+            "backend api",
+            "backend apis",
             "api endpoint",
             "api endpoints",
             "mock data",
+            "mocked/static",
+            "mocked or static",
+            "mocked/static data",
+            "static data",
             "route/path",
             "integration point",
             "where page should be mounted",
@@ -1761,8 +2114,8 @@ def _filter_unresolved_missing_info(
         ]
     if (
         str(analysis.get("platform") or "").strip().lower() == "web"
-        and ctx.jira_info and ctx.jira_info.get("content")
-        and ctx.repo_info and ctx.repo_info.get("content")
+        and _jira_fetch_succeeded(ctx)
+        and repo_url_known
         and ctx.design_info and ctx.design_info.get("content")
     ):
         defaultable_ui_ticket_kws = {
@@ -1780,12 +2133,47 @@ def _filter_unresolved_missing_info(
             item for item in unresolved_missing
             if not any(kw in item.lower() for kw in defaultable_ui_ticket_kws)
         ]
+    if (
+        str(analysis.get("platform") or "").strip().lower() == "android"
+        and _jira_fetch_succeeded(ctx)
+        and repo_url_known
+    ):
+        defaultable_android_kws = {
+            "app module",
+            "module / package",
+            "package path",
+            "package name",
+            "navigation graph",
+            "menu id",
+            "menu ids",
+            "bottom-nav",
+            "bottom nav",
+            "test runner",
+            "ci job",
+            "ci jobs",
+            "instrumentation tests should run",
+            "sdk install/license acceptance",
+            "sdk license",
+            "mock data schema",
+            "sample payload",
+            "sample payloads",
+        }
+        if ctx.design_info and ctx.design_info.get("content"):
+            defaultable_android_kws.update({
+                "mock data",
+                "sample items",
+                "visible fields",
+            })
+        unresolved_missing = [
+            item for item in unresolved_missing
+            if not any(kw in item.lower() for kw in defaultable_android_kws)
+        ]
     # Organisational conventions and preferences (README templates, PR reviewer
     # assignments, code-owner preferences) are always resolvable by the dev
     # agent using project defaults or industry best practice.  Filter them out
     # whenever both Jira and repo context have already been gathered so that
     # these "nice-to-have" items never block task execution.
-    if ctx.jira_info and ctx.jira_info.get("content") and ctx.repo_info and ctx.repo_info.get("content"):
+    if _jira_fetch_succeeded(ctx) and repo_url_known:
         org_preference_kws = {
             "reviewer",
             "code owner",
@@ -1854,7 +2242,7 @@ def _execute_gather_action(
         # Already have content for this ticket — skip only if the previous fetch SUCCEEDED
         if (
             _jira_fetch_succeeded(ctx)
-            and str(ctx.jira_info.get("ticket_key") or "").strip() == ticket_key
+            and str((ctx.jira_info or {}).get("ticket_key") or "").strip() == ticket_key
         ):
             return False
         # Limit retries for permanently-failed fetches (e.g. permission denied)
@@ -1870,6 +2258,9 @@ def _execute_gather_action(
             team_lead_task_id,
             workspace,
             compass_task_id,
+            permissions=ctx.permissions,
+            ctx=ctx,
+            callback_url=ctx.compass_callback_url,
         )
         content = _task_artifact_text(jira_task)
         ctx.jira_info = {"ticket_key": ticket_key, "content": content, "request": request_text}
@@ -1885,6 +2276,20 @@ def _execute_gather_action(
         request_text = message_text or reason
         if not request_text or _is_repeat(ctx.repo_info, request_text):
             return False
+        # If SCM search has already failed twice, don't retry — it's a config issue,
+        # not a transient error.  Returning False lets the fallback path ask the user.
+        _prev_content = str((ctx.repo_info or {}).get("content") or "")
+        _SCM_FAILURE_MARKERS = (
+            "repository search failed",
+            "missing_default_project",
+            "no repositories found",
+            "no repos found",
+            "unable to search",
+            "scm config",
+        )
+        if any(m in _prev_content.lower() for m in _SCM_FAILURE_MARKERS):
+            log_fn(f"SCM search previously failed ({_prev_content!r}), skipping repeat call")
+            return False
         log_fn(f"{reason} ({capability})")
         repo_task = _call_sync_agent(
             capability,
@@ -1892,6 +2297,9 @@ def _execute_gather_action(
             team_lead_task_id,
             workspace,
             compass_task_id,
+            permissions=ctx.permissions,
+            ctx=ctx,
+            callback_url=ctx.compass_callback_url,
         )
         content = _task_artifact_text(repo_task)
         repo_url = _extract_repo_url(content) or str(analysis.get("target_repo_url") or "").strip()
@@ -1906,6 +2314,11 @@ def _execute_gather_action(
         log_fn(
             f"Repository search context fetched ({len((ctx.repo_info or {}).get('content', ''))} chars)"
         )
+        # Return False for failure responses so the gather loop treats this as
+        # no-progress and escalates to the fallback (ask_user) path.
+        if any(m in content.lower() for m in _SCM_FAILURE_MARKERS):
+            log_fn(f"SCM search returned failure response — marking as no-progress")
+            return False
         return True
 
     if capability in {"figma.page.fetch", "stitch.project.get", "stitch.screen.fetch", "stitch.screen.image"}:
@@ -1918,6 +2331,10 @@ def _execute_gather_action(
         # Prevent redundant design fetches:
         # - Any project-level fetch is skipped if we already have ANY design content
         # - Screen-level fetches are skipped if we already fetched at screen level for the same page
+        # - Failed fetches (content empty, error present) are not retried in the same session
+        if ctx.design_info:
+            if ctx.design_info.get("error") and not ctx.design_info.get("content"):
+                return False  # previous fetch attempt failed; skip retry to avoid looping
         if ctx.design_info and ctx.design_info.get("content"):
             fetched_by = str(ctx.design_info.get("fetchedBy") or "").strip()
             existing_page = str(ctx.design_info.get("page_name") or "").strip()
@@ -1930,13 +2347,34 @@ def _execute_gather_action(
                     if not normalized_requested_page or normalized_existing_page == normalized_requested_page:
                         return False  # already fetched this screen
         log_fn(f"{reason} ({capability})")
-        design_task = _call_sync_agent(
-            capability,
-            request_text,
-            team_lead_task_id,
-            workspace,
-            compass_task_id,
-        )
+        try:
+            design_task = _call_sync_agent(
+                capability,
+                request_text,
+                team_lead_task_id,
+                workspace,
+                compass_task_id,
+                permissions=ctx.permissions,
+                ctx=ctx,
+                callback_url=ctx.compass_callback_url,
+            )
+        except Exception as design_err:
+            log_fn(f"Design fetch via '{capability}' failed (best-effort — continuing without design context): {design_err}")
+            ctx.design_info = {
+                "url": design_url,
+                "type": "stitch" if capability.startswith("stitch.") else "figma",
+                "content": "",
+                "page_name": page_name,
+                "fetchedBy": capability,
+                "request": request_text,
+                "error": str(design_err),
+            }
+            _save_workspace_file(
+                workspace,
+                "team-lead/design-context.json",
+                json.dumps(ctx.design_info, ensure_ascii=False, indent=2),
+            )
+            return False
         content = _task_artifact_text(design_task)
         ctx.design_info = {
             "url": design_url,
@@ -1972,6 +2410,9 @@ def _execute_gather_action(
             repo_url,
             workspace,
             compass_task_id,
+            ctx=ctx,
+            callback_url=ctx.compass_callback_url,
+            permissions=ctx.permissions,
         )
         ctx.repo_info = repo_info or {"repo_url": repo_url, "content": ""}
         ctx.repo_info["request"] = request_text
@@ -2084,6 +2525,29 @@ def _load_workspace_review_evidence(workspace: str) -> str:
             agent_path = os.path.join(workspace, agent_dir)
             if not os.path.isdir(agent_path):
                 continue
+            clone_path = os.path.join(agent_path, "clone-info.json")
+            if os.path.isfile(clone_path):
+                try:
+                    with open(clone_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    lines.append(f"Clone status: {data.get('status')}")
+                    lines.append(f"Clone repo URL: {data.get('repoUrl') or data.get('repo_url')}")
+                    lines.append(f"Clone path: {data.get('clonePath') or data.get('clone_path')}")
+                except Exception:
+                    pass
+            branch_path = os.path.join(agent_path, "branch-info.json")
+            if os.path.isfile(branch_path):
+                try:
+                    with open(branch_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    lines.append(
+                        f"Branch evidence: branch={data.get('branch')}, "
+                        f"base={data.get('baseBranch') or data.get('base_branch')}, "
+                        f"localPrepared={data.get('localBranchPrepared')}, "
+                        f"localCommit={data.get('localCommit')}"
+                    )
+                except Exception:
+                    pass
             pr_path = os.path.join(agent_path, "pr-evidence.json")
             if os.path.isfile(pr_path):
                 try:
@@ -2097,6 +2561,8 @@ def _load_workspace_review_evidence(workspace: str) -> str:
                     lines.append(f"Branch: {branch}")
                     lines.append(f"Build passed: {build_passed}")
                     lines.append(f"Generated files committed to PR: {gen_files}")
+                    if data.get("prBody"):
+                        lines.append(f"PR body preview: {str(data.get('prBody'))[:800]}")
                 except Exception:
                     pass
             tr_path = os.path.join(agent_path, "test-results.json")
@@ -2104,7 +2570,7 @@ def _load_workspace_review_evidence(workspace: str) -> str:
                 try:
                     with open(tr_path, encoding="utf-8") as f:
                         data = json.load(f)
-                    lines.append(f"Test results: passed={data.get('passed')}, output={str(data.get('output', ''))[:400]}")
+                    lines.append(f"Test results: passed={data.get('passed')}, output={str(data.get('finalOutput') or data.get('output') or '')[:400]}")
                 except Exception:
                     pass
             jira_path = os.path.join(agent_path, "jira-actions.json")
@@ -2117,6 +2583,18 @@ def _load_workspace_review_evidence(workspace: str) -> str:
                     lines.append(f"Jira actions completed: {completed}")
                 except Exception:
                     pass
+            design_reference_path = os.path.join(agent_path, "design-reference.png")
+            if os.path.isfile(design_reference_path):
+                lines.append(f"Design reference screenshot present: {design_reference_path}")
+            try:
+                screenshot_files = sorted(
+                    name for name in os.listdir(agent_path)
+                    if re.fullmatch(r"screenshot-\d+x\d+\.png", name)
+                )
+            except Exception:
+                screenshot_files = []
+            if screenshot_files:
+                lines.append(f"Implementation screenshots present: {screenshot_files}")
             if lines:  # found evidence in this agent dir; stop
                 break
     except Exception:
@@ -2207,9 +2685,11 @@ def _review_output(
 
     prompt = prompts.REVIEW_TEMPLATE.format(
         user_text=user_text,
+        target_repo_url=plan.get("target_repo_url") or "None provided.",
         acceptance_criteria=criteria_lines,
         requires_tests=str(plan.get("requires_tests", True)).lower(),
         test_requirements=plan.get("test_requirements") or "Not specified.",
+        screenshot_requirements=plan.get("screenshot_requirements") or "Not specified.",
         design_context_provided=design_context_provided,
         dev_output=(dev_output or "No output text.")[:3000],
         artifacts_summary=artifacts_summary,
@@ -2350,6 +2830,14 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     _missing.insert(0, "confirmed tech stack / framework")
                     analysis["missing_info"] = _missing
                 log(f"Tech stack unknown after Jira+repo inspection — queued user question: {_stack_clarification_q}")
+            analysis = _apply_platform_evidence_policy(
+                analysis,
+                user_text,
+                ctx.additional_info or "",
+                (ctx.jira_info or {}).get("content") or "",
+                (ctx.repo_info or {}).get("content") or "",
+                tech_stack_constraints=tech_stack_constraints,
+            )
             analysis = _apply_tech_stack_confirmation_policy(analysis, tech_stack_constraints, user_text)
             ctx.analysis = analysis
 
@@ -2478,13 +2966,31 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 _suppress_gather_q = False
                 if _jira_fetch_succeeded(ctx):
                     _jira_q_kws = {
-                        "acceptance criteria", "acceptancecriteria", "jira", "ticket",
-                        "checklist item", "story criteria", "pass/fail", "qa step", "test/qa",
+                        "acceptance criteria", "acceptancecriteria", "jira ticket",
+                        "jira browse", "atlassian.net", "browse/", "checklist item",
+                        "story criteria", "pass/fail", "qa step", "test/qa",
                     }
                     if any(kw in _q_text for kw in _jira_q_kws):
                         log(f"Suppressing gather-plan question (Jira already fetched): {next_action.get('question')}")
                         _suppress_gather_q = True
-                if not _suppress_gather_q and ctx.jira_info and ctx.jira_info.get("content") and ctx.repo_info and ctx.repo_info.get("content"):
+                if not _suppress_gather_q:
+                    _design_q_kws = {"figma", "stitch", "design url", "design link",
+                                     "design file", "wireframe url", "mockup url",
+                                     "canonical design", "design reference"}
+                    if any(kw in _q_text for kw in _design_q_kws):
+                        _design_url_in_ctx = (
+                            (ctx.design_info and ctx.design_info.get("content"))
+                            or str(analysis.get("design_url") or "").strip()
+                            or any(
+                                kw in str(ctx.additional_info or "").lower()
+                                for kw in ("figma.com", "stitch.", "figma.design",
+                                           "figma/design", "node-id")
+                            )
+                        )
+                        if _design_url_in_ctx:
+                            log(f"Suppressing design URL question (design URL already known): {next_action.get('question')}")
+                            _suppress_gather_q = True
+                if not _suppress_gather_q and _jira_fetch_succeeded(ctx) and _repo_url_known(analysis, ctx):
                     _org_q_kws = {
                         "reviewer", "code owner", "code reviewer", "pr reviewer",
                         "readme template", "readme format", "org-specific",
@@ -2751,10 +3257,13 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 team_lead_task_id=team_lead_task_id,
                 workspace=workspace,
                 target_repo_url=plan.get("target_repo_url") or target_repo_url or "",
+                permissions=ctx.permissions,
                 tech_stack_constraints=tech_stack_constraints,
                 acceptance_criteria=plan.get("acceptance_criteria") or [],
                 requires_tests=plan.get("requires_tests", False),
+                screenshot_requirements=plan.get("screenshot_requirements"),
                 jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
+                jira_context=ctx.jira_info,
                 design_context=ctx.design_info,
             ),
         }
@@ -2783,6 +3292,65 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         dev_output = dev_result.get("status_message", "")
         final_artifacts = dev_result.get("artifacts", [])
         log(f"Dev agent completed — state={dev_state}")
+
+        if dev_state in ("TASK_STATE_FAILED", "FAILED"):
+            permission_denial = extract_permission_denial({"artifacts": final_artifacts})
+            if permission_denial is not None and ctx.dev_service_url:
+                approved = _request_permission_approval(
+                    team_lead_task_id,
+                    callback_url,
+                    workspace,
+                    ctx,
+                    permission_denial,
+                )
+                if not approved:
+                    raise RuntimeError(
+                        f"User denied permission request for '{permission_denial.action}' on '{permission_denial.target}'."
+                    )
+
+                retry_feedback = (
+                    "Permission approved by the user. Retry the blocked operation and continue the task.\n\n"
+                    f"Agent: {permission_denial.target_agent}\n"
+                    f"Action: {permission_denial.action}\n"
+                    f"Target: {permission_denial.target or '(unspecified)'}"
+                )
+                retry_message = {
+                    "messageId": f"tl-{team_lead_task_id}-perm-retry-{int(time.time())}",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": retry_feedback}],
+                    "metadata": _build_dev_task_metadata(
+                        dev_capability=dev_capability,
+                        compass_task_id=compass_task_id,
+                        team_lead_task_id=team_lead_task_id,
+                        workspace=workspace,
+                        target_repo_url=plan.get("target_repo_url") or target_repo_url or "",
+                        permissions=ctx.permissions,
+                        tech_stack_constraints=tech_stack_constraints,
+                        acceptance_criteria=plan.get("acceptance_criteria") or [],
+                        requires_tests=plan.get("requires_tests", False),
+                        screenshot_requirements=plan.get("screenshot_requirements"),
+                        jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
+                        jira_context=ctx.jira_info,
+                        is_revision=True,
+                        revision_cycle=0,
+                        review_issues=[retry_feedback],
+                        design_context=ctx.design_info,
+                    ),
+                }
+                retry_task = _a2a_send(ctx.dev_service_url, retry_message)
+                retry_task_id = retry_task.get("id", "")
+                ctx.dev_task_id = retry_task_id
+                log(f"Dev task permission retry submitted: {retry_task_id}")
+                retry_result = _wait_for_dev_completion(team_lead_task_id, retry_task_id, ctx.dev_service_url)
+                if retry_result is None:
+                    raise RuntimeError(
+                        f"Dev agent permission retry timed out after {TASK_TIMEOUT} s."
+                    )
+                ctx.dev_result = retry_result
+                dev_state = retry_result.get("state", "TASK_STATE_FAILED")
+                dev_output = retry_result.get("status_message", "")
+                final_artifacts = retry_result.get("artifacts", [])
+                log(f"Dev agent permission retry completed — state={dev_state}")
 
         if dev_state in ("TASK_STATE_FAILED", "FAILED"):
             raise RuntimeError(f"Dev agent failed: {(dev_output or '')[:300]}")
@@ -2840,7 +3408,37 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             # Post review feedback to the PR as a comment (best-effort)
             _pr_url = _read_pr_url_from_workspace(workspace)
             if _pr_url:
-                _post_pr_review_comment(_pr_url, feedback, workspace, team_lead_task_id)
+                _post_pr_review_comment(
+                    _pr_url,
+                    feedback,
+                    workspace,
+                    team_lead_task_id,
+                    permissions=ctx.permissions,
+                )
+
+            # Post review rejection as a Jira comment for audit trail (best-effort)
+            if ctx.jira_info and ctx.jira_info.get("content") and (ctx.analysis or {}).get("jira_ticket_key"):
+                ticket_key = ctx.analysis["jira_ticket_key"]
+                issues_text = "\n".join(f"- {i}" for i in (review.get("issues") or []))
+                jira_review_comment = (
+                    f"Code Review — Cycle {review_cycle + 1} — REJECTED (score: {score})\n\n"
+                    f"Issues found:\n{issues_text or '(see feedback below)'}\n\n"
+                    f"Feedback for developer:\n{feedback[:1200]}"
+                )
+                try:
+                    _call_sync_agent(
+                        "jira.comment.add",
+                        f"Add comment to ticket {ticket_key}: {jira_review_comment}",
+                        team_lead_task_id,
+                        workspace,
+                        compass_task_id,
+                        permissions=ctx.permissions,
+                        ctx=ctx,
+                        callback_url=callback_url,
+                    )
+                    log(f"Posted review rejection comment to Jira ticket {ticket_key} (cycle {review_cycle + 1})")
+                except Exception as _jira_err:
+                    log(f"Warning: could not post review rejection comment to Jira: {_jira_err}")
 
             # Reuse the SAME dev agent container (it is still running, waiting for our ACK).
             # Do NOT call _acquire_dev_agent again — that would try to launch a new container
@@ -2867,10 +3465,13 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     team_lead_task_id=team_lead_task_id,
                     workspace=workspace,
                     target_repo_url=plan.get("target_repo_url") or target_repo_url or "",
+                    permissions=ctx.permissions,
                     tech_stack_constraints=tech_stack_constraints,
                     acceptance_criteria=plan.get("acceptance_criteria") or [],
                     requires_tests=plan.get("requires_tests", False),
+                    screenshot_requirements=plan.get("screenshot_requirements"),
                     jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
+                    jira_context=ctx.jira_info,
                     is_revision=True,
                     revision_cycle=review_cycle + 1,
                     review_issues=review.get("issues") or [],
@@ -2920,6 +3521,9 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     team_lead_task_id,
                     workspace,
                     compass_task_id,
+                    permissions=ctx.permissions,
+                    ctx=ctx,
+                    callback_url=callback_url,
                 )
                 log(f"Jira ticket {ticket_key} updated with completion comment")
             except Exception as err:
@@ -3130,6 +3734,12 @@ class TeamLeadHandler(BaseHTTPRequestHandler):
             prior_task = task_store.get(context_id)
             if prior_task and prior_task.state == "TASK_STATE_INPUT_REQUIRED":
                 additional_info = extract_text(message)
+                resumed_permissions = (message.get("metadata") or {}).get("permissions")
+                if isinstance(resumed_permissions, dict):
+                    with _TASK_CONTEXTS_LOCK:
+                        ctx = _TASK_CONTEXTS.get(context_id)
+                    if ctx is not None:
+                        ctx.permissions = resumed_permissions
                 with _INPUT_EVENTS_LOCK:
                     entry = _INPUT_EVENTS.get(context_id)
                     if entry:
@@ -3158,6 +3768,7 @@ class TeamLeadHandler(BaseHTTPRequestHandler):
         ctx.compass_callback_url = callback_url
         ctx.compass_url = compass_url
         ctx.shared_workspace_path = workspace
+        ctx.permissions = metadata.get("permissions") if isinstance(metadata.get("permissions"), dict) else None
         ctx.original_message = message
         ctx.user_text = user_text
 

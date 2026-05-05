@@ -410,7 +410,21 @@ class GlobTool(ConstellationTool):
         )
 
     # Directories to always skip
-    _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox"}
+    _SKIP_DIRS = {
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".tox",
+        ".gradle",
+        ".connect-agent",
+        ".transcripts",
+        "build",
+        "dist",
+        "out",
+        "target",
+    }
 
     def execute(self, args: dict) -> dict:
         pattern = args.get("pattern", "")
@@ -486,7 +500,21 @@ class GrepTool(ConstellationTool):
             },
         )
 
-    _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox"}
+    _SKIP_DIRS = {
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".tox",
+        ".gradle",
+        ".connect-agent",
+        ".transcripts",
+        "build",
+        "dist",
+        "out",
+        "target",
+    }
     _MAX_RESULTS = 500
 
     def execute(self, args: dict) -> dict:

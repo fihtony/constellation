@@ -24,6 +24,7 @@ from common.per_task_exit import PerTaskExitHandler
 from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt
 from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.task_permissions import grant_permission, load_permission_grant
 from common.task_store import TaskStore
 from common.time_utils import local_file_timestamp, local_iso_timestamp
 from compass import prompts
@@ -461,17 +462,25 @@ def _resume_compass_routed_task(prior_task, message):
         decision = _interpret_office_reply(prior_task, user_reply)
         if decision["action"] == "approve":
             router_context["outputMode"] = "inplace"
+            router_context["officeWriteApproved"] = True
             prior_task.router_context = router_context
             _build_office_dispatch_context(prior_task)
             return _start_task_worker(prior_task, prior_task.original_message or message, prior_task.pending_workflow or [router_context.get("requestedCapability")])
         if decision["action"] == "deny":
+            router_context["outputMode"] = "workspace"
+            router_context.pop("officeWriteApproved", None)
             prior_task.router_context = router_context
-            task_store.update_state(
+            _build_office_dispatch_context(prior_task)
+            task_store.add_progress_step(
                 prior_task.task_id,
-                "TASK_STATE_FAILED",
-                "Office task requires write permission for in-place output, and the request was denied.",
+                "Write access denied by user — continuing with workspace-only output.",
+                agent_id="compass-agent",
             )
-            return prior_task.to_dict()
+            return _start_task_worker(
+                prior_task,
+                prior_task.original_message or message,
+                prior_task.pending_workflow or [router_context.get("requestedCapability")],
+            )
         return _route_input_required(
             prior_task,
             decision["clarification_question"] or "Please reply yes to approve write access or no to stop.",
@@ -1069,6 +1078,29 @@ def _append_task_artifacts(task, summaries):
 def _build_step_message(task, original_message, task_id, capability, step_index, total_steps, upstream_artifacts):
     message = deep_copy_json(original_message)
     metadata = dict(message.get("metadata") or {})
+
+    # Determine task type and load permission grant
+    router_context = dict(getattr(task, "router_context", {}) or {})
+    task_type = router_context.get("task_type") or "development"
+    if _is_office_capability(capability):
+        task_type = "office"
+    elif task_type in ("dev", "development"):
+        task_type = "development"
+    grant_data = router_context.get("permissions") if isinstance(router_context.get("permissions"), dict) else None
+    if not isinstance(grant_data, dict):
+        grant_data = load_permission_grant(task_type).to_dict()
+    if _is_office_capability(capability) and router_context.get("officeWriteApproved"):
+        grant_data = grant_permission(
+            grant_data,
+            agent="office",
+            action="write",
+            scope="task_root",
+            description="User approved in-place Office output for this task.",
+        )
+    if isinstance(grant_data, dict):
+        router_context["permissions"] = grant_data
+        task.router_context = router_context
+
     metadata.update({
         "requestedCapability": capability,
         "orchestratorTaskId": task_id,
@@ -1078,6 +1110,7 @@ def _build_step_message(task, original_message, task_id, capability, step_index,
         "workflowStep": step_index,
         "workflowTotalSteps": total_steps,
         "upstreamArtifacts": upstream_artifacts,
+        "permissions": grant_data or {},
         "exitRule": PerTaskExitHandler.build(
             rule_type="wait_for_parent_ack",
             ack_timeout_seconds=COMPASS_CHILD_ACK_TIMEOUT,
@@ -1584,6 +1617,9 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
     )
 
     if route_decision and route_decision.get("needs_input"):
+        task_type = route_decision.get("task_type") or "development"
+        if task_type == "dev":
+            task_type = "development"
         return _route_input_required(
             task,
             route_decision.get("input_question") or "Please clarify the request.",
@@ -1591,8 +1627,16 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
                 "kind": route_decision.get("task_type") or "general",
                 "awaitingStep": "clarify_path",
                 "requestedCapability": workflow[0] if workflow else requested_capability,
+                "task_type": task_type,
             },
         )
+
+    # Store task_type in router_context for permission loading during dispatch
+    if route_decision:
+        task_type = route_decision.get("task_type") or "development"
+        if task_type == "dev":
+            task_type = "development"
+        task.router_context["task_type"] = task_type
 
     office_response = _maybe_prepare_office_route(task, workflow, route_decision or {})
     if office_response is not None:

@@ -20,7 +20,7 @@
     {
       "id": "jira.ticket.fetch",
       "name": "Jira Ticket Fetch",
-      "description": "Looks up tickets such as DMPP-2647 and prepares a downstream summary.",
+      "description": "Looks up tickets such as PROJ-2647 and prepares a downstream summary.",
       "tags": ["jira", "ticket", "fetch", "llm"]
     },
     {

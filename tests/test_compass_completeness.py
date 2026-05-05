@@ -71,7 +71,7 @@ class CompassCompletenessTests(unittest.TestCase):
                     "capability": "android.task.execute",
                     "prUrl": "https://bitbucket.example.com/pull-requests/42",
                     "url": "https://bitbucket.example.com/pull-requests/42",
-                    "branch": "agent/feature/CSTL-1_task-001",
+                    "branch": "agent/feature/PROJ-1_task-001",
                 }},
             ]
 

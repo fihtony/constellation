@@ -32,6 +32,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
+import json
 import os
 import socket
 import subprocess
@@ -57,6 +59,7 @@ from agent_test_support import (
     summary_exit_code,
 )
 from agent_test_targets import jira_ticket_key, jira_ticket_url, assert_jira_write_allowed
+from common.task_permissions import load_permission_grant
 
 DEFAULT_LOCAL_PORT = 18010
 CONTAINER_AGENT_URL = "http://127.0.0.1:8010"
@@ -66,10 +69,50 @@ CONTAINER_AGENT_URL = "http://127.0.0.1:8010"
 # ---------------------------------------------------------------------------
 
 _ENV = load_env_file("tests/.env")
+_DEVELOPMENT_PERMISSIONS = load_permission_grant("development").to_dict()
+
+
+def _build_cleanup_permissions() -> dict:
+    grant = copy.deepcopy(_DEVELOPMENT_PERMISSIONS)
+    filtered_denied = []
+    for entry in grant.get("denied", []):
+        if entry.get("agent") != "jira":
+            filtered_denied.append(entry)
+            continue
+        operations = [
+            op for op in entry.get("operations", [])
+            if op.get("action") != "comment.delete"
+        ]
+        if operations:
+            new_entry = dict(entry)
+            new_entry["operations"] = operations
+            filtered_denied.append(new_entry)
+    grant["denied"] = filtered_denied
+    grant.setdefault("allowed", []).append(
+        {
+            "agent": "jira",
+            "operations": [{"action": "comment.delete", "scope": "*"}],
+        }
+    )
+    return grant
+
+
+_CLEANUP_PERMISSIONS = _build_cleanup_permissions()
+
+
+def _permission_headers(grant: dict) -> dict:
+    return {"X-Task-Permissions": json.dumps(grant, ensure_ascii=False)}
+
+
+_READ_HEADERS = _permission_headers(_DEVELOPMENT_PERMISSIONS)
 
 
 def _env(key: str, fallback: str = "") -> str:
-    return os.environ.get(key) or _ENV.get(key, fallback)
+    return _ENV.get(key, fallback)
+
+
+def _as_dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
 
 
 def _jira_base_url() -> str:
@@ -205,12 +248,81 @@ def main(argv=None):
 
     reporter.section(f"Jira Agent REST Tests — {agent_url}")
 
+    # ---------------------------------------------------------------------------
+    # Cleanup tracker — collects artifacts to restore in finally block
+    # ---------------------------------------------------------------------------
+    _cleanup_comment_ids: list[str] = []       # comment IDs created during the test
+    _original_state: dict = {}                 # {"labels": [...], "summary": "...", "description": "...", "status": "..."}
+
+    def _teardown_cleanup() -> None:
+        """Best-effort restore of all test side-effects.
+
+        Must run even on test failure / exception so the Jira ticket is not
+        left in a dirty state.
+        """
+        reporter.section("Teardown — restoring Jira ticket state")
+        # 1. Delete test comments
+        for cid in _cleanup_comment_ids:
+            try:
+                s, b, _ = http_request(
+                    f"{agent_url}/jira/comments/{ticket_key}/{cid}",
+                    method="DELETE",
+                    headers=_permission_headers(_CLEANUP_PERMISSIONS),
+                )
+                if s == 200 and b.get("result") == "deleted":
+                    reporter.info(f"Teardown: deleted comment {cid}")
+                else:
+                    reporter.info(f"Teardown: comment {cid} delete returned status={s}")
+            except Exception as exc:
+                reporter.info(f"Teardown: comment {cid} cleanup failed: {exc}")
+
+        # 2. Restore mutable issue fields if they were modified during a test
+        restore_fields = {}
+        for field_name in ("labels", "summary", "description"):
+            if field_name in _original_state:
+                restore_fields[field_name] = _original_state[field_name]
+
+        if restore_fields:
+            try:
+                s, b, _ = http_request(
+                    f"{agent_url}/jira/tickets/{ticket_key}",
+                    method="PUT",
+                    payload={
+                        "fields": restore_fields,
+                        "permissions": _DEVELOPMENT_PERMISSIONS,
+                    },
+                )
+                if s == 200:
+                    reporter.info(f"Teardown: issue fields restored: {sorted(restore_fields.keys())}")
+                else:
+                    reporter.info(f"Teardown: field restore returned status={s}")
+            except Exception as exc:
+                reporter.info(f"Teardown: field restore failed: {exc}")
+
+        # 3. Restore status if it was changed
+        if _original_state.get("status"):
+            try:
+                s, b, _ = http_request(
+                    f"{agent_url}/jira/transitions/{ticket_key}",
+                    method="POST",
+                    payload={
+                        "transition": _original_state["status"],
+                        "permissions": _DEVELOPMENT_PERMISSIONS,
+                    },
+                )
+                if s == 200:
+                    reporter.info(f"Teardown: status restored to '{_original_state['status']}'")
+                else:
+                    reporter.info(f"Teardown: status restore returned status={s}")
+            except Exception as exc:
+                reporter.info(f"Teardown: status restore failed: {exc}")
+
     try:
         # TC-01 — myself ----------------------------------------------------
         reporter.step("TC-01  GET /jira/myself")
-        status, body, _ = http_request(f"{agent_url}/jira/myself")
+        status, body, _ = http_request(f"{agent_url}/jira/myself", headers=_READ_HEADERS)
         reporter.show("myself", body)
-        user = body.get("user", {})
+        user = _as_dict(body.get("user"))
         if status == 200 and body.get("result") == "ok" and user.get("accountId"):
             reporter.info(f"Authenticated as: {user.get('emailAddress') or user.get('displayName')}")
             reporter.ok("GET /jira/myself returned authenticated user")
@@ -233,7 +345,7 @@ def main(argv=None):
         status, body, _ = http_request(f"{agent_url}/.well-known/agent-card.json")
         reporter.show("agent-card", body)
         if status == 200 and "jira" in (body.get("name") or "").lower():
-            skills = [s["id"] for s in body.get("skills", [])]
+            skills = [str(skill.get("id")) for skill in body.get("skills", []) if isinstance(skill, dict) and skill.get("id")]
             reporter.info(f"Skills: {', '.join(skills)}")
             reporter.ok("Agent card valid")
         else:
@@ -241,10 +353,10 @@ def main(argv=None):
 
         # TC-04 — ticket fetch ----------------------------------------------
         reporter.step(f"TC-04  GET /jira/tickets/{ticket_key}")
-        status, body, _ = http_request(f"{agent_url}/jira/tickets/{ticket_key}")
+        status, body, _ = http_request(f"{agent_url}/jira/tickets/{ticket_key}", headers=_READ_HEADERS)
         reporter.show("ticket-fetch", body)
-        issue = body.get("issue") or {}
-        fields = issue.get("fields") or {}
+        issue = _as_dict(body.get("issue"))
+        fields = _as_dict(issue.get("fields"))
         if status == 200 and body.get("status") == "fetched":
             summary_text = fields.get("summary", "")
             reporter.info(f"Summary: {summary_text[:80]}")
@@ -254,7 +366,7 @@ def main(argv=None):
 
         # TC-05 — transitions -----------------------------------------------
         reporter.step(f"TC-05  GET /jira/transitions/{ticket_key}")
-        status, body, _ = http_request(f"{agent_url}/jira/transitions/{ticket_key}")
+        status, body, _ = http_request(f"{agent_url}/jira/transitions/{ticket_key}", headers=_READ_HEADERS)
         reporter.show("transitions", body)
         transitions = body.get("transitions", [])
         if status == 200 and body.get("result") == "ok" and transitions:
@@ -268,7 +380,8 @@ def main(argv=None):
         # TC-06 — search ----------------------------------------------------
         reporter.step(f"TC-06  GET /jira/search?jql=key={ticket_key}")
         status, body, _ = http_request(
-            f"{agent_url}/jira/search?{urlencode({'jql': f'key = {ticket_key}', 'maxResults': '1'})}"
+            f"{agent_url}/jira/search?{urlencode({'jql': f'key = {ticket_key}', 'maxResults': '1'})}",
+            headers=_READ_HEADERS,
         )
         reporter.show("search", body)
         search_result = body.get("search", {})
@@ -285,11 +398,12 @@ def main(argv=None):
         status, body, _ = http_request(
             f"{agent_url}/jira/comments/{ticket_key}",
             method="POST",
-            payload={"text": comment_text},
+            payload={"text": comment_text, "permissions": _DEVELOPMENT_PERMISSIONS},
         )
         reporter.show("comment-add", body)
         comment_id = body.get("commentId")
         if status == 201 and body.get("result") == "added" and comment_id:
+            _cleanup_comment_ids.append(comment_id)
             reporter.ok(f"Comment {comment_id} added to {ticket_key}")
         else:
             reporter.fail(f"POST /jira/comments/{ticket_key} failed", f"status={status} body={body}")
@@ -301,7 +415,10 @@ def main(argv=None):
             status, body, _ = http_request(
                 f"{agent_url}/jira/comments/{ticket_key}/{comment_id}",
                 method="PUT",
-                payload={"text": "[Agent Test] Constellation Jira REST test comment — updated"},
+                payload={
+                    "text": "[Agent Test] Constellation Jira REST test comment — updated",
+                    "permissions": _DEVELOPMENT_PERMISSIONS,
+                },
             )
             reporter.show("comment-update", body)
             if status == 200 and body.get("result") == "updated":
@@ -315,25 +432,38 @@ def main(argv=None):
             status, body, _ = http_request(
                 f"{agent_url}/jira/comments/{ticket_key}/{comment_id}",
                 method="DELETE",
+                headers=_permission_headers(_CLEANUP_PERMISSIONS),
             )
             reporter.show("comment-delete", body)
             if status == 200 and body.get("result") == "deleted":
+                # Remove from cleanup list since we already deleted it
+                if comment_id in _cleanup_comment_ids:
+                    _cleanup_comment_ids.remove(comment_id)
                 reporter.ok(f"Comment {comment_id} deleted (cleaned up)")
             else:
                 reporter.fail(f"DELETE /jira/comments/{ticket_key}/{comment_id} failed", f"status={status} body={body}")
 
         # TC-10 — field update (labels) with restore ------------------------
         reporter.step(f"TC-10  PUT /jira/tickets/{ticket_key} — labels update + restore")
-        # Read current labels first
-        status_r, body_r, _ = http_request(f"{agent_url}/jira/tickets/{ticket_key}")
+        # Read current labels first and save for teardown safety net
+        status_r, body_r, _ = http_request(f"{agent_url}/jira/tickets/{ticket_key}", headers=_READ_HEADERS)
         original_labels = []
         if status_r == 200:
-            original_labels = (body_r.get("issue") or {}).get("fields", {}).get("labels") or []
+            issue_payload = _as_dict(body_r.get("issue"))
+            issue_fields = _as_dict(issue_payload.get("fields"))
+            original_labels = issue_fields.get("labels") or []
+            _original_state["summary"] = issue_fields.get("summary") or ""
+            original_description = issue_fields.get("description")
+            _original_state["description"] = original_description if original_description is not None else ""
+        _original_state["labels"] = list(original_labels)  # save for teardown
         test_labels = list(dict.fromkeys(original_labels + ["constellation-agent-test"]))
         status, body, _ = http_request(
             f"{agent_url}/jira/tickets/{ticket_key}",
             method="PUT",
-            payload={"fields": {"labels": test_labels}},
+            payload={
+                "fields": {"labels": test_labels},
+                "permissions": _DEVELOPMENT_PERMISSIONS,
+            },
         )
         reporter.show("field-update", body)
         if status == 200 and body.get("result") == "updated":
@@ -342,7 +472,10 @@ def main(argv=None):
             restore_status, restore_body, _ = http_request(
                 f"{agent_url}/jira/tickets/{ticket_key}",
                 method="PUT",
-                payload={"fields": {"labels": original_labels}},
+                payload={
+                    "fields": {"labels": original_labels},
+                    "permissions": _DEVELOPMENT_PERMISSIONS,
+                },
             )
             if restore_status == 200 and restore_body.get("result") == "updated":
                 reporter.ok(f"Labels restored to original: {original_labels}")
@@ -354,13 +487,15 @@ def main(argv=None):
         # TC-11 — transition with restore -----------------------------------
         if transitions:
             transition_names = [t.get("name") for t in transitions if isinstance(t, dict)]
-            # Find current status
-            status_r2, body_r2, _ = http_request(f"{agent_url}/jira/tickets/{ticket_key}")
+            # Find current status and save for teardown safety net
+            status_r2, body_r2, _ = http_request(f"{agent_url}/jira/tickets/{ticket_key}", headers=_READ_HEADERS)
             current_status = ""
             if status_r2 == 200:
-                current_status = (
-                    (body_r2.get("issue") or {}).get("fields", {}).get("status", {}).get("name", "")
-                )
+                issue_payload = _as_dict(body_r2.get("issue"))
+                issue_fields = _as_dict(issue_payload.get("fields"))
+                status_payload = _as_dict(issue_fields.get("status"))
+                current_status = str(status_payload.get("name") or "")
+                _original_state["status"] = current_status  # save for teardown
             # Pick a non-current transition
             target_transition = None
             for t in transitions:
@@ -378,7 +513,10 @@ def main(argv=None):
                 status, body, _ = http_request(
                     f"{agent_url}/jira/transitions/{ticket_key}",
                     method="POST",
-                    payload={"transition": target_transition},
+                    payload={
+                        "transition": target_transition,
+                        "permissions": _DEVELOPMENT_PERMISSIONS,
+                    },
                 )
                 reporter.show("transition", body)
                 if status == 200 and body.get("transitionId"):
@@ -388,7 +526,10 @@ def main(argv=None):
                         restore_status2, restore_body2, _ = http_request(
                             f"{agent_url}/jira/transitions/{ticket_key}",
                             method="POST",
-                            payload={"transition": current_status},
+                            payload={
+                                "transition": current_status,
+                                "permissions": _DEVELOPMENT_PERMISSIONS,
+                            },
                         )
                         if restore_status2 == 200 and restore_body2.get("transitionId"):
                             reporter.ok(f"Status restored to: {current_status}")
@@ -408,6 +549,7 @@ def main(argv=None):
             reporter.skip("TC-11 transition", "No transitions available")
 
     finally:
+        _teardown_cleanup()
         if proc:
             proc.terminate()
             proc.wait(timeout=5)
