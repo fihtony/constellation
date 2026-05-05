@@ -1884,12 +1884,30 @@ def _classify_branch_kind(
 
 
 def _resolve_ticket_key(task_instruction: str, metadata: dict | None = None) -> str:
+    jira_context = (metadata or {}).get("jiraContext")
+    if isinstance(jira_context, dict):
+        ticket_key_from_context = str(jira_context.get("ticketKey") or "").strip()
+        if ticket_key_from_context:
+            return ticket_key_from_context
+
     ticket_key_from_meta = str((metadata or {}).get("jiraTicketKey") or "").strip()
     if ticket_key_from_meta:
         return ticket_key_from_meta
 
     ticket_match = re.search(r"\b([A-Z][A-Z0-9]+-\d{2,})\b", task_instruction or "")
     return ticket_match.group(1) if ticket_match else ""
+
+
+def _resolve_jira_context_from_metadata(
+    task_instruction: str,
+    metadata: dict | None = None,
+) -> tuple[str, str]:
+    jira_context = (metadata or {}).get("jiraContext")
+    if not isinstance(jira_context, dict):
+        jira_context = {}
+    ticket_key = _resolve_ticket_key(task_instruction, metadata)
+    content = str(jira_context.get("content") or "").strip()
+    return ticket_key, content
 
 
 def _list_remote_branches(
@@ -2901,8 +2919,14 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         # Extract Jira ticket key: prefer explicit metadata field from Team Lead,
         # then fall back to regex.  Require at least 2 digits to avoid matching
         # technical terms like "UTF-8", "ISO-8", "HTTP-2", etc.
-        ticket_key = _resolve_ticket_key(task_instruction, metadata)
-        if ticket_key and workspace:
+        ticket_key, jira_content = _resolve_jira_context_from_metadata(task_instruction, metadata)
+        if jira_content:
+            log(f"Using Jira context from Team Lead metadata for {ticket_key or 'provided ticket'}")
+            task_instruction = (
+                f"{task_instruction}\n\n"
+                f"Jira ticket context ({ticket_key or 'provided ticket'}):\n{jira_content[:3000]}"
+            )
+        elif ticket_key and workspace:
             log(f"Fetching Jira context for {ticket_key}")
             jira_content = _fetch_jira_context(
                 task_id,

@@ -1406,6 +1406,45 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
 
         self.assertEqual(ticket_key, "PROJ-2903")
 
+    def test_web_agent_resolves_prefetched_jira_context_from_team_lead_metadata(self):
+        ticket_key, jira_content = web_app._resolve_jira_context_from_metadata(
+            "Implement the dashboard in the target repository.",
+            {
+                "jiraTicketKey": "PROJ-2903",
+                "jiraContext": {
+                    "ticketKey": "PROJ-2903",
+                    "content": '{"fields": {"summary": "Implement dashboard"}}',
+                },
+            },
+        )
+
+        self.assertEqual(ticket_key, "PROJ-2903")
+        self.assertIn("Implement dashboard", jira_content)
+
+    def test_team_lead_dev_metadata_includes_prefetched_boundary_context(self):
+        metadata = team_lead_app._build_dev_task_metadata(
+            dev_capability="web.task.execute",
+            compass_task_id="compass-task-1",
+            team_lead_task_id="team-task-1",
+            workspace="/tmp/workspace",
+            target_repo_url="https://github.com/example/repo",
+            permissions={"grant": "development"},
+            tech_stack_constraints={"language": "typescript"},
+            acceptance_criteria=["Ship the page."],
+            requires_tests=True,
+            jira_ticket_key="PROJ-2903",
+            jira_context={"ticket_key": "PROJ-2903", "content": "jira payload"},
+            design_context={
+                "url": "https://figma.example/file",
+                "content": "design payload",
+                "type": "figma",
+            },
+        )
+
+        self.assertEqual(metadata["jiraContext"]["ticketKey"], "PROJ-2903")
+        self.assertEqual(metadata["jiraContext"]["content"], "jira payload")
+        self.assertEqual(metadata["designContext"]["content"], "design payload")
+
     def test_team_lead_launches_fresh_instance_for_per_task_capability(self):
         with mock.patch.object(
             team_lead_app.agent_directory,

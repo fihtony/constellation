@@ -139,6 +139,25 @@ def _read_workspace_json(workspace_path: str, relative_name: str) -> dict:
         return {}
 
 
+def _resolve_jira_context_from_metadata(
+    task_instruction: str,
+    metadata: dict | None = None,
+) -> tuple[str, str]:
+    metadata = metadata or {}
+    jira_context = metadata.get("jiraContext")
+    if not isinstance(jira_context, dict):
+        jira_context = {}
+
+    ticket_key = str(jira_context.get("ticketKey") or metadata.get("jiraTicketKey") or "").strip()
+    if not ticket_key:
+        ticket_match = re.search(r"\b([A-Z][A-Z0-9]+-\d{2,})\b", task_instruction or "")
+        if ticket_match:
+            ticket_key = ticket_match.group(1)
+
+    content = str(jira_context.get("content") or "").strip()
+    return ticket_key, content
+
+
 def _append_workspace_event(workspace_path: str, relative_name: str, event: dict) -> None:
     payload = _read_workspace_json(workspace_path, relative_name)
     raw_events = payload.get("events")
@@ -903,15 +922,45 @@ def _android_gradle_env(build_dir: str | None = None) -> dict[str, str]:
     return env
 
 
-def _android_gradle_base_args() -> list[str]:
+def _prepare_gradle_user_home_properties(build_dir: str, log_fn) -> None:
+    """Write GRADLE_USER_HOME/gradle.properties with memory-constrained JVM args.
+
+    Gradle reads JVM daemon args from gradle.properties in GRADLE_USER_HOME first,
+    which overrides the project-level gradle.properties.  This is the only reliable
+    way to cap the daemon heap from outside the project tree, preventing OOM crashes
+    in memory-constrained containers (especially emulated amd64 on Apple Silicon).
+    """
+    env = _android_gradle_env(build_dir)
+    gradle_home = env.get("GRADLE_USER_HOME", "")
+    if not gradle_home:
+        return
     jvm_args = os.environ.get("ANDROID_GRADLE_JVM_ARGS", "-Xmx1024m -Dfile.encoding=UTF-8").strip()
+    if not jvm_args:
+        return
+    try:
+        os.makedirs(gradle_home, exist_ok=True)
+        props_path = os.path.join(gradle_home, "gradle.properties")
+        with open(props_path, "w", encoding="utf-8") as fh:
+            fh.write(f"# Written by Android Agent — overrides project gradle.properties JVM heap\n")
+            fh.write(f"org.gradle.jvmargs={jvm_args}\n")
+            fh.write("org.gradle.daemon=false\n")
+        log_fn(f"Wrote GRADLE_USER_HOME/gradle.properties: org.gradle.jvmargs={jvm_args}")
+    except OSError as exc:
+        log_fn(f"Could not write GRADLE_USER_HOME/gradle.properties: {exc}")
+
+
+def _android_gradle_base_args() -> list[str]:
+    jvm_args = os.environ.get("ANDROID_GRADLE_JVM_ARGS", "-Xmx640m -Dfile.encoding=UTF-8").strip()
+    max_workers = os.environ.get("ANDROID_GRADLE_MAX_WORKERS", "1").strip()
     args = [
+        f"--max-workers={max_workers}" if max_workers else "",
         "--no-daemon",
         "--console=plain",
         "-Pkotlin.compiler.execution.strategy=in-process",
         "-Dkotlin.daemon.enabled=false",
         "-Dorg.gradle.vfs.watch=false",
     ]
+    args = [arg for arg in args if arg]
     if jvm_args:
         args.append(f"-Dorg.gradle.jvmargs={jvm_args}")
     return args
@@ -1122,6 +1171,30 @@ def _detect_android_build_steps(build_dir: str) -> list[dict]:
     return steps
 
 
+def _clear_stale_gradle_locks(build_dir: str, log_fn) -> None:
+    """Remove stale Gradle journal lock files left by previously killed containers.
+
+    Gradle creates lock files under GRADLE_USER_HOME/caches/journal-1/.  If the
+    container is killed mid-build these locks are never released, causing the next
+    build to wait for a timeout and then fail.  It is safe to delete them before
+    starting a fresh build because no live Gradle process is running at this point.
+    """
+    gradle_home = _android_gradle_env(build_dir).get(
+        "GRADLE_USER_HOME",
+        os.path.join(build_dir, ".gradle-agent"),
+    )
+    lock_patterns = [
+        os.path.join(gradle_home, "caches", "journal-1", "journal-1.lock"),
+    ]
+    for lock_path in lock_patterns:
+        if os.path.isfile(lock_path):
+            try:
+                os.remove(lock_path)
+                log_fn(f"Removed stale Gradle lock: {lock_path}")
+            except OSError as exc:
+                log_fn(f"Could not remove stale Gradle lock {lock_path}: {exc}")
+
+
 def _build_and_test_android(build_dir: str, log_fn) -> tuple[bool, str, list[dict]]:
     if not os.path.isdir(build_dir):
         return False, "Build directory is missing.", [{"attempt": 1, "success": False, "output": "Build directory is missing."}]
@@ -1129,6 +1202,8 @@ def _build_and_test_android(build_dir: str, log_fn) -> tuple[bool, str, list[dic
     if not os.path.isfile(os.path.join(build_dir, "gradlew")) and not os.path.isfile(os.path.join(build_dir, "build.gradle")) and not os.path.isfile(os.path.join(build_dir, "build.gradle.kts")):
         return False, "No Gradle wrapper or build file found.", [{"attempt": 1, "success": False, "output": "No Gradle wrapper or build file found."}]
 
+    _clear_stale_gradle_locks(build_dir, log_fn)
+    _prepare_gradle_user_home_properties(build_dir, log_fn)
     _prepare_android_local_properties(build_dir, log_fn)
     try:
         steps = _detect_android_build_steps(build_dir)
@@ -1467,20 +1542,13 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         task_store.update_state(task_id, "GATHERING_INFO", "Gathering Jira and repo context…")
         log("Gathering context")
 
-        jira_content = ""
-        ticket_key = ""
-        # Team Lead passes the Jira ticket key explicitly in metadata to avoid
-        # the regex accidentally matching technical terms like "UTF-8" or "ISO-8".
-        ticket_key_from_meta = str(metadata.get("jiraTicketKey") or "").strip()
-        if ticket_key_from_meta:
-            ticket_key = ticket_key_from_meta
-        else:
-            # Fallback: scan instruction text.  Require at least 2 digits to
-            # exclude version/encoding strings (UTF-8, ISO-8, HTTP-2, etc.).
-            ticket_match = re.search(r"\b([A-Z][A-Z0-9]+-\d{2,})\b", task_instruction)
-            if ticket_match:
-                ticket_key = ticket_match.group(1)
-        if ticket_key and workspace:
+        ticket_key, jira_content = _resolve_jira_context_from_metadata(task_instruction, metadata)
+        if jira_content:
+            log(f"Using Jira context from Team Lead metadata for {ticket_key or 'provided ticket'}")
+            task_instruction = (
+                f"{task_instruction}\n\nJira ticket context ({ticket_key or 'provided ticket'}):\n{jira_content[:3000]}"
+            )
+        elif ticket_key and workspace:
             log(f"Fetching Jira context for {ticket_key}")
             jira_content = _fetch_jira_context(task_id, ticket_key, workspace, compass_task_id, permissions=permissions)
             if jira_content:
