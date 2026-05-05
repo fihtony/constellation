@@ -114,8 +114,8 @@ def _ensure_stack(reporter: Reporter) -> bool:
         return False
 
     runtime, token = _resolve_runtime_inputs()
-    if runtime != "connect-agent":
-        reporter.fail("common/.env does not set AGENT_RUNTIME=connect-agent", f"current={runtime!r}")
+    if runtime != "copilot-cli":
+        reporter.fail("common/.env does not set AGENT_RUNTIME=copilot-cli", f"current={runtime!r}")
         return False
     if runtime == "copilot-cli" and not token:
         reporter.fail("COPILOT_GITHUB_TOKEN is not configured in common/.env or tests/.env")
