@@ -709,6 +709,7 @@ def _build_dev_task_metadata(
     requires_tests: bool,
     screenshot_requirements: str | None = None,
     jira_ticket_key: str = "",
+    jira_context: dict | None = None,
     is_revision: bool = False,
     revision_cycle: int = 0,
     review_issues: list | None = None,
@@ -737,6 +738,11 @@ def _build_dev_task_metadata(
     }
     if isinstance(permissions, dict) and permissions:
         metadata["permissions"] = permissions
+    if jira_context and jira_context.get("content"):
+        metadata["jiraContext"] = {
+            "ticketKey": jira_ticket_key or jira_context.get("ticket_key", ""),
+            "content": (jira_context.get("content") or "")[:30000],
+        }
     if design_context and (design_context.get("content") or design_context.get("url")):
         # Only use the Stitch thumbnail URL when the stitch-design.json came from a
         # get_screen call (identified by the presence of a "screenId" key at the top level).
@@ -920,12 +926,9 @@ def _interpret_permission_reply(reply_text: str) -> str:
         "continue",
         "ok",
         "okay",
-        "同意",
-        "批准",
-        "允许",
-        "可以",
-        "继续",
-        "是",
+        "accept",
+        "accepted",
+        "proceed",
     )
     deny_tokens = (
         "no",
@@ -935,11 +938,8 @@ def _interpret_permission_reply(reply_text: str) -> str:
         "reject",
         "stop",
         "cancel",
-        "不同意",
-        "拒绝",
-        "不允许",
-        "不要",
-        "否",
+        "decline",
+        "declined",
     )
     if any(token in lowered for token in approve_tokens):
         return "approve"
@@ -950,12 +950,12 @@ def _interpret_permission_reply(reply_text: str) -> str:
 
 def _build_permission_approval_question(details) -> str:
     return (
-        "执行过程中遇到额外权限请求。\n"
-        f"目标 Agent: {details.target_agent}\n"
-        f"操作: {details.action}\n"
-        f"目标: {details.target or '(unspecified)'}\n"
-        f"原因: {details.reason}\n\n"
-        "是否批准这项额外权限并继续任务？请回复 yes 或 no。"
+        "The task requires an additional permission before it can continue.\n"
+        f"Target agent: {details.target_agent}\n"
+        f"Action: {details.action}\n"
+        f"Target: {details.target or '(unspecified)'}\n"
+        f"Reason: {details.reason}\n\n"
+        "Approve this additional permission and continue the task? Reply yes or no."
     )
 
 
@@ -968,7 +968,7 @@ def _request_permission_approval(
 ) -> bool:
     artifact = build_permission_denied_artifact(details, agent_id=AGENT_ID)
     follow_up = _build_permission_approval_question(details)
-    clarification = "请只回复 yes 或 no。"
+    clarification = "Please reply with yes or no only."
     ctx.pending_permission_request = details.to_dict()
     _save_workspace_file(
         workspace,
@@ -3263,6 +3263,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 requires_tests=plan.get("requires_tests", False),
                 screenshot_requirements=plan.get("screenshot_requirements"),
                 jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
+                jira_context=ctx.jira_info,
                 design_context=ctx.design_info,
             ),
         }
@@ -3329,6 +3330,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                         requires_tests=plan.get("requires_tests", False),
                         screenshot_requirements=plan.get("screenshot_requirements"),
                         jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
+                        jira_context=ctx.jira_info,
                         is_revision=True,
                         revision_cycle=0,
                         review_issues=[retry_feedback],
@@ -3469,6 +3471,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                     requires_tests=plan.get("requires_tests", False),
                     screenshot_requirements=plan.get("screenshot_requirements"),
                     jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
+                    jira_context=ctx.jira_info,
                     is_revision=True,
                     revision_cycle=review_cycle + 1,
                     review_issues=review.get("issues") or [],

@@ -48,6 +48,8 @@ user-invocable: false
 - Any test that needs a Jira ticket URL/key, GitHub or Bitbucket repo URL, Figma URL, or Stitch URL must load that target from `tests/.env` (directly or through a helper). Do not hardcode real ticket IDs, repo URLs, or design URLs in test scripts.
 - When branch authorization depends on policy, add at least one test for default protected branches (`main`, `master`, `develop`, `release/*`) and one test for a custom regex override.
 - For execution agents, a failing local validation command is not the end of the workflow: run a bounded local self-repair loop, re-run the same focused validation, and persist each attempt before escalating the remaining defect to Team Lead.
+- For Team Lead → dev-agent workflows, add or update tests so prefetched `jiraContext` / `designContext` metadata is consumed before any duplicate boundary fetch is attempted.
+- For Android or other container-sensitive execution agents, validate the required build and unit-test commands inside the actual agent image with the repository bind-mounted. If the container cannot run the validation command, fix the image or repo state and rerun until the environment is ready or the remaining failure is a real product defect.
 
 ## Coverage Targets
 

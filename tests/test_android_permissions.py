@@ -329,6 +329,25 @@ class TestWorkflowExtractsPermissions(unittest.TestCase):
         self.assertIsNone(permissions)
 
 
+class TestAndroidJiraContextHandoff(unittest.TestCase):
+    def test_android_agent_uses_prefetched_jira_context_from_metadata(self):
+        from android.app import _resolve_jira_context_from_metadata
+
+        ticket_key, jira_content = _resolve_jira_context_from_metadata(
+            "Implement the Android screen.",
+            {
+                "jiraTicketKey": "PROJ-2904",
+                "jiraContext": {
+                    "ticketKey": "PROJ-2904",
+                    "content": '{"fields": {"summary": "Your contributions"}}',
+                },
+            },
+        )
+
+        self.assertEqual(ticket_key, "PROJ-2904")
+        self.assertIn("Your contributions", jira_content)
+
+
 class TestAndroidSdkPreparation(unittest.TestCase):
     def test_resolve_android_sdk_dir_prefers_android_home(self):
         from android.app import _resolve_android_sdk_dir

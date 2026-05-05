@@ -4,9 +4,11 @@
 
 | Content type | Language |
 |---|---|
-| Explanations, design discussions, answers to questions | **Chinese (中文)** |
-| Design documents (`docs/*.md`) | **Chinese (中文)** |
-| Source code, comments, tests, `README.md` | **English** |
+| Explanations, design discussions, answers to questions | **Chinese** |
+| Design documents (`docs/*.md`) | **Chinese** |
+| Source code, code comments, scripts, tests, skills, instruction files, `README.md` | **English** |
+
+All newly added code strings, comments, scripts, tests, skills, and instruction text must remain in English. User-facing explanations in chat stay in Chinese.
 
 ---
 
@@ -480,11 +482,13 @@ artifacts = [
 ### 12. LLM Usage
 
 Use `common/runtime/adapter.py` for all agentic LLM/CLI calls. It handles:
-- `connect-agent` as the primary built-in production backend
+- `connect-agent` as the primary built-in production runtime, using Copilot Connect as its underlying LLM transport
 - `copilot-cli` as an optional compatible CLI backend
 - `claude-code` as an optional compatible backend
 - Mock fallback when no real backend is available (`ALLOW_MOCK_FALLBACK=1`)
 - Proper timeout and structured result handling
+
+`common/runtime/copilot_connect.py` is a compatibility single-shot wrapper over the Copilot Connect transport. It is not a selectable agentic runtime backend.
 
 ```python
 from common.runtime.adapter import get_runtime
@@ -728,7 +732,7 @@ Before submitting a new agent, verify:
 | Workspace/debug log helpers | `common/devlog.py` | Shared debug log + workspace stage logging helpers |
 | Copilot CLI backend | `common/runtime/copilot_cli.py` | Primary agentic CLI backend |
 | Claude Code backend | `common/runtime/claude_code.py` | Optional compatible backend |
-| Copilot Connect backend | `common/runtime/copilot_connect.py` | OpenAI-compatible backend / fallback |
+| Copilot Connect transport wrapper | `common/runtime/copilot_connect.py` | Single-shot compatibility wrapper over the LLM transport used by `connect-agent`; not a selectable runtime backend |
 | Capability Registry | `registry/app.py` |
 | Shared low-level LLM client | `common/llm_client.py` | Legacy OpenAI-compatible helper used by runtime internals |
 | Shared Registry client | `common/registry_client.py` |
@@ -754,6 +758,7 @@ Before submitting a new agent, verify:
 - `registry` remains a non-agentic control-plane service. `compass` is now an agentic control-plane service for routing, clarification interpretation, and user-facing final summaries, but it must still avoid unbounded external-system reasoning loops and must not bypass registered boundary agents.
 - Task workspaces should keep `command-log.txt` and `stage-summary.json` under each agent subdirectory for auditability; runtime details belong inside `stage-summary.json` as `runtimeConfig`, not in a separate `runtime-config.json` file.
 - The shared `connect-agent` runtime prompt must stay domain-neutral. Task-specific development, design-to-code, office, or audit rules belong in the caller's agent prompt or explicit system prompt override, not in the runtime default prompt.
+- When Team Lead has already fetched Jira or UI-design context, it must pass bounded copies to the downstream dev agent through A2A metadata (`jiraContext`, `designContext`). Dev agents must consume that handed-off context first and only call Jira / UI Design again when they need additional detail beyond the provided payload.
 - Team Lead and Web currently inject the **six** workspace delivery playbooks `constellation-architecture-delivery`, `constellation-frontend-delivery`, `constellation-backend-delivery`, `constellation-database-delivery`, `constellation-code-review-delivery`, and `constellation-testing-delivery` through `build_system_prompt(...)`; their `stage-summary.json` should therefore retain both `runtimeConfig.runtime` and `runtimeConfig.skillPlaybooks` for auditability.
 - In execution task workspaces, generated source files should live in the real cloned repository directory; `web-agent/` and similar agent subdirectories are for metadata and audit artifacts only.
 - For repo-backed development tasks, Team Lead must instruct the dev agent to clone the target repository via the SCM agent into the shared workspace before editing files, and Web Agent must fail fast if a repo URL is present but no shared workspace is available or the clone path escapes that workspace.
@@ -767,6 +772,7 @@ Before submitting a new agent, verify:
 - Repo-backed development agents must work inside the shared-workspace clone on a local development branch, run local build/test validation before PR creation, and persist branch/test/PR evidence in their agent workspace. For UI tasks with design context, they must also capture design-reference plus implementation screenshots and include PR-safe copies in `docs/evidence/` when the repo workflow allows it.
 - Architecture-sensitive per-task agents may declare `launchSpec.platform`; `common/launcher.py` and `common/launcher_rancher.py` now pass that through to the Docker create payload. Android currently uses `linux/amd64` because some Android SDK binaries remain x86_64-only in this environment.
 - Android Agent now performs a bounded local build/test recovery loop before PR creation: on Gradle/unit-test failure it re-runs validation with stable CI-friendly Gradle flags, asks the runtime for targeted file fixes, reapplies those fixes in the clone, reruns validation, and persists every attempt in `android-agent/test-results.json`.
+- The validated Android container profile currently uses `--max-workers=1`, `-Pkotlin.compiler.execution.strategy=in-process`, `-Dkotlin.daemon.enabled=false`, and `ANDROID_GRADLE_JVM_ARGS=-Xmx640m -Dfile.encoding=UTF-8` by default. Increase concurrency or heap only when a repository proves it needs more resources and still remains stable in the per-task container.
 - Always construct `RegistryClient(REGISTRY_URL)` explicitly and pass it to `AgentDirectory(owner_id, registry_client)`. Never rely on the module-level `REGISTRY_URL` default inside `RegistryClient` — `load_dotenv` may not have run yet at import time.
 - Registry now exposes topology metadata (`/topology`, `/events?sinceVersion=`); agents that call other agents should cache capability lookups and refresh on cache miss or topology change.
 - Compass applies a final completeness gate to Team Lead results **using only A2A artifacts from Team Lead's callback** — it must never scan execution-agent subdirectories in the shared workspace (e.g., `android-agent/pr-evidence.json`, `web-agent/jira-actions.json`). Those files are internal to the Team Lead ↔ dev-agent pipeline. Compass reads PR URL and branch from artifact metadata (`prUrl`, `branch`), and Jira "In Review" status from the `jiraInReview` boolean flag in the execution agent's artifact metadata. Compass may still read `team-lead/` workspace files (Team Lead's own output) for display and fallback purposes. Compass may trigger a same-workspace follow-up cycle before marking the user task complete. The only exception is an explicit Team Lead validation checkpoint artifact (`metadata.validationCheckpoint=true`), which intentionally stops before dev dispatch and skips the completeness gate.
