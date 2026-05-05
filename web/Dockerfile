@@ -14,6 +14,8 @@ RUN find /usr/local/share/ca-certificates/ -name "*.pem" \
         -exec sh -c 'cp "$1" "${1%.pem}.crt"' _ {} \; \
     && update-ca-certificates
 
+RUN npm install -g @github/copilot
+
 RUN pip install --no-cache-dir flask pytest requests
 
 COPY common/  /app/common/

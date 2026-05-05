@@ -18,6 +18,8 @@ RUN apt-get update \
         tini \
         git \
         curl \
+        nodejs \
+        npm \
         unzip \
         openjdk-21-jdk-headless \
         locales \
@@ -47,6 +49,8 @@ RUN find /usr/local/share/ca-certificates/ -name "*.pem" \
                  -keystore "${JAVA_HOME}/lib/security/cacerts" \
                  -storepass changeit 2>/dev/null || true; \
        done
+
+RUN npm install -g @github/copilot
 
 # Android SDK — download and install command-line tools
 RUN mkdir -p /opt/android-sdk/cmdline-tools \

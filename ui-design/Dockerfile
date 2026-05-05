@@ -3,7 +3,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tini curl \
+    && apt-get install -y --no-install-recommends ca-certificates tini curl nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 # Import any corporate CA certificates placed in certs/ (supports .crt and .pem)
@@ -11,6 +11,8 @@ COPY certs/ /usr/local/share/ca-certificates/
 RUN find /usr/local/share/ca-certificates/ -name "*.pem" \
         -exec sh -c 'cp "$1" "${1%.pem}.crt"' _ {} \; \
     && update-ca-certificates
+
+RUN npm install -g @github/copilot
 
 COPY common/     /app/common/
 COPY ui-design/  /app/ui-design/

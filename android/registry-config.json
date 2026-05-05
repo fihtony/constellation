@@ -9,10 +9,7 @@
     "memory": "4g",
     "command": ["python3", "android/app.py"],
     "passThroughEnv": ["ARTIFACT_ROOT", "DYNAMIC_AGENT_NETWORK", "COPILOT_GITHUB_TOKEN", "TZ"],
-    "env": {
-      "AGENT_RUNTIME": "connect-agent",
-      "AGENT_MODEL": "gpt-5-mini"
-    },
+    "env": {},
     "mountDockerSocket": false
   },
   "scalingPolicy": {
