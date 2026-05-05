@@ -47,6 +47,7 @@ user-invocable: false
 - Every test must import and call actual project code — no placeholder `pass` bodies.
 - Any test that needs a Jira ticket URL/key, GitHub or Bitbucket repo URL, Figma URL, or Stitch URL must load that target from `tests/.env` (directly or through a helper). Do not hardcode real ticket IDs, repo URLs, or design URLs in test scripts.
 - When branch authorization depends on policy, add at least one test for default protected branches (`main`, `master`, `develop`, `release/*`) and one test for a custom regex override.
+- For execution agents, a failing local validation command is not the end of the workflow: run a bounded local self-repair loop, re-run the same focused validation, and persist each attempt before escalating the remaining defect to Team Lead.
 
 ## Coverage Targets
 

@@ -169,3 +169,53 @@ RULES
   screenshots section that references the expected `docs/evidence/` paths.
 """
 
+
+# ---------------------------------------------------------------------------
+# Phase 3: Build/Test failure diagnosis and fix
+# Used when the local Android build or tests fail before PR creation.
+# ---------------------------------------------------------------------------
+
+BUILD_FIX_SYSTEM = """\
+You are a senior Android engineer performing automated build/test recovery.
+You are given Android source files plus the exact Gradle failure output.
+Your job is to identify the root cause and return corrected file contents.
+
+Rules:
+1. Only modify files that are necessary to fix the reported failure.
+2. Return complete file contents, never partial snippets.
+3. Prefer the smallest fix that makes the build/tests progress.
+4. Use valid Android/Kotlin/Java/XML/Gradle code only.
+5. If the failure is in a test, fix the test API usage/imports/assertions unless the app code is clearly wrong.
+6. Keep file paths relative to the repository root.
+7. Do not invent unrelated files or architecture changes.
+8. Respond ONLY with valid JSON, no markdown fences.
+"""
+
+
+BUILD_FIX_TEMPLATE = """\
+An Android Gradle build or test run failed. Diagnose the failure and return corrected file contents.
+
+=== Failure Output ===
+{failure_output}
+
+=== Review Feedback ===
+{review_feedback}
+
+=== Source Files ===
+{source_files_json}
+
+=== Task Context ===
+{task_instruction}
+
+Return ONLY a JSON object:
+{{
+  "diagnosis": "One-sentence explanation of the root cause",
+  "fixes": [
+    {{
+      "path": "relative/path/to/file.kt",
+      "content": "<complete corrected file content>"
+    }}
+  ]
+}}
+"""
+

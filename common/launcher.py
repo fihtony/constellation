@@ -200,6 +200,9 @@ class Launcher:
                 }
             },
         }
+        platform = str(effective_launch_spec.get("platform") or "").strip()
+        if platform:
+            payload["Platform"] = platform
 
         # Apply security launcher profile from launchSpec.security.launcherProfile
         self._apply_launcher_profile(effective_launch_spec, payload)

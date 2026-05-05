@@ -254,6 +254,7 @@ Returns the current state of a task. Used by the Compass Agent for polling fallb
   "executionMode": "per-task",
   "launchSpec": {
     "image": "constellation-android-agent:latest",
+    "platform": "linux/amd64",
     "port": 8000
   },
   "scalingPolicy": {
@@ -263,6 +264,8 @@ Returns the current state of a task. Used by the Compass Agent for polling fallb
   }
 }
 ```
+
+`launchSpec.platform` is optional. Use it when a per-task agent depends on architecture-specific toolchains or binaries. Current example: the Android agent pins `linux/amd64` so Android SDK / AAPT2 tooling runs correctly on Apple Silicon hosts through Docker or Rancher Desktop.
 
 ### 5. Instance Registration and Heartbeat
 
@@ -480,7 +483,6 @@ Use `common/runtime/adapter.py` for all agentic LLM/CLI calls. It handles:
 - `connect-agent` as the primary built-in production backend
 - `copilot-cli` as an optional compatible CLI backend
 - `claude-code` as an optional compatible backend
-- `copilot-connect` as the legacy compatibility backend on top of the shared connect-agent transport
 - Mock fallback when no real backend is available (`ALLOW_MOCK_FALLBACK=1`)
 - Proper timeout and structured result handling
 
@@ -763,6 +765,8 @@ Before submitting a new agent, verify:
 - The permission system is pre-release and fail-closed by default. In `PERMISSION_ENFORCEMENT=strict`, missing or malformed permission snapshots must reject both read and write boundary operations; do not add compatibility fallbacks that weaken enforcement.
 - Team Lead intake/gathering should use the agentic runtime to emit structured pending actions, but the code must still execute boundary calls itself through Registry-discovered capabilities. Do not let runtime output bypass A2A boundaries or directly hardcode external system access.
 - Repo-backed development agents must work inside the shared-workspace clone on a local development branch, run local build/test validation before PR creation, and persist branch/test/PR evidence in their agent workspace. For UI tasks with design context, they must also capture design-reference plus implementation screenshots and include PR-safe copies in `docs/evidence/` when the repo workflow allows it.
+- Architecture-sensitive per-task agents may declare `launchSpec.platform`; `common/launcher.py` and `common/launcher_rancher.py` now pass that through to the Docker create payload. Android currently uses `linux/amd64` because some Android SDK binaries remain x86_64-only in this environment.
+- Android Agent now performs a bounded local build/test recovery loop before PR creation: on Gradle/unit-test failure it re-runs validation with stable CI-friendly Gradle flags, asks the runtime for targeted file fixes, reapplies those fixes in the clone, reruns validation, and persists every attempt in `android-agent/test-results.json`.
 - Always construct `RegistryClient(REGISTRY_URL)` explicitly and pass it to `AgentDirectory(owner_id, registry_client)`. Never rely on the module-level `REGISTRY_URL` default inside `RegistryClient` — `load_dotenv` may not have run yet at import time.
 - Registry now exposes topology metadata (`/topology`, `/events?sinceVersion=`); agents that call other agents should cache capability lookups and refresh on cache miss or topology change.
 - Compass applies a final completeness gate to Team Lead results **using only A2A artifacts from Team Lead's callback** — it must never scan execution-agent subdirectories in the shared workspace (e.g., `android-agent/pr-evidence.json`, `web-agent/jira-actions.json`). Those files are internal to the Team Lead ↔ dev-agent pipeline. Compass reads PR URL and branch from artifact metadata (`prUrl`, `branch`), and Jira "In Review" status from the `jiraInReview` boolean flag in the execution agent's artifact metadata. Compass may still read `team-lead/` workspace files (Team Lead's own output) for display and fallback purposes. Compass may trigger a same-workspace follow-up cycle before marking the user task complete. The only exception is an explicit Team Lead validation checkpoint artifact (`metadata.validationCheckpoint=true`), which intentionally stops before dev dispatch and skips the completeness gate.
