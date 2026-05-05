@@ -57,6 +57,7 @@ COMPASS_URL = os.environ.get("COMPASS_URL", "http://compass:8080")
 ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", "15"))
 TASK_TIMEOUT = int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "600"))
 SYNC_AGENT_TIMEOUT = int(os.environ.get("SYNC_AGENT_TIMEOUT_SECONDS", "120"))
+MAX_BUILD_RETRIES = int(os.environ.get("ANDROID_MAX_BUILD_RETRIES", "3"))
 
 _AGENT_CARD_PATH = os.path.join(os.path.dirname(__file__), "agent-card.json")
 
@@ -890,14 +891,175 @@ def _resolve_android_sdk_dir() -> str:
     return ""
 
 
-def _android_gradle_env() -> dict[str, str]:
+def _android_gradle_env(build_dir: str | None = None) -> dict[str, str]:
     env = dict(os.environ)
     sdk_dir = _resolve_android_sdk_dir()
     if sdk_dir:
         env.setdefault("ANDROID_HOME", sdk_dir)
         env.setdefault("ANDROID_SDK_ROOT", sdk_dir)
+    if build_dir:
+        env.setdefault("GRADLE_USER_HOME", os.path.join(build_dir, ".gradle-agent"))
     env["CI"] = "true"
     return env
+
+
+def _android_gradle_base_args() -> list[str]:
+    jvm_args = os.environ.get("ANDROID_GRADLE_JVM_ARGS", "-Xmx1024m -Dfile.encoding=UTF-8").strip()
+    args = [
+        "--no-daemon",
+        "--console=plain",
+        "-Pkotlin.compiler.execution.strategy=in-process",
+        "-Dkotlin.daemon.enabled=false",
+        "-Dorg.gradle.vfs.watch=false",
+    ]
+    if jvm_args:
+        args.append(f"-Dorg.gradle.jvmargs={jvm_args}")
+    return args
+
+
+def _android_gradle_command(gradle_cmd: str, *task_args: str) -> list[str]:
+    return [gradle_cmd, *_android_gradle_base_args(), *task_args]
+
+
+def _read_android_source_files(build_dir: str, max_files: int = 30) -> list[dict]:
+    files: list[dict] = []
+    skip_dirs = {
+        ".git", ".gradle", ".gradle-agent", "build", ".idea", "node_modules",
+        "__pycache__", ".pytest_cache", "out",
+    }
+    source_exts = {
+        ".kt", ".java", ".xml", ".gradle", ".kts", ".properties", ".md", ".txt", ".json",
+    }
+    for root, dirs, fnames in os.walk(build_dir):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for fname in sorted(fnames):
+            if len(files) >= max_files:
+                return files
+            _, ext = os.path.splitext(fname)
+            if ext.lower() not in source_exts:
+                continue
+            full_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(full_path, build_dir)
+            try:
+                with open(full_path, encoding="utf-8", errors="replace") as fh:
+                    files.append({"path": rel_path, "content": fh.read(6000)})
+            except Exception:
+                continue
+    return files
+
+
+def _normalize_fix_entries(fixes: object) -> list[dict]:
+    normalized: list[dict] = []
+    if not isinstance(fixes, list):
+        return normalized
+    for fix in fixes:
+        if not isinstance(fix, dict):
+            continue
+        rel_path = str(fix.get("path") or "").strip().lstrip("/")
+        content = fix.get("content")
+        if not rel_path or content is None:
+            continue
+        normalized.append({"path": rel_path, "content": str(content)})
+    return normalized
+
+
+def _apply_llm_fixes(build_dir: str, fixes: list[dict], log_fn) -> list[str]:
+    applied_paths: list[str] = []
+    for fix in fixes:
+        rel_path = str(fix.get("path") or "").strip().lstrip("/")
+        content = fix.get("content")
+        if not rel_path or content is None:
+            continue
+        full_path = os.path.join(build_dir, rel_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        try:
+            with open(full_path, "w", encoding="utf-8") as fh:
+                fh.write(str(content))
+            applied_paths.append(rel_path)
+            log_fn(f"Applied build-fix patch to {rel_path}")
+        except OSError as exc:
+            log_fn(f"Could not apply build-fix patch to {rel_path}: {exc}")
+    return applied_paths
+
+
+def _sync_generated_files_from_repo(base_dir: str, generated_files: list[dict], candidate_paths: list[str]) -> None:
+    existing_index = {
+        str(file_info.get("path") or "").lstrip("/"): idx
+        for idx, file_info in enumerate(generated_files)
+        if isinstance(file_info, dict)
+    }
+    for rel_path in dict.fromkeys(path.lstrip("/") for path in candidate_paths if path):
+        full_path = os.path.join(base_dir, rel_path)
+        if not os.path.isfile(full_path):
+            continue
+        try:
+            with open(full_path, encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        if rel_path in existing_index:
+            generated_files[existing_index[rel_path]]["content"] = content
+        else:
+            generated_files.append({"path": rel_path, "content": content})
+
+
+def _build_and_test_with_recovery(
+    build_dir: str,
+    task_instruction: str,
+    review_issues: list[str],
+    log_fn,
+) -> tuple[bool, str, list[dict], list[str]]:
+    attempts: list[dict] = []
+    final_output = ""
+    repaired_paths: list[str] = []
+
+    for repair_attempt in range(1, MAX_BUILD_RETRIES + 1):
+        log_fn(f"Build/test attempt {repair_attempt}/{MAX_BUILD_RETRIES}")
+        success, output, step_attempts = _build_and_test_android(build_dir, log_fn)
+        final_output = output
+        for step_attempt in step_attempts:
+            attempts.append(
+                {
+                    "attempt": repair_attempt,
+                    "label": step_attempt.get("label", "android:build"),
+                    "success": bool(step_attempt.get("success")),
+                    "output": str(step_attempt.get("output") or "")[:4000],
+                }
+            )
+        if success:
+            return True, final_output, attempts, repaired_paths
+
+        log_fn(f"Build/test failed (attempt {repair_attempt}): {final_output[:200]}")
+        if repair_attempt >= MAX_BUILD_RETRIES:
+            break
+
+        fix_prompt = prompts.BUILD_FIX_TEMPLATE.format(
+            failure_output=final_output[:4000],
+            source_files_json=json.dumps(_read_android_source_files(build_dir), ensure_ascii=False, indent=2)[:12000],
+            task_instruction=task_instruction[:2000],
+            review_feedback=("\n".join(review_issues) or "(none)"),
+        )
+        fix_response = _run_agentic(
+            fix_prompt,
+            f"build-fix-attempt-{repair_attempt}",
+            system_prompt=prompts.BUILD_FIX_SYSTEM,
+            max_tokens=8192,
+        )
+        fix_data = _parse_json_from_llm(fix_response)
+        diagnosis = str(fix_data.get("diagnosis") or "unknown")
+        fixes = _normalize_fix_entries(fix_data.get("fixes"))
+        log_fn(f"LLM diagnosis: {diagnosis} — {len(fixes)} fix(es) to apply")
+        if not fixes:
+            log_fn("LLM produced no build-fix patches — stopping retry loop")
+            break
+
+        applied = _apply_llm_fixes(build_dir, fixes, log_fn)
+        repaired_paths.extend(applied)
+        if not applied:
+            log_fn("No build-fix patches were applied — stopping retry loop")
+            break
+
+    return False, final_output, attempts, repaired_paths
 
 
 def _prepare_android_local_properties(build_dir: str, log_fn) -> str:
@@ -927,35 +1089,35 @@ def _prepare_android_local_properties(build_dir: str, log_fn) -> str:
 def _detect_android_build_steps(build_dir: str) -> list[dict]:
     gradle_cmd = _ensure_gradle_wrapper_executable(build_dir)
     tasks_result = subprocess.run(
-        [gradle_cmd, "tasks", "--all"],
+        _android_gradle_command(gradle_cmd, "tasks", "--all"),
         cwd=build_dir,
         capture_output=True,
         text=True,
-        timeout=180,
+        timeout=int(os.environ.get("ANDROID_GRADLE_DISCOVERY_TIMEOUT_SECONDS", "480")),
         check=False,
-        env=_android_gradle_env(),
+        env=_android_gradle_env(build_dir),
     )
     tasks_text = f"{tasks_result.stdout}\n{tasks_result.stderr}".lower()
     steps: list[dict] = []
 
     if "testdebugunittest" in tasks_text:
-        steps.append({"cmd": [gradle_cmd, "testDebugUnitTest"], "label": "android:testDebugUnitTest"})
+        steps.append({"cmd": _android_gradle_command(gradle_cmd, "testDebugUnitTest"), "label": "android:testDebugUnitTest"})
     elif re.search(r"(?m)^test\b", tasks_text):
-        steps.append({"cmd": [gradle_cmd, "test"], "label": "android:test"})
+        steps.append({"cmd": _android_gradle_command(gradle_cmd, "test"), "label": "android:test"})
     elif re.search(r"(?m)^check\b", tasks_text):
-        steps.append({"cmd": [gradle_cmd, "check"], "label": "android:check"})
+        steps.append({"cmd": _android_gradle_command(gradle_cmd, "check"), "label": "android:check"})
 
     if "assembledebug" in tasks_text:
-        steps.append({"cmd": [gradle_cmd, "assembleDebug"], "label": "android:assembleDebug"})
+        steps.append({"cmd": _android_gradle_command(gradle_cmd, "assembleDebug"), "label": "android:assembleDebug"})
     elif re.search(r"(?m)^assemble\b", tasks_text):
-        steps.append({"cmd": [gradle_cmd, "assemble"], "label": "android:assemble"})
+        steps.append({"cmd": _android_gradle_command(gradle_cmd, "assemble"), "label": "android:assemble"})
     elif re.search(r"(?m)^build\b", tasks_text):
-        steps.append({"cmd": [gradle_cmd, "build"], "label": "android:build"})
+        steps.append({"cmd": _android_gradle_command(gradle_cmd, "build"), "label": "android:build"})
 
     if not steps and os.path.isfile(os.path.join(build_dir, "gradlew")):
         steps = [
-            {"cmd": [gradle_cmd, "testDebugUnitTest"], "label": "android:testDebugUnitTest"},
-            {"cmd": [gradle_cmd, "assembleDebug"], "label": "android:assembleDebug"},
+            {"cmd": _android_gradle_command(gradle_cmd, "testDebugUnitTest"), "label": "android:testDebugUnitTest"},
+            {"cmd": _android_gradle_command(gradle_cmd, "assembleDebug"), "label": "android:assembleDebug"},
         ]
     return steps
 
@@ -975,8 +1137,8 @@ def _build_and_test_android(build_dir: str, log_fn) -> tuple[bool, str, list[dic
         if os.path.isfile(os.path.join(build_dir, "gradlew")):
             log_fn(f"Gradle task discovery failed ({exc}); falling back to default Android build/test steps")
             steps = [
-                {"cmd": [gradle_cmd, "testDebugUnitTest"], "label": "android:testDebugUnitTest"},
-                {"cmd": [gradle_cmd, "assembleDebug"], "label": "android:assembleDebug"},
+                {"cmd": _android_gradle_command(gradle_cmd, "testDebugUnitTest"), "label": "android:testDebugUnitTest"},
+                {"cmd": _android_gradle_command(gradle_cmd, "assembleDebug"), "label": "android:assembleDebug"},
             ]
         else:
             return False, f"Could not inspect Gradle tasks: {exc}", [{"attempt": 1, "success": False, "output": f"Could not inspect Gradle tasks: {exc}"}]
@@ -993,9 +1155,9 @@ def _build_and_test_android(build_dir: str, log_fn) -> tuple[bool, str, list[dic
             cwd=build_dir,
             capture_output=True,
             text=True,
-            timeout=900,
+            timeout=int(os.environ.get("ANDROID_GRADLE_STEP_TIMEOUT_SECONDS", "1800")),
             check=False,
-            env=_android_gradle_env(),
+            env=_android_gradle_env(build_dir),
         )
         output = (result.stdout + "\n" + result.stderr).strip()
         outputs.append(f"$ {' '.join(step['cmd'])}\n{output}".strip())
@@ -1550,12 +1712,24 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         )
 
         task_store.update_state(task_id, "BUILDING", "Running Android build and tests…")
+        repaired_paths: list[str] = []
         if clone_path:
-            build_ok, build_output, build_attempts = _build_and_test_android(clone_path, log)
+            build_ok, build_output, build_attempts, repaired_paths = _build_and_test_with_recovery(
+                clone_path,
+                task_instruction,
+                review_issues,
+                log,
+            )
         else:
-            build_ok, build_output, build_attempts = False, "No cloned repository available for build/test.", [
-                {"attempt": 1, "success": False, "output": "No cloned repository available for build/test."}
-            ]
+            build_ok, build_output, build_attempts, repaired_paths = False, "No cloned repository available for build/test.", [
+                {"attempt": 1, "label": "android:build", "success": False, "output": "No cloned repository available for build/test."}
+            ], []
+        if clone_path:
+            _sync_generated_files_from_repo(
+                clone_path,
+                impl_files,
+                [file_info.get("path", "") for file_info in impl_files] + repaired_paths,
+            )
         _save_workspace_file(
             workspace,
             f"{AGENT_ID}/test-results.json",

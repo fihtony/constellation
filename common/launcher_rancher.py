@@ -188,6 +188,9 @@ class RancherLauncher:
                 }
             },
         }
+        platform = str(launch_spec.get("platform") or "").strip()
+        if platform:
+            payload["Platform"] = platform
 
         artifact_root_container = os.environ.get("ARTIFACT_ROOT", "/app/artifacts")
         artifact_root_host = self._discover_host_source(artifact_root_container)

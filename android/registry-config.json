@@ -4,6 +4,7 @@
   "executionMode": "per-task",
   "launchSpec": {
     "image": "constellation-android-agent:latest",
+    "platform": "linux/amd64",
     "port": 8000,
     "command": ["python3", "android/app.py"],
     "passThroughEnv": ["ARTIFACT_ROOT", "DYNAMIC_AGENT_NETWORK", "COPILOT_GITHUB_TOKEN", "TZ"],
