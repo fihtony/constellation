@@ -32,7 +32,9 @@ def build_system_prompt_from_manifest(
     Args:
         agent_dir: Root directory of the agent (e.g. `/app/team-lead`).
         skill_names: Optional list of skill IDs to append from skills_root.
+            If not provided, reads `skillNames` from the manifest (if present).
         skills_root: Path to the skills catalog root (e.g. `/app/.github/skills`).
+            Defaults to `<agent_dir>/../.github/skills/` if not set.
 
     Returns:
         A single assembled system prompt string. Falls back to empty string if
@@ -44,6 +46,16 @@ def build_system_prompt_from_manifest(
 
     order = _read_manifest_order(manifest_path)
     include_skills = _read_manifest_include_skills(manifest_path)
+
+    # Skill names: explicit arg > manifest skillNames > empty
+    effective_skill_names: list[str] = list(skill_names or [])
+    if not effective_skill_names and include_skills:
+        effective_skill_names = _read_manifest_skill_names(manifest_path)
+
+    # Skills root: explicit arg > <agent_dir>/../.github/skills
+    if not skills_root:
+        parent = os.path.dirname(os.path.abspath(agent_dir))
+        skills_root = os.path.join(parent, ".github", "skills")
 
     system_dir = os.path.join(agent_dir, "prompts", "system")
     parts: list[str] = []
@@ -60,8 +72,8 @@ def build_system_prompt_from_manifest(
         except OSError:
             pass
 
-    if include_skills and skill_names and skills_root:
-        for skill_id in skill_names:
+    if include_skills and effective_skill_names and skills_root:
+        for skill_id in effective_skill_names:
             skill_md = os.path.join(skills_root, skill_id, "SKILL.md")
             if not os.path.isfile(skill_md):
                 continue
@@ -133,6 +145,27 @@ def _read_manifest_include_skills(manifest_path: str) -> bool:
     except OSError:
         pass
     return False
+
+
+def _read_manifest_skill_names(manifest_path: str) -> list[str]:
+    """Parse `skillNames` list from manifest.yaml (no yaml dependency)."""
+    names: list[str] = []
+    in_skill_names = False
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if stripped.startswith("skillNames:"):
+                    in_skill_names = True
+                    continue
+                if in_skill_names:
+                    if stripped.startswith("- "):
+                        names.append(stripped[2:].strip())
+                    elif stripped and not stripped.startswith("#"):
+                        in_skill_names = False
+    except OSError:
+        pass
+    return names
 
 
 def _strip_frontmatter(text: str) -> str:

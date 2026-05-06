@@ -21,8 +21,8 @@ COPY .github/skills/ /app/.github/skills/
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
-LABEL constellation.agent_id="tracker-agent"
-LABEL constellation.agent_name="Tracker Agent"
+LABEL constellation.agent_id="jira-agent"
+LABEL constellation.agent_name="Jira Agent"
 LABEL constellation.agent_role="fundamental"
 
 # Run as non-root user.

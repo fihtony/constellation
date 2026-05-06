@@ -764,5 +764,307 @@ class Phase7AcceptanceCriteriaTests(unittest.TestCase):
         self.assertIn("Team Lead", prompt)
 
 
+# ===========================================================================
+# Phase 6: Dockerfile base hierarchy
+# ===========================================================================
+
+class Phase6DockerfileBaseTests(unittest.TestCase):
+    """Phase 6: Shared base Dockerfile hierarchy must exist."""
+
+    DOCKERFILES_DIR = Path(_REPO_ROOT) / "dockerfiles"
+
+    def test_base_dockerfile_exists(self):
+        self.assertTrue((self.DOCKERFILES_DIR / "base.Dockerfile").is_file())
+
+    def test_base_copilot_cli_dockerfile_exists(self):
+        self.assertTrue((self.DOCKERFILES_DIR / "base-copilot-cli.Dockerfile").is_file())
+
+    def test_base_claude_code_dockerfile_exists(self):
+        self.assertTrue((self.DOCKERFILES_DIR / "base-claude-code.Dockerfile").is_file())
+
+    def test_base_connect_agent_dockerfile_exists(self):
+        self.assertTrue((self.DOCKERFILES_DIR / "base-connect-agent.Dockerfile").is_file())
+
+    def test_base_dockerfile_uses_python312_slim(self):
+        content = (self.DOCKERFILES_DIR / "base.Dockerfile").read_text()
+        self.assertIn("python:3.12-slim", content)
+
+    def test_base_dockerfile_installs_tini_git_curl(self):
+        content = (self.DOCKERFILES_DIR / "base.Dockerfile").read_text()
+        self.assertIn("tini", content)
+        self.assertIn("git", content)
+        self.assertIn("curl", content)
+
+    def test_base_dockerfile_creates_appuser(self):
+        content = (self.DOCKERFILES_DIR / "base.Dockerfile").read_text()
+        self.assertIn("appuser", content)
+        self.assertIn("1000", content)
+
+    def test_base_copilot_cli_extends_base(self):
+        content = (self.DOCKERFILES_DIR / "base-copilot-cli.Dockerfile").read_text()
+        self.assertIn("FROM constellation-base:latest", content)
+        self.assertIn("@github/copilot", content)
+
+    def test_base_claude_code_extends_base(self):
+        content = (self.DOCKERFILES_DIR / "base-claude-code.Dockerfile").read_text()
+        self.assertIn("FROM constellation-base:latest", content)
+        self.assertIn("@anthropic-ai/claude-code", content)
+
+    def test_base_connect_agent_extends_base(self):
+        content = (self.DOCKERFILES_DIR / "base-connect-agent.Dockerfile").read_text()
+        self.assertIn("FROM constellation-base:latest", content)
+        self.assertNotIn("npm install", content)
+
+    def test_base_connect_agent_sets_runtime_env(self):
+        content = (self.DOCKERFILES_DIR / "base-connect-agent.Dockerfile").read_text()
+        self.assertIn("AGENT_RUNTIME=connect-agent", content)
+
+
+class Phase6PersistentAgentDockerfileTests(unittest.TestCase):
+    """Phase 6: Persistent agents must also have backend-specific Dockerfiles."""
+
+    PERSISTENT_AGENTS = ["compass", "jira", "scm", "ui-design", "office"]
+    BACKENDS = ["copilot-cli", "connect-agent", "claude-code"]
+
+    def test_all_persistent_agents_have_all_backend_dockerfiles(self):
+        for agent in self.PERSISTENT_AGENTS:
+            for backend in self.BACKENDS:
+                path = Path(_REPO_ROOT) / agent / f"Dockerfile.{backend}"
+                self.assertTrue(path.is_file(), f"Missing: {path}")
+
+    def test_persistent_agent_dockerfiles_extend_base(self):
+        for agent in self.PERSISTENT_AGENTS:
+            for backend in self.BACKENDS:
+                content = (Path(_REPO_ROOT) / agent / f"Dockerfile.{backend}").read_text()
+                self.assertIn(
+                    f"constellation-base-{backend}:latest",
+                    content,
+                    f"{agent}/Dockerfile.{backend} must extend constellation-base-{backend}:latest"
+                )
+
+    def test_persistent_agent_dockerfiles_have_required_labels(self):
+        for agent in self.PERSISTENT_AGENTS:
+            for backend in self.BACKENDS:
+                content = (Path(_REPO_ROOT) / agent / f"Dockerfile.{backend}").read_text()
+                self.assertIn(
+                    "constellation.agent_id",
+                    content,
+                    f"{agent}/Dockerfile.{backend} missing constellation.agent_id label"
+                )
+                self.assertIn(
+                    f'constellation.runtime.backend="{backend}"',
+                    content,
+                    f"{agent}/Dockerfile.{backend} missing runtime.backend label"
+                )
+
+    def test_persistent_agent_dockerfiles_run_as_appuser(self):
+        for agent in self.PERSISTENT_AGENTS:
+            for backend in self.BACKENDS:
+                content = (Path(_REPO_ROOT) / agent / f"Dockerfile.{backend}").read_text()
+                self.assertIn(
+                    "USER appuser",
+                    content,
+                    f"{agent}/Dockerfile.{backend} must run as non-root user"
+                )
+
+
+class Phase6ResolveRuntimeAllAgentsTests(unittest.TestCase):
+    """Phase 6: resolve-agent-runtime.py must work for all LLM-enabled agents."""
+
+    ALL_AGENTIC_AGENTS = [
+        "team-lead", "web", "android", "office",
+        "compass", "jira", "scm", "ui-design"
+    ]
+
+    def setUp(self):
+        self.module = _load_resolve_module()
+
+    def test_registry_is_infrastructure_only(self):
+        """Registry is infrastructure-only — it should not appear in _AGENTIC_AGENTS."""
+        spec = importlib.util.spec_from_file_location(
+            "build_agent_image",
+            str(Path(_REPO_ROOT) / "scripts" / "build-agent-image.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertNotIn(
+            "registry", mod._AGENTIC_AGENTS,
+            "'registry' must not be in _AGENTIC_AGENTS — it is infrastructure-only"
+        )
+
+    def test_all_agentic_agents_resolve_successfully(self):
+        for agent in self.ALL_AGENTIC_AGENTS:
+            with mock.patch.dict(os.environ, {"AGENT_RUNTIME": "connect-agent"}):
+                try:
+                    backend, dockerfile = self.module.resolve_effective_backend(agent)
+                    self.assertIsInstance(backend, str, f"Agent {agent}: backend must be a string")
+                except SystemExit:
+                    self.fail(f"Agent {agent}: resolve_effective_backend raised SystemExit")
+
+    def test_build_agent_image_script_knows_all_agentic_agents(self):
+        """build-agent-image.py must include all agents with backend Dockerfiles."""
+        spec = importlib.util.spec_from_file_location(
+            "build_agent_image",
+            str(Path(_REPO_ROOT) / "scripts" / "build-agent-image.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for agent in self.ALL_AGENTIC_AGENTS:
+            self.assertIn(
+                agent, mod._AGENTIC_AGENTS,
+                f"build-agent-image.py does not list '{agent}' in _AGENTIC_AGENTS"
+            )
+
+    def test_registry_excluded_from_agentic_agents_in_resolve_script(self):
+        """Registry should be excluded from the non-agentic set (or raise SystemExit)."""
+        # The registry agent is the only one excluded; all others should be resolvable
+        # Verify that _NON_AGENTIC_AGENTS only contains 'registry'
+        non_agentic = self.module._NON_AGENTIC_AGENTS
+        self.assertIn("registry", non_agentic)
+        # Persistent LLM agents must NOT be in the non-agentic set
+        for agent in ["compass", "jira", "scm", "ui-design", "office"]:
+            self.assertNotIn(
+                agent, non_agentic,
+                f"'{agent}' should not be in _NON_AGENTIC_AGENTS — it has backend Dockerfiles"
+            )
+
+
+# ===========================================================================
+# Phase 6: Prompt manifest structure for all agents
+# ===========================================================================
+
+class Phase6AgentPromptManifestTests(unittest.TestCase):
+    """Phase 6: All LLM-enabled agents must have prompts/system/manifest.yaml."""
+
+    ALL_PROMPT_AGENTS = [
+        "compass", "jira", "scm", "ui-design", "office",
+        "team-lead", "web", "android",
+    ]
+    REQUIRED_FILES = [
+        "00-role.md", "10-boundaries.md", "20-tools.md",
+        "30-decision-policy.md", "50-definition-of-done.md", "60-failure-handling.md",
+    ]
+
+    def test_all_agents_have_manifest_yaml(self):
+        for agent in self.ALL_PROMPT_AGENTS:
+            path = Path(_REPO_ROOT) / agent / "prompts" / "system" / "manifest.yaml"
+            self.assertTrue(path.is_file(), f"Missing manifest.yaml for {agent}: {path}")
+
+    def test_all_agents_have_required_prompt_files(self):
+        for agent in self.ALL_PROMPT_AGENTS:
+            system_dir = Path(_REPO_ROOT) / agent / "prompts" / "system"
+            for filename in self.REQUIRED_FILES:
+                path = system_dir / filename
+                self.assertTrue(path.is_file(), f"Missing {filename} for agent {agent}")
+
+    def test_all_agents_manifests_list_files_that_exist(self):
+        from common.prompt_builder import _read_manifest_order
+        for agent in self.ALL_PROMPT_AGENTS:
+            system_dir = Path(_REPO_ROOT) / agent / "prompts" / "system"
+            manifest = str(system_dir / "manifest.yaml")
+            order = _read_manifest_order(manifest)
+            self.assertGreater(len(order), 0, f"Manifest for {agent} has empty systemOrder")
+            for filename in order:
+                path = system_dir / filename
+                self.assertTrue(
+                    path.is_file(),
+                    f"Agent {agent}: manifest lists '{filename}' but file not found"
+                )
+
+    def test_all_agents_prompts_have_tasks_directory(self):
+        for agent in self.ALL_PROMPT_AGENTS:
+            tasks_dir = Path(_REPO_ROOT) / agent / "prompts" / "tasks"
+            self.assertTrue(tasks_dir.is_dir(), f"Missing prompts/tasks/ for agent {agent}")
+
+    def test_all_agents_system_prompts_buildable(self):
+        """All agents must be able to assemble a non-trivial system prompt."""
+        from common.prompt_builder import build_system_prompt_from_manifest
+        for agent in self.ALL_PROMPT_AGENTS:
+            agent_dir = str(Path(_REPO_ROOT) / agent)
+            prompt = build_system_prompt_from_manifest(agent_dir)
+            self.assertGreater(
+                len(prompt), 100,
+                f"Agent {agent}: assembled system prompt is too short ({len(prompt)} chars)"
+            )
+
+
+class Phase6AgentRoleFilesTests(unittest.TestCase):
+    """Phase 6: Each agent's 00-role.md must contain agent-specific content."""
+
+    def _read_role(self, agent: str) -> str:
+        path = Path(_REPO_ROOT) / agent / "prompts" / "system" / "00-role.md"
+        return path.read_text() if path.is_file() else ""
+
+    def test_compass_role_mentions_routing(self):
+        content = self._read_role("compass")
+        self.assertIn("Compass", content)
+        self.assertIn("routing", content.lower())
+
+    def test_jira_role_mentions_jira(self):
+        content = self._read_role("jira")
+        self.assertIn("Jira", content)
+
+    def test_scm_role_mentions_git_or_scm(self):
+        content = self._read_role("scm")
+        self.assertTrue(
+            "SCM" in content or "Git" in content,
+            "scm 00-role.md must mention SCM or Git"
+        )
+
+    def test_ui_design_role_mentions_figma_or_design(self):
+        content = self._read_role("ui-design")
+        self.assertTrue(
+            "Figma" in content or "design" in content.lower(),
+            "ui-design 00-role.md must mention Figma or design"
+        )
+
+    def test_office_role_mentions_documents(self):
+        content = self._read_role("office")
+        self.assertTrue(
+            "document" in content.lower() or "Office" in content,
+            "office 00-role.md must mention documents or Office"
+        )
+
+    def test_team_lead_role_mentions_team_lead(self):
+        content = self._read_role("team-lead")
+        self.assertIn("Team Lead", content)
+
+    def test_web_role_mentions_web_agent(self):
+        content = self._read_role("web")
+        self.assertIn("Web Agent", content)
+
+    def test_android_role_mentions_android(self):
+        content = self._read_role("android")
+        self.assertIn("Android", content)
+
+
+class Phase6BoundaryFilesTests(unittest.TestCase):
+    """Phase 6: Each agent's 10-boundaries.md must contain boundary constraints."""
+
+    BOUNDARY_AGENTS = ["compass", "jira", "scm", "ui-design", "office"]
+
+    def test_all_agents_have_non_empty_boundaries(self):
+        for agent in self.BOUNDARY_AGENTS:
+            path = Path(_REPO_ROOT) / agent / "prompts" / "system" / "10-boundaries.md"
+            if path.is_file():
+                content = path.read_text()
+                self.assertGreater(len(content), 50, f"10-boundaries.md for {agent} is too short")
+
+    def test_jira_boundaries_forbid_non_jira_access(self):
+        content = (Path(_REPO_ROOT) / "jira" / "prompts" / "system" / "10-boundaries.md").read_text()
+        self.assertIn("Forbidden", content)
+
+    def test_scm_boundaries_mention_protected_branches(self):
+        content = (Path(_REPO_ROOT) / "scm" / "prompts" / "system" / "10-boundaries.md").read_text()
+        self.assertIn("protected", content.lower())
+
+    def test_office_boundaries_require_authorization(self):
+        content = (Path(_REPO_ROOT) / "office" / "prompts" / "system" / "10-boundaries.md").read_text()
+        self.assertTrue(
+            "authorized" in content.lower() or "authorization" in content.lower(),
+            "office 10-boundaries.md must mention authorization"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

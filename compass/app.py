@@ -21,8 +21,11 @@ from common.launcher import get_launcher
 from common.message_utils import artifact_text, deep_copy_json, extract_text
 from common.policy import PolicyEvaluator
 from common.per_task_exit import PerTaskExitHandler
+from common.tools.control_tools import configure_control_tools
 from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt
+from common.prompt_builder import build_system_prompt_from_manifest
+from common.agent_system_prompt import build_agent_system_prompt as _build_manifest_prompt
 from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import grant_permission, load_permission_grant
 from common.task_store import TaskStore
@@ -348,7 +351,7 @@ def _interpret_office_reply(task, user_reply):
         office_context=json.dumps(router_context, ensure_ascii=False, indent=2),
         user_reply=user_reply or "",
     )
-    system = build_system_prompt(prompts.OFFICE_REPLY_SYSTEM, "compass")
+    system = _build_manifest_prompt(__file__, prompts.OFFICE_REPLY_SYSTEM)
     response = _run_agentic(prompt, "office-reply", system_prompt=system)
     data = _parse_json_from_runtime(response)
     return {
@@ -503,7 +506,7 @@ def _route_with_runtime(user_text, requested_capability=""):
             "needs_input": False,
             "input_question": None,
         }
-    system = build_system_prompt(prompts.ROUTE_SYSTEM, "compass", include_workflow=True)
+    system = _build_manifest_prompt(__file__, prompts.ROUTE_SYSTEM)
     prompt = prompts.ROUTE_TEMPLATE.format(
         user_text=user_text or "",
         requested_capability=requested_capability or "null",
@@ -543,7 +546,7 @@ def _summarize_for_user(task, state, status_message, artifacts, workflow):
         status_message=status_message or "",
         artifacts_summary="\n".join(artifact_lines) or "(none)",
     )
-    system = build_system_prompt(prompts.FINAL_SUMMARY_SYSTEM, "compass")
+    system = _build_manifest_prompt(__file__, prompts.FINAL_SUMMARY_SYSTEM)
     response = _run_agentic(prompt, "final-summary", system_prompt=system)
     data = _parse_json_from_runtime(response)
     summary = str(data.get("summary") or "").strip()
@@ -1525,6 +1528,19 @@ def _run_workflow(task_id, message, workflow):
     task = task_store.get(task_id)
     if not task:
         return
+
+    metadata = message.get("metadata") or {}
+    configure_control_tools(
+        task_context={
+            "taskId": task_id,
+            "agentId": AGENT_ID,
+            "workspacePath": str(metadata.get("sharedWorkspacePath") or ""),
+            "permissions": metadata.get("permissions"),
+        },
+        complete_fn=lambda result, artifacts: task_store.update_state(task_id, "TASK_STATE_COMPLETED", result),
+        fail_fn=lambda error: task_store.update_state(task_id, "TASK_STATE_FAILED", error),
+        input_required_fn=lambda question, ctx: task_store.update_state(task_id, "TASK_STATE_INPUT_REQUIRED", question),
+    )
     upstream_artifacts = []
     final_state = "TASK_STATE_COMPLETED"
     final_message = "Workflow completed."

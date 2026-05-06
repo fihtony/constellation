@@ -7,3 +7,7 @@ systemOrder:
   - 50-definition-of-done.md
   - 60-failure-handling.md
 includeSkills: true
+skillNames:
+  - github-rest-workflow
+  - github-mcp-workflow
+  - bitbucket-server-workflow

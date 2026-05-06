@@ -7,3 +7,6 @@ systemOrder:
   - 50-definition-of-done.md
   - 60-failure-handling.md
 includeSkills: true
+skillNames:
+  - figma-rest-workflow
+  - stitch-mcp-workflow

@@ -17,7 +17,10 @@ from common.instance_reporter import InstanceReporter
 from common.message_utils import build_text_artifact, extract_text
 from common.orchestrator import resolve_orchestrator_base_url
 from common.per_task_exit import PerTaskExitHandler
+from common.tools.control_tools import configure_control_tools
 from common.rules_loader import build_system_prompt
+from common.prompt_builder import build_system_prompt_from_manifest
+from common.agent_system_prompt import build_agent_system_prompt as _build_manifest_prompt
 from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionDeniedError,
@@ -914,7 +917,7 @@ def _execute_summary(capability: str, user_text: str, metadata: dict, task_id: s
     response = _run_agentic_json(
         prompts.SUMMARIZE_TEMPLATE.format(user_text=user_text),
         "summarize",
-        system_prompt=build_system_prompt(prompts.SUMMARIZE_SYSTEM, "office"),
+        system_prompt=_build_manifest_prompt(__file__, prompts.SUMMARIZE_SYSTEM),
         context={"documents": previews},
     )
     summary_markdown = str(response.get("summary_markdown") or "").strip()
@@ -980,7 +983,7 @@ def _execute_analysis(capability: str, user_text: str, metadata: dict, task_id: 
     response = _run_agentic_json(
         prompts.ANALYZE_TEMPLATE.format(user_text=user_text),
         "analyze",
-        system_prompt=build_system_prompt(prompts.ANALYZE_SYSTEM, "office"),
+        system_prompt=_build_manifest_prompt(__file__, prompts.ANALYZE_SYSTEM),
         context={"datasets": profiles},
     )
     summary_markdown = str(response.get("summary_markdown") or "").strip()
@@ -1013,7 +1016,7 @@ def _execute_organize(capability: str, user_text: str, metadata: dict, task_id: 
     response = _run_agentic_json(
         prompts.ORGANIZE_TEMPLATE.format(user_text=user_text),
         "organize",
-        system_prompt=build_system_prompt(prompts.ORGANIZE_SYSTEM, "office"),
+        system_prompt=_build_manifest_prompt(__file__, prompts.ORGANIZE_SYSTEM),
         context={"inventory": _runtime_organize_context(organize_context)},
         timeout=300,
     )
@@ -1128,9 +1131,22 @@ def _run_workflow(task_id: str, message: dict):
     compass_url = resolve_orchestrator_base_url(metadata)
     compass_task_id = str(metadata.get("orchestratorTaskId") or "")
     exit_rule = PerTaskExitHandler.parse(metadata)
+    workspace_path = str(metadata.get("sharedWorkspacePath") or "")
     task = task_store.get(task_id)
     if not task:
         return
+
+    configure_control_tools(
+        task_context={
+            "taskId": task_id,
+            "agentId": AGENT_ID,
+            "workspacePath": workspace_path,
+            "permissions": metadata.get("permissions"),
+        },
+        complete_fn=lambda result, artifacts: task_store.update_state(task_id, "TASK_STATE_COMPLETED", result),
+        fail_fn=lambda error: task_store.update_state(task_id, "TASK_STATE_FAILED", error),
+        input_required_fn=lambda question, ctx: task_store.update_state(task_id, "TASK_STATE_INPUT_REQUIRED", question),
+    )
 
     try:
         task_store.update_state(task_id, "TASK_STATE_WORKING", "Office Agent is processing the request.")
