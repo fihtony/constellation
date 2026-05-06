@@ -2,10 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies (tini for signal handling, git/node/npm for SCM and build tools)
+# Install system dependencies (tini for signal handling, git/node/npm for SCM and build tools,
+# chromium for UI evidence screenshots)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       ca-certificates tini git curl nodejs npm \
+         ca-certificates tini git curl nodejs npm chromium fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Import any corporate CA certificates placed in certs/ (supports .crt and .pem)
