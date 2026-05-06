@@ -23,6 +23,7 @@ Copilot CLI checks credentials in this priority order:
 Constellation policy override:
 - Even though Copilot CLI itself can fall back to `GH_TOKEN`, `GITHUB_TOKEN`, keychain, or `gh auth`, Constellation agents must not allow those fallback paths.
 - Inside Constellation, only the file-backed `COPILOT_GITHUB_TOKEN` from `.env` is valid. Agent runtimes must build an isolated home/config directory and scrub all generic GitHub credential variables before launching `copilot`.
+- If `copilot` cannot authenticate, cannot start, or exits non-zero, fail the task directly. Do not silently fall back to Copilot Connect or a mock backend.
 - If a launcher or test injects a file-backed `COPILOT_GITHUB_TOKEN` into a child process, it must also set `CONSTELLATION_TRUSTED_ENV=1` for that child after removing inherited host GitHub credentials.
 
 ### Required PAT permissions

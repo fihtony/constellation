@@ -32,19 +32,18 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.env_patcher.stop()
 
     def test_get_runtime_supports_all_documented_backends(self):
-        for backend in ("connect-agent", "copilot-cli", "claude-code", "mock"):
+        for backend in ("connect-agent", "copilot-cli", "claude-code"):
             runtime = get_runtime(backend)
             self.assertIsNotNone(runtime)
 
-    def test_get_runtime_unknown_backend_falls_back_to_connect(self):
-        runtime = get_runtime("does-not-exist")
-        self.assertEqual(runtime.__class__.__name__, "ConnectAgentAdapter")
+    def test_get_runtime_unknown_backend_raises(self):
+        with self.assertRaises(KeyError):
+            get_runtime("does-not-exist")
 
-    def test_copilot_connect_resolves_to_connect_agent(self):
+    def test_copilot_connect_runtime_is_rejected(self):
         os.environ["AGENT_RUNTIME"] = "copilot-connect"
-        runtime = get_runtime()
-        # copilot-connect is no longer a registered runtime; unknown backends resolve to connect-agent
-        self.assertEqual(runtime.__class__.__name__, "ConnectAgentAdapter")
+        with self.assertRaises(KeyError):
+            get_runtime()
 
     def test_connect_agent_uses_model_override_and_contract(self):
         os.environ["AGENT_RUNTIME"] = "connect-agent"
@@ -140,15 +139,6 @@ class RuntimeAdapterTests(unittest.TestCase):
 
         self.assertEqual(result["backend_used"], "connect-agent")
         self.assertIn("unreachable", result["summary"])
-
-    def test_mock_runtime_returns_configured_response(self):
-        os.environ["AGENT_RUNTIME"] = "mock"
-        os.environ["MOCK_RUNTIME_RESPONSE"] = '{"summary":"mock ok","artifacts":[],"warnings":[],"next_actions":[]}'
-
-        result = get_runtime().run("hello mock")
-
-        self.assertEqual(result["backend_used"], "mock")
-        self.assertEqual(result["summary"], "mock ok")
 
     def test_claude_code_fails_when_binary_missing(self):
         os.environ["AGENT_RUNTIME"] = "claude-code"

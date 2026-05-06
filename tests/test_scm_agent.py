@@ -131,7 +131,6 @@ def start_local_agent(
         "INSTANCE_REPORTER_ENABLED": "0",
         "SCM_PROVIDER": provider,
         "SCM_TOKEN": token,
-        "ALLOW_MOCK_FALLBACK": "1",
         "OPENAI_BASE_URL": openai_base_url,
         "PYTHONPATH": PROJECT_ROOT,
     }

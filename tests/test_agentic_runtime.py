@@ -13,7 +13,6 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from common.runtime.adapter import AgenticCheckpoint, AgenticResult, AgentRuntimeAdapter, get_runtime
-from common.runtime.mock import MockAdapter
 
 
 class AgenticResultTests(unittest.TestCase):
@@ -73,53 +72,6 @@ class AgenticCheckpointTests(unittest.TestCase):
         cp_connect = AgenticCheckpoint(task_id="t1", provider="connect-agent", continuation="thread-y", summary="")
         self.assertNotEqual(cp_claude.provider, cp_connect.provider)
         self.assertNotEqual(cp_claude.continuation, cp_connect.continuation)
-
-
-class MockAdapterAgenticTests(unittest.TestCase):
-    def setUp(self):
-        self.env_patcher = patch.dict(os.environ, {}, clear=True)
-        self.env_patcher.start()
-        from common.runtime import adapter as m
-        m._INSTANCES.clear()
-
-    def tearDown(self):
-        self.env_patcher.stop()
-
-    def test_mock_run_agentic_returns_success(self):
-        os.environ["AGENT_RUNTIME"] = "mock"
-        runtime = get_runtime()
-        result = runtime.run_agentic("do something")
-        self.assertIsInstance(result, AgenticResult)
-        self.assertTrue(result.success)
-        self.assertEqual(result.backend_used, "mock")
-        self.assertEqual(result.turns_used, 1)
-
-    def test_mock_run_agentic_uses_env_response(self):
-        os.environ["AGENT_RUNTIME"] = "mock"
-        os.environ["MOCK_AGENTIC_RESPONSE"] = "custom agentic result"
-        runtime = get_runtime()
-        result = runtime.run_agentic("task")
-        self.assertEqual(result.summary, "custom agentic result")
-
-    def test_mock_run_agentic_calls_on_progress(self):
-        os.environ["AGENT_RUNTIME"] = "mock"
-        os.environ["MOCK_AGENTIC_RESPONSE"] = "progress update"
-        runtime = get_runtime()
-        progress_calls = []
-        result = runtime.run_agentic("task", on_progress=progress_calls.append)
-        self.assertTrue(result.success)
-        self.assertGreater(len(progress_calls), 0)
-
-    def test_mock_supports_mcp_default_false(self):
-        os.environ["AGENT_RUNTIME"] = "mock"
-        runtime = get_runtime()
-        self.assertFalse(runtime.supports_mcp())
-
-    def test_mock_supports_mcp_via_env(self):
-        os.environ["AGENT_RUNTIME"] = "mock"
-        os.environ["MOCK_SUPPORTS_MCP"] = "1"
-        runtime = get_runtime()
-        self.assertTrue(runtime.supports_mcp())
 
 
 class BaseAdapterAgenticNotImplementedTests(unittest.TestCase):
@@ -310,26 +262,25 @@ class ProviderRegistryTests(unittest.TestCase):
     def test_all_backends_auto_registered(self):
         # Importing each backend module triggers self-registration.
         from common.runtime.provider_registry import is_registered, list_runtimes
-        import common.runtime.mock        # noqa: F401
         import common.runtime.claude_code # noqa: F401
         import common.runtime.connect_agent # noqa: F401
         import common.runtime.copilot_cli # noqa: F401
 
-        for name in ("mock", "claude-code", "connect-agent", "copilot-cli"):
+        for name in ("claude-code", "connect-agent", "copilot-cli"):
             self.assertTrue(is_registered(name), f"{name!r} should be registered")
 
     def test_duplicate_registration_raises(self):
         from common.runtime.provider_registry import _registry, register_runtime
-        from common.runtime.mock import MockAdapter
-        # Ensure mock is not registered by clearing temporarily
-        original = _registry.pop("mock", None)
+        from common.runtime.copilot_cli import CopilotCliAdapter
+        # Ensure copilot-cli is not registered by clearing temporarily.
+        original = _registry.pop("copilot-cli", None)
         try:
-            register_runtime("mock", MockAdapter)
+            register_runtime("copilot-cli", CopilotCliAdapter)
             with self.assertRaises(ValueError):
-                register_runtime("mock", MockAdapter)
+                register_runtime("copilot-cli", CopilotCliAdapter)
         finally:
             if original is not None:
-                _registry["mock"] = original
+                _registry["copilot-cli"] = original
 
     def test_get_runtime_class_unknown_raises(self):
         from common.runtime.provider_registry import get_runtime_class

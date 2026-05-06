@@ -211,7 +211,6 @@ _ALIASES = {
     "connect-agent": "connect-agent",
     "claude": "claude-code",
     "claude-code": "claude-code",
-    "mock": "mock",
 }
 
 _INSTANCES: dict[str, AgentRuntimeAdapter] = {}
@@ -219,7 +218,7 @@ _INSTANCES: dict[str, AgentRuntimeAdapter] = {}
 
 def resolve_backend_name(backend: str | None = None) -> tuple[str, str]:
     requested = (backend or os.environ.get("AGENT_RUNTIME") or "connect-agent").strip().lower()
-    return requested, _ALIASES.get(requested, "connect-agent")
+    return requested, _ALIASES.get(requested, requested)
 
 
 def _copilot_cli_status() -> dict:
@@ -305,17 +304,6 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 "timeout": os.environ.get("CONNECT_AGENT_TIMEOUT", "1800"),
             }
         )
-    elif effective == "mock":
-        summary.update(
-            {
-                "model": AgentRuntimeAdapter.resolve_model(
-                    os.environ.get("AGENT_MODEL"),
-                    fallback="mock",
-                ),
-                "customResponseConfigured": bool(os.environ.get("MOCK_RUNTIME_RESPONSE", "").strip()),
-            }
-        )
-
     return summary
 
 
@@ -332,10 +320,6 @@ def _load_backend_class(backend: str) -> type[AgentRuntimeAdapter]:
         from common.runtime.connect_agent import ConnectAgentAdapter
 
         return ConnectAgentAdapter
-    if backend == "mock":
-        from common.runtime.mock import MockAdapter
-
-        return MockAdapter
     raise KeyError(backend)
 
 
@@ -351,11 +335,6 @@ def get_runtime(
     3. default ``connect-agent``
     """
     requested, effective_backend = resolve_backend_name(backend)
-
-    if requested not in _ALIASES:
-        print(
-            f"[runtime] Unknown backend '{requested}', falling back to '{effective_backend}'."
-        )
 
     if model:
         os.environ["AGENT_MODEL"] = model

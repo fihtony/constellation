@@ -46,7 +46,6 @@ sys.path.insert(0, _REPO_ROOT)
 os.environ["AGENT_RUNTIME"] = "connect-agent"
 os.environ["AGENT_MODEL"] = os.environ.get("AGENT_MODEL", "gpt-5-mini")
 os.environ["OPENAI_BASE_URL"] = os.environ.get("OPENAI_BASE_URL", "http://localhost:1288/v1")
-os.environ["ALLOW_MOCK_FALLBACK"] = "0"
 
 _DEFAULT_DESIGN_DIR = os.path.join(_REPO_ROOT, "reference", "stitch_open_english_study_hub")
 _TESTS_DATA_DIR = os.path.join(_REPO_ROOT, "tests", "data")
