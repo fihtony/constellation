@@ -3100,12 +3100,132 @@ def _take_ui_screenshot(
 # Main workflow
 # ---------------------------------------------------------------------------
 
-def _run_workflow(task_id: str, message: dict):  # noqa: C901
-    """
-    Full Web Agent workflow running in a background thread.
+def _build_web_task_prompt(
+    *,
+    user_text: str,
+    workspace: str,
+    compass_task_id: str,
+    web_task_id: str,
+    callback_url: str,
+    acceptance_criteria: list,
+    is_revision: bool,
+    review_issues: list,
+    tech_stack_constraints: dict,
+    design_context: dict,
+    target_repo_url: str,
+    jira_context: str,
+    ticket_key: str,
+    permissions: dict | None,
+) -> str:
+    """Build the task prompt for the agentic runtime."""
+    criteria_text = "\n".join(f"- {c}" for c in acceptance_criteria) if acceptance_criteria else "Not specified."
+    issues_text = "\n".join(f"- {i}" for i in review_issues) if review_issues else ""
+    tech_text = json.dumps(tech_stack_constraints, ensure_ascii=False) if tech_stack_constraints else "None"
+    design_text = str(design_context.get("content") or "") if design_context else ""
+    design_url = str(design_context.get("url") or "") if design_context else ""
 
-    Phases:
-      ANALYZING → PLANNING → IMPLEMENTING → PUSHING → COMPLETED
+    revision_section = ""
+    if is_revision and issues_text:
+        revision_section = f"""
+## REVISION REQUEST
+This is a revision. Fix the following issues from the previous implementation:
+{issues_text}
+"""
+
+    jira_section = ""
+    if ticket_key and jira_context:
+        jira_section = f"""
+## Jira Ticket Context ({ticket_key})
+{jira_context[:3000]}
+"""
+    elif ticket_key:
+        jira_section = f"\n## Jira Ticket\nKey: {ticket_key} (fetch additional context via jira_get_ticket)\n"
+
+    design_section = ""
+    if design_url or design_text:
+        design_section = f"""
+## Design Context
+URL: {design_url or '(see content below)'}
+{design_text[:2000] if design_text else ''}
+"""
+
+    return f"""You are the Web Agent. Implement the following web development task autonomously.
+
+## User Request
+{user_text}
+
+## Acceptance Criteria
+{criteria_text}
+
+## Tech Stack Constraints
+{tech_text}
+{jira_section}{design_section}{revision_section}
+## Your Workflow (follow this order)
+
+### 1. ANALYZE (use report_progress: "Analyzing task")
+- Identify frontend/backend framework, UI library, scope
+- Extract or use provided repo URL: {target_repo_url or '(detect from context)'}
+- If repo URL found: use bash to clone it into the shared workspace (under {workspace}/repo/)
+- Use todo_write to plan implementation steps
+- Use report_progress to announce progress
+
+### 2. GATHER CONTEXT (use report_progress: "Gathering context")
+- If Jira ticket key present ({ticket_key or 'none'}): use jira_get_ticket for ticket details
+- If design URL present: use design_fetch_figma_screen or design_fetch_stitch_screen
+- If repo cloned: use read_file/glob/grep to understand existing code structure
+- Capture repo snapshot for planning
+
+### 3. PLAN (use report_progress: "Planning implementation")
+- Create a detailed implementation plan
+- Use write_file to save plan to {workspace}/web-agent/plan.json
+- Identify all files to create/modify with their paths
+
+### 4. IMPLEMENT (use report_progress: "Implementing")
+- Work inside the cloned repo directory
+- Use write_file and edit_file to create/modify source files
+- Use bash to run builds/tests: validate your changes compile
+- For UI tasks: implement responsive layout matching design spec
+- Run local build/test validation before pushing:
+  - Use bash for `npm install && npm run build` or equivalent
+  - Fix any build errors before proceeding
+- Save implementation evidence to {workspace}/web-agent/
+
+### 5. PUSH & PR (use report_progress: "Creating PR")
+- Use scm_create_branch to create branch (name: feature/{ticket_key or 'task'}-{web_task_id[:8]})
+- Use scm_push_files to push implementation files
+- Use scm_create_pr to create a pull request with:
+  - Title: meaningful description of the change
+  - Description: implementation details + acceptance criteria coverage
+  - Link to Jira ticket if present
+- Save PR URL to {workspace}/web-agent/pr-evidence.json
+
+### 6. JIRA UPDATE (use report_progress: "Updating Jira")
+- If Jira ticket {ticket_key or '(none)'}: use jira_add_comment with PR link
+
+### 7. COMPLETE (use report_progress: "Completing task")
+- Use complete_current_task with:
+  - result: summary of implementation
+  - artifacts: include PR URL evidence with metadata fields:
+    - prUrl: the PR URL
+    - branch: the branch name
+    - jiraInReview: true (if Jira ticket updated)
+
+## Important Rules
+- Always work inside a cloned repo when a repo URL is available
+- Never push directly to main/master/develop/release/* branches
+- Run build validation before creating PR
+- Include PR URL in final artifacts metadata
+- sharedWorkspacePath: {workspace}
+- orchestratorTaskId: {compass_task_id}
+- webAgentTaskId: {web_task_id}
+"""
+
+
+def _run_workflow(task_id: str, message: dict):
+    """
+    Agentic Web Agent workflow driven by the LLM runtime.
+    The LLM uses tools (coding, scm, jira, design, progress, control) to:
+      analyze → gather → plan → implement → push/pr → update jira → complete
     """
     task = task_store.get(task_id)
     if not task:
@@ -3113,7 +3233,6 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
 
     metadata = message.get("metadata", {})
     compass_task_id = metadata.get("orchestratorTaskId", "")
-    workflow_task_id = compass_task_id or task_id
     callback_url = metadata.get("orchestratorCallbackUrl", "")
     compass_url = resolve_orchestrator_base_url(metadata, agent_directory=agent_directory)
     workspace = metadata.get("sharedWorkspacePath", "")
@@ -3122,12 +3241,17 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
     is_revision: bool = metadata.get("isRevision", False)
     review_issues: list = metadata.get("reviewIssues") or []
     tech_stack_constraints: dict = metadata.get("techStackConstraints") or {}
-    # Design context passed from Team Lead (Stitch/Figma content + URL)
     design_context_meta: dict = metadata.get("designContext") or {}
-    # Repo URL injected by Team Lead from Jira/analysis (preferred over text extraction)
-    metadata_repo_url: str = metadata.get("targetRepoUrl", "")
-    # Exit rule: how to shut down after task completion (defined by parent)
+    target_repo_url: str = metadata.get("targetRepoUrl", "")
     exit_rule = PerTaskExitHandler.parse(metadata)
+
+    user_text = _prepend_tech_stack_constraints(extract_text(message) or "", tech_stack_constraints)
+    ticket_key, jira_content = _resolve_jira_context_from_metadata(user_text, metadata)
+    if is_revision and review_issues:
+        issues_text = "\n".join(f"- {issue}" for issue in review_issues)
+        user_text = (
+            f"{user_text}\n\nREVISION REQUEST — please fix the following issues:\n{issues_text}"
+        )
 
     configure_control_tools(
         task_context={
@@ -3136,1085 +3260,84 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             "workspacePath": workspace,
             "permissions": permissions,
         },
-        complete_fn=lambda result, artifacts: task_store.update_state(task_id, "TASK_STATE_COMPLETED", result),
+        complete_fn=lambda result, artifacts: task_store.update_state(
+            task_id, "TASK_STATE_COMPLETED", result
+        ),
         fail_fn=lambda error: task_store.update_state(task_id, "TASK_STATE_FAILED", error),
-        input_required_fn=lambda question, ctx: task_store.update_state(task_id, "TASK_STATE_INPUT_REQUIRED", question),
+        input_required_fn=lambda question, ctx: task_store.update_state(
+            task_id, "TASK_STATE_INPUT_REQUIRED", question
+        ),
     )
 
-    task_instruction = _prepend_tech_stack_constraints(extract_text(message) or "", tech_stack_constraints)
-    final_artifacts: list = []
-    repo_url = metadata_repo_url or ""
-    clone_path = ""
-    branch_name = ""
-    branch_kind = ""
-    local_commit_sha = ""
-    pr_url = ""
-    build_dir = ""
-    build_ok: bool | None = None
-    agent_workspace = os.path.join(workspace, AGENT_ID) if workspace else ""
-    runtime_config = {
-        "runtime": summarize_runtime_configuration(),
-        "rulesLoaded": bool(load_rules("web")),
-        "workflowRulesLoaded": bool(load_rules("web", include_workflow=True)),
-        "workflowInstructionsPresent": bool(metadata.get("devWorkflowInstructions")),
-        "techStackConstraints": tech_stack_constraints,
-        "skillPlaybooks": list(_DEVELOPMENT_SKILL_NAMES),
-    }
-    design_spec_for_audit = str(design_context_meta.get("content") or "")
-    reference_html_for_audit = ""
+    task_store.update_state(task_id, "TASK_STATE_WORKING", "Web Agent is starting.")
+    audit_log("TASK_STARTED", task_id=task_id, compass_task_id=compass_task_id)
 
-    def log(phase: str):
-        ts = local_clock_time()
-        print(f"[{AGENT_ID}][{task_id}] [{ts}] {phase}")
-        entry = f"[{ts}] {phase}"
-        _append_workspace_file(workspace, f"{AGENT_ID}/command-log.txt", entry + "\n")
-        _save_workspace_file(
-            workspace,
-            f"{AGENT_ID}/stage-summary.json",
-            json.dumps(
-                {
-                    "taskId": workflow_task_id,
-                    "agentTaskId": task_id,
-                    "agentId": AGENT_ID,
-                    "currentPhase": phase,
-                    "repoUrl": repo_url,
-                    "clonePath": clone_path,
-                    "branch": branch_name,
-                    "branchKind": branch_kind,
-                    "localCommit": local_commit_sha,
-                    "prUrl": pr_url,
-                    "buildDir": build_dir,
-                    "buildPassed": build_ok,
-                    "acceptanceCriteria": acceptance_criteria,
-                    "reviewIssues": review_issues,
-                    "runtimeConfig": runtime_config,
-                    "updatedAt": local_iso_timestamp(),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
-        _report_progress(compass_url, compass_task_id, phase)
+    task_prompt = _build_web_task_prompt(
+        user_text=user_text,
+        workspace=workspace,
+        compass_task_id=compass_task_id,
+        web_task_id=task_id,
+        callback_url=callback_url,
+        acceptance_criteria=acceptance_criteria,
+        is_revision=is_revision,
+        review_issues=review_issues,
+        tech_stack_constraints=tech_stack_constraints,
+        design_context=design_context_meta,
+        target_repo_url=target_repo_url,
+        jira_context=jira_content,
+        ticket_key=ticket_key or "",
+        permissions=permissions,
+    )
+
+    system_prompt = _build_web_system_prompt(prompts.AGENTIC_IMPLEMENT_SYSTEM)
+    runtime = get_runtime()
 
     try:
-        audit_log("TASK_STARTED", task_id=task_id, compass_task_id=compass_task_id)
-        # If this is a revision, append review issues to instruction
-        if is_revision and review_issues:
-            issues_text = "\n".join(f"- {issue}" for issue in review_issues)
-            task_instruction = (
-                f"{task_instruction}\n\n"
-                f"REVISION REQUEST — please fix the following issues:\n{issues_text}"
-            )
-
-        # Restore clone/branch state from prior task in the same workspace (revision)
-        if is_revision and workspace:
-            _ci = _read_workspace_json(workspace, f"{AGENT_ID}/clone-info.json")
-            _bi = _read_workspace_json(workspace, f"{AGENT_ID}/branch-info.json")
-            if _ci and _ci.get("clonePath") and os.path.isdir(_ci["clonePath"]):
-                clone_path = _ci["clonePath"]
-                repo_url = repo_url or _ci.get("repoUrl", "")
-                log(f"Revision: reusing existing clone at {clone_path}")
-            if _bi and _bi.get("branch"):
-                branch_name = _bi["branch"]
-                branch_kind = _bi.get("branchKind", "feature")
-                pr_url = _bi.get("prUrl", "")
-                log(f"Revision: restored branch={branch_name} pr={pr_url}")
-
-        # ── Phase 1: Analyze ────────────────────────────────────────────────
-        task_store.update_state(task_id, "ANALYZING", "Analyzing the web development task…")
-        log("Analyzing task")
-        analysis = _apply_tech_stack_constraints(
-            _analyze_task(task_instruction, acceptance_criteria, repo_context=""),
-            tech_stack_constraints,
+        result = runtime.run_agentic(
+            task=task_prompt,
+            system_prompt=system_prompt,
+            cwd=workspace or os.getcwd(),
+            max_turns=80,
+            timeout=int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "1800")),
         )
-        log(
-            f"Analysis: scope={analysis.get('scope')}, "
-            f"frontend={analysis.get('frontend_framework')}, "
-            f"backend={analysis.get('backend_framework')}, "
-            f"ui={analysis.get('ui_library')}"
-        )
+        summary = result.summary or "Web Agent task completed."
+        final_artifacts: list = list(result.artifacts or [])
 
-        # ── Phase 2: Gather repo context (optional) ─────────────────────────
-        task_store.update_state(task_id, "GATHERING_INFO", "Gathering context…")
-        jira_content = ""
-        repo_snapshot = ""
-
-        if is_revision and review_issues:
-            _save_workspace_file(
-                workspace,
-                f"{AGENT_ID}/review-notes.json",
-                json.dumps(
-                    {
-                        "taskId": workflow_task_id,
-                        "agentTaskId": task_id,
-                        "agentId": AGENT_ID,
-                        "isRevision": True,
-                        "reviewIssues": review_issues,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-
-        # Extract Jira ticket key: prefer explicit metadata field from Team Lead,
-        # then fall back to regex.  Require at least 2 digits to avoid matching
-        # technical terms like "UTF-8", "ISO-8", "HTTP-2", etc.
-        ticket_key, jira_content = _resolve_jira_context_from_metadata(task_instruction, metadata)
-        if jira_content:
-            log(f"Using Jira context from Team Lead metadata for {ticket_key or 'provided ticket'}")
-            task_instruction = (
-                f"{task_instruction}\n\n"
-                f"Jira ticket context ({ticket_key or 'provided ticket'}):\n{jira_content[:3000]}"
-            )
-        elif ticket_key and workspace:
-            log(f"Fetching Jira context for {ticket_key}")
-            jira_content = _fetch_jira_context(
-                task_id,
-                ticket_key,
-                workspace,
-                compass_task_id,
-                permissions=permissions,
-            )
-            if jira_content:
-                log(f"Jira ticket {ticket_key} fetched ({len(jira_content)} chars)")
-                # Enrich task instruction with Jira context
-                task_instruction = (
-                    f"{task_instruction}\n\n"
-                    f"Jira ticket context ({ticket_key}):\n{jira_content[:3000]}"
-                )
-
-            # ── Dev Workflow Step 1: Mark ticket In Progress ─────────────────
-            if not is_revision:
-                log(f"Updating Jira ticket {ticket_key}: In Progress → assign self → comment")
-                _jira_transition(
-                    ticket_key,
-                    "In Progress",
-                    task_id,
-                    workspace,
-                    compass_task_id,
-                    permissions=permissions,
-                )
-                _jira_assign_self(
-                    ticket_key,
-                    task_id,
-                    workspace,
-                    compass_task_id,
-                    permissions=permissions,
-                )
-                _jira_add_comment(
-                    ticket_key,
-                    f"🤖 **Web Agent** (`{AGENT_ID}`) has picked up this ticket and started development.\n"
-                    f"Internal task ID: `{workflow_task_id}`",
-                    task_id,
-                    workspace,
-                    compass_task_id,
-                    permissions=permissions,
-                )
-            else:
-                rev_cycle = metadata.get("revisionCycle", 1)
-                log(f"Revision {rev_cycle}: adding Jira progress comment for {ticket_key}")
-                _jira_add_comment(
-                    ticket_key,
-                    f"📝 **Revision {rev_cycle}**: Applying code review feedback.\n"
-                    f"Internal task ID: `{workflow_task_id}`",
-                    task_id,
-                    workspace,
-                    compass_task_id,
-                    permissions=permissions,
-                )
-
-        repo_url = metadata_repo_url or analysis.get("repo_url") or ""
-        # Fall back to extracting from instruction text
-        if not repo_url:
-            url_match = re.search(r"https?://[^\s]+\.git", task_instruction) or \
-                        re.search(r"https?://github\.com/[^\s]+", task_instruction) or \
-                        re.search(r"https?://[^\s]*/scm/[^\s]+", task_instruction)
-            if url_match:
-                repo_url = url_match.group().rstrip("/.,;)")
-
-        _require_shared_workspace_for_repo_task(repo_url, workspace)
-
-        if repo_url and workspace:
-            if clone_path:
-                _ensure_clone_path_in_workspace(workspace, clone_path)
-                # Revision: reuse existing clone, just refresh snapshot and re-analyse
-                log(f"Revision: refreshing snapshot from existing clone {clone_path}")
-                repo_snapshot = _read_repo_snapshot(clone_path)
-                analysis = _apply_tech_stack_constraints(
-                    _analyze_task(task_instruction, acceptance_criteria, repo_snapshot[:2000]),
-                    tech_stack_constraints,
-                )
-            else:
-                log(f"Cloning repository: {repo_url}")
-                try:
-                    clone_path = _clone_repo(
-                        task_id,
-                        repo_url,
-                        workspace,
-                        compass_task_id,
-                        permissions=permissions,
-                    )
-                    _ensure_clone_path_in_workspace(workspace, clone_path)
-                except Exception as err:
-                    _save_workspace_file(
-                        workspace,
-                        f"{AGENT_ID}/clone-info.json",
-                        json.dumps(
-                            {
-                                "taskId": workflow_task_id,
-                                "agentTaskId": task_id,
-                                "agentId": AGENT_ID,
-                                "repoUrl": repo_url,
-                                "clonePath": "",
-                                "status": "failed",
-                                "error": str(err),
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                    raise
-                if clone_path:
-                    log(f"Repository cloned to {clone_path}")
-                    _save_workspace_file(
-                        workspace,
-                        f"{AGENT_ID}/clone-info.json",
-                        json.dumps(
-                            {
-                                "taskId": workflow_task_id,
-                                "agentTaskId": task_id,
-                                "agentId": AGENT_ID,
-                                "repoUrl": repo_url,
-                                "clonePath": clone_path,
-                                "status": "completed",
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                    repo_snapshot = _read_repo_snapshot(clone_path)
-                    # Re-analyze with repo context
-                    analysis = _apply_tech_stack_constraints(
-                        _analyze_task(task_instruction, acceptance_criteria, repo_snapshot[:2000]),
-                        tech_stack_constraints,
-                    )
-
-        # ── Phase 3: Plan ────────────────────────────────────────────────────
-        task_store.update_state(task_id, "PLANNING", "Creating implementation plan…")
-        log("Planning implementation")
-        # Build design context string from metadata (passed by Team Lead)
-        design_context_str = ""
-        if design_context_meta:
-            parts = []
-            if design_context_meta.get("url"):
-                parts.append(f"Design reference: {design_context_meta['url']}")
-            if design_context_meta.get("page_name"):
-                parts.append(f"Screen/Page: {design_context_meta['page_name']}")
-            if design_context_meta.get("content"):
-                parts.append(design_context_meta["content"])
-            design_context_str = "\n".join(parts)
-            log(f"Using design context from Team Lead ({len(design_context_str)} chars)")
-
-        # Augment with local reference files saved by UI Design Agent (full spec + HTML template)
-        if workspace:
-            _stitch_local = _read_workspace_json(workspace, "ui-design/stitch-design.json")
-            _local_code_html = _stitch_local.get("localCodeHtml", "")
-            _local_design_md = _stitch_local.get("localDesignMd", "")
-            if _local_code_html or _local_design_md:
-                if _local_design_md:
-                    design_spec_for_audit = _local_design_md
-                if _local_code_html:
-                    reference_html_for_audit = _local_code_html
-                _extra: list[str] = []
-                if _local_design_md:
-                    _extra.append(
-                        "## Design System Specification (DESIGN.md)\n"
-                        "Follow this design spec exactly — colors, typography, spacing, components.\n"
-                        + _local_design_md
-                    )
-                if _local_code_html:
-                    _extra.append(
-                        "## Reference HTML Implementation\n"
-                        "This is the pixel-perfect reference implementation. "
-                        "Use this as the authoritative design template — replicate the layout, "
-                        "color scheme, typography, and component structure faithfully.\n"
-                        f"```html\n{_local_code_html}\n```"
-                    )
-                design_context_str = "\n\n".join(filter(None, [design_context_str] + _extra))
-                log(f"Design context enriched with local Stitch reference ({len(design_context_str)} chars)")
-
-        plan = _plan_implementation(
-            task_instruction,
-            acceptance_criteria,
-            analysis,
-            repo_snapshot,
-            design_context=design_context_str,
-        )
-        files_to_implement, removed_plan_files = _sanitize_plan_files(
-            plan.get("files") or [],
-            analysis,
-            review_issues,
-        )
-        plan["files"] = files_to_implement
-        if removed_plan_files:
-            _save_workspace_file(
-                workspace,
-                f"{AGENT_ID}/plan-sanitization.json",
-                json.dumps(
-                    {
-                        "taskId": workflow_task_id,
-                        "agentTaskId": task_id,
-                        "agentId": AGENT_ID,
-                        "frontendFramework": analysis.get("frontend_framework"),
-                        "removedFiles": removed_plan_files,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-            removed_preview = ", ".join(item["path"] for item in removed_plan_files[:4])
-            if len(removed_plan_files) > 4:
-                removed_preview += ", ..."
-            log(
-                "Sanitized file plan — removed "
-                f"{len(removed_plan_files)} conflicting/non-source file(s): {removed_preview}"
-            )
-        log(f"Plan ready — {len(files_to_implement)} file(s) to implement")
-
-        # ── Auto-inject .gitignore if missing from plan and repo ─────────────
-        _planned_paths_lower = {fi.get("path", "").lower() for fi in files_to_implement}
-        if ".gitignore" not in _planned_paths_lower:
-            _existing_gitignore = clone_path and os.path.isfile(os.path.join(clone_path, ".gitignore"))
-            if not _existing_gitignore:
-                gitignore_content = _generate_gitignore_content(analysis)
-                files_to_implement.insert(0, {
-                    "path": ".gitignore",
-                    "action": "create",
-                    "purpose": "Standard .gitignore for the project tech stack",
-                    "key_logic": gitignore_content,
-                    "content": gitignore_content,  # pre-generated — no LLM call needed
-                    "dependencies": [],
-                })
-                plan["files"] = files_to_implement
-                log("Auto-added .gitignore to plan")
-
-        if not files_to_implement:
-            raise RuntimeError("LLM returned an empty file plan — cannot proceed.")
-
-        planned_paths = [file_info.get("path", "") for file_info in files_to_implement]
-        if repo_url and clone_path:
-            if not branch_name:
-                branch_name, branch_kind = _select_branch_name(
-                    task_instruction,
-                    analysis,
-                    planned_paths,
-                    ticket_key,
-                    task_id,
-                    repo_url,
-                    clone_path,
-                    workspace,
-                    compass_task_id,
-                    permissions=permissions,
-                )
-            else:
-                log(f"Revision: reusing branch {branch_name}")
-            _checkout_local_branch(clone_path, branch_name, "main", log)
-            _save_workspace_file(
-                workspace,
-                f"{AGENT_ID}/branch-info.json",
-                json.dumps(
-                    {
-                        "taskId": workflow_task_id,
-                        "agentTaskId": task_id,
-                        "agentId": AGENT_ID,
-                        "repoUrl": repo_url,
-                        "clonePath": clone_path,
-                        "branch": branch_name,
-                        "branchKind": branch_kind,
-                        "baseBranch": "main",
-                        "localBranchPrepared": True,
-                        "prUrl": pr_url,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-
-        # ── Phase 3b: Install plan dependencies at runtime ───────────────────
-        install_deps = plan.get("install_dependencies") or []
-        if install_deps:
-            task_store.update_state(task_id, "INSTALLING_DEPS", "Installing runtime dependencies…")
-            _install_plan_dependencies(
-                install_deps,
-                analysis.get("language", "python"),
-                log,
-                cwd=clone_path or agent_workspace,
-            )
-
-        # ── Phase 4: Implement ───────────────────────────────────────────────
-        task_store.update_state(task_id, "IMPLEMENTING", f"Implementing {len(files_to_implement)} file(s)…")
-        log(f"Implementing {len(files_to_implement)} file(s)")
-
-        generated_files: list[dict] = []
-        implementation_root = clone_path or agent_workspace
-        if implementation_root:
-            os.makedirs(implementation_root, exist_ok=True)
-            agentic_result = _run_agentic_implementation(
-                task_instruction,
-                acceptance_criteria,
-                analysis,
-                plan,
-                repo_snapshot,
-                design_context_str,
-                review_issues,
-                implementation_root,
-                log,
-            )
-            if not agentic_result.success:
-                raise RuntimeError(
-                    "Agentic implementation failed: "
-                    f"{agentic_result.summary or agentic_result.raw_output[:500]}"
-                )
-            generated_files = _collect_generated_files_from_directory(implementation_root, files_to_implement)
-            if not generated_files:
-                raise RuntimeError("Agentic implementation completed without any repository file changes.")
-            log(f"Agentic implementation complete — {len(generated_files)} file(s) changed")
-            _save_workspace_file(
-                workspace,
-                f"{AGENT_ID}/agentic-run.json",
-                json.dumps(
-                    {
-                        "taskId": workflow_task_id,
-                        "agentTaskId": task_id,
-                        "agentId": AGENT_ID,
-                        "backend": agentic_result.backend_used,
-                        "success": agentic_result.success,
-                        "summary": agentic_result.summary,
-                        "turnsUsed": agentic_result.turns_used,
-                        "toolCalls": agentic_result.tool_calls,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-        else:
-            context_summary = ""
-
-            for i, file_info in enumerate(files_to_implement):
-                file_path = file_info.get("path", f"file_{i}.txt")
-                log(f"Generating [{i+1}/{len(files_to_implement)}]: {file_path}")
-
-                existing_content = ""
-                if file_info.get("action") == "modify" and clone_path:
-                    candidate = os.path.join(clone_path, file_path.lstrip("/"))
-                    if os.path.isfile(candidate):
-                        try:
-                            with open(candidate, encoding="utf-8", errors="replace") as fh:
-                                existing_content = fh.read(8000)
-                        except Exception:
-                            pass
-
-                if file_info.get("content"):
-                    code = file_info["content"]
-                else:
-                    code = _generate_file_code(
-                        file_info,
-                        task_instruction,
-                        analysis,
-                        context_summary,
-                        existing_content,
-                    )
-                    code = _strip_code_fences(code)
-
-                generated_files.append({"path": file_path, "content": code, "action": file_info.get("action", "create")})
-
-                context_summary += f"\n{file_path}: {file_info.get('purpose', '')}\n"
-                if len(context_summary) > 2000:
-                    context_summary = context_summary[-2000:]
-
-            log(f"Code generation complete — {len(generated_files)} file(s) ready")
-
-        # ── Phase 5: Write to shared workspace ──────────────────────────────
-        if clone_path:
-            task_store.update_state(task_id, "WRITING", "Writing files into cloned repository…")
-            written_clone_paths = _write_files_to_directory(clone_path, generated_files)
-            log(f"Wrote {len(written_clone_paths)} file(s) into cloned repository")
-
-        build_dir = clone_path or agent_workspace
-        if build_dir and os.path.isdir(build_dir):
-            _install_written_node_dependencies(build_dir, log)
-
-        # ── Phase 5b: Build and test with LLM-guided recovery ───────────────
-        build_ok = True  # default: assume passing if no build dir
-        build_output = ""  # populated below if build/tests are actually run
-        if build_dir and os.path.isdir(build_dir):
-            task_store.update_state(task_id, "BUILDING", "Running build and tests…")
-            log("Running build/tests")
-            build_ok, build_output, build_attempts = _build_and_test_with_recovery(
-                build_dir,
-                task_instruction,
-                analysis.get("language", "python"),
-                log,
-            )
-            if build_ok:
-                log("Build/tests passed")
-            else:
-                log(f"Build/tests could not be fully resolved: {build_output[:200]}")
-            # Sync fixed files back to generated_files list
-            for gf in generated_files:
-                rel_path = gf["path"].lstrip("/")
-                candidate = os.path.join(build_dir, rel_path)
-                if os.path.isfile(candidate):
-                    try:
-                        with open(candidate, encoding="utf-8") as fh:
-                            gf["content"] = fh.read()
-                    except Exception:
-                        pass
-            _save_workspace_file(
-                workspace,
-                f"{AGENT_ID}/test-results.json",
-                json.dumps(
-                    {
-                        "taskId": workflow_task_id,
-                        "agentTaskId": task_id,
-                        "agentId": AGENT_ID,
-                        "buildDir": build_dir,
-                        "passed": build_ok,
-                        "attempts": build_attempts,
-                        "finalOutput": build_output[:4000],
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-
-        # ── Phase 5c: Capture UI evidence (design reference + screenshot) ────
-        _screenshot_paths: list[str] = []
-        _is_ui_task = (
-            analysis.get("frontend_framework", "none") not in ("none", "")
-            or any(fi.get("path", "").endswith(".html") for fi in generated_files)
-            or analysis.get("scope") in ("frontend_only", "fullstack")
-        )
-        if _is_ui_task and workspace:
-            evidence_dir = os.path.join(workspace, AGENT_ID)
-            os.makedirs(evidence_dir, exist_ok=True)
-            log("Capturing UI evidence (design reference + implementation screenshots)")
-            design_ref_path = os.path.join(evidence_dir, "design-reference.png")
-
-            # 1. Design reference — local file > Stitch thumbnail > browser capture
-            design_reference = _get_design_reference_details(workspace)
-            local_design_ref = design_reference.get("local_design_ref", "")
-            thumbnail_url = design_reference.get("thumbnail_url", "")
-            design_url = design_reference.get("design_url", "")
-            design_saved = False
-            if local_design_ref:
-                import shutil as _shutil
-                os.makedirs(os.path.dirname(design_ref_path), exist_ok=True)
-                _shutil.copy2(local_design_ref, design_ref_path)
-                log("Design reference screenshot copied from local reference")
-                design_saved = True
-            elif thumbnail_url:
-                if _download_url_to_file(thumbnail_url, design_ref_path):
-                    log("Design reference screenshot downloaded")
-                    design_saved = True
-                    _save_workspace_file(
-                        workspace,
-                        f"{AGENT_ID}/design-reference-url.txt",
-                        thumbnail_url,
-                    )
-                else:
-                    log(f"Could not download design reference — URL saved as text")
-                    _save_workspace_file(
-                        workspace,
-                        f"{AGENT_ID}/design-reference-url.txt",
-                        thumbnail_url,
-                    )
-
-            if not design_saved and design_url:
-                if _capture_browser_screenshot(design_url, design_ref_path, log):
-                    log("Design reference screenshot captured from design URL")
-                _save_workspace_file(
-                    workspace,
-                    f"{AGENT_ID}/design-reference-url.txt",
-                    design_url,
-                )
-
-            # 2. Implementation screenshots — one per viewport (best-effort)
-            # Files are named screenshot-{W}x{H}.png — no platform labels.
-            _captured: dict[tuple[int, int], str] = {}  # viewport → local path
-            if build_dir:
-                py_exec = _ensure_local_python_env(
-                    build_dir, analysis.get("language", "python"), log
-                )
-                for _vp in _UI_SCREENSHOT_VIEWPORTS:
-                    _vw, _vh = _vp
-                    _out = os.path.join(evidence_dir, f"screenshot-{_vw}x{_vh}.png")
-                    if _take_ui_screenshot(build_dir, py_exec, _out, log, analysis=analysis, viewport=_vp):
-                        _captured[_vp] = _out
-                        # Replace LLM-generated placeholder if first (widest) viewport
-                        if not _captured or _vp == _UI_SCREENSHOT_VIEWPORTS[0]:
-                            import shutil as _shutil
-                            for _rel in ("work/screenshots/index.png", ".work/screenshots/index.png"):
-                                _placeholder = os.path.join(build_dir, _rel)
-                                if os.path.exists(_placeholder):
-                                    os.makedirs(os.path.dirname(_placeholder), exist_ok=True)
-                                    _shutil.copy2(_out, _placeholder)
-                                    log(f"Replaced placeholder screenshot at {_rel}")
-
-            if clone_path:
-                if os.path.isfile(design_ref_path):
-                    _register_generated_artifact(
-                        clone_path,
-                        generated_files,
-                        design_ref_path,
-                        "docs/evidence/design-reference.png",
-                        log,
-                    )
-                for (_vw, _vh), _src in _captured.items():
-                    _register_generated_artifact(
-                        clone_path,
-                        generated_files,
-                        _src,
-                        f"docs/evidence/screenshot-{_vw}x{_vh}.png",
-                        log,
-                    )
-                _register_runtime_repo_artifacts(
-                    clone_path,
-                    generated_files,
-                    ["artifacts/figma"],
-                    log,
-                )
-            _screenshot_paths = list(_captured.values()) if _is_ui_task else []
-
-        # ── Phase 5d: Self-assessment loop (up to 5 iterations) ─────────────
-        MAX_SELF_IMPROVE = 5
-        for _sa_iter in range(MAX_SELF_IMPROVE):
-            log(f"Self-assess [{_sa_iter + 1}/{MAX_SELF_IMPROVE}]")
-            task_store.update_state(
-                task_id, "SELF_ASSESSING",
-                f"Self-assessment [{_sa_iter + 1}/{MAX_SELF_IMPROVE}]…",
-            )
-            _design_compare = _compare_design_fidelity(
-                generated_files,
-                build_ok,
-                build_output,
-                design_spec_for_audit,
-                reference_html_for_audit,
-                _screenshot_paths,
-            )
-            _design_missing = _design_compare.get("missing") or []
-            _design_redundant = _design_compare.get("redundant") or []
-            _design_wrong = _design_compare.get("wrong") or []
-            _design_findings = _design_missing + _design_redundant + _design_wrong
-            _design_files = [
-                item.get("file_to_fix", "") for item in _design_findings if item.get("file_to_fix")
-            ]
-            _save_workspace_file(
-                workspace,
-                f"{AGENT_ID}/design-compare-{_sa_iter + 1}.json",
-                json.dumps(
-                    {
-                        "iteration": _sa_iter + 1,
-                        "fidelityScore": _design_compare.get("fidelity_score", 0),
-                        "implemented": _design_compare.get("implemented") or [],
-                        "missing": _design_missing,
-                        "redundant": _design_redundant,
-                        "wrong": _design_wrong,
-                        "summary": _design_compare.get("summary", ""),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-            _assess = _self_assess_implementation(
-                task_instruction,
-                acceptance_criteria,
-                generated_files,
-                build_ok,
-                build_output,
-                _screenshot_paths,
-            )
-            _assess_passed = bool(_assess.get("passed")) and not _design_findings
-            _assess_issues = list(_assess.get("issues") or [])
-            for _finding in _design_findings:
-                _file_to_fix = _finding.get("file_to_fix") or "unknown-file"
-                _severity = _finding.get("severity", "major")
-                _requirement = _finding.get("requirement", "Unspecified design issue")
-                _fix_hint = _finding.get("fix_hint", "Fix the design mismatch.")
-                _assess_issues.append(
-                    f"{_file_to_fix}: {_severity}: {_requirement} — {_fix_hint}"
-                )
-            _assess_issues = list(dict.fromkeys(_assess_issues))
-            _assess_files = list(dict.fromkeys((_assess.get("files_to_fix") or []) + _design_files))
-            log(
-                f"Self-assess [{_sa_iter + 1}/{MAX_SELF_IMPROVE}]: "
-                f"passed={_assess_passed}, issues={len(_assess_issues)}, "
-                f"design_score={_design_compare.get('fidelity_score', 0)}"
-            )
-            _save_workspace_file(
-                workspace,
-                f"{AGENT_ID}/self-assess-{_sa_iter + 1}.json",
-                json.dumps(
-                    {
-                        "iteration": _sa_iter + 1,
-                        "passed": _assess_passed,
-                        "issues": _assess_issues,
-                        "filesToFix": _assess_files,
-                        "summary": _assess.get("summary", ""),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-            if _assess_passed or _sa_iter == MAX_SELF_IMPROVE - 1:
-                if not _assess_passed:
-                    log("Self-assess: max iterations reached, proceeding with current implementation")
-                break
-            if not _assess_files:
-                log("Self-assess: issues found but no specific files to fix — proceeding")
-                break
-            log(f"Self-assess: re-generating {len(_assess_files)} file(s): {_assess_files}")
-            _fix_context = ""
-            _file_issue_map: dict[str, list[str]] = {}
-            for _issue in _assess_issues:
-                for _target_file in _assess_files:
-                    if _target_file and _target_file in _issue:
-                        _file_issue_map.setdefault(_target_file, []).append(_issue)
-            for _fi in files_to_implement:
-                if _fi.get("path") not in _assess_files:
-                    continue
-                _existing_fix = ""
-                if clone_path:
-                    _fp = os.path.join(clone_path, _fi["path"].lstrip("/"))
-                    if os.path.isfile(_fp):
-                        try:
-                            with open(_fp, encoding="utf-8", errors="replace") as _fh:
-                                _existing_fix = _fh.read(8000)
-                        except Exception:
-                            pass
-                _targeted_instruction = task_instruction
-                _file_issues = _file_issue_map.get(_fi["path"], [])
-                if _file_issues:
-                    _targeted_instruction += "\n\nFix these specific review findings for this file:\n"
-                    _targeted_instruction += "\n".join(f"- {_issue}" for _issue in _file_issues)
-                _new_code = _generate_file_code(
-                    _fi, _targeted_instruction, analysis, _fix_context, _existing_fix,
-                )
-                _new_code = _strip_code_fences(_new_code)
-                for _gf in generated_files:
-                    if _gf["path"] == _fi["path"]:
-                        _gf["content"] = _new_code
-                        break
-                else:
-                    generated_files.append({
-                        "path": _fi["path"], "content": _new_code,
-                        "action": _fi.get("action", "modify"),
-                    })
-                _fix_context += f"\n{_fi['path']}: {_fi.get('purpose', '')}\n"
-                if _file_issues:
-                    _fix_context += "Review findings:\n" + "\n".join(f"- {_issue}" for _issue in _file_issues) + "\n"
-            if clone_path:
-                _fixed_subset = [gf for gf in generated_files if gf["path"] in _assess_files]
-                _written_fix = _write_files_to_directory(clone_path, _fixed_subset)
-                log(f"Self-assess: wrote {len(_written_fix)} fixed file(s)")
-                if build_dir and os.path.isdir(build_dir):
-                    build_ok, build_output, _ = _build_and_test_with_recovery(
-                        build_dir, task_instruction, analysis.get("language", "python"), log,
-                    )
-                    log(f"Self-assess: rebuild {'passed' if build_ok else 'failed'}")
-                    for _gf in generated_files:
-                        _rel = _gf["path"].lstrip("/")
-                        _cand = os.path.join(build_dir, _rel)
-                        if os.path.isfile(_cand):
-                            try:
-                                with open(_cand, encoding="utf-8") as _fh:
-                                    _gf["content"] = _fh.read()
-                            except Exception:
-                                pass
-                if _is_ui_task and build_dir and workspace:
-                    _py_exec2 = _ensure_local_python_env(
-                        build_dir, analysis.get("language", "python"), log,
-                    )
-                    _captured2: dict = {}
-                    for _vp2 in _UI_SCREENSHOT_VIEWPORTS:
-                        _vw2, _vh2 = _vp2
-                        _out2 = os.path.join(workspace, AGENT_ID, f"screenshot-{_vw2}x{_vh2}.png")
-                        if _take_ui_screenshot(
-                            build_dir, _py_exec2, _out2, log, analysis=analysis, viewport=_vp2,
-                        ):
-                            _captured2[_vp2] = _out2
-                    if _captured2:
-                        _screenshot_paths = list(_captured2.values())
-                        log(f"Self-assess: refreshed {len(_screenshot_paths)} screenshot(s)")
-
-        if clone_path and branch_name:
-            if not branch_kind:
-                branch_kind = "feature"
-            if branch_kind == "hotfix":
-                commit_msg = f"fix({ticket_key}): web agent implementation"
-            elif branch_kind == "chore":
-                commit_msg = f"chore({workflow_task_id}): docs and tests update"
-            else:
-                commit_msg = f"feat({ticket_key}): web agent implementation" if ticket_key else f"feat({workflow_task_id}): web agent implementation"
-            local_commit_sha = _commit_local_changes(
-                clone_path,
-                branch_name,
-                generated_files,
-                commit_msg,
-                log,
-            )
-
-        # ── Phase 6: Push files and create PR (if repo available) ────────────
-        if repo_url and workspace:
-            task_store.update_state(task_id, "PUSHING", "Creating branch and pushing code…")
-            base_branch = "main"  # PRs always target the default branch
-            branch_created = bool(branch_name)
-            _save_workspace_file(
-                workspace,
-                f"{AGENT_ID}/branch-info.json",
-                json.dumps(
-                    {
-                        "taskId": workflow_task_id,
-                        "agentTaskId": task_id,
-                        "agentId": AGENT_ID,
-                        "repoUrl": repo_url,
-                        "clonePath": clone_path,
-                        "branch": branch_name,
-                        "branchKind": branch_kind,
-                        "baseBranch": base_branch,
-                        "localBranchPrepared": branch_created,
-                        "localCommit": local_commit_sha,
-                        "prUrl": pr_url,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-            if not branch_created:
-                log("Warning: could not prepare a local branch — files saved to cloned repo only")
-            else:
-                # Push generated files
-                push_files = [
-                    {"path": gf["path"], "content": gf["content"]}
-                    for gf in generated_files
-                ]
-                pushed = _push_files(
-                    task_id,
-                    repo_url,
-                    branch_name,
-                    push_files,
-                    commit_msg,
-                    workspace,
-                    compass_task_id,
-                    permissions=permissions,
-                    base_branch=base_branch,
-                )
-                if pushed:
-                    log("Files pushed to branch")
-                    # Create PR
-                    files_changed = [gf["path"] for gf in generated_files]
-                    pr_title, pr_body = _generate_pr_description(
-                        task_instruction,
-                        acceptance_criteria,
-                        files_changed,
-                        plan.get("plan_summary") or "Web agent implementation",
-                        design_context_meta=design_context_meta,
-                        test_output=build_output if build_dir else "",
-                        repo_url=repo_url or "",
-                        branch_name=branch_name or "",
-                    )
-                    _save_pr_evidence(
-                        workspace,
-                        taskId=workflow_task_id,
-                        agentTaskId=task_id,
-                        repoUrl=repo_url,
-                        clonePath=clone_path,
-                        branch=branch_name,
-                        branchKind=branch_kind,
-                        localCommit=local_commit_sha,
-                        baseBranch=base_branch,
-                        title=pr_title,
-                        body=pr_body,
-                        buildPassed=build_ok,
-                        generatedFiles=files_changed,
-                    )
-                    if is_revision and pr_url:
-                        log(f"Revision: pushing to existing PR {pr_url}")
-                    else:
-                        pr_url = _create_pr(
-                            task_id,
-                            repo_url,
-                            branch_name,
-                            base_branch,
-                            pr_title,
-                            pr_body,
-                            workspace,
-                            compass_task_id,
-                            permissions=permissions,
-                        )
-                    _save_pr_evidence(
-                        workspace,
-                        taskId=workflow_task_id,
-                        agentTaskId=task_id,
-                        repoUrl=repo_url,
-                        clonePath=clone_path,
-                        branch=branch_name,
-                        branchKind=branch_kind,
-                        localCommit=local_commit_sha,
-                        baseBranch=base_branch,
-                        title=pr_title,
-                        body=pr_body,
-                        url=pr_url,
-                        buildPassed=build_ok,
-                        generatedFiles=files_changed,
-                    )
-                    _save_workspace_file(
-                        workspace,
-                        f"{AGENT_ID}/branch-info.json",
-                        json.dumps(
-                            {
-                                "taskId": workflow_task_id,
-                                "agentTaskId": task_id,
-                                "agentId": AGENT_ID,
-                                "repoUrl": repo_url,
-                                "clonePath": clone_path,
-                                "branch": branch_name,
-                                "branchKind": branch_kind,
-                                "baseBranch": base_branch,
-                                "localBranchPrepared": branch_created,
-                                "localCommit": local_commit_sha,
-                                "prUrl": pr_url,
-                                "buildPassed": build_ok,
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                    if pr_url:
-                        log(f"{'PR updated' if is_revision else 'PR created'}: {pr_url}")
-                        # ── Dev Workflow Step 2: Update Jira after PR ────────
-                        if ticket_key:
-                            if not is_revision:
-                                _jira_transition(
-                                    ticket_key,
-                                    "In Review",
-                                    task_id,
-                                    workspace,
-                                    compass_task_id,
-                                    permissions=permissions,
-                                )
-                            test_status = "✅ Build/tests passed" if build_ok else "⚠️ Build/tests had issues"
-                            _jira_add_comment(
-                                ticket_key,
-                                "",
-                                task_id,
-                                workspace,
-                                compass_task_id,
-                                permissions=permissions,
-                                adf_body=_build_pr_jira_comment_adf(
-                                    pr_url,
-                                    branch_name,
-                                    test_status,
-                                    generated_files,
-                                    plan.get("plan_summary", "Implementation complete."),
-                                ),
-                                comment_preview=(
-                                    f"PR: {pr_url}\n"
-                                    f"Branch: {branch_name}\n"
-                                    f"Test Status: {test_status}"
-                                ),
-                            )
-                    else:
-                        log("Warning: PR creation returned no URL")
-                else:
-                    log("Warning: file push failed — files saved to workspace only")
-
-        # ── Phase 7: Build artifacts and finalize ────────────────────────────
-        task_store.update_state(task_id, "COMPLETING", "Finalizing…")
-
-        files_list = [gf["path"] for gf in generated_files]
-        summary = _generate_summary(task_instruction, acceptance_criteria, files_list, pr_url)
-        log(f"Summary: {summary[:120]}")
-        _save_workspace_file(workspace, f"{AGENT_ID}/final-summary.md", summary)
-
-        # Create artifacts: one per generated file + summary
-        summary_artifact = build_text_artifact(
-            "web-agent-summary",
-            summary,
-            metadata={
+        summary_artifact = {
+            "name": "web-agent-summary",
+            "artifactType": "text/plain",
+            "parts": [{"text": summary}],
+            "metadata": {
                 "agentId": AGENT_ID,
                 "capability": "web.task.execute",
                 "orchestratorTaskId": compass_task_id,
-                "taskId": workflow_task_id,
-                "agentTaskId": task_id,
-                "prUrl": pr_url,
-                "url": pr_url,      # alias used by Compass evidence extraction
-                "branch": branch_name,
-                "filesCount": len(generated_files),
-                # jiraInReview is read by Compass to display "Completed / In Review"
-                # without having to scan the shared workspace filesystem.
-                "jiraInReview": bool(pr_url and ticket_key),
+                "taskId": task_id,
             },
+        }
+        final_artifacts.insert(0, summary_artifact)
+
+        if result.success:
+            task_store.update_state(task_id, "TASK_STATE_COMPLETED", summary)
+            task = task_store.get(task_id)
+            if task:
+                task.artifacts = final_artifacts
+            audit_log("TASK_COMPLETED", task_id=task_id, compass_task_id=compass_task_id)
+        else:
+            task_store.update_state(task_id, "TASK_STATE_FAILED", summary)
+            task = task_store.get(task_id)
+            if task:
+                task.artifacts = final_artifacts
+            audit_log("TASK_FAILED", task_id=task_id, error=summary[:300])
+
+        _notify_callback(
+            callback_url, task_id,
+            "TASK_STATE_COMPLETED" if result.success else "TASK_STATE_FAILED",
+            summary, final_artifacts,
         )
-        final_artifacts = [summary_artifact]
-
-        for artifact_name, artifact_path in (
-            ("web-agent-clone-info", f"{AGENT_ID}/clone-info.json"),
-            ("web-agent-branch-info", f"{AGENT_ID}/branch-info.json"),
-            ("web-agent-test-results", f"{AGENT_ID}/test-results.json"),
-            ("web-agent-jira-actions", f"{AGENT_ID}/jira-actions.json"),
-            ("web-agent-pr-evidence", f"{AGENT_ID}/pr-evidence.json"),
-        ):
-            payload = _read_workspace_json(workspace, artifact_path)
-            if payload:
-                final_artifacts.append(
-                    build_text_artifact(
-                        artifact_name,
-                        json.dumps(payload, ensure_ascii=False, indent=2)[:3000],
-                        artifact_type="application/json",
-                        metadata={
-                            "agentId": AGENT_ID,
-                            "capability": "web.task.execute",
-                            "orchestratorTaskId": compass_task_id,
-                            "path": artifact_path,
-                        },
-                    )
-                )
-
-        # Add code file artifacts (truncated for artifact payload)
-        for gf in generated_files[:10]:
-            code_preview = gf["content"][:2000] + ("\n...[truncated]" if len(gf["content"]) > 2000 else "")
-            final_artifacts.append(
-                build_text_artifact(
-                    f"web-agent-file-{gf['path'].replace('/', '-')}",
-                    f"File: {gf['path']}\n\n{code_preview}",
-                    metadata={
-                        "agentId": AGENT_ID,
-                        "capability": "web.task.execute",
-                        "orchestratorTaskId": compass_task_id,
-                        "filePath": gf["path"],
-                    },
-                )
-            )
-
-        task_store.update_state(task_id, "TASK_STATE_COMPLETED", summary)
-        task = task_store.get(task_id)
-        if task:
-            task.artifacts = final_artifacts
-
-        log("Task completed successfully")
-        audit_log(
-            "TASK_COMPLETED",
-            task_id=task_id,
-            compass_task_id=compass_task_id,
-            files_count=len(generated_files),
-            pr_url=pr_url,
-        )
-        _notify_callback(callback_url, task_id, "TASK_STATE_COMPLETED", summary, final_artifacts)
 
     except Exception as err:
         error_text = str(err)
-        failure_artifacts = []
+        failure_artifacts: list = []
         if isinstance(err, PermissionEscalationRequired):
             failure_artifacts = [build_permission_denied_artifact(err.details, agent_id=AGENT_ID)]
         print(f"[{AGENT_ID}][{task_id}] FAILED: {error_text}")
@@ -4222,31 +3345,15 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         task = task_store.get(task_id)
         if task:
             task.artifacts = failure_artifacts
-        _save_workspace_file(
-            workspace,
-            f"{AGENT_ID}/review-notes.json",
-            json.dumps(
-                {
-                    "taskId": workflow_task_id,
-                    "agentTaskId": task_id,
-                    "agentId": AGENT_ID,
-                    "error": error_text,
-                    "reviewIssues": review_issues,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
         audit_log("TASK_FAILED", task_id=task_id, error=error_text[:300])
         _notify_callback(
             callback_url, task_id, "TASK_STATE_FAILED",
-            f"Web Agent failed: {error_text[:500]}", failure_artifacts
+            f"Web Agent failed: {error_text[:500]}", failure_artifacts,
         )
     finally:
         _apply_task_exit_rule(task_id, exit_rule)
 
 
-def _strip_code_fences(code: str) -> str:
     """Remove markdown code fences from LLM output."""
     code = code.strip()
     if code.startswith("```"):

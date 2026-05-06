@@ -32,6 +32,7 @@ _task_context: dict = {}
 _complete_fn: Callable[[str, list], None] | None = None
 _fail_fn: Callable[[str], None] | None = None
 _input_required_fn: Callable[[str, str | None], None] | None = None
+_wait_for_input_fn: Callable[[str], str | None] | None = None
 
 # Sentinel so callers can explicitly pass None to clear a callback
 _UNSET = object()
@@ -43,6 +44,7 @@ def configure_control_tools(
     complete_fn: Any = _UNSET,
     fail_fn: Any = _UNSET,
     input_required_fn: Any = _UNSET,
+    wait_for_input_fn: Any = _UNSET,
 ) -> None:
     """Wire up lifecycle callbacks for control tools.
 
@@ -55,8 +57,9 @@ def configure_control_tools(
         complete_fn: callback(result_text, artifacts) to mark task COMPLETED
         fail_fn: callback(error_message) to mark task FAILED
         input_required_fn: callback(question, context) to request user input
+        wait_for_input_fn: callback(question) -> user_reply or None (blocking)
     """
-    global _task_context, _complete_fn, _fail_fn, _input_required_fn
+    global _task_context, _complete_fn, _fail_fn, _input_required_fn, _wait_for_input_fn
     if task_context is not _UNSET:
         _task_context = task_context or {}
     if complete_fn is not _UNSET:
@@ -65,6 +68,8 @@ def configure_control_tools(
         _fail_fn = fail_fn
     if input_required_fn is not _UNSET:
         _input_required_fn = input_required_fn
+    if wait_for_input_fn is not _UNSET:
+        _wait_for_input_fn = wait_for_input_fn
 
 
 # ---------------------------------------------------------------------------
@@ -581,10 +586,24 @@ class RequestUserInputTool(ConstellationTool):
         if not question:
             return self.error("Missing required argument: question")
 
+        # If a blocking wait function is configured, use it to get the user's reply
+        if _wait_for_input_fn is not None:
+            try:
+                full_question = question
+                if context:
+                    full_question = f"{question}\n\nContext: {context}"
+                user_reply = _wait_for_input_fn(full_question)
+                if user_reply is None:
+                    return self.error("User input request timed out. The user did not respond in time.")
+                return self.ok(f"User replied: {user_reply}")
+            except Exception as exc:  # noqa: BLE001
+                return self.error(f"Failed to get user input: {exc}")
+
+        # Non-blocking: just signal INPUT_REQUIRED to orchestrator
         if _input_required_fn is not None:
             try:
                 _input_required_fn(question, context if context else None)
-                return self.ok("INPUT_REQUIRED signaled to orchestrator.")
+                return self.ok("INPUT_REQUIRED signaled to orchestrator. The workflow will pause until user responds.")
             except Exception as exc:  # noqa: BLE001
                 return self.error(f"Failed to signal INPUT_REQUIRED: {exc}")
 

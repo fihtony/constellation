@@ -2772,6 +2772,86 @@ def _generate_summary(
 
 
 # ---------------------------------------------------------------------------
+# Agentic task prompt builder
+# ---------------------------------------------------------------------------
+
+def _build_team_lead_task_prompt(
+    *,
+    user_text: str,
+    workspace: str,
+    compass_task_id: str,
+    team_lead_task_id: str,
+    callback_url: str,
+    permissions: dict | None,
+    runtime_config: dict,
+) -> str:
+    """Build the task prompt for the agentic runtime."""
+    return f"""You are the Team Lead Agent. Execute this development task autonomously.
+
+## User Request
+{user_text}
+
+## Your Workflow (follow this order)
+
+### 1. ANALYZE
+- Identify the task type (implementation, bug fix, refactoring, etc.)
+- Extract Jira ticket key if present (pattern: PROJ-123)
+- Identify target platform and technology stack
+- Use `report_progress` to announce "Analyzing request"
+
+### 2. GATHER CONTEXT
+- Use `jira_get_ticket` to fetch ticket details if a Jira key is found
+- Use `design_fetch_figma_screen` or `design_fetch_stitch_screen` if design URLs are present
+- Use `registry_query` to discover available agents
+- If critical information is missing, use `request_user_input` to ask
+- Use `report_progress` to announce "Gathering context"
+
+### 3. PLAN
+- Create an implementation plan with acceptance criteria
+- Write the plan to the workspace using `write_file`
+- Determine which development agent to use (android.task.execute, web.task.execute, etc.)
+- Use `report_progress` to announce "Creating plan"
+
+### 4. EXECUTE
+- Use `launch_per_task_agent` if no idle development agent is available
+- Use `dispatch_agent_task` to send the implementation task with full context:
+  - Include jiraContext, designContext, scmContext in metadata
+  - Include sharedWorkspacePath: {workspace}
+  - Include orchestratorTaskId: {compass_task_id}
+  - Include permissions
+- Use `wait_for_agent_task` to wait for the development agent to finish
+- Use `report_progress` to announce "Executing implementation"
+
+### 5. REVIEW
+- Examine the dev agent's output artifacts
+- Check for PR URL and branch evidence
+- If output has issues, dispatch a revision (max {MAX_REVIEW_CYCLES} cycles)
+- Use `report_progress` to announce "Reviewing output"
+
+### 6. COMPLETE
+- Use `jira_add_comment` to post a completion comment if a Jira ticket exists
+- Use `ack_agent_task` to acknowledge the dev agent
+- Generate a final summary
+- Use `complete_current_task` with the summary and any PR evidence artifacts
+- Use `report_progress` to announce "Task completed"
+
+## Metadata for downstream agents
+- sharedWorkspacePath: {workspace}
+- orchestratorTaskId: {compass_task_id}
+- teamLeadTaskId: {team_lead_task_id}
+- callbackUrl: {callback_url}
+
+## Important Rules
+- Never write product code yourself — always delegate to development agents
+- If you cannot determine the platform or repo, ask the user via `request_user_input`
+- Always ACK per-task agents after all review cycles are complete
+- Include PR URL and branch in your final artifacts metadata (prUrl, branch fields)
+- Maximum review cycles: {MAX_REVIEW_CYCLES}
+- If Jira ticket found, include jiraInReview=true in final artifacts when PR is created
+"""
+
+
+# ---------------------------------------------------------------------------
 # Main workflow
 # ---------------------------------------------------------------------------
 
@@ -2779,9 +2859,9 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
     """
     Full Team Lead workflow running in a background thread.
 
-    Phases:
-      ANALYZING → GATHERING_INFO → PLANNING → [INPUT_REQUIRED] →
-      EXECUTING → REVIEWING → COMPLETING → TASK_STATE_COMPLETED
+    Uses the connect-agent agentic runtime to autonomously drive the workflow:
+    Analyze → Gather → Plan → Execute → Review → Complete
+    The LLM decides the workflow sequence using available tools.
     """
     task = task_store.get(team_lead_task_id)
     if not task:
@@ -2792,7 +2872,6 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
     callback_url = ctx.compass_callback_url
     workspace = ctx.shared_workspace_path
     user_text = ctx.user_text
-    final_artifacts: list = []
     runtime_config = {
         "runtime": summarize_runtime_configuration(),
         "rulesLoaded": bool(load_rules("team-lead")),
@@ -2800,16 +2879,46 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         "skillPlaybooks": list(_DEVELOPMENT_SKILL_NAMES),
     }
 
+    # Build the blocking input handler for the runtime
+    def _wait_for_user_input(question: str) -> str | None:
+        """Block until user provides input, relaying through Compass."""
+        task_store.update_state(team_lead_task_id, "TASK_STATE_INPUT_REQUIRED", question)
+        input_event = threading.Event()
+        with _INPUT_EVENTS_LOCK:
+            _INPUT_EVENTS[team_lead_task_id] = {"event": input_event, "info": None}
+        # Notify Compass about INPUT_REQUIRED
+        _notify_compass(
+            callback_url, team_lead_task_id,
+            "TASK_STATE_INPUT_REQUIRED",
+            prompts.INPUT_REQUIRED_PREAMBLE + question,
+        )
+        # Block until user responds or timeout
+        if not input_event.wait(timeout=INPUT_WAIT_TIMEOUT):
+            with _INPUT_EVENTS_LOCK:
+                _INPUT_EVENTS.pop(team_lead_task_id, None)
+            return None
+        with _INPUT_EVENTS_LOCK:
+            entry = _INPUT_EVENTS.pop(team_lead_task_id, {})
+        user_reply = entry.get("info") or ""
+        # Resume working state
+        task_store.update_state(team_lead_task_id, "TASK_STATE_WORKING", "Resumed with user input")
+        return user_reply
+
     configure_control_tools(
         task_context={
             "taskId": team_lead_task_id,
             "agentId": AGENT_ID,
             "workspacePath": workspace,
-            "permissions": ctx.permissions if hasattr(ctx, "permissions") else None,
+            "permissions": ctx.permissions,
+            "compassTaskId": compass_task_id,
+            "callbackUrl": callback_url,
+            "orchestratorUrl": orchestrator_url,
+            "userText": user_text[:500],
         },
-        complete_fn=lambda result, artifacts: task_store.update_state(team_lead_task_id, "TASK_STATE_COMPLETED", result),
-        fail_fn=lambda error: task_store.update_state(team_lead_task_id, "TASK_STATE_FAILED", error),
-        input_required_fn=lambda question, context: task_store.update_state(team_lead_task_id, "TASK_STATE_INPUT_REQUIRED", question),
+        complete_fn=lambda result, artifacts: None,  # We handle completion ourselves
+        fail_fn=lambda error: None,  # We handle failure ourselves
+        input_required_fn=lambda question, context: None,  # Handled by wait_for_input_fn
+        wait_for_input_fn=_wait_for_user_input,
     )
 
     def log(phase: str):
@@ -2818,776 +2927,56 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         ctx.phases_log.append(entry)
         print(f"[{AGENT_ID}][{team_lead_task_id}] {phase}")
         _append_workspace_file(workspace, "team-lead/command-log.txt", entry + "\n")
-        _save_workspace_file(
-            workspace,
-            "team-lead/stage-summary.json",
-            json.dumps(
-                {
-                    "taskId": team_lead_task_id,
-                    "agentId": AGENT_ID,
-                    "currentPhase": phase,
-                    "analysis": ctx.analysis,
-                    "hasPlan": bool(ctx.plan),
-                    "reviewCycles": ctx.review_cycles,
-                    "reviewPassed": (ctx.review_result or {}).get("passed") if ctx.review_result else None,
-                    "pendingTasks": ctx.pending_tasks,
-                    "runtimeConfig": runtime_config,
-                    "updatedAt": local_iso_timestamp(),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
         _report_progress(orchestrator_url, compass_task_id, phase)
 
+    # Build the system prompt from manifest files
+    system_prompt = build_system_prompt_from_manifest(os.path.dirname(__file__))
+
+    # Build the agentic task prompt with full context
+    task_prompt = _build_team_lead_task_prompt(
+        user_text=user_text,
+        workspace=workspace,
+        compass_task_id=compass_task_id,
+        team_lead_task_id=team_lead_task_id,
+        callback_url=callback_url,
+        permissions=ctx.permissions,
+        runtime_config=runtime_config,
+    )
+
     try:
-        # ── Phase 1: Analyze ─────────────────────────────────────────────────
-        task_store.update_state(team_lead_task_id, "ANALYZING", "Analyzing the request…")
-        log("Analyzing request")
-        analysis = _analyze_task(user_text)
-        analysis = _ensure_jira_ticket_for_workflow(analysis, user_text)
-        ctx.analysis = analysis
-        log(
-            f"Analysis complete — type={analysis.get('task_type')}, "
-            f"platform={analysis.get('platform')}"
+        log("Starting agentic workflow")
+        task_store.update_state(team_lead_task_id, "TASK_STATE_WORKING", "Analyzing task...")
+
+        runtime = get_runtime()
+        result = runtime.run_agentic(
+            task=task_prompt,
+            system_prompt=system_prompt,
+            cwd=workspace or os.getcwd(),
+            tools=[
+                # Gathering tools
+                "jira_get_ticket", "jira_add_comment",
+                "design_fetch_figma_screen", "design_fetch_stitch_screen",
+                # Orchestration tools
+                "dispatch_agent_task", "wait_for_agent_task", "ack_agent_task",
+                "launch_per_task_agent",
+                # Control tools
+                "request_user_input", "report_progress",
+                "registry_query", "list_available_agents", "check_agent_status",
+                "get_task_context", "get_agent_runtime_status",
+                # Planning and utility
+                "todo_write", "load_skill",
+                "read_file", "write_file", "glob", "grep",
+                # Validation
+                "run_validation_command", "collect_task_evidence",
+                "check_definition_of_done",
+            ],
+            max_turns=100,
+            timeout=TASK_TIMEOUT,
         )
 
-        # ── Phase 2: Gather external info ───────────────────────────────────
-        task_store.update_state(team_lead_task_id, "GATHERING_INFO", "Gathering required information…")
-        tech_stack_constraints: dict[str, str] = {}
-        input_rounds = 0
-        needs_reanalysis = False
-
-        for gather_round in range(1, MAX_GATHER_ROUNDS + 1):
-            if needs_reanalysis:
-                analysis = _refresh_analysis_with_known_context(
-                    user_text,
-                    ctx,
-                    analysis,
-                    log_fn=log,
-                )
-
-            tech_stack_constraints, _stack_needs_clarification, _stack_clarification_q = (
-                _infer_tech_stack_agentic(user_text, ctx)
-            )
-            if tech_stack_constraints:
-                log(
-                    "Tech stack inferred: "
-                    + ", ".join(f"{key}={value}" for key, value in tech_stack_constraints.items())
-                )
-            elif _stack_needs_clarification and _stack_clarification_q:
-                # Agentic inference could not determine the stack from Jira/repo context;
-                # surface it as a user question so the gather loop can pick it up.
-                if not _has_tech_stack_signal(str(analysis.get("question_for_user") or "")):
-                    analysis["question_for_user"] = _stack_clarification_q
-                _missing = [str(i).strip() for i in (analysis.get("missing_info") or []) if str(i).strip()]
-                if not any(_has_tech_stack_signal(i) for i in _missing):
-                    _missing.insert(0, "confirmed tech stack / framework")
-                    analysis["missing_info"] = _missing
-                log(f"Tech stack unknown after Jira+repo inspection — queued user question: {_stack_clarification_q}")
-            analysis = _apply_platform_evidence_policy(
-                analysis,
-                user_text,
-                ctx.additional_info or "",
-                (ctx.jira_info or {}).get("content") or "",
-                (ctx.repo_info or {}).get("content") or "",
-                tech_stack_constraints=tech_stack_constraints,
-            )
-            analysis = _apply_tech_stack_confirmation_policy(analysis, tech_stack_constraints, user_text)
-            ctx.analysis = analysis
-
-            if _is_validation_checkpoint_ready(ctx, analysis, tech_stack_constraints):
-                ctx.pending_tasks = ["Proceed to implementation planning"]
-                _save_gather_plan(
-                    workspace,
-                    {
-                        "pending_tasks": ctx.pending_tasks,
-                        "actions": [
-                            {
-                                "action": _GATHER_ACTION_PROCEED,
-                                "reason": (
-                                    "Validation checkpoint mode has the essential context needed to create the implementation plan."
-                                ),
-                            }
-                        ],
-                        "summary": "Ready to create the implementation plan for validation checkpoint.",
-                        "capability_snapshot": _available_capability_snapshot(force=(gather_round > 1)),
-                    },
-                )
-                log(
-                    f"Gather round {gather_round} pending tasks: "
-                    + ", ".join(ctx.pending_tasks)
-                )
-                break
-
-            gather_plan = _plan_information_gathering(
-                user_text,
-                analysis,
-                ctx,
-                force_refresh=(gather_round > 1),
-            )
-            if _should_prioritize_stack_question(analysis, ctx):
-                question = str(analysis.get("question_for_user") or "").strip()
-                gather_plan = {
-                    "pending_tasks": [f"Ask user: {question}"],
-                    "actions": [
-                        {
-                            "action": _GATHER_ACTION_ASK_USER,
-                            "question": question,
-                            "reason": (
-                                "Repository discovery did not determine the web tech stack; "
-                                "ask the user now before continuing lower-priority fetches."
-                            ),
-                        }
-                    ],
-                    "summary": "Need user tech stack confirmation before further planning.",
-                    "capability_snapshot": gather_plan.get("capability_snapshot") or {},
-                }
-            ctx.pending_tasks = list(gather_plan.get("pending_tasks") or [])
-            _save_gather_plan(workspace, gather_plan)
-            log(
-                f"Gather round {gather_round} pending tasks: "
-                + (", ".join(ctx.pending_tasks) if ctx.pending_tasks else "none")
-            )
-
-            actions = list(gather_plan.get("actions") or [])
-            if not actions:
-                break
-
-            fetch_actions = [
-                action for action in actions if action.get("action") == _GATHER_ACTION_FETCH
-            ]
-            if fetch_actions:
-                round_progress = False
-                for action in fetch_actions:
-                    round_progress = _execute_gather_action(
-                        action,
-                        analysis,
-                        ctx,
-                        team_lead_task_id=team_lead_task_id,
-                        workspace=workspace,
-                        compass_task_id=compass_task_id,
-                        log_fn=log,
-                    ) or round_progress
-                if round_progress:
-                    needs_reanalysis = True
-                    continue
-
-                fallback_plan = _build_fallback_gather_plan(
-                    analysis,
-                    ctx,
-                    _available_capability_snapshot(force=True),
-                )
-                fallback_fetch_actions = _select_new_fallback_fetch_actions(fetch_actions, fallback_plan)
-                if fallback_fetch_actions:
-                    ctx.pending_tasks = list(fallback_plan.get("pending_tasks") or [])
-                    _save_gather_plan(workspace, fallback_plan)
-                    log("No new boundary context fetched from current plan — retrying with fallback fetch actions")
-                    fallback_progress = False
-                    for action in fallback_fetch_actions:
-                        fallback_progress = _execute_gather_action(
-                            action,
-                            analysis,
-                            ctx,
-                            team_lead_task_id=team_lead_task_id,
-                            workspace=workspace,
-                            compass_task_id=compass_task_id,
-                            log_fn=log,
-                        ) or fallback_progress
-                    if fallback_progress:
-                        needs_reanalysis = True
-                        continue
-
-                fallback_actions = [
-                    item for item in (fallback_plan.get("actions") or [])
-                    if item.get("action") != _GATHER_ACTION_FETCH
-                ]
-                if not fallback_actions:
-                    break
-
-                ctx.pending_tasks = list(fallback_plan.get("pending_tasks") or [])
-                _save_gather_plan(workspace, fallback_plan)
-                log("No new boundary context fetched — falling back to clarification/proceed decision")
-                actions = fallback_actions
-
-            next_action = actions[0]
-            action_type = next_action.get("action")
-            if action_type == _GATHER_ACTION_ASK_USER:
-                # Before escalating to the user, check whether the question
-                # covers context that was already gathered from boundary agents.
-                # If it does, skip it and proceed to planning rather than
-                # blocking on an unnecessary clarification round.
-                _q_text = str(next_action.get("question") or "").lower()
-                _suppress_gather_q = False
-                if _jira_fetch_succeeded(ctx):
-                    _jira_q_kws = {
-                        "acceptance criteria", "acceptancecriteria", "jira ticket",
-                        "jira browse", "atlassian.net", "browse/", "checklist item",
-                        "story criteria", "pass/fail", "qa step", "test/qa",
-                    }
-                    if any(kw in _q_text for kw in _jira_q_kws):
-                        log(f"Suppressing gather-plan question (Jira already fetched): {next_action.get('question')}")
-                        _suppress_gather_q = True
-                if not _suppress_gather_q:
-                    _design_q_kws = {"figma", "stitch", "design url", "design link",
-                                     "design file", "wireframe url", "mockup url",
-                                     "canonical design", "design reference"}
-                    if any(kw in _q_text for kw in _design_q_kws):
-                        _design_url_in_ctx = (
-                            (ctx.design_info and ctx.design_info.get("content"))
-                            or str(analysis.get("design_url") or "").strip()
-                            or any(
-                                kw in str(ctx.additional_info or "").lower()
-                                for kw in ("figma.com", "stitch.", "figma.design",
-                                           "figma/design", "node-id")
-                            )
-                        )
-                        if _design_url_in_ctx:
-                            log(f"Suppressing design URL question (design URL already known): {next_action.get('question')}")
-                            _suppress_gather_q = True
-                if not _suppress_gather_q and _jira_fetch_succeeded(ctx) and _repo_url_known(analysis, ctx):
-                    _org_q_kws = {
-                        "reviewer", "code owner", "code reviewer", "pr reviewer",
-                        "readme template", "readme format", "org-specific",
-                        "wording requirement", "wording requirements",
-                        "naming convention", "commit convention",
-                        # PR state/review outcome is an SCM concern — never block gather with it
-                        "review outcome", "pr review", "approve or request",
-                        "merge the existing pr", "merge or rework",
-                        "should i review", "shall i review",
-                        # Existing PR / branch strategy decisions — always proceed with new impl
-                        "existing pr", "existing pull request", "open a new pr", "new pr",
-                        "update the existing", "create a new pr", "create a new branch",
-                        "open new pr", "existing prs", "prior pr",
-                        "pr #", "pull request #", "pr number", "pull request number",
-                        "whether to open", "whether to create", "should i open",
-                        "update or create", "merge or open", "new pull request",
-                    }
-                    if any(kw in _q_text for kw in _org_q_kws):
-                        log(f"Suppressing gather-plan question (jira+repo context available): {next_action.get('question')}")
-                        _suppress_gather_q = True
-                if _suppress_gather_q:
-                    # Treat as proceed: all resolvable context is already in hand.
-                    break
-
-                if input_rounds >= MAX_INPUT_ROUNDS:
-                    raise RuntimeError(
-                        f"Team Lead exceeded the maximum clarification rounds ({MAX_INPUT_ROUNDS})."
-                    )
-                input_rounds += 1
-                question = str(next_action.get("question") or analysis.get("question_for_user") or "").strip()
-                if not question:
-                    raise RuntimeError("Gather plan requested user clarification without a question.")
-
-                log(f"Missing critical info — asking user: {question}")
-                task_store.update_state(team_lead_task_id, "TASK_STATE_INPUT_REQUIRED", question)
-
-                input_event = threading.Event()
-                with _INPUT_EVENTS_LOCK:
-                    _INPUT_EVENTS[team_lead_task_id] = {"event": input_event, "info": None}
-
-                _notify_compass(
-                    callback_url,
-                    team_lead_task_id,
-                    "TASK_STATE_INPUT_REQUIRED",
-                    prompts.INPUT_REQUIRED_PREAMBLE + question,
-                )
-
-                if not input_event.wait(timeout=INPUT_WAIT_TIMEOUT):
-                    task_store.update_state(
-                        team_lead_task_id,
-                        "TASK_STATE_FAILED",
-                        "Timed out waiting for user input.",
-                    )
-                    # Register so the finally block's _delayed_cleanup can wait for
-                    # Compass ACK (or its timeout) before the container shuts down.
-                    exit_handler.register(team_lead_task_id)
-                    _notify_compass(
-                        callback_url,
-                        team_lead_task_id,
-                        "TASK_STATE_FAILED",
-                        "Timed out waiting for user input.",
-                    )
-                    return
-
-                with _INPUT_EVENTS_LOCK:
-                    entry = _INPUT_EVENTS.pop(team_lead_task_id, {})
-                    new_info = entry.get("info") or ""
-
-                ctx.additional_info = (
-                    (ctx.additional_info + "\n" + new_info).strip() if ctx.additional_info else new_info
-                )
-                log(f"User provided additional info: {new_info[:120]}")
-                task_store.update_state(team_lead_task_id, "ANALYZING", "Re-analyzing with additional information…")
-                needs_reanalysis = True
-                continue
-
-            if action_type == _GATHER_ACTION_STOP:
-                raise RuntimeError(str(next_action.get("reason") or "Team Lead stopped during information gathering."))
-
-            ctx.pending_tasks = []
-            break
-        else:
-            raise RuntimeError(
-                f"Team Lead exceeded the maximum information-gathering rounds ({MAX_GATHER_ROUNDS})."
-            )
-
-        # ── Phase 4: Plan ────────────────────────────────────────────────────
-        unresolved_missing = _filter_unresolved_missing_info(analysis, ctx, tech_stack_constraints)
-        if unresolved_missing and not _should_stop_before_dev_dispatch(ctx):
-            # Ask the user rather than hard-failing, so transient info gaps
-            # (e.g. Jira permission errors, unknown platform) surface as a
-            # question instead of a dead-end failure.
-            if input_rounds < MAX_INPUT_ROUNDS:
-                input_rounds += 1
-                question = (
-                    "I could not gather all the context needed to start implementation. "
-                    "Please clarify: "
-                    + "; ".join(unresolved_missing[:3])
-                )
-                log(f"Unresolved missing info — asking user: {question}")
-                task_store.update_state(team_lead_task_id, "TASK_STATE_INPUT_REQUIRED", question)
-                input_event = threading.Event()
-                with _INPUT_EVENTS_LOCK:
-                    _INPUT_EVENTS[team_lead_task_id] = {"event": input_event, "info": None}
-                _notify_compass(
-                    callback_url,
-                    team_lead_task_id,
-                    "TASK_STATE_INPUT_REQUIRED",
-                    prompts.INPUT_REQUIRED_PREAMBLE + question,
-                )
-                if not input_event.wait(timeout=INPUT_WAIT_TIMEOUT):
-                    task_store.update_state(team_lead_task_id, "TASK_STATE_FAILED",
-                                           "Timed out waiting for user input.")
-                    exit_handler.register(team_lead_task_id)
-                    _notify_compass(callback_url, team_lead_task_id, "TASK_STATE_FAILED",
-                                   "Timed out waiting for user input.")
-                    return
-                with _INPUT_EVENTS_LOCK:
-                    entry = _INPUT_EVENTS.pop(team_lead_task_id, {})
-                    new_info = entry.get("info") or ""
-                ctx.additional_info = (
-                    (ctx.additional_info + "\n" + new_info).strip() if ctx.additional_info else new_info
-                )
-                log(f"User provided additional info for planning: {new_info[:120]}")
-                # Re-derive unresolved after user input; if still unresolved, proceed anyway.
-                analysis["missing_info"] = []
-            else:
-                raise RuntimeError(
-                    "Cannot create implementation plan with unresolved missing information: "
-                    + "; ".join(unresolved_missing[:3])
-                )
-
-        task_store.update_state(team_lead_task_id, "PLANNING", "Creating implementation plan…")
-        log("Creating implementation plan")
-
-        # Extract repo URL from analysis (may have been pulled from Jira ticket content)
-        target_repo_url = (ctx.analysis or {}).get("target_repo_url") or ""
-        if not target_repo_url and ctx.jira_info and ctx.jira_info.get("content"):
-            # Fall back to regex scan of the Jira ticket body
-            _repo_match = re.search(
-                r"https?://(?:github\.com|bitbucket\.org)/[^\s/]+/[^\s/\])\"']+",
-                ctx.jira_info["content"],
-            )
-            if _repo_match:
-                target_repo_url = _repo_match.group().rstrip(".,;)")
-                log(f"Extracted repo URL from Jira ticket: {target_repo_url}")
-
-        plan = _create_plan(
-            user_text,
-            ctx.jira_info,
-            ctx.repo_info,
-            ctx.design_info,
-            ctx.additional_info,
-            target_repo_url,
-            tech_stack_constraints=tech_stack_constraints,
-        )
-        ctx.plan = plan
-        dev_capability = plan.get("dev_capability") or "web.task.execute"
-        log(
-            f"Plan ready — platform={plan.get('platform')}, "
-            f"capability={dev_capability}"
-        )
-        # Save plan to shared workspace
-        _save_workspace_file(
-            workspace,
-            "team-lead/plan.json",
-            json.dumps(plan, ensure_ascii=False, indent=2),
-        )
-
-        # ── Phase 5: Execute ─────────────────────────────────────────────────
-        task_store.update_state(
-            team_lead_task_id, "EXECUTING",
-            f"Dispatching to {dev_capability}…",
-        )
-        log(f"Looking up dev agent for capability: {dev_capability}")
-
-        if _should_stop_before_dev_dispatch(ctx):
-            checkpoint = {
-                "taskId": team_lead_task_id,
-                "agentId": AGENT_ID,
-                "readyToDispatchCapability": dev_capability,
-                "techStackConstraints": tech_stack_constraints,
-                "pendingTasks": ctx.pending_tasks,
-                "plan": {
-                    "platform": plan.get("platform"),
-                    "targetRepoUrl": plan.get("target_repo_url") or target_repo_url or "",
-                    "acceptanceCriteria": plan.get("acceptance_criteria") or [],
-                },
-                "updatedAt": local_iso_timestamp(),
-            }
-            _save_workspace_file(
-                workspace,
-                "team-lead/pre-dispatch-checkpoint.json",
-                json.dumps(checkpoint, ensure_ascii=False, indent=2),
-            )
-            checkpoint_text = (
-                f"Validation checkpoint reached. Team Lead gathered the required context, "
-                f"created the implementation plan, and is ready to dispatch {dev_capability}. "
-                "The workflow intentionally stopped before launching the development agent."
-            )
-            checkpoint_artifact = build_text_artifact(
-                "team-lead-pre-dispatch-checkpoint",
-                checkpoint_text,
-                metadata={
-                    "agentId": AGENT_ID,
-                    "capability": "team-lead.task.analyze",
-                    "orchestratorTaskId": compass_task_id,
-                    "teamLeadTaskId": team_lead_task_id,
-                    "validationCheckpoint": True,
-                    "readyToDispatchCapability": dev_capability,
-                },
-            )
-            log("Validation checkpoint reached — stopping before dev dispatch")
-            summary = _generate_summary(user_text, ctx.phases_log, "COMPLETED", [checkpoint_artifact])
-            _save_workspace_file(workspace, "team-lead/final-summary.md", summary)
-            final_summary_artifact = build_text_artifact(
-                "team-lead-summary",
-                summary,
-                metadata={
-                    "agentId": AGENT_ID,
-                    "capability": "team-lead.task.analyze",
-                    "orchestratorTaskId": compass_task_id,
-                    "teamLeadTaskId": team_lead_task_id,
-                    "platform": (ctx.plan or {}).get("platform", "unknown"),
-                    "reviewCycles": ctx.review_cycles,
-                    "reviewPassed": True,
-                    "validationCheckpoint": True,
-                    "readyToDispatchCapability": dev_capability,
-                },
-            )
-            all_artifacts = [final_summary_artifact, checkpoint_artifact]
-            task_store.update_state(team_lead_task_id, "TASK_STATE_COMPLETED", summary)
-            audit_log(
-                "TASK_COMPLETED",
-                task_id=team_lead_task_id,
-                compass_task_id=compass_task_id,
-                validation_checkpoint=True,
-            )
-            exit_handler.register(team_lead_task_id)
-            _notify_compass(callback_url, team_lead_task_id, "TASK_STATE_COMPLETED", summary, all_artifacts)
-            return
-
-        agent_def, instance, dev_service_url = _acquire_dev_agent(
-            dev_capability,
-            team_lead_task_id,
-            log_fn=log,
-            role_label="dev agent",
-        )
-        agent_id_str = agent_def["agent_id"]
-        instance_id_str = instance["instance_id"]
-
-        try:
-            registry.mark_instance_busy(agent_id_str, instance_id_str, team_lead_task_id)
-        except Exception:
-            pass
-
-        dev_message = {
-            "messageId": f"tl-{team_lead_task_id}-dev-{int(time.time())}",
-            "role": "ROLE_USER",
-            "parts": [{"text": plan.get("dev_instruction") or user_text}],
-            "metadata": _build_dev_task_metadata(
-                dev_capability=dev_capability,
-                compass_task_id=compass_task_id,
-                team_lead_task_id=team_lead_task_id,
-                workspace=workspace,
-                target_repo_url=plan.get("target_repo_url") or target_repo_url or "",
-                permissions=ctx.permissions,
-                tech_stack_constraints=tech_stack_constraints,
-                acceptance_criteria=plan.get("acceptance_criteria") or [],
-                requires_tests=plan.get("requires_tests", False),
-                screenshot_requirements=plan.get("screenshot_requirements"),
-                jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
-                jira_context=ctx.jira_info,
-                design_context=ctx.design_info,
-            ),
-        }
-
-        dev_task = _a2a_send(dev_service_url, dev_message)
-        dev_task_id = dev_task.get("id", "")
-        # Remember service URL and task ID so we can reuse the same container for revisions
-        ctx.dev_service_url = dev_service_url
-        ctx.dev_task_id = dev_task_id
-        log(f"Dev task submitted: {dev_task_id}")
-
-        # Wait for dev agent completion (callback + polling fallback)
-        dev_result = _wait_for_dev_completion(team_lead_task_id, dev_task_id, dev_service_url)
-        if dev_result is None:
-            raise RuntimeError(
-                f"Dev agent '{agent_id_str}' timed out after {TASK_TIMEOUT} s."
-            )
-
-        try:
-            registry.mark_instance_idle(agent_id_str, instance_id_str)
-        except Exception:
-            pass
-
-        ctx.dev_result = dev_result
-        dev_state = dev_result.get("state", "TASK_STATE_FAILED")
-        dev_output = dev_result.get("status_message", "")
-        final_artifacts = dev_result.get("artifacts", [])
-        log(f"Dev agent completed — state={dev_state}")
-
-        if dev_state in ("TASK_STATE_FAILED", "FAILED"):
-            permission_denial = extract_permission_denial({"artifacts": final_artifacts})
-            if permission_denial is not None and ctx.dev_service_url:
-                approved = _request_permission_approval(
-                    team_lead_task_id,
-                    callback_url,
-                    workspace,
-                    ctx,
-                    permission_denial,
-                )
-                if not approved:
-                    raise RuntimeError(
-                        f"User denied permission request for '{permission_denial.action}' on '{permission_denial.target}'."
-                    )
-
-                retry_feedback = (
-                    "Permission approved by the user. Retry the blocked operation and continue the task.\n\n"
-                    f"Agent: {permission_denial.target_agent}\n"
-                    f"Action: {permission_denial.action}\n"
-                    f"Target: {permission_denial.target or '(unspecified)'}"
-                )
-                retry_message = {
-                    "messageId": f"tl-{team_lead_task_id}-perm-retry-{int(time.time())}",
-                    "role": "ROLE_USER",
-                    "parts": [{"text": retry_feedback}],
-                    "metadata": _build_dev_task_metadata(
-                        dev_capability=dev_capability,
-                        compass_task_id=compass_task_id,
-                        team_lead_task_id=team_lead_task_id,
-                        workspace=workspace,
-                        target_repo_url=plan.get("target_repo_url") or target_repo_url or "",
-                        permissions=ctx.permissions,
-                        tech_stack_constraints=tech_stack_constraints,
-                        acceptance_criteria=plan.get("acceptance_criteria") or [],
-                        requires_tests=plan.get("requires_tests", False),
-                        screenshot_requirements=plan.get("screenshot_requirements"),
-                        jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
-                        jira_context=ctx.jira_info,
-                        is_revision=True,
-                        revision_cycle=0,
-                        review_issues=[retry_feedback],
-                        design_context=ctx.design_info,
-                    ),
-                }
-                retry_task = _a2a_send(ctx.dev_service_url, retry_message)
-                retry_task_id = retry_task.get("id", "")
-                ctx.dev_task_id = retry_task_id
-                log(f"Dev task permission retry submitted: {retry_task_id}")
-                retry_result = _wait_for_dev_completion(team_lead_task_id, retry_task_id, ctx.dev_service_url)
-                if retry_result is None:
-                    raise RuntimeError(
-                        f"Dev agent permission retry timed out after {TASK_TIMEOUT} s."
-                    )
-                ctx.dev_result = retry_result
-                dev_state = retry_result.get("state", "TASK_STATE_FAILED")
-                dev_output = retry_result.get("status_message", "")
-                final_artifacts = retry_result.get("artifacts", [])
-                log(f"Dev agent permission retry completed — state={dev_state}")
-
-        if dev_state in ("TASK_STATE_FAILED", "FAILED"):
-            raise RuntimeError(f"Dev agent failed: {(dev_output or '')[:300]}")
-
-        # ── Phase 6: Review ──────────────────────────────────────────────────
-        for review_cycle in range(MAX_REVIEW_CYCLES):
-            ctx.review_cycles = review_cycle + 1
-            task_store.update_state(
-                team_lead_task_id, "REVIEWING",
-                f"Reviewing output (cycle {review_cycle + 1}/{MAX_REVIEW_CYCLES})…",
-            )
-            log(f"Reviewing dev output (cycle {review_cycle + 1}/{MAX_REVIEW_CYCLES})")
-
-            review = _review_output_with_timeout(
-                user_text, plan, dev_output, final_artifacts,
-                design_info=ctx.design_info, workspace=workspace,
-                timeout_seconds=300,
-            )
-            ctx.review_result = review
-            _save_workspace_file(
-                workspace,
-                "team-lead/review-notes.json",
-                json.dumps(
-                    {
-                        "taskId": team_lead_task_id,
-                        "agentId": AGENT_ID,
-                        "cycle": review_cycle + 1,
-                        "review": review,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-
-            passed = review.get("passed", True)
-            score = review.get("score")
-            if score is None:
-                score = "N/A"
-            review_summary = review.get("summary", "")
-            log(f"Review result — passed={passed}, score={score}: {review_summary}")
-
-            if passed:
-                break
-
-            if review_cycle >= MAX_REVIEW_CYCLES - 1:
-                log(
-                    f"Max review cycles reached ({MAX_REVIEW_CYCLES}). "
-                    "Accepting output with noted issues."
-                )
-                break
-
-            feedback = review.get("feedback_for_dev") or ""
-            log(f"Review failed — sending revision request to dev agent: {feedback[:120]}")
-
-            # Post review feedback to the PR as a comment (best-effort)
-            _pr_url = _read_pr_url_from_workspace(workspace)
-            if _pr_url:
-                _post_pr_review_comment(
-                    _pr_url,
-                    feedback,
-                    workspace,
-                    team_lead_task_id,
-                    permissions=ctx.permissions,
-                )
-
-            # Post review rejection as a Jira comment for audit trail (best-effort)
-            if ctx.jira_info and ctx.jira_info.get("content") and (ctx.analysis or {}).get("jira_ticket_key"):
-                ticket_key = ctx.analysis["jira_ticket_key"]
-                issues_text = "\n".join(f"- {i}" for i in (review.get("issues") or []))
-                jira_review_comment = (
-                    f"Code Review — Cycle {review_cycle + 1} — REJECTED (score: {score})\n\n"
-                    f"Issues found:\n{issues_text or '(see feedback below)'}\n\n"
-                    f"Feedback for developer:\n{feedback[:1200]}"
-                )
-                try:
-                    _call_sync_agent(
-                        "jira.comment.add",
-                        f"Add comment to ticket {ticket_key}: {jira_review_comment}",
-                        team_lead_task_id,
-                        workspace,
-                        compass_task_id,
-                        permissions=ctx.permissions,
-                        ctx=ctx,
-                        callback_url=callback_url,
-                    )
-                    log(f"Posted review rejection comment to Jira ticket {ticket_key} (cycle {review_cycle + 1})")
-                except Exception as _jira_err:
-                    log(f"Warning: could not post review rejection comment to Jira: {_jira_err}")
-
-            # Reuse the SAME dev agent container (it is still running, waiting for our ACK).
-            # Do NOT call _acquire_dev_agent again — that would try to launch a new container
-            # which may cause DNS / timing issues while the first container is still alive.
-            revision_service_url = ctx.dev_service_url
-            if not revision_service_url:
-                log("Warning: no dev agent service URL stored; cannot send revision")
-                break
-
-            revision_message = {
-                "messageId": f"tl-{team_lead_task_id}-rev-{review_cycle + 1}",
-                "role": "ROLE_USER",
-                "parts": [
-                    {
-                        "text": (
-                            "Please revise your implementation based on the following "
-                            f"code review feedback:\n\n{feedback}"
-                        )
-                    }
-                ],
-                "metadata": _build_dev_task_metadata(
-                    dev_capability=dev_capability,
-                    compass_task_id=compass_task_id,
-                    team_lead_task_id=team_lead_task_id,
-                    workspace=workspace,
-                    target_repo_url=plan.get("target_repo_url") or target_repo_url or "",
-                    permissions=ctx.permissions,
-                    tech_stack_constraints=tech_stack_constraints,
-                    acceptance_criteria=plan.get("acceptance_criteria") or [],
-                    requires_tests=plan.get("requires_tests", False),
-                    screenshot_requirements=plan.get("screenshot_requirements"),
-                    jira_ticket_key=str((ctx.analysis or {}).get("jira_ticket_key") or "").strip(),
-                    jira_context=ctx.jira_info,
-                    is_revision=True,
-                    revision_cycle=review_cycle + 1,
-                    review_issues=review.get("issues") or [],
-                    design_context=ctx.design_info,
-                ),
-            }
-            rev_task = _a2a_send(revision_service_url, revision_message)
-            rev_task_id = rev_task.get("id", "")
-            ctx.dev_task_id = rev_task_id  # track latest task ID for final ACK
-            log(f"Revision task submitted to same dev agent: {rev_task_id}")
-
-            rev_result = _wait_for_dev_completion(
-                team_lead_task_id, rev_task_id, revision_service_url
-            )
-            if rev_result:
-                dev_output = rev_result.get("status_message", dev_output)
-                final_artifacts = rev_result.get("artifacts") or final_artifacts
-                ctx.dev_result = rev_result
-            else:
-                log("Warning: revision task timed out, keeping previous output.")
-
-        # After all review cycles are done, ACK the dev agent so it can shut down.
-        if ctx.dev_service_url and ctx.dev_task_id:
-            log(f"ACK-ing dev agent (task={ctx.dev_task_id}) — releasing it to shut down")
-            _ack_agent(ctx.dev_service_url, ctx.dev_task_id)
-
-        # ── Phase 7: Update Jira and finalise ───────────────────────────────
-        task_store.update_state(team_lead_task_id, "COMPLETING", "Finalizing and summarizing…")
-
-        if ctx.jira_info and (ctx.analysis or {}).get("jira_ticket_key"):
-            ticket_key = ctx.analysis["jira_ticket_key"]
-            review_note = (
-                f"Review: passed={ctx.review_result.get('passed', 'N/A')}, "
-                f"cycles={ctx.review_cycles}, "
-                f"score={ctx.review_result.get('score', 'N/A')}"
-                if ctx.review_result else f"Review cycles: {ctx.review_cycles}"
-            )
-            comment = (
-                f"Team Lead Agent completed implementation.\n"
-                f"{review_note}\n"
-                f"Output summary: {(dev_output or '')[:400]}"
-            )
-            try:
-                _call_sync_agent(
-                    "jira.comment.add",
-                    f"Add comment to ticket {ticket_key}: {comment}",
-                    team_lead_task_id,
-                    workspace,
-                    compass_task_id,
-                    permissions=ctx.permissions,
-                    ctx=ctx,
-                    callback_url=callback_url,
-                )
-                log(f"Jira ticket {ticket_key} updated with completion comment")
-            except Exception as err:
-                log(f"Warning: could not update Jira ticket {ticket_key}: {err}")
-
-        log("Generating task summary")
-        summary = _generate_summary(user_text, ctx.phases_log, "COMPLETED", final_artifacts)
-        _save_workspace_file(workspace, "team-lead/final-summary.md", summary)
-
+        # Extract result and build artifacts
+        summary = result.summary or "Team Lead workflow completed."
+        final_artifacts = []
         final_summary_artifact = build_text_artifact(
             "team-lead-summary",
             summary,
@@ -3596,56 +2985,62 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 "capability": "team-lead.task.analyze",
                 "orchestratorTaskId": compass_task_id,
                 "teamLeadTaskId": team_lead_task_id,
-                "platform": (ctx.plan or {}).get("platform", "unknown"),
-                "reviewCycles": ctx.review_cycles,
-                "reviewPassed": (ctx.review_result or {}).get("passed", True),
-                # True when Team Lead exhausted all review cycles and accepted the output
-                # with noted issues. Compass must NOT trigger a completeness retry in this case
-                # because Team Lead has already made a deliberate accept-with-defects decision.
-                "reviewMaxCyclesReached": ctx.review_cycles >= MAX_REVIEW_CYCLES,
             },
         )
-        all_artifacts = [final_summary_artifact] + (final_artifacts or [])
+        final_artifacts.append(final_summary_artifact)
 
-        task_store.update_state(team_lead_task_id, "TASK_STATE_COMPLETED", summary)
-        _final_review_passed = (ctx.review_result or {}).get("passed", True)
-        if _final_review_passed:
+        # Try to extract PR evidence from the runtime result
+        if result.artifacts:
+            for art in result.artifacts:
+                final_artifacts.append(art)
+
+        if result.success:
+            task_store.update_state(team_lead_task_id, "TASK_STATE_COMPLETED", summary)
             log("Task completed successfully")
+            audit_log(
+                "TASK_COMPLETED",
+                task_id=team_lead_task_id,
+                compass_task_id=compass_task_id,
+            )
         else:
-            log("Task completed with review issues noted (max review cycles reached — proceeding with defects logged)")
-        audit_log(
-            "TASK_COMPLETED",
-            task_id=team_lead_task_id,
-            compass_task_id=compass_task_id,
-            review_cycles=ctx.review_cycles,
+            task_store.update_state(team_lead_task_id, "TASK_STATE_FAILED", summary)
+            log(f"Task failed: {summary[:200]}")
+            audit_log(
+                "TASK_FAILED",
+                task_id=team_lead_task_id,
+                compass_task_id=compass_task_id,
+                error=summary[:300],
+            )
+
+        # Save workspace artifacts
+        _save_workspace_file(workspace, "team-lead/final-summary.md", summary)
+        _save_workspace_file(
+            workspace,
+            "team-lead/stage-summary.json",
+            json.dumps(
+                {
+                    "taskId": team_lead_task_id,
+                    "agentId": AGENT_ID,
+                    "currentPhase": "COMPLETED" if result.success else "FAILED",
+                    "runtimeConfig": runtime_config,
+                    "turnsUsed": result.turns_used,
+                    "updatedAt": local_iso_timestamp(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
         )
-        # Register for Compass ACK BEFORE sending callback (to avoid missing an immediate ACK)
+
+        # Register for Compass ACK BEFORE sending callback
         exit_handler.register(team_lead_task_id)
-        _notify_compass(callback_url, team_lead_task_id, "TASK_STATE_COMPLETED", summary, all_artifacts)
+        state = "TASK_STATE_COMPLETED" if result.success else "TASK_STATE_FAILED"
+        _notify_compass(callback_url, team_lead_task_id, state, summary, final_artifacts)
 
     except Exception as err:
         error_text = str(err)
         print(f"[{AGENT_ID}][{team_lead_task_id}] FAILED: {error_text}")
         log(f"FAILED: {error_text[:300]}")
 
-        # ACK dev agent if we failed mid-way (so it doesn't wait forever)
-        if ctx.dev_service_url and ctx.dev_task_id:
-            _ack_agent(ctx.dev_service_url, ctx.dev_task_id)
-
-        _save_workspace_file(
-            workspace,
-            "team-lead/review-notes.json",
-            json.dumps(
-                {
-                    "taskId": team_lead_task_id,
-                    "agentId": AGENT_ID,
-                    "error": error_text,
-                    "reviewCycles": ctx.review_cycles,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
         try:
             failure_summary = _generate_summary(
                 user_text, ctx.phases_log, "FAILED", []
@@ -3660,20 +3055,14 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
             compass_task_id=compass_task_id,
             error=error_text[:300],
         )
-        # Register for Compass ACK BEFORE sending callback
         exit_handler.register(team_lead_task_id)
         _notify_compass(callback_url, team_lead_task_id, "TASK_STATE_FAILED", failure_summary)
 
     finally:
-        # Wait for Compass ACK (or timeout), then shut down.
-        # Team Lead is always a per-task agent — it must always exit after its
-        # task completes so stale containers do not accumulate.
         def _delayed_cleanup():
-            # Give Compass a short window to poll task state before cleanup
             time.sleep(5)
             with _TASK_CONTEXTS_LOCK:
                 _TASK_CONTEXTS.pop(team_lead_task_id, None)
-            # Wait for Compass ACK or timeout
             acked = exit_handler.wait(team_lead_task_id, timeout=COMPASS_ACK_TIMEOUT)
             if acked:
                 print(f"[{AGENT_ID}] Compass ACK received for task {team_lead_task_id} — shutting down")

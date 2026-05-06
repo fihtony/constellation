@@ -62,9 +62,9 @@ class AgentRuntimeAdoptionTests(unittest.TestCase):
                 content = Path(path).read_text(encoding="utf-8")
                 self.assertIn("from common.runtime.adapter import get_runtime", content)
 
-    def test_common_env_uses_copilot_cli_with_gpt5_mini_model(self):
+    def test_common_env_uses_connect_agent_with_gpt5_mini_model(self):
         env = self._read_env_file(COMMON_ENV_PATH)
-        self.assertEqual(env.get("AGENT_RUNTIME"), "copilot-cli")
+        self.assertEqual(env.get("AGENT_RUNTIME"), "connect-agent")
         self.assertEqual(env.get("COPILOT_MODEL"), "gpt-5-mini")
 
     def test_per_task_agents_inherit_shared_runtime_defaults(self):
