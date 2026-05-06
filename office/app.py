@@ -79,6 +79,20 @@ def audit_log(event: str, **kwargs):
     print(f"[audit] {json.dumps(entry, ensure_ascii=False)}")
 
 
+_MANIFEST_SYSTEM_PROMPT: str = ""
+
+
+def _get_manifest_system_prompt() -> str:
+    """Return cached manifest-based system prompt, building it on first call."""
+    global _MANIFEST_SYSTEM_PROMPT
+    if not _MANIFEST_SYSTEM_PROMPT:
+        agent_dir = os.path.dirname(os.path.abspath(__file__))
+        _MANIFEST_SYSTEM_PROMPT = build_system_prompt_from_manifest(agent_dir) or build_system_prompt(
+            prompts.SYSTEM, "office"
+        )
+    return _MANIFEST_SYSTEM_PROMPT
+
+
 def _runtime_config_summary() -> dict:
     return {
         "service": AGENT_ID,
@@ -1125,6 +1139,82 @@ def _execute_capability(task_id: str, message: dict) -> dict:
             _release_write_root(write_root)
 
 
+def _build_office_task_prompt(
+    *,
+    user_text: str,
+    capability: str,
+    target_paths: list[str],
+    output_mode: str,
+    workspace_path: str,
+    task_id: str,
+    compass_task_id: str,
+) -> str:
+    """Build the task prompt for the agentic runtime."""
+    paths_text = "\n".join(f"- {p}" for p in target_paths) if target_paths else "- (not specified)"
+    output_section = ""
+    if output_mode == "inplace":
+        output_section = "Output mode: IN-PLACE — write results back into the source directory."
+    elif workspace_path:
+        output_section = f"Output mode: WORKSPACE — write results to {workspace_path}/office-agent/"
+    else:
+        output_section = "Output mode: return summary in task result."
+
+    task_description = ""
+    if capability in {"office.document.summarize", "office.folder.summarize"}:
+        task_description = """Task: DOCUMENT SUMMARIZATION
+- Use read_file to read each target document
+- For each document: identify title, key topics, main points, recommendations
+- Generate a concise summary (max 500 words per document)
+- If multiple documents: also create an overall cross-document summary
+- Save summary to output location as summary.md"""
+    elif capability == "office.data.analyze":
+        task_description = """Task: DATA ANALYSIS
+- Use read_file or bash (cat/head) to read CSV/spreadsheet files
+- Identify columns, data types, value ranges, missing data
+- Compute basic statistics (counts, averages, distributions)
+- Identify patterns, anomalies, correlations
+- Generate an analysis report with key findings
+- Save report to output location as analysis.md"""
+    elif capability == "office.folder.organize":
+        task_description = """Task: FOLDER ORGANIZATION
+- Use bash (ls -la, find) to enumerate files in target directories
+- Group files by type, topic, date, or logical category
+- Use write_file to create a reorganization plan (plan.json)
+- For inplace mode: move files to organized subdirectories using bash
+- For workspace mode: write the organization plan only, do not move files
+- Save organization report to output location as organization-report.md"""
+    else:
+        task_description = f"Task: {capability}\n{user_text}"
+
+    return f"""You are the Office Agent. Process the following office/document task.
+
+## User Request
+{user_text}
+
+## Capability
+{capability}
+
+## Target Files/Directories
+{paths_text}
+
+## {task_description}
+
+## Output
+{output_section}
+- orchestratorTaskId: {compass_task_id}
+- officeAgentTaskId: {task_id}
+
+## Rules
+- Only access files within the specified target paths
+- Do NOT access files outside the target paths
+- For summarize/analyze: read files, do not modify source files unless output_mode=inplace
+- Use read_file for text files, use bash (cat) for binary inspection
+- After completing work, use complete_current_task with a summary and any output file paths as artifacts
+- If you cannot access a file (permission denied, binary, too large), note it in warnings
+- Use report_progress to announce: "Reading files", "Analyzing content", "Writing results"
+"""
+
+
 def _run_workflow(task_id: str, message: dict):
     metadata = dict(message.get("metadata") or {})
     callback_url = str(metadata.get("orchestratorCallbackUrl") or "")
@@ -1135,6 +1225,28 @@ def _run_workflow(task_id: str, message: dict):
     task = task_store.get(task_id)
     if not task:
         return
+
+    capability = str(metadata.get("requestedCapability") or "").strip()
+    user_text = extract_text(message)
+    input_root = str(metadata.get("officeInputRoot") or INPUT_ROOT).strip() or INPUT_ROOT
+    output_mode = str(metadata.get("officeOutputMode") or "workspace")
+    target_paths = [os.path.realpath(p) for p in (metadata.get("officeTargetPaths") or []) if str(p).strip()]
+
+    # Validate permissions before starting agentic execution
+    if target_paths:
+        try:
+            _enforce_office_task_permissions(metadata, target_paths, input_root, output_mode)
+        except (PermissionDeniedError, RuntimeError) as perm_err:
+            failure = f"Office task failed: {perm_err}"
+            artifacts = []
+            if isinstance(perm_err, PermissionDeniedError):
+                artifacts = [build_permission_denied_artifact(perm_err.details, agent_id=AGENT_ID)]
+            task_store.update_state(task_id, "TASK_STATE_FAILED", failure)
+            task.artifacts = artifacts
+            _notify_callback(callback_url, task_id, "TASK_STATE_FAILED", failure, artifacts)
+            audit_log("TASK_FAILED", task_id=task_id, error=str(perm_err))
+            _apply_task_exit_rule(task_id, exit_rule)
+            return
 
     configure_control_tools(
         task_context={
@@ -1148,20 +1260,70 @@ def _run_workflow(task_id: str, message: dict):
         input_required_fn=lambda question, ctx: task_store.update_state(task_id, "TASK_STATE_INPUT_REQUIRED", question),
     )
 
+    task_store.update_state(task_id, "TASK_STATE_WORKING", "Office Agent is processing the request.")
+    _report_progress(compass_url, compass_task_id, "Office Agent is starting.")
+    audit_log("TASK_STARTED", task_id=task_id, capability=capability)
+
+    # Build system prompt from manifest or rules
+    manifest_prompt = _get_manifest_system_prompt()
+    system_prompt = manifest_prompt or build_system_prompt(
+        prompts.SYSTEM,
+        "office",
+    )
+
+    task_prompt = _build_office_task_prompt(
+        user_text=user_text,
+        capability=capability,
+        target_paths=target_paths,
+        output_mode=output_mode,
+        workspace_path=workspace_path,
+        task_id=task_id,
+        compass_task_id=compass_task_id,
+    )
+
+    # Set sandbox root to allow reading from target paths and writing to workspace
+    cwd = target_paths[0] if target_paths else workspace_path or os.getcwd()
+
     try:
-        task_store.update_state(task_id, "TASK_STATE_WORKING", "Office Agent is processing the request.")
-        _report_progress(compass_url, compass_task_id, "Office Agent is preparing the task.")
-        result = _execute_capability(task_id, message)
-        warnings = result.get("warnings") or []
-        summary = str(result.get("summary") or "Office task completed.")
-        if warnings:
-            summary = f"{summary} Warnings: {'; '.join(str(item) for item in warnings[:3])}"
-        task.artifacts = result.get("artifacts") or []
-        task_store.update_state(task_id, "TASK_STATE_COMPLETED", summary)
-        _update_stage_summary(metadata, task_id, "completed", warnings=warnings)
-        _report_progress(compass_url, compass_task_id, summary)
-        _notify_callback(callback_url, task_id, "TASK_STATE_COMPLETED", summary, task.artifacts)
-        audit_log("TASK_COMPLETED", task_id=task_id, capability=metadata.get("requestedCapability"))
+        runtime = get_runtime()
+        result = runtime.run_agentic(
+            task=task_prompt,
+            system_prompt=system_prompt,
+            cwd=cwd,
+            max_turns=40,
+            timeout=TASK_TIMEOUT,
+        )
+        summary = result.summary or "Office task completed."
+        final_artifacts: list = list(result.artifacts or [])
+
+        summary_artifact = {
+            "name": "office-agent-summary",
+            "artifactType": "text/plain",
+            "parts": [{"text": summary}],
+            "metadata": {
+                "agentId": AGENT_ID,
+                "capability": capability,
+                "orchestratorTaskId": compass_task_id,
+                "taskId": task_id,
+            },
+        }
+        final_artifacts.insert(0, summary_artifact)
+
+        if result.success:
+            task_store.update_state(task_id, "TASK_STATE_COMPLETED", summary)
+            task.artifacts = final_artifacts
+            _update_stage_summary(metadata, task_id, "completed")
+            _report_progress(compass_url, compass_task_id, summary)
+            _notify_callback(callback_url, task_id, "TASK_STATE_COMPLETED", summary, final_artifacts)
+            audit_log("TASK_COMPLETED", task_id=task_id, capability=capability)
+        else:
+            task_store.update_state(task_id, "TASK_STATE_FAILED", summary)
+            task.artifacts = final_artifacts
+            _update_stage_summary(metadata, task_id, "failed", error=summary)
+            _report_progress(compass_url, compass_task_id, summary)
+            _notify_callback(callback_url, task_id, "TASK_STATE_FAILED", summary, final_artifacts)
+            audit_log("TASK_FAILED", task_id=task_id, error=summary[:300])
+
     except Exception as err:
         failure = f"Office task failed: {err}"
         artifacts = []

@@ -5,6 +5,7 @@
 - `dispatch_agent_task` — Dispatch a task to a downstream agent (Team Lead, Office).
 - `wait_for_agent_task` — Wait for a downstream task to complete, polling for callbacks.
 - `ack_agent_task` — Send ACK to a per-task agent after reviewing its output.
+- `launch_per_task_agent` — Launch a per-task agent container when no idle instance is available.
 
 ## Control Tools
 

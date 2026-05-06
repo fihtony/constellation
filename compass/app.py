@@ -1530,49 +1530,108 @@ def _run_workflow(task_id, message, workflow):
         return
 
     metadata = message.get("metadata") or {}
+    user_text = extract_text(message)
+
+    # Configure control tools with lifecycle callbacks
+    def _on_complete(result_text, artifacts):
+        final_message = _summarize_for_user(task, "TASK_STATE_COMPLETED", result_text, artifacts, workflow)
+        _update_state_and_notify(task_id, "TASK_STATE_COMPLETED", final_message)
+        audit_log("TASK_COMPLETED", task_id=task_id, final_state="TASK_STATE_COMPLETED")
+
+    def _on_fail(error_message):
+        _update_state_and_notify(task_id, "TASK_STATE_FAILED", error_message)
+        audit_log("TASK_FAILED", task_id=task_id, error=error_message)
+
+    def _on_input_required(question, ctx):
+        _update_state_and_notify(task_id, "TASK_STATE_INPUT_REQUIRED", question)
+        task_store.add_progress_step(task_id, question, agent_id="compass-agent")
+
     configure_control_tools(
         task_context={
             "taskId": task_id,
             "agentId": AGENT_ID,
-            "workspacePath": str(metadata.get("sharedWorkspacePath") or ""),
+            "workspacePath": task.workspace_path or "",
+            "workflow": workflow,
             "permissions": metadata.get("permissions"),
+            "userText": user_text[:500],
         },
-        complete_fn=lambda result, artifacts: task_store.update_state(task_id, "TASK_STATE_COMPLETED", result),
-        fail_fn=lambda error: task_store.update_state(task_id, "TASK_STATE_FAILED", error),
-        input_required_fn=lambda question, ctx: task_store.update_state(task_id, "TASK_STATE_INPUT_REQUIRED", question),
+        complete_fn=_on_complete,
+        fail_fn=_on_fail,
+        input_required_fn=_on_input_required,
     )
-    upstream_artifacts = []
-    final_state = "TASK_STATE_COMPLETED"
-    final_message = "Workflow completed."
 
-    for step_index, capability in enumerate(workflow, start=1):
-        result = _dispatch_step(task, message, capability, step_index, len(workflow), upstream_artifacts)
-        if result.get("terminal"):
-            return task.to_dict()
+    # Build the agentic task prompt
+    task_prompt = (
+        f"Execute this multi-agent workflow for the user.\n\n"
+        f"## User Request\n{user_text}\n\n"
+        f"## Planned Workflow Steps\n"
+        f"{json.dumps(workflow, ensure_ascii=False)}\n\n"
+        f"## Instructions\n"
+        f"1. For each capability in the workflow, use `dispatch_agent_task` to send the task.\n"
+        f"   - If dispatch fails because no idle instance is available, use `launch_per_task_agent` first.\n"
+        f"2. Use `wait_for_agent_task` to wait for each step to complete.\n"
+        f"3. If the downstream agent reports INPUT_REQUIRED, forward the question to the user via `request_user_input`.\n"
+        f"4. After the final step completes, verify completeness:\n"
+        f"   - For team-lead.task.analyze: check that artifacts include PR URL and branch evidence.\n"
+        f"   - If evidence is missing, dispatch a follow-up (max {COMPASS_COMPLETENESS_MAX_REVISIONS} retries).\n"
+        f"5. When all steps are complete, call `complete_current_task` with a user-friendly summary.\n"
+        f"6. If any step fails irreversibly, call `fail_current_task` with a clear explanation.\n"
+        f"7. Use `ack_agent_task` after you are done with each per-task agent.\n\n"
+        f"## Metadata to pass downstream\n"
+        f"- sharedWorkspacePath: {task.workspace_path or ''}\n"
+        f"- orchestratorTaskId: {task_id}\n"
+        f"- orchestratorCallbackUrl: {ADVERTISED_URL}/tasks/{task_id}/callbacks?instance={COMPASS_INSTANCE_ID}\n"
+    )
 
-        artifact_summaries = result.get("artifact_summaries")
-        if not isinstance(artifact_summaries, list):
-            artifact_summaries = []
-        upstream_artifacts.extend(artifact_summaries)
-        if step_index < len(workflow) and result["state"] == "TASK_STATE_COMPLETED":
-            task_store.update_state(
-                task.task_id,
-                "STEP_COMPLETED",
-                f"Step {step_index}/{len(workflow)} completed via {result['agent_id']}.",
-            )
-            continue
+    # Load permission grant for the task type
+    task_type = (getattr(task, "router_context", {}) or {}).get("task_type") or "development"
+    try:
+        permissions = load_permission_grant(task_type)
+        task_prompt += f"- permissions: (loaded '{task_type}' permission grant)\n"
+    except Exception:
+        permissions = {}
 
-        final_state = result["state"]
-        final_message = str(result.get("status_message") or f"Workflow finished via {result['agent_id']}.")
-        if step_index < len(workflow):
-            _update_state_and_notify(task.task_id, final_state, final_message)
-            return task.to_dict()
+    # Build system prompt from manifest
+    system_prompt = _build_manifest_prompt(__file__, prompts.ROUTE_SYSTEM)
 
-    final_artifacts = upstream_artifacts[-8:] if upstream_artifacts else []
-    final_message = _summarize_for_user(task, final_state, final_message, final_artifacts, workflow)
-    _update_state_and_notify(task.task_id, final_state, final_message)
-    audit_log("TASK_COMPLETED", task_id=task.task_id, final_state=final_state)
-    return task.to_dict()
+    _update_state_and_notify(task_id, "TASK_STATE_WORKING", f"Executing workflow: {', '.join(workflow)}")
+
+    try:
+        runtime = get_runtime()
+        result = runtime.run_agentic(
+            task=task_prompt,
+            system_prompt=system_prompt,
+            cwd=task.workspace_path or os.getcwd(),
+            tools=[
+                "dispatch_agent_task", "wait_for_agent_task", "ack_agent_task",
+                "launch_per_task_agent",
+                "complete_current_task", "fail_current_task",
+                "request_user_input", "report_progress",
+                "registry_query", "list_available_agents", "check_agent_status",
+                "get_task_context", "get_agent_runtime_status",
+                "load_skill", "todo_write",
+                "read_file", "glob", "grep",
+            ],
+            max_turns=80,
+            timeout=DOWNSTREAM_TASK_TIMEOUT,
+        )
+
+        # If runtime completed without calling complete/fail tools, handle the result
+        if task_store.get(task_id) and task_store.get(task_id).state not in (
+            "TASK_STATE_COMPLETED", "TASK_STATE_FAILED"
+        ):
+            if result.success:
+                summary = result.summary or "Workflow completed."
+                _update_state_and_notify(task_id, "TASK_STATE_COMPLETED", summary)
+                audit_log("TASK_COMPLETED", task_id=task_id, final_state="TASK_STATE_COMPLETED")
+            else:
+                error = result.summary or "Workflow failed — runtime did not complete successfully."
+                _update_state_and_notify(task_id, "TASK_STATE_FAILED", error)
+                audit_log("TASK_FAILED", task_id=task_id, error=error)
+
+    except Exception as error:
+        _update_state_and_notify(task_id, "TASK_STATE_FAILED", f"Workflow error: {error}")
+        audit_log("TASK_FAILED", task_id=task_id, error=str(error))
 
 
 def route_and_dispatch(message, requested_capability=None, forced_workflow=None):

@@ -373,6 +373,7 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
             "common.tools.scm_tools": ["scm_create_branch", "scm_push_files", "scm_create_pr"],
             "common.tools.design_tools": ["design_fetch_figma_screen", "design_fetch_stitch_screen"],
             "common.tools.progress_tools": ["report_progress"],
+            "common.tools.launcher_tool": ["launch_per_task_agent"],
         }
         for module_name, expected_tools in domain_module_expectations.items():
             try:
