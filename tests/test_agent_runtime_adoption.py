@@ -113,6 +113,19 @@ class AgentRuntimeAdoptionTests(unittest.TestCase):
                     f"{path} must use manifest-based system prompt loading"
                 )
 
+    def test_execution_agents_use_run_agentic_for_implementation(self):
+        for path in [
+            os.path.join(PROJECT_ROOT, "web", "app.py"),
+            os.path.join(PROJECT_ROOT, "android", "app.py"),
+        ]:
+            with self.subTest(path=path):
+                content = Path(path).read_text(encoding="utf-8")
+                self.assertIn(
+                    "run_agentic(",
+                    content,
+                    f"{path} must invoke runtime.run_agentic() for execution-stage autonomy",
+                )
+
     def test_agent_manifests_exist_and_have_agent_id(self):
         agent_dirs = ["team-lead", "web", "jira", "scm", "ui-design", "office", "android", "compass"]
         for agent in agent_dirs:

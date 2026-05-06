@@ -39,7 +39,7 @@ from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt, load_rules
 from common.prompt_builder import build_system_prompt_from_manifest
 from common.agent_system_prompt import build_agent_system_prompt as _build_manifest_prompt
-from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
+from common.runtime.adapter import AgenticResult, get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionEscalationRequired,
     build_permission_denied_artifact,
@@ -897,6 +897,36 @@ def _write_files_to_directory(base_dir: str, files: list[dict]) -> list[str]:
     return written
 
 
+def _collect_changed_repo_paths(repo_dir: str, planned_paths: list[str] | None = None) -> list[str]:
+    candidates: list[str] = []
+    for raw_path in planned_paths or []:
+        normalized = str(raw_path or "").strip().lstrip("/")
+        if normalized:
+            candidates.append(normalized)
+
+    if os.path.isdir(os.path.join(repo_dir, ".git")):
+        ok, status_output = _run_local_git(repo_dir, ["status", "--porcelain"], check=False)
+        if ok and status_output.strip():
+            for line in status_output.splitlines():
+                if len(line) < 4:
+                    continue
+                rel_path = line[3:].strip()
+                if " -> " in rel_path:
+                    rel_path = rel_path.split(" -> ", 1)[1].strip()
+                rel_path = rel_path.strip('"').lstrip("/")
+                if rel_path:
+                    candidates.append(rel_path)
+
+    unique_paths: list[str] = []
+    seen: set[str] = set()
+    for rel_path in candidates:
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
+        unique_paths.append(rel_path)
+    return unique_paths
+
+
 def _ensure_gradle_wrapper_executable(build_dir: str) -> str:
     wrapper = os.path.join(build_dir, "gradlew")
     if os.path.isfile(wrapper):
@@ -1522,6 +1552,102 @@ def _generate_implementation(ticket_context: dict, repo_tree: str, file_contents
     raise RuntimeError(f"LLM returned unparseable implementation. Raw (first 500): {raw[:500]}")
 
 
+def _build_android_repo_info(repo_dir: str) -> tuple[str, str, str]:
+    """Return (package_name, build_file, extra_repo_info) from the local repo."""
+    build_file = "app/build.gradle.kts"
+    package_name = "com.example.androidtest"
+    extra_parts: list[str] = []
+
+    manifest_path = os.path.join(repo_dir, "app", "src", "main", "AndroidManifest.xml")
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, encoding="utf-8", errors="replace") as fh:
+                manifest_text = fh.read()
+            match = re.search(r'package="([^"]+)"', manifest_text)
+            if match:
+                package_name = match.group(1)
+        except OSError:
+            pass
+
+    for candidate in ("app/build.gradle.kts", "app/build.gradle", "build.gradle.kts", "build.gradle"):
+        if os.path.isfile(os.path.join(repo_dir, candidate)):
+            build_file = candidate
+            break
+
+    src_root = os.path.join(repo_dir, "app", "src", "main", "java")
+    if os.path.isdir(src_root):
+        kotlin_files: list[str] = []
+        for current_root, _dirs, files in os.walk(src_root):
+            for filename in files:
+                if filename.endswith(".kt"):
+                    kotlin_files.append(os.path.relpath(os.path.join(current_root, filename), repo_dir))
+        kotlin_files = sorted(kotlin_files)[:15]
+        if kotlin_files:
+            extra_parts.append("Existing Kotlin sources:\n" + "\n".join(f"  {path}" for path in kotlin_files))
+
+    test_root = os.path.join(repo_dir, "app", "src", "test")
+    if os.path.isdir(test_root):
+        test_files: list[str] = []
+        for current_root, _dirs, files in os.walk(test_root):
+            for filename in files:
+                if filename.endswith(".kt"):
+                    test_files.append(os.path.relpath(os.path.join(current_root, filename), repo_dir))
+        test_files = sorted(test_files)[:10]
+        if test_files:
+            extra_parts.append("Existing unit tests:\n" + "\n".join(f"  {path}" for path in test_files))
+
+    return package_name, build_file, "\n".join(extra_parts)
+
+
+def _build_android_agentic_task_prompt(ticket_context: dict, repo_dir: str, design_spec: str) -> str:
+    package_name, build_file, extra_repo_info = _build_android_repo_info(repo_dir)
+    deliverables = str(ticket_context.get("additional_context") or "").strip()
+    if not deliverables:
+        deliverables = "Implement the feature described in the Jira ticket with tests and evidence."
+    description_text = str(ticket_context.get("description") or ticket_context.get("title") or "").strip()
+    return prompts.ANDROID_AGENTIC_TASK_TEMPLATE.format(
+        ticket_key=ticket_context.get("ticket_key") or "UNKNOWN",
+        ticket_title=ticket_context.get("title") or "(no title)",
+        ticket_status=ticket_context.get("status") or "Unknown",
+        ticket_description=description_text[:4000],
+        design_spec=(design_spec or "No design spec provided.")[:16000],
+        package_name=package_name,
+        build_file=build_file,
+        extra_repo_info=extra_repo_info or "No extra repo info.",
+        deliverables=deliverables[:4000],
+    )
+
+
+def _run_agentic_repository_implementation(
+    ticket_context: dict,
+    repo_dir: str,
+    design_spec: str,
+    log_fn,
+) -> AgenticResult:
+    require_agentic_runtime("Android Agent")
+    runtime = get_runtime()
+    task_prompt = _build_android_agentic_task_prompt(ticket_context, repo_dir, design_spec)
+
+    def _on_progress(step: str) -> None:
+        text = " ".join(str(step or "").split())
+        if text:
+            log_fn(f"Agentic implementation progress: {text[:180]}")
+
+    try:
+        return runtime.run_agentic(
+            task=task_prompt,
+            system_prompt=prompts.ANDROID_AGENTIC_SYSTEM,
+            cwd=repo_dir,
+            max_turns=60,
+            timeout=1800,
+            on_progress=_on_progress,
+        )
+    except NotImplementedError as exc:
+        raise RuntimeError(
+            f"Configured runtime backend does not support agentic implementation: {exc}"
+        ) from exc
+
+
 def _save_pr_evidence(workspace_path: str, **details) -> None:
     payload = _read_workspace_json(workspace_path, f"{AGENT_ID}/pr-evidence.json")
     payload.update({k: v for k, v in details.items() if v is not None})
@@ -1814,16 +1940,62 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         task_store.update_state(task_id, "IMPLEMENTING", "Generating Android implementation…")
         log("Generating implementation")
 
-        implementation = _generate_implementation(ticket_context, repo_tree, file_contents)
-        impl_goal = implementation.get("goal") or f"Implement {ticket_key}"
-        impl_files = implementation.get("files") or []
-        impl_files_to_delete = implementation.get("files_to_delete") or []
-        impl_pr_desc = implementation.get("pr_description") or f"## {ticket_key}\n\n{impl_goal}"
+        design_spec_parts: list[str] = []
+        if design_context_meta.get("url"):
+            design_spec_parts.append(f"Design reference: {design_context_meta['url']}")
+        if design_context_meta.get("page_name"):
+            design_spec_parts.append(f"Screen/Page: {design_context_meta['page_name']}")
+        if design_context_meta.get("content"):
+            design_spec_parts.append(str(design_context_meta.get("content") or ""))
+        design_spec = "\n".join(part for part in design_spec_parts if part) or "No design spec provided."
 
-        if not impl_files and not impl_files_to_delete:
-            raise RuntimeError(f"No implementation files generated for {ticket_key}")
+        implementation_root = clone_path or agent_workspace
+        if not implementation_root:
+            raise RuntimeError("No repository workspace is available for agentic Android implementation.")
+        os.makedirs(implementation_root, exist_ok=True)
 
-        log(f"Generated {len(impl_files)} file(s), {len(impl_files_to_delete)} deletion(s)")
+        agentic_result = _run_agentic_repository_implementation(
+            ticket_context,
+            implementation_root,
+            design_spec,
+            log,
+        )
+        if not agentic_result.success:
+            raise RuntimeError(
+                "Agentic Android implementation failed: "
+                f"{agentic_result.summary or agentic_result.raw_output[:500]}"
+            )
+
+        impl_goal = ticket_context.get("title") or f"Implement {ticket_key or 'task'}"
+        impl_files: list[dict] = []
+        impl_files_to_delete: list[str] = []
+        impl_pr_desc = f"## {ticket_key or 'Task'}\n\n{agentic_result.summary or impl_goal}"
+        changed_paths = _collect_changed_repo_paths(implementation_root)
+        _sync_generated_files_from_repo(implementation_root, impl_files, changed_paths)
+
+        if not impl_files:
+            raise RuntimeError(f"No implementation files were changed for {ticket_key or 'task'}")
+
+        _save_workspace_file(
+            workspace,
+            f"{AGENT_ID}/agentic-run.json",
+            json.dumps(
+                {
+                    "taskId": workflow_task_id,
+                    "agentTaskId": task_id,
+                    "agentId": AGENT_ID,
+                    "backend": agentic_result.backend_used,
+                    "success": agentic_result.success,
+                    "summary": agentic_result.summary,
+                    "turnsUsed": agentic_result.turns_used,
+                    "toolCalls": agentic_result.tool_calls,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
+        log(f"Agentic implementation changed {len(impl_files)} file(s)")
 
         # ── Phase 4: Prepare local branch, validate, push, and create PR ────
         task_store.update_state(task_id, "PUSHING", "Preparing local branch, validating, and creating PR…")
@@ -1858,7 +2030,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
             _checkout_local_branch(clone_path, branch_name, base_branch, log)
             local_branch_prepared = True
             written_clone_paths = _write_files_to_directory(clone_path, impl_files)
-            log(f"Wrote {len(written_clone_paths)} file(s) into cloned repository")
+            log(f"Synchronized {len(written_clone_paths)} file(s) into cloned repository")
 
         # Create branch
         _create_branch(task_id, repo_url, branch_name, base_branch, workspace, compass_task_id, permissions=permissions)
