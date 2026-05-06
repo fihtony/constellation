@@ -23,7 +23,7 @@ from common.policy import PolicyEvaluator
 from common.per_task_exit import PerTaskExitHandler
 from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt
-from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import grant_permission, load_permission_grant
 from common.task_store import TaskStore
 from common.time_utils import local_file_timestamp, local_iso_timestamp
@@ -1105,6 +1105,7 @@ def _build_step_message(task, original_message, task_id, capability, step_index,
         "requestedCapability": capability,
         "orchestratorTaskId": task_id,
         "orchestratorCallbackUrl": f"{ADVERTISED_URL.rstrip('/')}/tasks/{task_id}/callbacks?instance={COMPASS_INSTANCE_ID}",
+        "orchestratorUrl": ADVERTISED_URL.rstrip("/"),
         "compassUrl": ADVERTISED_URL.rstrip("/"),
         "sharedWorkspacePath": task.workspace_path,
         "workflowStep": step_index,
@@ -1570,6 +1571,14 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
     design_url, design_type = _extract_design_reference(user_text)
     task.design_url = design_url
     task.design_type = design_type
+
+    try:
+        require_agentic_runtime("Compass")
+    except RuntimeError as exc:
+        failure = str(exc)
+        task_store.update_state(task.task_id, "TASK_STATE_FAILED", failure)
+        audit_log("TASK_FAILED", task_id=task.task_id, error=failure)
+        return task.to_dict()
 
     # Extract owner / channel metadata from message.metadata (IM Gateway sets these)
     msg_meta = message.get("metadata") or {}

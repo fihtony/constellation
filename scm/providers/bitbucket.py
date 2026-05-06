@@ -438,3 +438,129 @@ class BitbucketProvider(SCMProvider):
     @property
     def provider_name(self) -> str:
         return "bitbucket"
+
+    # ------------------------------------------------------------------
+    # Remote read operations (stubs — Bitbucket Server REST API support
+    # is limited; these return not_supported so callers can fall back
+    # to clone-based access or the LLM dispatch path).
+    # ------------------------------------------------------------------
+
+    def read_remote_file(
+        self, owner: str, repo: str, path: str, ref: str = ""
+    ) -> tuple[str, str]:
+        """Read file via Bitbucket Server raw-content endpoint."""
+        project = owner or self._default_project
+        branch_or_commit = ref or "HEAD"
+        # Bitbucket Server: GET /rest/api/1.0/projects/{K}/repos/{R}/raw/{path}?at={ref}
+        endpoint = f"projects/{project}/repos/{quote(repo)}/raw/{path.lstrip('/')}?at={quote(branch_or_commit)}"
+        url = f"{self._rest_api.rstrip('/')}/{endpoint}"
+        headers: dict[str, str] = {}
+        auth = self._auth_header()
+        if auth:
+            headers["Authorization"] = auth
+        req = Request(url, headers=headers)
+        try:
+            with urlopen(req, timeout=20, context=self._ssl_ctx()) as resp:
+                raw = resp.read()
+                return raw.decode("utf-8", errors="replace"), "ok"
+        except HTTPError as exc:
+            return "", f"error_{exc.code}"
+        except URLError as exc:
+            return "", f"url_error: {exc}"
+
+    def list_remote_dir(
+        self, owner: str, repo: str, path: str = "", ref: str = ""
+    ) -> tuple[list[dict], str]:
+        """List directory entries via Bitbucket Server files endpoint."""
+        project = owner or self._default_project
+        base_path = path.lstrip("/") if path else ""
+        endpoint = f"projects/{project}/repos/{quote(repo)}/files/{base_path}" if base_path else \
+            f"projects/{project}/repos/{quote(repo)}/files"
+        if ref:
+            endpoint += f"?at={quote(ref)}&limit=200"
+        else:
+            endpoint += "?limit=200"
+        status, body = self._request("GET", endpoint)
+        if status != 200:
+            return [], f"error_{status}"
+        values = body.get("values") or []
+        entries = [
+            {
+                "name": entry if isinstance(entry, str) else entry.get("name", ""),
+                "path": f"{base_path}/{entry}".lstrip("/") if isinstance(entry, str)
+                        else entry.get("path", ""),
+                "type": "unknown",
+                "size": 0,
+                "htmlUrl": "",
+            }
+            for entry in values
+        ]
+        return entries, "ok"
+
+    def search_code(
+        self, owner: str, repo: str, query: str, limit: int = 20
+    ) -> tuple[list[dict], str]:
+        """Code search is not natively supported on Bitbucket Server REST API."""
+        return [], "not_supported"
+
+    def compare_refs(
+        self,
+        owner: str,
+        repo: str,
+        base: str,
+        head: str,
+        stat_only: bool = False,
+    ) -> tuple[dict, str]:
+        """Compare two refs via Bitbucket Server compare endpoint (stat only)."""
+        project = owner or self._default_project
+        endpoint = (
+            f"projects/{project}/repos/{quote(repo)}/compare/commits"
+            f"?from={quote(head)}&to={quote(base)}&limit=100"
+        )
+        status, body = self._request("GET", endpoint)
+        if status != 200:
+            return {}, f"error_{status}"
+        values = body.get("values") or []
+        return {
+            "aheadBy": len(values),
+            "behindBy": 0,
+            "totalChangedFiles": 0,
+            "additions": 0,
+            "deletions": 0,
+            "files": [],
+            "diff": "",
+            "status": "compared",
+        }, "ok"
+
+    def get_default_branch(self, owner: str, repo: str) -> tuple[dict, str]:
+        """Return the default branch for a Bitbucket Server repository."""
+        project = owner or self._default_project
+        default_branch = self._default_branch(project, repo)
+        return {
+            "defaultBranch": default_branch,
+            "protectedBranches": [default_branch],
+        }, "ok"
+
+    def get_branch_rules(self, owner: str, repo: str) -> tuple[dict, str]:
+        """Return branch rules combining local policy defaults.
+        Bitbucket Server branch-permissions API requires admin access.
+        """
+        from common.task_permissions import _DEFAULT_PROTECTED_BRANCH_PATTERNS
+
+        project = owner or self._default_project
+        default_branch = self._default_branch(project, repo)
+        rules = [
+            {
+                "pattern": p,
+                "description": "Protected branch — no direct push allowed",
+                "source": "local_policy",
+            }
+            for p in _DEFAULT_PROTECTED_BRANCH_PATTERNS
+        ]
+        return {
+            "defaultBranch": default_branch,
+            "localProtectedPatterns": _DEFAULT_PROTECTED_BRANCH_PATTERNS,
+            "apiProtectionRules": {},
+            "rules": rules,
+            "source": "local_policy",
+        }, "ok"

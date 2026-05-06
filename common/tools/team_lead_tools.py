@@ -9,3 +9,4 @@ import common.tools.scm_tools       # noqa: F401
 import common.tools.design_tools    # noqa: F401
 import common.tools.progress_tools  # noqa: F401
 import common.tools.registry_tools  # noqa: F401 — registers RegistryQueryTool
+import common.tools.control_tools   # noqa: F401 — registers dispatch_agent_task, wait_for_agent_task, ack_agent_task, etc.

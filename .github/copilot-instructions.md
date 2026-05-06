@@ -155,7 +155,7 @@ with a task object (containing a task ID). Processing continues asynchronously.
     "metadata": {
       "requestedCapability": "my.skill.id",
       "orchestratorTaskId": "parent-task-id",
-      "orchestratorCallbackUrl": "http://compass:8080/tasks/{id}/callbacks",
+      "orchestratorCallbackUrl": "http://<orchestrator-service>/tasks/{id}/callbacks",
       "sharedWorkspacePath": "/app/artifacts/workspaces/task-xxx"
     }
   },
@@ -370,7 +370,8 @@ def _notify_compass(callback_url, task_id, state, status_message, artifacts):
 
 ### 8. Progress Reporting
 
-Agents SHOULD report major workflow steps to Compass via the progress endpoint.
+Agents SHOULD report major workflow steps to the orchestrator via the progress endpoint.
+Prefer deriving the base service URL from `message.metadata.orchestratorCallbackUrl`; if that is unavailable, discover `orchestrator.progress.report` through Registry. Do not hardcode `COMPASS_URL` in child agents.
 This is displayed in the Web UI timeline.
 
 ```python

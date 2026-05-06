@@ -42,3 +42,14 @@ def is_registered(name: str) -> bool:
 def clear_registry() -> None:
     """Remove all registered tools.  Intended for test isolation only."""
     _registry.clear()
+
+
+def snapshot_registry() -> dict:
+    """Return a shallow copy of the registry for save/restore in tests."""
+    return dict(_registry)
+
+
+def restore_registry(snapshot: dict) -> None:
+    """Restore a previously snapshotted registry state.  Intended for tests."""
+    _registry.clear()
+    _registry.update(snapshot)

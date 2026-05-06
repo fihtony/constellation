@@ -512,3 +512,73 @@ def audit_permission_check(
     prefix = f"[{agent_id}] " if agent_id else ""
     print(f"{prefix}[audit] {json.dumps(entry, ensure_ascii=False)}")
     return entry
+
+
+def write_operation_audit(
+    workspace_path: str,
+    agent_id: str,
+    entry: dict[str, Any],
+) -> None:
+    """Append a structured audit entry to <workspace>/<agent_id>/audit-log.jsonl.
+
+    Safe to call from multiple threads; each call is a single atomic write.
+    Silently ignores errors so audit failures never disrupt the main workflow.
+    """
+    if not workspace_path:
+        return
+    try:
+        audit_dir = os.path.join(workspace_path, agent_id)
+        os.makedirs(audit_dir, exist_ok=True)
+        audit_file = os.path.join(audit_dir, "audit-log.jsonl")
+        line = json.dumps(entry, ensure_ascii=False)
+        with open(audit_file, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def read_operation_audit(
+    workspace_path: str,
+    agent_id: str,
+    *,
+    task_id: str = "",
+    operation: str = "",
+    since: str = "",
+) -> list[dict[str, Any]]:
+    """Read and optionally filter the audit log for a given agent workspace.
+
+    Args:
+        workspace_path: Shared workspace root.
+        agent_id: Agent subdirectory name (e.g. "scm-agent").
+        task_id: If set, only return entries matching this taskId.
+        operation: If set, only return entries matching this operation/action.
+        since: ISO datetime string; only return entries with ts >= since.
+
+    Returns an empty list if the file does not exist or on read error.
+    """
+    if not workspace_path:
+        return []
+    audit_file = os.path.join(workspace_path, agent_id, "audit-log.jsonl")
+    if not os.path.isfile(audit_file):
+        return []
+    entries: list[dict[str, Any]] = []
+    try:
+        with open(audit_file, encoding="utf-8") as fh:
+            for raw_line in fh:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    entry = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if task_id and entry.get("taskId") != task_id and entry.get("orchestratorTaskId") != task_id:
+                    continue
+                if operation and entry.get("operation") != operation and entry.get("action") != operation:
+                    continue
+                if since and entry.get("ts", "") < since:
+                    continue
+                entries.append(entry)
+    except Exception:  # noqa: BLE001
+        pass
+    return entries

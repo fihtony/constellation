@@ -252,11 +252,17 @@ def _claude_code_status() -> dict:
     }
 
 
+def backend_supports_agentic(backend: str | None = None) -> bool:
+    _, effective = resolve_backend_name(backend)
+    return effective in {"connect-agent", "claude-code"}
+
+
 def summarize_runtime_configuration(backend: str | None = None) -> dict:
     requested, effective = resolve_backend_name(backend)
     summary = {
         "requestedBackend": requested,
         "effectiveBackend": effective,
+        "supportsAgentic": backend_supports_agentic(effective),
     }
 
     if effective == "copilot-cli":
@@ -266,11 +272,13 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 **cli_status,
                 "model": AgentRuntimeAdapter.resolve_model(
                     os.environ.get("AGENT_MODEL"),
-                    os.environ.get("COPILOT_MODEL"),
-                    os.environ.get("OPENAI_MODEL"),
                     fallback="gpt-5-mini",
                 ),
             }
+        )
+        summary["agenticReady"] = False
+        summary["agenticError"] = (
+            "Copilot CLI does not implement run_agentic(); use connect-agent or claude-code."
         )
         if not cli_status["ready"]:
             summary["error"] = "Copilot CLI is not ready (token or binary missing)."
@@ -281,11 +289,13 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 **claude_status,
                 "model": AgentRuntimeAdapter.resolve_model(
                     os.environ.get("AGENT_MODEL"),
-                    os.environ.get("CLAUDE_CODE_MODEL"),
                     fallback="claude-haiku-4-5",
                 ),
             }
         )
+        summary["agenticReady"] = bool(claude_status["ready"])
+        if not summary["agenticReady"]:
+            summary["agenticError"] = f"Claude Code binary '{claude_status['binary']}' is not available."
         if not claude_status["ready"]:
             summary["error"] = f"Claude Code binary '{claude_status['binary']}' is not available."
     elif effective == "connect-agent":
@@ -296,7 +306,6 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 "apiKeyConfigured": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
                 "model": AgentRuntimeAdapter.resolve_model(
                     os.environ.get("AGENT_MODEL"),
-                    os.environ.get("OPENAI_MODEL"),
                     fallback="gpt-5-mini",
                 ),
                 "sandboxRoot": os.environ.get("CONNECT_AGENT_SANDBOX_ROOT", ""),
@@ -304,6 +313,27 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 "timeout": os.environ.get("CONNECT_AGENT_TIMEOUT", "1800"),
             }
         )
+        summary["agenticReady"] = True
+    else:
+        summary["agenticReady"] = False
+        summary["agenticError"] = f"Unknown runtime backend '{effective}'."
+    return summary
+
+
+def require_agentic_runtime(agent_name: str, backend: str | None = None) -> dict:
+    summary = summarize_runtime_configuration(backend)
+    effective = str(summary.get("effectiveBackend") or "unknown")
+
+    if not summary.get("supportsAgentic"):
+        raise RuntimeError(
+            f"{agent_name} requires an agentic runtime backend, but '{effective}' does not support run_agentic(). "
+            "Configure AGENT_RUNTIME=connect-agent or AGENT_RUNTIME=claude-code for this agent."
+        )
+
+    if not summary.get("agenticReady"):
+        detail = str(summary.get("agenticError") or summary.get("error") or "Configured runtime backend is not ready.")
+        raise RuntimeError(f"{agent_name} cannot start agentic execution: {detail}")
+
     return summary
 
 
