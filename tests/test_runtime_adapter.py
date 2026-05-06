@@ -17,7 +17,7 @@ from common.env_utils import (
     resolve_openai_base_url,
     sanitize_credential_env,
 )
-from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 
 
 class RuntimeAdapterTests(unittest.TestCase):
@@ -155,6 +155,8 @@ class RuntimeAdapterTests(unittest.TestCase):
             summary = summarize_runtime_configuration()
 
         self.assertEqual(summary["effectiveBackend"], "copilot-cli")
+        self.assertFalse(summary["supportsAgentic"])
+        self.assertFalse(summary["agenticReady"])
         self.assertTrue(summary["tokenConfigured"])
         self.assertTrue(summary["tokenSources"]["COPILOT_GITHUB_TOKEN"])
         self.assertNotIn("copilot_token_secret", json.dumps(summary))
@@ -168,6 +170,7 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(summary["requestedBackend"], "copilot-cli")
         self.assertEqual(summary["effectiveBackend"], "copilot-cli")
         self.assertFalse(summary["tokenConfigured"])
+        self.assertFalse(summary["supportsAgentic"])
         self.assertIn("not ready", summary["error"])
 
     def test_resolve_openai_base_url_uses_rancher_host_inside_container(self):
@@ -192,8 +195,26 @@ class RuntimeAdapterTests(unittest.TestCase):
             summary = summarize_runtime_configuration()
 
         self.assertEqual(summary["effectiveBackend"], "connect-agent")
+        self.assertTrue(summary["supportsAgentic"])
+        self.assertTrue(summary["agenticReady"])
         self.assertEqual(summary["resolvedBaseUrl"], "http://host.rancher-desktop.internal:1288/v1")
         self.assertFalse(summary["baseUrlConfigured"])
+
+    def test_runtime_configuration_summary_reports_claude_agentic_readiness(self):
+        os.environ["AGENT_RUNTIME"] = "claude-code"
+
+        with patch("common.runtime.adapter.shutil.which", return_value="/usr/bin/claude"):
+            summary = summarize_runtime_configuration()
+
+        self.assertEqual(summary["effectiveBackend"], "claude-code")
+        self.assertTrue(summary["supportsAgentic"])
+        self.assertTrue(summary["agenticReady"])
+
+    def test_require_agentic_runtime_rejects_copilot_cli(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+
+        with self.assertRaisesRegex(RuntimeError, "does not support run_agentic"):
+            require_agentic_runtime("Team Lead")
 
     def test_load_dotenv_applies_shared_defaults_and_local_overrides(self):
         with tempfile.TemporaryDirectory() as temp_dir:

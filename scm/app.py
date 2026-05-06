@@ -27,13 +27,15 @@ from common.env_utils import build_isolated_git_env, load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.message_utils import build_text_artifact, extract_text
 from common.rules_loader import build_system_prompt, load_rules
-from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionDeniedError,
     audit_permission_check,
     build_permission_denied_artifact,
     build_permission_denied_details,
     parse_permission_grant,
+    write_operation_audit,
+    read_operation_audit,
 )
 from scm import prompts
 
@@ -49,7 +51,9 @@ AGENT_ID = os.environ.get("AGENT_ID", "scm-agent")
 INSTANCE_ID = os.environ.get("INSTANCE_ID", f"{AGENT_ID}-0")
 ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://scm:{PORT}")
 REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000")
-ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "http://compass:8080")
+# ORCHESTRATOR_URL: only used as a last-resort fallback for legacy callers.
+# All A2A callbacks must use orchestratorCallbackUrl from message.metadata instead.
+_LEGACY_ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "").strip()
 
 # Provider selection: "github" | "bitbucket"  (default: auto-detect from SCM_BASE_URL)
 _SCM_PROVIDER = os.environ.get("SCM_PROVIDER", "").strip().lower()
@@ -80,6 +84,7 @@ def _run_agentic(
     timeout: int = 120,
     max_tokens: int = 4096,
 ) -> str:
+    require_agentic_runtime("SCM Agent")
     result = get_runtime().run(
         prompt=prompt,
         context=context,
@@ -450,7 +455,7 @@ def _enforce_http_scm_permission(
 
 
 def _clone_to_workspace(
-    owner: str, repo: str, branch: str, target_path: str
+    owner: str, repo: str, branch: str, target_path: str, *, depth: int = 1, full_history: bool = False
 ) -> tuple[str | None, str]:
     clone_url = _provider.get_clone_url(owner, repo)
     clone_dir = os.path.join(target_path, repo)
@@ -459,9 +464,14 @@ def _clone_to_workspace(
 
     env = build_isolated_git_env(scope=f"{AGENT_ID}-workspace-clone")
 
+    depth_args = [] if full_history else ["--depth", str(max(1, depth))]
+
     if os.path.isdir(os.path.join(clone_dir, ".git")):
+        fetch_cmd = ["git", *git_config, "fetch", "origin", branch]
+        if not full_history:
+            fetch_cmd.extend(["--depth", str(max(1, depth))])
         r = subprocess.run(
-            ["git", *git_config, "fetch", "--depth", "1", "origin", branch],
+            fetch_cmd,
             cwd=clone_dir, capture_output=True, text=True,
             timeout=CLONE_TIMEOUT_SECONDS, env=env,
         )
@@ -471,7 +481,7 @@ def _clone_to_workspace(
         return clone_dir, "fetched"
 
     r = subprocess.run(
-        ["git", *git_config, "clone", "--depth", "1", "--branch", branch, clone_url, clone_dir],
+        ["git", *git_config, "clone", *depth_args, "--branch", branch, clone_url, clone_dir],
         capture_output=True, text=True, timeout=CLONE_TIMEOUT_SECONDS, env=env,
     )
     if r.returncode != 0:
@@ -532,7 +542,7 @@ def _fire_clone_callback(callback_url: str, task_id: str, state: str, clone_dir:
         print(f"[{AGENT_ID}] Clone callback failed: {exc}")
 
 
-def _clone_async_worker(task_id: str, owner: str, repo: str, branch: str, target_path: str, callback_url: str):
+def _clone_async_worker(task_id: str, owner: str, repo: str, branch: str, target_path: str, callback_url: str, *, depth: int = 1, full_history: bool = False):
     try:
         _update_task(task_id, state="TASK_STATE_WORKING",
                      message=f"Cloning {owner}/{repo} branch={branch} …")
@@ -548,7 +558,7 @@ def _clone_async_worker(task_id: str, owner: str, repo: str, branch: str, target
                 "runtimeConfig": _runtime_config_summary(),
             },
         )
-        clone_dir, result = _clone_to_workspace(owner, repo, branch, target_path)
+        clone_dir, result = _clone_to_workspace(owner, repo, branch, target_path, depth=depth, full_history=full_history)
         if clone_dir:
             clone_artifact = {
                 "name": "clone-result",
@@ -673,6 +683,18 @@ def process_message(message: dict) -> tuple[str, list]:
         return _handle_pr_comment_list(text)
     if capability == "scm.git.push":
         return _handle_git_push(text, message)
+    if capability == "scm.repo.read_file":
+        return _handle_remote_read_file(text, message)
+    if capability == "scm.repo.list_dir":
+        return _handle_remote_list_dir(text, message)
+    if capability == "scm.code.search":
+        return _handle_code_search(text, message)
+    if capability == "scm.ref.compare":
+        return _handle_ref_compare(text, message)
+    if capability == "scm.branch.default":
+        return _handle_branch_default(text, message)
+    if capability == "scm.branch.rules":
+        return _handle_branch_rules(text, message)
 
     # Default: use LLM to infer intent and dispatch
     return _handle_llm_dispatch(text, message, system_prompt)
@@ -755,6 +777,13 @@ def _handle_branch_create(text: str, message: dict) -> tuple[str, list]:
         message=message,
     )
     result, status = _provider.create_branch(owner, repo, branch, from_ref)
+    _write_audit(
+        message=message,
+        operation="scm.branch.create",
+        target={"owner": owner, "repo": repo, "branch": branch, "fromRef": from_ref},
+        input_summary={"branch": branch, "fromRef": from_ref},
+        result={"success": status == "created", "status": status},
+    )
     if status not in ("created",):
         return f"Branch creation failed: {status} — {result}", []
     artifact = build_text_artifact(
@@ -831,6 +860,14 @@ def _handle_pr_create(text: str, message: dict) -> tuple[str, list]:
         message=message,
     )
     pr, status = _provider.create_pr(owner, repo, from_branch, to_branch, title, description)
+    _write_audit(
+        message=message,
+        operation="scm.pr.create",
+        target={"owner": owner, "repo": repo, "fromBranch": from_branch, "toBranch": to_branch},
+        input_summary={"title": title[:120]},
+        result={"success": status in ("created", "already_exists"), "status": status,
+                "prUrl": pr.get("htmlUrl", "") if isinstance(pr, dict) else ""},
+    )
     if status not in ("created", "already_exists"):
         return f"PR creation failed: {status} — {pr}", []
     artifact = build_text_artifact(
@@ -909,6 +946,13 @@ def _handle_git_push(text: str, message: dict) -> tuple[str, list]:
         message=message,
     )
     result, status = _provider.push_files(owner, repo, branch, base_branch, files, commit_msg, files_to_delete)
+    _write_audit(
+        message=message,
+        operation="scm.git.push",
+        target={"owner": owner, "repo": repo, "branch": branch},
+        input_summary={"filesCount": len(files), "commitMessage": commit_msg[:120]},
+        result={"success": status == "pushed", "status": status},
+    )
     if status not in ("pushed",):
         return f"Git push failed: {status} — {result}", []
     return f"Pushed {len(files)} file(s) to {owner}/{repo}:{branch}.", [
@@ -918,6 +962,224 @@ def _handle_git_push(text: str, message: dict) -> tuple[str, list]:
             metadata={"agentId": AGENT_ID, "capability": "scm.git.push"},
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# New remote read handlers (no local clone required)
+# ---------------------------------------------------------------------------
+
+def _handle_remote_read_file(text: str, message: dict) -> tuple[str, list]:
+    metadata = (message.get("metadata") or {})
+    payload = metadata.get("scmPayload") or {}
+    owner = payload.get("owner", "") or ""
+    repo = payload.get("repo", "") or ""
+    path = payload.get("path", "") or ""
+    ref = payload.get("ref", "") or ""
+    if not owner or not repo:
+        owner, repo = _parse_owner_repo(text)
+    if not path:
+        pm = re.search(r"(?:path|file)[:\s]+([^\s,]+)", text, re.IGNORECASE)
+        path = pm.group(1) if pm else ""
+    if not ref:
+        rm = re.search(r"(?:ref|branch|at)[:\s]+([^\s,]+)", text, re.IGNORECASE)
+        ref = rm.group(1) if rm else ""
+    if not owner or not repo or not path:
+        return "Missing owner/repo/path for remote file read.", []
+    _require_scm_permission(
+        action="repo.read_file", target=f"{owner}/{repo}:{path}", message=message
+    )
+    content, status = _provider.read_remote_file(owner, repo, path, ref)
+    if status != "ok":
+        return f"Remote file read failed: {status}", []
+    artifact = build_text_artifact(
+        "remote-file",
+        content,
+        metadata={"agentId": AGENT_ID, "capability": "scm.repo.read_file",
+                  "owner": owner, "repo": repo, "path": path, "ref": ref},
+    )
+    return f"Read remote file {path} from {owner}/{repo} ref={ref or 'default'}.", [artifact]
+
+
+def _handle_remote_list_dir(text: str, message: dict) -> tuple[str, list]:
+    metadata = (message.get("metadata") or {})
+    payload = metadata.get("scmPayload") or {}
+    owner = payload.get("owner", "") or ""
+    repo = payload.get("repo", "") or ""
+    path = payload.get("path", "") or ""
+    ref = payload.get("ref", "") or ""
+    if not owner or not repo:
+        owner, repo = _parse_owner_repo(text)
+    if not ref:
+        rm = re.search(r"(?:ref|branch|at)[:\s]+([^\s,]+)", text, re.IGNORECASE)
+        ref = rm.group(1) if rm else ""
+    if not owner or not repo:
+        return "Missing owner/repo for remote dir list.", []
+    _require_scm_permission(
+        action="repo.list_dir", target=f"{owner}/{repo}:{path or '/'}", message=message
+    )
+    entries, status = _provider.list_remote_dir(owner, repo, path, ref)
+    if status != "ok":
+        return f"Remote dir list failed: {status}", []
+    artifact = build_text_artifact(
+        "remote-dir",
+        json.dumps(entries, ensure_ascii=False, indent=2),
+        metadata={"agentId": AGENT_ID, "capability": "scm.repo.list_dir",
+                  "owner": owner, "repo": repo, "path": path, "ref": ref},
+    )
+    return f"Listed {len(entries)} entries in {owner}/{repo}:{path or '/'} ref={ref or 'default'}.", [artifact]
+
+
+def _handle_code_search(text: str, message: dict) -> tuple[str, list]:
+    metadata = (message.get("metadata") or {})
+    payload = metadata.get("scmPayload") or {}
+    owner = payload.get("owner", "") or ""
+    repo = payload.get("repo", "") or ""
+    query = payload.get("query", "") or text
+    limit = int(payload.get("limit", 20))
+    if not owner or not repo:
+        owner, repo = _parse_owner_repo(text)
+    if not owner or not repo:
+        return "Missing owner/repo for code search.", []
+    _require_scm_permission(
+        action="code.search", target=f"{owner}/{repo}", message=message
+    )
+    results, status = _provider.search_code(owner, repo, query, limit)
+    if status not in ("ok", "not_supported"):
+        return f"Code search failed: {status}", []
+    if status == "not_supported":
+        return f"Code search not supported by {_provider.provider_name}.", []
+    artifact = build_text_artifact(
+        "code-search-results",
+        json.dumps(results, ensure_ascii=False, indent=2),
+        metadata={"agentId": AGENT_ID, "capability": "scm.code.search",
+                  "owner": owner, "repo": repo, "query": query[:200]},
+    )
+    return f"Found {len(results)} code search result(s) in {owner}/{repo}.", [artifact]
+
+
+def _handle_ref_compare(text: str, message: dict) -> tuple[str, list]:
+    metadata = (message.get("metadata") or {})
+    payload = metadata.get("scmPayload") or {}
+    owner = payload.get("owner", "") or ""
+    repo = payload.get("repo", "") or ""
+    base = payload.get("base", "") or ""
+    head = payload.get("head", "") or ""
+    stat_only = bool(payload.get("statOnly", False))
+    if not owner or not repo:
+        owner, repo = _parse_owner_repo(text)
+    if not base:
+        bm = re.search(r"base[:\s]+([^\s,]+)", text, re.IGNORECASE)
+        base = bm.group(1) if bm else "main"
+    if not head:
+        hm = re.search(r"(?:head|compare)[:\s]+([^\s,]+)", text, re.IGNORECASE)
+        head = hm.group(1) if hm else ""
+    if not owner or not repo or not head:
+        return "Missing owner/repo/head for ref comparison.", []
+    _require_scm_permission(
+        action="ref.compare", target=f"{owner}/{repo}:{base}...{head}", message=message
+    )
+    result, status = _provider.compare_refs(owner, repo, base, head, stat_only=stat_only)
+    if status != "ok":
+        return f"Ref comparison failed: {status}", []
+    artifact = build_text_artifact(
+        "ref-comparison",
+        json.dumps(result, ensure_ascii=False, indent=2),
+        metadata={"agentId": AGENT_ID, "capability": "scm.ref.compare",
+                  "owner": owner, "repo": repo, "base": base, "head": head},
+    )
+    ahead = result.get("aheadBy", "?")
+    changed = result.get("totalChangedFiles", len(result.get("files", [])))
+    return (
+        f"Compared {owner}/{repo}: {head} is {ahead} commit(s) ahead of {base}, "
+        f"{changed} file(s) changed."
+    ), [artifact]
+
+
+def _handle_branch_default(text: str, message: dict) -> tuple[str, list]:
+    metadata = (message.get("metadata") or {})
+    payload = metadata.get("scmPayload") or {}
+    owner = payload.get("owner", "") or ""
+    repo = payload.get("repo", "") or ""
+    if not owner or not repo:
+        owner, repo = _parse_owner_repo(text)
+    if not owner or not repo:
+        return "Missing owner/repo for default branch query.", []
+    _require_scm_permission(
+        action="branch.default", target=f"{owner}/{repo}", message=message
+    )
+    result, status = _provider.get_default_branch(owner, repo)
+    if status != "ok":
+        return f"Get default branch failed: {status}", []
+    artifact = build_text_artifact(
+        "default-branch",
+        json.dumps(result, ensure_ascii=False, indent=2),
+        metadata={"agentId": AGENT_ID, "capability": "scm.branch.default"},
+    )
+    return (
+        f"Default branch of {owner}/{repo}: '{result.get('defaultBranch', '?')}', "
+        f"{len(result.get('protectedBranches', []))} protected branch(es)."
+    ), [artifact]
+
+
+def _handle_branch_rules(text: str, message: dict) -> tuple[str, list]:
+    metadata = (message.get("metadata") or {})
+    payload = metadata.get("scmPayload") or {}
+    owner = payload.get("owner", "") or ""
+    repo = payload.get("repo", "") or ""
+    if not owner or not repo:
+        owner, repo = _parse_owner_repo(text)
+    if not owner or not repo:
+        return "Missing owner/repo for branch rules query.", []
+    _require_scm_permission(
+        action="branch.rules", target=f"{owner}/{repo}", message=message
+    )
+    result, status = _provider.get_branch_rules(owner, repo)
+    if status != "ok":
+        return f"Get branch rules failed: {status}", []
+    artifact = build_text_artifact(
+        "branch-rules",
+        json.dumps(result, ensure_ascii=False, indent=2),
+        metadata={"agentId": AGENT_ID, "capability": "scm.branch.rules"},
+    )
+    return (
+        f"Branch rules for {owner}/{repo}: {len(result.get('rules', []))} rule(s) "
+        f"from {result.get('source', 'unknown')}."
+    ), [artifact]
+
+
+# ---------------------------------------------------------------------------
+# Operation-level audit helper
+# ---------------------------------------------------------------------------
+
+def _write_audit(
+    *,
+    message: dict,
+    operation: str,
+    target: dict,
+    input_summary: dict,
+    result: dict,
+    duration_ms: int = 0,
+) -> None:
+    """Write a boundary-operation audit entry to the task workspace."""
+    metadata = (message.get("metadata") or {})
+    workspace_path = metadata.get("sharedWorkspacePath") or ""
+    task_id = metadata.get("taskId") or metadata.get("orchestratorTaskId") or ""
+    orchestrator_task_id = metadata.get("orchestratorTaskId") or ""
+    requesting_agent = metadata.get("requestAgent") or metadata.get("requestingAgent") or ""
+    entry = {
+        "ts": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
+        "agentId": AGENT_ID,
+        "operation": operation,
+        "taskId": task_id,
+        "orchestratorTaskId": orchestrator_task_id,
+        "requestingAgent": requesting_agent,
+        "target": target,
+        "input": input_summary,
+        "result": result,
+        "durationMs": duration_ms,
+    }
+    print(f"[{AGENT_ID}] [operation-audit] {json.dumps(entry, ensure_ascii=False)}")
+    write_operation_audit(workspace_path, AGENT_ID, entry)
 
 
 def _handle_llm_dispatch(text: str, message: dict, system_prompt: str) -> tuple[str, list]:
@@ -1007,6 +1269,10 @@ def _dispatch_clone(task_id: str, message: dict):
     branch_name = branch.group(1) if branch else "main"
     target = metadata.get("sharedWorkspacePath") or tempfile.mkdtemp(prefix="scm-workspace-")
     callback_url = metadata.get("orchestratorCallbackUrl", "")
+    # Depth control: default shallow (depth=1); caller may request full_history or custom depth
+    clone_payload = metadata.get("clonePayload") or {}
+    full_history = bool(clone_payload.get("fullHistory", False))
+    clone_depth = int(clone_payload.get("depth", 1))
     if not owner or not repo:
         _update_task(task_id, state="TASK_STATE_FAILED",
                      message="Could not parse owner/repo for clone.")
@@ -1032,6 +1298,7 @@ def _dispatch_clone(task_id: str, message: dict):
     t = threading.Thread(
         target=_clone_async_worker,
         args=(task_id, owner, repo, branch_name, target, callback_url),
+        kwargs={"depth": clone_depth, "full_history": full_history},
         daemon=True,
     )
     t.start()
@@ -1172,6 +1439,131 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"content": content, "file": file_path})
             return
 
+        # Remote read endpoints (no local clone required)
+        if path == "/scm/remote/file":
+            owner = qs.get("owner", qs.get("project", [""]))[0]
+            repo = qs.get("repo", [""])[0]
+            file_path = qs.get("path", [""])[0]
+            ref = qs.get("ref", [""])[0]
+            if not owner or not repo or not file_path:
+                self._send_json(400, {"error": "missing owner/repo/path"})
+                return
+            if not _enforce_http_scm_permission(
+                self, action="repo.read_file", target=f"{owner}/{repo}:{file_path}"
+            ):
+                return
+            content, status = _provider.read_remote_file(owner, repo, file_path, ref)
+            if status != "ok":
+                self._send_json(404, {"error": status})
+                return
+            self._send_json(200, {"content": content, "path": file_path, "ref": ref})
+            return
+
+        if path == "/scm/remote/dir":
+            owner = qs.get("owner", qs.get("project", [""]))[0]
+            repo = qs.get("repo", [""])[0]
+            dir_path = qs.get("path", [""])[0]
+            ref = qs.get("ref", [""])[0]
+            if not owner or not repo:
+                self._send_json(400, {"error": "missing owner/repo"})
+                return
+            if not _enforce_http_scm_permission(
+                self, action="repo.list_dir", target=f"{owner}/{repo}:{dir_path or '/'}"
+            ):
+                return
+            entries, status = _provider.list_remote_dir(owner, repo, dir_path, ref)
+            self._send_json(200 if status == "ok" else 500, {"entries": entries, "status": status})
+            return
+
+        if path == "/scm/remote/search":
+            owner = qs.get("owner", qs.get("project", [""]))[0]
+            repo = qs.get("repo", [""])[0]
+            query = qs.get("q", qs.get("query", [""]))[0]
+            limit = int(qs.get("limit", ["20"])[0])
+            if not owner or not repo or not query:
+                self._send_json(400, {"error": "missing owner/repo/q"})
+                return
+            if not _enforce_http_scm_permission(
+                self, action="code.search", target=f"{owner}/{repo}"
+            ):
+                return
+            results, status = _provider.search_code(owner, repo, query, limit)
+            self._send_json(200 if status in ("ok", "not_supported") else 500,
+                            {"results": results, "status": status})
+            return
+
+        if path == "/scm/refs/compare":
+            owner = qs.get("owner", qs.get("project", [""]))[0]
+            repo = qs.get("repo", [""])[0]
+            base = qs.get("base", ["main"])[0]
+            head = qs.get("head", [""])[0]
+            stat_only = qs.get("statOnly", ["false"])[0].lower() == "true"
+            if not owner or not repo or not head:
+                self._send_json(400, {"error": "missing owner/repo/head"})
+                return
+            if not _enforce_http_scm_permission(
+                self, action="ref.compare", target=f"{owner}/{repo}:{base}...{head}"
+            ):
+                return
+            result, status = _provider.compare_refs(owner, repo, base, head, stat_only=stat_only)
+            self._send_json(200 if status == "ok" else 500, {"comparison": result, "status": status})
+            return
+
+        if path == "/scm/branch/default":
+            owner = qs.get("owner", qs.get("project", [""]))[0]
+            repo = qs.get("repo", [""])[0]
+            if not owner or not repo:
+                self._send_json(400, {"error": "missing owner/repo"})
+                return
+            if not _enforce_http_scm_permission(
+                self, action="branch.default", target=f"{owner}/{repo}"
+            ):
+                return
+            result, status = _provider.get_default_branch(owner, repo)
+            self._send_json(200 if status == "ok" else 500, {"branchInfo": result, "status": status})
+            return
+
+        if path == "/scm/branch/rules":
+            owner = qs.get("owner", qs.get("project", [""]))[0]
+            repo = qs.get("repo", [""])[0]
+            if not owner or not repo:
+                self._send_json(400, {"error": "missing owner/repo"})
+                return
+            if not _enforce_http_scm_permission(
+                self, action="branch.rules", target=f"{owner}/{repo}"
+            ):
+                return
+            result, status = _provider.get_branch_rules(owner, repo)
+            self._send_json(200 if status == "ok" else 500, {"branchRules": result, "status": status})
+            return
+
+        # Audit log query endpoint
+        if path == "/audit":
+            task_id = qs.get("taskId", [""])[0]
+            agent_id_qs = qs.get("agentId", [AGENT_ID])[0]
+            operation = qs.get("operation", [""])[0]
+            since = qs.get("since", [""])[0]
+            workspace = qs.get("workspace", [""])[0]
+            if not workspace:
+                # Try to find a recent workspace from task store
+                with TASKS_LOCK:
+                    matching = [
+                        t for t in TASKS.values()
+                        if not task_id or t.get("id") == task_id
+                    ]
+                # Return in-memory audit from print logs only (no workspace path available)
+                self._send_json(200, {
+                    "entries": [],
+                    "note": "Provide ?workspace=<path> to query persistent audit log",
+                })
+                return
+            entries = read_operation_audit(
+                workspace, agent_id_qs,
+                task_id=task_id, operation=operation, since=since,
+            )
+            self._send_json(200, {"entries": entries, "count": len(entries)})
+            return
+
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -1261,6 +1653,8 @@ class Handler(BaseHTTPRequestHandler):
             branch = body.get("branch", "main")
             target_path = body.get("targetPath", "")
             callback_url = body.get("callbackUrl", "")
+            clone_depth = int(body.get("depth", 1))
+            full_history = bool(body.get("fullHistory", False))
             if not owner or not repo or not target_path:
                 self._send_json(400, {"error": "missing owner/repo/targetPath"})
                 return
@@ -1276,6 +1670,7 @@ class Handler(BaseHTTPRequestHandler):
             t = threading.Thread(
                 target=_clone_async_worker,
                 args=(task_id, owner, repo, branch, target_path, callback_url),
+                kwargs={"depth": clone_depth, "full_history": full_history},
                 daemon=True,
             )
             t.start()

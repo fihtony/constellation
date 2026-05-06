@@ -440,3 +440,192 @@ class GitHubProvider(SCMProvider):
     @property
     def provider_name(self) -> str:
         return "github"
+
+    # ------------------------------------------------------------------
+    # Remote read operations (no local clone required)
+    # ------------------------------------------------------------------
+
+    def read_remote_file(
+        self, owner: str, repo: str, path: str, ref: str = ""
+    ) -> tuple[str, str]:
+        """Read a single file from a remote branch/ref via GitHub contents API."""
+        endpoint = f"repos/{owner}/{repo}/contents/{path.lstrip('/')}"
+        if ref:
+            endpoint += f"?ref={quote(ref)}"
+        status, body = self._request("GET", endpoint)
+        if status != 200:
+            return "", f"error_{status}"
+        encoding = body.get("encoding", "")
+        raw_content = body.get("content", "")
+        if encoding == "base64":
+            try:
+                decoded = base64.b64decode(raw_content.replace("\n", "")).decode("utf-8", errors="replace")
+                return decoded, "ok"
+            except Exception as exc:
+                return "", f"decode_error: {exc}"
+        # Plain text fallback (unlikely from GitHub API)
+        return raw_content, "ok"
+
+    def list_remote_dir(
+        self, owner: str, repo: str, path: str = "", ref: str = ""
+    ) -> tuple[list[dict], str]:
+        """List directory contents from remote repo via GitHub contents API."""
+        endpoint = f"repos/{owner}/{repo}/contents/{path.lstrip('/')}" if path else f"repos/{owner}/{repo}/contents"
+        if ref:
+            endpoint += f"?ref={quote(ref)}"
+        status, body = self._request("GET", endpoint)
+        if status != 200:
+            return [], f"error_{status}"
+        if isinstance(body, list):
+            entries = [
+                {
+                    "name": item.get("name", ""),
+                    "path": item.get("path", ""),
+                    "type": item.get("type", ""),  # "file" | "dir" | "symlink"
+                    "size": item.get("size", 0),
+                    "htmlUrl": item.get("html_url", ""),
+                }
+                for item in body
+            ]
+            return entries, "ok"
+        # Single file response — wrap it
+        if isinstance(body, dict) and body.get("type") == "file":
+            return [
+                {
+                    "name": body.get("name", ""),
+                    "path": body.get("path", ""),
+                    "type": "file",
+                    "size": body.get("size", 0),
+                    "htmlUrl": body.get("html_url", ""),
+                }
+            ], "ok"
+        return [], "empty_or_unexpected"
+
+    def search_code(
+        self, owner: str, repo: str, query: str, limit: int = 20
+    ) -> tuple[list[dict], str]:
+        """Search code in the repository via GitHub code search API."""
+        q = quote(f"{query} repo:{owner}/{repo}")
+        per_page = min(max(1, limit), 30)
+        status, body = self._request("GET", f"search/code?q={q}&per_page={per_page}")
+        if status != 200:
+            return [], f"error_{status}"
+        items = body.get("items") or []
+        results = []
+        for item in items:
+            fragments = [
+                match.get("fragment", "")
+                for match in (item.get("text_matches") or [])
+                if match.get("fragment")
+            ]
+            results.append(
+                {
+                    "path": item.get("path", ""),
+                    "htmlUrl": item.get("html_url", ""),
+                    "repository": item.get("repository", {}).get("full_name", ""),
+                    "fragmentText": "\n---\n".join(fragments) if fragments else "",
+                }
+            )
+        return results, "ok"
+
+    def compare_refs(
+        self,
+        owner: str,
+        repo: str,
+        base: str,
+        head: str,
+        stat_only: bool = False,
+    ) -> tuple[dict, str]:
+        """Compare two branches or commits via GitHub compare API."""
+        endpoint = f"repos/{owner}/{repo}/compare/{quote(base, safe='')}...{quote(head, safe='')}"
+        status, body = self._request("GET", endpoint)
+        if status != 200:
+            return {}, f"error_{status}"
+        files_raw = body.get("files") or []
+        file_entries = [
+            {
+                "filename": f.get("filename", ""),
+                "status": f.get("status", ""),
+                "additions": f.get("additions", 0),
+                "deletions": f.get("deletions", 0),
+                "changes": f.get("changes", 0),
+            }
+            for f in files_raw
+        ]
+        result: dict = {
+            "aheadBy": body.get("ahead_by", 0),
+            "behindBy": body.get("behind_by", 0),
+            "totalChangedFiles": body.get("total_commits", len(file_entries)),
+            "additions": sum(f["additions"] for f in file_entries),
+            "deletions": sum(f["deletions"] for f in file_entries),
+            "files": file_entries,
+            "status": body.get("status", ""),  # "ahead" | "behind" | "diverged" | "identical"
+        }
+        if not stat_only:
+            # Include unified diff snippets from patch fields when available
+            diffs = [
+                f.get("patch", "")
+                for f in files_raw
+                if f.get("patch")
+            ]
+            result["diff"] = "\n".join(diffs)
+        return result, "ok"
+
+    def get_default_branch(self, owner: str, repo: str) -> tuple[dict, str]:
+        """Return the default branch and a list of protected branches."""
+        repo_info, status = self.get_repo(owner, repo)
+        if status != "ok":
+            return {}, status
+        default_branch = repo_info.get("defaultBranch", "main")
+        # Fetch protected branches from GitHub API
+        prot_status, prot_body = self._request(
+            "GET", f"repos/{owner}/{repo}/branches?protected=true&per_page=100"
+        )
+        protected: list[str] = []
+        if prot_status == 200 and isinstance(prot_body, list):
+            protected = [b["name"] for b in prot_body if b.get("name")]
+        # Ensure the default branch is always listed as protected
+        if default_branch and default_branch not in protected:
+            protected.insert(0, default_branch)
+        return {
+            "defaultBranch": default_branch,
+            "protectedBranches": protected,
+        }, "ok"
+
+    def get_branch_rules(self, owner: str, repo: str) -> tuple[dict, str]:
+        """Return branch protection rules, combining API data with local policy defaults."""
+        from common.task_permissions import _DEFAULT_PROTECTED_BRANCH_PATTERNS
+
+        # Try fetching branch protection for the default branch
+        repo_info, _ = self.get_repo(owner, repo)
+        default_branch = repo_info.get("defaultBranch", "main") if isinstance(repo_info, dict) else "main"
+        prot_status, prot_body = self._request(
+            "GET", f"repos/{owner}/{repo}/branches/{quote(default_branch)}/protection"
+        )
+        api_rules: dict = {}
+        if prot_status == 200 and isinstance(prot_body, dict):
+            api_rules = {
+                "requirePRReviews": bool(prot_body.get("required_pull_request_reviews")),
+                "dismissStaleReviews": (
+                    (prot_body.get("required_pull_request_reviews") or {})
+                    .get("dismiss_stale_reviews", False)
+                ),
+                "requireStatusChecks": bool(prot_body.get("required_status_checks")),
+                "enforceAdmins": (prot_body.get("enforce_admins") or {}).get("enabled", False),
+                "restrictPushToTeams": bool(prot_body.get("restrictions")),
+            }
+        rules = [
+            {
+                "pattern": p,
+                "description": "Protected branch — no direct push allowed",
+                "source": "local_policy",
+            }
+            for p in _DEFAULT_PROTECTED_BRANCH_PATTERNS
+        ]
+        return {
+            "defaultBranch": default_branch,
+            "localProtectedPatterns": _DEFAULT_PROTECTED_BRANCH_PATTERNS,
+            "apiProtectionRules": api_rules,
+            "rules": rules,
+            "source": "github_api+local_policy",
+        }, "ok"

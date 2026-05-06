@@ -31,10 +31,11 @@ from common.agent_directory import (
 from common.env_utils import build_isolated_git_env, load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.message_utils import artifact_text, build_text_artifact, extract_text
+from common.orchestrator import resolve_orchestrator_base_url
 from common.per_task_exit import PerTaskExitHandler
 from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt, load_rules
-from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionEscalationRequired,
     build_permission_denied_artifact,
@@ -52,7 +53,6 @@ AGENT_ID = os.environ.get("AGENT_ID", "web-agent")
 INSTANCE_ID = os.environ.get("INSTANCE_ID", f"{AGENT_ID}-local")
 ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://web-agent:{PORT}")
 REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000")
-COMPASS_URL = os.environ.get("COMPASS_URL", "http://compass:8080")
 
 ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", "15"))
 TASK_TIMEOUT = int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "600"))
@@ -652,6 +652,7 @@ def _run_agentic(
     max_tokens: int = 4096,
 ) -> str:
     """Run the configured runtime and return raw output text."""
+    require_agentic_runtime("Web Agent")
     result = get_runtime().run(
         prompt=prompt,
         context=context,
@@ -2974,7 +2975,7 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
     compass_task_id = metadata.get("orchestratorTaskId", "")
     workflow_task_id = compass_task_id or task_id
     callback_url = metadata.get("orchestratorCallbackUrl", "")
-    compass_url = metadata.get("compassUrl") or COMPASS_URL
+    compass_url = resolve_orchestrator_base_url(metadata, agent_directory=agent_directory)
     workspace = metadata.get("sharedWorkspacePath", "")
     permissions = metadata.get("permissions") if isinstance(metadata.get("permissions"), dict) else None
     acceptance_criteria: list = metadata.get("acceptanceCriteria") or []

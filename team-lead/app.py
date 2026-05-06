@@ -33,10 +33,11 @@ from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.launcher import get_launcher
 from common.message_utils import artifact_text, build_text_artifact, extract_text
+from common.orchestrator import resolve_orchestrator_base_url
 from common.per_task_exit import PerTaskExitHandler
 from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt, load_rules
-from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionEscalationRequired,
     build_permission_denied_artifact,
@@ -55,7 +56,6 @@ AGENT_ID = os.environ.get("AGENT_ID", "team-lead-agent")
 INSTANCE_ID = os.environ.get("INSTANCE_ID", f"{AGENT_ID}-local")
 ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://team-lead:{PORT}")
 REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000")
-COMPASS_URL = os.environ.get("COMPASS_URL", "http://compass:8080")
 
 ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", "15"))
 TASK_TIMEOUT = int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "3600"))
@@ -225,7 +225,7 @@ class _TaskContext:
     def __init__(self):
         self.compass_task_id: str = ""
         self.compass_callback_url: str = ""
-        self.compass_url: str = COMPASS_URL
+        self.compass_url: str = ""
         self.shared_workspace_path: str = ""
         self.permissions: dict | None = None
         self.original_message: dict = {}
@@ -800,14 +800,14 @@ def _ack_agent(service_url: str, task_id: str) -> None:
 # Progress / Callback helpers
 # ---------------------------------------------------------------------------
 
-def _report_progress(compass_url: str, compass_task_id: str, step: str):
-    """POST a progress step to Compass (best-effort, non-critical)."""
-    if not compass_url or not compass_task_id:
+def _report_progress(orchestrator_url: str, compass_task_id: str, step: str):
+    """POST a progress step to the orchestrator (best-effort, non-critical)."""
+    if not orchestrator_url or not compass_task_id:
         return
     payload = {"step": step, "agentId": AGENT_ID}
     data = json.dumps(payload).encode("utf-8")
     request = Request(
-        f"{compass_url.rstrip('/')}/tasks/{compass_task_id}/progress",
+        f"{orchestrator_url.rstrip('/')}/tasks/{compass_task_id}/progress",
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -1340,6 +1340,7 @@ def _run_agentic(
     max_tokens: int = 4096,
 ) -> str:
     """Run the configured agentic runtime and return raw text output."""
+    require_agentic_runtime("Team Lead")
     result = get_runtime().run(
         prompt=prompt,
         context=context,
@@ -2762,7 +2763,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
     if not task:
         return
 
-    compass_url = ctx.compass_url
+    orchestrator_url = ctx.compass_url
     compass_task_id = ctx.compass_task_id
     callback_url = ctx.compass_callback_url
     workspace = ctx.shared_workspace_path
@@ -2801,7 +2802,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
                 indent=2,
             ),
         )
-        _report_progress(compass_url, compass_task_id, phase)
+        _report_progress(orchestrator_url, compass_task_id, phase)
 
     try:
         # ── Phase 1: Analyze ─────────────────────────────────────────────────
@@ -3776,7 +3777,7 @@ class TeamLeadHandler(BaseHTTPRequestHandler):
         metadata = message.get("metadata", {})
         compass_task_id = metadata.get("orchestratorTaskId", "")
         callback_url = metadata.get("orchestratorCallbackUrl", "")
-        compass_url = metadata.get("compassUrl") or os.environ.get("COMPASS_URL", COMPASS_URL)
+        compass_url = resolve_orchestrator_base_url(metadata, agent_directory=agent_directory)
         workspace = metadata.get("sharedWorkspacePath", "")
         user_text = extract_text(message) or ""
 

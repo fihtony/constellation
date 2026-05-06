@@ -15,9 +15,10 @@ from urllib.request import Request, urlopen
 
 from common.instance_reporter import InstanceReporter
 from common.message_utils import build_text_artifact, extract_text
+from common.orchestrator import resolve_orchestrator_base_url
 from common.per_task_exit import PerTaskExitHandler
 from common.rules_loader import build_system_prompt
-from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionDeniedError,
     audit_permission_check,
@@ -220,6 +221,7 @@ def _run_agentic_json(
     context: dict | None = None,
     timeout: int = 180,
 ) -> dict:
+    require_agentic_runtime("Office Agent")
     result = get_runtime().run(
         prompt=prompt,
         context=context,
@@ -1123,7 +1125,7 @@ def _execute_capability(task_id: str, message: dict) -> dict:
 def _run_workflow(task_id: str, message: dict):
     metadata = dict(message.get("metadata") or {})
     callback_url = str(metadata.get("orchestratorCallbackUrl") or "")
-    compass_url = str(metadata.get("compassUrl") or "")
+    compass_url = resolve_orchestrator_base_url(metadata)
     compass_task_id = str(metadata.get("orchestratorTaskId") or "")
     exit_rule = PerTaskExitHandler.parse(metadata)
     task = task_store.get(task_id)

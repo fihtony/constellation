@@ -13,7 +13,10 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from common.tools.base import ConstellationTool, ToolSchema
-from common.tools.registry import clear_registry, get_tool, is_registered, list_tools, register_tool
+from common.tools.registry import (
+    clear_registry, get_tool, is_registered, list_tools, register_tool,
+    snapshot_registry, restore_registry,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -42,10 +45,11 @@ def _make_tool(name: str, description: str = "test tool") -> ConstellationTool:
 
 class ToolRegistryTests(unittest.TestCase):
     def setUp(self):
+        self._snapshot = snapshot_registry()
         clear_registry()
 
     def tearDown(self):
-        clear_registry()
+        restore_registry(self._snapshot)
 
     def test_register_and_retrieve(self):
         tool = _make_tool("test_tool_a")
@@ -112,10 +116,11 @@ class ToolBaseTests(unittest.TestCase):
 
 class McpAdapterTests(unittest.TestCase):
     def setUp(self):
+        self._snapshot = snapshot_registry()
         clear_registry()
 
     def tearDown(self):
-        clear_registry()
+        restore_registry(self._snapshot)
 
     def _run_server(self, lines: list[str]) -> list[dict]:
         from common.tools.mcp_adapter import start_mcp_server
@@ -189,10 +194,11 @@ class McpAdapterTests(unittest.TestCase):
 
 class NativeAdapterTests(unittest.TestCase):
     def setUp(self):
+        self._snapshot = snapshot_registry()
         clear_registry()
 
     def tearDown(self):
-        clear_registry()
+        restore_registry(self._snapshot)
 
     def test_get_function_definitions_empty(self):
         from common.tools.native_adapter import get_function_definitions
@@ -224,14 +230,11 @@ class NativeAdapterTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class BarrelImportTests(unittest.TestCase):
-    def setUp(self):
-        clear_registry()
-
-    def tearDown(self):
-        clear_registry()
+    # No clear_registry: tools are imported at module level in combined runs.
+    # Tests use issubset checks so extra registrations are fine.
 
     def test_dev_agent_barrel_registers_expected_tools(self):
-        import common.tools.dev_agent_tools  # noqa: F401
+        import common.tools.dev_agent_tools  # noqa: F401 (may be cached)
         expected = {
             "jira_get_ticket",
             "jira_add_comment",
@@ -250,6 +253,57 @@ class BarrelImportTests(unittest.TestCase):
         registered = {t.schema.name for t in list_tools()}
         self.assertIn("registry_query", registered)
         self.assertIn("registry_list_agents", registered)
+        self.assertIn("registry_agent_status", registered)
+
+
+class RegistryToolTests(unittest.TestCase):
+    # No clear_registry: these tests create tool instances directly.
+
+    def test_registry_agent_status_requires_selector(self):
+        import common.tools.registry_tools as registry_tools
+
+        tool = registry_tools.RegistryAgentStatusTool()
+        result = tool.execute({})
+
+        self.assertTrue(result["isError"])
+        self.assertIn("Provide either capability or agentId", result["content"][0]["text"])
+
+    def test_registry_agent_status_summarizes_capability_query(self):
+        import common.tools.registry_tools as registry_tools
+
+        payload = [
+            {
+                "agent_id": "scm-agent",
+                "display_name": "SCM Agent",
+                "capabilities": ["scm.repo.inspect"],
+                "instances": [
+                    {"instance_id": "scm-1", "status": "idle", "updated_at": "2026-05-06T10:00:00Z"},
+                    {"instance_id": "scm-2", "status": "busy", "updated_at": "2026-05-06T10:01:00Z"},
+                ],
+            }
+        ]
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(payload).encode("utf-8")
+
+        tool = registry_tools.RegistryAgentStatusTool()
+        with patch.object(registry_tools, "urlopen", return_value=_Response()):
+            result = tool.execute({"capability": "scm.repo.inspect"})
+
+        self.assertFalse(result["isError"])
+        summary = json.loads(result["content"][0]["text"])
+        self.assertEqual(summary[0]["agentId"], "scm-agent")
+        self.assertEqual(summary[0]["instanceCount"], 2)
+        self.assertEqual(summary[0]["idleInstances"], 1)
+        self.assertEqual(summary[0]["busyInstances"], 1)
+        self.assertEqual(summary[0]["status"], "healthy")
 
 
 if __name__ == "__main__":

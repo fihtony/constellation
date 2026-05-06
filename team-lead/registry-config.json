@@ -9,7 +9,6 @@
     "mountDockerSocket": true,
     "passThroughEnv": ["ARTIFACT_ROOT", "COPILOT_GITHUB_TOKEN", "TZ"],
     "env": {
-      "COMPASS_URL": "http://compass:8080",
       "DYNAMIC_AGENT_NETWORK": "constellation-network"
     }
   },

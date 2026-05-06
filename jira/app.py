@@ -21,7 +21,7 @@ from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.message_utils import build_text_artifact, extract_text
 from common.rules_loader import build_system_prompt
-from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionDeniedError,
     audit_permission_check,
@@ -135,6 +135,7 @@ def _run_agentic(
     timeout: int = 120,
     max_tokens: int = 4096,
 ) -> str:
+    require_agentic_runtime("Jira Agent")
     result = get_runtime().run(
         prompt=prompt,
         context=context,

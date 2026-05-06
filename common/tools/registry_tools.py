@@ -17,6 +17,41 @@ from common.tools.registry import register_tool
 _REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000")
 
 
+def _load_registry_json(path: str) -> list | dict:
+    req = Request(
+        f"{_REGISTRY_URL}{path}",
+        headers={"Accept": "application/json"},
+    )
+    with urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _summarize_agent_status(agent: dict) -> dict:
+    instances = list(agent.get("instances") or [])
+    idle_instances = sum(1 for instance in instances if instance.get("status") == "idle")
+    busy_instances = sum(1 for instance in instances if instance.get("status") == "busy")
+    last_heartbeat = ""
+    for instance in instances:
+        heartbeat = str(instance.get("updated_at") or instance.get("updatedAt") or "").strip()
+        if heartbeat and heartbeat > last_heartbeat:
+            last_heartbeat = heartbeat
+    status = "healthy"
+    if not instances:
+        status = "unavailable"
+    elif idle_instances == 0:
+        status = "degraded"
+    return {
+        "agentId": agent.get("agent_id") or agent.get("agentId") or "",
+        "displayName": agent.get("display_name") or agent.get("displayName") or "",
+        "capabilities": list(agent.get("capabilities") or []),
+        "instanceCount": len(instances),
+        "idleInstances": idle_instances,
+        "busyInstances": busy_instances,
+        "status": status,
+        "lastHeartbeat": last_heartbeat,
+    }
+
+
 class RegistryQueryTool(ConstellationTool):
     @property
     def schema(self) -> ToolSchema:
@@ -43,12 +78,7 @@ class RegistryQueryTool(ConstellationTool):
         if not capability:
             return self.error("Missing required argument: capability")
         try:
-            req = Request(
-                f"{_REGISTRY_URL}/query?capability={capability}",
-                headers={"Accept": "application/json"},
-            )
-            with urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            data = _load_registry_json(f"/query?capability={capability}")
             return self.ok(json.dumps(data, ensure_ascii=False, indent=2))
         except (URLError, OSError) as exc:
             return self.error(f"Registry query failed: {exc}")
@@ -70,16 +100,65 @@ class RegistryListAgentsTool(ConstellationTool):
     def execute(self, args: dict) -> dict:
         del args
         try:
-            req = Request(
-                f"{_REGISTRY_URL}/agents",
-                headers={"Accept": "application/json"},
-            )
-            with urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            data = _load_registry_json("/agents")
             return self.ok(json.dumps(data, ensure_ascii=False, indent=2))
         except (URLError, OSError) as exc:
             return self.error(f"Registry list agents failed: {exc}")
 
 
+class RegistryAgentStatusTool(ConstellationTool):
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="registry_agent_status",
+            description=(
+                "Summarize the runtime status of registered agents by capability or agent id, "
+                "including instance counts and availability."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "capability": {
+                        "type": "string",
+                        "description": "Optional capability identifier to filter by.",
+                    },
+                    "agentId": {
+                        "type": "string",
+                        "description": "Optional agent id to inspect directly.",
+                    },
+                },
+                "required": [],
+            },
+        )
+
+    def execute(self, args: dict) -> dict:
+        capability = str(args.get("capability") or "").strip()
+        agent_id = str(args.get("agentId") or "").strip()
+        if not capability and not agent_id:
+            return self.error("Provide either capability or agentId")
+        try:
+            if capability:
+                agents = _load_registry_json(f"/query?capability={capability}")
+            else:
+                agents = _load_registry_json("/agents")
+            items = list(agents or [])
+            if agent_id:
+                items = [item for item in items if (item.get("agent_id") or item.get("agentId")) == agent_id]
+                if items and "instances" not in items[0]:
+                    status_items = []
+                    for item in items:
+                        item_id = item.get("agent_id") or item.get("agentId")
+                        instances = _load_registry_json(f"/agents/{item_id}/instances")
+                        normalized = dict(item)
+                        normalized["instances"] = list(instances or [])
+                        status_items.append(normalized)
+                    items = status_items
+            summary = [_summarize_agent_status(item) for item in items]
+            return self.ok(json.dumps(summary, ensure_ascii=False, indent=2))
+        except (URLError, OSError) as exc:
+            return self.error(f"Registry agent status failed: {exc}")
+
+
 register_tool(RegistryQueryTool())
 register_tool(RegistryListAgentsTool())
+register_tool(RegistryAgentStatusTool())
