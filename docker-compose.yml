@@ -227,7 +227,6 @@ services:
   #     COMPASS_URL: "http://compass:8080"
   #     HEARTBEAT_INTERVAL: "30"
   #     OPENAI_BASE_URL: "http://host.docker.internal:1288/v1"
-  #     ALLOW_MOCK_FALLBACK: "0"
   #     DYNAMIC_AGENT_NETWORK: "constellation-network"
   #     ARTIFACT_ROOT: "/app/artifacts"
   #     DOCKER_SOCKET: "/var/run/docker.sock"

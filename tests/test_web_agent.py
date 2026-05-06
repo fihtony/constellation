@@ -22,7 +22,6 @@ Usage (against a running container):
 Environment variables (read from tests/.env or shell):
     OPENAI_BASE_URL   — LLM endpoint (default: http://localhost:1288/v1)
     OPENAI_MODEL      — model name   (default: gpt-5-mini)
-    ALLOW_MOCK_FALLBACK=1 to allow mock LLM responses in offline environments
 """
 
 from __future__ import annotations
@@ -442,7 +441,6 @@ def main(argv: list[str] | None = None) -> int:
         # Fall back to web/.env.example defaults
         env.setdefault("OPENAI_BASE_URL", "http://localhost:1288/v1")
         env.setdefault("OPENAI_MODEL", "gpt-5-mini")
-        env.setdefault("ALLOW_MOCK_FALLBACK", "1")
 
     report = Report(verbose=args.verbose)
     proc = None
@@ -463,7 +461,6 @@ def main(argv: list[str] | None = None) -> int:
             "OPENAI_BASE_URL": env.get("OPENAI_BASE_URL", "http://localhost:1288/v1"),
             "OPENAI_MODEL": env.get("OPENAI_MODEL", "gpt-5-mini"),
             "OPENAI_API_KEY": env.get("OPENAI_API_KEY", ""),
-            "ALLOW_MOCK_FALLBACK": env.get("ALLOW_MOCK_FALLBACK", "1"),
             "SCM_AGENT_URL": "",
             "JIRA_AGENT_URL": "",
             "COMPASS_URL": "",

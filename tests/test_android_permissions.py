@@ -26,7 +26,6 @@ os.environ.setdefault("ADVERTISED_BASE_URL", "http://android-agent:8000")
 os.environ.setdefault("COMPASS_URL", "http://compass:8080")
 os.environ.setdefault("OPENAI_BASE_URL", "http://localhost:1288/v1")
 os.environ.setdefault("OPENAI_MODEL", "gpt-5-mini")
-os.environ.setdefault("ALLOW_MOCK_FALLBACK", "1")
 
 
 class TestCallSyncAgentPermissions(unittest.TestCase):

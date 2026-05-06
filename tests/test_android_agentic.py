@@ -29,7 +29,6 @@ REPO_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(REPO_ROOT))
 
 os.environ.setdefault("OPENAI_BASE_URL", "http://localhost:1288/v1")
-os.environ.setdefault("ALLOW_MOCK_FALLBACK", "0")
 os.environ.setdefault("AGENT_RUNTIME", "connect-agent")
 
 from common.env_utils import load_dotenv  # noqa: E402

@@ -7,7 +7,6 @@ import json
 import os
 
 os.environ.setdefault("OPENAI_BASE_URL", "http://localhost:1288/v1")
-os.environ.setdefault("ALLOW_MOCK_FALLBACK", "0")
 
 from android.workflow import load_test_targets, run_android_workflow
 

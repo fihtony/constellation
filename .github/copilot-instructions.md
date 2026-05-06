@@ -482,10 +482,10 @@ artifacts = [
 ### 12. LLM Usage
 
 Use `common/runtime/adapter.py` for all agentic LLM/CLI calls. It handles:
-- `connect-agent` as the primary built-in production runtime, using Copilot Connect as its underlying LLM transport
-- `copilot-cli` as an optional compatible CLI backend
+- `copilot-cli` as the shared default runtime backend for LLM-enabled agents
 - `claude-code` as an optional compatible backend
-- Mock fallback when no real backend is available (`ALLOW_MOCK_FALLBACK=1`)
+- `connect-agent` as an explicit transport-backed backend when a workflow selects it
+- fail-fast runtime errors when the configured backend is unavailable or misconfigured
 - Proper timeout and structured result handling
 
 `common/runtime/copilot_connect.py` is a compatibility single-shot wrapper over the Copilot Connect transport. It is not a selectable agentic runtime backend.
@@ -521,7 +521,6 @@ REGISTRY_URL=http://registry:9000
 # OPENAI_BASE_URL=
 OPENAI_MODEL=gpt-5-mini
 OPENAI_API_KEY=
-ALLOW_MOCK_FALLBACK=0  # Set to 1 only for offline/test environments
 
 # Runtime
 HOST=0.0.0.0

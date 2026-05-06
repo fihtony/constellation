@@ -155,7 +155,6 @@ def start_local_agent(port: int) -> subprocess.Popen | None:
         "JIRA_BASE_URL": _jira_base_url(),
         "JIRA_TOKEN": _env("TEST_JIRA_TOKEN"),
         "JIRA_EMAIL": _env("TEST_JIRA_EMAIL"),
-        "ALLOW_MOCK_FALLBACK": "1",
         "OPENAI_BASE_URL": openai_base_url,
         "OPENAI_MODEL": _env("OPENAI_MODEL", "gpt-5-mini"),
         "PYTHONPATH": PROJECT_ROOT,
