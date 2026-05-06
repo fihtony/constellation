@@ -37,7 +37,7 @@ from common.tools.control_tools import configure_control_tools
 from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt, load_rules
 from common.prompt_builder import build_system_prompt_from_manifest
-from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
+from common.runtime.adapter import AgenticResult, get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionEscalationRequired,
     build_permission_denied_artifact,
@@ -900,6 +900,73 @@ def _generate_file_code(
         timeout=180,
         max_tokens=8192,
     )
+
+
+def _build_web_agentic_task_prompt(
+    task_instruction: str,
+    acceptance_criteria: list,
+    analysis: dict,
+    plan: dict,
+    repo_snapshot: str,
+    design_context: str,
+    review_issues: list[str],
+) -> str:
+    criteria_text = "\n".join(f"- {item}" for item in (acceptance_criteria or [])) or "Not specified."
+    review_text = "\n".join(f"- {item}" for item in (review_issues or [])) or "None."
+    analysis_json = json.dumps(analysis or {}, ensure_ascii=False, indent=2)
+    plan_json = json.dumps(plan or {}, ensure_ascii=False, indent=2)
+    return prompts.AGENTIC_IMPLEMENT_TEMPLATE.format(
+        task_instruction=task_instruction[:8000],
+        acceptance_criteria=criteria_text[:6000],
+        analysis_json=analysis_json[:12000],
+        plan_json=plan_json[:16000],
+        repo_snapshot=(repo_snapshot or "No repository snapshot provided.")[:12000],
+        design_context=(design_context or "No design context provided.")[:12000],
+        review_issues=review_text[:4000],
+    )
+
+
+def _run_agentic_implementation(
+    task_instruction: str,
+    acceptance_criteria: list,
+    analysis: dict,
+    plan: dict,
+    repo_snapshot: str,
+    design_context: str,
+    review_issues: list[str],
+    cwd: str,
+    log_fn,
+) -> AgenticResult:
+    require_agentic_runtime("Web Agent")
+    runtime = get_runtime()
+    task_prompt = _build_web_agentic_task_prompt(
+        task_instruction,
+        acceptance_criteria,
+        analysis,
+        plan,
+        repo_snapshot,
+        design_context,
+        review_issues,
+    )
+
+    def _on_progress(step: str) -> None:
+        text = " ".join(str(step or "").split())
+        if text:
+            log_fn(f"Agentic implementation progress: {text[:180]}")
+
+    try:
+        return runtime.run_agentic(
+            task=task_prompt,
+            system_prompt=_build_web_system_prompt(prompts.AGENTIC_IMPLEMENT_SYSTEM),
+            cwd=cwd,
+            max_turns=60,
+            timeout=1800,
+            on_progress=_on_progress,
+        )
+    except NotImplementedError as exc:
+        raise RuntimeError(
+            f"Configured runtime backend does not support agentic implementation: {exc}"
+        ) from exc
 
 
 def _normalize_plan_path(path: str) -> str:
@@ -2089,6 +2156,57 @@ def _commit_local_changes(
     commit_sha = head_output.strip()
     log_fn(f"Committed local changes on {branch_name}: {commit_sha[:12]}")
     return commit_sha
+
+
+def _collect_changed_repo_paths(repo_dir: str, planned_paths: list[str] | None = None) -> list[str]:
+    candidates: list[str] = []
+    for raw_path in planned_paths or []:
+        normalized = _normalize_plan_path(str(raw_path or ""))
+        if normalized:
+            candidates.append(normalized)
+
+    if os.path.isdir(os.path.join(repo_dir, ".git")):
+        ok, status_output = _run_local_git(repo_dir, ["status", "--porcelain"], check=False)
+        if ok and status_output.strip():
+            for line in status_output.splitlines():
+                if len(line) < 4:
+                    continue
+                rel_path = line[3:].strip()
+                if " -> " in rel_path:
+                    rel_path = rel_path.split(" -> ", 1)[1].strip()
+                rel_path = _normalize_plan_path(rel_path.strip('"'))
+                if rel_path:
+                    candidates.append(rel_path)
+
+    unique_paths: list[str] = []
+    seen: set[str] = set()
+    for rel_path in candidates:
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
+        unique_paths.append(rel_path)
+    return unique_paths
+
+
+def _collect_generated_files_from_directory(base_dir: str, planned_files: list[dict]) -> list[dict]:
+    planned_index = {
+        _normalize_plan_path(str(file_info.get("path", ""))): file_info
+        for file_info in planned_files or []
+        if _normalize_plan_path(str(file_info.get("path", "")))
+    }
+    generated_files: list[dict] = []
+    for rel_path in _collect_changed_repo_paths(base_dir, list(planned_index.keys())):
+        full_path = os.path.join(base_dir, rel_path)
+        if not os.path.isfile(full_path):
+            continue
+        try:
+            with open(full_path, encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        action = str((planned_index.get(rel_path) or {}).get("action") or "modify")
+        generated_files.append({"path": rel_path, "content": content, "action": action})
+    return generated_files
 
 
 # ---------------------------------------------------------------------------
@@ -3438,45 +3556,83 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         log(f"Implementing {len(files_to_implement)} file(s)")
 
         generated_files: list[dict] = []
-        context_summary = ""
-
-        for i, file_info in enumerate(files_to_implement):
-            file_path = file_info.get("path", f"file_{i}.txt")
-            log(f"Generating [{i+1}/{len(files_to_implement)}]: {file_path}")
-
-            # Read existing file if modifying and we have a clone
-            existing_content = ""
-            if file_info.get("action") == "modify" and clone_path:
-                candidate = os.path.join(clone_path, file_path.lstrip("/"))
-                if os.path.isfile(candidate):
-                    try:
-                        with open(candidate, encoding="utf-8", errors="replace") as fh:
-                            existing_content = fh.read(8000)
-                    except Exception:
-                        pass
-
-            # Use pre-generated content if available (e.g. auto-injected .gitignore)
-            if file_info.get("content"):
-                code = file_info["content"]
-            else:
-                code = _generate_file_code(
-                    file_info,
-                    task_instruction,
-                    analysis,
-                    context_summary,
-                    existing_content,
+        implementation_root = clone_path or agent_workspace
+        if implementation_root:
+            os.makedirs(implementation_root, exist_ok=True)
+            agentic_result = _run_agentic_implementation(
+                task_instruction,
+                acceptance_criteria,
+                analysis,
+                plan,
+                repo_snapshot,
+                design_context_str,
+                review_issues,
+                implementation_root,
+                log,
+            )
+            if not agentic_result.success:
+                raise RuntimeError(
+                    "Agentic implementation failed: "
+                    f"{agentic_result.summary or agentic_result.raw_output[:500]}"
                 )
-                # Strip any residual markdown fences from LLM output
-                code = _strip_code_fences(code)
+            generated_files = _collect_generated_files_from_directory(implementation_root, files_to_implement)
+            if not generated_files:
+                raise RuntimeError("Agentic implementation completed without any repository file changes.")
+            log(f"Agentic implementation complete — {len(generated_files)} file(s) changed")
+            _save_workspace_file(
+                workspace,
+                f"{AGENT_ID}/agentic-run.json",
+                json.dumps(
+                    {
+                        "taskId": workflow_task_id,
+                        "agentTaskId": task_id,
+                        "agentId": AGENT_ID,
+                        "backend": agentic_result.backend_used,
+                        "success": agentic_result.success,
+                        "summary": agentic_result.summary,
+                        "turnsUsed": agentic_result.turns_used,
+                        "toolCalls": agentic_result.tool_calls,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+        else:
+            context_summary = ""
 
-            generated_files.append({"path": file_path, "content": code, "action": file_info.get("action", "create")})
+            for i, file_info in enumerate(files_to_implement):
+                file_path = file_info.get("path", f"file_{i}.txt")
+                log(f"Generating [{i+1}/{len(files_to_implement)}]: {file_path}")
 
-            # Update context summary for subsequent files (brief)
-            context_summary += f"\n{file_path}: {file_info.get('purpose', '')}\n"
-            if len(context_summary) > 2000:
-                context_summary = context_summary[-2000:]
+                existing_content = ""
+                if file_info.get("action") == "modify" and clone_path:
+                    candidate = os.path.join(clone_path, file_path.lstrip("/"))
+                    if os.path.isfile(candidate):
+                        try:
+                            with open(candidate, encoding="utf-8", errors="replace") as fh:
+                                existing_content = fh.read(8000)
+                        except Exception:
+                            pass
 
-        log(f"Code generation complete — {len(generated_files)} file(s) ready")
+                if file_info.get("content"):
+                    code = file_info["content"]
+                else:
+                    code = _generate_file_code(
+                        file_info,
+                        task_instruction,
+                        analysis,
+                        context_summary,
+                        existing_content,
+                    )
+                    code = _strip_code_fences(code)
+
+                generated_files.append({"path": file_path, "content": code, "action": file_info.get("action", "create")})
+
+                context_summary += f"\n{file_path}: {file_info.get('purpose', '')}\n"
+                if len(context_summary) > 2000:
+                    context_summary = context_summary[-2000:]
+
+            log(f"Code generation complete — {len(generated_files)} file(s) ready")
 
         # ── Phase 5: Write to shared workspace ──────────────────────────────
         if clone_path:
