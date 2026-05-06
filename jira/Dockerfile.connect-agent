@@ -1,0 +1,19 @@
+# Jira Agent — connect-agent backend
+# Extends constellation-base-connect-agent with jira agent code.
+# Select this Dockerfile when AGENT_RUNTIME=connect-agent.
+
+FROM constellation-base-connect-agent:latest
+
+COPY jira/   /app/jira/
+COPY .github/skills/ /app/.github/skills/
+
+LABEL constellation.agent_id="tracker-agent"
+LABEL constellation.agent_name="Tracker Agent"
+LABEL constellation.agent_role="fundamental"
+LABEL constellation.runtime.backend="connect-agent"
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "jira/app.py"]

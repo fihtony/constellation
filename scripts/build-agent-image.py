@@ -32,8 +32,9 @@ _REPO_ROOT = Path(__file__).parent.parent.resolve()
 _SCRIPTS_DIR = Path(__file__).parent.resolve()
 _RESOLVE_SCRIPT = str(_SCRIPTS_DIR / "resolve-agent-runtime.py")
 
-# Agents with per-backend Dockerfiles (execution agents that need agentic runtime)
-_AGENTIC_AGENTS = ["team-lead", "web", "android"]
+# All agents that have per-backend Dockerfiles (Dockerfile.<backend>)
+# 'registry' is excluded — it is a pure infrastructure service with no agentic runtime.
+_AGENTIC_AGENTS = ["team-lead", "web", "android", "office", "compass", "jira", "scm", "ui-design"]
 
 # Platform overrides for specific agents (architecture-sensitive toolchains)
 _AGENT_PLATFORM_OVERRIDES: dict[str, str] = {
