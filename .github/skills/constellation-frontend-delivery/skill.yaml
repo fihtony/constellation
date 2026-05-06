@@ -1,0 +1,21 @@
+id: constellation-frontend-delivery
+version: 1.0.0
+level: agent-specific
+owner: web-agent
+appliesTo:
+  agentRoles: [frontend, web]
+  workflows: [development]
+  taskTags: [frontend, ui, accessibility, performance]
+  languages: [typescript, javascript]
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools:
+  - read_local_file
+  - edit_local_file
+  - run_local_command
+provides:
+  - frontend-implementation-guidance
+  - accessibility-checklist
+  - design-fidelity-review
+hashPolicy: sha256
+trustLevel: reviewed

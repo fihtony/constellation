@@ -197,11 +197,14 @@ class ConnectAgentAgenticTests(unittest.TestCase):
         self.env_patcher.start()
         from common.runtime import adapter as m
         m._INSTANCES.clear()
-        from common.tools.registry import clear_registry
+        from common.tools.registry import clear_registry, snapshot_registry
+        self._registry_snapshot = snapshot_registry()
         clear_registry()
 
     def tearDown(self):
         self.env_patcher.stop()
+        from common.tools.registry import restore_registry
+        restore_registry(self._registry_snapshot)
 
     def test_run_agentic_bootstraps_tools_from_constellation_mcp_server(self):
         captured_payloads = []

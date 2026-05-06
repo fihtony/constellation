@@ -200,6 +200,7 @@ class CompassDispatchTests(unittest.TestCase):
                      "needs_input": False,
                      "input_question": None,
                  }), \
+                 mock.patch.object(compass_app, "require_agentic_runtime"), \
                  mock.patch.object(compass_app, "audit_log"), \
                  mock.patch.object(compass_app, "record_workspace_stage"):
                 task_dict = compass_app.route_and_dispatch(
@@ -228,6 +229,7 @@ class CompassDispatchTests(unittest.TestCase):
                      "needs_input": True,
                      "input_question": "Please provide the absolute path to the document.",
                  }), \
+                 mock.patch.object(compass_app, "require_agentic_runtime"), \
                  mock.patch.object(compass_app, "audit_log"), \
                  mock.patch.object(compass_app, "record_workspace_stage"):
                 task_dict = compass_app.route_and_dispatch(

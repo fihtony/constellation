@@ -1,0 +1,16 @@
+id: bitbucket-server-workflow
+version: 1.0.0
+level: agent-specific
+owner: scm-agent
+appliesTo:
+  agentRoles: [scm, integration]
+  workflows: [scm, development]
+  taskTags: [bitbucket, scm, pr, branch]
+  languages: []
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools: []
+provides:
+  - bitbucket-scm-workflow-guidance
+hashPolicy: sha256
+trustLevel: reviewed

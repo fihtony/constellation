@@ -1,0 +1,17 @@
+id: github-mcp-workflow
+version: 1.0.0
+level: agent-specific
+owner: scm-agent
+appliesTo:
+  agentRoles: [scm, integration]
+  workflows: [scm, development]
+  taskTags: [github, mcp, pr, branch, scm]
+  languages: []
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools: []
+provides:
+  - github-mcp-integration-guidance
+  - scm-pr-workflow
+hashPolicy: sha256
+trustLevel: reviewed

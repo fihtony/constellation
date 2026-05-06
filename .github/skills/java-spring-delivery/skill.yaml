@@ -1,0 +1,19 @@
+id: java-spring-delivery
+version: 1.0.0
+level: agent-specific
+owner: web-agent
+appliesTo:
+  agentRoles: [backend, web]
+  workflows: [development]
+  taskTags: [java, spring, backend, api]
+  languages: [java]
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools:
+  - read_local_file
+  - edit_local_file
+  - run_local_command
+provides:
+  - java-spring-implementation-guidance
+hashPolicy: sha256
+trustLevel: reviewed
