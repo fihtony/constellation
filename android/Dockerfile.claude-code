@@ -1,21 +1,13 @@
 # Android Agent — claude-code backend
-# Installs the claude CLI for agentic execution.
+# Extends constellation-base-claude-code with Android SDK toolchain.
 # Select this Dockerfile when AGENT_RUNTIME=claude-code.
 # Platform: linux/amd64 (required for Android SDK toolchain compatibility on Apple Silicon hosts)
 
-FROM python:3.12-slim
+FROM constellation-base-claude-code:latest
 
-WORKDIR /app
-
-# System dependencies: same as the default Dockerfile, including nodejs/npm for claude CLI.
+# Android-specific system dependencies
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        tini \
-        git \
-        curl \
-        nodejs \
-        npm \
         unzip \
         openjdk-21-jdk-headless \
         locales \
@@ -26,21 +18,14 @@ ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
     LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8
 
-# Import any corporate CA certificates placed in certs/ (supports .crt and .pem)
-COPY certs/ /usr/local/share/ca-certificates/
-RUN find /usr/local/share/ca-certificates/ -name "*.pem" \
-        -exec sh -c 'cp "$1" "${1%.pem}.crt"' _ {} \; \
-    && update-ca-certificates \
-    && find /usr/local/share/ca-certificates/ -name "*.crt" ! -name "ca-certificates.crt" | while read cert; do \
+# Import JDK trust store certs from the CA certificates already in base
+RUN find /usr/local/share/ca-certificates/ -name "*.crt" ! -name "ca-certificates.crt" | while read cert; do \
          alias=$(basename "$cert" .crt); \
          keytool -noprompt -importcert -trustcacerts \
                  -file "$cert" -alias "$alias" \
                  -keystore "${JAVA_HOME}/lib/security/cacerts" \
                  -storepass changeit 2>/dev/null || true; \
        done
-
-# Backend-specific: install the Claude CLI
-RUN npm install -g @anthropic-ai/claude-code
 
 # Android SDK — command-line tools
 RUN mkdir -p /opt/android-sdk/cmdline-tools \
@@ -63,16 +48,10 @@ RUN set +o pipefail \
         "build-tools;35.0.0" \
     && chmod -R a+rX /opt/android-sdk
 
-RUN pip install --no-cache-dir requests
-
-COPY common/          /app/common/
 COPY android/         /app/android/
 COPY .github/skills/  /app/.github/skills/
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app \
-    AGENT_RUNTIME=claude-code \
-    ANDROID_GRADLE_JVM_ARGS="-Xmx2g -Dfile.encoding=UTF-8" \
+ENV ANDROID_GRADLE_JVM_ARGS="-Xmx2g -Dfile.encoding=UTF-8" \
     ANDROID_GRADLE_MAX_WORKERS="1" \
     GRADLE_OPTS="-Dorg.gradle.daemon=false -Dorg.gradle.workers.max=1 -Dorg.gradle.vfs.watch=false -Dkotlin.daemon.enabled=false"
 
@@ -81,8 +60,7 @@ LABEL constellation.agent_name="Android Agent"
 LABEL constellation.agent_role="execution"
 LABEL constellation.runtime.backend="claude-code"
 
-RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
-    && chown -R appuser:appuser /app
+RUN chown -R appuser:appuser /app
 USER appuser
 
 ENTRYPOINT ["/usr/bin/tini", "--"]

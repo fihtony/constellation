@@ -1,0 +1,22 @@
+# SCM Agent — connect-agent backend
+# Extends constellation-base-connect-agent with scm agent code.
+# Select this Dockerfile when AGENT_RUNTIME=connect-agent.
+
+FROM constellation-base-connect-agent:latest
+
+COPY scm/     /app/scm/
+COPY .github/skills/ /app/.github/skills/
+
+ENV SCM_GITHUB_BACKEND=rest \
+    MCP_RUNNER=auto
+
+LABEL constellation.agent_id="scm-agent"
+LABEL constellation.agent_name="SCM Agent"
+LABEL constellation.agent_role="integration"
+LABEL constellation.runtime.backend="connect-agent"
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "scm/app.py"]

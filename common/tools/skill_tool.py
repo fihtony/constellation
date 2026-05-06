@@ -44,7 +44,10 @@ def _fetch_skill_from_registry(skill_id: str) -> str | None:
     base = _registry_url_effective()
     if not base:
         return None
-    safe_id = skill_id.replace("..", "").replace("/", "").replace("\\", "")
+    # Reject path-traversal attempts before touching the network
+    if ".." in skill_id or "/" in skill_id or "\\" in skill_id:
+        return None
+    safe_id = skill_id.strip()
     if not safe_id:
         return None
     try:
@@ -106,8 +109,10 @@ class LoadSkillTool(ConstellationTool):
         if not name:
             return self.error("Skill name must not be empty.")
 
-        # Sanitise name to prevent path traversal
-        safe_name = name.replace("..", "").replace("/", "").replace("\\", "")
+        # Reject path-traversal attempts immediately
+        if ".." in name or "/" in name or "\\" in name:
+            return self.error("Invalid skill name: path traversal not allowed.")
+        safe_name = name.strip()
         if not safe_name:
             return self.error("Invalid skill name.")
 

@@ -1,0 +1,9 @@
+systemOrder:
+  - 00-role.md
+  - 10-boundaries.md
+  - 20-tools.md
+  - 30-decision-policy.md
+  - 40-validation-policy.md
+  - 50-definition-of-done.md
+  - 60-failure-handling.md
+includeSkills: true

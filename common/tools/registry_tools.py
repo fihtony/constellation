@@ -218,7 +218,7 @@ class CheckAgentStatusTool(ConstellationTool):
                 )
             summary = [_summarize_agent_status(item) for item in items]
             return self.ok(json.dumps(summary, ensure_ascii=False, indent=2))
-        except (URLError, OSError) as exc:
+        except Exception as exc:  # noqa: BLE001 — graceful degradation
             return self.ok(
                 json.dumps(
                     {"status": "unknown", "reason": "registry_unavailable", "error": str(exc)},
@@ -253,7 +253,7 @@ class ListAvailableAgentsTool(ConstellationTool):
             items = list(agents or [])
             summary = [_summarize_agent_status(item) for item in items]
             return self.ok(json.dumps(summary, ensure_ascii=False, indent=2))
-        except (URLError, OSError) as exc:
+        except Exception as exc:  # noqa: BLE001 — graceful degradation
             return self.ok(
                 json.dumps(
                     {"status": "unknown", "reason": "registry_unavailable", "error": str(exc)},

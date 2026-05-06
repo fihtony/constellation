@@ -26,8 +26,10 @@ _REPO_ROOT = Path(__file__).parent.parent.resolve()
 
 _SUPPORTED_BACKENDS = {"copilot-cli", "connect-agent", "claude-code"}
 
-# Agents that are non-agentic control-plane services (no backend Dockerfile)
-_NON_AGENTIC_AGENTS = {"compass", "registry", "jira", "scm", "ui-design"}
+# Agents that are purely infrastructure (no LLM, no backend Dockerfile)
+# All LLM-enabled agents (including persistent ones like jira, scm, compass, ui-design, office)
+# now support backend-specific Dockerfiles via Dockerfile.<backend>.
+_NON_AGENTIC_AGENTS = {"registry"}
 
 
 def _parse_dotenv(path: Path) -> dict[str, str]:
