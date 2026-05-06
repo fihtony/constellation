@@ -994,6 +994,49 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
 
         self.assertEqual(unresolved, [])
 
+    def test_team_lead_filters_defaultable_web_route_and_accessibility_missing_info(self):
+        ctx = team_lead_app._TaskContext()
+        ctx.jira_info = {"content": "Jira ticket content is available."}
+        ctx.repo_info = {
+            "repo_url": "https://github.com/example-org/example-web-app",
+            "content": "Repository context is available.",
+        }
+        ctx.design_info = {"content": "Stitch screen context is available."}
+
+        unresolved = team_lead_app._filter_unresolved_missing_info(
+            {
+                "platform": "web",
+                "missing_info": [
+                    "Preferred route path/URL to expose the landing page (if not /)",
+                    "Any required accessibility or localization constraints beyond 'bare-bones' styling",
+                ],
+            },
+            ctx,
+        )
+
+        self.assertEqual(unresolved, [])
+
+    def test_team_lead_filters_defaultable_web_test_environment_missing_info(self):
+        ctx = team_lead_app._TaskContext()
+        ctx.jira_info = {"content": "Jira ticket content is available."}
+        ctx.repo_info = {
+            "repo_url": "https://github.com/example-org/example-web-app",
+            "content": "Repository context is available.",
+        }
+        ctx.design_info = {"content": "Stitch screen context is available."}
+
+        unresolved = team_lead_app._filter_unresolved_missing_info(
+            {
+                "platform": "web",
+                "missing_info": [
+                    "Preferred approach for test-environment fix: add jsdom devDependency (specify acceptable version range) or configure Vitest to use 'jsdom' environment",
+                ],
+            },
+            ctx,
+        )
+
+        self.assertEqual(unresolved, [])
+
     def test_team_lead_filters_defaultable_android_delivery_missing_info(self):
         ctx = team_lead_app._TaskContext()
         ctx.jira_info = {"content": "Jira ticket content is available."}
@@ -1785,6 +1828,199 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                 web_app._install_written_node_dependencies(build_dir, lambda _message: None)
 
         self.assertEqual(calls, [build_dir, str(client_dir), str(server_dir)])
+
+    def test_web_agent_sanitizes_plan_dependency_annotations_before_npm_install(self):
+        calls: list[dict] = []
+
+        def fake_run(command, **_kwargs):
+            calls.append({"command": command, "cwd": _kwargs.get("cwd")})
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory(prefix="web_plan_deps_") as build_dir, mock.patch.object(
+            web_app.subprocess,
+            "run",
+            side_effect=fake_run,
+        ):
+            web_app._install_plan_dependencies(
+                ["react", "@vitejs/plugin-react (optional)", "`cross-env`"],
+                "javascript",
+                lambda _message: None,
+                cwd=build_dir,
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "command": ["npm", "install", "--save", "react", "@vitejs/plugin-react", "cross-env"],
+                    "cwd": build_dir,
+                }
+            ],
+        )
+
+    def test_web_agent_reinstalls_node_dependencies_after_manifest_fix(self):
+        with tempfile.TemporaryDirectory(prefix="web_retry_npm_") as build_dir:
+            Path(build_dir, "package.json").write_text(json.dumps({"name": "demo"}), encoding="utf-8")
+
+            install_calls: list[str] = []
+            log_messages: list[str] = []
+
+            with mock.patch.object(web_app, "_ensure_local_python_env", return_value=None), mock.patch.object(
+                web_app,
+                "_run_build",
+                side_effect=[
+                    (False, "MISSING DEP  Can not find dependency 'jsdom'"),
+                    (True, "build ok"),
+                ],
+            ), mock.patch.object(web_app, "_read_source_files", return_value=[]), mock.patch.object(
+                web_app,
+                "_run_agentic",
+                return_value='{"diagnosis":"missing jsdom","fixes":[{"path":"package.json","content":"{\\"name\\":\\"demo\\",\\"devDependencies\\":{\\"jsdom\\":\\"^24.0.0\\"}}"}]}',
+            ), mock.patch.object(
+                web_app,
+                "_install_written_node_dependencies",
+                side_effect=lambda path, _log_fn: install_calls.append(path),
+            ):
+                passed, output, attempts = web_app._build_and_test_with_recovery(
+                    build_dir,
+                    "Implement landing page",
+                    "javascript",
+                    log_messages.append,
+                )
+
+        self.assertTrue(passed)
+        self.assertEqual(output, "build ok")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(install_calls, [build_dir])
+
+    def test_web_agent_auto_installs_missing_node_dependency_before_llm_fix(self):
+        with tempfile.TemporaryDirectory(prefix="web_missing_dep_") as build_dir:
+            Path(build_dir, "package.json").write_text(json.dumps({"name": "demo"}), encoding="utf-8")
+
+            npm_calls: list[dict] = []
+            agentic_mock = mock.Mock(return_value="{}")
+
+            def fake_run(command, **kwargs):
+                npm_calls.append({"command": command, "cwd": kwargs.get("cwd")})
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(web_app, "_ensure_local_python_env", return_value=None), mock.patch.object(
+                web_app,
+                "_run_build",
+                side_effect=[
+                    (False, "Error: Failed to load url prop-types (resolved id: prop-types) in src/components/Landing.jsx"),
+                    (True, "build ok"),
+                ],
+            ), mock.patch.object(web_app.subprocess, "run", side_effect=fake_run), mock.patch.object(
+                web_app,
+                "_run_agentic",
+                agentic_mock,
+            ):
+                passed, output, attempts = web_app._build_and_test_with_recovery(
+                    build_dir,
+                    "Implement landing page",
+                    "javascript",
+                    lambda _message: None,
+                )
+
+        self.assertTrue(passed)
+        self.assertEqual(output, "build ok")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(
+            npm_calls,
+            [{"command": ["npm", "install", "--save", "prop-types"], "cwd": build_dir}],
+        )
+        agentic_mock.assert_not_called()
+
+    def test_web_agent_final_retry_auto_installs_missing_node_dependency(self):
+        with tempfile.TemporaryDirectory(prefix="web_final_missing_dep_") as build_dir:
+            Path(build_dir, "package.json").write_text(json.dumps({"name": "demo"}), encoding="utf-8")
+
+            npm_calls: list[dict] = []
+
+            def fake_run(command, **kwargs):
+                npm_calls.append({"command": command, "cwd": kwargs.get("cwd")})
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(web_app, "_ensure_local_python_env", return_value=None), mock.patch.object(
+                web_app,
+                "_run_build",
+                side_effect=[
+                    (False, "ReferenceError: expect is not defined"),
+                    (False, "ReferenceError: expect is not defined"),
+                    (False, "Error: Failed to load url prop-types (resolved id: prop-types) in src/components/Landing.jsx"),
+                    (True, "build ok"),
+                ],
+            ), mock.patch.object(web_app.subprocess, "run", side_effect=fake_run), mock.patch.object(
+                web_app,
+                "_read_source_files",
+                return_value=[],
+            ), mock.patch.object(
+                web_app,
+                "_run_agentic",
+                return_value="{}",
+            ), mock.patch.object(
+                web_app,
+                "_parse_json_from_llm",
+                side_effect=[
+                    {"diagnosis": "set up vitest expect", "fixes": [{"path": "src/test-setup.js", "content": "export {};"}]},
+                    {"diagnosis": "keep vitest setup", "fixes": [{"path": "src/test-setup.js", "content": "export const ready = true;"}]},
+                ],
+            ):
+                passed, output, attempts = web_app._build_and_test_with_recovery(
+                    build_dir,
+                    "Implement landing page",
+                    "javascript",
+                    lambda _message: None,
+                )
+
+        self.assertTrue(passed)
+        self.assertEqual(output, "build ok")
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(attempts[-1]["attempt"], web_app.MAX_BUILD_RETRIES + 1)
+        self.assertEqual(
+            npm_calls,
+            [{"command": ["npm", "install", "--save", "prop-types"], "cwd": build_dir}],
+        )
+
+    def test_web_agent_auto_fixes_vitest_jest_dom_setup(self):
+        with tempfile.TemporaryDirectory(prefix="web_vitest_fix_") as build_dir:
+            Path(build_dir, "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "demo",
+                        "scripts": {"test": "vitest --run"},
+                        "devDependencies": {
+                            "vitest": "^1.6.1",
+                            "@testing-library/jest-dom": "^6.0.0",
+                        },
+                        "vitest": {"environment": "jsdom"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            test_file = Path(build_dir, "src", "components", "__tests__", "Landing.test.jsx")
+            test_file.parent.mkdir(parents=True, exist_ok=True)
+            test_file.write_text(
+                "import * as matchers from '@testing-library/jest-dom/matchers';\n"
+                "// Register jest-dom matchers with Vitest's expect\n"
+                "expect.extend(matchers);\n"
+                "import { describe, it, expect } from 'vitest';\n"
+                "describe('Landing', () => { it('works', () => expect(true).toBe(true)); });\n",
+                encoding="utf-8",
+            )
+
+            fixed = web_app._auto_fix_vitest_jest_dom_setup(build_dir, lambda _message: None)
+
+            package_json = json.loads(Path(build_dir, "package.json").read_text(encoding="utf-8"))
+            updated_test = test_file.read_text(encoding="utf-8")
+            setup_file = Path(build_dir, "vitest.setup.js").read_text(encoding="utf-8")
+
+        self.assertTrue(fixed)
+        self.assertEqual(package_json["vitest"]["setupFiles"], "./vitest.setup.js")
+        self.assertNotIn("@testing-library/jest-dom/matchers", updated_test)
+        self.assertNotIn("expect.extend(matchers)", updated_test)
+        self.assertEqual(setup_file, "import '@testing-library/jest-dom/vitest';\n")
 
     def test_web_agent_detects_client_dev_launch_plan_for_ui_screenshot(self):
         with tempfile.TemporaryDirectory(prefix="web_ui_launch_") as build_dir:

@@ -1643,14 +1643,20 @@ def _read_repo_snapshot(clone_path: str, max_files: int = 30, max_chars: int = 8
     return "\n\n".join(snapshot_parts)
 
 
-def _install_plan_dependencies(deps: list[str], language: str, log_fn):
+def _normalize_dependency_spec(dep: str) -> str:
+    dep = re.sub(r"^[-*]\s*", "", dep.strip().strip("`").rstrip(","))
+    dep = re.sub(r"\s+\([^()]*\)$", "", dep).strip()
+    return dep
+
+
+def _install_plan_dependencies(deps: list[str], language: str, log_fn, cwd: str | None = None):
     """Install dependencies declared in the plan at runtime (best-effort)."""
     if not deps:
         return
     python_pkgs = []
     npm_pkgs = []
     for dep in deps:
-        dep = dep.strip()
+        dep = _normalize_dependency_spec(dep)
         if not dep:
             continue
         # Simple heuristic: if it looks like a PyPI package (no @, no /) it's Python;
@@ -1667,6 +1673,7 @@ def _install_plan_dependencies(deps: list[str], language: str, log_fn):
                 [sys.executable, "-m", "pip", "install", "--quiet"] + python_pkgs,
                 timeout=120,
                 check=False,
+                cwd=cwd,
             )
         except Exception as err:
             log_fn(f"Warning: pip install failed: {err}")
@@ -1678,6 +1685,7 @@ def _install_plan_dependencies(deps: list[str], language: str, log_fn):
                 ["npm", "install", "--save"] + npm_pkgs,
                 timeout=120,
                 check=False,
+                cwd=cwd,
             )
         except Exception as err:
             log_fn(f"Warning: npm install failed: {err}")
@@ -1716,6 +1724,49 @@ def _install_written_node_dependencies(build_dir: str, log_fn) -> None:
             )
         except Exception as err:
             log_fn(f"Warning: npm install from generated manifests failed in {label}: {err}")
+
+
+def _extract_missing_node_dependency(output: str) -> str:
+    patterns = [
+        r"Cannot find module '([^']+)'",
+        r"Cannot find package '([^']+)'",
+        r"Failed to load url ([^\s]+) \(resolved id: ([^)]+)\)",
+        r"sh: 1: ([A-Za-z0-9._@/-]+): not found",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, output)
+        if not match:
+            continue
+        candidate = match.group(match.lastindex or 1)
+        dep = _normalize_dependency_spec(candidate)
+        if dep and not dep.startswith((".", "/", "node:")):
+            return dep
+    return ""
+
+
+def _install_missing_node_dependency(build_dir: str, dep: str, log_fn) -> bool:
+    dep = _normalize_dependency_spec(dep)
+    if not dep:
+        return False
+    log_fn(f"Auto-installing missing Node dependency: {dep}")
+    try:
+        result = subprocess.run(
+            ["npm", "install", "--save", dep],
+            cwd=build_dir,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+            env={**os.environ, "CI": "true"},
+        )
+    except Exception as err:
+        log_fn(f"Auto-install failed for {dep}: {err}")
+        return False
+    if result.returncode == 0:
+        return True
+    stderr_text = (result.stderr or "").strip()[:200]
+    log_fn(f"Auto-install failed for {dep}: {stderr_text or 'unknown error'}")
+    return False
 
 
 def _write_files_to_directory(base_dir: str, files: list[dict]) -> list[str]:
@@ -2062,6 +2113,16 @@ def _load_package_json(package_json_path: str) -> dict:
         return {}
 
 
+def _write_package_json(package_json_path: str, data: dict) -> bool:
+    try:
+        with open(package_json_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        return True
+    except OSError:
+        return False
+
+
 def _package_uses_jest(manifest: dict) -> bool:
     scripts = manifest.get("scripts") if isinstance(manifest.get("scripts"), dict) else {}
     for section_name in ("dependencies", "devDependencies"):
@@ -2070,6 +2131,91 @@ def _package_uses_jest(manifest: dict) -> bool:
             return True
     script_text = "\n".join(str(value) for value in scripts.values()).lower()
     return "jest" in script_text
+
+
+def _output_suggests_vitest_jest_dom_issue(output: str) -> bool:
+    lower_output = output.lower()
+    if "vitest" not in lower_output:
+        return False
+    return (
+        "@testing-library/jest-dom" in output
+        and ("expect is not defined" in lower_output or "expect.extend" in output)
+    )
+
+
+def _auto_fix_vitest_jest_dom_setup(build_dir: str, log_fn) -> bool:
+    package_json_path = os.path.join(build_dir, "package.json")
+    manifest = _load_package_json(package_json_path)
+    if not manifest:
+        return False
+
+    scripts = manifest.get("scripts") if isinstance(manifest.get("scripts"), dict) else {}
+    dev_dependencies = manifest.get("devDependencies") if isinstance(manifest.get("devDependencies"), dict) else {}
+    if "vitest" not in "\n".join(str(value) for value in scripts.values()).lower() and "vitest" not in dev_dependencies:
+        return False
+
+    setup_rel_path = "./vitest.setup.js"
+    setup_abs_path = os.path.join(build_dir, "vitest.setup.js")
+    os.makedirs(os.path.dirname(setup_abs_path), exist_ok=True)
+    try:
+        with open(setup_abs_path, "w", encoding="utf-8") as fh:
+            fh.write("import '@testing-library/jest-dom/vitest';\n")
+    except OSError as err:
+        log_fn(f"Vitest jest-dom auto-fix failed to write setup file: {err}")
+        return False
+
+    vitest_config = manifest.get("vitest") if isinstance(manifest.get("vitest"), dict) else {}
+    setup_files = vitest_config.get("setupFiles")
+    if isinstance(setup_files, list):
+        if setup_rel_path not in setup_files:
+            vitest_config["setupFiles"] = [*setup_files, setup_rel_path]
+    elif isinstance(setup_files, str):
+        if setup_files != setup_rel_path:
+            vitest_config["setupFiles"] = [setup_files, setup_rel_path]
+    else:
+        vitest_config["setupFiles"] = setup_rel_path
+    if not vitest_config.get("environment"):
+        vitest_config["environment"] = "jsdom"
+    manifest["vitest"] = vitest_config
+    if not _write_package_json(package_json_path, manifest):
+        log_fn("Vitest jest-dom auto-fix failed to update package.json")
+        return False
+
+    updated_any_test = False
+    test_file_pattern = re.compile(r"\.(test|spec)\.[jt]sx?$")
+    cleanup_patterns = [
+        r"^\s*import ['\"]@testing-library/jest-dom(?:/extend-expect)?['\"];?\s*$",
+        r"^\s*import \* as matchers from ['\"]@testing-library/jest-dom/matchers['\"];?\s*$",
+        r"^\s*import matchers from ['\"]@testing-library/jest-dom/matchers['\"];?\s*$",
+        r"^\s*expect\.extend\(matchers\);?\s*$",
+        r"^\s*// Register jest-dom matchers with Vitest's expect\s*$",
+    ]
+    for root, dirs, files in os.walk(build_dir):
+        dirs[:] = [d for d in dirs if d != "node_modules"]
+        for fname in files:
+            if not test_file_pattern.search(fname):
+                continue
+            full_path = os.path.join(root, fname)
+            try:
+                with open(full_path, encoding="utf-8") as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            new_content = content
+            for pattern in cleanup_patterns:
+                new_content = re.sub(pattern, "", new_content, flags=re.MULTILINE)
+            new_content = re.sub(r"\n{3,}", "\n\n", new_content).rstrip() + "\n"
+            if new_content == content:
+                continue
+            try:
+                with open(full_path, "w", encoding="utf-8") as fh:
+                    fh.write(new_content)
+                updated_any_test = True
+            except OSError:
+                continue
+
+    log_fn("Applied Vitest + jest-dom auto-fix")
+    return updated_any_test or os.path.isfile(setup_abs_path)
 
 
 def _detect_node_build_steps(build_dir: str) -> list[dict]:
@@ -2238,6 +2384,15 @@ def _apply_llm_fixes(build_dir: str, fixes: list[dict]):
             print(f"[{AGENT_ID}] Could not apply fix to {rel_path}: {err}")
 
 
+def _fixes_touch_node_manifests(fixes: list[dict]) -> bool:
+    manifest_names = {"package.json", "package-lock.json", "npm-shrinkwrap.json"}
+    for fix in fixes:
+        rel_path = str(fix.get("path", "") or "").strip().lstrip("/")
+        if rel_path and os.path.basename(rel_path) in manifest_names:
+            return True
+    return False
+
+
 def _build_and_test_with_recovery(
     build_dir: str,
     task_instruction: str,
@@ -2251,6 +2406,8 @@ def _build_and_test_with_recovery(
     attempts: list[dict] = []
     output = ""
     python_executable = _ensure_local_python_env(build_dir, language, log_fn)
+    auto_installed_deps: set[str] = set()
+    vitest_jest_dom_fixed = False
     for attempt in range(1, MAX_BUILD_RETRIES + 1):
         log_fn(f"Build/test attempt {attempt}/{MAX_BUILD_RETRIES}")
         success, output = _run_build(build_dir, language, python_executable=python_executable)
@@ -2268,6 +2425,17 @@ def _build_and_test_with_recovery(
         log_fn(f"Build/test failed (attempt {attempt}): {output[:200]}")
         if attempt == MAX_BUILD_RETRIES:
             break
+
+        missing_dep = _extract_missing_node_dependency(output)
+        if missing_dep and missing_dep not in auto_installed_deps:
+            auto_installed_deps.add(missing_dep)
+            if _install_missing_node_dependency(build_dir, missing_dep, log_fn):
+                continue
+
+        if not vitest_jest_dom_fixed and _output_suggests_vitest_jest_dom_issue(output):
+            if _auto_fix_vitest_jest_dom_setup(build_dir, log_fn):
+                vitest_jest_dom_fixed = True
+                continue
 
         # Ask LLM to diagnose and fix
         source_files = _read_source_files(build_dir)
@@ -2293,6 +2461,25 @@ def _build_and_test_with_recovery(
             break
 
         _apply_llm_fixes(build_dir, fixes)
+        if _fixes_touch_node_manifests(fixes):
+            _install_written_node_dependencies(build_dir, log_fn)
+
+    final_missing_dep = _extract_missing_node_dependency(output)
+    if final_missing_dep and final_missing_dep not in auto_installed_deps:
+        auto_installed_deps.add(final_missing_dep)
+        if _install_missing_node_dependency(build_dir, final_missing_dep, log_fn):
+            log_fn(f"Build/test final retry after auto-installing {final_missing_dep}")
+            success, output = _run_build(build_dir, language, python_executable=python_executable)
+            attempts.append(
+                {
+                    "attempt": MAX_BUILD_RETRIES + 1,
+                    "success": success,
+                    "output": output[:4000],
+                }
+            )
+            if success:
+                log_fn(f"Build/test passed after final auto-install of {final_missing_dep}")
+                return True, output, attempts
 
     return False, output, attempts
 
@@ -3204,7 +3391,12 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
         install_deps = plan.get("install_dependencies") or []
         if install_deps:
             task_store.update_state(task_id, "INSTALLING_DEPS", "Installing runtime dependencies…")
-            _install_plan_dependencies(install_deps, analysis.get("language", "python"), log)
+            _install_plan_dependencies(
+                install_deps,
+                analysis.get("language", "python"),
+                log,
+                cwd=clone_path or agent_workspace,
+            )
 
         # ── Phase 4: Implement ───────────────────────────────────────────────
         task_store.update_state(task_id, "IMPLEMENTING", f"Implementing {len(files_to_implement)} file(s)…")
