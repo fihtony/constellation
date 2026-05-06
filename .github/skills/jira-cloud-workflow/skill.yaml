@@ -1,11 +1,11 @@
 id: jira-cloud-workflow
 version: 1.0.0
 level: agent-specific
-owner: tracker-agent
+owner: jira-agent
 appliesTo:
-  agentRoles: [tracker, integration]
-  workflows: [tracker, development]
-  taskTags: [jira, ticket, tracker, sprint]
+  agentRoles: [jira, integration]
+  workflows: [jira, development]
+  taskTags: [jira, ticket, sprint]
   languages: []
 runtimeCompatibility:
   backends: [connect-agent, copilot-cli, claude-code]

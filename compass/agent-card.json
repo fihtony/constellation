@@ -20,7 +20,7 @@
     {
       "id": "orchestrate",
       "name": "Constellation Orchestrator",
-      "description": "Uses the agentic runtime to route user requests, dispatches to Team Lead, Office Agent, Tracker, SCM, Android, and other agents, and summarizes final results for the user.",
+      "description": "Uses the agentic runtime to route user requests, dispatches to Team Lead, Office Agent, Jira, SCM, Android, and other agents, and summarizes final results for the user.",
       "tags": ["compass", "orchestrator", "workflow", "routing", "constellation", "office", "runtime"]
     },
     {

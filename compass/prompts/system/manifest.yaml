@@ -6,4 +6,4 @@ systemOrder:
   - 40-validation-policy.md
   - 50-definition-of-done.md
   - 60-failure-handling.md
-includeSkills: true
+includeSkills: false

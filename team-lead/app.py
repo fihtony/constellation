@@ -35,8 +35,10 @@ from common.launcher import get_launcher
 from common.message_utils import artifact_text, build_text_artifact, extract_text
 from common.orchestrator import resolve_orchestrator_base_url
 from common.per_task_exit import PerTaskExitHandler
+from common.tools.control_tools import configure_control_tools
 from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt, load_rules
+from common.prompt_builder import build_system_prompt_from_manifest
 from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionEscalationRequired,
@@ -1354,7 +1356,29 @@ def _run_agentic(
     return result.get("raw_response") or result.get("summary") or ""
 
 
+# Cached manifest-based system prompt for Team Lead
+_MANIFEST_SYSTEM_PROMPT: str = ""
+
+
+def _get_manifest_system_prompt() -> str:
+    """Return cached manifest-based system prompt, building it on first call."""
+    global _MANIFEST_SYSTEM_PROMPT
+    if not _MANIFEST_SYSTEM_PROMPT:
+        agent_dir = os.path.dirname(os.path.abspath(__file__))
+        _MANIFEST_SYSTEM_PROMPT = build_system_prompt_from_manifest(agent_dir) or build_system_prompt(
+            "", "team-lead", skill_names=_DEVELOPMENT_SKILL_NAMES
+        )
+    return _MANIFEST_SYSTEM_PROMPT
+
+
 def _build_team_lead_system_prompt(base_prompt: str, *, include_workflow: bool = False) -> str:
+    manifest_prompt = _get_manifest_system_prompt()
+    if manifest_prompt and base_prompt:
+        # Manifest provides structural context; base_prompt adds task-specific specialization
+        return f"{manifest_prompt}\n\n---\n\nTASK CONTEXT:\n{base_prompt}"
+    if manifest_prompt:
+        return manifest_prompt
+    # Fallback to legacy approach
     return build_system_prompt(
         base_prompt,
         "team-lead",
@@ -2775,6 +2799,18 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):  # noqa: C901
         "workflowRulesLoaded": bool(load_rules("team-lead", include_workflow=True)),
         "skillPlaybooks": list(_DEVELOPMENT_SKILL_NAMES),
     }
+
+    configure_control_tools(
+        task_context={
+            "taskId": team_lead_task_id,
+            "agentId": AGENT_ID,
+            "workspacePath": workspace,
+            "permissions": ctx.permissions if hasattr(ctx, "permissions") else None,
+        },
+        complete_fn=lambda result, artifacts: task_store.update_state(team_lead_task_id, "TASK_STATE_COMPLETED", result),
+        fail_fn=lambda error: task_store.update_state(team_lead_task_id, "TASK_STATE_FAILED", error),
+        input_required_fn=lambda question, context: task_store.update_state(team_lead_task_id, "TASK_STATE_INPUT_REQUIRED", question),
+    )
 
     def log(phase: str):
         ts = local_clock_time()

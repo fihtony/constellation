@@ -7,3 +7,11 @@ systemOrder:
   - 50-definition-of-done.md
   - 60-failure-handling.md
 includeSkills: true
+skillNames:
+  - constellation-architecture-delivery
+  - constellation-frontend-delivery
+  - constellation-backend-delivery
+  - constellation-database-delivery
+  - constellation-code-review-delivery
+  - constellation-testing-delivery
+  - constellation-ui-evidence-delivery

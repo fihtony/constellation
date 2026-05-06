@@ -341,11 +341,27 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
             {"SANDBOX_ROOT": sandbox_root, "ARTIFACT_ROOT": sandbox_root},
         )
 
+        # Core tools — always loaded
         module_expectations = {
             "common.tools.coding_tools": ["bash", "read_file", "write_file", "edit_file", "glob", "grep"],
             "common.tools.planning_tools": ["todo_write", "compress"],
             "common.tools.subagent_tool": ["subagent"],
             "common.tools.skill_tool": ["load_skill"],
+            # Agent lifecycle and control tools (complete/fail task, dispatch agents, etc.)
+            "common.tools.control_tools": [
+                "dispatch_agent_task", "wait_for_agent_task", "ack_agent_task",
+                "complete_current_task", "fail_current_task", "get_task_context",
+                "get_agent_runtime_status", "request_user_input",
+            ],
+            # Registry / discovery tools (query capabilities, list agents, check health)
+            "common.tools.registry_tools": [
+                "registry_query", "list_available_agents", "check_agent_status",
+            ],
+            # Validation and evidence tools
+            "common.tools.validation_tools": [
+                "run_validation_command", "collect_task_evidence",
+                "check_definition_of_done", "summarize_failure_context",
+            ],
         }
         for module_name, expected_tools in module_expectations.items():
             module = importlib.import_module(module_name)

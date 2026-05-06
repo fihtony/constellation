@@ -248,7 +248,7 @@ def main(argv=None):
     reporter.section(f"Jira Agent REST Tests — {agent_url}")
 
     # ---------------------------------------------------------------------------
-    # Cleanup tracker — collects artifacts to restore in finally block
+    # Cleanup Jira artifacts — collects artifacts to restore in finally block
     # ---------------------------------------------------------------------------
     _cleanup_comment_ids: list[str] = []       # comment IDs created during the test
     _original_state: dict = {}                 # {"labels": [...], "summary": "...", "description": "...", "status": "..."}

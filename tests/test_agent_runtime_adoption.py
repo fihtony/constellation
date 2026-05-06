@@ -87,6 +87,43 @@ class AgentRuntimeAdoptionTests(unittest.TestCase):
                 content = Path(path).read_text(encoding="utf-8")
                 self.assertIn("npm install -g @github/copilot", content)
 
+    def test_agents_import_configure_control_tools(self):
+        all_agent_files = AGENT_FILES + [
+            os.path.join(PROJECT_ROOT, "compass", "app.py"),
+            os.path.join(PROJECT_ROOT, "android", "app.py"),
+            os.path.join(PROJECT_ROOT, "office", "app.py"),
+        ]
+        for path in all_agent_files:
+            with self.subTest(path=path):
+                content = Path(path).read_text(encoding="utf-8")
+                self.assertIn("configure_control_tools", content,
+                              f"{path} must call configure_control_tools in its task workflow")
+
+    def test_agents_use_manifest_system_prompt(self):
+        all_agent_files = AGENT_FILES + [
+            os.path.join(PROJECT_ROOT, "compass", "app.py"),
+            os.path.join(PROJECT_ROOT, "android", "app.py"),
+            os.path.join(PROJECT_ROOT, "office", "app.py"),
+        ]
+        for path in all_agent_files:
+            with self.subTest(path=path):
+                content = Path(path).read_text(encoding="utf-8")
+                self.assertTrue(
+                    "build_system_prompt_from_manifest" in content or "_build_manifest_prompt" in content,
+                    f"{path} must use manifest-based system prompt loading"
+                )
+
+    def test_agent_manifests_exist_and_have_agent_id(self):
+        agent_dirs = ["team-lead", "web", "jira", "scm", "ui-design", "office", "android", "compass"]
+        for agent in agent_dirs:
+            manifest_path = os.path.join(PROJECT_ROOT, agent, "prompts", "system", "manifest.yaml")
+            with self.subTest(agent=agent):
+                self.assertTrue(os.path.isfile(manifest_path),
+                                f"{agent} must have a prompts/system/manifest.yaml")
+                content = Path(manifest_path).read_text(encoding="utf-8")
+                self.assertIn("systemOrder:", content,
+                              f"{agent}/prompts/system/manifest.yaml must have systemOrder field")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

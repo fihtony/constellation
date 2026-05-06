@@ -35,7 +35,7 @@ working together to complete complex engineering tasks.
 | **Compass Agent** | `compass/` | Control-plane entry point. Routes ALL tasks to Team Lead, manages workflow, owns the Web UI. |
 | **Team Lead Agent** | `team-lead/` | Intelligence layer. Analyzes tasks, gathers Jira/design context, plans, dispatches to dev agents, reviews output, and summarizes results. Runs on port 8030. |
 | **Capability Registry** | `registry/` | Agent discovery and instance tracking. All agents register here on startup. |
-| **Tracker Agent** | `jira/` | Integrates with Jira-compatible systems. Fetches tickets, updates status, posts comments. Runs on port 8010 (Docker service name: `tracker`). |
+| **Jira Agent** | `jira/` | Integrates with Jira-compatible systems. Fetches tickets, updates status, posts comments. Runs on port 8010 (Docker service name: `jira`). |
 | **SCM Agent** | `scm/` | Integrates with Git SCM (Bitbucket/GitHub). Repo inspection, branch, PR operations. Runs on port 8020. |
 | **Android Agent** | `android/` | On-demand execution agent. Launched per-task by Team Lead via Docker socket. |
 | **UI Design Agent** | `ui-design/` | Design context agent. Fetches design data from Figma (REST API) and Google Stitch (MCP). Runs on port 8040. |
@@ -228,7 +228,7 @@ Returns the current state of a task. Used by the Compass Agent for polling fallb
 **Rules:**
 - `__ADVERTISED_URL__` is a placeholder replaced at runtime with `ADVERTISED_BASE_URL`.
 - `skills[].id` is the capability identifier used by Compass to route tasks.
-- Skill IDs follow dot-notation: `<domain>.<resource>.<action>` (e.g., `tracker.ticket.fetch`).
+- Skill IDs follow dot-notation: `<domain>.<resource>.<action>` (e.g., `jira.ticket.fetch`).
 
 ### 4. registry-config.json
 
@@ -246,7 +246,7 @@ Returns the current state of a task. Used by the Compass Agent for polling fallb
 ```
 
 **`executionMode` values:**
-- `"persistent"` — agent is always running (tracker, scm, compass). Registered once at startup.
+- `"persistent"` — agent is always running (jira, scm, compass). Registered once at startup.
 - `"per-task"` — agent is launched on demand by Compass via Docker socket (android, ios). Must include `launchSpec`.
 
 **For `per-task` agents, add `launchSpec`:**
@@ -414,8 +414,8 @@ import json
 workspace_path = message.get("metadata", {}).get("sharedWorkspacePath", "")
 
 # Read upstream output
-tracker_dir = os.path.join(workspace_path, "tracker-agent")
-ticket_file = os.path.join(tracker_dir, "ticket.json")
+jira_dir = os.path.join(workspace_path, "jira-agent")
+ticket_file = os.path.join(jira_dir, "ticket.json")
 if os.path.isfile(ticket_file):
     with open(ticket_file, encoding="utf-8") as fh:
         ticket = json.load(fh)
@@ -657,7 +657,7 @@ Skill IDs follow the pattern: `<domain>.<resource>.<action>`
 
 | Domain | Examples |
 |--------|---------|
-| `tracker` | `tracker.ticket.fetch`, `tracker.ticket.update`, `tracker.ticket.comment` |
+| `jira` | `jira.ticket.fetch`, `jira.ticket.update`, `jira.ticket.comment` |
 | `scm` | `scm.repo.inspect`, `scm.branch.create`, `scm.pr.create` |
 | `android` | `android.task.execute`, `android.build.run` |
 | `ios` | `ios.task.execute` |

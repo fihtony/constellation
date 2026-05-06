@@ -13,7 +13,10 @@ from common.devlog import debug_log, record_workspace_stage
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.message_utils import build_text_artifact, extract_text
+from common.tools.control_tools import configure_control_tools
 from common.rules_loader import build_system_prompt
+from common.prompt_builder import build_system_prompt_from_manifest
+from common.agent_system_prompt import build_agent_system_prompt as _build_manifest_prompt
 from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionDeniedError,
@@ -353,7 +356,7 @@ def _handle_figma_message(user_text: str, capability: str, workspace_path: str =
     llm_text = _run_agentic(
         prompt,
         AGENT_ID,
-        system_prompt=build_system_prompt(agent_prompts.FIGMA_SUMMARY_SYSTEM, "ui-design"),
+        system_prompt=_build_manifest_prompt(__file__, agent_prompts.FIGMA_SUMMARY_SYSTEM),
     )
     if not str(llm_text).strip():
         llm_text = "; ".join(summary_parts) or "No Figma data fetched."
@@ -505,7 +508,7 @@ def _handle_stitch_message(user_text: str, capability: str, workspace_path: str 
     llm_text = _run_agentic(
         prompt,
         AGENT_ID,
-        system_prompt=build_system_prompt(agent_prompts.STITCH_SUMMARY_SYSTEM, "ui-design"),
+        system_prompt=_build_manifest_prompt(__file__, agent_prompts.STITCH_SUMMARY_SYSTEM),
     )
     artifacts = [
         build_text_artifact(
@@ -534,7 +537,7 @@ def _handle_generic_message(user_text: str) -> tuple[str, list]:
     llm_text = _run_agentic(
         prompt,
         AGENT_ID,
-        system_prompt=build_system_prompt(agent_prompts.GENERIC_SYSTEM, "ui-design"),
+        system_prompt=_build_manifest_prompt(__file__, agent_prompts.GENERIC_SYSTEM),
     )
     artifacts = [
         build_text_artifact(
@@ -624,6 +627,17 @@ def _run_task_background(
     metadata = message.get("metadata", {}) if isinstance(message, dict) else {}
     workspace_path = metadata.get("sharedWorkspacePath", "")
     capability = metadata.get("requestedCapability", "")
+    configure_control_tools(
+        task_context={
+            "taskId": task_id,
+            "agentId": AGENT_ID,
+            "workspacePath": workspace_path,
+            "permissions": metadata.get("permissions"),
+        },
+        complete_fn=lambda result, artifacts: _TASKS.update({task_id: {**_TASKS.get(task_id, {}), "status": {"state": "TASK_STATE_COMPLETED"}}}),
+        fail_fn=lambda error: _TASKS.update({task_id: {**_TASKS.get(task_id, {}), "status": {"state": "TASK_STATE_FAILED"}}}),
+        input_required_fn=lambda question, ctx: _TASKS.update({task_id: {**_TASKS.get(task_id, {}), "status": {"state": "TASK_STATE_INPUT_REQUIRED"}}}),
+    )
     try:
         status_text, artifacts = _dispatch_message(message)
         if workspace_path:

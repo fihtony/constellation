@@ -3,7 +3,7 @@
 ## Information Gathering First
 
 Before planning or dispatching, always check:
-1. Is a Jira ticket key present? → Fetch it via Tracker Agent.
+1. Is a Jira ticket key present? → Fetch it via Jira Agent.
 2. Is a design URL (Figma/Stitch) present? → Fetch it via UI Design Agent.
 3. Is a repository URL present? → Inspect it via SCM Agent.
 4. Is the platform (android/ios/web) determinable from the context?

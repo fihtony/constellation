@@ -34,8 +34,11 @@ from common.instance_reporter import InstanceReporter
 from common.message_utils import artifact_text, build_text_artifact, extract_text
 from common.orchestrator import resolve_orchestrator_base_url
 from common.per_task_exit import PerTaskExitHandler
+from common.tools.control_tools import configure_control_tools
 from common.registry_client import RegistryClient
 from common.rules_loader import build_system_prompt, load_rules
+from common.prompt_builder import build_system_prompt_from_manifest
+from common.agent_system_prompt import build_agent_system_prompt as _build_manifest_prompt
 from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionEscalationRequired,
@@ -1560,6 +1563,18 @@ def _run_workflow(task_id: str, message: dict):  # noqa: C901
     metadata_repo_url: str = metadata.get("targetRepoUrl", "")
     exit_rule = PerTaskExitHandler.parse(metadata)
     permissions: dict | None = metadata.get("permissions") if isinstance(metadata.get("permissions"), dict) else None
+
+    configure_control_tools(
+        task_context={
+            "taskId": task_id,
+            "agentId": AGENT_ID,
+            "workspacePath": workspace,
+            "permissions": permissions,
+        },
+        complete_fn=lambda result, artifacts: task_store.update_state(task_id, "TASK_STATE_COMPLETED", result),
+        fail_fn=lambda error: task_store.update_state(task_id, "TASK_STATE_FAILED", error),
+        input_required_fn=lambda question, ctx: task_store.update_state(task_id, "TASK_STATE_INPUT_REQUIRED", question),
+    )
 
     task_instruction = extract_text(message) or ""
     final_artifacts: list = []
