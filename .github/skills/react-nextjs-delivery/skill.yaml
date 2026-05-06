@@ -1,0 +1,19 @@
+id: react-nextjs-delivery
+version: 1.0.0
+level: agent-specific
+owner: web-agent
+appliesTo:
+  agentRoles: [frontend, web]
+  workflows: [development]
+  taskTags: [react, nextjs, ui, ssr, frontend]
+  languages: [typescript, javascript]
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools:
+  - read_local_file
+  - edit_local_file
+  - run_local_command
+provides:
+  - react-nextjs-implementation-guidance
+hashPolicy: sha256
+trustLevel: reviewed

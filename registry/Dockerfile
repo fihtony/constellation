@@ -14,6 +14,7 @@ RUN find /usr/local/share/ca-certificates/ -name "*.pem" \
 
 COPY common/   /app/common/
 COPY registry/ /app/registry/
+COPY .github/skills/ /app/.github/skills/
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app

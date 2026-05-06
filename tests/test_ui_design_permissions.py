@@ -16,7 +16,13 @@ if _UI_DESIGN_DIR not in sys.path:
     sys.path.insert(0, _UI_DESIGN_DIR)
 
 from common.task_permissions import load_permission_grant
-import app as ui_app
+import importlib.util as _importlib_util
+_ui_app_spec = _importlib_util.spec_from_file_location(
+    "ui_design_app",
+    os.path.join(_UI_DESIGN_DIR, "app.py"),
+)
+ui_app = _importlib_util.module_from_spec(_ui_app_spec)
+_ui_app_spec.loader.exec_module(ui_app)
 
 
 class _FakeHandler:

@@ -9,14 +9,26 @@ import re
 from urllib.parse import parse_qs, urlparse
 
 from common.registry_store import RegistryStore
+from common.skills_catalog import SkillsCatalog
 
 HOST = os.environ.get("REGISTRY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("REGISTRY_PORT", "9000"))
 
 store = RegistryStore()
+_skills = SkillsCatalog()
 
 
 def _parse_path(path):
+    # Skills catalog endpoints
+    if path == "/skills/catalog":
+        return "skills_catalog", None, None, None
+    if path == "/skills/catalog/version":
+        return "skills_catalog_version", None, None, None
+    if path == "/skills/query":
+        return "skills_query", None, None, None
+    m = re.match(r"^/skills/([^/]+)$", path)
+    if m:
+        return "skill", m.group(1), None, None
     if path == "/topology":
         return "topology", None, None, None
     if path == "/events":
@@ -112,6 +124,26 @@ class RegistryHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if resource == "skills_catalog":
+            self._send_json(200, {
+                "version": _skills.get_version(),
+                "skills": _skills.get_catalog(),
+            })
+            return
+
+        if resource == "skills_catalog_version":
+            self._send_json(200, {"version": _skills.get_version()})
+            return
+
+        if resource == "skill":
+            # agent_id holds the skill id in this context (reused slot)
+            s = _skills.get_skill(agent_id)
+            if s is None:
+                self._send_json(404, {"error": "skill_not_found", "skillId": agent_id})
+            else:
+                self._send_json(200, s)
+            return
+
         self._send_json(404, {"error": "unknown_path"})
 
     def do_POST(self):
@@ -150,6 +182,11 @@ class RegistryHandler(BaseHTTPRequestHandler):
             )
             print(f"[registry] Instance added: {agent_id}/{instance.instance_id} url={instance.service_url}")
             self._send_json(201, instance.to_dict())
+            return
+
+        if resource == "skills_query":
+            result = _skills.query(body)
+            self._send_json(200, result)
             return
 
         self._send_json(404, {"error": "unknown_path"})
@@ -206,6 +243,8 @@ class RegistryHandler(BaseHTTPRequestHandler):
 
 def main():
     print(f"[registry] Capability Registry starting on {HOST}:{PORT}")
+    _skills.scan()
+    print(f"[registry] Skills catalog loaded: {len(_skills.get_catalog())} skills, version={_skills.get_version()}")
     server = ThreadingHTTPServer((HOST, PORT), RegistryHandler)
     server.serve_forever()
 

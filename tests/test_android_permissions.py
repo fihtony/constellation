@@ -19,8 +19,9 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "android"))
 
-# Minimal env setup
-os.environ.setdefault("AGENT_ID", "android-agent")
+# Minimal env setup — do NOT set AGENT_ID here; android/app.py defaults to
+# "android-agent" already, and setting it here would contaminate other agent
+# modules (e.g. office/app.py) that import AFTER this module is collected.
 os.environ.setdefault("REGISTRY_URL", "http://localhost:9000")
 os.environ.setdefault("ADVERTISED_BASE_URL", "http://android-agent:8000")
 os.environ.setdefault("COMPASS_URL", "http://compass:8080")

@@ -2098,6 +2098,14 @@ class TestPerTaskExitHandlerExtended(unittest.TestCase):
 class TestMCPConstellationServer(unittest.TestCase):
     """Test the embeddable MCP constellation server module loading."""
 
+    def setUp(self):
+        from common.tools.registry import snapshot_registry
+        self._registry_snapshot = snapshot_registry()
+
+    def tearDown(self):
+        from common.tools.registry import restore_registry
+        restore_registry(self._registry_snapshot)
+
     def test_load_tool_modules_empty(self):
         from common.mcp.constellation_server import _load_tool_modules
         from common.tools.registry import clear_registry
@@ -2158,8 +2166,13 @@ class TestMCPAdapter(unittest.TestCase):
     """Test MCP adapter request handling."""
 
     def setUp(self):
-        from common.tools.registry import clear_registry
+        from common.tools.registry import snapshot_registry, clear_registry
+        self._registry_snapshot = snapshot_registry()
         clear_registry()
+
+    def tearDown(self):
+        from common.tools.registry import restore_registry
+        restore_registry(self._registry_snapshot)
 
     def test_initialize(self):
         from common.tools.mcp_adapter import _handle_request
@@ -2207,8 +2220,13 @@ class TestToolRegistry(unittest.TestCase):
     """Test tool registry operations."""
 
     def setUp(self):
-        from common.tools.registry import clear_registry
+        from common.tools.registry import snapshot_registry, clear_registry
+        self._registry_snapshot = snapshot_registry()
         clear_registry()
+
+    def tearDown(self):
+        from common.tools.registry import restore_registry
+        restore_registry(self._registry_snapshot)
 
     def test_register_and_get(self):
         from common.tools.base import ConstellationTool, ToolSchema
@@ -2292,8 +2310,13 @@ class TestNativeAdapter(unittest.TestCase):
     """Test native function-calling adapter."""
 
     def setUp(self):
-        from common.tools.registry import clear_registry
+        from common.tools.registry import snapshot_registry, clear_registry
+        self._registry_snapshot = snapshot_registry()
         clear_registry()
+
+    def tearDown(self):
+        from common.tools.registry import restore_registry
+        restore_registry(self._registry_snapshot)
 
     def test_get_function_definitions_empty(self):
         from common.tools.native_adapter import get_function_definitions

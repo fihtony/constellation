@@ -1,0 +1,16 @@
+id: github-rest-workflow
+version: 1.0.0
+level: agent-specific
+owner: scm-agent
+appliesTo:
+  agentRoles: [scm, integration]
+  workflows: [scm, development]
+  taskTags: [github, rest-api, pr, branch]
+  languages: []
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools: []
+provides:
+  - github-rest-api-guidance
+hashPolicy: sha256
+trustLevel: reviewed

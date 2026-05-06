@@ -40,6 +40,25 @@ class _FakeGitHubMCPProvider(GitHubMCPProvider):
     def __init__(self):
         super().__init__(token="")
 
+    # Stub implementations for abstract remote-read methods added in Phase 3.
+    def read_remote_file(self, owner, repo, path, ref=""):
+        return ("", "not_implemented")
+
+    def list_remote_dir(self, owner, repo, path="", ref=""):
+        return ([], "not_implemented")
+
+    def search_code(self, owner, repo, query, limit=20):
+        return ([], "not_implemented")
+
+    def compare_refs(self, owner, repo, base, head, stat_only=False):
+        return ({}, "not_implemented")
+
+    def get_default_branch(self, owner, repo):
+        return ({"defaultBranch": "main", "protectedBranches": []}, "ok")
+
+    def get_branch_rules(self, owner, repo):
+        return ({"rules": [], "source": "stub"}, "ok")
+
     def _call(self, tool: str, args: dict, timeout: int = 60) -> dict:
         if tool == "create_pull_request":
             return {
@@ -98,6 +117,8 @@ class SCMPrReuseTests(unittest.TestCase):
             "toBranch": "main",
             "title": "Demo PR",
         }
+        from common.task_permissions import load_permission_grant
+        dev_perms = load_permission_grant("development").to_dict()
         message = {
             "metadata": {
                 "prPayload": {
@@ -107,7 +128,8 @@ class SCMPrReuseTests(unittest.TestCase):
                     "toBranch": "main",
                     "title": "Demo PR",
                     "description": "Body",
-                }
+                },
+                "permissions": dev_perms,
             }
         }
 

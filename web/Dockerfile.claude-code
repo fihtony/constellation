@@ -1,0 +1,41 @@
+# Web Agent — claude-code backend
+# Select this Dockerfile when AGENT_RUNTIME=claude-code.
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         ca-certificates tini git curl nodejs npm chromium fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY certs/ /usr/local/share/ca-certificates/
+RUN find /usr/local/share/ca-certificates/ -name "*.pem" \
+        -exec sh -c 'cp "$1" "${1%.pem}.crt"' _ {} \; \
+    && update-ca-certificates
+
+# Backend-specific: install the Claude CLI
+RUN npm install -g @anthropic-ai/claude-code
+
+RUN pip install --no-cache-dir flask pytest requests
+
+COPY common/  /app/common/
+COPY web/     /app/web/
+COPY .github/skills/ /app/.github/skills/
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    AGENT_RUNTIME=claude-code
+
+LABEL constellation.agent_id="web-agent"
+LABEL constellation.agent_name="Web Agent"
+LABEL constellation.agent_role="execution"
+LABEL constellation.runtime.backend="claude-code"
+
+RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "web/app.py"]

@@ -46,7 +46,8 @@ class FigmaClientRateLimitTests(unittest.TestCase):
 
         self.assertEqual(status, 429)
         self.assertEqual(body.get("error"), "rate_limited")
-        self.assertEqual(sleep_calls, [5.0, 5.0, 5.0])
+        # _MAX_RETRIES=5 means 5 retry waits before giving up on the 6th attempt.
+        self.assertEqual(sleep_calls, [5.0, 5.0, 5.0, 5.0, 5.0])
 
 
 if __name__ == "__main__":

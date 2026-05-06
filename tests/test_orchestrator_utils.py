@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import patch
 
@@ -112,12 +113,13 @@ class ProgressToolTests(unittest.TestCase):
 
         with patch("common.tools.progress_tools._get_agent_directory", return_value=None):
             with patch("common.tools.progress_tools.urlopen") as mocked_urlopen:
-                result = tool.execute(
-                    {
-                        "message": "Validation finished",
-                        "task_id": "task-3",
-                    }
-                )
+                with patch.dict(os.environ, {"COMPASS_URL": ""}, clear=False):
+                    result = tool.execute(
+                        {
+                            "message": "Validation finished",
+                            "task_id": "task-3",
+                        }
+                    )
 
         self.assertFalse(result["isError"])
         self.assertIn("no orchestrator URL", result["content"][0]["text"])

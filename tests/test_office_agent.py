@@ -7,10 +7,32 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from common.task_permissions import PermissionDeniedError, grant_permission, load_permission_grant
 from office import app as office_app
 
+# Default office permissions grant for unit tests — mirrors what Compass attaches.
+_OFFICE_PERMISSIONS = load_permission_grant("office").to_dict()
+# Extend the grant to allow writes — used by inplace and organize tests.
+_OFFICE_RW_PERMISSIONS = grant_permission(
+    _OFFICE_PERMISSIONS,
+    agent="office",
+    action="write",
+    scope="task_root",
+    description="Allow in-place write during unit tests",
+)
 
-def _make_message(capability: str, paths: list[str], workspace: str, *, output_mode: str = "workspace") -> dict:
+
+def _make_message(
+    capability: str,
+    paths: list[str],
+    workspace: str,
+    *,
+    output_mode: str = "workspace",
+    permissions: dict | None = None,
+) -> dict:
+    if permissions is None:
+        # Inplace mode needs write permission; workspace mode only needs read.
+        permissions = _OFFICE_RW_PERMISSIONS if output_mode == "inplace" else _OFFICE_PERMISSIONS
     return {
         "parts": [{"text": f"Run {capability} on the given files."}],
         "metadata": {
@@ -21,6 +43,7 @@ def _make_message(capability: str, paths: list[str], workspace: str, *, output_m
             "officeWorkspacePath": workspace,
             "sharedWorkspacePath": workspace,
             "orchestratorTaskId": "task-unit",
+            "permissions": permissions,
         },
     }
 
@@ -492,7 +515,8 @@ class TestInputValidation(unittest.TestCase):
             source = Path(other, "secret.txt")
             source.write_text("secret", encoding="utf-8")
             message = _make_message("office.document.summarize", [str(source)], workspace)
-            with self.assertRaises(RuntimeError, msg="Path outside input root must be rejected"):
+            # PermissionDeniedError (a PermissionError) is raised in strict enforcement mode.
+            with self.assertRaises((RuntimeError, PermissionError), msg="Path outside input root must be rejected"):
                 office_app._execute_capability("task-escape", message)
 
     def test_unsupported_capability_raises(self):
@@ -851,8 +875,8 @@ class TestPathTraversal(unittest.TestCase):
             # Create the file outside the expected root
             sneaky_path = os.path.join(workspace, "subdir", "..", "..", "etc", "passwd")
             message = _make_message("office.document.summarize", [sneaky_path], workspace)
-            # The path after realpath resolution should escape the input root
-            with self.assertRaises(RuntimeError):
+            # PermissionDeniedError (a PermissionError) is raised in strict enforcement mode.
+            with self.assertRaises((RuntimeError, PermissionError)):
                 office_app._execute_capability("task-traversal", message)
 
 
