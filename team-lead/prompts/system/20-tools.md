@@ -6,6 +6,14 @@
 |------|---------|
 | `jira_get_ticket` | Fetch Jira ticket details (summary, description, acceptance criteria, attachments) |
 | `jira_add_comment` | Add a structured comment to a Jira ticket |
+| `jira_search` | Search Jira tickets by JQL query |
+| `jira_transition` | Transition a Jira ticket to a new status (e.g. In Review) |
+| `jira_assign` | Assign a Jira ticket to a user by account ID |
+| `jira_get_transitions` | List available transitions for a Jira ticket |
+| `jira_get_myself` | Get current authenticated Jira user info |
+| `jira_create_issue` | Create a new Jira issue |
+| `jira_update_fields` | Update arbitrary fields on a Jira ticket |
+| `jira_validate_permissions` | Check if a Jira action is allowed by current permissions |
 | `design_fetch_figma_screen` | Fetch design specs from Figma |
 | `design_fetch_stitch_screen` | Fetch design specs from Google Stitch |
 | `scm_repo_inspect` | Inspect remote repo metadata (default branch, languages, build system) |
@@ -66,6 +74,8 @@
 - Use `registry_query` to discover boundary agent URLs at runtime.
 - Use `report_progress` at the start of each major workflow step.
 - Use `jira_get_ticket` to gather context instead of dispatching to the Jira agent for simple fetches.
+- Use `jira_transition` to move tickets to "In Review" after a PR is created.
+- Use `jira_validate_permissions` before performing write operations on Jira tickets.
 - Use `request_user_input` only after exhausting all other sources of clarification.
 - Prefer the `*_local_*` tool names for shared-workspace artifacts and plans; keep legacy aliases only for compatibility with older prompts.
 

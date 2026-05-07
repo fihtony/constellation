@@ -1290,6 +1290,15 @@ class Phase8RegistrySkillHotUpgradeTests(unittest.TestCase):
 
         mock_thread.assert_not_called()
 
+    def test_registry_service_mounts_workspace_skills_catalog(self):
+        compose_path = Path(_REPO_ROOT) / "docker-compose.yml"
+        compose_text = compose_path.read_text(encoding="utf-8")
+        self.assertIn(
+            "./.github/skills:/app/.github/skills:ro",
+            compose_text,
+            "Registry service must mount the workspace skills catalog for hot-reload support",
+        )
+
     def test_skills_catalog_scan_is_idempotent(self):
         """Rescanning the catalog should be safe to call multiple times."""
         from common.skills_catalog import SkillsCatalog

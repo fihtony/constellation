@@ -13,6 +13,8 @@ services:
       constellation.agent_id: "capability-registry"
       constellation.agent_name: "Capability Registry"
       constellation.agent_role: "fundamental"
+    volumes:
+      - ./.github/skills:/app/.github/skills:ro
     ports:
       - "9000:9000"
     healthcheck:

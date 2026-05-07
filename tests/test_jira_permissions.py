@@ -229,63 +229,83 @@ def test_a2a_comment_add_uses_requested_capability_and_metadata_permissions():
 
 
 def test_a2a_transition_uses_requested_capability_and_provider():
-    from common.tools.registry import get_tool
+    from common.tools.registry import get_tool, _registry, register_tool, snapshot_registry, restore_registry
     import jira.provider_tools as _jpt
-    message = {
-        "parts": [{"text": "Transition ticket PROJ-2903 to In Review"}],
-        "metadata": {
-            "requestedCapability": "jira.ticket.transition",
-            "ticketKey": "PROJ-2903",
-            "transition": "In Review",
-            "permissions": _DEVELOPMENT_PERMISSIONS,
-        },
-    }
-    with patch.dict(os.environ, {"PERMISSION_ENFORCEMENT": "strict"}, clear=False):
-        _jpt.configure_jira_provider_tools(
-            message=message,
-            provider=jira_app.PROVIDER,
-            permission_fn=None,  # no permission enforcement — this test checks provider call, not permissions
-        )
-        tool = get_tool("jira_transition")
-        with patch.object(
-            jira_app.PROVIDER,
-            "transition_issue",
-            return_value=("31", "ok"),
-        ) as mock_transition:
-            result = tool.execute({"ticket_key": "PROJ-2903", "transition_name": "In Review"})
+    snap = snapshot_registry()
+    try:
+        # Ensure the provider version is registered (not the boundary A2A version)
+        for t in _jpt._TOOLS:
+            if t.schema.name == "jira_transition":
+                _registry.pop("jira_transition", None)
+                register_tool(t)
+                break
+        message = {
+            "parts": [{"text": "Transition ticket PROJ-2903 to In Review"}],
+            "metadata": {
+                "requestedCapability": "jira.ticket.transition",
+                "ticketKey": "PROJ-2903",
+                "transition": "In Review",
+                "permissions": _DEVELOPMENT_PERMISSIONS,
+            },
+        }
+        with patch.dict(os.environ, {"PERMISSION_ENFORCEMENT": "strict"}, clear=False):
+            _jpt.configure_jira_provider_tools(
+                message=message,
+                provider=jira_app.PROVIDER,
+                permission_fn=None,
+            )
+            tool = get_tool("jira_transition")
+            with patch.object(
+                jira_app.PROVIDER,
+                "transition_issue",
+                return_value=("31", "ok"),
+            ) as mock_transition:
+                result = tool.execute({"ticket_key": "PROJ-2903", "transition_name": "In Review"})
 
-    mock_transition.assert_called_once_with("PROJ-2903", "In Review")
-    text = result["content"][0]["text"]
-    assert "PROJ-2903" in text or "31" in text
+        mock_transition.assert_called_once_with("PROJ-2903", "In Review")
+        text = result["content"][0]["text"]
+        assert "PROJ-2903" in text or "31" in text
+    finally:
+        restore_registry(snap)
 
 
 def test_a2a_myself_returns_json_artifact():
-    from common.tools.registry import get_tool
+    from common.tools.registry import get_tool, _registry, register_tool, snapshot_registry, restore_registry
     import jira.provider_tools as _jpt
-    message = {
-        "parts": [{"text": "Who am I?"}],
-        "metadata": {
-            "requestedCapability": "jira.user.myself",
-            "permissions": _DEVELOPMENT_PERMISSIONS,
-        },
-    }
-    with patch.dict(os.environ, {"PERMISSION_ENFORCEMENT": "strict"}, clear=False):
-        _jpt.configure_jira_provider_tools(
-            message=message,
-            provider=jira_app.PROVIDER,
-            permission_fn=None,  # no permission enforcement — this test checks provider call, not permissions
-        )
-        tool = get_tool("jira_get_myself")
-        with patch.object(
-            jira_app.PROVIDER,
-            "get_myself",
-            return_value=({"accountId": "abc-123", "displayName": "Svc"}, "ok"),
-        ) as mock_myself:
-            result = tool.execute({})
+    snap = snapshot_registry()
+    try:
+        # Ensure the provider version is registered (not the boundary A2A version)
+        for t in _jpt._TOOLS:
+            if t.schema.name == "jira_get_myself":
+                _registry.pop("jira_get_myself", None)
+                register_tool(t)
+                break
+        message = {
+            "parts": [{"text": "Who am I?"}],
+            "metadata": {
+                "requestedCapability": "jira.user.myself",
+                "permissions": _DEVELOPMENT_PERMISSIONS,
+            },
+        }
+        with patch.dict(os.environ, {"PERMISSION_ENFORCEMENT": "strict"}, clear=False):
+            _jpt.configure_jira_provider_tools(
+                message=message,
+                provider=jira_app.PROVIDER,
+                permission_fn=None,
+            )
+            tool = get_tool("jira_get_myself")
+            with patch.object(
+                jira_app.PROVIDER,
+                "get_myself",
+                return_value=({"accountId": "abc-123", "displayName": "Svc"}, "ok"),
+            ) as mock_myself:
+                result = tool.execute({})
 
-    mock_myself.assert_called_once_with()
-    text = result["content"][0]["text"]
-    assert "abc-123" in text
+        mock_myself.assert_called_once_with()
+        text = result["content"][0]["text"]
+        assert "abc-123" in text
+    finally:
+        restore_registry(snap)
 
 
 def test_jira_audit_log_written_on_write_operation(tmp_path):

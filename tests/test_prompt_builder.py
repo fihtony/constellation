@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -13,9 +14,11 @@ if _REPO_ROOT not in sys.path:
 from common.prompt_builder import (
     build_system_prompt_from_manifest,
     build_task_prompt,
+    _fetch_skill_from_registry,
     _read_manifest_order,
     _read_manifest_include_skills,
 )
+from common.agent_system_prompt import get_agent_manifest_prompt
 
 _TEAM_LEAD_DIR = os.path.join(_REPO_ROOT, "team-lead")
 _SKILLS_ROOT = os.path.join(_REPO_ROOT, ".github", "skills")
@@ -145,6 +148,47 @@ class PromptBuilderTests(unittest.TestCase):
         )
         self.assertNotIn("name: fenced-skill", result)
         self.assertIn("# Fenced Content", result)
+
+    def test_include_skills_prefers_registry_content_when_available(self):
+        sys_dir = os.path.join(self.tmpdir, "prompts", "system")
+        with open(os.path.join(sys_dir, "manifest.yaml"), "w") as f:
+            f.write("systemOrder:\n  - 00-role.md\nincludeSkills: true\n")
+
+        skills_root = tempfile.mkdtemp()
+        skill_dir = os.path.join(skills_root, "my-skill")
+        os.makedirs(skill_dir)
+        with open(os.path.join(skill_dir, "SKILL.md"), "w") as f:
+            f.write("# Local Skill\nUse the local copy.")
+
+        with mock.patch(
+            "common.prompt_builder._fetch_skill_from_registry",
+            return_value="# Registry Skill\nUse the registry copy.",
+        ):
+            result = build_system_prompt_from_manifest(
+                self.tmpdir,
+                skill_names=["my-skill"],
+                skills_root=skills_root,
+                registry_url="http://registry:9000",
+            )
+
+        self.assertIn("Registry Skill", result)
+        self.assertIn("Use the registry copy.", result)
+        self.assertNotIn("Use the local copy.", result)
+
+    def test_fetch_skill_from_registry_returns_empty_when_unconfigured(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_fetch_skill_from_registry("my-skill"), "")
+
+
+class AgentSystemPromptTests(unittest.TestCase):
+    def test_get_agent_manifest_prompt_rebuilds_each_call(self):
+        fake_agent_file = os.path.join(self.tmpdir if hasattr(self, "tmpdir") else tempfile.mkdtemp(), "agent", "app.py")
+        with mock.patch(
+            "common.agent_system_prompt.build_system_prompt_from_manifest",
+            side_effect=["first", "second"],
+        ):
+            self.assertEqual(get_agent_manifest_prompt(fake_agent_file, agent_name="agent"), "first")
+            self.assertEqual(get_agent_manifest_prompt(fake_agent_file, agent_name="agent"), "second")
 
 
 class BuildTaskPromptTests(unittest.TestCase):

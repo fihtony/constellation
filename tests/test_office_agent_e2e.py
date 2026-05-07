@@ -28,6 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agent_test_support import Reporter, http_request, load_env_file, run_command, summary_exit_code
+from common.runtime.adapter import resolve_backend_name
 
 COMPASS_URL = "http://localhost:8080"
 REGISTRY_URL = "http://localhost:9000"
@@ -40,6 +41,11 @@ TERMINAL_STATES = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED"}
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Office Agent end-to-end tests through Compass.")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--reuse-images",
+        action="store_true",
+        help="Reuse existing Office/Compass images instead of rebuilding them before the test run.",
+    )
     return parser.parse_args()
 
 
@@ -57,18 +63,24 @@ def _container_to_host(path: str) -> Path:
     return Path(path).resolve()
 
 
-def _resolve_runtime_inputs() -> tuple[str, str]:
+def _resolve_runtime_inputs() -> tuple[str, str, str]:
     common_env = load_env_file("common/.env")
     tests_env = load_env_file("tests/.env")
     token = ""
-    runtime = str(common_env.get("AGENT_RUNTIME") or "").strip()
+    requested_runtime = str(common_env.get("AGENT_RUNTIME") or "connect-agent").strip()
+    _, effective_runtime = resolve_backend_name(requested_runtime)
     for mapping in (common_env, tests_env):
         token = str(mapping.get("COPILOT_GITHUB_TOKEN") or "").strip()
         if token:
             break
     if not token and os.environ.get("CONSTELLATION_TRUSTED_ENV", "").strip().lower() in {"1", "true", "yes", "on"}:
         token = str(os.environ.get("COPILOT_GITHUB_TOKEN") or "").strip()
-    return runtime, token
+    return requested_runtime, effective_runtime, token
+
+
+def _expected_runtime() -> tuple[str, str]:
+    requested_runtime, effective_runtime, _ = _resolve_runtime_inputs()
+    return requested_runtime, effective_runtime
 
 
 def _read_json(path: Path) -> dict:
@@ -96,6 +108,15 @@ def _run_checked(args: list[str], reporter: Reporter, *, label: str, timeout: in
     return False
 
 
+def _docker_image_exists(image_name: str) -> bool:
+    code, _, _ = run_command(
+        ["docker", "image", "inspect", image_name],
+        cwd=str(PROJECT_ROOT),
+        timeout=120,
+    )
+    return code == 0
+
+
 def _wait_for_health(url: str, timeout: int = 90) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -106,29 +127,38 @@ def _wait_for_health(url: str, timeout: int = 90) -> bool:
     return False
 
 
-def _ensure_stack(reporter: Reporter) -> bool:
+def _ensure_stack(reporter: Reporter, *, reuse_images: bool = False) -> bool:
     reporter.section("T0 — Prepare Compass Stack")
 
     if shutil.which("docker") is None:
         reporter.fail("Docker CLI is not available")
         return False
 
-    runtime, token = _resolve_runtime_inputs()
-    if runtime != "copilot-cli":
-        reporter.fail("common/.env does not set AGENT_RUNTIME=copilot-cli", f"current={runtime!r}")
+    requested_runtime, effective_runtime, token = _resolve_runtime_inputs()
+    if effective_runtime not in {"connect-agent", "copilot-cli", "claude-code"}:
+        reporter.fail(
+            "common/.env does not configure a supported agentic runtime",
+            f"requested={requested_runtime!r} effective={effective_runtime!r}",
+        )
         return False
-    if runtime == "copilot-cli" and not token:
+    if effective_runtime == "copilot-cli" and not token:
         reporter.fail("COPILOT_GITHUB_TOKEN is not configured in common/.env or tests/.env")
         return False
-    reporter.ok("Runtime prerequisites are configured")
+    reporter.ok(f"Runtime prerequisites are configured ({effective_runtime})")
 
-    reporter.step("Build Office Agent image")
-    if not _run_checked([str(PROJECT_ROOT / "build-agents.sh"), "office"], reporter, label="Office Agent image built"):
-        return False
+    if reuse_images and _docker_image_exists("constellation-office-agent:latest"):
+        reporter.ok("Reusing existing Office Agent image")
+    else:
+        reporter.step("Build Office Agent image")
+        if not _run_checked([str(PROJECT_ROOT / "build-agents.sh"), "office"], reporter, label="Office Agent image built"):
+            return False
 
-    reporter.step("Build Compass and init-register images")
-    if not _run_checked(["docker", "compose", "build", "compass", "init-register"], reporter, label="Compass and init-register images built"):
-        return False
+    if reuse_images and _docker_image_exists("constellation-compass-agent:latest") and _docker_image_exists("constellation-init-register:latest"):
+        reporter.ok("Reusing existing Compass and init-register images")
+    else:
+        reporter.step("Build Compass and init-register images")
+        if not _run_checked(["docker", "compose", "build", "compass", "init-register"], reporter, label="Compass and init-register images built"):
+            return False
 
     reporter.step("Start Compass stack")
     if not _run_checked(
@@ -212,7 +242,7 @@ def _assert_card_visible(task_id: str, capability: str, reporter: Reporter, labe
         reporter.fail(f"{label} task card is visible but workflow is unexpected", json.dumps(card, ensure_ascii=False)[:500])
 
 
-def _assert_copilot_cli_runtime(workspace_host: Path, reporter: Reporter, label: str) -> None:
+def _assert_expected_runtime(workspace_host: Path, reporter: Reporter, label: str) -> None:
     stage_summary_path = workspace_host / "office-agent" / "stage-summary.json"
     try:
         stage_summary = json.loads(stage_summary_path.read_text(encoding="utf-8"))
@@ -223,10 +253,17 @@ def _assert_copilot_cli_runtime(workspace_host: Path, reporter: Reporter, label:
     runtime = runtime_config.get("runtimeConfig") if isinstance(runtime_config.get("runtimeConfig"), dict) else {}
     requested = str(runtime.get("requestedBackend") or "")
     effective = str(runtime.get("effectiveBackend") or "")
-    if requested == "copilot-cli" and effective == "copilot-cli":
-        reporter.ok(f"{label} used Copilot CLI runtime")
+    expected_requested, expected_effective = _expected_runtime()
+    if requested == expected_requested and effective == expected_effective:
+        reporter.ok(f"{label} used the configured runtime ({expected_effective})")
     else:
-        reporter.fail(f"{label} did not stay on Copilot CLI runtime", f"requested={requested!r}, effective={effective!r}")
+        reporter.fail(
+            f"{label} did not stay on the configured runtime",
+            (
+                f"expected_requested={expected_requested!r}, expected_effective={expected_effective!r}, "
+                f"requested={requested!r}, effective={effective!r}"
+            ),
+        )
 
 
 def _top_sales_rep(csv_path: Path) -> str:
@@ -410,7 +447,7 @@ def test_csv_analysis(reporter: Reporter) -> None:
         reporter.ok(f"CSV analysis names the top sales rep ({expected_top_rep})")
     else:
         reporter.fail("CSV analysis did not mention the expected top rep", report_text[:300])
-    _assert_copilot_cli_runtime(workspace_host, reporter, "CSV analysis")
+    _assert_expected_runtime(workspace_host, reporter, "CSV analysis")
 
 
 def test_pdf_summary(reporter: Reporter) -> None:
@@ -441,7 +478,7 @@ def test_pdf_summary(reporter: Reporter) -> None:
         reporter.ok("PDF summary reflects month/event context from the fixture data")
     else:
         reporter.fail("PDF summary did not include expected notice context", summary_text[:300])
-    _assert_copilot_cli_runtime(workspace_host, reporter, "PDF summary")
+    _assert_expected_runtime(workspace_host, reporter, "PDF summary")
 
 
 def test_essay_organize(reporter: Reporter) -> None:
@@ -550,7 +587,7 @@ def test_essay_organize(reporter: Reporter) -> None:
             "Essay organize still repeats content across Ethan's grouped files",
             "\n".join(str(path.relative_to(output_root)) for path in ethan_files[:10]),
         )
-    _assert_copilot_cli_runtime(workspace_host, reporter, "Essay organize")
+    _assert_expected_runtime(workspace_host, reporter, "Essay organize")
 
 
 def test_csv_analysis_inplace(reporter: Reporter) -> None:
@@ -593,7 +630,7 @@ def test_csv_analysis_inplace(reporter: Reporter) -> None:
         reporter.ok("CSV in-place did not leak agent audit files into the user folder")
     else:
         reporter.fail("CSV in-place leaked audit files into the user folder")
-    _assert_copilot_cli_runtime(workspace_host, reporter, "CSV analysis in-place")
+    _assert_expected_runtime(workspace_host, reporter, "CSV analysis in-place")
 
 
 def test_pdf_summary_inplace(reporter: Reporter) -> None:
@@ -635,7 +672,7 @@ def test_pdf_summary_inplace(reporter: Reporter) -> None:
         reporter.ok("PDF in-place did not leak agent audit files into the user folder")
     else:
         reporter.fail("PDF in-place leaked audit files into the user folder")
-    _assert_copilot_cli_runtime(workspace_host, reporter, "PDF summary in-place")
+    _assert_expected_runtime(workspace_host, reporter, "PDF summary in-place")
 
 
 def test_essay_organize_inplace(reporter: Reporter) -> None:
@@ -730,14 +767,14 @@ def test_essay_organize_inplace(reporter: Reporter) -> None:
         reporter.ok("Essay organize in-place did not leak agent audit files into the user folder")
     else:
         reporter.fail("Essay organize in-place leaked audit files into the user folder")
-    _assert_copilot_cli_runtime(workspace_host, reporter, "Essay organize in-place")
+    _assert_expected_runtime(workspace_host, reporter, "Essay organize in-place")
 
 
 def main() -> int:
     args = _parse_args()
     reporter = Reporter(verbose=args.verbose)
 
-    if not _ensure_stack(reporter):
+    if not _ensure_stack(reporter, reuse_images=args.reuse_images):
         return summary_exit_code(reporter)
 
     test_csv_analysis(reporter)

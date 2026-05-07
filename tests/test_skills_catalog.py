@@ -50,9 +50,14 @@ class SkillsCatalogScanTests(unittest.TestCase):
         s = self.cat.get_skill("constellation-architecture-delivery")
         self.assertIsNotNone(s)
         self.assertEqual(s["id"], "constellation-architecture-delivery")
+        self.assertTrue(str(s.get("content") or "").strip())
 
     def test_get_skill_unknown_returns_none(self):
         self.assertIsNone(self.cat.get_skill("nonexistent-skill-xyz"))
+
+    def test_catalog_listing_omits_full_skill_content(self):
+        first_skill = self.cat.get_catalog()[0]
+        self.assertNotIn("content", first_skill)
 
     def test_expected_skills_present(self):
         expected = {
