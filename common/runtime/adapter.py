@@ -254,7 +254,7 @@ def _claude_code_status() -> dict:
 
 def backend_supports_agentic(backend: str | None = None) -> bool:
     _, effective = resolve_backend_name(backend)
-    return effective in {"connect-agent", "claude-code"}
+    return effective in {"connect-agent", "claude-code", "copilot-cli"}
 
 
 def summarize_runtime_configuration(backend: str | None = None) -> dict:
@@ -276,10 +276,9 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 ),
             }
         )
-        summary["agenticReady"] = False
-        summary["agenticError"] = (
-            "Copilot CLI does not implement run_agentic(); use connect-agent or claude-code."
-        )
+        summary["agenticReady"] = bool(cli_status["ready"])
+        if not summary["agenticReady"]:
+            summary["agenticError"] = "Copilot CLI is not ready (token or binary missing)."
         if not cli_status["ready"]:
             summary["error"] = "Copilot CLI is not ready (token or binary missing)."
     elif effective == "claude-code":

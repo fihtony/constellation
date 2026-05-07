@@ -28,7 +28,11 @@
 
 ## Common Tools
 
+- `todo_write` — Record a short plan or checklist for multi-step SCM work.
 - `report_progress` — Report progress for long-running operations.
 - `complete_current_task` — Mark the current task as complete.
 - `fail_current_task` — Mark the current task as failed with a structured error.
+- `get_task_context` — Inspect the current task metadata and permissions snapshot.
+- `get_agent_runtime_status` — Inspect the current runtime backend and readiness.
 - `load_skill` — Load an SCM workflow skill for guidance.
+- `list_skills` — List available skills before loading one dynamically.

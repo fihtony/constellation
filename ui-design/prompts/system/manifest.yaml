@@ -8,5 +8,6 @@ systemOrder:
   - 60-failure-handling.md
 includeSkills: true
 skillNames:
+  - constellation-generic-agent-workflow
   - figma-rest-workflow
   - stitch-mcp-workflow

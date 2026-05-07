@@ -31,7 +31,9 @@ class AgentDirectory:
         watch_interval_seconds: int | None = None,
     ):
         self.owner_agent_id = owner_agent_id
-        self.registry = registry_client or RegistryClient()
+        self.registry = registry_client or RegistryClient(
+            os.environ.get("REGISTRY_URL", "http://registry:9000")
+        )
         self.cache_ttl_seconds = int(
             cache_ttl_seconds
             if cache_ttl_seconds is not None

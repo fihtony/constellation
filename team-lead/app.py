@@ -27,7 +27,7 @@ from common.agent_directory import AgentDirectory
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.launcher import get_launcher
-from common.message_utils import artifact_text, build_text_artifact, extract_text
+from common.message_utils import build_text_artifact, extract_text
 from common.orchestrator import resolve_orchestrator_base_url
 from common.per_task_exit import PerTaskExitHandler
 from common.registry_client import RegistryClient
@@ -36,13 +36,13 @@ from common.runtime.adapter import get_runtime, require_agentic_runtime
 from common.task_store import TaskStore
 from common.team_lead_agentic_workflow import (
     TEAM_LEAD_RUNTIME_TOOL_NAMES,
+    TEAM_LEAD_INPUT_REQUIRED_PREAMBLE,
     build_team_lead_runtime_config,
     build_team_lead_task_prompt as _build_team_lead_task_prompt,
     configure_team_lead_control_tools,
     make_wait_for_user_input,
 )
 from common.time_utils import local_clock_time, local_iso_timestamp
-from team_lead import prompts
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -60,7 +60,7 @@ COMPASS_ACK_TIMEOUT = int(os.environ.get("COMPASS_ACK_TIMEOUT_SECONDS", "300"))
 
 _AGENT_CARD_PATH = os.path.join(os.path.dirname(__file__), "agent-card.json")
 
-registry = RegistryClient()
+registry = RegistryClient(REGISTRY_URL)
 agent_directory = AgentDirectory(AGENT_ID, registry)
 launcher = get_launcher()
 exit_handler = PerTaskExitHandler()
@@ -205,35 +205,17 @@ def _notify_compass(
 
 
 # ---------------------------------------------------------------------------
-# Summary helper (fallback for runtime error path)
+# Failure summary helper (deterministic fallback only)
 # ---------------------------------------------------------------------------
 
-def _generate_summary(
-    user_text: str,
-    phases_log: list[str],
-    final_state: str,
-    artifacts: list,
-) -> str:
-    artifacts_text = "\n".join(
-        f"- {a.get('name', 'artifact')}: {(artifact_text(a) or '')[:200]}"
-        for a in (artifacts or [])[:3]
-    ) or "No deliverables recorded."
-    phases_text = "\n".join(f"  {p}" for p in (phases_log or [])[-15:]) or "  (no phase log)"
-    prompt = prompts.SUMMARIZE_TEMPLATE.format(
-        user_text=user_text,
-        phases_log=phases_text,
-        final_state=final_state,
-        artifacts=artifacts_text,
+def _build_failure_summary(user_text: str, phases_log: list[str], error_text: str) -> str:
+    request_excerpt = " ".join((user_text or "").split())[:180] or "(request unavailable)"
+    phase_excerpt = " | ".join((phases_log or [])[-5:]) or "no recorded phases"
+    return (
+        f"Task failed while handling request: {request_excerpt}. "
+        f"Recent phases: {phase_excerpt}. "
+        f"Error: {error_text[:300]}"
     )
-    try:
-        result = get_runtime().run(
-            prompt=prompt,
-            system_prompt=prompts.SUMMARIZE_SYSTEM,
-            timeout=120,
-        )
-        return result.get("raw_response") or result.get("summary") or f"Task {final_state.lower()}."
-    except Exception as err:
-        return f"Task {final_state.lower()}. Summary unavailable: {err}"
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +248,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):
         input_events_lock=_INPUT_EVENTS_LOCK,
         notify_compass=_notify_compass,
         input_wait_timeout=INPUT_WAIT_TIMEOUT,
-        input_required_preamble=prompts.INPUT_REQUIRED_PREAMBLE,
+        input_required_preamble=TEAM_LEAD_INPUT_REQUIRED_PREAMBLE,
     )
     configure_team_lead_control_tools(
         task_id=team_lead_task_id,
@@ -373,10 +355,7 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):
         print(f"[{AGENT_ID}][{team_lead_task_id}] FAILED: {error_text}")
         log(f"FAILED: {error_text[:300]}")
 
-        try:
-            failure_summary = _generate_summary(user_text, ctx.phases_log, "FAILED", [])
-        except Exception:
-            failure_summary = f"Task failed: {error_text[:500]}"
+        failure_summary = _build_failure_summary(user_text, ctx.phases_log, error_text)
 
         task_store.update_state(team_lead_task_id, "TASK_STATE_FAILED", failure_summary)
         audit_log(

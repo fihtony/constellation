@@ -15,10 +15,14 @@
 
 ## Common Tools
 
+- `todo_write` — Record a short plan or checklist for multi-step design fetch work.
 - `report_progress` — Report progress for long-running design fetches.
 - `complete_current_task` — Mark the current task as complete with design context payload.
 - `fail_current_task` — Mark the current task as failed with a structured error.
+- `get_task_context` — Inspect the current task metadata and permissions snapshot.
+- `get_agent_runtime_status` — Inspect the current runtime backend and readiness.
 - `load_skill` — Load a design workflow skill for guidance.
+- `list_skills` — List available skills before loading one dynamically.
 
 ## Tool Selection Strategy
 

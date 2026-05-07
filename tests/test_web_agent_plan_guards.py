@@ -17,12 +17,9 @@ have been removed.  This module covers:
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
-import sys
 import threading
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -37,18 +34,6 @@ from common.web_agentic_workflow import (
 from common.runtime.connect_agent.adapter import DEFAULT_AGENTIC_SYSTEM
 
 _TEAM_LEAD_DIR = Path(__file__).resolve().parents[1] / "team-lead"
-_TL_PROMPTS_SPEC = importlib.util.spec_from_file_location(
-    "team_lead.prompts", _TEAM_LEAD_DIR / "prompts.py"
-)
-team_lead_prompts = importlib.util.module_from_spec(_TL_PROMPTS_SPEC)
-assert _TL_PROMPTS_SPEC and _TL_PROMPTS_SPEC.loader
-_TL_PROMPTS_SPEC.loader.exec_module(team_lead_prompts)
-team_lead_package = types.ModuleType("team_lead")
-team_lead_package.__path__ = [str(_TEAM_LEAD_DIR)]
-team_lead_package.prompts = team_lead_prompts
-sys.modules.setdefault("team_lead", team_lead_package)
-sys.modules.setdefault("team_lead.prompts", team_lead_prompts)
-
 _WEB_SYSTEM_DIR = Path(__file__).resolve().parents[1] / "web" / "prompts" / "system"
 
 
@@ -59,6 +44,7 @@ class WebAgentRuntimeToolTests(unittest.TestCase):
         "complete_current_task",
         "fail_current_task",
         "request_user_input",
+        "request_agent_clarification",
         "report_progress",
         "get_task_context",
         "todo_write",
@@ -91,6 +77,12 @@ class WebAgentRuntimeToolTests(unittest.TestCase):
     def test_tool_names_are_strings(self):
         for item in WEB_AGENT_RUNTIME_TOOL_NAMES:
             self.assertIsInstance(item, str)
+
+    def test_runtime_config_tracks_generic_and_ui_evidence_playbooks(self):
+        runtime_config = build_web_agent_runtime_config()
+        playbooks = runtime_config["skillPlaybooks"]
+        self.assertIn("constellation-generic-agent-workflow", playbooks)
+        self.assertIn("constellation-ui-evidence-delivery", playbooks)
 
 
 class WebAgentWorkflowTests(unittest.TestCase):
@@ -148,7 +140,7 @@ class WebAgentWorkflowTests(unittest.TestCase):
                 done_event.set()
 
         with mock.patch.object(web_app, "_notify_callback", side_effect=lambda *a, **kw: callback_calls.append(a)), \
-             mock.patch("common.web_agentic_workflow.configure_control_tools"), \
+             mock.patch("web.agentic_workflow.configure_control_tools"), \
              mock.patch.object(web_app, "get_runtime") as mock_get_runtime, \
              mock.patch.object(web_app, "require_agentic_runtime"), \
              mock.patch.object(web_app, "build_system_prompt_from_manifest", return_value="sys"), \
@@ -282,7 +274,7 @@ class ControlToolsWiringTests(unittest.TestCase):
     def test_configure_sets_task_context(self):
         captured = []
         with mock.patch(
-            "common.web_agentic_workflow.configure_control_tools",
+            "web.agentic_workflow.configure_control_tools",
             side_effect=lambda task_context, **kw: captured.append(task_context),
         ):
             configure_web_agent_control_tools(
@@ -396,12 +388,15 @@ class AgentPromptBoundaryTests(unittest.TestCase):
         self.assertNotIn("jira comment", lowered)
 
     def test_team_lead_prompts_enforce_planning_and_repo_clone_boundary(self):
-        plan_lower = team_lead_prompts.PLAN_SYSTEM.lower()
-        review_lower = team_lead_prompts.REVIEW_SYSTEM.lower()
-        self.assertIn("you do not write implementation code yourself", plan_lower)
-        self.assertIn("clone the target repository", plan_lower)
-        self.assertIn("shared workspace", plan_lower)
-        self.assertIn("missing scm evidence is a delivery failure", review_lower)
+        orchestrate_lower = (
+            (_TEAM_LEAD_DIR / "prompts" / "tasks" / "orchestrate.md")
+            .read_text(encoding="utf-8")
+            .lower()
+        )
+        self.assertIn("never write product code yourself", orchestrate_lower)
+        self.assertIn("clone that repository", orchestrate_lower)
+        self.assertIn("shared workspace", orchestrate_lower)
+        self.assertIn("missing scm evidence is a delivery failure", orchestrate_lower)
 
     def test_web_system_prompts_exist_in_manifest_directory(self):
         self.assertTrue(_WEB_SYSTEM_DIR.is_dir(), "web/prompts/system/ must exist")

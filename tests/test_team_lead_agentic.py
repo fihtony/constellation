@@ -9,28 +9,14 @@ Verifies that the Team Lead Agent:
 
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
 import threading
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
 _TEAM_LEAD_DIR = Path(__file__).resolve().parents[1] / "team-lead"
-_TEAM_LEAD_PROMPTS_SPEC = importlib.util.spec_from_file_location(
-    "team_lead.prompts", _TEAM_LEAD_DIR / "prompts.py"
-)
-team_lead_prompts = importlib.util.module_from_spec(_TEAM_LEAD_PROMPTS_SPEC)
-assert _TEAM_LEAD_PROMPTS_SPEC and _TEAM_LEAD_PROMPTS_SPEC.loader
-_TEAM_LEAD_PROMPTS_SPEC.loader.exec_module(team_lead_prompts)
-
-team_lead_package = types.ModuleType("team_lead")
-team_lead_package.__path__ = [str(_TEAM_LEAD_DIR)]
-team_lead_package.prompts = team_lead_prompts
-sys.modules.setdefault("team_lead", team_lead_package)
-sys.modules.setdefault("team_lead.prompts", team_lead_prompts)
+import importlib.util
 
 _TEAM_LEAD_APP_PATH = _TEAM_LEAD_DIR / "app.py"
 _TEAM_LEAD_SPEC = importlib.util.spec_from_file_location("team_lead_app", _TEAM_LEAD_APP_PATH)
@@ -132,6 +118,11 @@ class TeamLeadAgentArchitectureTests(unittest.TestCase):
         """_run_workflow must provide a comprehensive tool list to run_agentic."""
         required_tools = [
             "jira_get_ticket",
+            "scm_repo_inspect",
+            "scm_read_file",
+            "scm_list_dir",
+            "scm_search_code",
+            "scm_get_default_branch",
             "dispatch_agent_task",
             "wait_for_agent_task",
             "ack_agent_task",
@@ -139,6 +130,10 @@ class TeamLeadAgentArchitectureTests(unittest.TestCase):
             "report_progress",
             "registry_query",
             "check_agent_status",
+            "scm_get_pr_details",
+            "scm_get_pr_diff",
+            "collect_task_evidence",
+            "check_definition_of_done",
         ]
         # tools are defined in TEAM_LEAD_RUNTIME_TOOL_NAMES constant or inline in _run_workflow
         import inspect

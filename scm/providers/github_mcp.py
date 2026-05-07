@@ -23,7 +23,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from scm.providers.base import SCMProvider
+from scm.providers.github import GitHubProvider
 
 GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -197,7 +197,7 @@ def _parse_json(text: str) -> Any:
 # GitHub MCP Provider
 # ---------------------------------------------------------------------------
 
-class GitHubMCPProvider(SCMProvider):
+class GitHubMCPProvider(GitHubProvider):
     """SCM provider backed by the remote GitHub MCP server (cloud HTTP)."""
 
     def __init__(
@@ -207,10 +207,12 @@ class GitHubMCPProvider(SCMProvider):
         author_name: str = "SCM Agent",
         author_email: str = "scm-agent@local",
     ):
-        self._token = token.strip()
+        super().__init__(
+            token=token,
+            author_name=author_name,
+            author_email=author_email,
+        )
         self._timeout = timeout
-        self._author_name = author_name
-        self._author_email = author_email
         self._session: _HTTPMCPSession | None = None
         self._lock = threading.Lock()
 

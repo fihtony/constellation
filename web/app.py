@@ -38,7 +38,7 @@ from common.task_permissions import (
 )
 from common.task_store import TaskStore
 from common.time_utils import local_clock_time, local_iso_timestamp
-from common.web_agentic_workflow import (
+from web.agentic_workflow import (
     WEB_AGENT_RUNTIME_TOOL_NAMES,
     build_web_agent_runtime_config,
     build_web_task_prompt,

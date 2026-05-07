@@ -18,6 +18,7 @@ import time
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
@@ -128,6 +129,12 @@ def _make_provider():
 
 
 _provider = _make_provider()
+SCM_AGENT_SKILL_PLAYBOOKS = [
+    "constellation-generic-agent-workflow",
+    "github-rest-workflow",
+    "github-mcp-workflow",
+    "bitbucket-server-workflow",
+]
 
 # ---------------------------------------------------------------------------
 # Task state
@@ -280,6 +287,7 @@ def _resolve_clone_auth(owner: str, repo: str, clone_url: str) -> tuple[str, lis
 def _runtime_config_summary() -> dict:
     return {
         "runtime": summarize_runtime_configuration(),
+        "skillPlaybooks": list(SCM_AGENT_SKILL_PLAYBOOKS),
         "rulesLoaded": bool(load_rules("scm")),
         "workflowRulesLoaded": bool(load_rules("scm", include_workflow=True)),
         "provider": _provider.provider_name,
@@ -514,20 +522,26 @@ def _require_scm_permission(
     print(f"[{AGENT_ID}] WARN: permission check failed but enforcement={_permission_enforcement_mode()}: {reason}")
 
 
+class _JsonResponseHandler(Protocol):
+    def _send_json(self, code: int, body: dict):
+        ...
+
+
 def _enforce_http_scm_permission(
-    handler: BaseHTTPRequestHandler,
+    handler: _JsonResponseHandler,
     *,
     action: str,
     target: str,
     scope: str = "*",
     payload_permissions: dict | None = None,
 ) -> bool:
+    headers = getattr(handler, "headers", None)
     allowed, reason, escalation = _check_scm_permission(
         action=action,
         target=target,
         scope=scope,
         payload_permissions=payload_permissions,
-        headers=handler.headers,
+        headers=headers,
     )
     if allowed:
         return True
@@ -773,8 +787,10 @@ def _run_task_async(task_id: str, message: dict):
                 "scm_get_pr_diff", "scm_list_prs", "scm_list_pr_comments",
                 "scm_create_branch", "scm_push_files", "scm_create_pr",
                 "scm_add_pr_comment", "scm_clone_repo",
-                "report_progress", "complete_current_task", "fail_current_task",
-                "load_skill",
+                "todo_write", "report_progress",
+                "complete_current_task", "fail_current_task",
+                "get_task_context", "get_agent_runtime_status",
+                "load_skill", "list_skills",
             ],
             max_turns=15,
             timeout=300,

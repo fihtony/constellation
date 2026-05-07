@@ -1,309 +1,37 @@
 #!/usr/bin/env python3
-"""Unit tests for the Android Agent permissions forwarding fix.
+"""Unit tests for the Android Agent agentic rewrite.
 
-Verifies that _call_sync_agent, _clone_repo, _list_remote_branches,
-_create_branch, _push_files, and _create_pr correctly forward
-permissions to downstream agents.
+Covers:
+- Permission extraction from task metadata (_run_workflow logic)
+- Jira context handoff from Team Lead metadata
+- build_android_task_prompt() generates correct prompt sections
+- ANDROID_AGENT_RUNTIME_TOOL_NAMES contains required tool names
+- AndroidValidationProvider returns ValidationResult instances
+- configure_android_agent_control_tools() stores permissions in context
 """
 
-import json
 import os
 import sys
-import tempfile
-import time
 import unittest
 from typing import cast
 from unittest.mock import patch, MagicMock
 
-# Ensure correct paths
+# Ensure project root is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "android"))
 
-# Minimal env setup — do NOT set AGENT_ID here; android/app.py defaults to
-# "android-agent" already, and setting it here would contaminate other agent
-# modules (e.g. office/app.py) that import AFTER this module is collected.
+# Minimal env setup
 os.environ.setdefault("REGISTRY_URL", "http://localhost:9000")
 os.environ.setdefault("ADVERTISED_BASE_URL", "http://android-agent:8000")
-os.environ.setdefault("COMPASS_URL", "http://compass:8080")
 os.environ.setdefault("OPENAI_BASE_URL", "http://localhost:1288/v1")
 os.environ.setdefault("OPENAI_MODEL", "gpt-5-mini")
 
 
-class TestCallSyncAgentPermissions(unittest.TestCase):
-    """Test that _call_sync_agent forwards permissions in metadata."""
-
-    @patch("android.app._a2a_send")
-    @patch("android.app._resolve_agent_service_url")
-    def test_permissions_included_in_message(self, mock_resolve, mock_send):
-        from android.app import _call_sync_agent
-        mock_resolve.return_value = "http://scm:8020"
-        mock_send.return_value = {
-            "id": "t1",
-            "status": {"state": "TASK_STATE_COMPLETED"},
-            "artifacts": [],
-        }
-        perms = {"grant": "development", "actions": [{"action": "repo.clone", "scope": "*"}]}
-
-        _call_sync_agent(
-            "scm.git.clone",
-            "Clone repo X",
-            "task-001",
-            "/workspace",
-            "compass-task-001",
-            permissions=perms,
-        )
-
-        # Verify the message sent includes permissions
-        call_args = mock_send.call_args
-        message = call_args[0][1]  # Second positional arg is the message
-        self.assertIn("permissions", message.get("metadata", {}))
-        self.assertEqual(message["metadata"]["permissions"], perms)
-
-    @patch("android.app._a2a_send")
-    @patch("android.app._resolve_agent_service_url")
-    def test_no_permissions_when_none(self, mock_resolve, mock_send):
-        from android.app import _call_sync_agent
-        mock_resolve.return_value = "http://scm:8020"
-        mock_send.return_value = {
-            "id": "t1",
-            "status": {"state": "TASK_STATE_COMPLETED"},
-            "artifacts": [],
-        }
-
-        _call_sync_agent(
-            "scm.git.clone",
-            "Clone repo X",
-            "task-001",
-            "/workspace",
-            "compass-task-001",
-            permissions=None,
-        )
-
-        call_args = mock_send.call_args
-        message = call_args[0][1]
-        self.assertNotIn("permissions", message.get("metadata", {}))
-
-
-class TestCloneRepoPermissions(unittest.TestCase):
-    """Test that _clone_repo passes permissions to _call_sync_agent."""
-
-    @patch("android.app._call_sync_agent")
-    def test_clone_repo_forwards_permissions(self, mock_call):
-        from android.app import _clone_repo
-        mock_call.return_value = {
-            "status": {"state": "TASK_STATE_COMPLETED"},
-            "artifacts": [
-                {"parts": [{"text": json.dumps({"clonePath": "/workspace/repo"})}]}
-            ],
-        }
-        perms = {"grant": "development", "actions": [{"action": "repo.clone", "scope": "*"}]}
-
-        result = _clone_repo("task-001", "https://github.com/org/repo.git", "/workspace", "compass-001", permissions=perms)
-
-        mock_call.assert_called_once()
-        kwargs = mock_call.call_args[1]
-        self.assertEqual(kwargs.get("permissions"), perms)
-        self.assertEqual(result, "/workspace/repo")
-
-    @patch("android.app._call_sync_agent")
-    def test_clone_repo_no_permissions(self, mock_call):
-        from android.app import _clone_repo
-        mock_call.return_value = {
-            "status": {"state": "TASK_STATE_COMPLETED"},
-            "artifacts": [
-                {"parts": [{"text": json.dumps({"clonePath": "/workspace/repo"})}]}
-            ],
-        }
-
-        _clone_repo("task-001", "https://github.com/org/repo.git", "/workspace", "compass-001")
-
-        kwargs = mock_call.call_args[1]
-        self.assertIsNone(kwargs.get("permissions"))
-
-
-class TestListRemoteBranchesPermissions(unittest.TestCase):
-    @patch("android.app._call_sync_agent")
-    def test_list_branches_forwards_permissions(self, mock_call):
-        from android.app import _list_remote_branches
-        mock_call.return_value = {
-            "status": {"state": "TASK_STATE_COMPLETED"},
-            "artifacts": [
-                {"parts": [{"text": json.dumps([{"name": "main"}, {"name": "dev"}])}]}
-            ],
-        }
-        perms = {"grant": "development"}
-
-        result = _list_remote_branches("task-001", "https://github.com/org/repo.git", "/ws", "c-001", permissions=perms)
-
-        kwargs = mock_call.call_args[1]
-        self.assertEqual(kwargs.get("permissions"), perms)
-        self.assertEqual(result, {"main", "dev"})
-
-
-class TestCreateBranchPermissions(unittest.TestCase):
-    @patch("android.app._call_sync_agent")
-    def test_create_branch_forwards_permissions(self, mock_call):
-        from android.app import _create_branch
-        mock_call.return_value = {
-            "status": {"state": "TASK_STATE_COMPLETED"},
-            "artifacts": [],
-        }
-        perms = {"grant": "development"}
-
-        result = _create_branch("task-001", "https://github.com/org/repo.git", "feat/x", "main", "/ws", "c-001", permissions=perms)
-
-        kwargs = mock_call.call_args[1]
-        self.assertEqual(kwargs.get("permissions"), perms)
-        self.assertTrue(result)
-
-
-class TestPushFilesPermissions(unittest.TestCase):
-    @patch("android.app._poll_task")
-    @patch("android.app._a2a_send")
-    @patch("android.app._resolve_agent_service_url")
-    def test_push_files_includes_permissions(self, mock_resolve, mock_send, mock_poll):
-        from android.app import _push_files
-        mock_resolve.return_value = "http://scm:8020"
-        mock_send.return_value = {
-            "id": "t1",
-            "status": {"state": "TASK_STATE_COMPLETED"},
-            "artifacts": [],
-        }
-        perms = {"grant": "development", "actions": [{"action": "git.push", "scope": "*"}]}
-
-        files = [{"path": "src/main.kt", "content": "fun main() {}"}]
-        result = _push_files(
-            "task-001", "https://github.com/org/repo.git", "feat/x",
-            files, "commit msg", "/ws", "c-001", "main",
-            permissions=perms,
-        )
-
-        call_args = mock_send.call_args
-        message = call_args[0][1]
-        self.assertIn("permissions", message.get("metadata", {}))
-        self.assertEqual(message["metadata"]["permissions"], perms)
-        self.assertTrue(result)
-
-
-class TestCreatePrPermissions(unittest.TestCase):
-    @patch("android.app._poll_task")
-    @patch("android.app._a2a_send")
-    @patch("android.app._resolve_agent_service_url")
-    def test_create_pr_includes_permissions(self, mock_resolve, mock_send, mock_poll):
-        from android.app import _create_pr
-        mock_resolve.return_value = "http://scm:8020"
-        mock_send.return_value = {
-            "id": "t1",
-            "status": {"state": "TASK_STATE_COMPLETED"},
-            "artifacts": [
-                {"parts": [{"text": json.dumps({"htmlUrl": "https://github.com/org/repo/pull/1"})}]}
-            ],
-        }
-        perms = {"grant": "development", "actions": [{"action": "pr.create", "scope": "*"}]}
-
-        result = _create_pr(
-            "task-001", "https://github.com/org/repo.git", "feat/x", "main",
-            "PR Title", "PR Body", "/ws", "c-001",
-            permissions=perms,
-        )
-
-        call_args = mock_send.call_args
-        message = call_args[0][1]
-        self.assertIn("permissions", message.get("metadata", {}))
-        self.assertEqual(message["metadata"]["permissions"], perms)
-        self.assertEqual(result, "https://github.com/org/repo/pull/1")
-
-    @patch("android.app._poll_task")
-    @patch("android.app._a2a_send")
-    @patch("android.app._resolve_agent_service_url")
-    def test_create_pr_extracts_url_from_bitbucket_detail_links(self, mock_resolve, mock_send, mock_poll):
-        from android.app import _create_pr
-
-        mock_resolve.return_value = "http://scm:8020"
-        mock_send.return_value = {
-            "id": "t1",
-            "status": {"state": "TASK_STATE_COMPLETED"},
-            "artifacts": [
-                {
-                    "parts": [
-                        {
-                            "text": json.dumps(
-                                {
-                                    "detail": {
-                                        "links": {
-                                            "self": [
-                                                {"href": "https://bitbucket.example.com/projects/APP/repos/mobile/pull-requests/42"}
-                                            ]
-                                        }
-                                    }
-                                }
-                            )
-                        }
-                    ]
-                }
-            ],
-        }
-
-        result = _create_pr(
-            "task-001", "https://bitbucket.example.com/projects/APP/repos/mobile", "feat/x", "main",
-            "PR Title", "PR Body", "/ws", "c-001",
-        )
-
-        self.assertEqual(result, "https://bitbucket.example.com/projects/APP/repos/mobile/pull-requests/42")
-
-    @patch("android.app._poll_task")
-    @patch("android.app._a2a_send")
-    @patch("android.app._resolve_agent_service_url")
-    def test_create_pr_extracts_url_from_artifact_metadata(self, mock_resolve, mock_send, mock_poll):
-        from android.app import _create_pr
-
-        mock_resolve.return_value = "http://scm:8020"
-        mock_send.return_value = {
-            "id": "t1",
-            "status": {"state": "TASK_STATE_COMPLETED"},
-            "artifacts": [
-                {
-                    "metadata": {"prUrl": "https://github.com/org/widget/pull/7"},
-                    "parts": [{"text": "PR created successfully"}],
-                }
-            ],
-        }
-
-        result = _create_pr(
-            "task-001", "https://github.com/org/widget.git", "feat/x", "main",
-            "PR Title", "PR Body", "/ws", "c-001",
-        )
-
-        self.assertEqual(result, "https://github.com/org/widget/pull/7")
-
-
-class TestJiraRequestPermissions(unittest.TestCase):
-    @patch("android.app._call_sync_agent")
-    def test_jira_request_uses_a2a_metadata_permissions(self, mock_call_sync):
-        from android.app import _jira_request_json
-        mock_call_sync.return_value = {
-            "status": {"state": "TASK_STATE_COMPLETED"},
-            "artifacts": [
-                {"name": "jira-raw-payload", "parts": [{"text": json.dumps({"key": "TEST-1"})}]}
-            ],
-        }
-        perms = {"grant": "development", "actions": [{"action": "ticket.fetch", "scope": "*"}]}
-
-        result = _jira_request_json(
-            "jira.ticket.fetch", "GET", "/jira/tickets/TEST-1",
-            task_id="task-001",
-            compass_task_id="compass-001",
-            permissions=perms,
-        )
-
-        kwargs = mock_call_sync.call_args.kwargs
-        self.assertEqual(kwargs.get("permissions"), perms)
-        self.assertEqual(kwargs.get("extra_metadata", {}).get("ticketKey"), "TEST-1")
-        self.assertEqual(result["issue"]["key"], "TEST-1")
-
+# ---------------------------------------------------------------------------
+# Permission extraction tests (logic still lives in android/app.py _run_workflow)
+# ---------------------------------------------------------------------------
 
 class TestWorkflowExtractsPermissions(unittest.TestCase):
-    """Test that _run_workflow extracts permissions from metadata."""
+    """Test that _run_workflow extracts permissions from message metadata."""
 
     def test_permissions_extracted_from_metadata(self):
         """Simulate the permission extraction logic from _run_workflow."""
@@ -312,7 +40,6 @@ class TestWorkflowExtractsPermissions(unittest.TestCase):
             "sharedWorkspacePath": "/workspace",
             "permissions": {"grant": "development", "actions": [{"action": "repo.clone"}]},
         }
-        # Same logic used in _run_workflow
         raw_permissions = metadata.get("permissions")
         self.assertIsInstance(raw_permissions, dict)
         permissions = cast(dict, raw_permissions)
@@ -320,17 +47,31 @@ class TestWorkflowExtractsPermissions(unittest.TestCase):
 
     def test_no_permissions_when_not_dict(self):
         metadata = {"orchestratorTaskId": "compass-001", "permissions": "invalid"}
-        permissions = metadata.get("permissions") if isinstance(metadata.get("permissions"), dict) else None
+        permissions = (
+            metadata.get("permissions")
+            if isinstance(metadata.get("permissions"), dict)
+            else None
+        )
         self.assertIsNone(permissions)
 
     def test_no_permissions_when_missing(self):
         metadata = {"orchestratorTaskId": "compass-001"}
-        permissions = metadata.get("permissions") if isinstance(metadata.get("permissions"), dict) else None
+        permissions = (
+            metadata.get("permissions")
+            if isinstance(metadata.get("permissions"), dict)
+            else None
+        )
         self.assertIsNone(permissions)
 
 
+# ---------------------------------------------------------------------------
+# Jira context handoff tests
+# ---------------------------------------------------------------------------
+
 class TestAndroidJiraContextHandoff(unittest.TestCase):
-    def test_android_agent_uses_prefetched_jira_context_from_metadata(self):
+    """Test that _resolve_jira_context_from_metadata reads Team Lead-passed context."""
+
+    def test_uses_prefetched_jira_context_from_metadata(self):
         from android.app import _resolve_jira_context_from_metadata
 
         ticket_key, jira_content = _resolve_jira_context_from_metadata(
@@ -347,25 +88,313 @@ class TestAndroidJiraContextHandoff(unittest.TestCase):
         self.assertEqual(ticket_key, "PROJ-2904")
         self.assertIn("Your contributions", jira_content)
 
+    def test_falls_back_to_ticket_key_in_text(self):
+        from android.app import _resolve_jira_context_from_metadata
 
-class TestAndroidSdkPreparation(unittest.TestCase):
-    def test_resolve_android_sdk_dir_prefers_android_home(self):
-        from android.app import _resolve_android_sdk_dir
+        ticket_key, jira_content = _resolve_jira_context_from_metadata(
+            "Please implement PROJ-1234 as described.",
+            {},
+        )
 
-        with patch.dict(os.environ, {"ANDROID_HOME": "/opt/android-sdk", "ANDROID_SDK_ROOT": "/tmp/other"}, clear=False):
-            self.assertEqual(_resolve_android_sdk_dir(), "/opt/android-sdk")
+        self.assertEqual(ticket_key, "PROJ-1234")
+        self.assertEqual(jira_content, "")
 
-    def test_prepare_android_local_properties_writes_sdk_dir(self):
-        from android.app import _prepare_android_local_properties
+    def test_empty_when_no_jira_info(self):
+        from android.app import _resolve_jira_context_from_metadata
 
-        messages: list[str] = []
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"ANDROID_HOME": "/opt/android-sdk"}, clear=False):
-            sdk_dir = _prepare_android_local_properties(temp_dir, messages.append)
+        ticket_key, jira_content = _resolve_jira_context_from_metadata("Some task", {})
 
-            self.assertEqual(sdk_dir, "/opt/android-sdk")
-            with open(os.path.join(temp_dir, "local.properties"), encoding="utf-8") as fh:
-                self.assertEqual(fh.read().strip(), "sdk.dir=/opt/android-sdk")
-            self.assertTrue(any("Prepared Android SDK local.properties" in item for item in messages))
+        self.assertEqual(ticket_key, "")
+        self.assertEqual(jira_content, "")
+
+    def test_prefers_metadata_ticket_key_over_text_match(self):
+        from android.app import _resolve_jira_context_from_metadata
+
+        ticket_key, _ = _resolve_jira_context_from_metadata(
+            "Also mentioned PROJ-9999 in description",
+            {
+                "jiraContext": {
+                    "ticketKey": "PROJ-1111",
+                    "content": "explicit content",
+                }
+            },
+        )
+        self.assertEqual(ticket_key, "PROJ-1111")
+
+
+# ---------------------------------------------------------------------------
+# build_android_task_prompt tests
+# ---------------------------------------------------------------------------
+
+class TestBuildAndroidTaskPrompt(unittest.TestCase):
+    """Test that build_android_task_prompt generates required sections."""
+
+    def test_includes_user_text(self):
+        from common.android_agentic_workflow import build_android_task_prompt
+
+        prompt = build_android_task_prompt(
+            user_text="Add a Contributions screen",
+            workspace="/tmp/ws",
+            compass_task_id="cmp-001",
+            android_task_id="and-001",
+        )
+
+        self.assertIn("Add a Contributions screen", prompt)
+
+    def test_includes_jira_context_when_provided(self):
+        from common.android_agentic_workflow import build_android_task_prompt
+
+        prompt = build_android_task_prompt(
+            user_text="implement screen",
+            workspace="/tmp/ws",
+            compass_task_id="cmp-001",
+            android_task_id="and-001",
+            ticket_key="PROJ-42",
+            jira_context='{"summary": "User wants contributions list"}',
+        )
+
+        self.assertIn("PROJ-42", prompt)
+        self.assertIn("contributions list", prompt)
+
+    def test_includes_acceptance_criteria(self):
+        from common.android_agentic_workflow import build_android_task_prompt
+
+        prompt = build_android_task_prompt(
+            user_text="implement",
+            workspace="/tmp/ws",
+            compass_task_id="cmp-001",
+            android_task_id="and-001",
+            acceptance_criteria=["Must show RecyclerView", "Must have unit tests"],
+        )
+
+        self.assertIn("Must show RecyclerView", prompt)
+        self.assertIn("Must have unit tests", prompt)
+
+    def test_includes_revision_issues_when_revision(self):
+        from common.android_agentic_workflow import build_android_task_prompt
+
+        prompt = build_android_task_prompt(
+            user_text="implement",
+            workspace="/tmp/ws",
+            compass_task_id="cmp-001",
+            android_task_id="and-001",
+            is_revision=True,
+            review_issues=["Fix the RecyclerView adapter null check"],
+        )
+
+        self.assertIn("REVISION", prompt)
+        self.assertIn("Fix the RecyclerView adapter null check", prompt)
+
+    def test_includes_repo_url_when_provided(self):
+        from common.android_agentic_workflow import build_android_task_prompt
+
+        prompt = build_android_task_prompt(
+            user_text="implement",
+            workspace="/tmp/ws",
+            compass_task_id="cmp-001",
+            android_task_id="and-001",
+            target_repo_url="https://github.com/org/android-app.git",
+        )
+
+        self.assertIn("https://github.com/org/android-app.git", prompt)
+
+    def test_includes_workspace_path(self):
+        from common.android_agentic_workflow import build_android_task_prompt
+
+        prompt = build_android_task_prompt(
+            user_text="implement",
+            workspace="/shared/workspace/task-001",
+            compass_task_id="cmp-001",
+            android_task_id="and-001",
+        )
+
+        self.assertIn("/shared/workspace/task-001", prompt)
+
+
+# ---------------------------------------------------------------------------
+# ANDROID_AGENT_RUNTIME_TOOL_NAMES tests
+# ---------------------------------------------------------------------------
+
+class TestAndroidRuntimeToolNames(unittest.TestCase):
+    """Test that the tool name list includes required categories."""
+
+    def setUp(self):
+        from common.android_agentic_workflow import ANDROID_AGENT_RUNTIME_TOOL_NAMES
+        self.tool_names = ANDROID_AGENT_RUNTIME_TOOL_NAMES
+
+    def test_is_a_list_of_strings(self):
+        self.assertIsInstance(self.tool_names, list)
+        for name in self.tool_names:
+            self.assertIsInstance(name, str)
+
+    def test_includes_scm_tools(self):
+        scm_tools = [t for t in self.tool_names if t.startswith("scm_")]
+        self.assertGreater(len(scm_tools), 0, "Expected at least one scm_ tool")
+        # Key SCM operations
+        self.assertIn("scm_clone_repo", self.tool_names)
+        self.assertIn("scm_create_branch", self.tool_names)
+        self.assertIn("scm_push_files", self.tool_names)
+        self.assertIn("scm_create_pr", self.tool_names)
+
+    def test_includes_jira_tools(self):
+        jira_tools = [t for t in self.tool_names if t.startswith("jira_")]
+        self.assertGreater(len(jira_tools), 0, "Expected at least one jira_ tool")
+        self.assertIn("jira_get_ticket", self.tool_names)
+        self.assertIn("jira_add_comment", self.tool_names)
+
+    def test_includes_validation_tools(self):
+        self.assertIn("run_validation_command", self.tool_names)
+        self.assertIn("collect_task_evidence", self.tool_names)
+        self.assertIn("check_definition_of_done", self.tool_names)
+
+    def test_includes_coding_tools(self):
+        coding_tools = [
+            t for t in self.tool_names
+            if t in ("read_local_file", "write_local_file", "edit_local_file", "list_local_dir", "search_local_files")
+        ]
+        self.assertGreater(len(coding_tools), 0, "Expected at least one coding tool")
+
+    def test_no_duplicates(self):
+        self.assertEqual(len(self.tool_names), len(set(self.tool_names)))
+
+
+# ---------------------------------------------------------------------------
+# AndroidValidationProvider tests
+# ---------------------------------------------------------------------------
+
+class TestAndroidValidationProvider(unittest.TestCase):
+    """Test AndroidValidationProvider returns correct ValidationResult structure.
+
+    Note: Methods take (workspace_path, options) as required by the
+    ValidationProvider protocol in common/tools/validation_tools.py.
+    """
+
+    def _get_provider(self):
+        from common.android_agentic_workflow import AndroidValidationProvider
+        return AndroidValidationProvider()
+
+    def test_run_build_returns_validation_result(self):
+        from common.tools.validation_tools import ValidationResult
+
+        with patch("android.agentic_workflow._run_gradle_task") as mock_gradle:
+            mock_gradle.return_value = ValidationResult(
+                passed=True,
+                summary="BUILD SUCCESSFUL",
+                details=[],
+                retriable=False,
+            )
+
+            provider = self._get_provider()
+            result = provider.run_build("/tmp/fake-repo", {})
+
+        self.assertIsInstance(result, ValidationResult)
+        self.assertTrue(result.passed)
+        mock_gradle.assert_called_once_with("/tmp/fake-repo", "assembleDebug", {})
+
+    def test_run_build_failure_returns_false_result(self):
+        from common.tools.validation_tools import ValidationResult
+
+        with patch("android.agentic_workflow._run_gradle_task") as mock_gradle:
+            mock_gradle.return_value = ValidationResult(
+                passed=False,
+                summary="BUILD FAILED",
+                details=[],
+                retriable=True,
+            )
+
+            provider = self._get_provider()
+            result = provider.run_build("/tmp/fake-repo", {})
+
+        self.assertIsInstance(result, ValidationResult)
+        self.assertFalse(result.passed)
+
+    def test_run_unit_test_returns_validation_result(self):
+        from common.tools.validation_tools import ValidationResult
+
+        with patch("android.agentic_workflow._run_gradle_task") as mock_gradle:
+            mock_gradle.return_value = ValidationResult(
+                passed=True,
+                summary="Tests passed",
+                details=[],
+                retriable=False,
+            )
+
+            provider = self._get_provider()
+            result = provider.run_unit_test("/tmp/fake-repo", {})
+
+        self.assertIsInstance(result, ValidationResult)
+        mock_gradle.assert_called_once_with("/tmp/fake-repo", "testDebugUnitTest", {})
+
+    def test_run_e2e_skipped_gracefully(self):
+        from common.tools.validation_tools import ValidationResult
+
+        provider = self._get_provider()
+        result = provider.run_e2e("/tmp/fake-repo", {})
+
+        self.assertIsInstance(result, ValidationResult)
+        self.assertTrue(result.passed, "E2E should be skipped (no device) not failed")
+
+    def test_run_integration_test_skipped_gracefully(self):
+        from common.tools.validation_tools import ValidationResult
+
+        provider = self._get_provider()
+        result = provider.run_integration_test("/tmp/fake-repo", {})
+
+        self.assertIsInstance(result, ValidationResult)
+        self.assertTrue(result.passed, "Integration tests should be skipped not failed")
+
+
+# ---------------------------------------------------------------------------
+# configure_android_agent_control_tools tests
+# ---------------------------------------------------------------------------
+
+class TestConfigureAndroidAgentControlTools(unittest.TestCase):
+    """Test that configure_android_agent_control_tools wires permissions into context."""
+
+    def test_stores_permissions_in_control_tools_context(self):
+        from common.android_agentic_workflow import configure_android_agent_control_tools
+        from common.tools import control_tools
+
+        perms = {"grant": "development", "actions": [{"action": "repo.clone"}]}
+
+        with patch("android.agentic_workflow.configure_control_tools") as mock_configure:
+            configure_android_agent_control_tools(
+                task_id="t-001",
+                agent_id="android-agent",
+                workspace="/tmp/ws",
+                permissions=perms,
+                compass_task_id="c-001",
+                callback_url="http://compass:8080/tasks/c-001/callbacks",
+                orchestrator_url="http://compass:8080",
+                user_text="implement screen",
+                wait_for_input_fn=lambda q: None,
+            )
+            mock_configure.assert_called_once()
+            kwargs = mock_configure.call_args[1]
+            ctx = kwargs.get("task_context", {})
+            self.assertEqual(ctx.get("permissions"), perms)
+            self.assertEqual(ctx.get("taskId"), "t-001")
+            self.assertEqual(ctx.get("agentId"), "android-agent")
+
+    def test_works_without_permissions(self):
+        from common.android_agentic_workflow import configure_android_agent_control_tools
+
+        with patch("android.agentic_workflow.configure_control_tools") as mock_configure:
+            configure_android_agent_control_tools(
+                task_id="t-002",
+                agent_id="android-agent",
+                workspace="/tmp/ws",
+                permissions=None,
+                compass_task_id="c-002",
+                callback_url="",
+                orchestrator_url="",
+                user_text="implement",
+                wait_for_input_fn=lambda q: None,
+            )
+            mock_configure.assert_called_once()
+            kwargs = mock_configure.call_args[1]
+            ctx = kwargs.get("task_context", {})
+            self.assertIsNone(ctx.get("permissions"))
 
 
 if __name__ == "__main__":

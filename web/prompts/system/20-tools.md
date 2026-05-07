@@ -42,6 +42,7 @@
 | `complete_current_task` | Mark this task as completed |
 | `fail_current_task` | Mark this task as failed with reason |
 | `request_user_input` | Ask the user a blocking question (escalate upward) |
+| `request_agent_clarification` | Ask Team Lead or the orchestrator for clarification before blocking on the user |
 | `get_task_context` | Get current task metadata and workspace path |
 | `get_agent_runtime_status` | Check current backend and readiness |
 

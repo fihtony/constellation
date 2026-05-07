@@ -33,6 +33,12 @@ _AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _AGENT_DIR not in sys.path:
     sys.path.insert(0, _AGENT_DIR)
 
+UI_DESIGN_AGENT_SKILL_PLAYBOOKS = [
+    "constellation-generic-agent-workflow",
+    "figma-rest-workflow",
+    "stitch-mcp-workflow",
+]
+
 import figma_client  # noqa: E402  (local to ui-design/)
 import stitch_client  # noqa: E402  (local to ui-design/)
 import provider_tools as _udt  # noqa: E402 — registers ui-design internal tools
@@ -51,6 +57,7 @@ _TASKS: dict[str, dict] = {}
 def _runtime_config_summary() -> dict:
     return {
         "runtime": summarize_runtime_configuration(),
+        "skillPlaybooks": list(UI_DESIGN_AGENT_SKILL_PLAYBOOKS),
         "provider": "figma+stitch",
     }
 
@@ -306,8 +313,10 @@ def _run_task_background(
                 "figma_list_pages", "figma_fetch_page", "figma_fetch_node",
                 "stitch_list_screens", "stitch_fetch_screen",
                 "stitch_find_screen_by_name", "stitch_fetch_image",
-                "report_progress", "complete_current_task", "fail_current_task",
-                "load_skill",
+                "todo_write", "report_progress",
+                "complete_current_task", "fail_current_task",
+                "get_task_context", "get_agent_runtime_status",
+                "load_skill", "list_skills",
             ],
             max_turns=15,
             timeout=300,

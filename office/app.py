@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.message_utils import extract_text
-from common.office_agentic_workflow import (
+from office.agentic_workflow import (
     OFFICE_AGENT_RUNTIME_TOOL_NAMES,
     build_office_agent_runtime_config,
     build_office_task_prompt,
