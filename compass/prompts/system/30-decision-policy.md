@@ -23,6 +23,8 @@ Analyze the full user request and classify it **before** dispatching:
 Before dispatching any `office.*` capability:
 1. Extract absolute file/directory paths from the user request.
 2. Call `validate_office_paths` to confirm paths are accessible and within allowed boundaries.
+   - Do not use local workspace file tools to probe user-provided host paths before this step.
+   - A host path that Compass cannot read directly is not, by itself, a failure condition.
    - If paths are missing or invalid, call `request_user_input` to ask for them.
 3. Confirm output mode with the user if not specified (`workspace` = safe read-only copy,
    `inplace` = edit files in place — requires explicit user confirmation).
@@ -44,3 +46,5 @@ Before dispatching any `office.*` capability:
 - Never expose raw stack traces to the user — summarize errors in plain language.
 - Never ask the user for clarification on development/engineering tasks unless absolutely
   necessary (e.g., the Jira ticket ID is genuinely ambiguous).
+- Never fail an office task just because Compass cannot open a user-provided `/Users/...` path
+   inside its own sandbox. Validate it and pass it through to the Office Agent launch flow.

@@ -377,6 +377,7 @@ def _run_workflow(task_id: str, message: dict) -> None:
             task=task_prompt,
             system_prompt=system_prompt,
             cwd=cwd,
+            extra_allow_roots=[workspace_path] if workspace_path else None,
             tools=OFFICE_AGENT_RUNTIME_TOOL_NAMES,
             max_turns=40,
             timeout=TASK_TIMEOUT,

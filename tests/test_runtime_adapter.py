@@ -140,6 +140,26 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(result["backend_used"], "connect-agent")
         self.assertIn("unreachable", result["summary"])
 
+    def test_connect_agent_setup_tools_includes_extra_allow_roots(self):
+        from common.runtime.connect_agent.adapter import ConnectAgentAdapter
+
+        adapter = ConnectAgentAdapter()
+        profile = adapter._policy_config.profiles["workspace-write"]
+
+        with tempfile.TemporaryDirectory() as sandbox_root, tempfile.TemporaryDirectory() as shared_workspace:
+            with patch("common.runtime.connect_agent.adapter.is_registered", return_value=True), \
+                 patch("common.tools.coding_tools.configure_coding_tools") as mocked_configure:
+                adapter._setup_tools(
+                    sandbox_root=sandbox_root,
+                    profile=profile,
+                    extra_allow_roots=[shared_workspace, sandbox_root],
+                )
+
+        allow_roots = mocked_configure.call_args.kwargs["allow_roots"]
+        self.assertIn(shared_workspace, allow_roots)
+        self.assertEqual(allow_roots.count(shared_workspace), 1)
+        self.assertNotIn(sandbox_root, allow_roots)
+
     def test_claude_code_fails_when_binary_missing(self):
         os.environ["AGENT_RUNTIME"] = "claude-code"
         with patch("common.runtime.claude_code.shutil.which", return_value=None):

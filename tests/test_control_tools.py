@@ -66,6 +66,43 @@ class DispatchAgentTaskTests(unittest.TestCase):
     def setUp(self):
         self.tool = get_tool("dispatch_agent_task")
 
+    def test_discover_capability_url_accepts_registry_list_shape(self):
+        payload = [
+            {
+                "agent_id": "office-agent",
+                "instances": [{"service_url": "http://office-agent:8060"}],
+            }
+        ]
+
+        class _R:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps(payload).encode()
+
+        with patch("common.tools.control_tools.urlopen", return_value=_R()):
+            url = _ctrl._discover_capability_url("office.data.analyze")
+
+        self.assertEqual(url, "http://office-agent:8060")
+
+    def test_discover_capability_url_falls_back_to_card_url(self):
+        payload = [
+            {
+                "agent_id": "office-agent",
+                "card_url": "http://office-agent:8060/.well-known/agent-card.json",
+                "instances": [],
+            }
+        ]
+
+        class _R:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps(payload).encode()
+
+        with patch("common.tools.control_tools.urlopen", return_value=_R()):
+            url = _ctrl._discover_capability_url("office.data.analyze")
+
+        self.assertEqual(url, "http://office-agent:8060")
+
     def test_missing_capability_returns_error(self):
         result = self.tool.execute({"task_text": "do something"})
         self.assertTrue(result["isError"])
