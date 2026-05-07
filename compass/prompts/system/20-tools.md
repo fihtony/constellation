@@ -21,3 +21,13 @@
 
 - `load_skill` — Load a skill playbook for guidance.
 - `list_skills` — List available skills in the catalog.
+
+## Local Workspace Evidence Tools
+
+- `read_local_file` — Read shared-workspace evidence, logs, and summaries.
+- `list_local_dir` — Inspect workspace folders before deciding what evidence is available.
+- `search_local_files` — Search the shared workspace for PR URLs, branch names, or failure context.
+
+## Compatibility Notes
+
+- Legacy aliases `read_file`, `glob`, and `grep` still exist, but prefer the `*_local_*` names when reasoning about shared-workspace evidence.

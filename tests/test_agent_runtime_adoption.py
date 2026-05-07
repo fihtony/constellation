@@ -60,12 +60,15 @@ class AgentRuntimeAdoptionTests(unittest.TestCase):
         for path in AGENT_FILES:
             with self.subTest(path=path):
                 content = Path(path).read_text(encoding="utf-8")
-                self.assertIn("from common.runtime.adapter import get_runtime", content)
+                self.assertRegex(
+                    content,
+                    r"from common\.runtime\.adapter import [^\n]*\bget_runtime\b",
+                )
 
     def test_common_env_uses_connect_agent_with_gpt5_mini_model(self):
         env = self._read_env_file(COMMON_ENV_PATH)
         self.assertEqual(env.get("AGENT_RUNTIME"), "connect-agent")
-        self.assertEqual(env.get("COPILOT_MODEL"), "gpt-5-mini")
+        self.assertEqual(env.get("AGENT_MODEL"), "gpt-5-mini")
 
     def test_per_task_agents_inherit_shared_runtime_defaults(self):
         for path in PER_TASK_REGISTRY_CONFIGS:
@@ -93,11 +96,18 @@ class AgentRuntimeAdoptionTests(unittest.TestCase):
             os.path.join(PROJECT_ROOT, "android", "app.py"),
             os.path.join(PROJECT_ROOT, "office", "app.py"),
         ]
+        # Agents may call configure_control_tools directly or via a named wrapper
+        # (e.g. configure_team_lead_control_tools or run_compass_workflow from common modules)
+        valid_patterns = ["configure_control_tools", "configure_team_lead_control_tools",
+                          "team_lead_agentic_workflow", "run_compass_workflow",
+                          "compass_agentic_workflow"]
         for path in all_agent_files:
             with self.subTest(path=path):
                 content = Path(path).read_text(encoding="utf-8")
-                self.assertIn("configure_control_tools", content,
-                              f"{path} must call configure_control_tools in its task workflow")
+                self.assertTrue(
+                    any(pattern in content for pattern in valid_patterns),
+                    f"{path} must call configure_control_tools (or a named wrapper) in its task workflow"
+                )
 
     def test_agents_use_manifest_system_prompt(self):
         all_agent_files = AGENT_FILES + [

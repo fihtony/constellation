@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
 import time
 import uuid
@@ -57,9 +58,29 @@ class Artifact:
 
 class ArtifactStore:
     def __init__(self, root=None):
-        self.root = root or os.environ.get("ARTIFACT_ROOT") or os.path.join(os.getcwd(), "artifacts")
-        os.makedirs(self.root, exist_ok=True)
+        desired_root = root or os.environ.get("ARTIFACT_ROOT") or os.path.join(os.getcwd(), "artifacts")
+        self.root = self._prepare_root(desired_root)
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _fallback_root_for(root):
+        root_name = os.path.basename(os.path.normpath(root)) or "artifacts"
+        return os.path.join(tempfile.gettempdir(), "constellation-artifacts", root_name)
+
+    @classmethod
+    def _prepare_root(cls, root):
+        try:
+            os.makedirs(root, exist_ok=True)
+            return root
+        except OSError as exc:
+            fallback_root = cls._fallback_root_for(root)
+            if os.path.realpath(fallback_root) == os.path.realpath(root):
+                raise
+            os.makedirs(fallback_root, exist_ok=True)
+            print(
+                f"[artifact-store] Falling back to writable artifact root {fallback_root}: {exc}"
+            )
+            return fallback_root
 
     def store(self, task_id, artifact_type, content, metadata=None):
         artifact = Artifact(task_id, artifact_type, content, metadata=metadata)

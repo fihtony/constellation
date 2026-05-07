@@ -38,10 +38,15 @@
 |------|---------|
 | `todo_write` | Write/update a structured task plan |
 | `load_skill` | Load a skill playbook for domain guidance |
-| `read_file` | Read files from the workspace |
-| `write_file` | Write files to the workspace |
-| `glob` | Find files by pattern |
-| `grep` | Search file contents |
+| `read_local_file` | Read files from the shared workspace |
+| `write_local_file` | Write plan and summary files inside the shared workspace |
+| `edit_local_file` | Update existing workspace files without rewriting the whole file |
+| `list_local_dir` | Inspect workspace contents before deciding the next step |
+| `search_local_files` | Search workspace logs, plans, and evidence |
+| `read_file` | Legacy alias for reading workspace files |
+| `write_file` | Legacy alias for writing workspace files |
+| `glob` | Legacy alias for file-pattern discovery |
+| `grep` | Legacy alias for content search |
 
 ## Tool Usage Rules
 
@@ -51,6 +56,7 @@
 - Use `report_progress` at the start of each major workflow step.
 - Use `jira_get_ticket` to gather context instead of dispatching to the Jira agent for simple fetches.
 - Use `request_user_input` only after exhausting all other sources of clarification.
+- Prefer the `*_local_*` tool names for shared-workspace artifacts and plans; keep legacy aliases only for compatibility with older prompts.
 
 ## Disabled / Forbidden Tool Patterns
 

@@ -6,4 +6,6 @@ systemOrder:
   - 40-validation-policy.md
   - 50-definition-of-done.md
   - 60-failure-handling.md
-includeSkills: false
+includeSkills: true
+skillNames:
+  - constellation-generic-agent-workflow

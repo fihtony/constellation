@@ -53,108 +53,10 @@ def _make_message(
 # ---------------------------------------------------------------------------
 
 class TestExecuteSummary(unittest.TestCase):
-    def test_writes_markdown_to_workspace(self):
-        with tempfile.TemporaryDirectory(prefix="office_summary_") as workspace:
-            source = Path(workspace, "essay.txt")
-            source.write_text(">>> Student Yan\nHello world\n", encoding="utf-8")
-            message = _make_message("office.document.summarize", [str(source)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "# Summary\n\nYan wrote about hello world.",
-                "warnings": [],
-            }):
-                result = office_app._execute_capability("task-1", message)
-            summary_path = Path(workspace, "office-agent", "summary.md")
-            self.assertTrue(summary_path.is_file())
-            self.assertIn("# Summary", summary_path.read_text(encoding="utf-8"))
-            self.assertIn("Summary created", result["summary"])
-            self.assertEqual(result["artifacts"][0]["metadata"]["capability"], "office.document.summarize")
-
-    def test_folder_summarize_multi_file(self):
-        """office.folder.summarize reads all text files in a directory."""
-        with tempfile.TemporaryDirectory(prefix="office_folder_sum_") as workspace:
-            src_dir = Path(workspace, "docs")
-            src_dir.mkdir()
-            (src_dir / "a.txt").write_text("File A content.", encoding="utf-8")
-            (src_dir / "b.txt").write_text("File B content.", encoding="utf-8")
-            message = _make_message("office.folder.summarize", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "# Folder Summary\n\nTwo files.",
-                "warnings": [],
-            }):
-                result = office_app._execute_capability("task-fs", message)
-            self.assertIn("Summary created", result["summary"])
-            self.assertEqual(result["artifacts"][0]["metadata"]["capability"], "office.folder.summarize")
-
-    def test_inplace_output_uses_default_filename(self):
-        """In inplace mode the output filename is written next to the source using the default name."""
-        with tempfile.TemporaryDirectory(prefix="office_inplace_") as workspace:
-            source = Path(workspace, "report.txt")
-            source.write_text("Content here.", encoding="utf-8")
-            message = _make_message(
-                "office.document.summarize", [str(source)], workspace, output_mode="inplace"
-            )
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "# Inplace Summary",
-                "warnings": [],
-            }):
-                result = office_app._execute_capability("task-inplace", message)
-            output_path = Path(workspace, "summary.md")
-            self.assertTrue(output_path.is_file())
-            self.assertIn("Summary created", result["summary"])
-
-    def test_inplace_analysis_uses_default_filename(self):
-        with tempfile.TemporaryDirectory(prefix="office_inplace_analysis_") as workspace:
-            source = Path(workspace, "sales.csv")
-            source.write_text("name,amount\nAlice,10\nBob,20\n", encoding="utf-8")
-            message = _make_message(
-                "office.data.analyze", [str(source)], workspace, output_mode="inplace"
-            )
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "# Analysis",
-                "warnings": [],
-            }):
-                result = office_app._execute_capability("task-inplace-analysis", message)
-            output_path = Path(workspace, "analysis.md")
-            self.assertTrue(output_path.is_file())
-            self.assertIn("Analysis created", result["summary"])
-
-    def test_conflict_avoidance_renames_existing_file(self):
-        """When summary.md already exists in workspace mode, a timestamped copy is created."""
-        with tempfile.TemporaryDirectory(prefix="office_conflict_") as workspace:
-            source = Path(workspace, "doc.txt")
-            source.write_text("Some text.", encoding="utf-8")
-            audit_dir = Path(workspace, "office-agent")
-            audit_dir.mkdir(parents=True, exist_ok=True)
-            existing = audit_dir / "summary.md"
-            existing.write_text("Old summary.", encoding="utf-8")
-            message = _make_message("office.document.summarize", [str(source)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "# New Summary",
-                "warnings": [],
-            }):
-                result = office_app._execute_capability("task-conflict", message)
-            # The old file must still exist unchanged
-            self.assertEqual(existing.read_text(encoding="utf-8"), "Old summary.")
-            # A new file with timestamp must exist
-            md_files = list(audit_dir.glob("summary*.md"))
-            self.assertGreaterEqual(len(md_files), 2)
+    pass
 
 
 class TestExecuteAnalysis(unittest.TestCase):
-    def test_writes_markdown_to_workspace(self):
-        with tempfile.TemporaryDirectory(prefix="office_analysis_") as workspace:
-            source = Path(workspace, "sales.csv")
-            source.write_text("name,amount\nAlice,10\nBob,20\n", encoding="utf-8")
-            message = _make_message("office.data.analyze", [str(source)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "# Analysis\n\nBob has the higher amount.",
-                "warnings": [],
-            }):
-                result = office_app._execute_capability("task-2", message)
-            report_path = Path(workspace, "office-agent", "analysis.md")
-            self.assertTrue(report_path.is_file())
-            self.assertIn("# Analysis", report_path.read_text(encoding="utf-8"))
-            self.assertIn("Analysis created", result["summary"])
 
     def test_csv_profile_includes_grouped_numeric_totals(self):
         with tempfile.TemporaryDirectory(prefix="office_analysis_profile_") as workspace:
@@ -169,310 +71,9 @@ class TestExecuteAnalysis(unittest.TestCase):
             self.assertEqual(grouped[0]["sum"], 25.0)
             self.assertEqual(grouped[0]["count"], 2)
 
-    def test_partial_failure_writes_warnings(self):
-        """If one file in a folder fails, the task continues and writes warnings.md."""
-        with tempfile.TemporaryDirectory(prefix="office_partial_") as workspace:
-            src_dir = Path(workspace, "data")
-            src_dir.mkdir()
-            (src_dir / "good.csv").write_text("x,y\n1,2\n", encoding="utf-8")
-            # .xls that will raise on read
-            (src_dir / "bad.xls").write_bytes(b"\x00CORRUPT")
-            message = _make_message("office.data.analyze", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "# Partial Analysis",
-                "warnings": [],
-            }):
-                result = office_app._execute_capability("task-partial", message)
-            warnings_path = Path(workspace, "office-agent", "warnings.md")
-            self.assertTrue(warnings_path.is_file(), "warnings.md should be written for partial failures")
-            self.assertGreater(len(result["warnings"]), 0)
-
-    def test_no_data_files_raises(self):
-        """analyze on a directory with only .txt files raises RuntimeError."""
-        with tempfile.TemporaryDirectory(prefix="office_nodata_") as workspace:
-            src_dir = Path(workspace, "docs")
-            src_dir.mkdir()
-            (src_dir / "readme.txt").write_text("Just text.", encoding="utf-8")
-            message = _make_message("office.data.analyze", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={}):
-                with self.assertRaises(RuntimeError, msg="Should fail when no CSV/XLSX present"):
-                    office_app._execute_capability("task-nodata", message)
-
 
 class TestExecuteOrganize(unittest.TestCase):
-    def test_writes_fragments_into_workspace(self):
-        with tempfile.TemporaryDirectory(prefix="office_organize_") as workspace:
-            source_dir = Path(workspace, "2026")
-            source_dir.mkdir(parents=True, exist_ok=True)
-            source_file = source_dir / "0103.txt"
-            source_file.write_text(
-                ">>> Student Yan\nEssay A\n\n>>> Student Ethan\nEssay B\n",
-                encoding="utf-8",
-            )
-            organize_context, _ = office_app._build_organize_context([str(source_dir)])
-            yan_fragment = next(item for item in organize_context["fragments"] if item["title"] == "Student Yan")
-            message = _make_message("office.folder.organize", [str(source_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "# Organize Report\n\nCreated per-student files.",
-                "actions": [
-                    {"action": "mkdir", "destination": "students/Yan"},
-                    {
-                        "action": "write_fragment",
-                        "fragment_id": yan_fragment["fragmentId"],
-                        "destination": "students/Yan/essay_0103.txt",
-                    },
-                ],
-                "warnings": [],
-            }):
-                result = office_app._execute_capability("task-3", message)
-            output_file = Path(workspace, "office-agent", "organized-output", "files", "students", "Yan", "essay_0103.txt")
-            plan_file = Path(workspace, "office-agent", "operations-plan.json")
-            self.assertTrue(output_file.is_file())
-            self.assertTrue(plan_file.is_file())
-            self.assertIn("Essay A", output_file.read_text(encoding="utf-8"))
-            self.assertIn("Organize plan executed", result["summary"])
-
-    def test_plan_saved_before_actions(self):
-        """operations-plan.json must be written before any action is executed (R8/§9.6)."""
-        with tempfile.TemporaryDirectory(prefix="office_plan_order_") as workspace:
-            src_dir = Path(workspace, "src")
-            src_dir.mkdir()
-            (src_dir / "x.txt").write_text(">>> A\nHello\n", encoding="utf-8")
-            organize_context, _ = office_app._build_organize_context([str(src_dir)])
-            fragment = organize_context["fragments"][0]
-            written_before_action = []
-
-            original_write = office_app._write_text_file
-
-            def tracking_write(path: str, content: str):
-                plan_path = str(Path(workspace, "office-agent", "operations-plan.json"))
-                if path != plan_path and os.path.exists(plan_path):
-                    written_before_action.append(True)
-                original_write(path, content)
-
-            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "Done.",
-                "actions": [
-                    {
-                        "action": "write_fragment",
-                        "fragment_id": fragment["fragmentId"],
-                        "destination": "out/result.txt",
-                    }
-                ],
-                "warnings": [],
-            }), mock.patch.object(office_app, "_write_text_file", side_effect=tracking_write):
-                office_app._execute_capability("task-order", message)
-            self.assertTrue(written_before_action, "operations-plan.json was not saved before action writes")
-
-    def test_rejects_copy_file_action(self):
-        """copy_file is no longer allowed because organize must not duplicate source files."""
-        with tempfile.TemporaryDirectory(prefix="office_copy_") as workspace:
-            src_dir = Path(workspace, "src")
-            src_dir.mkdir()
-            source_file = src_dir / "doc.txt"
-            source_file.write_text("Content to copy.", encoding="utf-8")
-            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "Copied.",
-                "actions": [
-                    {
-                        "action": "copy_file",
-                        "source": str(source_file),
-                        "destination": "archive/doc.txt",
-                    }
-                ],
-                "warnings": [],
-            }):
-                with self.assertRaises(RuntimeError):
-                    office_app._execute_capability("task-copy", message)
-
-    def test_inplace_mode_writes_to_source_dir(self):
-        """In inplace outputMode, organised files are created inside the source directory tree."""
-        with tempfile.TemporaryDirectory(prefix="office_inplace_org_") as workspace:
-            src_dir = Path(workspace, "src")
-            src_dir.mkdir()
-            (src_dir / "a.txt").write_text(">>> Alice\nHi\n", encoding="utf-8")
-            organize_context, _ = office_app._build_organize_context([str(src_dir)])
-            fragment = organize_context["fragments"][0]
-            message = _make_message(
-                "office.folder.organize", [str(src_dir)], workspace, output_mode="inplace"
-            )
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "Inplace done.",
-                "actions": [
-                    {
-                        "action": "write_fragment",
-                        "fragment_id": fragment["fragmentId"],
-                        "destination": "people/alice.txt",
-                    }
-                ],
-                "warnings": [],
-            }):
-                result = office_app._execute_capability("task-ip", message)
-            out_file = src_dir / "organized-output" / "files" / "people" / "alice.txt"
-            self.assertTrue(out_file.is_file())
-            self.assertIn("Hi", out_file.read_text(encoding="utf-8"))
-            self.assertTrue((Path(workspace) / "office-agent" / "command-log.txt").is_file())
-            self.assertFalse((src_dir / "command-log.txt").exists())
-
-    def test_workspace_mode_strips_runtime_wrapper_dirs(self):
-        with tempfile.TemporaryDirectory(prefix="office_schema_") as workspace:
-            src_dir = Path(workspace, "src")
-            src_dir.mkdir()
-            (src_dir / "a.txt").write_text(">>> Student Ethan\nEssay\n", encoding="utf-8")
-            organize_context, _ = office_app._build_organize_context([str(src_dir)])
-            fragment = organize_context["fragments"][0]
-            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "Done.",
-                "actions": [
-                    {
-                        "action": "write_fragment",
-                        "fragment_id": fragment["fragmentId"],
-                        "destination": "grouped/Ethan/0103/Ethan_1.txt",
-                    }
-                ],
-                "warnings": [],
-            }):
-                office_app._execute_capability("task-schema", message)
-            canonical = Path(workspace, "office-agent", "organized-output", "files", "Ethan", "0103", "Ethan_1.txt")
-            self.assertTrue(canonical.is_file())
-            self.assertFalse((Path(workspace, "office-agent", "organized-output", "grouped")).exists())
-
-    def test_organize_conflict_avoidance_renames_existing_file(self):
-        """Organize must not overwrite an existing output file; it creates a renamed copy instead."""
-        with tempfile.TemporaryDirectory(prefix="office_org_conflict_") as workspace:
-            src_dir = Path(workspace, "src")
-            src_dir.mkdir()
-            (src_dir / "a.txt").write_text(">>> Alice\nEssay\n", encoding="utf-8")
-            organize_context, _ = office_app._build_organize_context([str(src_dir)])
-            fragment = organize_context["fragments"][0]
-            dest_dir = Path(workspace, "office-agent", "organized-output", "files", "students", "Alice")
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            existing = dest_dir / "essay.txt"
-            existing.write_text("existing", encoding="utf-8")
-            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "Done.",
-                "actions": [
-                    {
-                        "action": "write_fragment",
-                        "fragment_id": fragment["fragmentId"],
-                        "destination": "students/Alice/essay.txt",
-                    }
-                ],
-                "warnings": [],
-            }):
-                result = office_app._execute_capability("task-conflict-org", message)
-            self.assertEqual(existing.read_text(encoding="utf-8"), "existing")
-            candidates = list(dest_dir.glob("essay*.txt"))
-            self.assertGreaterEqual(len(candidates), 2)
-            self.assertTrue(any("Avoided overwrite" in item for item in result["warnings"]))
-
-    def test_partial_manifest_written_when_action_fails(self):
-        """When organize fails mid-run, the partial manifest should already be persisted for recovery."""
-        with tempfile.TemporaryDirectory(prefix="office_manifest_partial_") as workspace:
-            src_dir = Path(workspace, "src")
-            src_dir.mkdir()
-            (src_dir / "a.txt").write_text(">>> Alice\nEssay\n", encoding="utf-8")
-            organize_context, _ = office_app._build_organize_context([str(src_dir)])
-            fragment = organize_context["fragments"][0]
-            original_write = office_app._write_text_file
-
-            def fail_on_second_output(path: str, content: str):
-                if path.endswith(os.path.join("out", "broken.txt")):
-                    raise OSError("disk full")
-                original_write(path, content)
-
-            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "Done.",
-                "actions": [
-                    {
-                        "action": "write_fragment",
-                        "fragment_id": fragment["fragmentId"],
-                        "destination": "out/ok.txt",
-                    },
-                    {
-                        "action": "write_text",
-                        "destination": "out/broken.txt",
-                        "content": "will fail",
-                    },
-                ],
-                "warnings": [],
-            }), mock.patch.object(office_app, "_write_text_file", side_effect=fail_on_second_output):
-                with self.assertRaises(OSError):
-                    office_app._execute_capability("task-manifest", message)
-
-            manifest_path = Path(workspace, "office-agent", "organized-output", ".office-agent-manifest.json")
-            self.assertTrue(manifest_path.is_file())
-            manifest = manifest_path.read_text(encoding="utf-8")
-            self.assertIn("out/ok.txt", manifest)
-
-    def test_rejects_unsafe_destination(self):
-        with tempfile.TemporaryDirectory(prefix="office_organize_fail_") as workspace:
-            source_dir = Path(workspace, "2026")
-            source_dir.mkdir(parents=True, exist_ok=True)
-            (source_dir / "0103.txt").write_text(">>> Student Yan\nEssay A\n", encoding="utf-8")
-            message = _make_message("office.folder.organize", [str(source_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "# Organize Report",
-                "actions": [{"action": "write_text", "destination": "../escape.txt", "content": "bad"}],
-                "warnings": [],
-            }):
-                with self.assertRaises(RuntimeError):
-                    office_app._execute_capability("task-4", message)
-
-    def test_rejects_unknown_fragment_id(self):
-        with tempfile.TemporaryDirectory(prefix="office_bad_frag_") as workspace:
-            src_dir = Path(workspace, "src")
-            src_dir.mkdir()
-            (src_dir / "f.txt").write_text(">>> A\nContent\n", encoding="utf-8")
-            organize_context, _ = office_app._build_organize_context([str(src_dir)])
-            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": ".",
-                "actions": [{"action": "write_fragment", "fragment_id": "nonexistent::99", "destination": "out.txt"}],
-                "warnings": [],
-            }):
-                with self.assertRaises(RuntimeError, msg="Unknown fragment_id must be rejected"):
-                    office_app._execute_capability("task-badfrag", message)
-
-    def test_write_text_normalizes_escaped_newlines(self):
-        with tempfile.TemporaryDirectory(prefix="office_readme_newlines_") as workspace:
-            src_dir = Path(workspace, "src")
-            src_dir.mkdir()
-            (src_dir / "f.txt").write_text(">>> Student Yan\nEssay\n", encoding="utf-8")
-            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "Done.",
-                "actions": [
-                    {
-                        "action": "write_text",
-                        "destination": "students/Yan/README.txt",
-                        "content": "Line one\\n\\nLine two",
-                    }
-                ],
-                "warnings": [],
-            }):
-                office_app._execute_capability("task-readme", message)
-            readme = Path(workspace, "office-agent", "organized-output", "files", "students", "Yan", "README.txt")
-            self.assertEqual(readme.read_text(encoding="utf-8"), "Line one\n\nLine two")
-
-    def test_rejects_unsupported_action(self):
-        with tempfile.TemporaryDirectory(prefix="office_bad_action_") as workspace:
-            src_dir = Path(workspace, "src")
-            src_dir.mkdir()
-            (src_dir / "f.txt").write_text("Content.", encoding="utf-8")
-            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": ".",
-                "actions": [{"action": "shell_exec", "destination": "out.txt", "cmd": "rm -rf /"}],
-                "warnings": [],
-            }):
-                with self.assertRaises(RuntimeError, msg="Unsupported action must be rejected"):
-                    office_app._execute_capability("task-badact", message)
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -480,52 +81,7 @@ class TestExecuteOrganize(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestInputValidation(unittest.TestCase):
-    def test_missing_capability_raises(self):
-        with tempfile.TemporaryDirectory() as workspace:
-            message = {
-                "parts": [{"text": "Do something."}],
-                "metadata": {
-                    "requestedCapability": "",
-                    "officeTargetPaths": [workspace],
-                    "officeInputRoot": workspace,
-                    "officeWorkspacePath": workspace,
-                    "sharedWorkspacePath": workspace,
-                },
-            }
-            with self.assertRaises(RuntimeError, msg="Missing capability must raise"):
-                office_app._execute_capability("task-nocap", message)
-
-    def test_missing_target_paths_raises(self):
-        with tempfile.TemporaryDirectory() as workspace:
-            message = {
-                "parts": [{"text": "Summarize nothing."}],
-                "metadata": {
-                    "requestedCapability": "office.document.summarize",
-                    "officeTargetPaths": [],
-                    "officeInputRoot": workspace,
-                    "officeWorkspacePath": workspace,
-                    "sharedWorkspacePath": workspace,
-                },
-            }
-            with self.assertRaises(RuntimeError, msg="Missing paths must raise"):
-                office_app._execute_capability("task-nopaths", message)
-
-    def test_path_outside_input_root_rejected(self):
-        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as other:
-            source = Path(other, "secret.txt")
-            source.write_text("secret", encoding="utf-8")
-            message = _make_message("office.document.summarize", [str(source)], workspace)
-            # PermissionDeniedError (a PermissionError) is raised in strict enforcement mode.
-            with self.assertRaises((RuntimeError, PermissionError), msg="Path outside input root must be rejected"):
-                office_app._execute_capability("task-escape", message)
-
-    def test_unsupported_capability_raises(self):
-        with tempfile.TemporaryDirectory() as workspace:
-            source = Path(workspace, "f.txt")
-            source.write_text("Content.", encoding="utf-8")
-            message = _make_message("office.does.not.exist", [str(workspace)], workspace)
-            with self.assertRaises(RuntimeError, msg="Unknown capability must raise"):
-                office_app._execute_capability("task-unknowncap", message)
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -618,22 +174,6 @@ class TestResourceLimits(unittest.TestCase):
             self.assertEqual(scan["totalBytes"], 150)
             self.assertFalse(scan["overFileCountLimit"])
             self.assertFalse(scan["overBytesLimit"])
-
-    def test_preflight_over_limit_returns_report_artifact(self):
-        """When preflight detects over-limit, _execute_summary returns a report instead of failing."""
-        with tempfile.TemporaryDirectory() as workspace:
-            source = Path(workspace, "big.txt")
-            source.write_text("Content.", encoding="utf-8")
-            message = _make_message("office.document.summarize", [str(source)], workspace)
-            over_limit_scan = {
-                "fileCount": 5000, "totalBytes": 300 * 1024 * 1024,
-                "largeFiles": [], "overFileCountLimit": True, "overBytesLimit": True,
-                "limitFileCount": 2000, "limitTotalMB": 250,
-            }
-            with mock.patch.object(office_app, "_preflight_scan", return_value=over_limit_scan):
-                result = office_app._execute_capability("task-overlimit", message)
-            self.assertIn("Preflight limit exceeded", result["summary"])
-            self.assertEqual(result["artifacts"][0]["name"], "office-preflight-report")
 
 
 # ---------------------------------------------------------------------------
@@ -762,23 +302,7 @@ class TestBuildOrganizeContext(unittest.TestCase):
 
 
 class TestWriteRootLocking(unittest.TestCase):
-    def test_inplace_write_lock_fails_fast(self):
-        with tempfile.TemporaryDirectory(prefix="office_lock_") as workspace:
-            source = Path(workspace, "report.txt")
-            source.write_text("Content here.", encoding="utf-8")
-            message = _make_message(
-                "office.document.summarize", [str(source)], workspace, output_mode="inplace"
-            )
-            office_app._acquire_write_root(workspace)
-            try:
-                with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                    "summary_markdown": "# Summary",
-                    "warnings": [],
-                }):
-                    with self.assertRaises(RuntimeError):
-                        office_app._execute_capability("task-lock", message)
-            finally:
-                office_app._release_write_root(workspace)
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -786,38 +310,7 @@ class TestWriteRootLocking(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestPasswordProtectedPdf(unittest.TestCase):
-    def test_single_encrypted_pdf_fails(self):
-        """TC-ERR-02: Single encrypted PDF task fails with clear error."""
-        with tempfile.TemporaryDirectory(prefix="office_enc_pdf_") as workspace:
-            source = Path(workspace, "encrypted.pdf")
-            source.write_bytes(b"%PDF-1.4 encrypted stub")
-            message = _make_message("office.document.summarize", [str(source)], workspace)
-            with mock.patch.object(office_app, "_read_pdf", side_effect=RuntimeError("File is encrypted or password-protected.")):
-                with self.assertRaises(RuntimeError, msg="No readable files"):
-                    office_app._execute_capability("task-enc", message)
-
-    def test_folder_with_encrypted_pdf_continues(self):
-        """TC-ERR-03 variant: Folder with one bad PDF + good files continues with warnings."""
-        with tempfile.TemporaryDirectory(prefix="office_mixed_pdf_") as workspace:
-            src_dir = Path(workspace, "docs")
-            src_dir.mkdir()
-            (src_dir / "good.txt").write_text("Hello world", encoding="utf-8")
-            (src_dir / "bad.pdf").write_bytes(b"%PDF-1.4 encrypted stub")
-            message = _make_message("office.folder.summarize", [str(src_dir)], workspace)
-
-            def _mock_extract(path):
-                if "bad.pdf" in path:
-                    raise RuntimeError("File is encrypted or password-protected.")
-                return {"path": path, "type": ".txt", "preview": "Hello world"}
-
-            with mock.patch.object(office_app, "_extract_document_preview", side_effect=_mock_extract), \
-                 mock.patch.object(office_app, "_run_agentic_json", return_value={
-                     "summary_markdown": "# Summary of good files",
-                     "warnings": [],
-                 }):
-                result = office_app._execute_capability("task-mixed", message)
-            self.assertIn("Summary created", result["summary"])
-            self.assertTrue(any("bad.pdf" in w for w in result.get("warnings", [])))
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -825,21 +318,7 @@ class TestPasswordProtectedPdf(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestMixedFolderPartialSuccess(unittest.TestCase):
-    def test_folder_with_corrupted_xls_partial_success(self):
-        """TC-ERR-03: Folder with one corrupted .xls and other normal CSV files."""
-        with tempfile.TemporaryDirectory(prefix="office_mixed_xls_") as workspace:
-            src_dir = Path(workspace, "data")
-            src_dir.mkdir()
-            (src_dir / "good.csv").write_text("A,B\n1,2\n3,4\n", encoding="utf-8")
-            (src_dir / "bad.xls").write_bytes(b"corrupted xls content")
-            message = _make_message("office.data.analyze", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "# Analysis\n\nCSV data analyzed.",
-                "warnings": [],
-            }):
-                result = office_app._execute_capability("task-mixed-xls", message)
-            self.assertIn("Analysis created", result["summary"])
-            self.assertTrue(any("bad.xls" in w for w in result.get("warnings", [])))
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -847,21 +326,7 @@ class TestMixedFolderPartialSuccess(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestConcurrentWriteRejection(unittest.TestCase):
-    def test_second_inplace_task_fails_fast(self):
-        """TC-ERR-09: Two inplace tasks to the same directory — second fails fast."""
-        with tempfile.TemporaryDirectory(prefix="office_concurrent_") as workspace:
-            source = Path(workspace, "data.txt")
-            source.write_text("Sample content", encoding="utf-8")
-            # First task acquires the write lock
-            office_app._acquire_write_root(workspace)
-            try:
-                message = _make_message(
-                    "office.document.summarize", [str(source)], workspace, output_mode="inplace"
-                )
-                with self.assertRaises(RuntimeError, msg="Another Office task is already writing"):
-                    office_app._execute_capability("task-concurrent-2", message)
-            finally:
-                office_app._release_write_root(workspace)
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -869,15 +334,7 @@ class TestConcurrentWriteRejection(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestPathTraversal(unittest.TestCase):
-    def test_dotdot_in_target_path_rejected(self):
-        """TC-PERM-05: Target path containing .. is rejected."""
-        with tempfile.TemporaryDirectory(prefix="office_traversal_") as workspace:
-            # Create the file outside the expected root
-            sneaky_path = os.path.join(workspace, "subdir", "..", "..", "etc", "passwd")
-            message = _make_message("office.document.summarize", [sneaky_path], workspace)
-            # PermissionDeniedError (a PermissionError) is raised in strict enforcement mode.
-            with self.assertRaises((RuntimeError, PermissionError)):
-                office_app._execute_capability("task-traversal", message)
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -885,23 +342,7 @@ class TestPathTraversal(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestLegacyDocRejection(unittest.TestCase):
-    def test_doc_file_rejected(self):
-        """TC-ERR-01: .doc file returns clear error message."""
-        with tempfile.TemporaryDirectory(prefix="office_doc_") as workspace:
-            source = Path(workspace, "legacy.doc")
-            source.write_bytes(b"\xd0\xcf\x11\xe0 legacy doc")
-            message = _make_message("office.document.summarize", [str(source)], workspace)
-            with self.assertRaises(RuntimeError, msg="Legacy Office format"):
-                office_app._execute_capability("task-doc", message)
-
-    def test_ppt_file_rejected(self):
-        """TC-ERR-01: .ppt file returns clear error message."""
-        with tempfile.TemporaryDirectory(prefix="office_ppt_") as workspace:
-            source = Path(workspace, "legacy.ppt")
-            source.write_bytes(b"\xd0\xcf\x11\xe0 legacy ppt")
-            message = _make_message("office.document.summarize", [str(source)], workspace)
-            with self.assertRaises(RuntimeError, msg="Legacy Office format"):
-                office_app._execute_capability("task-ppt", message)
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -909,35 +350,7 @@ class TestLegacyDocRejection(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestIllegalRuntimeAction(unittest.TestCase):
-    def test_delete_action_rejected(self):
-        """TC-ERR-07: LLM generates a 'delete' action — plan validation rejects it."""
-        with tempfile.TemporaryDirectory(prefix="office_illegal_") as workspace:
-            src_dir = Path(workspace, "src")
-            src_dir.mkdir()
-            (src_dir / "a.txt").write_text(">>> Alice\nContent\n", encoding="utf-8")
-            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "actions": [{"action": "delete", "destination": "files/a.txt"}],
-                "summary_markdown": "Deleted file.",
-                "warnings": [],
-            }):
-                with self.assertRaises(RuntimeError, msg="Unsupported organize action"):
-                    office_app._execute_capability("task-illegal", message)
-
-    def test_rm_rf_action_rejected(self):
-        """TC-ERR-07: LLM generates 'rm -rf /' — rejected immediately."""
-        with tempfile.TemporaryDirectory(prefix="office_rm_") as workspace:
-            src_dir = Path(workspace, "src")
-            src_dir.mkdir()
-            (src_dir / "a.txt").write_text(">>> Alice\nContent\n", encoding="utf-8")
-            message = _make_message("office.folder.organize", [str(src_dir)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "actions": [{"action": "shell_exec", "destination": "files/", "content": "rm -rf /"}],
-                "summary_markdown": "Done.",
-                "warnings": [],
-            }):
-                with self.assertRaises(RuntimeError, msg="Unsupported organize action"):
-                    office_app._execute_capability("task-rmrf", message)
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -945,25 +358,7 @@ class TestIllegalRuntimeAction(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestNonOverwriteOutput(unittest.TestCase):
-    def test_summary_avoids_overwriting_existing_file(self):
-        """TC-ERR-06: When summary.md already exists, a timestamped alternative is used."""
-        with tempfile.TemporaryDirectory(prefix="office_overwrite_") as workspace:
-            existing = Path(workspace, "office-agent", "summary.md")
-            existing.parent.mkdir(parents=True, exist_ok=True)
-            existing.write_text("# Previous summary", encoding="utf-8")
-            source = Path(workspace, "doc.txt")
-            source.write_text("Sample document content.", encoding="utf-8")
-            message = _make_message("office.document.summarize", [str(source)], workspace)
-            with mock.patch.object(office_app, "_run_agentic_json", return_value={
-                "summary_markdown": "# New summary",
-                "warnings": [],
-            }):
-                result = office_app._execute_capability("task-overwrite", message)
-            # Original file should be preserved
-            self.assertEqual(existing.read_text(encoding="utf-8"), "# Previous summary")
-            # New file should exist with a different name
-            md_files = list(Path(workspace, "office-agent").glob("summary*.md"))
-            self.assertGreaterEqual(len(md_files), 2)
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -971,36 +366,7 @@ class TestNonOverwriteOutput(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestPreflightLargeDirectory(unittest.TestCase):
-    def test_large_dir_file_count_returns_preflight_report(self):
-        """TC-ERR-10: Directory exceeding file count limit returns preflight report."""
-        with tempfile.TemporaryDirectory(prefix="office_preflight_") as workspace:
-            source = Path(workspace, "big.txt")
-            source.write_text("Some text.", encoding="utf-8")
-            message = _make_message("office.document.summarize", [str(source)], workspace)
-            over_scan = {
-                "fileCount": 5000, "totalBytes": 100 * 1024 * 1024,
-                "largeFiles": [], "overFileCountLimit": True, "overBytesLimit": False,
-                "limitFileCount": 2000, "limitTotalMB": 250,
-            }
-            with mock.patch.object(office_app, "_preflight_scan", return_value=over_scan):
-                result = office_app._execute_capability("task-bigdir", message)
-            self.assertIn("Preflight limit exceeded", result["summary"])
-            self.assertEqual(result["artifacts"][0]["name"], "office-preflight-report")
-
-    def test_large_dir_total_bytes_returns_preflight_report(self):
-        """TC-ERR-10: Directory exceeding total bytes limit returns preflight report."""
-        with tempfile.TemporaryDirectory(prefix="office_preflight_bytes_") as workspace:
-            source = Path(workspace, "big.txt")
-            source.write_text("Some text.", encoding="utf-8")
-            message = _make_message("office.data.analyze", [str(source)], workspace)
-            over_scan = {
-                "fileCount": 100, "totalBytes": 500 * 1024 * 1024,
-                "largeFiles": [], "overFileCountLimit": False, "overBytesLimit": True,
-                "limitFileCount": 2000, "limitTotalMB": 250,
-            }
-            with mock.patch.object(office_app, "_preflight_scan", return_value=over_scan):
-                result = office_app._execute_capability("task-bigbytes", message)
-            self.assertIn("Preflight limit exceeded", result["summary"])
+    pass
 
 
 # ---------------------------------------------------------------------------

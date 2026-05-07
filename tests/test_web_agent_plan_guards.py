@@ -263,203 +263,111 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
 
         self.assertTrue(team_lead_app._should_prioritize_stack_question(analysis, ctx))
 
-    def test_team_lead_same_task_resumes_and_carries_stack_constraints_into_dev_launch(self):
-        class StopBeforeDevLaunch(RuntimeError):
-            pass
+    # ------------------------------------------------------------------
+    # New agentic _run_workflow tests (LLM-driven, mock get_runtime)
+    # ------------------------------------------------------------------
 
-        with tempfile.TemporaryDirectory(prefix="team_lead_resume_") as workspace:
+    def test_team_lead_run_workflow_completes_on_success(self):
+        """_run_workflow transitions task to COMPLETED when run_agentic succeeds."""
+        from common.runtime.adapter import AgenticResult
+
+        with tempfile.TemporaryDirectory(prefix="tl_success_") as workspace:
             task = team_lead_app.task_store.create()
             ctx = team_lead_app._TaskContext()
             ctx.compass_task_id = "compass-task-1"
             ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
             ctx.compass_url = "http://compass.local"
             ctx.shared_workspace_path = workspace
-            ctx.user_text = "Implement https://example.atlassian.net/browse/PROJ-2"
+            ctx.user_text = "Implement login screen for PROJ-2."
 
-            analyze_calls: list[str] = []
-            agent_calls: list[tuple[str, str]] = []
-            captured_dev_message: dict = {}
+            mock_result = AgenticResult(
+                success=True,
+                summary="Feature implemented and PR created.",
+                artifacts=[],
+                turns_used=15,
+                tool_calls=20,
+            )
+            mock_runtime = mock.MagicMock()
+            mock_runtime.run_agentic.return_value = mock_result
 
-            def fake_analyze(user_text: str, additional_info: str = "") -> dict:
-                analyze_calls.append(additional_info)
-                if len(analyze_calls) == 1:
-                    return {
-                        "task_type": "feature",
-                        "platform": "web",
-                        "needs_jira_fetch": True,
-                        "jira_ticket_key": "PROJ-2",
-                        "needs_design_context": False,
-                        "missing_info": [],
-                        "question_for_user": None,
-                        "summary": "Implement PROJ-2.",
-                    }
-                if len(analyze_calls) == 2:
-                    return {
-                        "task_type": "feature",
-                        "platform": "web",
-                        "needs_jira_fetch": True,
-                        "jira_ticket_key": "PROJ-2",
-                        "needs_design_context": True,
-                        "design_url": "https://www.figma.com/design/abc123/Example-App",
-                        "design_type": "figma",
-                        "design_page_name": "Practice Quiz",
-                        "target_repo_url": "",
-                        "missing_info": [],
-                        "question_for_user": None,
-                        "summary": "Implement PROJ-2 from Figma.",
-                    }
-                if len(analyze_calls) == 3:
-                    return {
-                        "task_type": "feature",
-                        "platform": "web",
-                        "needs_jira_fetch": True,
-                        "jira_ticket_key": "PROJ-2",
-                        "needs_design_context": True,
-                        "design_url": "https://www.figma.com/design/abc123/Example-App",
-                        "design_type": "figma",
-                        "design_page_name": "Practice Quiz",
-                        "target_repo_url": "",
-                        "missing_info": [],
-                        "question_for_user": None,
-                        "summary": "Implement PROJ-2 from Figma.",
-                    }
+            with mock.patch.object(team_lead_app, "get_runtime", return_value=mock_runtime), \
+                    mock.patch.object(team_lead_app, "_notify_compass") as notify_mock, \
+                    mock.patch.object(team_lead_app, "_report_progress"):
+                team_lead_app._run_workflow(task.task_id, ctx)
 
-                self.assertIn("python 3.12", additional_info.lower())
-                self.assertIn("flask", additional_info.lower())
-                return {
-                    "task_type": "feature",
-                    "platform": "web",
-                    "needs_jira_fetch": True,
-                    "jira_ticket_key": "PROJ-2",
-                    "needs_design_context": True,
-                    "design_url": "https://www.figma.com/design/abc123/Example-App",
-                    "design_type": "figma",
-                    "design_page_name": "Practice Quiz",
-                    "target_repo_url": "",
-                    "missing_info": [],
-                    "question_for_user": None,
-                    "summary": "Implement PROJ-2 from Figma in Flask.",
-                }
+            current = team_lead_app.task_store.get(task.task_id)
+            self.assertEqual(current.state, "TASK_STATE_COMPLETED")
+            self.assertIn("Feature implemented", current.status_message)
+            mock_runtime.run_agentic.assert_called_once()
+            notify_mock.assert_called()
 
-            def fake_plan_information_gathering(_user_text: str, analysis: dict, workflow_ctx, **_kwargs) -> dict:
-                if analysis.get("needs_jira_fetch") and workflow_ctx.jira_info is None:
-                    return {
-                        "pending_tasks": ["Fetch Jira ticket PROJ-2"],
-                        "actions": [
-                            {
-                                "action": "fetch_agent_context",
-                                "capability": "jira.ticket.fetch",
-                                "message": "Fetch ticket PROJ-2",
-                                "reason": "Need the Jira ticket details before planning.",
-                            }
-                        ],
-                    }
+    def test_team_lead_run_workflow_fails_on_runtime_failure(self):
+        """_run_workflow transitions task to FAILED when run_agentic returns failure."""
+        from common.runtime.adapter import AgenticResult
 
-                if analysis.get("needs_design_context") and workflow_ctx.design_info is None:
-                    capability, message_text, page_name = team_lead_app._build_design_fetch_request(analysis)
-                    pending_text = f"Fetch design from {analysis['design_url']}"
-                    if page_name:
-                        pending_text += f" page: {page_name}"
-                    return {
-                        "pending_tasks": [pending_text],
-                        "actions": [
-                            {
-                                "action": "fetch_agent_context",
-                                "capability": capability,
-                                "message": message_text,
-                                "reason": "Need the design specification before planning.",
-                            }
-                        ],
-                    }
+        with tempfile.TemporaryDirectory(prefix="tl_fail_") as workspace:
+            task = team_lead_app.task_store.create()
+            ctx = team_lead_app._TaskContext()
+            ctx.compass_task_id = "compass-task-1"
+            ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
+            ctx.compass_url = "http://compass.local"
+            ctx.shared_workspace_path = workspace
+            ctx.user_text = "Implement PROJ-3."
 
-                if analysis.get("question_for_user"):
-                    return {
-                        "pending_tasks": [f"Ask user: {analysis['question_for_user']}"],
-                        "actions": [
-                            {
-                                "action": "ask_user",
-                                "question": analysis["question_for_user"],
-                                "reason": "Need user clarification before planning.",
-                            }
-                        ],
-                    }
+            mock_result = AgenticResult(
+                success=False,
+                summary="Could not determine repository URL.",
+                artifacts=[],
+                turns_used=8,
+                tool_calls=5,
+            )
+            mock_runtime = mock.MagicMock()
+            mock_runtime.run_agentic.return_value = mock_result
 
-                return {
-                    "pending_tasks": ["Proceed to implementation planning"],
-                    "actions": [
-                        {
-                            "action": "proceed_to_plan",
-                            "reason": "All critical implementation context is available.",
-                        }
-                    ],
-                }
+            with mock.patch.object(team_lead_app, "get_runtime", return_value=mock_runtime), \
+                    mock.patch.object(team_lead_app, "_notify_compass") as notify_mock, \
+                    mock.patch.object(team_lead_app, "_report_progress"):
+                team_lead_app._run_workflow(task.task_id, ctx)
 
-            def fake_call_sync_agent(capability: str, message_text: str, *_args, **_kwargs) -> dict:
-                agent_calls.append((capability, message_text))
-                if capability == "jira.ticket.fetch":
-                    return {
-                        "artifacts": [
-                            {
-                                "parts": [
-                                    {
-                                        "text": "Ticket content with Figma https://www.figma.com/design/abc123/Example-App and page Practice Quiz."
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                if capability == "figma.page.fetch":
-                    return {"artifacts": [{"parts": [{"text": "Practice Quiz UI spec"}]}]}
-                raise AssertionError(f"Unexpected capability: {capability}")
+            current = team_lead_app.task_store.get(task.task_id)
+            self.assertEqual(current.state, "TASK_STATE_FAILED")
+            notify_mock.assert_called()
 
-            def fake_create_plan(*_args, **_kwargs) -> dict:
-                return {
-                    "platform": "web",
-                    "dev_capability": "web.task.execute",
-                    "target_repo_url": "",
-                    "dev_instruction": "Implement the requested flow in Flask.",
-                    "acceptance_criteria": ["Practice Quiz screen matches the design."],
-                    "requires_tests": True,
-                    "test_requirements": "Add integration coverage for the Practice Quiz screen.",
-                    "screenshot_requirements": None,
-                }
+    def test_team_lead_run_workflow_handles_input_required(self):
+        """_run_workflow blocks on INPUT_REQUIRED and resumes when user replies."""
+        from common.runtime.adapter import AgenticResult
+        from common.tools import control_tools as ct
 
-            def fake_acquire_dev_agent(*_args, **_kwargs):
-                return (
-                    {"agent_id": "web-agent", "execution_mode": "per-task"},
-                    {"instance_id": "web-1", "status": "idle", "service_url": "http://web-agent:8050"},
-                    "http://web-agent:8050",
+        with tempfile.TemporaryDirectory(prefix="tl_input_") as workspace:
+            task = team_lead_app.task_store.create()
+            ctx = team_lead_app._TaskContext()
+            ctx.compass_task_id = "compass-task-1"
+            ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
+            ctx.compass_url = "http://compass.local"
+            ctx.shared_workspace_path = workspace
+            ctx.user_text = "Implement PROJ-2."
+
+            user_reply_received: list[str] = []
+
+            def mock_run_agentic(**kwargs):
+                wait_fn = ct._wait_for_input_fn
+                if wait_fn:
+                    reply = wait_fn("Please confirm the tech stack.")
+                    user_reply_received.append(reply or "")
+                return AgenticResult(
+                    success=True,
+                    summary="Completed after user confirmed stack.",
+                    artifacts=[],
+                    turns_used=20,
+                    tool_calls=15,
                 )
 
-            def fake_a2a_send(agent_url: str, message: dict, context_id: str | None = None) -> dict:
-                captured_dev_message["agent_url"] = agent_url
-                captured_dev_message["context_id"] = context_id
-                captured_dev_message["message"] = message
-                raise StopBeforeDevLaunch("stop before launching the real web agent")
+            mock_runtime = mock.MagicMock()
+            mock_runtime.run_agentic.side_effect = mock_run_agentic
 
-            with mock.patch.object(team_lead_app, "_analyze_task", side_effect=fake_analyze), mock.patch.object(
-                team_lead_app,
-                "_call_sync_agent",
-                side_effect=fake_call_sync_agent,
-            ), mock.patch.object(
-                team_lead_app,
-                "_plan_information_gathering",
-                side_effect=fake_plan_information_gathering,
-            ), mock.patch.object(team_lead_app, "_create_plan", side_effect=fake_create_plan), mock.patch.object(
-                team_lead_app,
-                "_acquire_dev_agent",
-                side_effect=fake_acquire_dev_agent,
-            ), mock.patch.object(team_lead_app, "_a2a_send", side_effect=fake_a2a_send), mock.patch.object(
-                team_lead_app,
-                "_notify_compass",
-            ), mock.patch.object(team_lead_app, "_report_progress"), mock.patch.object(
-                team_lead_app,
-                "_generate_summary",
-                return_value="workflow intercepted for test",
-            ), mock.patch.object(team_lead_app.registry, "mark_instance_busy"), mock.patch.object(
-                team_lead_app.registry,
-                "mark_instance_idle",
-            ):
+            with mock.patch.object(team_lead_app, "get_runtime", return_value=mock_runtime), \
+                    mock.patch.object(team_lead_app, "_notify_compass"), \
+                    mock.patch.object(team_lead_app, "_report_progress"):
                 worker = threading.Thread(
                     target=team_lead_app._run_workflow,
                     args=(task.task_id, ctx),
@@ -477,134 +385,6 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                     self.fail("Team Lead never entered TASK_STATE_INPUT_REQUIRED")
 
                 current = team_lead_app.task_store.get(task.task_id)
-                self.assertIsNotNone(current)
-                self.assertIn("tech stack", current.status_message.lower())
-                self.assertIn(
-                    ("figma.page.fetch", "Fetch design from https://www.figma.com/design/abc123/Example-App page: Practice Quiz"),
-                    agent_calls,
-                )
-
-                with team_lead_app._INPUT_EVENTS_LOCK:
-                    entry = team_lead_app._INPUT_EVENTS.get(task.task_id)
-                    self.assertIsNotNone(entry)
-                    entry["info"] = "Use Python 3.12 and Flask."
-                    entry["event"].set()
-
-                worker.join(timeout=5)
-
-            metadata = captured_dev_message["message"]["metadata"]
-            self.assertEqual(metadata["techStackConstraints"]["language"], "python")
-            self.assertEqual(metadata["techStackConstraints"]["python_version"], "3.12")
-            self.assertEqual(metadata["techStackConstraints"]["backend_framework"], "flask")
-
-            history_states = [entry["state"] for entry in team_lead_app.task_store.get(task.task_id).history]
-            self.assertIn("TASK_STATE_INPUT_REQUIRED", history_states)
-            self.assertIn("EXECUTING", history_states)
-
-    def test_team_lead_falls_back_to_user_question_when_fetch_actions_make_no_progress(self):
-        with tempfile.TemporaryDirectory(prefix="team_lead_no_progress_") as workspace:
-            task = team_lead_app.task_store.create()
-            ctx = team_lead_app._TaskContext()
-            ctx.compass_task_id = "compass-task-1"
-            ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
-            ctx.compass_url = "http://compass.local"
-            ctx.shared_workspace_path = workspace
-            ctx.user_text = "Implement PROJ-2."
-            ctx.original_message = {"metadata": {"stopBeforeDevDispatch": True}}
-            ctx.jira_info = {
-                "ticket_key": "PROJ-2",
-                "content": "Existing Jira ticket content.",
-                "request": "Fetch ticket PROJ-2",
-            }
-
-            def fake_analyze(_user_text: str, additional_info: str = "") -> dict:
-                if not additional_info:
-                    return {
-                        "task_type": "feature",
-                        "platform": "web",
-                        "needs_jira_fetch": True,
-                        "jira_ticket_key": "PROJ-2",
-                        "needs_design_context": False,
-                        "missing_info": ["confirmed web tech stack"],
-                        "question_for_user": "Please confirm the web tech stack.",
-                        "summary": "Implement PROJ-2.",
-                    }
-                return {
-                    "task_type": "feature",
-                    "platform": "web",
-                    "needs_jira_fetch": True,
-                    "jira_ticket_key": "PROJ-2",
-                    "needs_design_context": False,
-                    "missing_info": [],
-                    "question_for_user": None,
-                    "summary": "Implement PROJ-2 in Flask.",
-                }
-
-            def fake_plan_information_gathering(_user_text: str, _analysis: dict, _workflow_ctx, **_kwargs) -> dict:
-                return {
-                    "pending_tasks": [
-                        "Refresh Jira ticket PROJ-2",
-                        "Ask user: Please confirm the web tech stack.",
-                    ],
-                    "actions": [
-                        {
-                            "action": "fetch_agent_context",
-                            "capability": "jira.ticket.fetch",
-                            "message": "Fetch ticket PROJ-2",
-                            "reason": "Need the latest Jira ticket content before planning.",
-                        }
-                    ],
-                }
-
-            fake_plan = {
-                "platform": "web",
-                "dev_capability": "web.task.execute",
-                "target_repo_url": "",
-                "dev_instruction": "Implement the requested flow in Flask.",
-                "acceptance_criteria": ["Practice Quiz screen matches the design."],
-                "requires_tests": True,
-                "test_requirements": "Add integration coverage for the Practice Quiz screen.",
-                "screenshot_requirements": None,
-            }
-
-            with mock.patch.object(team_lead_app, "_analyze_task", side_effect=fake_analyze), mock.patch.object(
-                team_lead_app,
-                "_plan_information_gathering",
-                side_effect=fake_plan_information_gathering,
-            ), mock.patch.object(
-                team_lead_app,
-                "_call_sync_agent",
-                side_effect=AssertionError("no fetch action should run when it makes no progress"),
-            ) as sync_mock, mock.patch.object(
-                team_lead_app,
-                "_create_plan",
-                return_value=fake_plan,
-            ), mock.patch.object(team_lead_app, "_notify_compass"), mock.patch.object(
-                team_lead_app,
-                "_report_progress",
-            ), mock.patch.object(
-                team_lead_app,
-                "_generate_summary",
-                return_value="validation checkpoint reached",
-            ):
-                worker = threading.Thread(
-                    target=team_lead_app._run_workflow,
-                    args=(task.task_id, ctx),
-                    daemon=True,
-                )
-                worker.start()
-
-                deadline = time.time() + 5
-                while time.time() < deadline:
-                    current = team_lead_app.task_store.get(task.task_id)
-                    if current and current.state == "TASK_STATE_INPUT_REQUIRED":
-                        break
-                    time.sleep(0.05)
-                else:
-                    self.fail("Team Lead never fell back to TASK_STATE_INPUT_REQUIRED")
-
-                current = team_lead_app.task_store.get(task.task_id)
-                self.assertIsNotNone(current)
                 self.assertIn("tech stack", current.status_message.lower())
 
                 with team_lead_app._INPUT_EVENTS_LOCK:
@@ -614,197 +394,52 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
                     entry["event"].set()
 
                 worker.join(timeout=5)
-                self.assertFalse(worker.is_alive(), "workflow thread did not finish")
-                sync_mock.assert_not_called()
+                self.assertFalse(worker.is_alive(), "workflow did not resume after user reply")
 
+            self.assertEqual(user_reply_received, ["Use Python 3.12 and Flask."])
             current = team_lead_app.task_store.get(task.task_id)
             self.assertEqual(current.state, "TASK_STATE_COMPLETED")
-            history_states = [entry["state"] for entry in current.history]
+            history_states = [e["state"] for e in current.history]
             self.assertIn("TASK_STATE_INPUT_REQUIRED", history_states)
 
-    def test_team_lead_executes_new_fallback_fetch_when_runtime_plan_repeats_stale_fetches(self):
-        with tempfile.TemporaryDirectory(prefix="team_lead_fallback_fetch_") as workspace:
+    def test_team_lead_run_workflow_prompt_contains_user_text_and_workspace(self):
+        """_run_workflow builds a task prompt containing user request and metadata."""
+        from common.runtime.adapter import AgenticResult
+
+        with tempfile.TemporaryDirectory(prefix="tl_prompt_") as workspace:
             task = team_lead_app.task_store.create()
             ctx = team_lead_app._TaskContext()
-            ctx.compass_task_id = "compass-task-1"
-            ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
+            ctx.compass_task_id = "compass-task-42"
+            ctx.compass_callback_url = "http://compass.local/tasks/task-42/callbacks"
             ctx.compass_url = "http://compass.local"
             ctx.shared_workspace_path = workspace
-            ctx.user_text = "Implement PROJ-4."
-            ctx.additional_info = "Use React with an Express backend."
-            ctx.original_message = {"metadata": {"stopBeforeDevDispatch": True}}
-            ctx.jira_info = {
-                "ticket_key": "PROJ-4",
-                "content": "Ticket content with linked Figma design.",
-                "request": "Fetch ticket PROJ-4",
-            }
-            ctx.repo_info = {
-                "repo_url": "https://github.com/example-org/example-app",
-                "content": "Repository metadata already fetched.",
-                "request": "Inspect repository https://github.com/example-org/example-app",
-            }
+            ctx.user_text = "Please implement the registration screen from PROJ-99."
 
-            analysis = {
-                "task_type": "feature",
-                "platform": "web",
-                "needs_jira_fetch": True,
-                "jira_ticket_key": "PROJ-4",
-                "needs_design_context": True,
-                "design_url": "https://www.figma.com/design/abc123/Example-App",
-                "design_type": "figma",
-                "design_page_name": "Practice Quiz",
-                "target_repo_url": "https://github.com/example-org/example-app",
-                "missing_info": [],
-                "question_for_user": None,
-                "summary": "Implement PROJ-4.",
-            }
-            expected_capability, expected_message, _ = team_lead_app._build_design_fetch_request(analysis)
+            captured: list[str] = []
 
-            def fake_plan_information_gathering(_user_text: str, _analysis: dict, _workflow_ctx, **_kwargs) -> dict:
-                return {
-                    "pending_tasks": [
-                        "Fetch the full Jira issue PROJ-4 (all fields, AC, links, attachments, comments, sprint/epic context).",
-                        "Inspect the target repository example-org/example-app (branch, file tree, manifests, README, CI, infer tech stack).",
-                        "Fetch the referenced Figma design node/page from the provided Figma URL (capture images, node structure, styles, and page name).",
-                    ],
-                    "actions": [
-                        {
-                            "action": "fetch_agent_context",
-                            "capability": "jira.ticket.fetch",
-                            "message": "Fetch ticket PROJ-4",
-                            "reason": "Need the latest Jira issue details.",
-                        },
-                        {
-                            "action": "fetch_agent_context",
-                            "capability": "scm.repo.inspect",
-                            "message": "Inspect repository https://github.com/example-org/example-app",
-                            "reason": "Need the latest repository metadata.",
-                        },
-                    ],
-                }
+            def mock_run_agentic(**kwargs):
+                captured.append(kwargs.get("task", ""))
+                return AgenticResult(success=True, summary="done", artifacts=[], turns_used=1, tool_calls=0)
 
-            def fake_call_sync_agent(capability: str, message_text: str, *_args, **_kwargs) -> dict:
-                self.assertEqual(capability, expected_capability)
-                self.assertEqual(message_text, expected_message)
-                return {"artifacts": [{"parts": [{"text": "Practice Quiz design context"}]}]}
+            mock_runtime = mock.MagicMock()
+            mock_runtime.run_agentic.side_effect = mock_run_agentic
 
-            fake_plan = {
-                "platform": "web",
-                "dev_capability": "web.task.execute",
-                "target_repo_url": "https://github.com/example-org/example-app",
-                "dev_instruction": "Implement the requested page in the target repository.",
-                "acceptance_criteria": ["Practice Quiz screen matches the design."],
-                "requires_tests": True,
-                "test_requirements": "Add integration coverage for the Practice Quiz screen.",
-                "screenshot_requirements": None,
-            }
-
-            with mock.patch.object(team_lead_app, "_analyze_task", return_value=analysis), mock.patch.object(
-                team_lead_app,
-                "_plan_information_gathering",
-                side_effect=fake_plan_information_gathering,
-            ), mock.patch.object(
-                team_lead_app.agent_directory,
-                "list_agents",
-                return_value=[
-                    {
-                        "agent_id": "ui-design-agent",
-                        "capabilities": ["figma.page.fetch"],
-                        "instances": [
-                            {
-                                "instance_id": "ui-1",
-                                "status": "idle",
-                                "service_url": "http://ui-design:8040",
-                            }
-                        ],
-                    }
-                ],
-            ), mock.patch.object(
-                team_lead_app,
-                "_call_sync_agent",
-                side_effect=fake_call_sync_agent,
-            ) as sync_mock, mock.patch.object(
-                team_lead_app,
-                "_create_plan",
-                return_value=fake_plan,
-            ), mock.patch.object(team_lead_app, "_notify_compass"), mock.patch.object(
-                team_lead_app,
-                "_report_progress",
-            ), mock.patch.object(
-                team_lead_app,
-                "_generate_summary",
-                return_value="validation checkpoint reached",
-            ):
+            with mock.patch.object(team_lead_app, "get_runtime", return_value=mock_runtime), \
+                    mock.patch.object(team_lead_app, "_notify_compass"), \
+                    mock.patch.object(team_lead_app, "_report_progress"):
                 team_lead_app._run_workflow(task.task_id, ctx)
 
-            sync_mock.assert_called_once_with(
-                expected_capability,
-                expected_message,
-                task.task_id,
-                workspace,
-                "compass-task-1",
-                permissions=None,
-            )
-            self.assertIsNotNone(ctx.design_info)
-            self.assertEqual(ctx.design_info["fetchedBy"], expected_capability)
-            self.assertTrue(Path(workspace, "team-lead/design-context.json").is_file())
+            self.assertTrue(captured, "run_agentic was not called")
+            prompt = captured[0]
+            self.assertIn("PROJ-99", prompt)
+            self.assertIn("compass-task-42", prompt)
+            self.assertIn(workspace, prompt)
 
-            current = team_lead_app.task_store.get(task.task_id)
-            self.assertEqual(current.state, "TASK_STATE_COMPLETED")
+    def test_team_lead_run_workflow_stop_before_dispatch_includes_checkpoint_marker(self):
+        """When stopBeforeDevDispatch is set in the message, prompt includes the checkpoint instruction."""
+        from common.runtime.adapter import AgenticResult
 
-    def test_team_lead_does_not_plan_with_unresolved_missing_info(self):
-        with tempfile.TemporaryDirectory(prefix="team_lead_unresolved_missing_") as workspace:
-            task = team_lead_app.task_store.create()
-            ctx = team_lead_app._TaskContext()
-            ctx.compass_task_id = "compass-task-1"
-            ctx.compass_callback_url = "http://compass.local/tasks/task-1/callbacks"
-            ctx.compass_url = "http://compass.local"
-            ctx.shared_workspace_path = workspace
-            ctx.user_text = "Implement PROJ-2."
-            ctx.original_message = {"metadata": {}}
-
-            analysis = {
-                "task_type": "feature",
-                "platform": "web",
-                "needs_jira_fetch": False,
-                "needs_design_context": False,
-                "missing_info": ["Exact Stitch screen ID is still missing"],
-                "question_for_user": None,
-                "summary": "Implement PROJ-2.",
-            }
-
-            with mock.patch.object(team_lead_app, "_analyze_task", return_value=analysis), mock.patch.object(
-                team_lead_app,
-                "_plan_information_gathering",
-                return_value={
-                    "pending_tasks": ["Proceed to implementation planning"],
-                    "actions": [
-                        {
-                            "action": "proceed_to_plan",
-                            "reason": "Planner claims it can proceed.",
-                        }
-                    ],
-                },
-            ), mock.patch.object(
-                team_lead_app,
-                "_create_plan",
-            ) as create_plan_mock, mock.patch.object(team_lead_app, "_notify_compass"), mock.patch.object(
-                team_lead_app,
-                "_report_progress",
-            ), mock.patch.object(
-                team_lead_app,
-                "_generate_summary",
-                return_value="failure summary",
-            ):
-                team_lead_app._run_workflow(task.task_id, ctx)
-
-            create_plan_mock.assert_not_called()
-            current = team_lead_app.task_store.get(task.task_id)
-            self.assertEqual(current.state, "TASK_STATE_FAILED")
-            self.assertEqual(current.status_message, "failure summary")
-
-    def test_team_lead_validation_mode_can_checkpoint_with_noncritical_missing_info(self):
-        with tempfile.TemporaryDirectory(prefix="team_lead_validation_checkpoint_") as workspace:
+        with tempfile.TemporaryDirectory(prefix="tl_checkpoint_") as workspace:
             task = team_lead_app.task_store.create()
             ctx = team_lead_app._TaskContext()
             ctx.compass_task_id = "compass-task-1"
@@ -813,86 +448,28 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
             ctx.shared_workspace_path = workspace
             ctx.user_text = "Implement PROJ-2."
             ctx.original_message = {"metadata": {"stopBeforeDevDispatch": True}}
-            ctx.jira_info = {
-                "ticket_key": "PROJ-2",
-                "content": "Jira content with the Stitch URL and no repo URL.",
-                "request": "Fetch ticket PROJ-2",
-            }
-            ctx.design_info = {
-                "url": "https://stitch.withgoogle.com/projects/mock-project-id?pli=1",
-                "type": "stitch",
-                "content": "Lesson Library screen metadata already fetched.",
-                "page_name": "Lesson Library page",
-                "request": "Fetch design from Stitch",
-            }
-            ctx.additional_info = "Use Python 3.12 and Flask."
 
-            def fake_analyze(_user_text: str, additional_info: str = "") -> dict:
-                return {
-                    "task_type": "feature",
-                    "platform": "web",
-                    "needs_jira_fetch": True,
-                    "jira_ticket_key": "PROJ-2",
-                    "needs_design_context": True,
-                    "design_url": "https://stitch.withgoogle.com/projects/mock-project-id?pli=1",
-                    "design_type": "stitch",
-                    "design_page_name": "Lesson Library page",
-                    "target_repo_url": None,
-                    "missing_info": [
-                        "Google Stitch read/export API token or grant export permissions so screens and PNG assets can be fetched"
-                    ],
-                    "question_for_user": None,
-                    "summary": "Implement the Lesson Library page.",
-                }
+            captured: list[str] = []
 
-            fake_plan = {
-                "platform": "web",
-                "dev_capability": "web.task.execute",
-                "target_repo_url": "",
-                "dev_instruction": "Implement the requested flow in Flask.",
-                "acceptance_criteria": ["Lesson Library page matches the design."],
-                "requires_tests": True,
-                "test_requirements": "Add integration coverage.",
-                "screenshot_requirements": None,
-            }
+            def mock_run_agentic(**kwargs):
+                captured.append(kwargs.get("task", ""))
+                return AgenticResult(
+                    success=True, summary="validation checkpoint reached",
+                    artifacts=[], turns_used=1, tool_calls=0
+                )
 
-            with mock.patch.object(team_lead_app, "_analyze_task", side_effect=fake_analyze), mock.patch.object(
-                team_lead_app,
-                "_plan_information_gathering",
-                return_value={
-                    "pending_tasks": ["Fetch more Jira and Stitch details"],
-                    "actions": [
-                        {
-                            "action": "fetch_agent_context",
-                            "capability": "jira.ticket.fetch",
-                            "message": "Fetch ticket PROJ-2 again",
-                            "reason": "Gather more details.",
-                        }
-                    ],
-                },
-            ) as gather_mock, mock.patch.object(
-                team_lead_app,
-                "_call_sync_agent",
-                side_effect=AssertionError("validation checkpoint should not fetch more context once ready"),
-            ) as sync_mock, mock.patch.object(
-                team_lead_app,
-                "_create_plan",
-                return_value=fake_plan,
-            ), mock.patch.object(team_lead_app, "_notify_compass"), mock.patch.object(
-                team_lead_app,
-                "_report_progress",
-            ), mock.patch.object(
-                team_lead_app,
-                "_generate_summary",
-                return_value="validation checkpoint reached",
-            ):
+            mock_runtime = mock.MagicMock()
+            mock_runtime.run_agentic.side_effect = mock_run_agentic
+
+            with mock.patch.object(team_lead_app, "get_runtime", return_value=mock_runtime), \
+                    mock.patch.object(team_lead_app, "_notify_compass"), \
+                    mock.patch.object(team_lead_app, "_report_progress"):
                 team_lead_app._run_workflow(task.task_id, ctx)
 
-            gather_mock.assert_not_called()
-            sync_mock.assert_not_called()
+            self.assertTrue(captured, "run_agentic was not called")
+            self.assertIn("stopBeforeDevDispatch", captured[0])
             current = team_lead_app.task_store.get(task.task_id)
             self.assertEqual(current.state, "TASK_STATE_COMPLETED")
-            self.assertIn("validation checkpoint reached", current.status_message)
 
     def test_team_lead_reports_missing_jira_capability_clearly(self):
         with mock.patch.object(
@@ -1063,7 +640,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
     def test_team_lead_suppresses_defaultable_web_ui_questions_with_full_context(self):
         ctx = team_lead_app._TaskContext()
         ctx.jira_info = {"content": "Jira ticket content is available."}
-        ctx.repo_info = {"content": "Repository context is available."}
+        ctx.repo_info = {"content": "Repository context is available.", "repo_url": "https://github.com/example-org/example-repo"}
         ctx.design_info = {"content": "Figma node context is available."}
 
         updated = team_lead_app._suppress_redundant_questions(
@@ -1227,7 +804,7 @@ class WebAgentPlanGuardsTests(unittest.TestCase):
         self.assertEqual(metadata["revisionCycle"], 2)
         self.assertEqual(metadata["reviewIssues"], ["Re-run pytest and attach evidence."])
         self.assertEqual(metadata["permissions"]["taskType"], "development")
-        self.assertIn("transition the Jira ticket to 'In Progress'", metadata["devWorkflowInstructions"])
+        self.assertIn("transition the Jira ticket to `In Progress`", metadata["devWorkflowInstructions"])
 
     def test_team_lead_sync_agent_forwards_permissions_snapshot(self):
         captured: dict = {}
