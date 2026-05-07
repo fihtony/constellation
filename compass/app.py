@@ -14,17 +14,15 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from common.artifact_store import ArtifactStore
+from common.compass_agentic_workflow import run_compass_workflow
 from common.devlog import record_workspace_stage
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.launcher import get_launcher
-from common.message_utils import artifact_text, deep_copy_json, extract_text
+from common.message_utils import artifact_text, deep_copy_json, extract_text, parse_json_object
 from common.policy import PolicyEvaluator
 from common.per_task_exit import PerTaskExitHandler
-from common.tools.control_tools import configure_control_tools
 from common.registry_client import RegistryClient
-from common.rules_loader import build_system_prompt
-from common.prompt_builder import build_system_prompt_from_manifest
 from common.agent_system_prompt import build_agent_system_prompt as _build_manifest_prompt
 from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import grant_permission, load_permission_grant
@@ -98,10 +96,6 @@ NON_TERMINAL_TASK_STATES = {
     "BUILDING",
     "PUSHING",
 }
-CALLBACK_LOCK = threading.Lock()
-CALLBACK_EVENTS = {}
-CALLBACK_RESULTS = {}
-
 # States that trigger notification webhooks
 _NOTIFY_STATES = {"TASK_STATE_INPUT_REQUIRED", "TASK_STATE_COMPLETED", "TASK_STATE_FAILED"}
 
@@ -167,32 +161,6 @@ def _runtime_config_summary():
     }
     summary["runtimeConfig"] = summarize_runtime_configuration()
     return summary
-
-
-def _parse_json_from_runtime(text):
-    text = (text or "").strip()
-    if not text:
-        return {}
-    if text.startswith("```"):
-        lines = text.splitlines()
-        start = 1
-        end = len(lines)
-        while end > start and lines[end - 1].strip() in ("```", ""):
-            end -= 1
-        text = "\n".join(lines[start:end]).strip()
-    try:
-        payload = json.loads(text)
-        return payload if isinstance(payload, dict) else {}
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        return {}
-    try:
-        payload = json.loads(match.group())
-        return payload if isinstance(payload, dict) else {}
-    except json.JSONDecodeError:
-        return {}
 
 
 def _run_agentic(prompt, actor, *, system_prompt=None, context=None, timeout=120, max_tokens=2048):
@@ -353,7 +321,7 @@ def _interpret_office_reply(task, user_reply):
     )
     system = _build_manifest_prompt(__file__, prompts.OFFICE_REPLY_SYSTEM)
     response = _run_agentic(prompt, "office-reply", system_prompt=system)
-    data = _parse_json_from_runtime(response)
+    data = parse_json_object(response)
     return {
         "action": str(data.get("action") or "unclear").strip().lower() or "unclear",
         "clarification_question": str(data.get("clarification_question") or "").strip() or None,
@@ -512,7 +480,7 @@ def _route_with_runtime(user_text, requested_capability=""):
         requested_capability=requested_capability or "null",
     )
     response = _run_agentic(prompt, "route", system_prompt=system)
-    data = _parse_json_from_runtime(response)
+    data = parse_json_object(response)
     workflow = _normalize_workflow(data.get("workflow") or [])
     if requested_capability and not workflow:
         workflow = [requested_capability]
@@ -548,7 +516,7 @@ def _summarize_for_user(task, state, status_message, artifacts, workflow):
     )
     system = _build_manifest_prompt(__file__, prompts.FINAL_SUMMARY_SYSTEM)
     response = _run_agentic(prompt, "final-summary", system_prompt=system)
-    data = _parse_json_from_runtime(response)
+    data = parse_json_object(response)
     summary = str(data.get("summary") or "").strip()
     return summary or status_message
 
@@ -948,30 +916,6 @@ def _send_agent_ack(service_url: str, task_id: str) -> None:
         print(f"[compass] Could not ACK agent at {service_url} task {task_id}: {err}")
 
 
-def _lookup_agents(requested_capability=None):
-    try:
-        if requested_capability:
-            return registry.find_by_capability(requested_capability)
-        return registry.find_any_active()
-    except (URLError, OSError) as error:
-        print(f"[compass] Registry unreachable: {error}")
-        return None
-
-
-def _find_idle_agent_and_instance(agents, container_name=None):
-    for agent in agents:
-        for instance in agent.get("instances", []):
-            if container_name and instance.get("container_id") != container_name:
-                continue
-            if instance.get("status") == "idle":
-                return agent, instance
-    return None, None
-
-
-def _should_launch_fresh_instance(agent_definition):
-    return (agent_definition or {}).get("execution_mode") == "per-task"
-
-
 def _extract_requested_capability(body, message):
     top_level = body.get("requestedCapability")
     if top_level:
@@ -994,644 +938,32 @@ def _dedupe(items):
     return ordered
 
 
-def _infer_capability_workflow(user_text):
-    decision = _route_with_runtime(user_text)
-    return decision.get("workflow") or ["team-lead.task.analyze"]
-
-
-def _wait_for_instance(agent_id, container_name, timeout_seconds=20):
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        instances = registry.list_instances(agent_id)
-        for instance in instances:
-            if instance.get("container_id") == container_name and instance.get("status") == "idle":
-                return instance
-        time.sleep(0.5)
-    return None
-
-
-def _summarize_artifacts(agent_id, capability, artifacts):
-    summaries = []
-    for index, artifact in enumerate(artifacts, start=1):
-        text = artifact_text(artifact)
-        metadata = dict(artifact.get("metadata") or {})
-        metadata.update({
-            "agentId": agent_id,
-            "capability": capability,
-            "artifactName": artifact.get("name", f"artifact-{index}"),
-            "index": index,
-        })
-        stored = artifact_store.store(
-            metadata.get("orchestratorTaskId") or metadata.get("taskId") or "",
-            artifact.get("artifactType", "a2a_artifact"),
-            text or json.dumps(artifact, ensure_ascii=False),
-            metadata=metadata,
-        )
-        summaries.append({
-            "artifactId": stored.artifact_id,
-            "agentId": agent_id,
-            "capability": capability,
-            "name": artifact.get("name", f"artifact-{index}"),
-            "text": text,
-            "metadata": metadata,
-        })
-    return summaries
-
-
-def _store_task_artifacts(task_id, agent_id, capability, artifacts):
-    summaries = []
-    for index, artifact in enumerate(artifacts, start=1):
-        text = artifact_text(artifact)
-        metadata = dict(artifact.get("metadata") or {})
-        metadata.update({
-            "agentId": agent_id,
-            "capability": capability,
-            "artifactName": artifact.get("name", f"artifact-{index}"),
-            "index": index,
-            "orchestratorTaskId": task_id,
-        })
-        stored = artifact_store.store(
-            task_id,
-            artifact.get("artifactType", "a2a_artifact"),
-            text or json.dumps(artifact, ensure_ascii=False),
-            metadata=metadata,
-        )
-        summaries.append({
-            "artifactId": stored.artifact_id,
-            "agentId": agent_id,
-            "capability": capability,
-            "name": artifact.get("name", f"artifact-{index}"),
-            "text": text,
-            "metadata": metadata,
-        })
-    return summaries
-
-
-def _append_task_artifacts(task, summaries):
-    for summary in summaries:
-        task.artifacts.append({
-            "artifactId": summary["artifactId"],
-            "name": summary["name"],
-            "artifactType": "application/vnd.multi-agent.reference",
-            "parts": [{"text": summary["text"]}],
-            "metadata": summary["metadata"],
-        })
-
-
-def _build_step_message(task, original_message, task_id, capability, step_index, total_steps, upstream_artifacts):
-    message = deep_copy_json(original_message)
-    metadata = dict(message.get("metadata") or {})
-
-    # Determine task type and load permission grant
-    router_context = dict(getattr(task, "router_context", {}) or {})
-    task_type = router_context.get("task_type") or "development"
-    if _is_office_capability(capability):
-        task_type = "office"
-    elif task_type in ("dev", "development"):
-        task_type = "development"
-    grant_data = router_context.get("permissions") if isinstance(router_context.get("permissions"), dict) else None
-    if not isinstance(grant_data, dict):
-        grant_data = load_permission_grant(task_type).to_dict()
-    if _is_office_capability(capability) and router_context.get("officeWriteApproved"):
-        grant_data = grant_permission(
-            grant_data,
-            agent="office",
-            action="write",
-            scope="task_root",
-            description="User approved in-place Office output for this task.",
-        )
-    if isinstance(grant_data, dict):
-        router_context["permissions"] = grant_data
-        task.router_context = router_context
-
-    metadata.update({
-        "requestedCapability": capability,
-        "orchestratorTaskId": task_id,
-        "orchestratorCallbackUrl": f"{ADVERTISED_URL.rstrip('/')}/tasks/{task_id}/callbacks?instance={COMPASS_INSTANCE_ID}",
-        "orchestratorUrl": ADVERTISED_URL.rstrip("/"),
-        "compassUrl": ADVERTISED_URL.rstrip("/"),
-        "sharedWorkspacePath": task.workspace_path,
-        "workflowStep": step_index,
-        "workflowTotalSteps": total_steps,
-        "upstreamArtifacts": upstream_artifacts,
-        "permissions": grant_data or {},
-        "exitRule": PerTaskExitHandler.build(
-            rule_type="wait_for_parent_ack",
-            ack_timeout_seconds=COMPASS_CHILD_ACK_TIMEOUT,
-        ),
-    })
-    router_context = dict(getattr(task, "router_context", {}) or {})
-    dispatch = router_context.get("dispatch") if isinstance(router_context.get("dispatch"), dict) else {}
-    if _is_office_capability(capability) and dispatch:
-        metadata.update({
-            "officeTargetPaths": list(dispatch.get("mountedTargetPaths") or []),
-            "officeHostTargetPaths": list(router_context.get("targetPaths") or []),
-            "officeOutputMode": router_context.get("outputMode") or "workspace",
-            "officeInputRoot": OFFICE_CONTAINER_INPUT_PATH,
-            "officeWorkspacePath": OFFICE_CONTAINER_WORKSPACE_PATH if dispatch.get("workspaceHostPath") else task.workspace_path,
-            "officeSubtype": router_context.get("officeSubtype") or "",
-        })
-    message["metadata"] = metadata
-    return message
-
-
 def _is_terminal_state(state):
     return (state or "TASK_STATE_COMPLETED") not in NON_TERMINAL_TASK_STATES
-
-
-def _extract_downstream_result(downstream_task):
-    state = downstream_task.get("status", {}).get("state", "TASK_STATE_COMPLETED")
-    status_message = ""
-    artifacts = downstream_task.get("artifacts", [])
-    if artifacts:
-        status_message = artifact_text(artifacts[0])
-    if not status_message:
-        status_message = extract_text(downstream_task.get("status", {}).get("message", {}))
-    return {
-        "state": state,
-        "status_message": status_message,
-        "artifacts": artifacts,
-    }
-
-
-def _callback_key(task_id, downstream_task_id):
-    return f"{task_id}:{downstream_task_id}"
-
-
-def _register_callback_waiter(task_id, downstream_task_id):
-    key = _callback_key(task_id, downstream_task_id)
-    event = threading.Event()
-    with CALLBACK_LOCK:
-        CALLBACK_EVENTS[key] = event
-        if key in CALLBACK_RESULTS:
-            event.set()
-    return key, event
-
-
-def _store_callback_result(task_id, downstream_task_id, payload):
-    key = _callback_key(task_id, downstream_task_id)
-    with CALLBACK_LOCK:
-        CALLBACK_RESULTS[key] = payload
-        event = CALLBACK_EVENTS.get(key)
-    if event:
-        event.set()
-
-
-def _consume_callback_result(key):
-    with CALLBACK_LOCK:
-        CALLBACK_EVENTS.pop(key, None)
-        return CALLBACK_RESULTS.pop(key, None)
-
-
-def _cleanup_callback_waiter(key):
-    with CALLBACK_LOCK:
-        CALLBACK_EVENTS.pop(key, None)
-        CALLBACK_RESULTS.pop(key, None)
-
-
-def _wait_for_downstream_completion(task, agent_id, capability, service_url, downstream_task_id):
-    """Wait for a downstream agent task to reach a terminal state.
-
-    Handles TASK_STATE_INPUT_REQUIRED specially: stores the downstream task info on the
-    compass task (so the HTTP handler can forward the user's reply to Team Lead) and
-    continues waiting rather than returning immediately.
-    """
-    key, event = _register_callback_waiter(task.task_id, downstream_task_id)
-    deadline = time.time() + DOWNSTREAM_TASK_TIMEOUT
-    next_poll_at = time.time()
-    try:
-        while time.time() < deadline:
-            if event.wait(timeout=1.0):
-                callback_result = _consume_callback_result(key)
-                if callback_result:
-                    if callback_result.get("state") == "TASK_STATE_INPUT_REQUIRED":
-                        # Store Team Lead task info for resume, propagate state to user,
-                        # then re-register the waiter and keep waiting for the final result.
-                        task.downstream_task_id = downstream_task_id
-                        task.downstream_service_url = service_url
-                        _update_state_and_notify(
-                            task.task_id,
-                            "TASK_STATE_INPUT_REQUIRED",
-                            callback_result.get("status_message", "Additional information required."),
-                        )
-                        task_store.add_progress_step(
-                            task.task_id,
-                            callback_result.get("status_message", "Waiting for additional user input."),
-                            agent_id=agent_id,
-                        )
-                        audit_log(
-                            "TASK_INPUT_REQUIRED",
-                            task_id=task.task_id,
-                            downstream_task_id=downstream_task_id,
-                            question=callback_result.get("status_message", "")[:200],
-                        )
-                        # Re-register callback waiter for when Team Lead resumes
-                        key, event = _register_callback_waiter(task.task_id, downstream_task_id)
-                        continue
-                    return callback_result
-
-            if time.time() >= next_poll_at:
-                next_poll_at = time.time() + 5.0
-                # Skip polling while waiting for user input to reduce noise
-                if task.state == "TASK_STATE_INPUT_REQUIRED":
-                    continue
-                try:
-                    response = _fetch_task(service_url, downstream_task_id)
-                except Exception:
-                    continue
-                downstream_task = response.get("task", {})
-                if not downstream_task:
-                    continue
-                polled_result = _extract_downstream_result(downstream_task)
-                if _is_terminal_state(polled_result["state"]):
-                    if polled_result["state"] == "TASK_STATE_INPUT_REQUIRED":
-                        if task.state != "TASK_STATE_INPUT_REQUIRED":
-                            task.downstream_task_id = downstream_task_id
-                            task.downstream_service_url = service_url
-                            _update_state_and_notify(
-                                task.task_id,
-                                "TASK_STATE_INPUT_REQUIRED",
-                                polled_result.get("status_message", "Additional information required."),
-                            )
-                            task_store.add_progress_step(
-                                task.task_id,
-                                polled_result.get("status_message", "Waiting for additional user input."),
-                                agent_id=agent_id,
-                            )
-                            audit_log(
-                                "TASK_INPUT_REQUIRED",
-                                task_id=task.task_id,
-                                downstream_task_id=downstream_task_id,
-                            )
-                        continue
-                    return polled_result
-
-        task_store.update_state(
-            task.task_id,
-            "FAILED",
-            f"Timed out waiting for {agent_id} to finish capability '{capability}'.",
-        )
-        return {
-            "state": "FAILED",
-            "status_message": f"Timed out waiting for {agent_id} to finish capability '{capability}'.",
-            "artifacts": [],
-        }
-    finally:
-        _cleanup_callback_waiter(key)
-
-
-def _dispatch_step(task, original_message, capability, step_index, total_steps, upstream_artifacts):
-    agents = _lookup_agents(capability)
-    if agents is None:
-        task_store.update_state(
-            task.task_id,
-            "CAPABILITY_TEMPORARILY_UNAVAILABLE",
-            f"Registry unavailable while resolving capability '{capability}'.",
-        )
-        audit_log("REGISTRY_UNAVAILABLE", task_id=task.task_id, capability=capability)
-        return {"terminal": True}
-
-    if not agents:
-        task_store.update_state(
-            task.task_id,
-            "NO_CAPABLE_AGENT",
-            f"No active agent advertises capability '{capability}'.",
-        )
-        audit_log("NO_CAPABLE_AGENT", task_id=task.task_id, capability=capability)
-        return {"terminal": True}
-
-    agent, instance = _find_idle_agent_and_instance(agents)
-    candidate = deep_copy_json(agents[0])
-    if _is_office_capability(capability) and getattr(task, "router_context", {}):
-        dispatch = (task.router_context or {}).get("dispatch") or {}
-        if dispatch:
-            launch_spec = dict(candidate.get("launch_spec") or {})
-            existing_binds = list(launch_spec.get("extraBinds") or [])
-            launch_spec["extraBinds"] = existing_binds + list(dispatch.get("extraBinds") or [])
-            candidate["launch_spec"] = launch_spec
-
-    if _should_launch_fresh_instance(candidate):
-        agent, instance = candidate, None
-
-    if instance is None:
-        if candidate.get("execution_mode") == "per-task":
-            try:
-                launch_info = launcher.launch_instance(candidate, task.task_id)
-            except Exception as error:
-                task_store.update_state(
-                    task.task_id,
-                    "CAPABILITY_TEMPORARILY_UNAVAILABLE",
-                    f"Failed to launch capability '{capability}': {error}",
-                )
-                audit_log("LAUNCH_FAILED", task_id=task.task_id, capability=capability, error=str(error))
-                return {"terminal": True}
-            instance = _wait_for_instance(candidate["agent_id"], launch_info["container_name"])
-            if instance is None:
-                task_store.update_state(
-                    task.task_id,
-                    "CAPABILITY_TEMPORARILY_UNAVAILABLE",
-                    f"Capability '{capability}' did not register an idle instance in time.",
-                )
-                audit_log("LAUNCH_TIMEOUT", task_id=task.task_id, capability=capability)
-                return {"terminal": True}
-            agent = candidate
-        else:
-            task_store.update_state(
-                task.task_id,
-                "CAPACITY_EXHAUSTED",
-                f"Capability '{capability}' is registered but has no idle instances.",
-            )
-            audit_log("CAPACITY_EXHAUSTED", task_id=task.task_id, capability=capability)
-            return {"terminal": True}
-
-    policy_result = policy.evaluate(task.to_dict(), agent)
-    if not policy_result.get("approved"):
-        task_store.update_state(task.task_id, "POLICY_DENIED", policy_result.get("reason", ""))
-        audit_log("POLICY_DENIED", task_id=task.task_id, capability=capability)
-        return {"terminal": True}
-
-    if agent is None or instance is None:
-        task_store.update_state(
-            task.task_id,
-            "CAPABILITY_TEMPORARILY_UNAVAILABLE",
-            f"Capability '{capability}' could not provide a routable instance.",
-        )
-        audit_log("ROUTE_INSTANCE_MISSING", task_id=task.task_id, capability=capability)
-        return {"terminal": True}
-
-    agent_id = agent["agent_id"]
-    instance_id = instance["instance_id"]
-    service_url = instance["service_url"]
-    task_store.assign_agent(task.task_id, agent_id, instance_id)
-    task_store.update_state(
-        task.task_id,
-        "DISPATCHED",
-        f"Step {step_index}/{total_steps} dispatched to {agent_id} ({capability}).",
-    )
-    audit_log(
-        "TASK_DISPATCHED",
-        task_id=task.task_id,
-        capability=capability,
-        agent_id=agent_id,
-        instance_id=instance_id,
-        service_url=service_url,
-    )
-
-    try:
-        registry.mark_instance_busy(agent_id, instance_id, task.task_id)
-    except (URLError, OSError):
-        pass
-
-    try:
-        current_message = original_message
-        revision_cycle = 0
-        aggregated_summaries = []
-        while True:
-            step_message = _build_step_message(
-                task,
-                current_message,
-                task.task_id,
-                capability,
-                step_index,
-                total_steps,
-                upstream_artifacts,
-            )
-            result = _a2a_call(service_url, step_message)
-            downstream_task = result.get("task", {})
-            downstream_task_id = downstream_task.get("id", "")
-            extracted = _extract_downstream_result(downstream_task)
-            state = extracted["state"]
-            status_message = extracted["status_message"]
-            artifacts = extracted["artifacts"]
-
-            if downstream_task_id and not _is_terminal_state(state):
-                task_store.update_state(
-                    task.task_id,
-                    "STEP_IN_PROGRESS",
-                    f"Step {step_index}/{total_steps} running in {agent_id} ({capability}).",
-                )
-                extracted = _wait_for_downstream_completion(
-                    task,
-                    agent_id,
-                    capability,
-                    service_url,
-                    downstream_task_id,
-                )
-                state = extracted["state"]
-                status_message = extracted["status_message"]
-                artifacts = extracted["artifacts"]
-
-            summaries = _store_task_artifacts(task.task_id, agent_id, capability, artifacts)
-            _append_task_artifacts(task, summaries)
-            aggregated_summaries.extend(summaries)
-
-            if capability != "team-lead.task.analyze" or state != "TASK_STATE_COMPLETED":
-                audit_log(
-                    "STEP_COMPLETED",
-                    task_id=task.task_id,
-                    capability=capability,
-                    agent_id=agent_id,
-                    state=state,
-                    artifact_count=len(aggregated_summaries),
-                )
-                # ACK the downstream agent so it can apply its exit rule and shut down
-                _send_agent_ack(service_url, downstream_task_id)
-                return {
-                    "terminal": False,
-                    "state": state,
-                    "status_message": status_message,
-                    "agent_id": agent_id,
-                    "artifact_summaries": aggregated_summaries,
-                }
-
-            completeness_issues = _extract_team_lead_completeness_issues(task, artifacts)
-            if not completeness_issues:
-                audit_log(
-                    "STEP_COMPLETED",
-                    task_id=task.task_id,
-                    capability=capability,
-                    agent_id=agent_id,
-                    state=state,
-                    artifact_count=len(aggregated_summaries),
-                )
-                # Completeness check passed — ACK Team Lead so it can shut down
-                _send_agent_ack(service_url, downstream_task_id)
-                return {
-                    "terminal": False,
-                    "state": state,
-                    "status_message": status_message,
-                    "agent_id": agent_id,
-                    "artifact_summaries": aggregated_summaries,
-                }
-
-            if revision_cycle >= COMPASS_COMPLETENESS_MAX_REVISIONS:
-                failure_message = (
-                    "Compass completeness check failed after follow-up attempts: "
-                    + "; ".join(completeness_issues)
-                )
-                task_store.update_state(task.task_id, "TASK_STATE_FAILED", failure_message)
-                audit_log(
-                    "COMPASS_COMPLETENESS_FAILED",
-                    task_id=task.task_id,
-                    capability=capability,
-                    agent_id=agent_id,
-                    issues=completeness_issues,
-                )
-                # Max revisions reached — ACK Team Lead so it can shut down
-                _send_agent_ack(service_url, downstream_task_id)
-                _fire_notification(task)
-                return {"terminal": True}
-
-            revision_cycle += 1
-            task_store.update_state(
-                task.task_id,
-                "REVIEWING",
-                f"Compass completeness check requested follow-up {revision_cycle}/{COMPASS_COMPLETENESS_MAX_REVISIONS}.",
-            )
-            if getattr(task, "workspace_path", ""):
-                record_workspace_stage(
-                    task.workspace_path,
-                    "compass",
-                    f"Compass requested Team Lead follow-up #{revision_cycle}",
-                    task_id=task.task_id,
-                    extra={
-                        "sourceAgent": "compass-agent",
-                        "completenessIssues": completeness_issues,
-                        "runtimeConfig": _runtime_config_summary(),
-                    },
-                )
-            audit_log(
-                "COMPASS_COMPLETENESS_RETRY",
-                task_id=task.task_id,
-                capability=capability,
-                agent_id=agent_id,
-                revision_cycle=revision_cycle,
-                issues=completeness_issues,
-            )
-            current_message = _build_completeness_follow_up_message(
-                original_message,
-                completeness_issues,
-                revision_cycle,
-            )
-    except Exception as error:
-        _update_state_and_notify(task.task_id, "FAILED", f"Dispatch failed: {error}")
-        audit_log("TASK_FAILED", task_id=task.task_id, capability=capability, error=str(error))
-        return {"terminal": True}
-    finally:
-        try:
-            registry.mark_instance_idle(agent_id, instance_id)
-        except (URLError, OSError):
-            pass
 
 
 def _run_workflow(task_id, message, workflow):
     task = task_store.get(task_id)
     if not task:
         return
-
-    metadata = message.get("metadata") or {}
-    user_text = extract_text(message)
-
-    # Configure control tools with lifecycle callbacks
-    def _on_complete(result_text, artifacts):
-        final_message = _summarize_for_user(task, "TASK_STATE_COMPLETED", result_text, artifacts, workflow)
-        _update_state_and_notify(task_id, "TASK_STATE_COMPLETED", final_message)
-        audit_log("TASK_COMPLETED", task_id=task_id, final_state="TASK_STATE_COMPLETED")
-
-    def _on_fail(error_message):
-        _update_state_and_notify(task_id, "TASK_STATE_FAILED", error_message)
-        audit_log("TASK_FAILED", task_id=task_id, error=error_message)
-
-    def _on_input_required(question, ctx):
-        _update_state_and_notify(task_id, "TASK_STATE_INPUT_REQUIRED", question)
-        task_store.add_progress_step(task_id, question, agent_id="compass-agent")
-
-    configure_control_tools(
-        task_context={
-            "taskId": task_id,
-            "agentId": AGENT_ID,
-            "workspacePath": task.workspace_path or "",
-            "workflow": workflow,
-            "permissions": metadata.get("permissions"),
-            "userText": user_text[:500],
-        },
-        complete_fn=_on_complete,
-        fail_fn=_on_fail,
-        input_required_fn=_on_input_required,
+    run_compass_workflow(
+        task_id=task_id,
+        task=task,
+        message=message,
+        workflow=workflow,
+        agent_id=AGENT_ID,
+        agent_file=__file__,
+        route_system_prompt=prompts.ROUTE_SYSTEM,
+        advertised_url=ADVERTISED_URL,
+        compass_instance_id=COMPASS_INSTANCE_ID,
+        max_revisions=COMPASS_COMPLETENESS_MAX_REVISIONS,
+        timeout_seconds=DOWNSTREAM_TASK_TIMEOUT,
+        get_task=task_store.get,
+        update_state_and_notify=_update_state_and_notify,
+        summarize_for_user=_summarize_for_user,
+        add_progress_step=task_store.add_progress_step,
+        audit_log=audit_log,
     )
-
-    # Build the agentic task prompt
-    task_prompt = (
-        f"Execute this multi-agent workflow for the user.\n\n"
-        f"## User Request\n{user_text}\n\n"
-        f"## Planned Workflow Steps\n"
-        f"{json.dumps(workflow, ensure_ascii=False)}\n\n"
-        f"## Instructions\n"
-        f"1. For each capability in the workflow, use `dispatch_agent_task` to send the task.\n"
-        f"   - If dispatch fails because no idle instance is available, use `launch_per_task_agent` first.\n"
-        f"2. Use `wait_for_agent_task` to wait for each step to complete.\n"
-        f"3. If the downstream agent reports INPUT_REQUIRED, forward the question to the user via `request_user_input`.\n"
-        f"4. After the final step completes, verify completeness:\n"
-        f"   - For team-lead.task.analyze: check that artifacts include PR URL and branch evidence.\n"
-        f"   - If evidence is missing, dispatch a follow-up (max {COMPASS_COMPLETENESS_MAX_REVISIONS} retries).\n"
-        f"5. When all steps are complete, call `complete_current_task` with a user-friendly summary.\n"
-        f"6. If any step fails irreversibly, call `fail_current_task` with a clear explanation.\n"
-        f"7. Use `ack_agent_task` after you are done with each per-task agent.\n\n"
-        f"## Metadata to pass downstream\n"
-        f"- sharedWorkspacePath: {task.workspace_path or ''}\n"
-        f"- orchestratorTaskId: {task_id}\n"
-        f"- orchestratorCallbackUrl: {ADVERTISED_URL}/tasks/{task_id}/callbacks?instance={COMPASS_INSTANCE_ID}\n"
-    )
-
-    # Load permission grant for the task type
-    task_type = (getattr(task, "router_context", {}) or {}).get("task_type") or "development"
-    try:
-        permissions = load_permission_grant(task_type)
-        task_prompt += f"- permissions: (loaded '{task_type}' permission grant)\n"
-    except Exception:
-        permissions = {}
-
-    # Build system prompt from manifest
-    system_prompt = _build_manifest_prompt(__file__, prompts.ROUTE_SYSTEM)
-
-    _update_state_and_notify(task_id, "TASK_STATE_WORKING", f"Executing workflow: {', '.join(workflow)}")
-
-    try:
-        runtime = get_runtime()
-        result = runtime.run_agentic(
-            task=task_prompt,
-            system_prompt=system_prompt,
-            cwd=task.workspace_path or os.getcwd(),
-            tools=[
-                "dispatch_agent_task", "wait_for_agent_task", "ack_agent_task",
-                "launch_per_task_agent",
-                "complete_current_task", "fail_current_task",
-                "request_user_input", "report_progress",
-                "registry_query", "list_available_agents", "check_agent_status",
-                "get_task_context", "get_agent_runtime_status",
-                "load_skill", "todo_write",
-                "read_file", "glob", "grep",
-            ],
-            max_turns=80,
-            timeout=DOWNSTREAM_TASK_TIMEOUT,
-        )
-
-        # If runtime completed without calling complete/fail tools, handle the result
-        if task_store.get(task_id) and task_store.get(task_id).state not in (
-            "TASK_STATE_COMPLETED", "TASK_STATE_FAILED"
-        ):
-            if result.success:
-                summary = result.summary or "Workflow completed."
-                _update_state_and_notify(task_id, "TASK_STATE_COMPLETED", summary)
-                audit_log("TASK_COMPLETED", task_id=task_id, final_state="TASK_STATE_COMPLETED")
-            else:
-                error = result.summary or "Workflow failed — runtime did not complete successfully."
-                _update_state_and_notify(task_id, "TASK_STATE_FAILED", error)
-                audit_log("TASK_FAILED", task_id=task_id, error=error)
-
-    except Exception as error:
-        _update_state_and_notify(task_id, "TASK_STATE_FAILED", f"Workflow error: {error}")
-        audit_log("TASK_FAILED", task_id=task_id, error=str(error))
 
 
 def route_and_dispatch(message, requested_capability=None, forced_workflow=None):
@@ -2049,7 +1381,6 @@ class CompassHandler(BaseHTTPRequestHandler):
                 "artifacts": body.get("artifacts") or [],
                 "agent_id": body.get("agentId", ""),
             }
-            _store_callback_result(task_id, downstream_task_id, payload)
             audit_log(
                 "TASK_CALLBACK_RECEIVED",
                 task_id=task_id,

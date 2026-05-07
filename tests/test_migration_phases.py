@@ -734,8 +734,20 @@ class Phase7AcceptanceCriteriaTests(unittest.TestCase):
     def test_criterion_5_execution_agents_have_local_workspace_tools(self):
         """Execution agents must have local base tools registered."""
         from common.tools.registry import get_tool
-        # coding_tools.py registers: bash, read_file, write_file, edit_file, glob, grep
-        for tool_name in ("bash", "read_file", "write_file", "edit_file", "glob", "grep"):
+        for tool_name in (
+            "bash",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "glob",
+            "grep",
+            "run_local_command",
+            "read_local_file",
+            "write_local_file",
+            "edit_local_file",
+            "list_local_dir",
+            "search_local_files",
+        ):
             self.assertIsNotNone(get_tool(tool_name), f"Missing tool: {tool_name}")
 
     def test_criterion_6_scm_agent_has_remote_readonly_tools(self):

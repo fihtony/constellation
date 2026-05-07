@@ -17,14 +17,6 @@ from common.task_store import TaskStore
 
 
 class CompassDispatchTests(unittest.TestCase):
-    def test_should_launch_fresh_instance_for_per_task_agents(self):
-        self.assertTrue(
-            compass_app._should_launch_fresh_instance({"execution_mode": "per-task"})
-        )
-        self.assertFalse(
-            compass_app._should_launch_fresh_instance({"execution_mode": "persistent"})
-        )
-
     def test_task_store_list_tasks_returns_newest_first(self):
         store = TaskStore()
         first = store.create()
@@ -162,27 +154,6 @@ class CompassDispatchTests(unittest.TestCase):
             )
 
         self.assertEqual(summary, "Completed. The generated report is ready for review.")
-
-    def test_build_step_message_includes_exit_rule(self):
-        task = TaskStore().create()
-        task.workspace_path = "/tmp/workspace"
-        message = {"parts": [{"text": "Implement the task."}], "metadata": {}}
-
-        payload = compass_app._build_step_message(
-            task,
-            message,
-            task.task_id,
-            "team-lead.task.analyze",
-            1,
-            1,
-            [],
-        )
-
-        self.assertEqual(payload["metadata"]["exitRule"]["type"], "wait_for_parent_ack")
-        self.assertEqual(
-            payload["metadata"]["exitRule"]["ack_timeout_seconds"],
-            compass_app.COMPASS_CHILD_ACK_TIMEOUT,
-        )
 
     def test_route_and_dispatch_office_task_prompts_for_output_mode(self):
         original_store = compass_app.task_store
