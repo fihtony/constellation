@@ -155,8 +155,8 @@ class RuntimeAdapterTests(unittest.TestCase):
             summary = summarize_runtime_configuration()
 
         self.assertEqual(summary["effectiveBackend"], "copilot-cli")
-        self.assertFalse(summary["supportsAgentic"])
-        self.assertFalse(summary["agenticReady"])
+        self.assertTrue(summary["supportsAgentic"])
+        self.assertTrue(summary["agenticReady"])
         self.assertTrue(summary["tokenConfigured"])
         self.assertTrue(summary["tokenSources"]["COPILOT_GITHUB_TOKEN"])
         self.assertNotIn("copilot_token_secret", json.dumps(summary))
@@ -170,7 +170,7 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(summary["requestedBackend"], "copilot-cli")
         self.assertEqual(summary["effectiveBackend"], "copilot-cli")
         self.assertFalse(summary["tokenConfigured"])
-        self.assertFalse(summary["supportsAgentic"])
+        self.assertTrue(summary["supportsAgentic"])
         self.assertIn("not ready", summary["error"])
 
     def test_resolve_openai_base_url_uses_rancher_host_inside_container(self):
@@ -210,11 +210,52 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertTrue(summary["supportsAgentic"])
         self.assertTrue(summary["agenticReady"])
 
-    def test_require_agentic_runtime_rejects_copilot_cli(self):
+    def test_require_agentic_runtime_accepts_ready_copilot_cli(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+        os.environ["COPILOT_GITHUB_TOKEN"] = "copilot_token_test"
+
+        with patch("common.runtime.adapter.shutil.which", return_value="/usr/bin/copilot"):
+            summary = require_agentic_runtime("Team Lead")
+
+        self.assertEqual(summary["effectiveBackend"], "copilot-cli")
+        self.assertTrue(summary["agenticReady"])
+
+    def test_require_agentic_runtime_rejects_unready_copilot_cli(self):
         os.environ["AGENT_RUNTIME"] = "copilot-cli"
 
-        with self.assertRaisesRegex(RuntimeError, "does not support run_agentic"):
+        with self.assertRaisesRegex(RuntimeError, "cannot start agentic execution"):
             require_agentic_runtime("Team Lead")
+
+    def test_copilot_cli_run_agentic_executes_tools_until_final_answer(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+        os.environ["COPILOT_GITHUB_TOKEN"] = "copilot_token_test"
+
+        responses = [
+            {
+                "summary": "calling tool",
+                "raw_response": '<tool_call name="demo_tool">{"value": 7}</tool_call>',
+                "warnings": [],
+            },
+            {
+                "summary": "finished",
+                "raw_response": "<final_answer>done after tool call</final_answer>",
+                "warnings": [],
+            },
+        ]
+
+        with patch("common.runtime.copilot_cli.shutil.which", return_value="/usr/bin/copilot"), \
+             patch("common.runtime.copilot_cli.CopilotCliAdapter.run", side_effect=responses) as mocked_run, \
+             patch("common.runtime.copilot_cli._dispatch_tool", return_value="tool ok") as mocked_dispatch:
+            result = get_runtime().run_agentic("do something", tools=["demo_tool"], max_turns=3)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.backend_used, "copilot-cli")
+        self.assertEqual(result.summary, "done after tool call")
+        self.assertEqual(result.turns_used, 2)
+        self.assertEqual(result.tool_calls[0]["name"], "demo_tool")
+        self.assertEqual(result.tool_calls[0]["arguments"], {"value": 7})
+        mocked_dispatch.assert_called_once_with("demo_tool", {"value": 7})
+        self.assertEqual(mocked_run.call_count, 2)
 
     def test_load_dotenv_applies_shared_defaults_and_local_overrides(self):
         with tempfile.TemporaryDirectory() as temp_dir:

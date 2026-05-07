@@ -714,7 +714,7 @@ Before submitting a new agent, verify:
 | Purpose | Path |
 |---------|------|
 | **Team Lead Agent** | `team-lead/` | Intelligence layer: analysis, planning, dispatch, review | port 8030 |
-| Team Lead prompts | `team-lead/prompts.py` | ALL LLM prompt strings for Team Lead |
+| Team Lead prompts | `team-lead/prompts/system/` and `team-lead/prompts/tasks/` | Modular system/task prompt assets for Team Lead |
 | Jira prompts | `jira/prompts.py` | ALL LLM prompt strings for Jira Agent |
 | SCM prompts | `scm/prompts.py` | ALL LLM prompt strings for SCM Agent |
 | UI Design prompts | `ui-design/prompts.py` | ALL LLM prompt strings for UI Design Agent |

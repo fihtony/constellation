@@ -184,15 +184,15 @@ class TestPathHelpers(unittest.TestCase):
             self.assertFalse(path_within_base(child, base))
 
     def test_can_defer_outside_container(self):
-        with mock.patch("common.compass_office_routing.is_containerized", return_value=False):
+        with mock.patch("compass.office_routing.is_containerized", return_value=False):
             self.assertFalse(can_defer_office_path_existence_check("/abs/path/file.txt"))
 
     def test_can_defer_inside_container_absolute(self):
-        with mock.patch("common.compass_office_routing.is_containerized", return_value=True):
+        with mock.patch("compass.office_routing.is_containerized", return_value=True):
             self.assertTrue(can_defer_office_path_existence_check("/abs/path/file.txt"))
 
     def test_can_defer_inside_container_relative_is_false(self):
-        with mock.patch("common.compass_office_routing.is_containerized", return_value=True):
+        with mock.patch("compass.office_routing.is_containerized", return_value=True):
             self.assertFalse(can_defer_office_path_existence_check("relative/path"))
 
 
@@ -207,13 +207,13 @@ class TestValidateOfficePaths(unittest.TestCase):
         self.assertIn("Path must be absolute", error)
 
     def test_rejects_nonexistent_path_outside_container(self):
-        with mock.patch("common.compass_office_routing.is_containerized", return_value=False):
+        with mock.patch("compass.office_routing.is_containerized", return_value=False):
             paths, error = validate_office_target_paths(["/nonexistent/path/file.txt"])
         self.assertEqual(paths, [])
         self.assertIn("Path does not exist", error)
 
     def test_defers_existence_check_inside_container(self):
-        with mock.patch("common.compass_office_routing.is_containerized", return_value=True):
+        with mock.patch("compass.office_routing.is_containerized", return_value=True):
             paths, error = validate_office_target_paths(["/nonexistent/host/file.txt"])
         self.assertEqual(paths, ["/nonexistent/host/file.txt"])
         self.assertEqual(error, "")

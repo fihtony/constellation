@@ -101,8 +101,10 @@ class AgentRuntimeAdoptionTests(unittest.TestCase):
         #  or run_compass_workflow from common modules)
         valid_patterns = ["configure_control_tools", "configure_team_lead_control_tools",
                           "configure_web_agent_control_tools",
+                          "configure_android_agent_control_tools",
                           "configure_office_control_tools",
                           "team_lead_agentic_workflow", "web_agentic_workflow",
+                          "android_agentic_workflow",
                           "office_agentic_workflow",
                           "run_compass_workflow", "compass_agentic_workflow"]
         for path in all_agent_files:
@@ -198,6 +200,67 @@ class AgentRuntimeAdoptionTests(unittest.TestCase):
                 content = Path(manifest_path).read_text(encoding="utf-8")
                 self.assertIn("systemOrder:", content,
                               f"{agent}/prompts/system/manifest.yaml must have systemOrder field")
+
+    def test_runtime_agents_include_generic_workflow_skill_in_manifest(self):
+        agent_dirs = ["compass", "team-lead", "web", "office", "jira", "scm", "ui-design", "android"]
+        for agent in agent_dirs:
+            manifest_path = Path(PROJECT_ROOT, agent, "prompts", "system", "manifest.yaml")
+            with self.subTest(agent=agent):
+                content = manifest_path.read_text(encoding="utf-8")
+                self.assertIn(
+                    "constellation-generic-agent-workflow",
+                    content,
+                    f"{agent} manifest must include the generic agent workflow skill",
+                )
+
+    def test_android_uses_task_prompt_file_instead_of_inline_workflow_markdown(self):
+        android_app = Path(PROJECT_ROOT, "android", "app.py").read_text(encoding="utf-8")
+        self.assertTrue(
+            "build_android_task_prompt" in android_app,
+            "android/app.py must delegate task prompt construction to build_android_task_prompt",
+        )
+        # Old inline tool guide must not be in app.py directly
+        self.assertNotIn("## Your Workflow", android_app)
+
+    def test_android_task_prompt_uses_canonical_workspace_and_scm_tools(self):
+        prompt = Path(PROJECT_ROOT, "android", "prompts", "tasks", "implement.md").read_text(encoding="utf-8")
+        for token in (
+            "scm_clone_repo",
+            "get_task_context",
+            "read_local_file",
+            "write_local_file",
+            "edit_local_file",
+            "run_local_command",
+            "run_validation_command",
+            "collect_task_evidence",
+        ):
+            self.assertIn(token, prompt, f"android implement.md must reference {token}")
+        self.assertNotIn("use bash to clone", prompt.lower())
+
+    def test_android_agent_manifest_exists_with_generic_workflow_skill(self):
+        manifest_path = Path(PROJECT_ROOT, "android", "prompts", "system", "manifest.yaml")
+        self.assertTrue(manifest_path.is_file(), "android must have prompts/system/manifest.yaml")
+        content = manifest_path.read_text(encoding="utf-8")
+        self.assertIn("systemOrder:", content)
+        self.assertIn("constellation-generic-agent-workflow", content)
+
+    def test_office_system_tool_doc_uses_current_planning_tool(self):
+        prompt = Path(PROJECT_ROOT, "office", "prompts", "system", "20-tools.md").read_text(encoding="utf-8")
+        self.assertIn("todo_write", prompt)
+        self.assertNotIn("create_plan", prompt)
+        self.assertNotIn("update_plan_step", prompt)
+
+    def test_boundary_agents_expose_common_agentic_tools(self):
+        expectations = {
+            "jira": ["todo_write", "get_task_context", "get_agent_runtime_status", "list_skills"],
+            "scm": ["todo_write", "get_task_context", "get_agent_runtime_status", "list_skills"],
+            "ui-design": ["todo_write", "get_task_context", "get_agent_runtime_status", "list_skills"],
+        }
+        for agent, required_tokens in expectations.items():
+            source = Path(PROJECT_ROOT, agent, "app.py").read_text(encoding="utf-8")
+            for token in required_tokens:
+                with self.subTest(agent=agent, token=token):
+                    self.assertIn(token, source)
 
 
 if __name__ == "__main__":

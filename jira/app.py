@@ -94,6 +94,10 @@ def _make_provider():
 
 
 PROVIDER = _make_provider()
+JIRA_AGENT_SKILL_PLAYBOOKS = [
+    "constellation-generic-agent-workflow",
+    "jira-cloud-workflow",
+]
 
 
 def _load_agent_card():
@@ -118,6 +122,7 @@ def _record_workspace_phase(workspace_path: str, task_id: str, phase: str, **ext
             "agentId": AGENT_ID,
             "runtimeConfig": {
                 "runtime": summarize_runtime_configuration(),
+                "skillPlaybooks": list(JIRA_AGENT_SKILL_PLAYBOOKS),
                 "backend": JIRA_BACKEND,
             },
             **extra,
@@ -470,8 +475,10 @@ def _run_task_async(task_id, message):
                 "jira_comment", "jira_transition", "jira_assign",
                 "jira_create_issue", "jira_update_fields",
                 "jira_update_comment", "jira_delete_comment",
-                "report_progress", "complete_current_task", "fail_current_task",
-                "load_skill",
+                "todo_write", "report_progress",
+                "complete_current_task", "fail_current_task",
+                "get_task_context", "get_agent_runtime_status",
+                "load_skill", "list_skills",
             ],
             max_turns=15,
             timeout=300,

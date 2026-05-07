@@ -14,12 +14,12 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from common.artifact_store import ArtifactStore
-from common.compass_agentic_workflow import run_compass_workflow
-from common.compass_completeness import (
+from compass.agentic_workflow import run_compass_workflow
+from compass.completeness import (
     extract_pr_evidence_from_artifacts,
     derive_task_card_status,
 )
-from common.compass_office_routing import (
+from compass.office_routing import (
     validate_office_target_paths,
 )
 from common.devlog import record_workspace_stage
@@ -41,6 +41,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "compass-agent")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://localhost:{PORT}")
+REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000")
 # Unique ID for this Compass process instance.  Scopes artifact folders and
 # lets agents detect stale callbacks from a previous Compass instance.
 COMPASS_INSTANCE_ID = os.environ.get("COMPASS_INSTANCE_ID") or str(uuid.uuid4())[:8]
@@ -57,7 +58,7 @@ OFFICE_ALLOWED_BASE_PATHS = [
 OFFICE_CONTAINER_INPUT_PATH = "/app/userdata"
 OFFICE_CONTAINER_WORKSPACE_PATH = "/app/workspace"
 
-registry = RegistryClient()
+registry = RegistryClient(REGISTRY_URL)
 task_store = TaskStore()
 # Each Compass instance stores artifacts under its own subdirectory so that
 # a restart with a reset task counter cannot mix files with previous runs.
@@ -100,6 +101,14 @@ def _validate_office_target_paths(target_paths, *, allowed_base_paths=None):
             seen.add(real_path)
             normalized.append(real_path)
     return normalized, ""
+
+
+def _is_containerized():
+    return bool(
+        os.path.exists("/.dockerenv")
+        or os.path.exists("/run/.containerenv")
+        or os.environ.get("KUBERNETES_SERVICE_HOST", "").strip()
+    )
 
 # Notification target registry (IM Gateway or other webhook subscribers)
 _notification_targets_lock = threading.Lock()
@@ -333,7 +342,8 @@ def _refresh_task_card_metadata(task):
 
     if workspace_path:
         stage_summary = _read_workspace_json(workspace_path, "team-lead/stage-summary.json")
-        analysis = stage_summary.get("analysis") if isinstance(stage_summary.get("analysis"), dict) else {}
+        analysis_payload = stage_summary.get("analysis")
+        analysis = analysis_payload if isinstance(analysis_payload, dict) else {}
         current_phase = str(stage_summary.get("currentPhase") or "")
         design_context = _read_workspace_json(workspace_path, "team-lead/design-context.json")
         jira_context = _read_workspace_json(workspace_path, "team-lead/jira-context.json")

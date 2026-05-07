@@ -8,6 +8,7 @@ systemOrder:
   - 60-failure-handling.md
 includeSkills: true
 skillNames:
+  - constellation-generic-agent-workflow
   - github-rest-workflow
   - github-mcp-workflow
   - bitbucket-server-workflow

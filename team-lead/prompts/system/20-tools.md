@@ -8,6 +8,12 @@
 | `jira_add_comment` | Add a structured comment to a Jira ticket |
 | `design_fetch_figma_screen` | Fetch design specs from Figma |
 | `design_fetch_stitch_screen` | Fetch design specs from Google Stitch |
+| `scm_repo_inspect` | Inspect remote repo metadata (default branch, languages, build system) |
+| `scm_read_file` | Read a remote repo file without cloning |
+| `scm_list_dir` | Inspect a remote repo directory without cloning |
+| `scm_search_code` | Search remote repo code without cloning |
+| `scm_compare_refs` | Compare remote refs when investigating branch or revision state |
+| `scm_get_default_branch` | Resolve default/protected branches before dispatching repo-backed work |
 | `registry_query` | Query Registry for a specific capability |
 | `list_available_agents` | List all registered agents and capabilities |
 | `check_agent_status` | Check if a downstream agent is healthy |
@@ -38,11 +44,16 @@
 |------|---------|
 | `todo_write` | Write/update a structured task plan |
 | `load_skill` | Load a skill playbook for domain guidance |
+| `list_skills` | Discover available playbooks before loading one dynamically |
 | `read_local_file` | Read files from the shared workspace |
 | `write_local_file` | Write plan and summary files inside the shared workspace |
 | `edit_local_file` | Update existing workspace files without rewriting the whole file |
 | `list_local_dir` | Inspect workspace contents before deciding the next step |
 | `search_local_files` | Search workspace logs, plans, and evidence |
+| `scm_get_pr_details` | Inspect PR metadata during review |
+| `scm_get_pr_diff` | Inspect PR diff content during review |
+| `collect_task_evidence` | Aggregate workspace and artifact evidence before review decisions |
+| `check_definition_of_done` | Validate the delivery against acceptance and workflow checks |
 | `read_file` | Legacy alias for reading workspace files |
 | `write_file` | Legacy alias for writing workspace files |
 | `glob` | Legacy alias for file-pattern discovery |

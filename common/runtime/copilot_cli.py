@@ -384,32 +384,6 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
             backend_used="copilot-cli",
         )
 
-    def run_agentic(
-        self,
-        task: str,
-        *,
-        system_prompt: str | None = None,
-        cwd: str | None = None,
-        tools: list[str] | None = None,
-        mcp_servers: dict | None = None,
-        allowed_tools: list[str] | None = None,
-        disallowed_tools: list[str] | None = None,
-        max_turns: int = 50,
-        timeout: int = 1800,
-        on_progress: Callable[[str], None] | None = None,
-        continuation: str | None = None,
-    ) -> AgenticResult:
-        """Copilot CLI does not support headless agentic mode.
-
-        Use connect-agent runtime instead if you need agentic execution.
-        """
-        del task, system_prompt, cwd, tools, mcp_servers, allowed_tools, disallowed_tools
-        del max_turns, timeout, on_progress, continuation
-        raise NotImplementedError(
-            "CopilotCliAdapter does not support run_agentic(). "
-            "Use connect-agent runtime for agentic execution."
-        )
-
 
 from common.runtime.provider_registry import register_runtime  # noqa: E402
 

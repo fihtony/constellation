@@ -724,12 +724,14 @@ class Phase7AcceptanceCriteriaTests(unittest.TestCase):
         self.assertIsInstance(android_backend, str)
 
     def test_criterion_3_no_fallback_in_adapter(self):
-        """Backend must not auto-fallback — require_agentic_runtime must fail for copilot-cli."""
-        from common.runtime.adapter import require_agentic_runtime
-        with mock.patch.dict(os.environ, {"AGENT_RUNTIME": "copilot-cli"}):
+        """Backend must not auto-fallback — copilot-cli stays selected even when not ready."""
+        from common.runtime.adapter import require_agentic_runtime, summarize_runtime_configuration
+        with mock.patch.dict(os.environ, {"AGENT_RUNTIME": "copilot-cli"}, clear=False):
+            summary = summarize_runtime_configuration()
+            self.assertEqual(summary["effectiveBackend"], "copilot-cli")
             with self.assertRaises(RuntimeError) as ctx:
                 require_agentic_runtime("TestAgent")
-        self.assertIn("copilot-cli", str(ctx.exception).lower())
+        self.assertIn("copilot cli is not ready", str(ctx.exception).lower())
 
     def test_criterion_5_execution_agents_have_local_workspace_tools(self):
         """Execution agents must have local base tools registered."""
@@ -1109,5 +1111,188 @@ class Phase6BoundaryFilesTests(unittest.TestCase):
                          "office-agent-workflow SKILL.md must not contain Python class definitions")
 
 
+# ===========================================================================
+# common/ folder organization tests
+# ===========================================================================
+
+class CommonFolderOrganizationTests(unittest.TestCase):
+    """Verify common/ only contains files shared across all agents.
+
+    Agent-specific workflow helpers must live in their respective agent directories.
+    Backward-compat stubs are allowed in common/ but must re-export from canonical locations.
+    """
+
+    def test_compass_agentic_workflow_canonical_in_compass(self):
+        """Canonical implementation must be in compass/agentic_workflow.py."""
+        path = Path(_REPO_ROOT) / "compass" / "agentic_workflow.py"
+        self.assertTrue(path.is_file(), "compass/agentic_workflow.py must exist as canonical implementation")
+        content = path.read_text()
+        self.assertIn("run_compass_workflow", content)
+
+    def test_compass_completeness_canonical_in_compass(self):
+        path = Path(_REPO_ROOT) / "compass" / "completeness.py"
+        self.assertTrue(path.is_file(), "compass/completeness.py must exist")
+        content = path.read_text()
+        self.assertIn("extract_pr_evidence_from_artifacts", content)
+
+    def test_compass_office_routing_canonical_in_compass(self):
+        path = Path(_REPO_ROOT) / "compass" / "office_routing.py"
+        self.assertTrue(path.is_file(), "compass/office_routing.py must exist")
+        content = path.read_text()
+        self.assertIn("validate_office_target_paths", content)
+
+    def test_web_agentic_workflow_canonical_in_web(self):
+        path = Path(_REPO_ROOT) / "web" / "agentic_workflow.py"
+        self.assertTrue(path.is_file(), "web/agentic_workflow.py must exist as canonical implementation")
+        content = path.read_text()
+        self.assertIn("WEB_AGENT_RUNTIME_TOOL_NAMES", content)
+
+    def test_android_agentic_workflow_canonical_in_android(self):
+        path = Path(_REPO_ROOT) / "android" / "agentic_workflow.py"
+        self.assertTrue(path.is_file(), "android/agentic_workflow.py must exist as canonical implementation")
+        content = path.read_text()
+        self.assertIn("ANDROID_AGENT_RUNTIME_TOOL_NAMES", content)
+
+    def test_office_agentic_workflow_canonical_in_office(self):
+        path = Path(_REPO_ROOT) / "office" / "agentic_workflow.py"
+        self.assertTrue(path.is_file(), "office/agentic_workflow.py must exist as canonical implementation")
+        content = path.read_text()
+        self.assertIn("OFFICE_AGENT_RUNTIME_TOOL_NAMES", content)
+
+    def test_common_stubs_re_export_from_canonical(self):
+        """common/ stubs must re-export from the canonical agent-package location."""
+        stubs_to_check = [
+            ("common/compass_agentic_workflow.py", "compass.agentic_workflow"),
+            ("common/compass_completeness.py", "compass.completeness"),
+            ("common/compass_office_routing.py", "compass.office_routing"),
+            ("common/web_agentic_workflow.py", "web.agentic_workflow"),
+            ("common/android_agentic_workflow.py", "android.agentic_workflow"),
+            ("common/office_agentic_workflow.py", "office.agentic_workflow"),
+        ]
+        for stub_rel, canonical_module in stubs_to_check:
+            stub_path = Path(_REPO_ROOT) / stub_rel
+            self.assertTrue(stub_path.is_file(), f"Stub {stub_rel} must exist for backward compat")
+            content = stub_path.read_text()
+            self.assertIn(
+                canonical_module, content,
+                f"{stub_rel} must re-export from {canonical_module}"
+            )
+
+    def test_common_stubs_are_importable(self):
+        """All common/ stubs must be importable without errors."""
+        stubs = [
+            "common.compass_agentic_workflow",
+            "common.compass_completeness",
+            "common.compass_office_routing",
+            "common.web_agentic_workflow",
+            "common.android_agentic_workflow",
+            "common.office_agentic_workflow",
+        ]
+        for mod_name in stubs:
+            with self.subTest(module=mod_name):
+                mod = importlib.import_module(mod_name)
+                self.assertIsNotNone(mod)
+
+    def test_team_lead_agentic_workflow_stays_in_common_due_to_naming(self):
+        """team_lead_agentic_workflow stays in common/ because 'team-lead' is not
+        a valid Python identifier (hyphen), making direct package imports impossible."""
+        path = Path(_REPO_ROOT) / "common" / "team_lead_agentic_workflow.py"
+        self.assertTrue(path.is_file(), "common/team_lead_agentic_workflow.py must exist")
+        content = path.read_text()
+        # Should still contain the actual implementation (no re-export stub here)
+        self.assertIn("TEAM_LEAD_RUNTIME_TOOL_NAMES", content)
+
+    def test_common_tools_are_shared_infrastructure(self):
+        """Files directly in common/ (not in subdirs) should be shared infrastructure."""
+        shared_modules = [
+            "artifact_store.py", "agent_bus.py", "agent_directory.py",
+            "devlog.py", "env_utils.py", "instance_reporter.py",
+            "launcher.py", "llm_client.py", "message_utils.py",
+            "orchestrator.py", "per_task_exit.py", "policy.py",
+            "prompt_builder.py", "registry_client.py", "registry_store.py",
+            "rules_loader.py", "skills_catalog.py", "task_store.py",
+            "time_utils.py",
+        ]
+        for module in shared_modules:
+            path = Path(_REPO_ROOT) / "common" / module
+            self.assertTrue(path.is_file(), f"Shared infrastructure module common/{module} must exist")
+
+
+# ===========================================================================
+# Registry skill hot-upgrade tests
+# ===========================================================================
+
+class RegistrySkillHotUpgradeTests(unittest.TestCase):
+    """Registry must support skill hot-upgrade without agent restart."""
+
+    def test_registry_has_skills_rescan_endpoint_in_parse_path(self):
+        """_parse_path must recognize /skills/rescan."""
+        import sys
+        # Ensure registry module is importable
+        registry_path = str(Path(_REPO_ROOT) / "registry")
+        if registry_path not in sys.path:
+            sys.path.insert(0, registry_path)
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "registry_app", Path(_REPO_ROOT) / "registry" / "app.py"
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            resource, _, _, _ = module._parse_path("/skills/rescan")
+            self.assertEqual(resource, "skills_rescan")
+        except Exception as exc:
+            self.fail(f"Could not load registry app.py: {exc}")
+
+    def test_registry_has_periodic_rescan_function(self):
+        """Registry must export _start_skills_rescan_thread for hot-upgrade support."""
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "registry_app_fn", Path(_REPO_ROOT) / "registry" / "app.py"
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.assertTrue(
+                hasattr(module, "_start_skills_rescan_thread"),
+                "Registry must have _start_skills_rescan_thread for hot-upgrade"
+            )
+        except Exception as exc:
+            self.fail(f"Could not load registry app.py: {exc}")
+
+    def test_skills_catalog_scan_is_idempotent(self):
+        """Rescanning the catalog should be safe to call multiple times."""
+        from common.skills_catalog import SkillsCatalog
+        catalog = SkillsCatalog(
+            skills_root=str(Path(_REPO_ROOT) / ".github" / "skills")
+        )
+        catalog.scan()
+        v1 = catalog.get_version()
+        c1 = len(catalog.get_catalog())
+        catalog.scan()
+        v2 = catalog.get_version()
+        c2 = len(catalog.get_catalog())
+        self.assertEqual(v1, v2, "Version should be stable across identical rescans")
+        self.assertEqual(c1, c2, "Catalog count should be stable")
+
+    def test_skills_catalog_version_changes_on_new_skill(self):
+        """Adding a new skill should change the catalog version."""
+        from common.skills_catalog import SkillsCatalog
+        with tempfile.TemporaryDirectory() as tmpdir:
+            catalog = SkillsCatalog(skills_root=tmpdir)
+            catalog.scan()
+            v1 = catalog.get_version()
+            # Add a new skill
+            skill_dir = Path(tmpdir) / "test-skill"
+            skill_dir.mkdir()
+            (skill_dir / "skill.yaml").write_text(
+                "id: test-skill\nversion: 1.0.0\nlevel: generic\n"
+            )
+            (skill_dir / "SKILL.md").write_text("# Test Skill\nA test skill.")
+            catalog.scan()
+            v2 = catalog.get_version()
+            self.assertNotEqual(v1, v2, "Version must change when a new skill is added")
+            self.assertEqual(len(catalog.get_catalog()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -8,6 +8,7 @@ systemOrder:
   - 60-failure-handling.md
 includeSkills: true
 skillNames:
+  - constellation-generic-agent-workflow
   - constellation-architecture-delivery
   - constellation-frontend-delivery
   - constellation-backend-delivery

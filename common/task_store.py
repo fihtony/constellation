@@ -61,7 +61,7 @@ class Task:
         self.created_at = time.time()
         self.updated_at = time.time()
         self.original_message = None
-        self.pending_workflow = None
+        self.pending_workflow: list[str] | None = None
         self.downstream_task_id = ""
         self.downstream_service_url = ""
         self.summary = ""
