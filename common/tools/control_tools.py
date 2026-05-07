@@ -698,6 +698,135 @@ class RequestAgentClarificationTool(ConstellationTool):
 
 
 # ---------------------------------------------------------------------------
+# aggregate_task_card
+# ---------------------------------------------------------------------------
+
+class AggregateTaskCardTool(ConstellationTool):
+    """Aggregate task evidence from artifacts and workspace into a structured card.
+
+    Reads Team Lead's own workspace files and A2A artifacts to build a compact
+    summary of task progress, PR evidence, Jira context, and completeness issues.
+    Never reads execution-agent subdirectories directly.
+    """
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="aggregate_task_card",
+            description=(
+                "Aggregate task evidence from A2A artifacts and Team Lead workspace files. "
+                "Returns PR URL, branch, jiraInReview flag, completeness issues, and current phase. "
+                "Use this to check whether a team-lead.task.analyze deliverable is complete before "
+                "calling complete_current_task. Never reads execution-agent workspace files directly."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "artifacts": {
+                        "type": "array",
+                        "description": "A2A artifacts from the latest Team Lead callback.",
+                        "items": {"type": "object"},
+                    },
+                },
+                "required": ["artifacts"],
+            },
+        )
+
+    def execute(self, args: dict) -> dict:
+        artifacts = list(args.get("artifacts") or [])
+        workspace_path = str(_task_context.get("workspacePath") or "")
+
+        try:
+            from common.compass_completeness import (
+                extract_pr_evidence_from_artifacts,
+                extract_team_lead_completeness_issues,
+                derive_task_card_status,
+            )
+        except ImportError as exc:
+            return self.error(f"compass_completeness module not available: {exc}")
+
+        pr_evidence = extract_pr_evidence_from_artifacts(artifacts)
+        issues = extract_team_lead_completeness_issues(workspace_path, artifacts)
+
+        # Derive current phase from team-lead workspace
+        current_phase = ""
+        try:
+            import json as _json
+            import os as _os
+            stage_path = _os.path.join(workspace_path, "team-lead", "stage-summary.json")
+            if _os.path.isfile(stage_path):
+                with open(stage_path, encoding="utf-8") as fh:
+                    stage = _json.load(fh)
+                current_phase = str(stage.get("currentPhase") or "")
+        except Exception:  # noqa: BLE001
+            pass
+
+        card = {
+            "prEvidence": pr_evidence,
+            "completenessIssues": issues,
+            "isComplete": len(issues) == 0,
+            "currentPhase": current_phase,
+            "artifactCount": len(artifacts),
+        }
+        return self.ok(json.dumps(card, ensure_ascii=False, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# derive_user_facing_status
+# ---------------------------------------------------------------------------
+
+class DeriveUserFacingStatusTool(ConstellationTool):
+    """Derive the user-facing status label and kind from task state and artifacts."""
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="derive_user_facing_status",
+            description=(
+                "Derive the user-facing status label (e.g. 'Completed / PR Raised', "
+                "'Completed / In Review', 'Failed', 'Waiting for Info') from the task "
+                "state and PR evidence in artifacts."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task_state": {
+                        "type": "string",
+                        "description": "Current task state string, e.g. 'TASK_STATE_COMPLETED'.",
+                    },
+                    "artifacts": {
+                        "type": "array",
+                        "description": "A2A artifacts to extract PR evidence from.",
+                        "items": {"type": "object"},
+                    },
+                },
+                "required": ["task_state"],
+            },
+        )
+
+    def execute(self, args: dict) -> dict:
+        task_state = str(args.get("task_state") or "").strip()
+        artifacts = list(args.get("artifacts") or [])
+
+        try:
+            from common.compass_completeness import (
+                extract_pr_evidence_from_artifacts,
+                derive_task_card_status,
+            )
+        except ImportError as exc:
+            return self.error(f"compass_completeness module not available: {exc}")
+
+        pr_evidence = extract_pr_evidence_from_artifacts(artifacts)
+        status_kind, status_label = derive_task_card_status(task_state, pr_evidence)
+        return self.ok(
+            json.dumps(
+                {"statusKind": status_kind, "statusLabel": status_label, "prEvidence": pr_evidence},
+                ensure_ascii=False,
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
 # Self-register all tools
 # ---------------------------------------------------------------------------
 
@@ -710,3 +839,5 @@ register_tool(GetTaskContextTool())
 register_tool(GetAgentRuntimeStatusTool())
 register_tool(RequestUserInputTool())
 register_tool(RequestAgentClarificationTool())
+register_tool(AggregateTaskCardTool())
+register_tool(DeriveUserFacingStatusTool())

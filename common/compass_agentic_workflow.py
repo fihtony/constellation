@@ -24,6 +24,8 @@ COMPASS_RUNTIME_TOOL_NAMES = [
     "check_agent_status",
     "get_task_context",
     "get_agent_runtime_status",
+    "aggregate_task_card",
+    "derive_user_facing_status",
     "load_skill",
     "list_skills",
     "todo_write",
@@ -56,9 +58,10 @@ def build_compass_workflow_prompt(
         f"2. For each downstream capability you decide to run, use `dispatch_agent_task`, then `wait_for_agent_task`.\n"
         f"   - If dispatch fails because no idle instance is available, use `launch_per_task_agent` first.\n"
         f"3. If a downstream agent reports INPUT_REQUIRED, forward the question to the user via `request_user_input`.\n"
-        f"4. After the final step completes, verify completeness:\n"
-        f"   - For team-lead.task.analyze, check artifacts and workspace evidence for PR URL and branch data.\n"
-        f"   - If evidence is missing, dispatch a follow-up (max {max_revisions} retries).\n"
+        f"4. After the final step completes, verify completeness using `aggregate_task_card`:\n"
+        f"   - Pass the artifacts from the last callback to `aggregate_task_card`.\n"
+        f"   - If isComplete=false, inspect completenessIssues and dispatch a follow-up (max {max_revisions} retries).\n"
+        f"   - Use `derive_user_facing_status` to determine the correct status label for the user.\n"
         f"5. Prefer shared-workspace aliases (`read_local_file`, `list_local_dir`, `search_local_files`) when inspecting evidence.\n"
         f"6. When all steps are complete, call `complete_current_task` with a user-friendly summary.\n"
         f"7. If any step fails irreversibly, call `fail_current_task` with a clear explanation.\n"

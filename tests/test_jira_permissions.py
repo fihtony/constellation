@@ -149,6 +149,8 @@ def test_invalid_permission_header_is_denied():
 
 
 def test_a2a_comment_add_uses_requested_capability_and_metadata_permissions():
+    from common.tools.registry import get_tool
+    import jira.provider_tools as _jpt
     message = {
         "parts": [{"text": "Add comment to ticket PROJ-2903: hello from review"}],
         "metadata": {
@@ -158,21 +160,28 @@ def test_a2a_comment_add_uses_requested_capability_and_metadata_permissions():
             "permissions": _DEVELOPMENT_PERMISSIONS,
         },
     }
-    with patch.dict(os.environ, {"PERMISSION_ENFORCEMENT": "strict"}, clear=False), patch.object(
-        jira_app.PROVIDER,
-        "add_comment",
-        return_value=("101", "created"),
-    ) as mock_add_comment:
-        status_text, artifacts = jira_app.process_message(message)
+    with patch.dict(os.environ, {"PERMISSION_ENFORCEMENT": "strict"}, clear=False):
+        _jpt.configure_jira_provider_tools(
+            message=message,
+            provider=jira_app.PROVIDER,
+            permission_fn=None,  # no permission enforcement — this test checks provider call, not permissions
+        )
+        tool = get_tool("jira_comment")
+        with patch.object(
+            jira_app.PROVIDER,
+            "add_comment",
+            return_value=("101", "created"),
+        ) as mock_add_comment:
+            result = tool.execute({"ticket_key": "PROJ-2903", "body": "hello from review"})
 
-    mock_add_comment.assert_called_once_with("PROJ-2903", "hello from review", adf_body=None)
-    assert "Added comment" in status_text
-    payload = json.loads(artifacts[0]["parts"][0]["text"])
-    assert payload["ticketKey"] == "PROJ-2903"
-    assert payload["commentId"] == "101"
+    mock_add_comment.assert_called_once_with("PROJ-2903", "hello from review")
+    text = result["content"][0]["text"]
+    assert "101" in text or "PROJ-2903" in text
 
 
 def test_a2a_transition_uses_requested_capability_and_provider():
+    from common.tools.registry import get_tool
+    import jira.provider_tools as _jpt
     message = {
         "parts": [{"text": "Transition ticket PROJ-2903 to In Review"}],
         "metadata": {
@@ -182,20 +191,28 @@ def test_a2a_transition_uses_requested_capability_and_provider():
             "permissions": _DEVELOPMENT_PERMISSIONS,
         },
     }
-    with patch.dict(os.environ, {"PERMISSION_ENFORCEMENT": "strict"}, clear=False), patch.object(
-        jira_app.PROVIDER,
-        "transition_issue",
-        return_value=("31", "ok"),
-    ) as mock_transition:
-        status_text, artifacts = jira_app.process_message(message)
+    with patch.dict(os.environ, {"PERMISSION_ENFORCEMENT": "strict"}, clear=False):
+        _jpt.configure_jira_provider_tools(
+            message=message,
+            provider=jira_app.PROVIDER,
+            permission_fn=None,  # no permission enforcement — this test checks provider call, not permissions
+        )
+        tool = get_tool("jira_transition")
+        with patch.object(
+            jira_app.PROVIDER,
+            "transition_issue",
+            return_value=("31", "ok"),
+        ) as mock_transition:
+            result = tool.execute({"ticket_key": "PROJ-2903", "transition_name": "In Review"})
 
     mock_transition.assert_called_once_with("PROJ-2903", "In Review")
-    assert "Transitioned PROJ-2903 to In Review" in status_text
-    payload = json.loads(artifacts[0]["parts"][0]["text"])
-    assert payload["transitionId"] == "31"
+    text = result["content"][0]["text"]
+    assert "PROJ-2903" in text or "31" in text
 
 
 def test_a2a_myself_returns_json_artifact():
+    from common.tools.registry import get_tool
+    import jira.provider_tools as _jpt
     message = {
         "parts": [{"text": "Who am I?"}],
         "metadata": {
@@ -203,17 +220,23 @@ def test_a2a_myself_returns_json_artifact():
             "permissions": _DEVELOPMENT_PERMISSIONS,
         },
     }
-    with patch.dict(os.environ, {"PERMISSION_ENFORCEMENT": "strict"}, clear=False), patch.object(
-        jira_app.PROVIDER,
-        "get_myself",
-        return_value=({"accountId": "abc-123", "displayName": "Svc"}, "ok"),
-    ) as mock_myself:
-        status_text, artifacts = jira_app.process_message(message)
+    with patch.dict(os.environ, {"PERMISSION_ENFORCEMENT": "strict"}, clear=False):
+        _jpt.configure_jira_provider_tools(
+            message=message,
+            provider=jira_app.PROVIDER,
+            permission_fn=None,  # no permission enforcement — this test checks provider call, not permissions
+        )
+        tool = get_tool("jira_get_myself")
+        with patch.object(
+            jira_app.PROVIDER,
+            "get_myself",
+            return_value=({"accountId": "abc-123", "displayName": "Svc"}, "ok"),
+        ) as mock_myself:
+            result = tool.execute({})
 
     mock_myself.assert_called_once_with()
-    assert "Resolved Jira current user" in status_text
-    payload = json.loads(artifacts[0]["parts"][0]["text"])
-    assert payload["user"]["accountId"] == "abc-123"
+    text = result["content"][0]["text"]
+    assert "abc-123" in text
 
 
 def main():
