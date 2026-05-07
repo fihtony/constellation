@@ -841,3 +841,99 @@ register_tool(RequestUserInputTool())
 register_tool(RequestAgentClarificationTool())
 register_tool(AggregateTaskCardTool())
 register_tool(DeriveUserFacingStatusTool())
+
+
+# ---------------------------------------------------------------------------
+# validate_office_paths
+# ---------------------------------------------------------------------------
+
+class ValidateOfficePathsTool(ConstellationTool):
+    """Validate office target paths and compute Docker bind mounts.
+
+    Used by the Compass agentic workflow when routing office tasks.
+    Returns the validated paths and the ``extra_binds`` list to pass to
+    ``launch_per_task_agent`` so the Office Agent container can access the
+    user's files.
+    """
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="validate_office_paths",
+            description=(
+                "Validate one or more absolute file/directory paths for an office task "
+                "and compute the Docker bind mounts needed to launch the Office Agent. "
+                "Returns validatedPaths, extraBinds (for launch_per_task_agent), and "
+                "an error message when paths are invalid."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "target_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Absolute host paths to validate.",
+                    },
+                    "output_mode": {
+                        "type": "string",
+                        "enum": ["workspace", "inplace"],
+                        "description": "workspace = read-only; inplace = read-write.",
+                    },
+                    "workspace_host_path": {
+                        "type": "string",
+                        "description": "Host-side shared workspace path (optional).",
+                    },
+                },
+                "required": ["target_paths"],
+            },
+        )
+
+    def execute(self, args: dict) -> dict:
+        from common.compass_office_routing import (
+            validate_office_target_paths,
+            build_office_dispatch_context,
+        )
+
+        raw_paths = [str(p).strip() for p in (args.get("target_paths") or []) if str(p).strip()]
+        output_mode = str(args.get("output_mode") or "workspace").strip().lower()
+        workspace_host_path = str(args.get("workspace_host_path") or "").strip()
+
+        allowed_base_paths_env = os.environ.get("OFFICE_ALLOWED_BASE_PATHS", "")
+        allowed_base_paths = [
+            os.path.realpath(p.strip())
+            for p in allowed_base_paths_env.split(":")
+            if p.strip()
+        ] or None
+
+        validated, error = validate_office_target_paths(raw_paths, allowed_base_paths)
+
+        if error:
+            return self.error(f"Office path validation failed: {error}")
+
+        if not validated:
+            return self.error("No valid paths provided. Please supply absolute paths to files or directories.")
+
+        try:
+            dispatch_ctx = build_office_dispatch_context(
+                validated,
+                output_mode=output_mode,
+                workspace_host_path=workspace_host_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self.error(f"Failed to build office dispatch context: {exc}")
+
+        return self.ok(
+            json.dumps(
+                {
+                    "validatedPaths": validated,
+                    "containerTargetPaths": dispatch_ctx["mountedTargetPaths"],
+                    "extraBinds": dispatch_ctx["extraBinds"],
+                    "outputMode": output_mode,
+                    "readMode": dispatch_ctx["readMode"],
+                },
+                ensure_ascii=False,
+            )
+        )
+
+
+register_tool(ValidateOfficePathsTool())

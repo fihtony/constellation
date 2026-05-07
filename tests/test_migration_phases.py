@@ -1076,6 +1076,37 @@ class Phase6BoundaryFilesTests(unittest.TestCase):
             "authorized" in content.lower() or "authorization" in content.lower(),
             "office 10-boundaries.md must mention authorization"
         )
+        # Must NOT reference the old OFFICE_ALLOWED_PATHS variable
+        self.assertNotIn("OFFICE_ALLOWED_PATHS", content,
+                         "office 10-boundaries.md must not reference OFFICE_ALLOWED_PATHS")
+
+    def test_office_tools_use_canonical_names(self):
+        content = (Path(_REPO_ROOT) / "office" / "prompts" / "system" / "20-tools.md").read_text()
+        for token in ("read_local_file", "write_local_file", "list_local_dir",
+                      "search_local_files", "run_local_command"):
+            self.assertIn(token, content, f"office 20-tools.md must list {token}")
+        # Old aliases must not be the primary tool names
+        for old_name in ("`read_file`", "`write_file`", "`list_dir`", "`glob`"):
+            self.assertNotIn(old_name, content,
+                             f"office 20-tools.md must not use legacy tool name {old_name}")
+
+    def test_office_decision_policy_no_allowed_paths_variable(self):
+        content = (Path(_REPO_ROOT) / "office" / "prompts" / "system" / "30-decision-policy.md").read_text()
+        self.assertNotIn("OFFICE_ALLOWED_PATHS", content,
+                         "office 30-decision-policy.md must not reference OFFICE_ALLOWED_PATHS")
+
+    def test_office_agent_workflow_skill_exists_and_has_llm_guidance(self):
+        skill_path = Path(_REPO_ROOT) / ".github" / "skills" / "office-agent-workflow" / "SKILL.md"
+        self.assertTrue(skill_path.is_file(), "office-agent-workflow skill must exist")
+        content = skill_path.read_text()
+        self.assertGreater(len(content), 500, "office-agent-workflow SKILL.md must have substantial content")
+        # Must contain LLM-guidance keywords, not Python class names
+        self.assertTrue(
+            "summarize" in content.lower() or "analyze" in content.lower() or "organize" in content.lower(),
+            "office-agent-workflow SKILL.md must contain LLM guidance for office capabilities"
+        )
+        self.assertNotIn("class ", content,
+                         "office-agent-workflow SKILL.md must not contain Python class definitions")
 
 
 if __name__ == "__main__":

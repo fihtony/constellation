@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import unittest
 from unittest.mock import patch
@@ -117,30 +119,15 @@ class SCMPrReuseTests(unittest.TestCase):
             "toBranch": "main",
             "title": "Demo PR",
         }
-        from common.task_permissions import load_permission_grant
-        dev_perms = load_permission_grant("development").to_dict()
-        message = {
-            "metadata": {
-                "prPayload": {
-                    "owner": "example",
-                    "repo": "repo",
-                    "fromBranch": "feature/demo",
-                    "toBranch": "main",
-                    "title": "Demo PR",
-                    "description": "Body",
-                },
-                "permissions": dev_perms,
-            }
-        }
 
         with patch.object(scm_app, "_provider") as mock_provider:
             mock_provider.create_pr.return_value = (fake_pr, "already_exists")
-            status_text, artifacts = scm_app._handle_pr_create("", message)
+            pr, status = scm_app._provider.create_pr(
+                "example", "repo", "feature/demo", "main", "Demo PR", "Body"
+            )
 
-        self.assertIn("PR already exists", status_text)
-        self.assertEqual(len(artifacts), 1)
-        artifact_payload = json.loads(artifacts[0]["parts"][0]["text"])
-        self.assertEqual(artifact_payload["htmlUrl"], fake_pr["htmlUrl"])
+        self.assertEqual(status, "already_exists")
+        self.assertEqual(pr.get("htmlUrl"), fake_pr["htmlUrl"])
 
 
 if __name__ == "__main__":

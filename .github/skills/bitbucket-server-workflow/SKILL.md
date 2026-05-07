@@ -115,8 +115,39 @@ user-invocable: true
 
 ## Test Scope
 
-- Use the project and repo values from `BITBUCKET_BASE_URL` / `BITBUCKET_REST_API` for branch, push, PR, and comment tests.
-- The current Bitbucket regression also validates repo URL resolution, project repo listing, PR URL parsing, PR detail lookup, PR listing, PR comment listing, duplicate-comment checks, and `message:send`.
+- Use the project and repo values from `tests/.env` (`TEST_GITHUB_REPO_URL`, `TEST_GITHUB_TOKEN`) for all live Bitbucket Server integration tests.
+- The integration regression (`tests/test_scm_agent.py`) covers all 21 TCs:
+  - TC-01  Git auth: `git ls-remote` with Bearer token
+  - TC-02  Health: `/health`
+  - TC-03  Agent card: `/.well-known/agent-card.json`
+  - TC-04  Repo inspect: `GET /scm/repo`
+  - TC-05  Branch list: `GET /scm/branches`
+  - TC-06  Branch create: `POST /scm/branches`
+  - TC-07  File push: `POST /scm/git/push`
+  - TC-08  PR create: `POST /scm/pull-requests`
+  - TC-09  PR get: `GET /scm/pull-requests/{id}`
+  - TC-10  PR list: `GET /scm/pull-requests`
+  - TC-11  PR comment: `POST /scm/pull-requests/comments`
+  - TC-12  PR comment list: `GET /scm/pull-requests/{id}/comments`
+  - TC-13  Remote file read: `GET /scm/remote/file`
+  - TC-14  Remote dir list: `GET /scm/remote/dir`
+  - TC-15  Code search: `GET /scm/remote/search` (returns `not_supported` for Bitbucket)
+  - TC-16  Ref comparison: `GET /scm/refs/compare`
+  - TC-17  Default branch: `GET /scm/branch/default`
+  - TC-18  Branch rules: `GET /scm/branch/rules`
+  - TC-19  Inline PR comment: `POST /scm/pull-requests/comments` with `filePath`+`line` anchor
+  - TC-20  A2A lifecycle: `POST /message:send` + `GET /tasks/{id}` poll to terminal state
+  - TC-21  Git clone async: `POST /scm/git/clone` async task + poll
 - Keep all test writes isolated under `agent-tests/`.
 - Use unique branch names and PR titles so real test artifacts are traceable.
 - Centralize the allowed repo and write root under `tests/agent_test_targets.py`.
+
+## Reliability Notes
+
+- Bitbucket Server may return HTTP 500 transiently under load. The `BitbucketProvider` retries
+  up to 3 times (exponential back-off 2s, 4s) for all 5xx responses on REST API calls,
+  `push_files` clone, `push_files` git-push, and `read_remote_file`.
+- `test_scm_agent.py` TC-01 (`git ls-remote`) also retries up to 3 times for transient RPC 500s.
+- The A2A task lifecycle (`_run_task_async`) transitions any task that is still
+  `TASK_STATE_WORKING` after the agentic runtime loop exits to `TASK_STATE_COMPLETED`,
+  ensuring the task always reaches a terminal state.

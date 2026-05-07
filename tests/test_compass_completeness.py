@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from compass import app as compass_app
+from common.compass_completeness import extract_team_lead_completeness_issues
 
 
 class CompassCompletenessTests(unittest.TestCase):
@@ -18,22 +18,20 @@ class CompassCompletenessTests(unittest.TestCase):
     def test_extract_team_lead_completeness_issues_passes_when_review_passed(self):
         """reviewPassed=True in Team Lead summary artifact → no issues (trust the review)."""
         with tempfile.TemporaryDirectory(prefix="compass_complete_") as workspace:
-            task = SimpleNamespace(workspace_path=workspace, artifacts=[])
             # All evidence comes via A2A artifacts; workspace files are irrelevant here.
             artifacts = [{"metadata": {"capability": "team-lead.task.analyze", "reviewPassed": True}}]
 
-            issues = compass_app._extract_team_lead_completeness_issues(task, artifacts)
+            issues = extract_team_lead_completeness_issues(workspace, artifacts)
 
         self.assertEqual(issues, [])
 
     def test_extract_team_lead_completeness_issues_detects_failed_review(self):
         """reviewPassed=False → 'Team Lead review did not pass.' issue raised."""
         with tempfile.TemporaryDirectory(prefix="compass_incomplete_") as workspace:
-            task = SimpleNamespace(workspace_path=workspace, artifacts=[])
             # reviewPassed=False and no PR evidence in artifacts
             artifacts = [{"metadata": {"capability": "team-lead.task.analyze", "reviewPassed": False}}]
 
-            issues = compass_app._extract_team_lead_completeness_issues(task, artifacts)
+            issues = extract_team_lead_completeness_issues(workspace, artifacts)
 
         self.assertIn("Team Lead review did not pass.", issues)
 
@@ -47,10 +45,9 @@ class CompassCompletenessTests(unittest.TestCase):
                 "analysis": {"target_repo_url": "https://github.com/example/repo"},
             })
             # reviewPassed not set and no prUrl in artifacts → PR missing issue
-            task = SimpleNamespace(workspace_path=workspace, artifacts=[])
             artifacts = [{"metadata": {"capability": "team-lead.task.analyze"}}]
 
-            issues = compass_app._extract_team_lead_completeness_issues(task, artifacts)
+            issues = extract_team_lead_completeness_issues(workspace, artifacts)
 
         self.assertIn("Pull request URL is missing from execution agent artifacts.", issues)
         self.assertIn("Branch name is missing from execution agent artifacts.", issues)
@@ -64,7 +61,6 @@ class CompassCompletenessTests(unittest.TestCase):
             self._write_json(workspace, "team-lead/stage-summary.json", {
                 "analysis": {"target_repo_url": "https://github.com/example/repo"},
             })
-            task = SimpleNamespace(workspace_path=workspace, artifacts=[])
             artifacts = [
                 {"metadata": {"capability": "team-lead.task.analyze"}},
                 {"metadata": {
@@ -75,7 +71,7 @@ class CompassCompletenessTests(unittest.TestCase):
                 }},
             ]
 
-            issues = compass_app._extract_team_lead_completeness_issues(task, artifacts)
+            issues = extract_team_lead_completeness_issues(workspace, artifacts)
 
         # No PR-related issues
         self.assertNotIn("Pull request URL is missing from execution agent artifacts.", issues)
@@ -84,7 +80,6 @@ class CompassCompletenessTests(unittest.TestCase):
     def test_extract_team_lead_completeness_issues_skips_validation_checkpoint(self):
         """validationCheckpoint=True → no issues regardless of other state."""
         with tempfile.TemporaryDirectory(prefix="compass_validation_checkpoint_") as workspace:
-            task = SimpleNamespace(workspace_path=workspace, artifacts=[])
             artifacts = [
                 {
                     "metadata": {
@@ -95,14 +90,13 @@ class CompassCompletenessTests(unittest.TestCase):
                 }
             ]
 
-            issues = compass_app._extract_team_lead_completeness_issues(task, artifacts)
+            issues = extract_team_lead_completeness_issues(workspace, artifacts)
 
         self.assertEqual(issues, [])
 
     def test_extract_team_lead_completeness_issues_skips_max_cycles_reached(self):
         """reviewMaxCyclesReached=True → skip retry regardless of reviewPassed value."""
         with tempfile.TemporaryDirectory(prefix="compass_max_cycles_") as workspace:
-            task = SimpleNamespace(workspace_path=workspace, artifacts=[])
             artifacts = [
                 {
                     "metadata": {
@@ -113,7 +107,7 @@ class CompassCompletenessTests(unittest.TestCase):
                 }
             ]
 
-            issues = compass_app._extract_team_lead_completeness_issues(task, artifacts)
+            issues = extract_team_lead_completeness_issues(workspace, artifacts)
 
         self.assertEqual(issues, [])
 

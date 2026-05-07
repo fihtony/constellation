@@ -76,7 +76,8 @@ class BitbucketProvider(SCMProvider):
         return f"Bearer {token}"
 
     def _request(
-        self, method: str, path: str, payload: dict | None = None, timeout: int = 20
+        self, method: str, path: str, payload: dict | None = None, timeout: int = 20,
+        _retries: int = 2,
     ) -> tuple[int, dict]:
         url = f"{self._rest_api.rstrip('/')}/{path.lstrip('/')}"
         headers = {"Accept": "application/json"}
@@ -88,18 +89,31 @@ class BitbucketProvider(SCMProvider):
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
         req = Request(url, data=data, headers=headers, method=method)
-        try:
-            with urlopen(req, timeout=timeout, context=self._ssl_ctx()) as resp:
-                raw = resp.read().decode("utf-8")
-                return resp.status, json.loads(raw) if raw.strip() else {}
-        except HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
+        last_status, last_body = 0, {}
+        for attempt in range(1 + _retries):
+            if attempt > 0:
+                import time as _time
+                _time.sleep(2 ** attempt)  # 2s, 4s back-off
             try:
-                return exc.code, json.loads(raw)
-            except Exception:
-                return exc.code, {"error": raw[:500]}
-        except URLError as exc:
-            return 0, {"error": str(exc)}
+                with urlopen(req, timeout=timeout, context=self._ssl_ctx()) as resp:
+                    raw = resp.read().decode("utf-8")
+                    return resp.status, json.loads(raw) if raw.strip() else {}
+            except HTTPError as exc:
+                raw = exc.read().decode("utf-8", errors="replace")
+                try:
+                    last_status, last_body = exc.code, json.loads(raw)
+                except Exception:
+                    last_status, last_body = exc.code, {"error": raw[:500]}
+                if exc.code < 500 or attempt == _retries:
+                    return last_status, last_body
+                # 5xx — retry
+                continue
+            except URLError as exc:
+                last_status, last_body = 0, {"error": str(exc)}
+                if attempt == _retries:
+                    return last_status, last_body
+                continue
+        return last_status, last_body
 
     def _default_branch(self, project: str, repo: str) -> str:
         status, body = self._request("GET", f"projects/{project}/repos/{quote(repo)}/branches/default")
@@ -381,7 +395,19 @@ class BitbucketProvider(SCMProvider):
         workspace = tempfile.mkdtemp(prefix=f"scm-push-{repo}-")
         repo_dir = os.path.join(workspace, repo)
         try:
-            ok, detail = self._run_git(["clone", "--depth", "1", "--branch", base_branch, clone_url, repo_dir])
+            # Retry clone for transient 5xx server errors.
+            ok, detail = False, {}
+            for _clone_attempt in range(3):
+                ok, detail = self._run_git(["clone", "--depth", "1", "--branch", base_branch, clone_url, repo_dir])
+                if ok:
+                    break
+                output = detail.get("output", "")
+                if "500" not in output and "RPC failed" not in output:
+                    break
+                import time as _time
+                _time.sleep(4)
+                # Remove partial clone directory before retrying
+                shutil.rmtree(repo_dir, ignore_errors=True)
             if not ok:
                 return detail, "clone_failed"
             self._run_git(["config", "user.name", self._author_name], cwd=repo_dir)
@@ -416,7 +442,17 @@ class BitbucketProvider(SCMProvider):
             ok, detail = self._run_git(["commit", "-m", commit_message], cwd=repo_dir)
             if not ok:
                 return detail, "commit_failed"
-            ok, detail = self._run_git(["push", "--force", "-u", "origin", branch], cwd=repo_dir)
+            # Retry push up to 3 times to handle transient 5xx server errors.
+            ok, detail = False, {}
+            for _push_attempt in range(3):
+                ok, detail = self._run_git(["push", "--force", "-u", "origin", branch], cwd=repo_dir)
+                if ok:
+                    break
+                output = detail.get("output", "")
+                if "500" not in output and "RPC failed" not in output:
+                    break
+                import time as _time
+                _time.sleep(4)
             if not ok:
                 return detail, "push_failed"
             return {
@@ -458,15 +494,21 @@ class BitbucketProvider(SCMProvider):
         auth = self._auth_header()
         if auth:
             headers["Authorization"] = auth
-        req = Request(url, headers=headers)
-        try:
-            with urlopen(req, timeout=20, context=self._ssl_ctx()) as resp:
-                raw = resp.read()
-                return raw.decode("utf-8", errors="replace"), "ok"
-        except HTTPError as exc:
-            return "", f"error_{exc.code}"
-        except URLError as exc:
-            return "", f"url_error: {exc}"
+        import time as _time
+        for _attempt in range(3):
+            req = Request(url, headers=headers)
+            try:
+                with urlopen(req, timeout=20, context=self._ssl_ctx()) as resp:
+                    raw = resp.read()
+                    return raw.decode("utf-8", errors="replace"), "ok"
+            except HTTPError as exc:
+                if exc.code < 500 or _attempt == 2:
+                    return "", f"error_{exc.code}"
+                _time.sleep(4)
+                continue
+            except URLError as exc:
+                return "", f"url_error: {exc}"
+        return "", "error_500"
 
     def list_remote_dir(
         self, owner: str, repo: str, path: str = "", ref: str = ""

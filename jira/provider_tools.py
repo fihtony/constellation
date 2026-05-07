@@ -12,11 +12,13 @@ Usage in app.py:
         permission_fn=lambda action, target, scope="*": _require_jira_permission(
             action=action, target=target, scope=scope, message=message
         ),
+        audit_fn=lambda operation, target, input_summary, result, duration_ms=0: _write_jira_audit(...),
     )
 """
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Callable
 
 from common.tools.base import ConstellationTool, ToolSchema
@@ -29,6 +31,7 @@ from common.tools.registry import is_registered, register_tool
 _current_message: dict = {}
 _current_provider: Any = None
 _permission_fn: Callable[[str, str, str], None] | None = None
+_audit_fn: Callable[..., None] | None = None
 
 
 def configure_jira_provider_tools(
@@ -36,17 +39,25 @@ def configure_jira_provider_tools(
     message: dict,
     provider: Any,
     permission_fn: Callable[[str, str, str], None] | None = None,
+    audit_fn: Callable[..., None] | None = None,
 ) -> None:
-    """Wire up the provider and permission callback for the current task."""
-    global _current_message, _current_provider, _permission_fn
+    """Wire up the provider, permission callback, and audit callback for the current task."""
+    global _current_message, _current_provider, _permission_fn, _audit_fn
     _current_message = message
     _current_provider = provider
     _permission_fn = permission_fn
+    _audit_fn = audit_fn
 
 
 def _require(action: str, target: str, scope: str = "*") -> None:
     if _permission_fn:
         _permission_fn(action, target, scope)
+
+
+def _audit(operation: str, target: str, input_summary: dict, result: dict, duration_ms: int = 0) -> None:
+    """Write a structured audit entry if an audit function is configured."""
+    if _audit_fn:
+        _audit_fn(operation, target, input_summary, result, duration_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -224,8 +235,17 @@ class _JiraCommentTool(ConstellationTool):
     def execute(self, args: dict) -> dict:
         key = args.get("ticket_key", "")
         _require("comment.add", key)
+        t0 = time.perf_counter()
         result, status = _current_provider.add_comment(key, args.get("body", ""))
-        if result is None:
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        success = result is not None
+        _audit(
+            "jira.comment.add", key,
+            {"bodyPreview": (args.get("body") or "")[:200]},
+            {"success": success, "commentId": (result or {}).get("id") if isinstance(result, dict) else None, "status": status},
+            duration_ms,
+        )
+        if not success:
             return self.error(f"jira_comment: {status}")
         return self.ok(json.dumps(result, ensure_ascii=False))
 
@@ -255,8 +275,17 @@ class _JiraTransitionTool(ConstellationTool):
     def execute(self, args: dict) -> dict:
         key = args.get("ticket_key", "")
         _require("ticket.transition", key)
+        t0 = time.perf_counter()
         result, status = _current_provider.transition_issue(key, args.get("transition_name", ""))
-        if "error" in (status or "").lower() and not result:
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        success = not ("error" in (status or "").lower() and not result)
+        _audit(
+            "jira.ticket.transition", key,
+            {"transitionName": args.get("transition_name", "")},
+            {"success": success, "status": status},
+            duration_ms,
+        )
+        if not success:
             return self.error(f"jira_transition: {status}")
         return self.ok(json.dumps(result or {"status": status}, ensure_ascii=False))
 
@@ -283,8 +312,17 @@ class _JiraAssignTool(ConstellationTool):
     def execute(self, args: dict) -> dict:
         key = args.get("ticket_key", "")
         _require("ticket.assign", key)
+        t0 = time.perf_counter()
         result, status = _current_provider.change_assignee(key, args.get("account_id", ""))
-        if "error" in (status or "").lower() and not result:
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        success = not ("error" in (status or "").lower() and not result)
+        _audit(
+            "jira.ticket.assign", key,
+            {"accountId": args.get("account_id", "")},
+            {"success": success, "status": status},
+            duration_ms,
+        )
+        if not success:
             return self.error(f"jira_assign: {status}")
         return self.ok(json.dumps(result or {"status": status}, ensure_ascii=False))
 
@@ -316,6 +354,7 @@ class _JiraCreateIssueTool(ConstellationTool):
 
     def execute(self, args: dict) -> dict:
         _require("ticket.create", args.get("project", ""))
+        t0 = time.perf_counter()
         issue, status = _current_provider.create_issue(
             args.get("project", ""),
             args.get("summary", ""),
@@ -323,7 +362,15 @@ class _JiraCreateIssueTool(ConstellationTool):
             args.get("issue_type", "Task"),
             args.get("fields", {}),
         )
-        if issue is None:
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        success = issue is not None
+        _audit(
+            "jira.ticket.create", args.get("project", ""),
+            {"summary": args.get("summary", ""), "issueType": args.get("issue_type", "Task")},
+            {"success": success, "ticketKey": (issue or {}).get("key") if isinstance(issue, dict) else None, "status": status},
+            duration_ms,
+        )
+        if not success:
             return self.error(f"jira_create_issue: {status}")
         return self.ok(json.dumps(issue, ensure_ascii=False))
 
@@ -350,8 +397,17 @@ class _JiraUpdateFieldsTool(ConstellationTool):
     def execute(self, args: dict) -> dict:
         key = args.get("ticket_key", "")
         _require("ticket.write", key)
+        t0 = time.perf_counter()
         result, status = _current_provider.update_issue_fields(key, args.get("fields", {}))
-        if "error" in (status or "").lower() and not result:
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        success = not ("error" in (status or "").lower() and not result)
+        _audit(
+            "jira.ticket.update_fields", key,
+            {"fieldKeys": list((args.get("fields") or {}).keys())},
+            {"success": success, "status": status},
+            duration_ms,
+        )
+        if not success:
             return self.error(f"jira_update_fields: {status}")
         return self.ok(json.dumps(result or {"status": status}, ensure_ascii=False))
 
@@ -376,10 +432,19 @@ class _JiraUpdateCommentTool(ConstellationTool):
     def execute(self, args: dict) -> dict:
         key = args.get("ticket_key", "")
         _require("comment.edit", key)
+        t0 = time.perf_counter()
         result, status = _current_provider.update_comment(
             key, args.get("comment_id", ""), args.get("body", "")
         )
-        if "error" in (status or "").lower() and not result:
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        success = not ("error" in (status or "").lower() and not result)
+        _audit(
+            "jira.comment.update", key,
+            {"commentId": args.get("comment_id", ""), "bodyPreview": (args.get("body") or "")[:200]},
+            {"success": success, "status": status},
+            duration_ms,
+        )
+        if not success:
             return self.error(f"jira_update_comment: {status}")
         return self.ok(json.dumps(result or {"status": status}, ensure_ascii=False))
 
@@ -403,8 +468,17 @@ class _JiraDeleteCommentTool(ConstellationTool):
     def execute(self, args: dict) -> dict:
         key = args.get("ticket_key", "")
         _require("comment.delete", key)
+        t0 = time.perf_counter()
         result, status = _current_provider.delete_comment(key, args.get("comment_id", ""))
-        if "error" in (status or "").lower() and not result:
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        success = not ("error" in (status or "").lower() and not result)
+        _audit(
+            "jira.comment.delete", key,
+            {"commentId": args.get("comment_id", "")},
+            {"success": success, "status": status},
+            duration_ms,
+        )
+        if not success:
             return self.error(f"jira_delete_comment: {status}")
         return self.ok(json.dumps(result or {"status": status}, ensure_ascii=False))
 

@@ -2,28 +2,30 @@
 
 ## Authorized Paths Only
 
-- Only process files within paths explicitly mounted via Docker volume and listed in `OFFICE_ALLOWED_PATHS`.
-- Reject any request to access files outside the authorized paths.
-- Validate that all file paths resolve within the mounted directory (no path traversal).
+- Only process files within the **Target Files / Directories** explicitly provided in the task prompt.
+- Never access files outside those paths.
+- Validate that all resolved file paths stay within the provided target roots (no path traversal).
+- If a user-supplied path resolves outside the authorized root, report it as a permission error and skip it.
 
-## File Type Restrictions
+## Supported File Types
 
-Supported formats:
-- PDF (`.pdf`)
-- Word documents (`.docx`, `.doc`)
-- PowerPoint presentations (`.pptx`, `.ppt`)
-- Excel spreadsheets (`.xlsx`, `.xls`, `.csv`)
-- Plain text (`.txt`, `.md`)
+Preferred formats (fully supported):
+- Plain text: `.txt`, `.md`, `.rst`, `.log`
+- Data: `.csv`, `.tsv`, `.json`, `.yaml`, `.xml`
+- Code: `.py`, `.js`, `.ts`, `.java`, `.go`, `.sql`
+- Markup: `.html`, `.htm`
 
-Reject requests for unsupported file types.
+Binary / proprietary formats (inspect metadata only, do not read raw bytes):
+- `.pdf`, `.docx`, `.doc`, `.pptx`, `.ppt`, `.xlsx`, `.xls`
+- For these, note the file name, size, and extension in the summary/warnings
 
 ## Output Modes
 
-- `summarize` — Read-only: produce a text summary. Never modify source files.
-- `analyze` — Read-only: extract structured data. Never modify source files.
-- `organize` — Read/write: suggest or apply folder reorganization. Requires explicit user confirmation before modifying.
+- `workspace` (default) — Write output to `{workspace_path}/office-agent/`. Never modify source files.
+- `inplace` — Write output back into the source directory. Source files may be modified only with explicit user authorization.
+- `return` — Return result as the task artifact text only. No files written.
 
 ## Privacy
 
-- Never include raw document content in logs.
+- Never include raw document content in logs or progress messages.
 - Summaries and analysis results go to the shared workspace output directory only.
