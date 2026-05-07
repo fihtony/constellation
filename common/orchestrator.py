@@ -40,5 +40,5 @@ def resolve_orchestrator_base_url(
         if discovered_url:
             return discovered_url
 
-    legacy_url = str(payload.get("orchestratorUrl") or payload.get("compassUrl") or "")
+    legacy_url = str(payload.get("orchestratorUrl") or "")
     return derive_service_base_url(legacy_url)

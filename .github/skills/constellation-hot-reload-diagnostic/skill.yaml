@@ -1,0 +1,19 @@
+id: constellation-hot-reload-diagnostic
+version: 1.0.0
+level: generic
+owner: test-suite
+appliesTo:
+  agentRoles:
+    - compass
+    - office
+runtimeCompatibility:
+  backends:
+    - connect-agent
+    - copilot-cli
+    - claude-code
+requiredTools:
+  - load_skill
+provides:
+  - hot-reload-diagnostic-marker
+hashPolicy: sha256
+trustLevel: reviewed

@@ -14,20 +14,16 @@ Usage in each agent's app.py:
 from __future__ import annotations
 
 import os
-from functools import lru_cache
 
 from common.prompt_builder import build_system_prompt_from_manifest
 
 
-@lru_cache(maxsize=16)
 def get_agent_manifest_prompt(agent_file: str, *, agent_name: str = "") -> str:
     """Return the manifest-based system prompt for the agent owning `agent_file`.
 
-    Results are cached per (agent_file, agent_name) tuple so the file is only
-    read once per process lifetime.  Pass `agent_file=__file__` from app.py.
-
     Falls back to empty string if no manifest.yaml exists.
     """
+    del agent_name
     agent_dir = os.path.dirname(os.path.abspath(agent_file))
     return build_system_prompt_from_manifest(agent_dir)
 

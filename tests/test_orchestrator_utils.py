@@ -61,15 +61,15 @@ class OrchestratorUtilsTests(unittest.TestCase):
         self.assertEqual(resolved, "http://discovered-orchestrator:8080")
         self.assertEqual(directory.calls, ["orchestrator.progress.report"])
 
-    def test_resolve_orchestrator_base_url_keeps_legacy_metadata_as_last_resort(self):
+    def test_resolve_orchestrator_base_url_returns_empty_when_no_sources(self):
         directory = _FakeAgentDirectory(error=RuntimeError("missing capability"))
 
         resolved = resolve_orchestrator_base_url(
-            {"compassUrl": "http://legacy-compass:8080"},
+            {"orchestratorUrl": "http://legacy-orchestrator:8080"},
             agent_directory=directory,
         )
 
-        self.assertEqual(resolved, "http://legacy-compass:8080")
+        self.assertEqual(resolved, "http://legacy-orchestrator:8080")
 
 
 class ProgressToolTests(unittest.TestCase):

@@ -166,10 +166,12 @@ class SkillsCatalog:
             skill_id = meta.get("id") or entry
             # Optionally attach SKILL.md summary (first non-frontmatter heading or description)
             description_md = ""
+            skill_content = ""
             if os.path.isfile(md_path):
                 try:
                     with open(md_path, encoding="utf-8") as fh:
-                        description_md = _extract_md_description(fh.read())
+                        skill_content = fh.read()
+                    description_md = _extract_md_description(skill_content)
                 except Exception:
                     pass
 
@@ -185,6 +187,7 @@ class SkillsCatalog:
                 "hashPolicy": meta.get("hashPolicy", "sha256"),
                 "trustLevel": meta.get("trustLevel", "unreviewed"),
                 "description": description_md,
+                "content": skill_content,
                 "directory": entry,
             }
 
@@ -199,7 +202,10 @@ class SkillsCatalog:
 
     def get_catalog(self) -> list[dict]:
         with self._lock:
-            return list(self._skills.values())
+            return [
+                {key: value for key, value in skill.items() if key != "content"}
+                for skill in self._skills.values()
+            ]
 
     def get_skill(self, skill_id: str) -> dict | None:
         with self._lock:

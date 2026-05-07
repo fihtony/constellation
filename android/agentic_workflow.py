@@ -79,6 +79,8 @@ ANDROID_AGENT_RUNTIME_TOOL_NAMES = [
     # --- Jira boundary tools (via Jira Agent) ---
     "jira_get_ticket",
     "jira_add_comment",
+    "jira_search",
+    "jira_transition",
     # --- Validation and evidence ---
     "run_validation_command",
     "collect_task_evidence",

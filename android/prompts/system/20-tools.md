@@ -30,6 +30,15 @@
 | `check_definition_of_done` | Evaluate task completion |
 | `summarize_failure_context` | Structured failure analysis |
 
+## Jira Tools
+
+| Tool | Purpose |
+|------|---------|
+| `jira_get_ticket` | Fetch Jira ticket details when task context needs refreshing |
+| `jira_add_comment` | Add implementation notes or status comments to the Jira ticket |
+| `jira_search` | Search related Jira tickets by JQL |
+| `jira_transition` | Transition a Jira ticket to a new status |
+
 ## Control Tools
 
 | Tool | Purpose |
