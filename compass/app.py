@@ -15,6 +15,19 @@ from urllib.request import Request, urlopen
 
 from common.artifact_store import ArtifactStore
 from common.compass_agentic_workflow import run_compass_workflow
+from common.compass_completeness import (
+    extract_pr_evidence_from_artifacts,
+    extract_team_lead_completeness_issues,
+    build_completeness_follow_up_message,
+    derive_task_card_status,
+)
+from common.compass_office_routing import (
+    validate_office_target_paths,
+    build_office_dispatch_context,
+    build_output_target_question,
+    build_write_permission_question,
+    resume_office_clarification,
+)
 from common.devlog import record_workspace_stage
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
@@ -62,6 +75,44 @@ artifact_store = ArtifactStore(root=_artifact_root_instance)
 launcher = get_launcher()
 policy = PolicyEvaluator()
 COMPASS_API_KEY = os.environ.get("COMPASS_API_KEY", "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat thin wrappers around common/compass_office_routing.py.
+# These private names are kept so that existing tests can continue to patch
+# compass_app._is_containerized and call compass_app._validate_office_target_paths.
+# ---------------------------------------------------------------------------
+from common.compass_office_routing import (
+    is_containerized as _is_containerized,
+    can_defer_office_path_existence_check as _can_defer_office_path_existence_check,
+)
+
+
+def _validate_office_target_paths(target_paths, *, allowed_base_paths=None):
+    from common.compass_office_routing import path_within_base
+    effective_bases = allowed_base_paths if allowed_base_paths is not None else OFFICE_ALLOWED_BASE_PATHS or None
+    normalized: list = []
+    seen: set = set()
+    for raw_path in target_paths or []:
+        path = str(raw_path or "").strip()
+        if not path:
+            continue
+        if not os.path.isabs(path):
+            return [], f"Path must be absolute: {path}"
+        real_path = os.path.realpath(path)
+        if effective_bases and not any(path_within_base(real_path, base) for base in effective_bases):
+            return [], f"Path is outside OFFICE_ALLOWED_BASE_PATHS: {path}"
+        if not os.path.exists(real_path):
+            if _is_containerized() and os.path.isabs(real_path):
+                if real_path not in seen:
+                    seen.add(real_path)
+                    normalized.append(real_path)
+                continue
+            return [], f"Path does not exist: {path}"
+        if real_path not in seen:
+            seen.add(real_path)
+            normalized.append(real_path)
+    return normalized, ""
 
 # Notification target registry (IM Gateway or other webhook subscribers)
 _notification_targets_lock = threading.Lock()
@@ -197,73 +248,6 @@ def _path_within_base(path, base):
     return common == os.path.realpath(base)
 
 
-def _is_containerized():
-    """Return True when running inside a container (Docker Desktop, Rancher Desktop, etc.).
-
-    Checks two independent signals so that both Docker (/.dockerenv) and
-    Rancher Desktop in containerd mode (/proc/1/cgroup) are covered.
-    """
-    # Docker Desktop and Rancher Desktop (dockerd mode) create this marker file.
-    if os.path.exists("/.dockerenv"):
-        return True
-    # Fallback for Rancher Desktop containerd mode and other OCI runtimes.
-    try:
-        with open("/proc/1/cgroup", "rb") as fh:
-            content = fh.read(4096).decode("ascii", errors="replace")
-            if any(m in content for m in ("docker", "containerd", "/lxc/")):
-                return True
-    except OSError:
-        pass
-    return False
-
-
-def _can_defer_office_path_existence_check(path):
-    # Inside a container, host-side paths (e.g. /Users/…) are not accessible,
-    # so skip the existence check and defer validation to the Office agent.
-    return _is_containerized() and os.path.isabs(path)
-
-
-def _validate_office_target_paths(target_paths):
-    normalized = []
-    for raw_path in target_paths or []:
-        path = str(raw_path or "").strip()
-        if not path:
-            continue
-        if not os.path.isabs(path):
-            return [], f"Path must be absolute: {path}"
-        real_path = os.path.realpath(path)
-        if OFFICE_ALLOWED_BASE_PATHS and not any(
-            _path_within_base(real_path, base) for base in OFFICE_ALLOWED_BASE_PATHS
-        ):
-            return [], f"Path is outside OFFICE_ALLOWED_BASE_PATHS: {path}"
-        if not os.path.exists(real_path):
-            if _can_defer_office_path_existence_check(real_path):
-                normalized.append(real_path)
-                continue
-            return [], f"Path does not exist: {path}"
-        normalized.append(real_path)
-    return _dedupe(normalized), ""
-
-
-def _build_output_target_question(paths):
-    joined = "\n".join(f"- {path}" for path in paths)
-    return (
-        "Choose where the Office task should write its output:\n"
-        "[A] workspace only (recommended, source stays read-only)\n"
-        "[B] modify the original location directly (requires write permission)\n\n"
-        f"Target path(s):\n{joined}"
-    )
-
-
-def _build_write_permission_question(paths):
-    joined = "\n".join(f"- {path}" for path in paths)
-    return (
-        "This Office task will modify the original location directly. Approve write access?\n"
-        "Reply yes to continue or no to stop.\n\n"
-        f"Target path(s):\n{joined}"
-    )
-
-
 def _route_input_required(task, question, router_context):
     task.router_context = dict(router_context or {})
     _update_state_and_notify(task.task_id, "TASK_STATE_INPUT_REQUIRED", question)
@@ -280,32 +264,17 @@ def _resolve_workspace_host_path(workspace_path):
         return ""
 
 
-def _build_office_dispatch_context(task):
+def _apply_office_dispatch_context(task):
+    """Build Docker bind context from task.router_context and store it back."""
     router_context = dict(getattr(task, "router_context", {}) or {})
     target_paths = [os.path.realpath(path) for path in router_context.get("targetPaths") or []]
-    if not target_paths:
-        raise ValueError("Office routing requires at least one target path.")
-
-    mount_roots = [path if os.path.isdir(path) else os.path.dirname(path) for path in target_paths]
-    mount_root = os.path.commonpath(mount_roots)
-    read_mode = "rw" if router_context.get("outputMode") == "inplace" else "ro"
     workspace_host_path = _resolve_workspace_host_path(task.workspace_path)
-    mounted_targets = []
-    for host_path in target_paths:
-        relative = os.path.relpath(host_path, mount_root)
-        mounted_targets.append(os.path.join(OFFICE_CONTAINER_INPUT_PATH, relative))
-
-    extra_binds = [f"{mount_root}:{OFFICE_CONTAINER_INPUT_PATH}:{read_mode}"]
-    if workspace_host_path:
-        extra_binds.append(f"{workspace_host_path}:{OFFICE_CONTAINER_WORKSPACE_PATH}:rw")
-
-    router_context["dispatch"] = {
-        "mountRootHostPath": mount_root,
-        "mountedTargetPaths": mounted_targets,
-        "workspaceHostPath": workspace_host_path,
-        "extraBinds": extra_binds,
-        "readMode": read_mode,
-    }
+    dispatch_ctx = build_office_dispatch_context(
+        target_paths,
+        output_mode=router_context.get("outputMode") or "workspace",
+        workspace_host_path=workspace_host_path,
+    )
+    router_context["dispatch"] = dispatch_ctx
     task.router_context = router_context
     return router_context
 
@@ -350,7 +319,9 @@ def _maybe_prepare_office_route(task, workflow, route_decision):
     if not workflow or not _is_office_capability(workflow[0]):
         return None
 
-    validated_paths, error_message = _validate_office_target_paths(route_decision.get("target_paths") or [])
+    validated_paths, error_message = _validate_office_target_paths(
+        route_decision.get("target_paths") or [],
+    )
     if not validated_paths:
         question = route_decision.get("input_question") or error_message or "Please provide the absolute path for the Office task."
         return _route_input_required(
@@ -363,20 +334,28 @@ def _maybe_prepare_office_route(task, workflow, route_decision):
             },
         )
 
+    question = build_output_target_question(validated_paths)
     return _route_input_required(
         task,
-        _build_output_target_question(validated_paths),
+        question,
         {
             "kind": "office",
             "awaitingStep": "output_mode",
             "requestedCapability": workflow[0],
             "officeSubtype": route_decision.get("office_subtype"),
             "targetPaths": validated_paths,
+            "currentQuestion": question,
         },
     )
 
 
 def _resume_compass_routed_task(prior_task, message):
+    """Advance the office pre-flight state machine when the user replies.
+
+    Returns None if this task does not need office pre-flight handling
+    (i.e. it already has a downstream_task_id, meaning the agentic workflow
+    has started).
+    """
     router_context = dict(getattr(prior_task, "router_context", {}) or {})
     if not router_context or prior_task.downstream_task_id:
         return None
@@ -385,6 +364,7 @@ def _resume_compass_routed_task(prior_task, message):
     awaiting_step = router_context.get("awaitingStep") or ""
 
     if awaiting_step == "clarify_path":
+        # User provided clarifying text — re-run routing with combined request.
         original_text = extract_text(prior_task.original_message or {})
         combined_text = (original_text + "\n\n" + user_reply).strip() if original_text else user_reply
         combined_message = deep_copy_json(prior_task.original_message or message)
@@ -408,57 +388,51 @@ def _resume_compass_routed_task(prior_task, message):
             return office_response
         return _start_task_worker(prior_task, combined_message, workflow)
 
-    if awaiting_step == "output_mode":
-        decision = _interpret_office_reply(prior_task, user_reply)
-        if decision["action"] == "workspace":
-            router_context["outputMode"] = "workspace"
-            prior_task.router_context = router_context
-            _build_office_dispatch_context(prior_task)
-            return _start_task_worker(prior_task, prior_task.original_message or message, prior_task.pending_workflow or [router_context.get("requestedCapability")])
-        if decision["action"] == "inplace":
-            router_context["outputMode"] = "inplace"
-            router_context["awaitingStep"] = "confirm_write"
-            return _route_input_required(
-                prior_task,
-                _build_write_permission_question(router_context.get("targetPaths") or []),
-                router_context,
-            )
-        return _route_input_required(
-            prior_task,
-            decision["clarification_question"] or "Please choose workspace or in-place output.",
+    if awaiting_step in ("output_mode", "confirm_write"):
+        # Delegate to the shared state machine helper; it calls _interpret_office_reply
+        # via the injected fn for steps that need LLM interpretation.
+        result = resume_office_clarification(
             router_context,
+            user_reply,
+            interpret_reply_fn=lambda ctx, reply: _interpret_office_reply_for_context(
+                prior_task, ctx, reply
+            ),
         )
+        action = result.get("action")
+        prior_task.router_context = result["router_context"]
 
-    if awaiting_step == "confirm_write":
-        decision = _interpret_office_reply(prior_task, user_reply)
-        if decision["action"] == "approve":
-            router_context["outputMode"] = "inplace"
-            router_context["officeWriteApproved"] = True
-            prior_task.router_context = router_context
-            _build_office_dispatch_context(prior_task)
-            return _start_task_worker(prior_task, prior_task.original_message or message, prior_task.pending_workflow or [router_context.get("requestedCapability")])
-        if decision["action"] == "deny":
-            router_context["outputMode"] = "workspace"
-            router_context.pop("officeWriteApproved", None)
-            prior_task.router_context = router_context
-            _build_office_dispatch_context(prior_task)
-            task_store.add_progress_step(
-                prior_task.task_id,
-                "Write access denied by user — continuing with workspace-only output.",
-                agent_id="compass-agent",
-            )
+        if action == "dispatch":
+            note = result.get("note") or ""
+            if note:
+                task_store.add_progress_step(prior_task.task_id, note, agent_id="compass-agent")
+            _apply_office_dispatch_context(prior_task)
             return _start_task_worker(
                 prior_task,
                 prior_task.original_message or message,
-                prior_task.pending_workflow or [router_context.get("requestedCapability")],
+                prior_task.pending_workflow or [prior_task.router_context.get("requestedCapability")],
             )
-        return _route_input_required(
-            prior_task,
-            decision["clarification_question"] or "Please reply yes to approve write access or no to stop.",
-            router_context,
-        )
+
+        if action == "input_required":
+            return _route_input_required(prior_task, result["question"], result["router_context"])
+
+        if action == "error":
+            task_store.update_state(prior_task.task_id, "TASK_STATE_FAILED", result.get("error") or "Office routing error.")
+            return prior_task.to_dict()
+
+        # re_route or unknown — fall through to None
+        return None
 
     return None
+
+
+def _interpret_office_reply_for_context(task, ctx, user_reply):
+    """Bridge between resume_office_clarification and _interpret_office_reply."""
+    # Temporarily inject ctx into router_context for the LLM prompt
+    saved_ctx = getattr(task, "router_context", {})
+    task.router_context = ctx
+    decision = _interpret_office_reply(task, user_reply)
+    task.router_context = saved_ctx
+    return decision
 
 
 def _route_with_runtime(user_text, requested_capability=""):
@@ -545,24 +519,8 @@ def _read_workspace_json(workspace_path, relative_path):
 
 
 def _extract_pr_evidence_from_artifacts(artifacts: list) -> dict:
-    """Extract PR evidence (URL, branch, jiraInReview) from A2A artifacts.
-
-    Execution agents (android, web) embed prUrl and branch in their artifact
-    metadata and send them via A2A callback to Team Lead, which passes them
-    through to Compass.  Compass must NOT scan the shared workspace filesystem
-    to find these files — all evidence must come through A2A artifacts.
-    """
-    for artifact in artifacts or []:
-        metadata = artifact.get("metadata") or {}
-        pr_url = metadata.get("prUrl") or metadata.get("url") or ""
-        branch = metadata.get("branch") or ""
-        if pr_url:
-            return {
-                "url": pr_url,
-                "branch": branch,
-                "jiraInReview": bool(metadata.get("jiraInReview", False)),
-            }
-    return {}
+    """Delegate to common.compass_completeness."""
+    return extract_pr_evidence_from_artifacts(artifacts)
 
 
 def _truncate_text(value, limit=180):
@@ -690,28 +648,8 @@ def _refresh_task_card_metadata(task):
 
 
 def _task_card_status(task_state, pr_evidence):
-    failed_states = {
-        "TASK_STATE_FAILED",
-        "FAILED",
-        "NO_CAPABLE_AGENT",
-        "CAPABILITY_TEMPORARILY_UNAVAILABLE",
-        "POLICY_DENIED",
-        "CAPACITY_EXHAUSTED",
-    }
-    if task_state == "TASK_STATE_INPUT_REQUIRED":
-        return "waiting_for_info", "Waiting for Info"
-    if task_state in failed_states:
-        return "failed", "Failed"
-    if task_state == "TASK_STATE_COMPLETED":
-        pr_url = pr_evidence.get("url") or pr_evidence.get("prUrl") or ""
-        if pr_url:
-            # jiraInReview flag is set by execution agents in their artifact metadata
-            # when they successfully transition the Jira ticket to "In Review".
-            if pr_evidence.get("jiraInReview"):
-                return "completed", "Completed / In Review"
-            return "completed", "Completed / PR Raised"
-        return "completed", "Completed"
-    return "in_progress", "In Progress"
+    """Delegate to common.compass_completeness.derive_task_card_status."""
+    return derive_task_card_status(task_state, pr_evidence)
 
 
 def _serialize_task_card(task):
@@ -815,20 +753,8 @@ def _extract_team_lead_completeness_issues(task, artifacts):
 
 
 def _build_completeness_follow_up_message(original_message, issues, revision_cycle):
-    message = deep_copy_json(original_message)
-    base_text = extract_text(message)
-    issue_lines = "\n".join(f"- {issue}" for issue in issues)
-    follow_up = (
-        f"Compass completeness check revision {revision_cycle} found unresolved gaps:\n"
-        f"{issue_lines}\n\n"
-        "Continue from the existing shared workspace, preserve prior work, and use only registered boundary agents."
-    )
-    message["parts"] = [{"text": (base_text + "\n\n" + follow_up).strip()}]
-    metadata = dict(message.get("metadata") or {})
-    metadata["compassCompletenessRevision"] = revision_cycle
-    metadata["completenessIssues"] = issues
-    message["metadata"] = metadata
-    return message
+    """Delegate to common.compass_completeness.build_completeness_follow_up_message."""
+    return build_completeness_follow_up_message(original_message, issues, revision_cycle)
 
 
 def _read_agent_logs(since=0):

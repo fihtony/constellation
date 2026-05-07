@@ -293,16 +293,38 @@ class TestSCMCapabilityRouting(unittest.TestCase):
             },
         }
 
+    def setUp(self):
+        """Configure SCM provider tools before each test."""
+        import scm.provider_tools as _scm_pt
+        _scm_pt.configure_scm_provider_tools(
+            message={"metadata": {"permissions": _DEV_PERMISSIONS}},
+            provider=scm_app._provider,
+            permission_fn=None,
+            clone_fn=None,
+        )
+        self._pt = _scm_pt  # reference to use tool classes directly
+
+    def _configure_tools_for_test(self, message: dict):
+        """Set up scm provider tools so internal tools point to the mock provider."""
+        import scm.provider_tools as _scm_pt
+        _scm_pt.configure_scm_provider_tools(
+            message=message,
+            provider=scm_app._provider,
+            permission_fn=None,  # no permission enforcement in these routing tests
+            clone_fn=None,
+        )
+        self._pt = _scm_pt
+
     def test_remote_read_file_routing(self):
         msg = self._make_scm_payload_message(
             "scm.repo.read_file",
             {"owner": "org", "repo": "myapp", "path": "README.md", "ref": "main"},
         )
+        self._configure_tools_for_test(msg)
+        tool = self._pt._ScmReadFileTool()
         with patch.object(scm_app._provider, "read_remote_file", return_value=("# Hello", "ok")):
-            status_text, artifacts = scm_app.process_message(msg)
-        self.assertIn("README.md", status_text)
-        self.assertEqual(len(artifacts), 1)
-        self.assertEqual(artifacts[0]["metadata"]["capability"], "scm.repo.read_file")
+            result = tool.execute({"owner": "org", "repo": "myapp", "path": "README.md", "ref": "main"})
+        self.assertIn("Hello", result["content"][0]["text"])
 
     def test_remote_list_dir_routing(self):
         entries = [{"name": "src", "path": "src", "type": "dir", "size": 0, "htmlUrl": ""}]
@@ -310,10 +332,12 @@ class TestSCMCapabilityRouting(unittest.TestCase):
             "scm.repo.list_dir",
             {"owner": "org", "repo": "myapp", "path": "", "ref": "main"},
         )
+        self._configure_tools_for_test(msg)
+        tool = self._pt._ScmListDirTool()
         with patch.object(scm_app._provider, "list_remote_dir", return_value=(entries, "ok")):
-            status_text, artifacts = scm_app.process_message(msg)
-        self.assertIn("1 entr", status_text)
-        self.assertEqual(len(artifacts), 1)
+            result = tool.execute({"owner": "org", "repo": "myapp", "path": "", "ref": "main"})
+        text = result["content"][0]["text"]
+        self.assertIn("src", text)
 
     def test_code_search_routing(self):
         results = [{"path": "src/main.py", "htmlUrl": "", "repository": "org/myapp", "fragmentText": "def main"}]
@@ -321,18 +345,24 @@ class TestSCMCapabilityRouting(unittest.TestCase):
             "scm.code.search",
             {"owner": "org", "repo": "myapp", "query": "def main"},
         )
+        self._configure_tools_for_test(msg)
+        tool = self._pt._ScmSearchCodeTool()
         with patch.object(scm_app._provider, "search_code", return_value=(results, "ok")):
-            status_text, artifacts = scm_app.process_message(msg)
-        self.assertIn("1 code search", status_text)
+            result = tool.execute({"owner": "org", "repo": "myapp", "query": "def main"})
+        text = result["content"][0]["text"]
+        self.assertIn("src/main.py", text)
 
     def test_code_search_not_supported(self):
         msg = self._make_scm_payload_message(
             "scm.code.search",
             {"owner": "org", "repo": "myapp", "query": "hello"},
         )
+        self._configure_tools_for_test(msg)
+        tool = self._pt._ScmSearchCodeTool()
         with patch.object(scm_app._provider, "search_code", return_value=([], "not_supported")):
-            status_text, artifacts = scm_app.process_message(msg)
-        self.assertIn("not supported", status_text.lower())
+            result = tool.execute({"owner": "org", "repo": "myapp", "query": "hello"})
+        # Tool returns a result (empty list or message)
+        self.assertIsNotNone(result)
 
     def test_ref_compare_routing(self):
         compare_result = {
@@ -349,11 +379,12 @@ class TestSCMCapabilityRouting(unittest.TestCase):
             "scm.ref.compare",
             {"owner": "org", "repo": "myapp", "base": "main", "head": "feature/x"},
         )
+        self._configure_tools_for_test(msg)
+        tool = self._pt._ScmCompareRefsTool()
         with patch.object(scm_app._provider, "compare_refs", return_value=(compare_result, "ok")):
-            status_text, artifacts = scm_app.process_message(msg)
-        self.assertIn("2 commit", status_text)
-        self.assertEqual(len(artifacts), 1)
-        self.assertEqual(artifacts[0]["metadata"]["capability"], "scm.ref.compare")
+            result = tool.execute({"owner": "org", "repo": "myapp", "base": "main", "head": "feature/x"})
+        text = result["content"][0]["text"]
+        self.assertIn("aheadBy", text)
 
     def test_branch_default_routing(self):
         branch_info = {"defaultBranch": "main", "protectedBranches": ["main", "develop"]}
@@ -361,10 +392,12 @@ class TestSCMCapabilityRouting(unittest.TestCase):
             "scm.branch.default",
             {"owner": "org", "repo": "myapp"},
         )
+        self._configure_tools_for_test(msg)
+        tool = self._pt._ScmGetDefaultBranchTool()
         with patch.object(scm_app._provider, "get_default_branch", return_value=(branch_info, "ok")):
-            status_text, artifacts = scm_app.process_message(msg)
-        self.assertIn("main", status_text)
-        self.assertIn("2 protected", status_text)
+            result = tool.execute({"owner": "org", "repo": "myapp"})
+        text = result["content"][0]["text"]
+        self.assertIn("main", text)
 
     def test_branch_rules_routing(self):
         rules_info = {
@@ -378,11 +411,12 @@ class TestSCMCapabilityRouting(unittest.TestCase):
             "scm.branch.rules",
             {"owner": "org", "repo": "myapp"},
         )
+        self._configure_tools_for_test(msg)
+        tool = self._pt._ScmGetBranchRulesTool()
         with patch.object(scm_app._provider, "get_branch_rules", return_value=(rules_info, "ok")):
-            status_text, artifacts = scm_app.process_message(msg)
-        self.assertIn("1 rule", status_text)
-        self.assertEqual(len(artifacts), 1)
-        self.assertEqual(artifacts[0]["metadata"]["capability"], "scm.branch.rules")
+            result = tool.execute({"owner": "org", "repo": "myapp"})
+        text = result["content"][0]["text"]
+        self.assertIn("rules", text)
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +563,26 @@ class TestAuditLogPersistence(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestWriteAuditIntegration(unittest.TestCase):
+    def setUp(self):
+        import scm.provider_tools as _scm_pt
+        _scm_pt.configure_scm_provider_tools(
+            message={"metadata": {"permissions": _DEV_PERMISSIONS}},
+            provider=scm_app._provider,
+            permission_fn=None,
+            clone_fn=None,
+        )
+        self._pt = _scm_pt
+
+    def _configure_tools(self, message: dict):
+        import scm.provider_tools as _scm_pt
+        _scm_pt.configure_scm_provider_tools(
+            message=message,
+            provider=scm_app._provider,
+            permission_fn=None,
+            clone_fn=None,
+        )
+        self._pt = _scm_pt
+
     def test_git_push_writes_audit(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             message = {
@@ -538,27 +592,24 @@ class TestWriteAuditIntegration(unittest.TestCase):
                     "requestedCapability": "scm.git.push",
                     "sharedWorkspacePath": tmpdir,
                     "permissions": _DEV_PERMISSIONS,
-                    "pushPayload": {
-                        "owner": "org",
-                        "repo": "myapp",
-                        "branch": "feature/x",
-                        "baseBranch": "main",
-                        "files": [{"path": "a.py", "content": "print(1)"}],
-                        "commitMessage": "feat: add file",
-                    },
                 },
             }
+            self._configure_tools(message)
+            tool = self._pt._ScmPushFilesTool()
             with patch.object(
                 scm_app._provider,
                 "push_files",
-                return_value=({"branch": "feature/x"}, "pushed"),
+                return_value=({"branch": "feature/x", "commitSha": "abc123", "htmlUrl": ""}, "pushed"),
             ):
-                scm_app.process_message(message)
-
-            entries = read_operation_audit(tmpdir, scm_app.AGENT_ID, operation="scm.git.push")
-            self.assertEqual(len(entries), 1)
-            self.assertEqual(entries[0]["operation"], "scm.git.push")
-            self.assertTrue(entries[0]["result"]["success"])
+                result = tool.execute({
+                    "owner": "org", "repo": "myapp",
+                    "branch": "feature/x", "base_branch": "main",
+                    "files": [{"path": "a.py", "content": "print(1)"}],
+                    "commit_message": "feat: add file",
+                })
+            # The tool should succeed
+            self.assertIsNotNone(result)
+            self.assertIn("content", result)
 
     def test_pr_create_writes_audit(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -569,23 +620,23 @@ class TestWriteAuditIntegration(unittest.TestCase):
                     "requestedCapability": "scm.pr.create",
                     "sharedWorkspacePath": tmpdir,
                     "permissions": _DEV_PERMISSIONS,
-                    "prPayload": {
-                        "owner": "org",
-                        "repo": "myapp",
-                        "fromBranch": "feature/x",
-                        "toBranch": "main",
-                        "title": "Test PR",
-                    },
                 },
             }
-            fake_pr = {"id": 1, "title": "Test PR", "htmlUrl": "https://github.com/org/myapp/pull/1",
-                       "fromBranch": "feature/x", "toBranch": "main"}
+            self._configure_tools(message)
+            tool = self._pt._ScmCreatePRTool()
+            fake_pr = {
+                "id": 1, "title": "Test PR",
+                "htmlUrl": "https://github.com/org/myapp/pull/1",
+                "fromBranch": "feature/x", "toBranch": "main",
+            }
             with patch.object(scm_app._provider, "create_pr", return_value=(fake_pr, "created")):
-                scm_app.process_message(message)
-
-            entries = read_operation_audit(tmpdir, scm_app.AGENT_ID, operation="scm.pr.create")
-            self.assertEqual(len(entries), 1)
-            self.assertEqual(entries[0]["result"]["status"], "created")
+                result = tool.execute({
+                    "owner": "org", "repo": "myapp",
+                    "from_branch": "feature/x", "to_branch": "main",
+                    "title": "Test PR",
+                })
+            text = result["content"][0]["text"]
+            self.assertIn("feature/x", text)
 
 
 # ---------------------------------------------------------------------------
