@@ -1,6 +1,6 @@
 """Office Agent-specific helpers for runtime-driven execution.
 
-Mirrors common/web_agentic_workflow.py but for the Office Agent role:
+Mirrors the agent-local workflow module pattern used by other execution agents:
 local document processing (summarize, analyze, organize) driven entirely by
 the agentic runtime backend via tools.
 

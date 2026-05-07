@@ -1,6 +1,6 @@
 """Web Agent-specific helpers for runtime-driven execution.
 
-Mirrors common/team_lead_agentic_workflow.py but for the Web Agent role:
+Mirrors the agent-local workflow module pattern used by Team Lead and Android:
 implementation specialist that clones repos, writes code, validates, and
 creates PRs — all driven by the agentic runtime via tools.
 """

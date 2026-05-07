@@ -1115,12 +1115,8 @@ class Phase6BoundaryFilesTests(unittest.TestCase):
 # common/ folder organization tests
 # ===========================================================================
 
-class CommonFolderOrganizationTests(unittest.TestCase):
-    """Verify common/ only contains files shared across all agents.
-
-    Agent-specific workflow helpers must live in their respective agent directories.
-    Backward-compat stubs are allowed in common/ but must re-export from canonical locations.
-    """
+class Phase8CommonFolderOrganizationTests(unittest.TestCase):
+    """Phase 8: common/ only keeps shared infrastructure modules."""
 
     def test_compass_agentic_workflow_canonical_in_compass(self):
         """Canonical implementation must be in compass/agentic_workflow.py."""
@@ -1159,48 +1155,44 @@ class CommonFolderOrganizationTests(unittest.TestCase):
         content = path.read_text()
         self.assertIn("OFFICE_AGENT_RUNTIME_TOOL_NAMES", content)
 
-    def test_common_stubs_re_export_from_canonical(self):
-        """common/ stubs must re-export from the canonical agent-package location."""
-        stubs_to_check = [
-            ("common/compass_agentic_workflow.py", "compass.agentic_workflow"),
-            ("common/compass_completeness.py", "compass.completeness"),
-            ("common/compass_office_routing.py", "compass.office_routing"),
-            ("common/web_agentic_workflow.py", "web.agentic_workflow"),
-            ("common/android_agentic_workflow.py", "android.agentic_workflow"),
-            ("common/office_agentic_workflow.py", "office.agentic_workflow"),
-        ]
-        for stub_rel, canonical_module in stubs_to_check:
-            stub_path = Path(_REPO_ROOT) / stub_rel
-            self.assertTrue(stub_path.is_file(), f"Stub {stub_rel} must exist for backward compat")
-            content = stub_path.read_text()
-            self.assertIn(
-                canonical_module, content,
-                f"{stub_rel} must re-export from {canonical_module}"
-            )
+    def test_team_lead_agentic_workflow_canonical_in_team_lead(self):
+        path = Path(_REPO_ROOT) / "team-lead" / "agentic_workflow.py"
+        self.assertTrue(path.is_file(), "team-lead/agentic_workflow.py must exist")
+        content = path.read_text()
+        self.assertIn("TEAM_LEAD_RUNTIME_TOOL_NAMES", content)
 
-    def test_common_stubs_are_importable(self):
-        """All common/ stubs must be importable without errors."""
-        stubs = [
-            "common.compass_agentic_workflow",
-            "common.compass_completeness",
-            "common.compass_office_routing",
-            "common.web_agentic_workflow",
-            "common.android_agentic_workflow",
-            "common.office_agentic_workflow",
+    def test_team_lead_app_imports_local_agentic_workflow(self):
+        path = Path(_REPO_ROOT) / "team-lead" / "app.py"
+        content = path.read_text()
+        self.assertIn("from agentic_workflow import", content)
+        self.assertNotIn("from common.team_lead_agentic_workflow import", content)
+
+    def test_common_no_longer_contains_agent_specific_helpers(self):
+        removed_paths = [
+            "common/compass_agentic_workflow.py",
+            "common/compass_completeness.py",
+            "common/compass_office_routing.py",
+            "common/web_agentic_workflow.py",
+            "common/android_agentic_workflow.py",
+            "common/office_agentic_workflow.py",
+            "common/team_lead_agentic_workflow.py",
         ]
-        for mod_name in stubs:
+        for rel_path in removed_paths:
+            self.assertFalse((Path(_REPO_ROOT) / rel_path).exists(), f"{rel_path} should be removed")
+
+    def test_canonical_modules_are_importable(self):
+        module_names = [
+            "compass.agentic_workflow",
+            "compass.completeness",
+            "compass.office_routing",
+            "web.agentic_workflow",
+            "android.agentic_workflow",
+            "office.agentic_workflow",
+        ]
+        for mod_name in module_names:
             with self.subTest(module=mod_name):
                 mod = importlib.import_module(mod_name)
                 self.assertIsNotNone(mod)
-
-    def test_team_lead_agentic_workflow_stays_in_common_due_to_naming(self):
-        """team_lead_agentic_workflow stays in common/ because 'team-lead' is not
-        a valid Python identifier (hyphen), making direct package imports impossible."""
-        path = Path(_REPO_ROOT) / "common" / "team_lead_agentic_workflow.py"
-        self.assertTrue(path.is_file(), "common/team_lead_agentic_workflow.py must exist")
-        content = path.read_text()
-        # Should still contain the actual implementation (no re-export stub here)
-        self.assertIn("TEAM_LEAD_RUNTIME_TOOL_NAMES", content)
 
     def test_common_tools_are_shared_infrastructure(self):
         """Files directly in common/ (not in subdirs) should be shared infrastructure."""
@@ -1222,7 +1214,7 @@ class CommonFolderOrganizationTests(unittest.TestCase):
 # Registry skill hot-upgrade tests
 # ===========================================================================
 
-class RegistrySkillHotUpgradeTests(unittest.TestCase):
+class Phase8RegistrySkillHotUpgradeTests(unittest.TestCase):
     """Registry must support skill hot-upgrade without agent restart."""
 
     def test_registry_has_skills_rescan_endpoint_in_parse_path(self):
@@ -1257,6 +1249,46 @@ class RegistrySkillHotUpgradeTests(unittest.TestCase):
             )
         except Exception as exc:
             self.fail(f"Could not load registry app.py: {exc}")
+
+    def test_registry_uses_rescan_interval_setting(self):
+        spec = importlib.util.spec_from_file_location(
+            "registry_app_interval", Path(_REPO_ROOT) / "registry" / "app.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(module)
+        self.assertTrue(hasattr(module, "SKILLS_RESCAN_INTERVAL"))
+        self.assertIsInstance(module.SKILLS_RESCAN_INTERVAL, int)
+
+    def test_start_skills_rescan_thread_starts_daemon_when_enabled(self):
+        spec = importlib.util.spec_from_file_location(
+            "registry_app_thread", Path(_REPO_ROOT) / "registry" / "app.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(module)
+
+        fake_thread = mock.Mock()
+        with mock.patch.object(module, "SKILLS_RESCAN_INTERVAL", 30), \
+             mock.patch.object(module.threading, "Thread", return_value=fake_thread) as mock_thread:
+            module._start_skills_rescan_thread()
+
+        mock_thread.assert_called_once()
+        fake_thread.start.assert_called_once()
+
+    def test_start_skills_rescan_thread_skips_when_disabled(self):
+        spec = importlib.util.spec_from_file_location(
+            "registry_app_thread_disabled", Path(_REPO_ROOT) / "registry" / "app.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(module)
+
+        with mock.patch.object(module, "SKILLS_RESCAN_INTERVAL", 0), \
+             mock.patch.object(module.threading, "Thread") as mock_thread:
+            module._start_skills_rescan_thread()
+
+        mock_thread.assert_not_called()
 
     def test_skills_catalog_scan_is_idempotent(self):
         """Rescanning the catalog should be safe to call multiple times."""

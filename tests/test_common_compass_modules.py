@@ -1,4 +1,4 @@
-"""Tests for common/compass_completeness.py and common/compass_office_routing.py."""
+"""Tests for compass/completeness.py and compass/office_routing.py."""
 from __future__ import annotations
 
 import json
@@ -8,13 +8,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from common.compass_completeness import (
+from compass.completeness import (
     build_completeness_follow_up_message,
     derive_task_card_status,
     extract_pr_evidence_from_artifacts,
     extract_team_lead_completeness_issues,
 )
-from common.compass_office_routing import (
+from compass.office_routing import (
     build_output_target_question,
     build_write_permission_question,
     can_defer_office_path_existence_check,

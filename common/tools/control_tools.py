@@ -737,7 +737,7 @@ class AggregateTaskCardTool(ConstellationTool):
         workspace_path = str(_task_context.get("workspacePath") or "")
 
         try:
-            from common.compass_completeness import (
+            from compass.completeness import (
                 extract_pr_evidence_from_artifacts,
                 extract_team_lead_completeness_issues,
                 derive_task_card_status,
@@ -809,7 +809,7 @@ class DeriveUserFacingStatusTool(ConstellationTool):
         artifacts = list(args.get("artifacts") or [])
 
         try:
-            from common.compass_completeness import (
+            from compass.completeness import (
                 extract_pr_evidence_from_artifacts,
                 derive_task_card_status,
             )
@@ -889,7 +889,7 @@ class ValidateOfficePathsTool(ConstellationTool):
         )
 
     def execute(self, args: dict) -> dict:
-        from common.compass_office_routing import (
+        from compass.office_routing import (
             validate_office_target_paths,
             build_office_dispatch_context,
         )
