@@ -316,5 +316,5 @@ Create docs/evidence/self-review.md that describes:
 # The Android Agent is now fully LLM-driven via run_agentic(). All workflow
 # decisions are made by the agentic runtime via tools.
 # System prompt: prompts/system/manifest.yaml via build_system_prompt_from_manifest()
-# Task prompt: build_android_task_prompt() in common/android_agentic_workflow.py
+# Task prompt: build_android_task_prompt() in android/agentic_workflow.py
 # ---------------------------------------------------------------------------

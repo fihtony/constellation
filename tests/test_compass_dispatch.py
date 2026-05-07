@@ -182,7 +182,7 @@ class CompassDispatchTests(unittest.TestCase):
 
     def test_build_compass_workflow_prompt_loads_from_orchestrate_md(self):
         """build_compass_workflow_prompt() must load content from orchestrate.md, not hardcode it."""
-        from common.compass_agentic_workflow import build_compass_workflow_prompt
+        from compass.agentic_workflow import build_compass_workflow_prompt
         prompt = build_compass_workflow_prompt(
             user_text="Implement PROJ-10 feature",
             workspace_path="/tmp/ws/task-001",
@@ -201,7 +201,7 @@ class CompassDispatchTests(unittest.TestCase):
 
     def test_orchestrate_template_has_routing_decision_guidance(self):
         """orchestrate.md must contain routing classification guidance."""
-        from common.compass_agentic_workflow import _load_orchestrate_template
+        from compass.agentic_workflow import _load_orchestrate_template
         template = _load_orchestrate_template()
         self.assertIn("team-lead.task.analyze", template)
         self.assertIn("office.", template)
@@ -212,7 +212,7 @@ class CompassDispatchTests(unittest.TestCase):
     def test_run_compass_workflow_does_not_accept_workflow_parameter(self):
         """run_compass_workflow() must not have workflow or route_system_prompt params."""
         import inspect
-        from common.compass_agentic_workflow import run_compass_workflow
+        from compass.agentic_workflow import run_compass_workflow
         sig = inspect.signature(run_compass_workflow)
         self.assertNotIn("workflow", sig.parameters)
         self.assertNotIn("route_system_prompt", sig.parameters)

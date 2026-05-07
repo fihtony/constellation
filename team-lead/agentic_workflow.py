@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 import threading
 
-from common.runtime.adapter import summarize_runtime_configuration
 from common.prompt_builder import build_task_prompt
+from common.runtime.adapter import summarize_runtime_configuration
 from common.tools.control_tools import configure_control_tools
 
 DEFAULT_TEAM_LEAD_SKILL_PLAYBOOKS = [
@@ -158,7 +158,7 @@ IMPORTANT: Do NOT dispatch a development agent in this run.
 Instead, complete steps 1-3 only (Analyze, Gather, Plan), then call `complete_current_task`
 with `validationCheckpoint=true` in the metadata. Include your full analysis and plan in the summary.
 """
-    agent_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "team-lead"))
+    agent_dir = os.path.dirname(__file__)
     template = build_task_prompt(agent_dir, "orchestrate")
     if not template:
         raise RuntimeError(

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,7 +35,12 @@ from common.registry_client import RegistryClient
 from common.prompt_builder import build_system_prompt_from_manifest
 from common.runtime.adapter import get_runtime, require_agentic_runtime
 from common.task_store import TaskStore
-from common.team_lead_agentic_workflow import (
+
+_THIS_DIR = os.path.dirname(__file__)
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+from agentic_workflow import (
     TEAM_LEAD_RUNTIME_TOOL_NAMES,
     TEAM_LEAD_INPUT_REQUIRED_PREAMBLE,
     build_team_lead_runtime_config,

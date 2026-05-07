@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from common.compass_completeness import extract_team_lead_completeness_issues
+from compass.completeness import extract_team_lead_completeness_issues
 
 
 class CompassCompletenessTests(unittest.TestCase):

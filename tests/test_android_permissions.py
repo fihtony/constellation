@@ -130,7 +130,7 @@ class TestBuildAndroidTaskPrompt(unittest.TestCase):
     """Test that build_android_task_prompt generates required sections."""
 
     def test_includes_user_text(self):
-        from common.android_agentic_workflow import build_android_task_prompt
+        from android.agentic_workflow import build_android_task_prompt
 
         prompt = build_android_task_prompt(
             user_text="Add a Contributions screen",
@@ -142,7 +142,7 @@ class TestBuildAndroidTaskPrompt(unittest.TestCase):
         self.assertIn("Add a Contributions screen", prompt)
 
     def test_includes_jira_context_when_provided(self):
-        from common.android_agentic_workflow import build_android_task_prompt
+        from android.agentic_workflow import build_android_task_prompt
 
         prompt = build_android_task_prompt(
             user_text="implement screen",
@@ -157,7 +157,7 @@ class TestBuildAndroidTaskPrompt(unittest.TestCase):
         self.assertIn("contributions list", prompt)
 
     def test_includes_acceptance_criteria(self):
-        from common.android_agentic_workflow import build_android_task_prompt
+        from android.agentic_workflow import build_android_task_prompt
 
         prompt = build_android_task_prompt(
             user_text="implement",
@@ -171,7 +171,7 @@ class TestBuildAndroidTaskPrompt(unittest.TestCase):
         self.assertIn("Must have unit tests", prompt)
 
     def test_includes_revision_issues_when_revision(self):
-        from common.android_agentic_workflow import build_android_task_prompt
+        from android.agentic_workflow import build_android_task_prompt
 
         prompt = build_android_task_prompt(
             user_text="implement",
@@ -186,7 +186,7 @@ class TestBuildAndroidTaskPrompt(unittest.TestCase):
         self.assertIn("Fix the RecyclerView adapter null check", prompt)
 
     def test_includes_repo_url_when_provided(self):
-        from common.android_agentic_workflow import build_android_task_prompt
+        from android.agentic_workflow import build_android_task_prompt
 
         prompt = build_android_task_prompt(
             user_text="implement",
@@ -199,7 +199,7 @@ class TestBuildAndroidTaskPrompt(unittest.TestCase):
         self.assertIn("https://github.com/org/android-app.git", prompt)
 
     def test_includes_workspace_path(self):
-        from common.android_agentic_workflow import build_android_task_prompt
+        from android.agentic_workflow import build_android_task_prompt
 
         prompt = build_android_task_prompt(
             user_text="implement",
@@ -219,7 +219,7 @@ class TestAndroidRuntimeToolNames(unittest.TestCase):
     """Test that the tool name list includes required categories."""
 
     def setUp(self):
-        from common.android_agentic_workflow import ANDROID_AGENT_RUNTIME_TOOL_NAMES
+        from android.agentic_workflow import ANDROID_AGENT_RUNTIME_TOOL_NAMES
         self.tool_names = ANDROID_AGENT_RUNTIME_TOOL_NAMES
 
     def test_is_a_list_of_strings(self):
@@ -270,7 +270,7 @@ class TestAndroidValidationProvider(unittest.TestCase):
     """
 
     def _get_provider(self):
-        from common.android_agentic_workflow import AndroidValidationProvider
+        from android.agentic_workflow import AndroidValidationProvider
         return AndroidValidationProvider()
 
     def test_run_build_returns_validation_result(self):
@@ -352,7 +352,7 @@ class TestConfigureAndroidAgentControlTools(unittest.TestCase):
     """Test that configure_android_agent_control_tools wires permissions into context."""
 
     def test_stores_permissions_in_control_tools_context(self):
-        from common.android_agentic_workflow import configure_android_agent_control_tools
+        from android.agentic_workflow import configure_android_agent_control_tools
         from common.tools import control_tools
 
         perms = {"grant": "development", "actions": [{"action": "repo.clone"}]}
@@ -377,7 +377,7 @@ class TestConfigureAndroidAgentControlTools(unittest.TestCase):
             self.assertEqual(ctx.get("agentId"), "android-agent")
 
     def test_works_without_permissions(self):
-        from common.android_agentic_workflow import configure_android_agent_control_tools
+        from android.agentic_workflow import configure_android_agent_control_tools
 
         with patch("android.agentic_workflow.configure_control_tools") as mock_configure:
             configure_android_agent_control_tools(

@@ -1,6 +1,6 @@
 """Android Agent-specific helpers for runtime-driven execution.
 
-Mirrors common/web_agentic_workflow.py but for the Android Agent role:
+Mirrors the agent-local workflow module pattern used by Web Agent:
 Android implementation specialist that clones repos, writes Kotlin/Android code,
 runs Gradle builds, validates tests, and creates PRs — all driven by the
 agentic runtime via tools.

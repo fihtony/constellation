@@ -25,7 +25,7 @@ from pathlib import Path
 from unittest import mock
 
 from web import app as web_app
-from common.web_agentic_workflow import (
+from web.agentic_workflow import (
     WEB_AGENT_RUNTIME_TOOL_NAMES,
     build_web_agent_runtime_config,
     build_web_task_prompt,

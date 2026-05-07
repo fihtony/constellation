@@ -144,10 +144,10 @@ An Office Agent task is **complete** when ALL of the following are true:
 | File | Purpose |
 |---|---|
 | `office/app.py` | A2A protocol, permission enforcement, task lifecycle |
-| `common/office_agentic_workflow.py` | Tool names, task prompt builder, control tool wiring |
+| `office/agentic_workflow.py` | Tool names, task prompt builder, control tool wiring |
 | `office/prompts/tasks/process.md` | Task prompt template injected into run_agentic() |
 | `office/prompts/system/` | Modular system prompt (role, boundaries, tools, DoD) |
-| `common/compass_office_routing.py` | Compass-side path validation and Docker bind helpers |
+| `compass/office_routing.py` | Compass-side path validation and Docker bind helpers |
 
 ---
 

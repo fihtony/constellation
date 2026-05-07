@@ -726,8 +726,9 @@ Before submitting a new agent, verify:
 | UI Design client (Figma) | `ui-design/figma_client.py` | Agent-local, NOT in `common/` |
 | UI Design client (Stitch) | `ui-design/stitch_client.py` | Agent-local, NOT in `common/` |
 | Compass Agent (control plane) | `compass/app.py` |
-| Compass office routing helpers | `common/compass_office_routing.py` | Path validation and Docker bind-mount helpers for office tasks (state machine removed; LLM uses `validate_office_paths` control tool instead) |
-| Compass completeness gate helpers | `common/compass_completeness.py` | PR evidence extraction, completeness checks, follow-up message builder, task card status derivation |
+| Compass office routing helpers | `compass/office_routing.py` | Path validation and Docker bind-mount helpers for office tasks (state machine removed; LLM uses `validate_office_paths` control tool instead) |
+| Compass completeness gate helpers | `compass/completeness.py` | PR evidence extraction, completeness checks, follow-up message builder, task card status derivation |
+| Team Lead workflow helpers | `team-lead/agentic_workflow.py` | Runtime tool list, task prompt builder, input-wait helper, and control tool wiring |
 | Runtime adapter factory | `common/runtime/adapter.py` | Unified runtime contract + backend factory |
 | Shared runtime env template | `common/.env.example` | Shared default runtime/timezone config loaded before agent-local `.env` |
 | Local time helpers | `common/time_utils.py` | Shared local timestamp helpers for workspace and audit logs |

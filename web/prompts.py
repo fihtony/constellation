@@ -4,7 +4,7 @@ All system prompts are defined in web/prompts/system/*.md (loaded via manifest.y
 through build_system_prompt_from_manifest()).
 
 All task prompts are defined in web/prompts/tasks/*.md and rendered by
-common.web_agentic_workflow.build_web_task_prompt().
+web.agentic_workflow.build_web_task_prompt().
 
 This module is intentionally minimal.  All workflow-driving prompt strings
 live in the files above to enable independent versioning, review, and A/B testing.

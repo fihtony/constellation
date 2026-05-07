@@ -71,13 +71,12 @@ COMPASS_API_KEY = os.environ.get("COMPASS_API_KEY", "").strip()
 
 
 # ---------------------------------------------------------------------------
-# Backward-compat thin wrapper around common/compass_office_routing.py.
-# Kept so existing tests can patch compass_app._validate_office_target_paths.
+# Local validation seam used by Compass and targeted tests.
 # ---------------------------------------------------------------------------
 
 
 def _validate_office_target_paths(target_paths, *, allowed_base_paths=None):
-    from common.compass_office_routing import path_within_base
+    from compass.office_routing import path_within_base
     effective_bases = allowed_base_paths if allowed_base_paths is not None else OFFICE_ALLOWED_BASE_PATHS or None
     normalized: list = []
     seen: set = set()
@@ -394,7 +393,7 @@ def _refresh_task_card_metadata(task):
 
 
 def _task_card_status(task_state, pr_evidence):
-    """Delegate to common.compass_completeness.derive_task_card_status."""
+    """Delegate to compass.completeness.derive_task_card_status."""
     return derive_task_card_status(task_state, pr_evidence)
 
 
