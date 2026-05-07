@@ -2,20 +2,18 @@
 
 ## Purpose
 
-Use this skill when implementing, reviewing, or testing the Office Agent and the
-Compass-side Office routing flow.
+This skill guides the **Office Agent** through document-processing tasks using
+the agentic runtime backend. The LLM uses this guidance — combined with the
+available tools — to decide every next action.
 
-This skill covers:
-- Compass agentic-runtime routing for all user-facing cases
-- Office path extraction and clarification handling
-- Output-mode selection (`workspace` vs `inplace`)
-- Conditional write-permission confirmation
-- Office Agent execution for summarize / analyze / organize
-- Bounded organize-plan validation and safe file writes
+Capabilities covered:
+- `office.document.summarize` / `office.folder.summarize` — read-only summarization
+- `office.data.analyze` — spreadsheet and CSV data analysis
+- `office.folder.organize` — folder restructuring
 
 ---
 
-## Core Workflow
+## Compass Routing Overview (context only — not for Office Agent execution)
 
 1. Compass uses the shared agentic runtime to classify every incoming request.
 2. Development work routes to `team-lead.task.analyze`.
@@ -25,137 +23,144 @@ This skill covers:
    - `office.data.analyze`
    - `office.folder.organize`
 4. If an office task does not include an absolute path, Compass enters `TASK_STATE_INPUT_REQUIRED`.
-5. Once the path is known, Compass asks where output should go:
+5. Once the path is known, Compass selects output mode:
    - `workspace` → source bind is read-only
    - `inplace` → Compass asks for write confirmation before dispatch
-6. Compass launches Office Agent with `extraBinds` and sends metadata:
-   - `officeTargetPaths`
-   - `officeOutputMode`
-   - `officeInputRoot`
-   - `officeWorkspacePath`
-7. Office Agent executes the requested capability and calls back to Compass.
+6. Compass launches Office Agent with metadata: `officeTargetPaths`, `officeOutputMode`, `officeInputRoot`.
 
 ---
 
-## Safety Rules
+## Office Agent Execution Workflow
 
-- Compass must not guess missing office paths.
-- Compass must use the agentic runtime for routing, clarification interpretation,
-  and final user summaries.
-- Office Agent must never execute arbitrary shell commands from runtime output.
-- Organize plans must be validated against a strict action allowlist before any writes:
-  - `mkdir`
-  - `write_text`
-  - `write_fragment`
-- Destinations must always be relative to the approved output root.
-- Default behavior preserves originals. MVP does not delete source files.
-- Workspace-mode organize must not duplicate the original source tree into `organized-output/`.
-- Organize destinations are normalized into a single schema root: `organized-output/files/`.
-- In-place mode writes only final user-facing outputs under the source folder; audit files stay in the workspace audit dir.
+The Office Agent runtime backend drives all decisions below. Python code only
+handles protocol, permissions, and tool wiring.
+
+### Step 1: Orientation
+
+1. Call `report_progress` with `"Office Agent starting: <capability>"`
+2. Use `todo_write` to record a high-level execution plan.
+3. Use `list_local_dir` to understand the target structure.
+4. If no target paths are available, call `fail_current_task` with a clear message.
+
+### Step 2: File Discovery
+
+1. Walk target paths with `list_local_dir` and `search_local_files`.
+2. Collect readable files by extension: `.txt`, `.md`, `.csv`, `.json`, `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.xls`
+3. Skip files > 50 MB — note them as warnings.
+4. Skip macro-enabled formats (`.xlsm`, `.docm`) — note as unsupported.
+5. Call `report_progress` with `"Discovered N files"`
+
+### Step 3a: Summarization (office.document.summarize / office.folder.summarize)
+
+1. Use `read_local_file` to read each file in turn.
+2. For binary or large files, use `run_local_command` with `head -n 200`.
+3. For each document identify: title, key topics, main findings, page count.
+4. Compose a Markdown summary. For multiple docs, add a cross-document synthesis.
+5. Save to `<workspace>/office-agent/summary.md` using `write_local_file`.
+6. Call `report_progress` with `"Summary written"`
+
+### Step 3b: Data Analysis (office.data.analyze)
+
+1. Use `read_local_file` or `run_local_command` with `head -n 50` for CSV preview.
+2. Identify columns, data types, value ranges, missing values.
+3. Compute statistics: row count, min/max/avg for numeric columns, top categories.
+4. Identify patterns, trends, anomalies relevant to the user request.
+5. Write a Markdown analysis report with an overview table and key findings.
+6. Save to `<workspace>/office-agent/analysis.md` using `write_local_file`.
+7. Call `report_progress` with `"Analysis report written"`
+
+### Step 3c: Folder Organization (office.folder.organize)
+
+1. Use `list_local_dir` to enumerate all files.
+2. Group files by logical category (file type, topic, date, project).
+3. Write the plan to `<workspace>/office-agent/organization-plan.json` using `write_local_file`.
+4. **IN-PLACE mode only**:
+   - Create subdirectories with `run_local_command` using `mkdir -p`
+   - Move files with `run_local_command` using `mv`
+   - Never delete original files
+   - Write `.office-agent-manifest.json` in the source folder for recoverability
+5. **WORKSPACE mode**: only write the plan, do not move files.
+6. Call `report_progress` with `"Organization complete"` or `"Plan written"`
+
+### Step 4: Completion
+
+1. Write `<workspace>/office-agent/warnings.md` if any files were skipped.
+2. Call `collect_task_evidence` to capture output paths.
+3. Call `check_definition_of_done` with an appropriate checklist.
+4. Call `complete_current_task` with a concise summary and artifact paths.
 
 ---
 
-## Output Conflict Protection
+## Error Handling
 
-- `_non_overwrite_path(path)` appends a compact timestamp suffix when the target file already exists.
-- Workspace and inplace modes both default to `summary.md` / `analysis.md`; `_non_overwrite_path(path)` avoids collisions by renaming only when the target already exists.
-- For organize, final files live under `organized-output/files/` in both workspace and inplace modes.
-- For organize, the `.office-agent-manifest.json` always reflects the final executed actions.
-- Organize fragment ids must be unique across the full source tree; use relative source-path prefixes instead of bare basenames to avoid cross-folder collisions like `0103/1.txt::1` vs `0110/1.txt::1`.
-
-## Analysis Data Fidelity
-
-- `_build_csv_profile(path)` now reads the full CSV and exposes `groupedNumericTotals` for categorical-to-numeric rankings such as `Sales_Rep -> Sales_Amount`.
-- When `groupedNumericTotals` is present, analysis should treat it as authoritative for full-dataset ranking instead of inferring from `sampleRows`.
+| Situation | Action |
+|---|---|
+| No readable files found | `fail_current_task` with explanation |
+| All files too large or unsupported | `fail_current_task` with file list |
+| Write permission denied (IN-PLACE) | `fail_current_task` with path and error |
+| Partial success (some files failed) | Continue; note failures in warnings.md; `complete_current_task` |
+| Unexpected exception | `fail_current_task` with error message |
 
 ---
 
-## Operations Plan Before Writes (§9.6)
+## Authorization Constraints
 
-- `_execute_organize` saves `operations-plan.json` to the audit dir **before** executing any action.
-- In inplace mode each executed action is also logged to `command-log.txt` immediately for human recoverability.
-
----
-
-## Directory Preflight Limits
-
-- `_preflight_scan(paths)` counts files and total bytes without reading content.
-- If `overFileCountLimit` or `overBytesLimit` is set, `_execute_summary` / `_execute_analysis` return a preflight report artifact instead of running the LLM, avoiding OOM.
-- Hard limits are configurable via `OFFICE_MAX_FILE_SIZE_MB`, `OFFICE_MAX_DIR_FILE_COUNT`, `OFFICE_MAX_DIR_TOTAL_MB`.
+- Only operate on the paths listed in the task's **Target Files / Directories**.
+- Do not access, read, or write any files outside the authorized target paths.
+- For summarize/analyze modes: never modify source files.
+- Preserve originals: never delete user files.
+- No external calls: do not access the internet, Jira, SCM, or any external system.
+- No macro execution: never open or execute macros from `.xlsm` or `.docm` files.
 
 ---
 
-## Container Security
+## Supported File Formats
 
-- All agent containers run as non-root `appuser` (UID 1000); see each `Dockerfile`.
-- Compass container must receive the mounted Docker socket's numeric group id through `group_add` in `docker-compose.yml` to access the socket as non-root on both Docker Desktop and Rancher Desktop. Keep group `0` for Docker Desktop compatibility, and when Rancher Desktop needs an override, derive `DOCKER_SOCKET_GID` from a helper container: `docker run --rm -v "${DOCKER_SOCKET:-$HOME/.rd/docker.sock}:/var/run/docker.sock" python:3.12-slim python -c "import os; print(os.stat('/var/run/docker.sock').st_gid)"`.
+| Extension | Support level |
+|---|---|
+| `.txt`, `.md`, `.csv`, `.json` | Full — use `read_local_file` |
+| `.docx`, `.xlsx`, `.pptx`, `.pdf` | Full — runtime extracts text |
+| `.xls` | Best-effort |
+| `.doc`, `.ppt` | Unsupported — report with guidance |
+| Scanned/OCR-only PDFs | Unsupported — report clearly |
+| `.xlsm`, `.docm` | Rejected — macro safety boundary |
 
 ---
 
-## Format Support
+## Definition of Done
 
-Guaranteed MVP support:
-- `.txt`
-- `.csv`
-- `.xlsx`
-- `.docx`
-- `.pptx`
-- `.pdf` (text PDFs only)
+An Office Agent task is **complete** when ALL of the following are true:
 
-Best-effort:
-- `.xls`
-
-Rejected with explicit guidance:
-- `.doc`
-- `.ppt`
-- scanned/OCR-only PDFs
+1. At least one target file was successfully read and processed.
+2. The requested output (summary/analysis/plan) was written to workspace or source directory.
+3. All accessed paths were within the authorized target paths.
+4. A result artifact was returned with the output file path and task summary.
+5. Source files were NOT modified (for summarize/analyze modes).
 
 ---
 
 ## Key Files
 
-- `compass/app.py`
-- `compass/prompts.py`
-- `office/app.py`
-- `office/prompts.py`
-- `common/launcher.py`
-- `common/launcher_rancher.py`
-- `tests/test_compass_dispatch.py`
-- `tests/test_office_agent.py`
+| File | Purpose |
+|---|---|
+| `office/app.py` | A2A protocol, permission enforcement, task lifecycle |
+| `common/office_agentic_workflow.py` | Tool names, task prompt builder, control tool wiring |
+| `office/prompts/tasks/process.md` | Task prompt template injected into run_agentic() |
+| `office/prompts/system/` | Modular system prompt (role, boundaries, tools, DoD) |
+| `common/compass_office_routing.py` | Compass-side path validation and Docker bind helpers |
 
 ---
 
 ## Validation Commands
 
-Run the focused unit tests first:
-
 ```bash
-venv/bin/python -m unittest \
-  tests.test_compass_dispatch \
-  tests.test_office_agent \
-  tests.test_env_isolation
-```
+# Unit tests for office agent agentic workflow
+python -m unittest tests.test_agent_runtime_adoption -v
+python -m unittest tests.test_migration_phases -v
 
-Then run the Office end-to-end flow through Compass, including inplace writes:
+# End-to-end through Compass
+python tests/test_office_agent_e2e.py -v
 
-```bash
-venv/bin/python tests/test_office_agent_e2e.py -v
-```
-
-Build the Office Agent image when validating container wiring:
-
-```bash
+# Build office agent image
 ./build-agents.sh office
 ```
-
----
-
-## Common Failure Modes
-
-- Office task stays in `TASK_STATE_INPUT_REQUIRED` because the path is not absolute.
-- Office launch fails because `OFFICE_ALLOWED_BASE_PATHS` rejects the selected path.
-- Office organize fails because runtime returned an unsafe destination such as `../...`.
-- Office organize unexpectedly produces `grouped/`, `by-student/`, or `originals/` at the output root because destination normalization regressed.
-- Workspace output is missing because the Docker volume mount for `/app/artifacts` could not be auto-discovered (check Docker socket access for Compass).
-- In-place mode was requested but the user denied write permission.
-- In-place final outputs are missing from the user folder because the test looked for the Compass task id instead of the Office child-task file name or glob pattern.

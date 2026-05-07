@@ -18,6 +18,7 @@ Usage in app.py:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable
 
 from common.tools.base import ConstellationTool, ToolSchema
@@ -51,6 +52,31 @@ def configure_scm_provider_tools(
 def _require(action: str, target: str, scope: str = "*") -> None:
     if _permission_fn:
         _permission_fn(action, target, scope)
+
+
+def _coerce_owner_repo(args: dict) -> tuple[str, str]:
+    owner = str(args.get("owner") or "").strip()
+    repo = str(args.get("repo") or "").strip()
+    if owner and repo and "/" not in repo:
+        return owner, repo
+
+    repo_ref = repo if not owner else f"{owner}/{repo}"
+    normalized = repo_ref.rstrip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+
+    github_match = re.search(r"github\.com/([^/\s]+)/([^/\s?#]+)", normalized)
+    if github_match:
+        return github_match.group(1), github_match.group(2)
+
+    bitbucket_match = re.search(r"/projects/([^/\s]+)/repos/([^/\s?#]+)", normalized)
+    if bitbucket_match:
+        return bitbucket_match.group(1), bitbucket_match.group(2)
+
+    shorthand = normalized.strip("/").split("/")
+    if len(shorthand) >= 2:
+        return shorthand[-2], shorthand[-1]
+    return "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -569,8 +595,8 @@ class _ScmCloneRepoTool(ConstellationTool):
             input_schema={
                 "type": "object",
                 "properties": {
-                    "owner": {"type": "string", "description": "Repository owner."},
-                    "repo": {"type": "string", "description": "Repository name."},
+                    "owner": {"type": "string", "description": "Repository owner (optional when repo is owner/name or URL)."},
+                    "repo": {"type": "string", "description": "Repository name, owner/name shorthand, or full repository URL."},
                     "branch": {"type": "string", "description": "Branch to clone (default: default branch)."},
                     "workspace_path": {
                         "type": "string",
@@ -580,23 +606,30 @@ class _ScmCloneRepoTool(ConstellationTool):
                         "type": "integer",
                         "description": "Clone depth (default: 1 for shallow). Use 0 for full history.",
                     },
+                    "full_history": {
+                        "type": "boolean",
+                        "description": "Clone full history instead of a shallow checkout.",
+                    },
                 },
-                "required": ["owner", "repo"],
+                "required": ["repo"],
             },
         )
 
     def execute(self, args: dict) -> dict:
-        owner, repo = args.get("owner", ""), args.get("repo", "")
+        owner, repo = _coerce_owner_repo(args)
+        if not owner or not repo:
+            return self.error("scm_clone_repo: could not parse owner/repo from input")
         _require("repo.clone", f"{owner}/{repo}")
         if not _clone_fn:
             return self.error("Clone function not configured.")
-        clone_url = _current_provider.get_clone_url(owner, repo)
         try:
             result = _clone_fn(
-                repo_url=clone_url,
+                owner=owner,
+                repo=repo,
                 branch=args.get("branch", ""),
                 workspace_path=args.get("workspace_path", ""),
                 depth=args.get("depth", 1),
+                full_history=bool(args.get("full_history", False)),
                 message=_current_message,
             )
             return self.ok(json.dumps(result or {}, ensure_ascii=False))

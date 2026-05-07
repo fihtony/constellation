@@ -7,14 +7,18 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from common.tools.base import ConstellationTool, ToolSchema
-from common.tools.registry import register_tool
+from common.tools.registry import is_registered, register_tool
 
 _REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000")
 _ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", "15"))
+_TASK_TIMEOUT = int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "300"))
+_CLONE_TASK_TIMEOUT = int(os.environ.get("SCM_CLONE_TASK_TIMEOUT_SECONDS", "600"))
+_TASK_POLL_INTERVAL = float(os.environ.get("A2A_TASK_POLL_INTERVAL_SECONDS", "1.0"))
 
 
 def _discover_scm_url(capability: str) -> str | None:
@@ -38,17 +42,14 @@ def _discover_scm_url(capability: str) -> str | None:
 
 
 def _a2a_send(agent_url: str, capability: str, params: dict) -> dict:
+    agent_url = agent_url.rstrip("/")
     payload = {
-        "jsonrpc": "2.0",
-        "id": "tool-call",
-        "method": "message:send",
-        "params": {
-            "message": {
-                "role": "user",
-                "parts": [{"kind": "text", "text": json.dumps(params)}],
-            },
-            "metadata": {"capability": capability, **params},
+        "message": {
+            "role": "user",
+            "parts": [{"text": json.dumps(params, ensure_ascii=False)}],
+            "metadata": {"requestedCapability": capability, **params},
         },
+        "configuration": {"returnImmediately": True},
     }
     req = Request(
         f"{agent_url}/message:send",
@@ -57,7 +58,51 @@ def _a2a_send(agent_url: str, capability: str, params: dict) -> dict:
         method="POST",
     )
     with urlopen(req, timeout=_ACK_TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        data = json.loads(resp.read().decode("utf-8"))
+
+    task = data.get("task") or {}
+    task_id = str(task.get("id") or "").strip()
+    if not task_id:
+        return data
+    if _is_terminal_task(task):
+        return task
+    timeout = _CLONE_TASK_TIMEOUT if capability == "scm.git.clone" else _TASK_TIMEOUT
+    return _poll_task(agent_url, task_id, timeout=timeout)
+
+
+def _is_terminal_task(task: dict) -> bool:
+    state = str(((task or {}).get("status") or {}).get("state") or "")
+    return state in {
+        "TASK_STATE_COMPLETED",
+        "TASK_STATE_FAILED",
+        "TASK_STATE_INPUT_REQUIRED",
+    }
+
+
+def _poll_task(agent_url: str, task_id: str, *, timeout: int) -> dict:
+    deadline = time.time() + max(1, timeout)
+    last_task: dict = {"id": task_id}
+    while time.time() < deadline:
+        req = Request(
+            f"{agent_url}/tasks/{task_id}",
+            headers={"Accept": "application/json"},
+        )
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        task = data.get("task") or {}
+        if task:
+            last_task = task
+        if _is_terminal_task(task):
+            return task
+        time.sleep(_TASK_POLL_INTERVAL)
+
+    status = last_task.setdefault("status", {})
+    status.setdefault("state", "TASK_STATE_FAILED")
+    status.setdefault(
+        "message",
+        {"parts": [{"text": f"Timed out waiting for {task_id} to complete."}]},
+    )
+    return last_task
 
 
 class ScmCreateBranchTool(ConstellationTool):
@@ -158,9 +203,9 @@ class ScmCreatePRTool(ConstellationTool):
             return self.error(f"SCM create PR failed: {exc}")
 
 
-register_tool(ScmCreateBranchTool())
-register_tool(ScmPushFilesTool())
-register_tool(ScmCreatePRTool())
+for _tool in (ScmCreateBranchTool(), ScmPushFilesTool(), ScmCreatePRTool()):
+    if not is_registered(_tool.schema.name):
+        register_tool(_tool)
 
 
 # ---------------------------------------------------------------------------
@@ -566,14 +611,18 @@ class ScmRepoInspectTool(ConstellationTool):
             return self.error(f"scm_repo_inspect failed: {exc}")
 
 
-register_tool(ScmReadFileTool())
-register_tool(ScmListDirTool())
-register_tool(ScmSearchCodeTool())
-register_tool(ScmCompareRefsTool())
-register_tool(ScmGetDefaultBranchTool())
-register_tool(ScmGetBranchRulesTool())
-register_tool(ScmGetPRDetailsTool())
-register_tool(ScmGetPRDiffTool())
-register_tool(ScmListBranchesTool())
-register_tool(ScmCloneRepoTool())
-register_tool(ScmRepoInspectTool())
+for _tool in (
+    ScmReadFileTool(),
+    ScmListDirTool(),
+    ScmSearchCodeTool(),
+    ScmCompareRefsTool(),
+    ScmGetDefaultBranchTool(),
+    ScmGetBranchRulesTool(),
+    ScmGetPRDetailsTool(),
+    ScmGetPRDiffTool(),
+    ScmListBranchesTool(),
+    ScmCloneRepoTool(),
+    ScmRepoInspectTool(),
+):
+    if not is_registered(_tool.schema.name):
+        register_tool(_tool)

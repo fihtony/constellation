@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import inspect
 import os
 import sys
 import tempfile
@@ -706,6 +707,46 @@ class TestCloneDepthSupport(unittest.TestCase):
         self.assertIn("--depth", captured_args)
         depth_index = captured_args.index("--depth")
         self.assertEqual(captured_args[depth_index + 1], "10")
+
+    def test_provider_clone_tool_accepts_repo_url_and_returns_clone_path(self):
+        import scm.provider_tools as _scm_pt
+
+        captured_call: dict = {}
+
+        def fake_clone_fn(**kwargs):
+            captured_call.update(kwargs)
+            return {
+                "clonePath": "/tmp/workspace/repo",
+                "result": "cloned",
+                "branch": "main",
+                "workspacePath": "/tmp/workspace",
+            }
+
+        _scm_pt.configure_scm_provider_tools(
+            message={"metadata": {"permissions": _DEV_PERMISSIONS}},
+            provider=scm_app._provider,
+            permission_fn=None,
+            clone_fn=fake_clone_fn,
+        )
+        tool = _scm_pt._ScmCloneRepoTool()
+        result = tool.execute({
+            "repo": "https://github.com/org/myapp.git",
+            "branch": "main",
+            "workspace_path": "/tmp/workspace",
+        })
+
+        self.assertFalse(result.get("isError"))
+        payload = json.loads(result["content"][0]["text"])
+        self.assertEqual(payload["clonePath"], "/tmp/workspace/repo")
+        self.assertEqual(captured_call["owner"], "org")
+        self.assertEqual(captured_call["repo"], "myapp")
+
+
+class TestScmWorkflowCleanup(unittest.TestCase):
+    def test_run_task_async_has_no_clone_special_case(self):
+        source = inspect.getsource(scm_app._run_task_async)
+        self.assertNotIn('if capability == "scm.git.clone"', source)
+        self.assertIn("run_agentic(", source)
 
 
 # ---------------------------------------------------------------------------

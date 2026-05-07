@@ -115,122 +115,113 @@ class CompassDispatchTests(unittest.TestCase):
         finally:
             compass_app.task_store = original_store
 
-    def test_route_with_runtime_can_choose_office_workflow(self):
-        with mock.patch.object(compass_app, "_run_agentic", return_value=json.dumps({
-            "summary": "Summarize the local sales workbook.",
-            "workflow": ["office.data.analyze"],
-            "task_type": "office",
-            "office_subtype": "analyze",
-            "target_paths": ["/Users/example/Documents/sales.xlsx"],
-            "needs_input": False,
-            "input_question": None,
-            "reasoning": "Local spreadsheet analysis belongs to Office Agent.",
-        })):
-            decision = compass_app._route_with_runtime(
-                "Please analyze /Users/example/Documents/sales.xlsx and summarize the trends."
-            )
-
-        self.assertEqual(decision["workflow"], ["office.data.analyze"])
-        self.assertEqual(decision["task_type"], "office")
-        self.assertEqual(decision["office_subtype"], "analyze")
-        self.assertEqual(decision["target_paths"], ["/Users/example/Documents/sales.xlsx"])
-        self.assertFalse(decision["needs_input"])
-
-    def test_summarize_for_user_prefers_runtime_summary(self):
-        task = TaskStore().create()
-        task.original_message = {"parts": [{"text": "Summarize the generated report."}]}
-
-        with mock.patch.object(compass_app, "_run_agentic", return_value=json.dumps({
-            "summary": "Completed. The generated report is ready for review.",
-            "highlights": ["report generated"],
-            "warnings": [],
-        })):
-            summary = compass_app._summarize_for_user(
-                task,
-                "TASK_STATE_COMPLETED",
-                "Workflow completed.",
-                [{"name": "final-summary", "text": "Report created in workspace."}],
-                ["team-lead.task.analyze"],
-            )
-
-        self.assertEqual(summary, "Completed. The generated report is ready for review.")
-
-    def test_route_and_dispatch_office_task_prompts_for_output_mode(self):
+    def test_route_and_dispatch_starts_worker_directly_without_prerouting(self):
+        """route_and_dispatch() must create a task and start the worker without
+        calling a single-shot routing LLM step — routing is the LLM's job inside run_agentic()."""
         original_store = compass_app.task_store
         compass_app.task_store = TaskStore()
         try:
-            with tempfile.TemporaryDirectory(prefix="compass_office_route_") as workspace, \
-                 tempfile.NamedTemporaryFile(suffix=".csv") as handle, \
-                 mock.patch.object(compass_app, "_create_shared_workspace", return_value=workspace), \
-                 mock.patch.object(compass_app, "_route_with_runtime", return_value={
-                     "summary": "Analyze the local CSV file.",
-                     "workflow": ["office.data.analyze"],
-                     "task_type": "office",
-                     "office_subtype": "analyze",
-                     "target_paths": [handle.name],
-                     "needs_input": False,
-                     "input_question": None,
-                 }), \
-                 mock.patch.object(compass_app, "require_agentic_runtime"), \
-                 mock.patch.object(compass_app, "audit_log"), \
-                 mock.patch.object(compass_app, "record_workspace_stage"):
-                task_dict = compass_app.route_and_dispatch(
-                    {"parts": [{"text": f"Analyze {handle.name}"}]}
-                )
+            worker_calls = []
 
-            self.assertEqual(task_dict["status"]["state"], "TASK_STATE_INPUT_REQUIRED")
-            self.assertIn("workspace only", task_dict["status"]["message"]["parts"][0]["text"])
-            self.assertEqual(task_dict["routerContext"]["awaitingStep"], "output_mode")
-            self.assertEqual(task_dict["routerContext"]["requestedCapability"], "office.data.analyze")
+            def fake_worker(task, message, workflow):
+                worker_calls.append({"task_id": task.task_id, "workflow": workflow})
+                return task.to_dict()
+
+            message = {"parts": [{"text": "Implement feature PROJ-42 from Figma."}]}
+            with mock.patch.object(compass_app, "_start_task_worker", side_effect=fake_worker), \
+                 mock.patch.object(compass_app, "require_agentic_runtime"), \
+                 mock.patch.object(compass_app, "_create_shared_workspace", return_value="/tmp/ws"):
+                result = compass_app.route_and_dispatch(message)
+
+            self.assertEqual(len(worker_calls), 1)
+            self.assertIn("task_id", worker_calls[0])
         finally:
             compass_app.task_store = original_store
 
-    def test_route_and_dispatch_office_missing_path_prompts_for_clarification(self):
+    def test_route_and_dispatch_uses_explicit_capability_as_workflow_hint(self):
+        """When a requested_capability is provided, it should be used as the workflow hint."""
         original_store = compass_app.task_store
         compass_app.task_store = TaskStore()
         try:
-            with tempfile.TemporaryDirectory(prefix="compass_office_clarify_") as workspace, \
-                 mock.patch.object(compass_app, "_create_shared_workspace", return_value=workspace), \
-                 mock.patch.object(compass_app, "_route_with_runtime", return_value={
-                     "summary": "Summarize the local document.",
-                     "workflow": ["office.document.summarize"],
-                     "task_type": "office",
-                     "office_subtype": "summarize",
-                     "target_paths": [],
-                     "needs_input": True,
-                     "input_question": "Please provide the absolute path to the document.",
-                 }), \
-                 mock.patch.object(compass_app, "require_agentic_runtime"), \
-                 mock.patch.object(compass_app, "audit_log"), \
-                 mock.patch.object(compass_app, "record_workspace_stage"):
-                task_dict = compass_app.route_and_dispatch(
-                    {"parts": [{"text": "Summarize my local report"}]}
-                )
+            worker_calls = []
 
-            self.assertEqual(task_dict["status"]["state"], "TASK_STATE_INPUT_REQUIRED")
-            self.assertIn("absolute path", task_dict["status"]["message"]["parts"][0]["text"])
-            self.assertEqual(task_dict["routerContext"]["awaitingStep"], "clarify_path")
-            self.assertEqual(task_dict["routerContext"]["requestedCapability"], "office.document.summarize")
+            def fake_worker(task, message, workflow):
+                worker_calls.append({"workflow": workflow})
+                return task.to_dict()
+
+            message = {"parts": [{"text": "Fetch Jira ticket ABC-1."}]}
+            with mock.patch.object(compass_app, "_start_task_worker", side_effect=fake_worker), \
+                 mock.patch.object(compass_app, "require_agentic_runtime"), \
+                 mock.patch.object(compass_app, "_create_shared_workspace", return_value="/tmp/ws"):
+                compass_app.route_and_dispatch(message, requested_capability="jira.ticket.fetch")
+
+            self.assertEqual(worker_calls[0]["workflow"], ["jira.ticket.fetch"])
         finally:
             compass_app.task_store = original_store
+
+    def test_route_and_dispatch_defaults_to_team_lead_hint(self):
+        """Without an explicit capability, the default workflow hint is team-lead.task.analyze."""
+        original_store = compass_app.task_store
+        compass_app.task_store = TaskStore()
+        try:
+            worker_calls = []
+
+            def fake_worker(task, message, workflow):
+                worker_calls.append({"workflow": workflow})
+                return task.to_dict()
+
+            message = {"parts": [{"text": "Build a REST API for user management."}]}
+            with mock.patch.object(compass_app, "_start_task_worker", side_effect=fake_worker), \
+                 mock.patch.object(compass_app, "require_agentic_runtime"), \
+                 mock.patch.object(compass_app, "_create_shared_workspace", return_value="/tmp/ws"):
+                compass_app.route_and_dispatch(message)
+
+            self.assertEqual(worker_calls[0]["workflow"], ["team-lead.task.analyze"])
+        finally:
+            compass_app.task_store = original_store
+
+    def test_build_compass_workflow_prompt_loads_from_orchestrate_md(self):
+        """build_compass_workflow_prompt() must load content from orchestrate.md, not hardcode it."""
+        from common.compass_agentic_workflow import build_compass_workflow_prompt
+        prompt = build_compass_workflow_prompt(
+            user_text="Implement PROJ-10 feature",
+            workspace_path="/tmp/ws/task-001",
+            task_id="task-001",
+            advertised_url="http://compass:8080",
+            compass_instance_id="abc123",
+            max_revisions=2,
+        )
+        # The prompt should include the user request
+        self.assertIn("Implement PROJ-10 feature", prompt)
+        # The prompt should have routing instructions (from orchestrate.md, not hardcoded)
+        self.assertIn("team-lead.task.analyze", prompt)
+        self.assertIn("dispatch_agent_task", prompt)
+        self.assertIn("aggregate_task_card", prompt)
+        self.assertIn("complete_current_task", prompt)
+
+    def test_orchestrate_template_has_routing_decision_guidance(self):
+        """orchestrate.md must contain routing classification guidance."""
+        from common.compass_agentic_workflow import _load_orchestrate_template
+        template = _load_orchestrate_template()
+        self.assertIn("team-lead.task.analyze", template)
+        self.assertIn("office.", template)
+        self.assertIn("request_user_input", template)
+        self.assertIn("validate_office_paths", template)
+        self.assertIn("check_agent_status", template)
+
+    def test_run_compass_workflow_does_not_accept_workflow_parameter(self):
+        """run_compass_workflow() must not have workflow or route_system_prompt params."""
+        import inspect
+        from common.compass_agentic_workflow import run_compass_workflow
+        sig = inspect.signature(run_compass_workflow)
+        self.assertNotIn("workflow", sig.parameters)
+        self.assertNotIn("route_system_prompt", sig.parameters)
+        self.assertNotIn("summarize_for_user", sig.parameters)
 
     def test_validate_office_target_paths_rejects_relative_path(self):
         paths, error = compass_app._validate_office_target_paths(["docs/report.txt"])
         self.assertEqual(paths, [])
         self.assertIn("Path must be absolute", error)
-
-    def test_validate_office_target_paths_defers_missing_host_path_when_containerized(self):
-        host_path = "/Users/example/projects/constellation/tests/data/csv/sales_data.csv"
-        # Simulate running inside a container by patching the helper directly.
-        with mock.patch.object(compass_app, "_is_containerized", return_value=True), \
-             mock.patch.object(compass_app.os.path, "exists", return_value=False):
-            paths, error = compass_app._validate_office_target_paths([host_path])
-
-        self.assertEqual(paths, [host_path])
-        self.assertEqual(error, "")
-
-        self.assertEqual(paths, [host_path])
-        self.assertEqual(error, "")
 
     def test_validate_office_target_paths_rejects_outside_whitelist(self):
         with tempfile.TemporaryDirectory(prefix="compass_allow_") as allowed, tempfile.TemporaryDirectory(prefix="compass_other_") as other:
@@ -251,125 +242,6 @@ class CompassDispatchTests(unittest.TestCase):
                 paths, error = compass_app._validate_office_target_paths([str(link)])
             self.assertEqual(paths, [])
             self.assertIn("outside OFFICE_ALLOWED_BASE_PATHS", error)
-
-    def test_resume_input_required_office_workspace_reuses_same_task(self):
-        original_store = compass_app.task_store
-        compass_app.task_store = TaskStore()
-        try:
-            task = compass_app.task_store.create()
-            task.state = "TASK_STATE_INPUT_REQUIRED"
-            task.workspace_path = "/app/artifacts/workspaces/task-0001"
-            task.status_message = "Choose output target"
-            task.original_message = {"parts": [{"text": "Analyze the CSV file."}]}
-            task.pending_workflow = ["office.data.analyze"]
-            task.router_context = {
-                "kind": "office",
-                "awaitingStep": "output_mode",
-                "requestedCapability": "office.data.analyze",
-                "officeSubtype": "analyze",
-                "targetPaths": ["/Users/example/Documents/sales.csv"],
-            }
-
-            def fake_start(current_task, message, workflow):
-                compass_app.task_store.update_state(current_task.task_id, "ROUTING", "Planned workflow: office.data.analyze")
-                return current_task.to_dict()
-
-            with mock.patch.object(compass_app, "_interpret_office_reply", return_value={"action": "workspace", "clarification_question": None}), \
-                 mock.patch.object(compass_app, "_start_task_worker", side_effect=fake_start), \
-                 mock.patch.object(compass_app.launcher, "resolve_host_path", return_value="/tmp/artifacts-host/workspaces/task-0001"):
-                resumed = compass_app._resume_input_required_task(
-                    {"contextId": task.task_id},
-                    {"parts": [{"text": "Use workspace output."}]},
-                )
-
-            self.assertEqual(resumed["id"], task.task_id)
-            self.assertEqual(compass_app.task_store.get(task.task_id).state, "ROUTING")
-            self.assertEqual(task.router_context["outputMode"], "workspace")
-            self.assertIn("/Users/example/Documents", task.router_context["dispatch"]["mountRootHostPath"])
-            self.assertIn(":ro", task.router_context["dispatch"]["extraBinds"][0])
-        finally:
-            compass_app.task_store = original_store
-
-    def test_resume_input_required_office_inplace_requires_write_confirmation(self):
-        original_store = compass_app.task_store
-        compass_app.task_store = TaskStore()
-        try:
-            task = compass_app.task_store.create()
-            task.state = "TASK_STATE_INPUT_REQUIRED"
-            task.status_message = "Choose output target"
-            task.original_message = {"parts": [{"text": "Organize the folder."}]}
-            task.pending_workflow = ["office.folder.organize"]
-            task.router_context = {
-                "kind": "office",
-                "awaitingStep": "output_mode",
-                "requestedCapability": "office.folder.organize",
-                "officeSubtype": "organize",
-                "targetPaths": ["/Users/example/Documents/2026"],
-            }
-
-            with mock.patch.object(compass_app, "_interpret_office_reply", return_value={"action": "inplace", "clarification_question": None}):
-                resumed = compass_app._resume_input_required_task(
-                    {"contextId": task.task_id},
-                    {"parts": [{"text": "Modify the original folder directly."}]},
-                )
-
-            self.assertEqual(resumed["id"], task.task_id)
-            self.assertEqual(compass_app.task_store.get(task.task_id).state, "TASK_STATE_INPUT_REQUIRED")
-            self.assertEqual(task.router_context["awaitingStep"], "confirm_write")
-            self.assertIn("Approve write access", compass_app.task_store.get(task.task_id).status_message)
-        finally:
-            compass_app.task_store = original_store
-
-    def test_resume_input_required_office_denied_write_falls_back_to_workspace(self):
-        original_store = compass_app.task_store
-        compass_app.task_store = TaskStore()
-        try:
-            task = compass_app.task_store.create()
-            task.state = "TASK_STATE_INPUT_REQUIRED"
-            task.status_message = "Approve write access"
-            task.original_message = {"parts": [{"text": "Organize the folder."}]}
-            task.pending_workflow = ["office.folder.organize"]
-            task.router_context = {
-                "kind": "office",
-                "awaitingStep": "confirm_write",
-                "requestedCapability": "office.folder.organize",
-                "officeSubtype": "organize",
-                "targetPaths": ["/Users/example/Documents/2026"],
-                "outputMode": "inplace",
-            }
-
-            with mock.patch.object(compass_app, "_interpret_office_reply", return_value={"action": "deny", "clarification_question": None}), \
-                 mock.patch.object(compass_app, "_start_task_worker", side_effect=lambda current_task, *_args, **_kwargs: current_task.to_dict()):
-                resumed = compass_app._resume_input_required_task(
-                    {"contextId": task.task_id},
-                    {"parts": [{"text": "No, do not modify the original folder."}]},
-                )
-
-            self.assertEqual(resumed["id"], task.task_id)
-            self.assertEqual(task.router_context["outputMode"], "workspace")
-            self.assertEqual(compass_app.task_store.get(task.task_id).state, "TASK_STATE_INPUT_REQUIRED")
-        finally:
-            compass_app.task_store = original_store
-
-    def test_route_with_runtime_recognizes_dev_task(self):
-        """TC-PERM-08: LLM classifies a development request as 'dev' task."""
-        with mock.patch.object(compass_app, "_run_agentic", return_value=json.dumps({
-            "summary": "Develop a new iOS application.",
-            "workflow": ["team-lead.task.analyze"],
-            "task_type": "dev",
-            "office_subtype": None,
-            "target_paths": [],
-            "needs_input": False,
-            "input_question": None,
-            "reasoning": "Building an iOS app is a software development task.",
-        })):
-            decision = compass_app._route_with_runtime(
-                "Help me develop an iOS application with SwiftUI."
-            )
-
-        self.assertEqual(decision["task_type"], "dev")
-        self.assertEqual(decision["workflow"], ["team-lead.task.analyze"])
-        self.assertFalse(decision["needs_input"])
 
     def test_validate_office_target_paths_rejects_dotdot(self):
         """TC-PERM-05: Path containing .. resolves outside the whitelist is rejected."""

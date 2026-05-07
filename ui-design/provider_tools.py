@@ -11,6 +11,7 @@ Usage in app.py:
         permission_fn=lambda action, target: _require_ui_permission(
             action=action, target=target, message=message
         ),
+        audit_fn=lambda operation, target, result, duration_ms=0: _write_ui_design_audit(...),
     )
 """
 from __future__ import annotations
@@ -18,6 +19,7 @@ from __future__ import annotations
 import json
 import sys
 import os
+import time
 from typing import Callable
 
 from common.tools.base import ConstellationTool, ToolSchema
@@ -36,22 +38,31 @@ if _UI_AGENT_DIR not in sys.path:
 # ---------------------------------------------------------------------------
 _current_message: dict = {}
 _permission_fn: Callable[[str, str], None] | None = None
+_audit_fn: Callable[..., None] | None = None
 
 
 def configure_ui_provider_tools(
     *,
     message: dict,
     permission_fn: Callable[[str, str], None] | None = None,
+    audit_fn: Callable[..., None] | None = None,
 ) -> None:
-    """Wire up the permission callback for the current task."""
-    global _current_message, _permission_fn
+    """Wire up the permission and audit callbacks for the current task."""
+    global _current_message, _permission_fn, _audit_fn
     _current_message = message
     _permission_fn = permission_fn
+    _audit_fn = audit_fn
 
 
 def _require(action: str, target: str) -> None:
     if _permission_fn:
         _permission_fn(action, target)
+
+
+def _audit(operation: str, target: str, result: dict, duration_ms: int = 0) -> None:
+    """Write a structured audit entry if an audit function is configured."""
+    if _audit_fn:
+        _audit_fn(operation, target, result, duration_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -81,12 +92,18 @@ class _FigmaListPagesTool(ConstellationTool):
         )
 
     def execute(self, args: dict) -> dict:
-        _require("figma.read", args.get("file_key", ""))
+        file_key = args.get("file_key", "")
+        _require("figma.read", file_key)
         import figma_client as fc
+        t0 = time.perf_counter()
         try:
-            pages = fc.list_pages(args.get("file_key", ""))
+            pages = fc.list_pages(file_key)
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("figma.list_pages", file_key, {"success": True, "pageCount": len(pages) if isinstance(pages, list) else None}, duration_ms)
             return self.ok(json.dumps(pages, ensure_ascii=False))
         except Exception as exc:
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("figma.list_pages", file_key, {"success": False, "error": str(exc)}, duration_ms)
             return self.error(f"figma_list_pages: {exc}")
 
 
@@ -117,15 +134,18 @@ class _FigmaFetchPageTool(ConstellationTool):
         )
 
     def execute(self, args: dict) -> dict:
-        _require("figma.read", args.get("file_key", ""))
+        file_key = args.get("file_key", "")
+        _require("figma.read", file_key)
         import figma_client as fc
+        t0 = time.perf_counter()
         try:
-            page = fc.fetch_page(
-                args.get("file_key", ""),
-                args.get("page_name", ""),
-            )
+            page = fc.fetch_page(file_key, args.get("page_name", ""))
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("figma.fetch_page", f"{file_key}/{args.get('page_name', '')}", {"success": True}, duration_ms)
             return self.ok(json.dumps(page, ensure_ascii=False))
         except Exception as exc:
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("figma.fetch_page", file_key, {"success": False, "error": str(exc)}, duration_ms)
             return self.error(f"figma_fetch_page: {exc}")
 
 
@@ -155,12 +175,19 @@ class _FigmaFetchNodeTool(ConstellationTool):
         )
 
     def execute(self, args: dict) -> dict:
-        _require("element.inspect", args.get("file_key", ""))
+        file_key = args.get("file_key", "")
+        node_id = args.get("node_id", "")
+        _require("element.inspect", file_key)
         import figma_client as fc
+        t0 = time.perf_counter()
         try:
-            node = fc.fetch_node(args.get("file_key", ""), args.get("node_id", ""))
+            node = fc.fetch_node(file_key, node_id)
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("figma.fetch_node", f"{file_key}/{node_id}", {"success": True}, duration_ms)
             return self.ok(json.dumps(node, ensure_ascii=False))
         except Exception as exc:
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("figma.fetch_node", f"{file_key}/{node_id}", {"success": False, "error": str(exc)}, duration_ms)
             return self.error(f"figma_fetch_node: {exc}")
 
 
@@ -190,12 +217,18 @@ class _StitchListScreensTool(ConstellationTool):
         )
 
     def execute(self, args: dict) -> dict:
-        _require("stitch.read", args.get("project_id", ""))
+        project_id = args.get("project_id", "")
+        _require("stitch.read", project_id)
         import stitch_client as sc
+        t0 = time.perf_counter()
         try:
-            screens = sc.list_screens(args.get("project_id", ""))
+            screens = sc.list_screens(project_id)
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("stitch.list_screens", project_id, {"success": True, "screenCount": len(screens) if isinstance(screens, list) else None}, duration_ms)
             return self.ok(json.dumps(screens, ensure_ascii=False))
         except Exception as exc:
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("stitch.list_screens", project_id, {"success": False, "error": str(exc)}, duration_ms)
             return self.error(f"stitch_list_screens: {exc}")
 
 
@@ -225,12 +258,19 @@ class _StitchFetchScreenTool(ConstellationTool):
         )
 
     def execute(self, args: dict) -> dict:
-        _require("stitch.read", args.get("project_id", ""))
+        project_id = args.get("project_id", "")
+        screen_id = args.get("screen_id", "")
+        _require("stitch.read", project_id)
         import stitch_client as sc
+        t0 = time.perf_counter()
         try:
-            screen = sc.fetch_screen(args.get("project_id", ""), args.get("screen_id", ""))
+            screen = sc.fetch_screen(project_id, screen_id)
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("stitch.fetch_screen", f"{project_id}/{screen_id}", {"success": True}, duration_ms)
             return self.ok(json.dumps(screen, ensure_ascii=False))
         except Exception as exc:
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("stitch.fetch_screen", f"{project_id}/{screen_id}", {"success": False, "error": str(exc)}, duration_ms)
             return self.error(f"stitch_fetch_screen: {exc}")
 
 
@@ -260,14 +300,19 @@ class _StitchFindScreenByNameTool(ConstellationTool):
         )
 
     def execute(self, args: dict) -> dict:
-        _require("stitch.read", args.get("project_id", ""))
+        project_id = args.get("project_id", "")
+        screen_name = args.get("screen_name", "")
+        _require("stitch.read", project_id)
         import stitch_client as sc
+        t0 = time.perf_counter()
         try:
-            screen = sc.find_screen_by_name(
-                args.get("project_id", ""), args.get("screen_name", "")
-            )
+            screen = sc.find_screen_by_name(project_id, screen_name)
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("stitch.find_screen_by_name", f"{project_id}/{screen_name}", {"success": True}, duration_ms)
             return self.ok(json.dumps(screen, ensure_ascii=False))
         except Exception as exc:
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("stitch.find_screen_by_name", f"{project_id}/{screen_name}", {"success": False, "error": str(exc)}, duration_ms)
             return self.error(f"stitch_find_screen_by_name: {exc}")
 
 
@@ -294,14 +339,21 @@ class _StitchFetchImageTool(ConstellationTool):
         )
 
     def execute(self, args: dict) -> dict:
-        _require("stitch.read", args.get("project_id", ""))
+        project_id = args.get("project_id", "")
+        screen_id = args.get("screen_id", "")
+        _require("stitch.read", project_id)
         import stitch_client as sc
+        t0 = time.perf_counter()
         try:
-            image_data = sc.fetch_image(args.get("project_id", ""), args.get("screen_id", ""))
+            image_data = sc.fetch_image(project_id, screen_id)
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("stitch.fetch_image", f"{project_id}/{screen_id}", {"success": True}, duration_ms)
             if isinstance(image_data, dict):
                 return self.ok(json.dumps(image_data, ensure_ascii=False))
             return self.ok(str(image_data))
         except Exception as exc:
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            _audit("stitch.fetch_image", f"{project_id}/{screen_id}", {"success": False, "error": str(exc)}, duration_ms)
             return self.error(f"stitch_fetch_image: {exc}")
 
 

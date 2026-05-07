@@ -17,6 +17,7 @@ TC-08  comment-update PUT  /jira/comments/{key}/{id}
 TC-09  comment-delete DELETE /jira/comments/{key}/{id}
 TC-10  field-update   PUT  /jira/tickets/{key} with labels (restore)
 TC-11  transition     POST /jira/transitions/{key} → In Progress + restore
+TC-12  assignee       PUT  /jira/assignee/{key} → change assignee + restore
 
 Required keys in tests/.env:
   TEST_JIRA_TICKET_URL   Full Jira browse URL
@@ -251,7 +252,7 @@ def main(argv=None):
     # Cleanup Jira artifacts — collects artifacts to restore in finally block
     # ---------------------------------------------------------------------------
     _cleanup_comment_ids: list[str] = []       # comment IDs created during the test
-    _original_state: dict = {}                 # {"labels": [...], "summary": "...", "description": "...", "status": "..."}
+    _original_state: dict = {}                 # {"labels": [...], "status": "...", "assignee": accountId|None}
 
     def _teardown_cleanup() -> None:
         """Best-effort restore of all test side-effects.
@@ -275,11 +276,10 @@ def main(argv=None):
             except Exception as exc:
                 reporter.info(f"Teardown: comment {cid} cleanup failed: {exc}")
 
-        # 2. Restore mutable issue fields if they were modified during a test
+        # 2. Restore mutable issue fields modified during the test (only allowed fields)
         restore_fields = {}
-        for field_name in ("labels", "summary", "description"):
-            if field_name in _original_state:
-                restore_fields[field_name] = _original_state[field_name]
+        if "labels" in _original_state:
+            restore_fields["labels"] = _original_state["labels"]
 
         if restore_fields:
             try:
@@ -316,17 +316,37 @@ def main(argv=None):
             except Exception as exc:
                 reporter.info(f"Teardown: status restore failed: {exc}")
 
+        # 4. Restore assignee if it was changed and not already restored in-test
+        if "assignee" in _original_state:
+            try:
+                s, b, _ = http_request(
+                    f"{agent_url}/jira/assignee/{ticket_key}",
+                    method="PUT",
+                    payload={
+                        "accountId": _original_state["assignee"],
+                        "permissions": _DEVELOPMENT_PERMISSIONS,
+                    },
+                )
+                if s == 200:
+                    reporter.info(f"Teardown: assignee restored to {_original_state['assignee']!r}")
+                else:
+                    reporter.info(f"Teardown: assignee restore returned status={s}")
+            except Exception as exc:
+                reporter.info(f"Teardown: assignee restore failed: {exc}")
+
     try:
         # TC-01 — myself ----------------------------------------------------
         reporter.step("TC-01  GET /jira/myself")
         status, body, _ = http_request(f"{agent_url}/jira/myself", headers=_READ_HEADERS)
         reporter.show("myself", body)
         user = _as_dict(body.get("user"))
-        if status == 200 and body.get("result") == "ok" and user.get("accountId"):
-            reporter.info(f"Authenticated as: {user.get('emailAddress') or user.get('displayName')}")
+        my_account_id = user.get("accountId", "")  # used in TC-12 for assignee change
+        if status == 200 and body.get("result") == "ok" and my_account_id:
+            reporter.info(f"Authenticated as: {user.get('emailAddress') or user.get('displayName')} ({my_account_id[:16]}...)")
             reporter.ok("GET /jira/myself returned authenticated user")
         else:
             reporter.fail("GET /jira/myself failed", f"status={status} body={body}")
+            my_account_id = ""
 
         # TC-02 — health ----------------------------------------------------
         reporter.step("TC-02  GET /health")
@@ -451,10 +471,7 @@ def main(argv=None):
             issue_payload = _as_dict(body_r.get("issue"))
             issue_fields = _as_dict(issue_payload.get("fields"))
             original_labels = issue_fields.get("labels") or []
-            _original_state["summary"] = issue_fields.get("summary") or ""
-            original_description = issue_fields.get("description")
-            _original_state["description"] = original_description if original_description is not None else ""
-        _original_state["labels"] = list(original_labels)  # save for teardown
+        _original_state["labels"] = list(original_labels)  # save for teardown (labels only; summary/description are denied)
         test_labels = list(dict.fromkeys(original_labels + ["constellation-agent-test"]))
         status, body, _ = http_request(
             f"{agent_url}/jira/tickets/{ticket_key}",
@@ -546,6 +563,66 @@ def main(argv=None):
                 reporter.skip(f"TC-11 transition", "No suitable non-current transition found")
         else:
             reporter.skip("TC-11 transition", "No transitions available")
+
+        # TC-12 — assignee change + restore ---------------------------------
+        reporter.step(f"TC-12  PUT /jira/assignee/{ticket_key} — change assignee + restore")
+        # Read current assignee
+        status_r3, body_r3, _ = http_request(
+            f"{agent_url}/jira/tickets/{ticket_key}", headers=_READ_HEADERS
+        )
+        original_assignee_id: str | None = None
+        if status_r3 == 200:
+            issue_payload3 = _as_dict(body_r3.get("issue"))
+            issue_fields3 = _as_dict(issue_payload3.get("fields"))
+            assignee_field = issue_fields3.get("assignee")
+            if isinstance(assignee_field, dict):
+                original_assignee_id = assignee_field.get("accountId")
+            _original_state["assignee"] = original_assignee_id  # teardown safety net
+
+        # If already assigned to me, unassign first; otherwise assign to me
+        if my_account_id and original_assignee_id != my_account_id:
+            target_assignee_id: str | None = my_account_id
+            restore_assignee_id: str | None = original_assignee_id
+        else:
+            target_assignee_id = None
+            restore_assignee_id = original_assignee_id
+
+        reporter.info(
+            f"Original assignee: {original_assignee_id!r} → Changing to: {target_assignee_id!r}"
+        )
+        status, body, _ = http_request(
+            f"{agent_url}/jira/assignee/{ticket_key}",
+            method="PUT",
+            payload={
+                "accountId": target_assignee_id,
+                "permissions": _DEVELOPMENT_PERMISSIONS,
+            },
+        )
+        reporter.show("assignee-change", body)
+        if status == 200 and body.get("result") == "assigned":
+            reporter.ok(f"PUT /jira/assignee/{ticket_key} — assignee changed to {target_assignee_id!r}")
+            # Restore original assignee
+            restore_s, restore_b, _ = http_request(
+                f"{agent_url}/jira/assignee/{ticket_key}",
+                method="PUT",
+                payload={
+                    "accountId": restore_assignee_id,
+                    "permissions": _DEVELOPMENT_PERMISSIONS,
+                },
+            )
+            if restore_s == 200 and restore_b.get("result") == "assigned":
+                reporter.ok(f"Assignee restored to original: {restore_assignee_id!r}")
+                _original_state.pop("assignee", None)  # already restored
+            else:
+                reporter.fail(
+                    "Assignee restore failed",
+                    f"status={restore_s} body={restore_b}",
+                )
+        else:
+            reporter.fail(
+                f"PUT /jira/assignee/{ticket_key} failed",
+                f"status={status} body={body}",
+            )
 
     finally:
         _teardown_cleanup()

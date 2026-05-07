@@ -97,10 +97,14 @@ class AgentRuntimeAdoptionTests(unittest.TestCase):
             os.path.join(PROJECT_ROOT, "office", "app.py"),
         ]
         # Agents may call configure_control_tools directly or via a named wrapper
-        # (e.g. configure_team_lead_control_tools or run_compass_workflow from common modules)
+        # (e.g. configure_team_lead_control_tools, configure_web_agent_control_tools,
+        #  or run_compass_workflow from common modules)
         valid_patterns = ["configure_control_tools", "configure_team_lead_control_tools",
-                          "team_lead_agentic_workflow", "run_compass_workflow",
-                          "compass_agentic_workflow"]
+                          "configure_web_agent_control_tools",
+                          "configure_office_control_tools",
+                          "team_lead_agentic_workflow", "web_agentic_workflow",
+                          "office_agentic_workflow",
+                          "run_compass_workflow", "compass_agentic_workflow"]
         for path in all_agent_files:
             with self.subTest(path=path):
                 content = Path(path).read_text(encoding="utf-8")
@@ -127,6 +131,7 @@ class AgentRuntimeAdoptionTests(unittest.TestCase):
         for path in [
             os.path.join(PROJECT_ROOT, "web", "app.py"),
             os.path.join(PROJECT_ROOT, "android", "app.py"),
+            os.path.join(PROJECT_ROOT, "office", "app.py"),
         ]:
             with self.subTest(path=path):
                 content = Path(path).read_text(encoding="utf-8")
@@ -135,6 +140,53 @@ class AgentRuntimeAdoptionTests(unittest.TestCase):
                     content,
                     f"{path} must invoke runtime.run_agentic() for execution-stage autonomy",
                 )
+
+    def test_web_uses_task_prompt_file_instead_of_inline_workflow_markdown(self):
+        web_app = Path(PROJECT_ROOT, "web", "app.py").read_text(encoding="utf-8")
+        # Accept build_task_prompt (direct call) or build_web_task_prompt (via common helper)
+        self.assertTrue(
+            "build_task_prompt" in web_app or "build_web_task_prompt" in web_app,
+            "web/app.py must delegate task prompt construction to a helper (build_task_prompt or build_web_task_prompt)",
+        )
+        self.assertNotIn("## Your Workflow (follow this order)", web_app)
+
+    def test_office_uses_task_prompt_file_instead_of_inline_workflow_markdown(self):
+        office_app = Path(PROJECT_ROOT, "office", "app.py").read_text(encoding="utf-8")
+        self.assertTrue(
+            "build_office_task_prompt" in office_app,
+            "office/app.py must delegate task prompt construction to build_office_task_prompt",
+        )
+        # Old Python-branched capability prompt builder must be gone
+        self.assertNotIn("_build_office_task_prompt", office_app)
+
+    def test_office_task_prompt_uses_canonical_workspace_tools(self):
+        prompt = Path(PROJECT_ROOT, "office", "prompts", "tasks", "process.md").read_text(encoding="utf-8")
+        for token in (
+            "read_local_file",
+            "write_local_file",
+            "list_local_dir",
+            "search_local_files",
+            "run_local_command",
+        ):
+            self.assertIn(token, prompt, f"office process.md must reference {token}")
+        # Legacy aliases must not appear as primary instruction
+        self.assertNotIn("`read_file`", prompt)
+        self.assertNotIn("`write_file`", prompt)
+        self.assertNotIn("`glob`", prompt)
+        self.assertNotIn("`list_dir`", prompt)
+
+    def test_web_task_prompt_uses_canonical_workspace_and_scm_tools(self):
+        prompt = Path(PROJECT_ROOT, "web", "prompts", "tasks", "implement.md").read_text(encoding="utf-8")
+        for token in (
+            "scm_clone_repo",
+            "get_task_context",
+            "read_local_file",
+            "write_local_file",
+            "edit_local_file",
+            "run_local_command",
+        ):
+            self.assertIn(token, prompt)
+        self.assertNotIn("use bash to clone", prompt.lower())
 
     def test_agent_manifests_exist_and_have_agent_id(self):
         agent_dirs = ["team-lead", "web", "jira", "scm", "ui-design", "office", "android", "compass"]

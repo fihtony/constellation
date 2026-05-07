@@ -18,18 +18,16 @@ import time
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-from common.devlog import debug_log, record_workspace_stage
+from common.devlog import record_workspace_stage
 from common.env_utils import build_isolated_git_env, load_dotenv
 from common.instance_reporter import InstanceReporter
-from common.message_utils import build_text_artifact, extract_text
+from common.message_utils import extract_text
 from common.tools.control_tools import configure_control_tools
-from common.rules_loader import build_system_prompt, load_rules
+from common.rules_loader import load_rules
 from common.prompt_builder import build_system_prompt_from_manifest
-from common.agent_system_prompt import build_agent_system_prompt as _build_manifest_prompt
 from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionDeniedError,
@@ -286,6 +284,131 @@ def _runtime_config_summary() -> dict:
         "workflowRulesLoaded": bool(load_rules("scm", include_workflow=True)),
         "provider": _provider.provider_name,
         "backend": _SCM_BACKEND,
+    }
+
+
+def _resolve_clone_branch(owner: str, repo: str, requested_branch: str) -> str:
+    branch = str(requested_branch or "").strip()
+    if branch:
+        return branch
+    result, _status = _provider.get_default_branch(owner, repo)
+    if isinstance(result, dict):
+        default_branch = str(result.get("defaultBranch") or "").strip()
+        if default_branch:
+            return default_branch
+    return "main"
+
+
+def _write_clone_audit(
+    *,
+    message: dict,
+    workspace_path: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    success: bool,
+    result: str,
+    clone_path: str,
+    duration_ms: int,
+) -> None:
+    metadata = message.get("metadata") or {}
+    write_operation_audit(
+        workspace_path,
+        AGENT_ID,
+        {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "taskId": metadata.get("taskId") or "",
+            "orchestratorTaskId": metadata.get("orchestratorTaskId") or "",
+            "requestingAgent": metadata.get("requestingAgent") or metadata.get("agentId") or "",
+            "operation": "scm.git.clone",
+            "target": {"owner": owner, "repo": repo, "branch": branch},
+            "result": {
+                "success": success,
+                "clonePath": clone_path,
+                "status": result,
+            },
+            "durationMs": duration_ms,
+        },
+    )
+
+
+def _clone_repo_for_tool(
+    *,
+    owner: str,
+    repo: str,
+    branch: str,
+    workspace_path: str,
+    depth: int = 1,
+    full_history: bool = False,
+    message: dict,
+) -> dict:
+    target_path = workspace_path or (message.get("metadata") or {}).get("sharedWorkspacePath") or tempfile.mkdtemp(prefix="scm-workspace-")
+    branch_name = _resolve_clone_branch(owner, repo, branch)
+    clone_depth = max(1, int(depth or 1))
+    clone_full_history = bool(full_history or int(depth or 1) <= 0)
+    task_ref = (message.get("metadata") or {}).get("taskId") or ""
+
+    record_workspace_stage(
+        target_path,
+        "scm",
+        f"Cloning {owner}/{repo} ({branch_name}) via scm_clone_repo",
+        task_id=task_ref,
+        extra={
+            "owner": owner,
+            "repo": repo,
+            "branch": branch_name,
+            "runtimeConfig": _runtime_config_summary(),
+        },
+    )
+
+    started = time.perf_counter()
+    clone_dir, result = _clone_to_workspace(
+        owner,
+        repo,
+        branch_name,
+        target_path,
+        depth=clone_depth,
+        full_history=clone_full_history,
+    )
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    _write_clone_audit(
+        message=message,
+        workspace_path=target_path,
+        owner=owner,
+        repo=repo,
+        branch=branch_name,
+        success=bool(clone_dir),
+        result=result,
+        clone_path=clone_dir or "",
+        duration_ms=duration_ms,
+    )
+
+    if not clone_dir:
+        record_workspace_stage(
+            target_path,
+            "scm",
+            f"Failed scm_clone_repo for {owner}/{repo}",
+            task_id=task_ref,
+            extra={"result": result, "runtimeConfig": _runtime_config_summary()},
+        )
+        raise RuntimeError(result)
+
+    record_workspace_stage(
+        target_path,
+        "scm",
+        f"Completed scm_clone_repo for {owner}/{repo}",
+        task_id=task_ref,
+        extra={
+            "clonePath": clone_dir,
+            "result": result,
+            "runtimeConfig": _runtime_config_summary(),
+        },
+    )
+    return {
+        "clonePath": clone_dir,
+        "result": result,
+        "branch": branch_name,
+        "workspacePath": target_path,
     }
 
 
@@ -623,7 +746,7 @@ def _run_task_async(task_id: str, message: dict):
         permission_fn=lambda action, target, scope="*": _require_scm_permission(
             action=action, target=target, scope=scope, message=message
         ),
-        clone_fn=_clone_to_workspace,
+        clone_fn=_clone_repo_for_tool,
     )
     try:
         _update_task(task_id, state="TASK_STATE_WORKING",
@@ -636,11 +759,6 @@ def _run_task_async(task_id: str, message: dict):
                 task_id=task_id,
                 extra={"runtimeConfig": _runtime_config_summary()},
             )
-        # Special handling for async clone (preserves callback format with clonePath)
-        if capability == "scm.git.clone":
-            _dispatch_clone(task_id, message)
-            return
-
         text = extract_text(message)
         system_prompt = build_system_prompt_from_manifest(os.path.dirname(__file__))
         require_agentic_runtime("SCM Agent")
@@ -662,6 +780,13 @@ def _run_task_async(task_id: str, message: dict):
             timeout=300,
         )
         # Task state and artifacts are set by complete_current_task / fail_current_task tools.
+        # If the runtime loop exits without those tools being called, transition the task to
+        # TASK_STATE_COMPLETED so it does not stay stuck in TASK_STATE_WORKING.
+        with TASKS_LOCK:
+            if TASKS.get(task_id, {}).get("state") == "TASK_STATE_WORKING":
+                TASKS[task_id]["state"] = "TASK_STATE_COMPLETED"
+                TASKS[task_id]["message"] = "SCM operation completed."
+                TASKS[task_id]["updatedAt"] = time.time()
         # Read final state to send A2A callback.
         final = TASKS.get(task_id, {})
         final_state = final.get("state", "TASK_STATE_COMPLETED")
@@ -692,50 +817,6 @@ def _run_task_async(task_id: str, message: dict):
                 extra={"error": str(error), "runtimeConfig": _runtime_config_summary()},
             )
         _notify_completion(message, task_id, "TASK_STATE_FAILED", failure_text, artifacts)
-
-
-def _dispatch_clone(task_id: str, message: dict):
-    """Kick off async git clone."""
-    text = extract_text(message)
-    metadata = message.get("metadata") or {}
-    owner, repo = _parse_owner_repo(text)
-    branch = re.search(r"branch[:\s]+([^\s,]+)", text, re.IGNORECASE)
-    branch_name = branch.group(1) if branch else "main"
-    target = metadata.get("sharedWorkspacePath") or tempfile.mkdtemp(prefix="scm-workspace-")
-    callback_url = metadata.get("orchestratorCallbackUrl", "")
-    # Depth control: default shallow (depth=1); caller may request full_history or custom depth
-    clone_payload = metadata.get("clonePayload") or {}
-    full_history = bool(clone_payload.get("fullHistory", False))
-    clone_depth = int(clone_payload.get("depth", 1))
-    if not owner or not repo:
-        _update_task(task_id, state="TASK_STATE_FAILED",
-                     message="Could not parse owner/repo for clone.")
-        if metadata.get("sharedWorkspacePath"):
-            record_workspace_stage(
-                metadata.get("sharedWorkspacePath"),
-                "scm",
-                "Failed scm.git.clone",
-                task_id=task_id,
-                extra={
-                    "error": "Could not parse owner/repo for clone.",
-                    "runtimeConfig": _runtime_config_summary(),
-                },
-            )
-        return
-    _require_scm_permission(
-        action="repo.clone",
-        target=f"{owner}/{repo}",
-        scope=branch_name,
-        message=message,
-    )
-    # Run the actual clone in a background thread
-    t = threading.Thread(
-        target=_clone_async_worker,
-        args=(task_id, owner, repo, branch_name, target, callback_url),
-        kwargs={"depth": clone_depth, "full_history": full_history},
-        daemon=True,
-    )
-    t.start()
 
 
 # ---------------------------------------------------------------------------

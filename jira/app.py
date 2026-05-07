@@ -13,17 +13,16 @@ import os
 import re
 import threading
 import time
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from common.devlog import debug_log, preview_data, record_workspace_stage
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
-from common.message_utils import build_text_artifact, extract_text
+from common.message_utils import extract_text
 from common.tools.control_tools import configure_control_tools
-from common.rules_loader import build_system_prompt
 from common.prompt_builder import build_system_prompt_from_manifest
-from common.agent_system_prompt import build_agent_system_prompt as _build_manifest_prompt
 from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 from common.task_permissions import (
     PermissionDeniedError,
@@ -46,7 +45,8 @@ JIRA_API_BASE_URL = os.environ.get("JIRA_API_BASE_URL", f"{JIRA_BASE_URL.rstrip(
 JIRA_TOKEN = os.environ.get("JIRA_TOKEN", "")
 JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "")
 JIRA_AUTH_MODE = os.environ.get("JIRA_AUTH_MODE", "basic").strip().lower()
-ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "http://orchestrator:8080")
+# ORCHESTRATOR_URL removed: boundary agents must not hardcode upstream URLs.
+# All A2A callbacks use orchestratorCallbackUrl from message.metadata.
 JIRA_CLOUD_ID = os.environ.get("JIRA_CLOUD_ID", "").strip()
 CORP_CA_BUNDLE = (
     os.environ.get("CORP_CA_BUNDLE", "") or os.environ.get("SSL_CERT_FILE", "")
@@ -70,7 +70,19 @@ def _make_provider():
     from jira.providers.rest import JiraRESTProvider
     from jira.providers.mcp import JiraMCPProvider
 
-    kwargs = dict(
+    if JIRA_BACKEND == "mcp":
+        print(f"[{AGENT_ID}] Jira back-end: MCP (Atlassian Rovo MCP)")
+        return JiraMCPProvider(
+            jira_base_url=JIRA_BASE_URL,
+            jira_token=JIRA_TOKEN,
+            jira_email=JIRA_EMAIL,
+            jira_auth_mode=JIRA_AUTH_MODE,
+            jira_cloud_id=JIRA_CLOUD_ID,
+            jira_api_base_url=JIRA_API_BASE_URL,
+            corp_ca_bundle=CORP_CA_BUNDLE,
+        )
+    print(f"[{AGENT_ID}] Jira back-end: REST API")
+    return JiraRESTProvider(
         jira_base_url=JIRA_BASE_URL,
         jira_token=JIRA_TOKEN,
         jira_email=JIRA_EMAIL,
@@ -79,11 +91,6 @@ def _make_provider():
         jira_api_base_url=JIRA_API_BASE_URL,
         corp_ca_bundle=CORP_CA_BUNDLE,
     )
-    if JIRA_BACKEND == "mcp":
-        print(f"[{AGENT_ID}] Jira back-end: MCP (Atlassian Rovo MCP)")
-        return JiraMCPProvider(**kwargs)
-    print(f"[{AGENT_ID}] Jira back-end: REST API")
-    return JiraRESTProvider(**kwargs)
 
 
 PROVIDER = _make_provider()
@@ -94,18 +101,6 @@ def _load_agent_card():
         card = json.load(fh)
     text = json.dumps(card).replace("__ADVERTISED_URL__", ADVERTISED_URL)
     return json.loads(text)
-
-
-
-def _write_workspace_file(workspace_path, relative_name, content):
-    if not workspace_path:
-        return
-    os.makedirs(workspace_path, exist_ok=True)
-    target_path = os.path.join(workspace_path, relative_name)
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    with open(target_path, "w", encoding="utf-8") as handle:
-        handle.write(content)
-
 
 def _workspace_headers(handler: BaseHTTPRequestHandler) -> tuple[str, str]:
     workspace_path = (handler.headers.get("X-Shared-Workspace-Path") or "").strip()
@@ -157,9 +152,9 @@ def _check_jira_permission(
     headers=None,
     message: dict | None = None,
     scope: str = "*",
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
     if _permission_enforcement_mode() == "off":
-        return True, "allowed"
+        return True, "allowed", ""
 
     metadata = (message or {}).get("metadata") or {}
     request_agent = (
@@ -237,7 +232,7 @@ def _require_jira_permission(
 
 
 def _enforce_jira_permission(
-    handler: BaseHTTPRequestHandler,
+    handler: Any,
     *,
     action: str,
     target: str,
@@ -353,13 +348,19 @@ def _post_json_url(url, payload):
 
 
 def _notify_orchestrator_completion(message, downstream_task_id, state, status_text, artifacts):
+    """Send A2A callback to orchestrator. Uses orchestratorCallbackUrl from message metadata only.
+    No ORCHESTRATOR_URL fallback — boundary agents must not hardcode upstream agent addresses.
+    """
     metadata = message.get("metadata", {})
     callback_url = (metadata.get("orchestratorCallbackUrl") or "").strip()
     if not callback_url:
-        orchestrator_task_id = (metadata.get("orchestratorTaskId") or "").strip()
-        if not orchestrator_task_id:
-            return
-        callback_url = f"{ORCHESTRATOR_URL.rstrip('/')}/tasks/{orchestrator_task_id}/callbacks"
+        debug_log(
+            AGENT_ID,
+            "jira.workflow.callback_skipped",
+            taskId=downstream_task_id,
+            reason="orchestratorCallbackUrl not set in message metadata",
+        )
+        return
     try:
         _post_json_url(
             callback_url,
@@ -380,6 +381,39 @@ def _notify_orchestrator_completion(message, downstream_task_id, state, status_t
             callbackUrl=callback_url,
             error=str(error),
         )
+
+
+def _write_jira_audit(
+    *,
+    workspace_path: str,
+    message: dict,
+    operation: str,
+    target: str,
+    input_summary: dict,
+    result: dict,
+    duration_ms: int = 0,
+) -> None:
+    """Append a structured audit entry to audit-log.jsonl in the task workspace."""
+    if not workspace_path:
+        return
+    import json as _json
+    metadata = message.get("metadata") or {}
+    entry = {
+        "ts": local_iso_timestamp(),
+        "agentId": AGENT_ID,
+        "requestingAgent": str(metadata.get("requestingAgent") or metadata.get("agentId") or ""),
+        "requestingTaskId": str(metadata.get("orchestratorTaskId") or ""),
+        "operation": operation,
+        "target": target,
+        "input": input_summary,
+        "result": result,
+        "durationMs": duration_ms,
+    }
+    audit_dir = os.path.join(workspace_path, "jira-agent")
+    os.makedirs(audit_dir, exist_ok=True)
+    audit_path = os.path.join(audit_dir, "audit-log.jsonl")
+    with open(audit_path, "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def _run_task_async(task_id, message):
@@ -406,6 +440,15 @@ def _run_task_async(task_id, message):
         provider=PROVIDER,
         permission_fn=lambda action, target, scope="*": _require_jira_permission(
             action=action, target=target, scope=scope, message=message
+        ),
+        audit_fn=lambda operation, target, input_summary, result, duration_ms=0: _write_jira_audit(
+            workspace_path=workspace_path,
+            message=message,
+            operation=operation,
+            target=target,
+            input_summary=input_summary,
+            result=result,
+            duration_ms=duration_ms,
         ),
     )
     try:
@@ -577,7 +620,45 @@ class JiraHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # GET /audit?workspace=<path>&taskId=<id>&operation=<op>&since=<ts>
+        if path == "/audit":
+            qs = parse_qs(urlparse(self.path).query)
+            workspace = (qs.get("workspace") or [""])[0]
+            task_id_qs = (qs.get("taskId") or [""])[0]
+            operation = (qs.get("operation") or [""])[0]
+            since = (qs.get("since") or [""])[0]
+            if not workspace:
+                self._send_json(400, {"error": "workspace parameter required", "note": "Provide ?workspace=<sharedWorkspacePath>"})
+                return
+            entries = self._read_jira_audit(workspace, task_id=task_id_qs, operation=operation, since=since)
+            self._send_json(200, {"entries": entries, "count": len(entries)})
+            return
+
         self._send_json(404, {"error": "not_found"})
+
+    def _read_jira_audit(self, workspace: str, task_id: str = "", operation: str = "", since: str = "") -> list:
+        """Read audit-log.jsonl from the given workspace directory."""
+        audit_path = os.path.join(workspace, "jira-agent", "audit-log.jsonl")
+        if not os.path.isfile(audit_path):
+            return []
+        entries = []
+        with open(audit_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if task_id and entry.get("requestingTaskId") != task_id:
+                    continue
+                if operation and entry.get("operation") != operation:
+                    continue
+                if since and entry.get("ts", "") < since:
+                    continue
+                entries.append(entry)
+        return entries
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -588,31 +669,17 @@ class JiraHandler(BaseHTTPRequestHandler):
             if not message:
                 self._send_json(400, {"error": "missing message"})
                 return
-            configuration = body.get("configuration") or {}
-            if configuration.get("returnImmediately"):
-                task_id = _create_task_record(
-                    "TASK_STATE_ACCEPTED",
-                    "Jira agent accepted the task and will continue asynchronously.",
-                )
-                worker = threading.Thread(
-                    target=_run_task_async,
-                    args=(task_id, message),
-                    daemon=True,
-                )
-                worker.start()
-                self._send_json(200, {"task": _task_payload(task_id)})
-                return
-            status_text, artifacts = process_message(message)
-            self._send_json(200, {
-                "task": {
-                    "id": next_task_id(), "agentId": AGENT_ID,
-                    "status": {
-                        "state": "TASK_STATE_COMPLETED",
-                        "message": {"role": "ROLE_AGENT", "parts": [{"text": status_text}]},
-                    },
-                    "artifacts": artifacts,
-                }
-            })
+            task_id = _create_task_record(
+                "TASK_STATE_ACCEPTED",
+                "Jira agent accepted the task and will continue asynchronously.",
+            )
+            worker = threading.Thread(
+                target=_run_task_async,
+                args=(task_id, message),
+                daemon=True,
+            )
+            worker.start()
+            self._send_json(200, {"task": _task_payload(task_id)})
             return
 
         # POST /jira/transitions/{key}  body: {"transition": "In Progress"}

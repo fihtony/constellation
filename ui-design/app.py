@@ -7,12 +7,13 @@ import json
 import os
 import sys
 import threading
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from common.devlog import debug_log, record_workspace_stage
+from common.devlog import record_workspace_stage
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
-from common.message_utils import build_text_artifact, extract_text
+from common.message_utils import extract_text
 from common.tools.control_tools import configure_control_tools
 from common.prompt_builder import build_system_prompt_from_manifest
 from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
@@ -33,6 +34,7 @@ if _AGENT_DIR not in sys.path:
     sys.path.insert(0, _AGENT_DIR)
 
 import figma_client  # noqa: E402  (local to ui-design/)
+import stitch_client  # noqa: E402  (local to ui-design/)
 import provider_tools as _udt  # noqa: E402 — registers ui-design internal tools
 
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -138,7 +140,7 @@ def _require_ui_permission(*, action: str, target: str, message: dict) -> None:
     print(f"[{AGENT_ID}] WARN: permission check failed but enforcement={_permission_enforcement_mode()}: {reason}")
 
 
-def _enforce_http_ui_permission(handler: BaseHTTPRequestHandler, *, action: str, target: str) -> bool:
+def _enforce_http_ui_permission(handler: Any, *, action: str, target: str) -> bool:
     allowed, reason, escalation = _check_ui_permission(action=action, target=target, headers=handler.headers)
     if allowed:
         return True
@@ -202,6 +204,51 @@ def _fire_callback(
         print(f"[{AGENT_ID}] Callback failed: {exc}", flush=True)
 
 
+def _update_task(task_id: str, *, state: str, message: str = "", artifacts: list | None = None) -> None:
+    """Thread-safe task state update."""
+    with _TASK_SEQ_LOCK:
+        task = _TASKS.get(task_id)
+        if task is None:
+            return
+        task["status"] = {
+            "state": state,
+            "message": {"role": "ROLE_AGENT", "parts": [{"text": message}]},
+        }
+        if artifacts is not None:
+            task["artifacts"] = artifacts
+
+
+def _write_ui_design_audit(
+    *,
+    workspace_path: str,
+    message: dict,
+    operation: str,
+    target: str,
+    result: dict,
+    duration_ms: int = 0,
+) -> None:
+    """Append a structured audit entry to audit-log.jsonl in the task workspace."""
+    if not workspace_path:
+        return
+    from common.time_utils import local_iso_timestamp
+    metadata = message.get("metadata") or {}
+    entry = {
+        "ts": local_iso_timestamp(),
+        "agentId": AGENT_ID,
+        "requestingAgent": str(metadata.get("requestingAgent") or metadata.get("agentId") or ""),
+        "requestingTaskId": str(metadata.get("orchestratorTaskId") or ""),
+        "operation": operation,
+        "target": target,
+        "result": result,
+        "durationMs": duration_ms,
+    }
+    audit_dir = os.path.join(workspace_path, "ui-design-agent")
+    os.makedirs(audit_dir, exist_ok=True)
+    audit_path = os.path.join(audit_dir, "audit-log.jsonl")
+    with open(audit_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 def _run_task_background(
     task_id: str, message: dict,
 ) -> None:
@@ -215,26 +262,42 @@ def _run_task_background(
             "workspacePath": workspace_path,
             "permissions": metadata.get("permissions"),
         },
-        complete_fn=lambda result, artifacts: _TASKS.update({
-            task_id: {**_TASKS.get(task_id, {}), "status": {"state": "TASK_STATE_COMPLETED"}, "artifacts": artifacts or []}
-        }),
-        fail_fn=lambda error: _TASKS.update({
-            task_id: {**_TASKS.get(task_id, {}), "status": {"state": "TASK_STATE_FAILED"}}
-        }),
-        input_required_fn=lambda question, ctx: _TASKS.update({
-            task_id: {**_TASKS.get(task_id, {}), "status": {"state": "TASK_STATE_INPUT_REQUIRED"}}
-        }),
+        complete_fn=lambda result, artifacts: _update_task(
+            task_id, state="TASK_STATE_COMPLETED", message=result or "", artifacts=artifacts or []
+        ),
+        fail_fn=lambda error: _update_task(
+            task_id, state="TASK_STATE_FAILED", message=str(error), artifacts=[]
+        ),
+        input_required_fn=lambda question, ctx: _update_task(
+            task_id, state="TASK_STATE_INPUT_REQUIRED", message=question
+        ),
     )
     _udt.configure_ui_provider_tools(
         message=message,
         permission_fn=lambda action, target: _require_ui_permission(
             action=action, target=target, message=message
         ),
+        audit_fn=lambda operation, target, result, duration_ms=0: _write_ui_design_audit(
+            workspace_path=workspace_path,
+            message=message,
+            operation=operation,
+            target=target,
+            result=result,
+            duration_ms=duration_ms,
+        ),
     )
     try:
         text = extract_text(message)
         system_prompt = build_system_prompt_from_manifest(os.path.dirname(__file__))
         require_agentic_runtime("UI-Design Agent")
+        if workspace_path:
+            record_workspace_stage(
+                workspace_path,
+                "ui-design",
+                f"Started {capability or 'ui-design request'}",
+                task_id=task_id,
+                extra={"runtimeConfig": _runtime_config_summary()},
+            )
         get_runtime().run_agentic(
             task=text,
             system_prompt=system_prompt,
@@ -249,12 +312,19 @@ def _run_task_background(
             max_turns=15,
             timeout=300,
         )
-        # Read final task state (set by complete_current_task / fail_current_task)
-        final = _TASKS.get(task_id, {})
-        final_state = (final.get("status") or {}).get("state", "TASK_STATE_COMPLETED")
-        final_artifacts = final.get("artifacts", [])
-        final_message = ((final.get("status") or {}).get("message") or {})
-        status_text = (final_message.get("parts") or [{}])[0].get("text", "UI design operation completed.")
+        # Read final task state (set by complete_current_task / fail_current_task).
+        # If neither tool was called (runtime loop exited cleanly), default to COMPLETED.
+        with _TASK_SEQ_LOCK:
+            final = _TASKS.get(task_id, {})
+            final_state = (final.get("status") or {}).get("state", "TASK_STATE_WORKING")
+            if final_state == "TASK_STATE_WORKING":
+                # Runtime finished without calling complete/fail — treat as completed
+                final_state = "TASK_STATE_COMPLETED"
+                if final:
+                    final["status"]["state"] = final_state
+            final_artifacts = final.get("artifacts", [])
+            final_msg_parts = ((final.get("status") or {}).get("message") or {}).get("parts") or []
+            status_text = (final_msg_parts[0].get("text") if final_msg_parts else None) or "UI design operation completed."
         if workspace_path:
             record_workspace_stage(
                 workspace_path,
@@ -263,15 +333,6 @@ def _run_task_background(
                 task_id=task_id,
                 extra={"statusText": status_text, "runtimeConfig": _runtime_config_summary()},
             )
-        _TASKS[task_id] = {
-            "id": task_id,
-            "agentId": AGENT_ID,
-            "status": {
-                "state": final_state,
-                "message": {"role": "ROLE_AGENT", "parts": [{"text": status_text}]},
-            },
-            "artifacts": final_artifacts,
-        }
         callback_url = metadata.get("orchestratorCallbackUrl", "")
         if callback_url:
             _fire_callback(callback_url, task_id, final_state, status_text, final_artifacts)
@@ -280,6 +341,7 @@ def _run_task_background(
         artifacts = []
         if isinstance(exc, PermissionDeniedError):
             artifacts = [build_permission_denied_artifact(exc.details, agent_id=AGENT_ID)]
+        _update_task(task_id, state="TASK_STATE_FAILED", message=str(exc), artifacts=artifacts)
         if workspace_path:
             record_workspace_stage(
                 workspace_path,
@@ -288,15 +350,6 @@ def _run_task_background(
                 task_id=task_id,
                 extra={"error": str(exc), "runtimeConfig": _runtime_config_summary()},
             )
-        _TASKS[task_id] = {
-            "id": task_id,
-            "agentId": AGENT_ID,
-            "status": {
-                "state": "TASK_STATE_FAILED",
-                "message": {"role": "ROLE_AGENT", "parts": [{"text": str(exc)}]},
-            },
-            "artifacts": artifacts,
-        }
         callback_url = metadata.get("orchestratorCallbackUrl", "")
         if callback_url:
             _fire_callback(callback_url, task_id, "TASK_STATE_FAILED", str(exc), artifacts)
@@ -508,10 +561,34 @@ class UIDesignHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/tasks/"):
             task_id = path[len("/tasks/"):]
-            if task_id in _TASKS:
-                self._send_json(200, {"task": _TASKS[task_id]})
+            with _TASK_SEQ_LOCK:
+                task = _TASKS.get(task_id)
+            if task:
+                # Return A2A-compatible task wrapper
+                self._send_json(200, {
+                    "task": {
+                        "id": task.get("id", task_id),
+                        "agentId": task.get("agentId", AGENT_ID),
+                        "status": task.get("status", {"state": "TASK_STATE_WORKING"}),
+                        "artifacts": task.get("artifacts", []),
+                    }
+                })
             else:
                 self._send_json(404, {"error": "task_not_found"})
+            return
+
+        # --- Audit log query ---
+
+        if path == "/audit":
+            audit_qs = parse_qs(parsed.query)
+            workspace = (audit_qs.get("workspace") or [""])[0]
+            task_id_qs = (audit_qs.get("taskId") or [""])[0]
+            operation = (audit_qs.get("operation") or [""])[0]
+            if not workspace:
+                self._send_json(400, {"error": "workspace parameter required"})
+                return
+            entries = self._read_ui_audit(workspace, task_id=task_id_qs, operation=operation)
+            self._send_json(200, {"entries": entries, "count": len(entries)})
             return
 
         self._send_json(404, {"error": "not_found"})
@@ -536,7 +613,10 @@ class UIDesignHandler(BaseHTTPRequestHandler):
             _TASKS[task_id] = {
                 "id": task_id,
                 "agentId": AGENT_ID,
-                "status": {"state": "TASK_STATE_WORKING"},
+                "status": {
+                    "state": "TASK_STATE_WORKING",
+                    "message": {"role": "ROLE_AGENT", "parts": [{"text": "UI Design Agent processing the task."}]},
+                },
                 "artifacts": [],
             }
 
@@ -550,6 +630,28 @@ class UIDesignHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json(404, {"error": "not_found"})
+
+    def _read_ui_audit(self, workspace: str, task_id: str = "", operation: str = "") -> list:
+        """Read audit-log.jsonl from the given workspace directory."""
+        audit_path = os.path.join(workspace, "ui-design-agent", "audit-log.jsonl")
+        if not os.path.isfile(audit_path):
+            return []
+        entries = []
+        with open(audit_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if task_id and entry.get("requestingTaskId") != task_id:
+                    continue
+                if operation and entry.get("operation") != operation:
+                    continue
+                entries.append(entry)
+        return entries
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,15 @@
-"""Web Agent — full-stack web development execution agent.
+"""Web Agent -- full-stack web development execution agent.
 
 Capabilities:
 - Frontend: React, Next.js, Vue.js with Ant Design, Material UI, Tailwind CSS
 - Backend: Python (Flask, FastAPI, Django), Node.js (Express, NestJS)
-- Analyzes task, generates code, writes files to shared workspace
+- Clones target repository, implements requested changes, validates locally
 - Creates feature branch and pull request via SCM Agent
-- Can query Jira Agent for additional ticket context
-- Reports completion via callback to Team Lead Agent
+- Reports completion via A2A callback to Team Lead Agent
+
+Architecture:
+  All workflow decisions are made by the agentic runtime via tools.
+  Python code handles only: A2A protocol, task lifecycle, tool wiring, and I/O.
 """
 
 from __future__ import annotations
@@ -14,38 +17,49 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
-import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from common.agent_directory import (
-    AgentDirectory,
-    CapabilityUnavailableError,
-    RegistryUnavailableError,
-)
-from common.env_utils import build_isolated_git_env, load_dotenv
+from common.agent_directory import AgentDirectory
+from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
-from common.message_utils import artifact_text, build_text_artifact, extract_text
+from common.message_utils import build_text_artifact, extract_text
 from common.orchestrator import resolve_orchestrator_base_url
 from common.per_task_exit import PerTaskExitHandler
-from common.tools.control_tools import configure_control_tools
-from common.registry_client import RegistryClient
-from common.rules_loader import build_system_prompt, load_rules
 from common.prompt_builder import build_system_prompt_from_manifest
-from common.runtime.adapter import AgenticResult, get_runtime, require_agentic_runtime, summarize_runtime_configuration
+from common.registry_client import RegistryClient
+from common.runtime.adapter import get_runtime, require_agentic_runtime
 from common.task_permissions import (
     PermissionEscalationRequired,
     build_permission_denied_artifact,
-    extract_permission_denial,
 )
 from common.task_store import TaskStore
 from common.time_utils import local_clock_time, local_iso_timestamp
-from web import prompts
+from common.web_agentic_workflow import (
+    WEB_AGENT_RUNTIME_TOOL_NAMES,
+    build_web_agent_runtime_config,
+    build_web_task_prompt,
+    configure_web_agent_control_tools,
+)
+
+# ---------------------------------------------------------------------------
+# Tool auto-registration -- import so tools self-register for run_agentic()
+# ---------------------------------------------------------------------------
+from common.tools import (  # noqa: F401 -- side-effect imports
+    coding_tools,
+    control_tools,
+    design_tools,
+    jira_tools,
+    planning_tools,
+    progress_tools,
+    registry_tools,
+    scm_tools,
+    skill_tool,
+    validation_tools,
+)
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -57,11 +71,8 @@ ADVERTISED_URL = os.environ.get("ADVERTISED_BASE_URL", f"http://web-agent:{PORT}
 REGISTRY_URL = os.environ.get("REGISTRY_URL", "http://registry:9000")
 
 ACK_TIMEOUT = int(os.environ.get("A2A_ACK_TIMEOUT_SECONDS", "15"))
-TASK_TIMEOUT = int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "600"))
-SYNC_AGENT_TIMEOUT = int(os.environ.get("SYNC_AGENT_TIMEOUT_SECONDS", "120"))
-PLAN_TIMEOUT_SECONDS = 300
-PLAN_REPAIR_TIMEOUT_SECONDS = 120
-PLAN_MAX_TOKENS = 8192
+TASK_TIMEOUT = int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "1800"))
+INPUT_WAIT_TIMEOUT = int(os.environ.get("INPUT_WAIT_TIMEOUT_SECONDS", "7200"))
 
 _AGENT_CARD_PATH = os.path.join(os.path.dirname(__file__), "agent-card.json")
 
@@ -75,61 +86,25 @@ reporter = InstanceReporter(
     port=PORT,
 )
 
-_DEVELOPMENT_SKILL_NAMES = [
-    "constellation-architecture-delivery",
-    "constellation-frontend-delivery",
-    "constellation-backend-delivery",
-    "constellation-database-delivery",
-    "constellation-code-review-delivery",
-    "constellation-testing-delivery",
-    "constellation-ui-evidence-delivery",
-    "react-nextjs-delivery",
-    "ant-design-delivery",
-    "mui-delivery",
-    "nodejs-express-delivery",
-    "java-spring-delivery",
-    "sql-mongodb-delivery",
-]
-
-# Viewports for UI implementation screenshots captured after each build.
-# Each entry is (width_px, height_px).  Files land in docs/evidence/ named
-# screenshot-{W}x{H}.png — no platform labels so the web agent stays generic.
-_UI_SCREENSHOT_VIEWPORTS: list[tuple[int, int]] = [
-    (1280, 900),   # standard laptop / desktop
-    (375, 812),    # standard phone (iPhone-class)
-]
+# INPUT_REQUIRED pause/resume -- keyed by task_id
+_INPUT_EVENTS: dict[str, dict] = {}
+_INPUT_EVENTS_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
 
-def audit_log(event: str, **kwargs):
+def audit_log(event: str, **kwargs) -> None:
     entry = {"ts": local_iso_timestamp(), "event": event, **kwargs}
     print(f"[audit] {json.dumps(entry, ensure_ascii=False)}")
 
 
-def _report_progress(compass_url: str, compass_task_id: str, step: str):
-    """POST progress step to Compass (best-effort)."""
-    if not compass_url or not compass_task_id:
-        return
-    payload = {"step": step, "agentId": AGENT_ID}
-    data = json.dumps(payload).encode("utf-8")
-    request = Request(
-        f"{compass_url.rstrip('/')}/tasks/{compass_task_id}/progress",
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=5):
-            pass
-    except Exception as err:
-        print(f"[{AGENT_ID}] Progress report failed (non-critical): {err}")
-
+# ---------------------------------------------------------------------------
+# Workspace helpers
+# ---------------------------------------------------------------------------
 
 def _save_workspace_file(workspace_path: str, relative_name: str, content: str) -> None:
-    """Write content to a file inside the shared workspace (best-effort)."""
     if not workspace_path:
         return
     try:
@@ -142,7 +117,6 @@ def _save_workspace_file(workspace_path: str, relative_name: str, content: str) 
 
 
 def _append_workspace_file(workspace_path: str, relative_name: str, content: str) -> None:
-    """Append content to a file inside the shared workspace (best-effort)."""
     if not workspace_path:
         return
     try:
@@ -154,320 +128,9 @@ def _append_workspace_file(workspace_path: str, relative_name: str, content: str
         print(f"[{AGENT_ID}] Warning: could not append workspace file {relative_name}: {exc}")
 
 
-def _read_workspace_json(workspace_path: str, relative_name: str) -> dict:
-    """Read a JSON file from the shared workspace (best-effort)."""
-    if not workspace_path:
-        return {}
-    full_path = os.path.join(workspace_path, relative_name)
-    if not os.path.isfile(full_path):
-        return {}
-    try:
-        with open(full_path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"[{AGENT_ID}] Warning: could not read workspace JSON {relative_name}: {exc}")
-        return {}
-
-
-def _append_workspace_event(workspace_path: str, relative_name: str, event: dict) -> None:
-    """Append an event object to a workspace JSON file under the `events` key."""
-    payload = _read_workspace_json(workspace_path, relative_name)
-    events = payload.get("events") if isinstance(payload.get("events"), list) else []
-    events.append(event)
-    payload["events"] = events
-    _save_workspace_file(
-        workspace_path,
-        relative_name,
-        json.dumps(payload, ensure_ascii=False, indent=2),
-    )
-
-
-def _is_path_within(root_path: str, candidate_path: str) -> bool:
-    """Return True when *candidate_path* resolves under *root_path*."""
-    if not root_path or not candidate_path:
-        return False
-    try:
-        root_real = os.path.realpath(root_path)
-        candidate_real = os.path.realpath(candidate_path)
-        return os.path.commonpath([root_real, candidate_real]) == root_real
-    except (OSError, ValueError):
-        return False
-
-
-def _require_shared_workspace_for_repo_task(repo_url: str, workspace: str) -> None:
-    """Repo-backed tasks must use the shared workspace so SCM can clone into it."""
-    if repo_url and not workspace:
-        raise RuntimeError(
-            "Shared workspace path is required for repo-backed development tasks so the SCM agent "
-            "can clone the target repository into the task workspace."
-        )
-
-
-def _ensure_clone_path_in_workspace(workspace: str, clone_path: str) -> None:
-    """Reject clone paths that do not resolve under the shared workspace."""
-    if workspace and clone_path and not _is_path_within(workspace, clone_path):
-        raise RuntimeError(
-            f"Repository clone path must stay inside the shared workspace. workspace={workspace} clone={clone_path}"
-        )
-
-
-def _resolve_agent_service_url(capability: str) -> str:
-    try:
-        _, instance = agent_directory.resolve_capability(capability)
-    except RegistryUnavailableError as err:
-        raise RuntimeError(
-            f"Registry unavailable while resolving required capability '{capability}': {err}"
-        ) from err
-    except CapabilityUnavailableError as err:
-        raise RuntimeError(
-            f"Required capability '{capability}' is unavailable. "
-            "Boundary systems must be accessed only through registered agents."
-        ) from err
-
-    service_url = (instance or {}).get("service_url", "")
-    if not service_url:
-        raise RuntimeError(
-            f"Capability '{capability}' is registered but has no routable service URL."
-        )
-    return service_url.rstrip("/")
-
-
-def _adf_text_node(text: str, *, href: str = "") -> dict:
-    node = {"type": "text", "text": str(text or "")}
-    if href:
-        node["marks"] = [{"type": "link", "attrs": {"href": href}}]
-    return node
-
-
-def _adf_document(paragraphs: list[list[dict]]) -> dict:
-    return {
-        "type": "doc",
-        "version": 1,
-        "content": [
-            {
-                "type": "paragraph",
-                "content": paragraph or [_adf_text_node("")],
-            }
-            for paragraph in paragraphs
-        ],
-    }
-
-
-def _adf_plain_text(adf_body: dict | None) -> str:
-    if not isinstance(adf_body, dict):
-        return ""
-    lines = []
-    for block in adf_body.get("content", []):
-        if not isinstance(block, dict):
-            continue
-        parts = []
-        for inline in block.get("content", []):
-            if isinstance(inline, dict) and inline.get("type") == "text":
-                parts.append(str(inline.get("text", "")))
-        line = "".join(parts).strip()
-        if line:
-            lines.append(line)
-    return "\n".join(lines)
-
-
-def _build_pr_jira_comment_adf(
-    pr_url: str,
-    branch_name: str,
-    test_status: str,
-    generated_files: list[dict],
-    summary: str,
-) -> dict:
-    file_paths = [item.get("path", "") for item in generated_files if item.get("path")]
-    preview = ", ".join(file_paths[:5])
-    if len(file_paths) > 5:
-        preview += "…"
-    return _adf_document(
-        [
-            [_adf_text_node("Web Agent completed implementation.")],
-            [_adf_text_node("PR: "), _adf_text_node(pr_url, href=pr_url)],
-            [_adf_text_node(f"Branch: {branch_name}")],
-            [_adf_text_node(f"Test Status: {test_status}")],
-            [_adf_text_node(f"Files changed ({len(file_paths)}): {preview}")],
-            [_adf_text_node(f"Summary: {summary}")],
-        ]
-    )
-
-
-def _record_jira_action(
-    workspace_path: str,
-    task_id: str,
-    ticket_key: str,
-    action: str,
-    status: str,
-    agent_task_id: str = "",
-    **details,
-) -> None:
-    """Persist Jira workflow evidence for later review."""
-    event = {
-        "ts": local_iso_timestamp(),
-        "taskId": task_id,
-        "agentTaskId": agent_task_id or task_id,
-        "agentId": AGENT_ID,
-        "ticketKey": ticket_key,
-        "action": action,
-        "status": status,
-    }
-    event.update({key: value for key, value in details.items() if value not in (None, "")})
-    _append_workspace_event(workspace_path, f"{AGENT_ID}/jira-actions.json", event)
-
-
-def _save_pr_evidence(workspace_path: str, **details) -> None:
-    """Persist PR metadata and description so review can verify SCM evidence locally."""
-    payload = _read_workspace_json(workspace_path, f"{AGENT_ID}/pr-evidence.json")
-    payload.update({key: value for key, value in details.items() if value is not None})
-    payload.setdefault("agentId", AGENT_ID)
-    payload.setdefault("ts", local_iso_timestamp())
-    _save_workspace_file(
-        workspace_path,
-        f"{AGENT_ID}/pr-evidence.json",
-        json.dumps(payload, ensure_ascii=False, indent=2),
-    )
-
-
-def _prepend_tech_stack_constraints(task_instruction: str, constraints: dict | None) -> str:
-    if not constraints:
-        return task_instruction
-    lines = ["HARD TECH STACK CONSTRAINTS:"]
-    if constraints.get("language") == "python":
-        version = constraints.get("python_version")
-        lines.append(f"- Use Python{f' {version}' if version else ''}.")
-    if constraints.get("backend_framework"):
-        lines.append(f"- Use {constraints['backend_framework']} for the backend/web server.")
-    if constraints.get("frontend_framework"):
-        lines.append(f"- Use {constraints['frontend_framework']} for the frontend.")
-    lines.append("- Do not switch to React, Next.js, or Node.js unless the user explicitly overrides these constraints.")
-    lines.append("- If the target repo is empty or sparse, scaffold the required stack in-place.")
-    block = "\n".join(lines)
-    if block in task_instruction:
-        return task_instruction
-    return f"{block}\n\n{task_instruction}".strip()
-
-
-def _apply_tech_stack_constraints(analysis: dict, constraints: dict | None) -> dict:
-    if not constraints:
-        return analysis
-    updated = dict(analysis or {})
-    if constraints.get("language"):
-        updated["language"] = constraints["language"]
-    if constraints.get("backend_framework"):
-        updated["backend_framework"] = constraints["backend_framework"]
-        if updated.get("scope") in (None, "", "frontend_only"):
-            updated["scope"] = "fullstack"
-    if constraints.get("frontend_framework"):
-        updated["frontend_framework"] = constraints["frontend_framework"]
-    elif constraints.get("backend_framework") == "flask":
-        updated["frontend_framework"] = "none"
-        updated.setdefault("ui_library", "none")
-    return updated
-
-
-def _jira_request_json(
-    capability: str,
-    method: str,
-    path: str,
-    *,
-    payload: dict | None = None,
-    permissions: dict | None = None,
-    workspace: str = "",
-    task_id: str = "",
-    compass_task_id: str = "",
-    timeout: int = 30,
-) -> dict:
-    request_payload = dict(payload) if isinstance(payload, dict) else {}
-    normalized_path = urlparse(path).path
-    ticket_match = re.search(r"/jira/(?:tickets|transitions|comments|assignee)/([A-Z][A-Z0-9]+-\d+)", normalized_path)
-    ticket_key = ticket_match.group(1) if ticket_match else ""
-    extra_metadata: dict = {}
-    if ticket_key:
-        extra_metadata["ticketKey"] = ticket_key
-
-    if capability == "jira.ticket.fetch":
-        message_text = f"Fetch Jira ticket {ticket_key}".strip()
-    elif capability == "jira.user.myself":
-        message_text = "Get current Jira user"
-    elif capability == "jira.ticket.transition":
-        transition = str(request_payload.get("transition") or "").strip()
-        if transition:
-            extra_metadata["transition"] = transition
-        message_text = f"Transition ticket {ticket_key} to {transition}".strip()
-    elif capability == "jira.ticket.assignee":
-        account_id = str(request_payload.get("accountId") or "").strip()
-        if account_id:
-            extra_metadata["accountId"] = account_id
-        message_text = f"Assign ticket {ticket_key} to accountId {account_id}".strip()
-    elif capability == "jira.comment.add":
-        adf_body = request_payload.get("adf") if isinstance(request_payload.get("adf"), dict) else None
-        if adf_body:
-            extra_metadata["adf"] = adf_body
-            message_text = f"Add structured comment to ticket {ticket_key}".strip()
-        else:
-            comment_text = str(request_payload.get("text") or request_payload.get("comment") or "").strip()
-            if comment_text:
-                extra_metadata["commentText"] = comment_text
-            message_text = f"Add comment to ticket {ticket_key}: {comment_text}".strip()
-    else:
-        raise RuntimeError(f"Unsupported Jira A2A capability: {capability}")
-
-    result = _call_sync_agent(
-        capability,
-        message_text,
-        task_id,
-        workspace,
-        compass_task_id or task_id,
-        permissions=permissions,
-        extra_metadata=extra_metadata,
-    )
-    state = str((result.get("status") or {}).get("state") or "").strip()
-    if state in {"TASK_STATE_FAILED", "FAILED"}:
-        status_text = extract_text((result.get("status") or {}).get("message") or {}).strip()
-        raise RuntimeError(status_text or f"{capability} failed")
-
-    for artifact in result.get("artifacts", []):
-        text = artifact_text(artifact)
-        if not text:
-            continue
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if capability == "jira.ticket.fetch":
-            if artifact.get("name") == "jira-raw-payload":
-                return {"issue": data}
-            if isinstance(data, dict) and "issue" in data:
-                return data
-            continue
-        if isinstance(data, dict):
-            return data
-    return {"issue": {}} if capability == "jira.ticket.fetch" else {}
-
-
-def _get_jira_account_id(
-    workspace: str,
-    task_id: str,
-    permissions: dict | None = None,
-    compass_task_id: str = "",
-) -> str:
-    response = _jira_request_json(
-        "jira.user.myself",
-        "GET",
-        "/jira/myself",
-        permissions=permissions,
-        workspace=workspace,
-        task_id=task_id,
-        compass_task_id=compass_task_id,
-    )
-    user = response.get("user") or {}
-    account_id = user.get("accountId") or ""
-    if not account_id:
-        raise RuntimeError(f"jira.myself returned no accountId: {response}")
-    return account_id
-
+# ---------------------------------------------------------------------------
+# Callback helper
+# ---------------------------------------------------------------------------
 
 def _notify_callback(
     callback_url: str,
@@ -475,8 +138,7 @@ def _notify_callback(
     state: str,
     status_message: str,
     artifacts: list | None = None,
-):
-    """Notify Team Lead Agent (or caller) of task completion."""
+) -> None:
     if not callback_url:
         return
     payload = {
@@ -501,1949 +163,106 @@ def _notify_callback(
         print(f"[{AGENT_ID}] Callback failed: {err}")
 
 
-def _auto_stop_after_task_enabled() -> bool:
-    return os.environ.get("AUTO_STOP_AFTER_TASK", "").strip() == "1"
+# ---------------------------------------------------------------------------
+# INPUT_REQUIRED pause / resume
+# ---------------------------------------------------------------------------
 
+def _make_wait_for_user_input(*, task_id: str, callback_url: str):
+    """Return a blocking callable that pauses the runtime until the user replies."""
+
+    def _wait(question: str) -> str | None:
+        task_store.update_state(task_id, "TASK_STATE_INPUT_REQUIRED", question)
+        event = threading.Event()
+        with _INPUT_EVENTS_LOCK:
+            _INPUT_EVENTS[task_id] = {"event": event, "info": None}
+        _notify_callback(
+            callback_url,
+            task_id,
+            "TASK_STATE_INPUT_REQUIRED",
+            f"Web Agent needs input: {question}",
+        )
+        if not event.wait(timeout=INPUT_WAIT_TIMEOUT):
+            with _INPUT_EVENTS_LOCK:
+                _INPUT_EVENTS.pop(task_id, None)
+            return None
+        with _INPUT_EVENTS_LOCK:
+            entry = _INPUT_EVENTS.pop(task_id, {})
+        user_reply = entry.get("info") or ""
+        task_store.update_state(task_id, "TASK_STATE_WORKING", "Resumed with user input")
+        return user_reply
+
+    return _wait
+
+
+# ---------------------------------------------------------------------------
+# Task exit rule
+# ---------------------------------------------------------------------------
 
 def _apply_task_exit_rule(task_id: str, exit_rule: dict) -> None:
-    """Apply the exit rule for a completed task in a background thread."""
-    def _run():
-        rule_type = (exit_rule or {}).get("type", "wait_for_parent_ack")
-        # If AUTO_STOP env is not set and rule is "auto_stop", treat as persistent
-        if rule_type == "auto_stop":
-            if not _auto_stop_after_task_enabled():
-                print(f"[{AGENT_ID}] AUTO_STOP_AFTER_TASK not set — keeping agent alive")
-                return
-            rule_type = "immediate"
+    def _run() -> None:
         exit_handler.apply(
             task_id,
-            {**exit_rule, "type": rule_type},
+            exit_rule or {},
             shutdown_fn=_schedule_shutdown,
             agent_id=AGENT_ID,
         )
+
     threading.Thread(target=_run, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
-# A2A helpers for calling downstream agents
+# Context helpers
 # ---------------------------------------------------------------------------
 
-def _a2a_send(agent_url: str, message: dict) -> dict:
-    """Send a message to an agent and return the downstream task dict."""
-    body = {
-        "message": message,
-        "configuration": {"returnImmediately": True},
-    }
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    request = Request(
-        f"{agent_url.rstrip('/')}/message:send",
-        data=data,
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
-    with urlopen(request, timeout=ACK_TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8")).get("task", {})
-
-
-def _poll_task(agent_url: str, task_id: str, timeout: int = 60) -> dict | None:
-    """Poll GET /tasks/{id} until a terminal state is reached."""
-    terminal = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED"}
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            request = Request(
-                f"{agent_url.rstrip('/')}/tasks/{task_id}",
-                headers={"Accept": "application/json"},
-            )
-            with urlopen(request, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                task = data.get("task", {})
-                state = task.get("status", {}).get("state", "")
-                if state in terminal:
-                    return task
-        except Exception:
-            pass
-        time.sleep(3)
-    return None
-
-
-def _call_sync_agent(
-    capability: str,
-    message_text: str,
-    task_id: str,
-    workspace_path: str,
-    compass_task_id: str,
-    permissions: dict | None = None,
-    extra_metadata: dict | None = None,
-) -> dict:
-    """Call a synchronous agent and wait for its result."""
-    agent_url = _resolve_agent_service_url(capability)
-    message = {
-        "messageId": f"web-{task_id}-{capability}-{int(time.time())}",
-        "role": "ROLE_USER",
-        "parts": [{"text": message_text}],
-        "metadata": {
-            "requestedCapability": capability,
-            "orchestratorTaskId": compass_task_id,
-            "sharedWorkspacePath": workspace_path,
-        },
-    }
-    if isinstance(permissions, dict) and permissions:
-        message["metadata"]["permissions"] = permissions
-    if isinstance(extra_metadata, dict) and extra_metadata:
-        message["metadata"].update(extra_metadata)
-    downstream = _a2a_send(agent_url, message)
-    task_id_ds = downstream.get("id", "")
-    state = downstream.get("status", {}).get("state", "")
-
-    terminal = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "FAILED", "COMPLETED"}
-    if state in terminal:
-        details = extract_permission_denial(downstream)
-        if state in {"TASK_STATE_FAILED", "FAILED"} and details is not None:
-            raise PermissionEscalationRequired(details)
-        return downstream
-
-    if task_id_ds:
-        result = _poll_task(agent_url, task_id_ds, timeout=SYNC_AGENT_TIMEOUT)
-        if result:
-            details = extract_permission_denial(result)
-            result_state = result.get("status", {}).get("state", "")
-            if result_state in {"TASK_STATE_FAILED", "FAILED"} and details is not None:
-                raise PermissionEscalationRequired(details)
-            return result
-
-    return downstream
-
-
-# ---------------------------------------------------------------------------
-# LLM helpers
-# ---------------------------------------------------------------------------
-
-def _parse_json_from_llm(text: str) -> dict:
-    """Extract JSON object from LLM response, stripping markdown fences."""
-    text = (text or "").strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        start = 1
-        end = len(lines)
-        while end > start and lines[end - 1].strip() in ("```", ""):
-            end -= 1
-        text = "\n".join(lines[start:end]).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-    print(f"[{AGENT_ID}] Warning: could not parse JSON from LLM: {text[:200]}")
-    return {}
-
-
-def _run_agentic(
-    prompt: str,
-    actor: str,
-    *,
-    system_prompt: str | None = None,
-    context: dict | None = None,
-    model: str | None = None,
-    timeout: int = 120,
-    max_tokens: int = 4096,
-) -> str:
-    """Run the configured runtime and return raw output text."""
-    require_agentic_runtime("Web Agent")
-    result = get_runtime().run(
-        prompt=prompt,
-        context=context,
-        system_prompt=system_prompt,
-        model=model,
-        timeout=timeout,
-        max_tokens=max_tokens,
-    )
-    for warning in result.get("warnings") or []:
-        print(f"[{AGENT_ID}] Runtime warning ({actor}): {warning}")
-    return result.get("raw_response") or result.get("summary") or ""
-
-
-# Cached manifest-based system prompt for Web Agent
-_MANIFEST_SYSTEM_PROMPT: str = ""
-
-
-def _get_manifest_system_prompt() -> str:
-    """Return cached manifest-based system prompt, building it on first call."""
-    global _MANIFEST_SYSTEM_PROMPT
-    if not _MANIFEST_SYSTEM_PROMPT:
-        agent_dir = os.path.dirname(os.path.abspath(__file__))
-        _MANIFEST_SYSTEM_PROMPT = build_system_prompt_from_manifest(agent_dir) or build_system_prompt(
-            "", "web", skill_names=_DEVELOPMENT_SKILL_NAMES
-        )
-    return _MANIFEST_SYSTEM_PROMPT
-
-
-def _build_web_system_prompt(base_prompt: str) -> str:
-    manifest_prompt = _get_manifest_system_prompt()
-    if manifest_prompt and base_prompt:
-        return f"{manifest_prompt}\n\n---\n\nTASK CONTEXT:\n{base_prompt}"
-    if manifest_prompt:
-        return manifest_prompt
-    return build_system_prompt(
-        base_prompt,
-        "web",
-        skill_names=_DEVELOPMENT_SKILL_NAMES,
-    )
-
-
-def _plan_implementation(
-    task_instruction: str,
-    acceptance_criteria: list,
-    analysis: dict,
-    repo_snapshot: str,
-    design_context: str,
-) -> dict:
-    criteria_text = "\n".join(f"- {c}" for c in (acceptance_criteria or [])) or "Not specified."
-    analysis_json = json.dumps(analysis, ensure_ascii=False, indent=2)
-    repo_snapshot_text = repo_snapshot or "No existing codebase."
-    design_context_text = design_context or "No design context provided."
-    prompt = prompts.PLAN_TEMPLATE.format(
-        task_instruction=task_instruction,
-        acceptance_criteria=criteria_text,
-        analysis_json=analysis_json,
-        repo_snapshot=repo_snapshot_text,
-        design_context=design_context_text,
-    )
-    system = _build_web_system_prompt(prompts.PLAN_SYSTEM)
-    response = _run_agentic(
-        prompt,
-        f"[{AGENT_ID}] plan",
-        system_prompt=system,
-        timeout=PLAN_TIMEOUT_SECONDS,
-        max_tokens=PLAN_MAX_TOKENS,
-    )
-    plan = _parse_json_from_llm(response)
-    if plan.get("files"):
-        return plan
-
-    repair_prompt = prompts.PLAN_REPAIR_TEMPLATE.format(
-        task_instruction=task_instruction,
-        acceptance_criteria=criteria_text,
-        analysis_json=analysis_json,
-        repo_snapshot=repo_snapshot_text,
-        design_context=design_context_text,
-        previous_response=response or "<empty response>",
-    )
-    repair_system = _build_web_system_prompt(prompts.PLAN_REPAIR_SYSTEM)
-    repaired_response = _run_agentic(
-        repair_prompt,
-        f"[{AGENT_ID}] plan-repair",
-        system_prompt=repair_system,
-        timeout=PLAN_REPAIR_TIMEOUT_SECONDS,
-        max_tokens=PLAN_MAX_TOKENS,
-    )
-    repaired_plan = _parse_json_from_llm(repaired_response)
-    return repaired_plan or plan
-
-
-def _normalize_plan_path(path: str) -> str:
-    normalized = (path or "").strip().replace("\\", "/")
-    # Strip leading ./ or / prefixes only as complete units to avoid removing
-    # legitimate leading dots (e.g. .github/, .gitignore)
-    while normalized.startswith("./") or normalized.startswith("/"):
-        normalized = normalized[2:] if normalized.startswith("./") else normalized[1:]
-    if not normalized:
-        return normalized
-    dir_name, base_name = os.path.split(normalized)
-    dotfile_aliases = {
-        "gitignore": ".gitignore",
-        "nvmrc": ".nvmrc",
-        "dockerignore": ".dockerignore",
-    }
-    replacement = dotfile_aliases.get(base_name.lower())
-    if replacement:
-        normalized = os.path.join(dir_name, replacement) if dir_name else replacement
-    return normalized.replace("\\", "/")
-
-
-def _is_spa_router_file(path: str) -> bool:
-    path_lower = path.lower()
-    return bool(
-        re.match(r"^src/(app|main|routes|router)\.[^/]+$", path_lower)
-        or path_lower.startswith("src/routes/")
-        or path_lower.startswith("src/router/")
-    )
-
-
-def _is_top_level_next_route_file(path: str) -> bool:
-    path_lower = path.lower()
-    return path_lower.startswith("pages/") or path_lower.startswith("app/")
-
-
-def _is_operational_plan_artifact(file_info: dict) -> bool:
-    path_lower = _normalize_plan_path(str(file_info.get("path", ""))).lower()
-    purpose_lower = str(file_info.get("purpose", "")).lower()
-    logic_lower = str(file_info.get("key_logic", "")).lower()
-    text = " ".join(part for part in (path_lower, purpose_lower, logic_lower) if part)
-    if not path_lower:
-        return True
-    if "pull request body" in text or "pr description" in text or "jira evidence" in text:
-        return True
-    if path_lower.startswith("artifacts/"):
-        return True
-    # Reject work/ and .work/ evidence directories (screenshots, test logs, CI evidence, Jira API responses)
-    if path_lower.startswith("work/") or "/work/" in path_lower:
-        return True
-    if path_lower.startswith(".work/") or "/.work/" in path_lower:
-        return True
-    # Reject scripts/ helper folders (branch/PR scripts, Jira update scripts, etc.)
-    # Note: do NOT include "script" — too broad; it would match any JS file described as a script
-    if path_lower.startswith("scripts/") and any(
-        kw in text for kw in ("jira", "branch", "pr", "update", "instructions", "helper")
-    ):
-        return True
-    base_name = os.path.basename(path_lower)
-    if re.match(r"^step-\d+.*\.md$", base_name):
-        return True
-    if re.match(r"^pr[_-]?template", base_name):
-        return True
-    # Reject common evidence/scratch file names regardless of directory
-    if re.match(r"^(jira[_-]update|branch[_-]and[_-]pr|server[_-]curl|pytest[_-]output)\.(sh|txt|json|md)$", base_name):
-        return True
-    return False
-
-
-def _sanitize_plan_files(files: list[dict], analysis: dict, review_issues: list[str]) -> tuple[list[dict], list[dict]]:
-    """Remove conflicting or non-repo plan entries before code generation."""
-    normalized_files: list[dict] = []
-    removed: list[dict] = []
-    seen_paths: set[str] = set()
-
-    for file_info in files or []:
-        normalized_path = _normalize_plan_path(str(file_info.get("path", "")))
-        if not normalized_path:
-            removed.append({"path": "", "reason": "empty plan path"})
-            continue
-        path_key = normalized_path.lower()
-        if path_key in seen_paths:
-            removed.append({"path": normalized_path, "reason": "duplicate plan path"})
-            continue
-        candidate = dict(file_info)
-        candidate["path"] = normalized_path
-        normalized_files.append(candidate)
-        seen_paths.add(path_key)
-
-    if not normalized_files:
-        return normalized_files, removed
-
-    frontend = str(analysis.get("frontend_framework", "")).strip().lower()
-    issue_text = "\n".join(str(issue) for issue in (review_issues or [])).lower()
-    prefer_nextjs = frontend == "nextjs" or ("next.js" in issue_text and "remove spa" in issue_text)
-    prefer_react = frontend == "react" or ("react router" in issue_text and "remove next" in issue_text)
-    has_top_level_next_routes = any(
-        _is_top_level_next_route_file(file_info["path"])
-        for file_info in normalized_files
-    )
-
-    kept: list[dict] = []
-    kept_paths: set[str] = set()
-    for file_info in normalized_files:
-        path = file_info["path"]
-        path_lower = path.lower()
-        base_name = os.path.basename(path_lower)
-        reason = ""
-
-        if base_name.startswith(".env") and ".example" not in base_name:
-            reason = "drop environment-specific file; keep only example env templates"
-        elif _is_operational_plan_artifact(file_info):
-            reason = "workflow evidence belongs in workspace artifacts, not repo file plan"
-        elif prefer_nextjs and _is_spa_router_file(path):
-            reason = "drop SPA router shell for Next.js implementation"
-        elif prefer_nextjs and has_top_level_next_routes and (
-            path_lower.startswith("src/pages/") or path_lower.startswith("src/app/")
-        ):
-            reason = "drop duplicate src route tree when top-level Next.js routes are present"
-        elif prefer_react and (
-            path_lower.startswith("pages/")
-            or path_lower.startswith("app/")
-            or re.search(r"\.next\.test\.[^.]+$", path_lower)
-        ):
-            reason = "drop Next.js-specific files for React SPA implementation"
-
-        if reason:
-            removed.append({"path": path, "reason": reason})
-            continue
-
-        kept.append(file_info)
-        kept_paths.add(path_lower)
-
-    if prefer_nextjs and has_top_level_next_routes and kept:
-        final_kept: list[dict] = []
-        for file_info in kept:
-            path_lower = file_info["path"].lower()
-            if path_lower.startswith("src/pages/__tests__/") and not any(
-                route in kept_paths for route in ("pages/index.tsx", "pages/index.jsx", "app/page.tsx", "app/page.jsx")
-            ):
-                removed.append({
-                    "path": file_info["path"],
-                    "reason": "drop orphaned SPA page test after Next.js route sanitization",
-                })
-                continue
-            final_kept.append(file_info)
-        if final_kept:
-            kept = final_kept
-
-    return kept or normalized_files, removed
-
-
-# ---------------------------------------------------------------------------
-# SCM / Jira helpers
-# ---------------------------------------------------------------------------
-
-
-def _sanitize_base_branch(branch: str) -> str:
-    """Return a safe base branch name. Fall back to 'main' if the value looks
-    like a Jira ticket key or other non-branch string."""
-    if not branch:
-        return "main"
-    # Reject patterns like PROJ-123, PROJ-1/landing-page, jira-key/foo
-    if re.match(r"^[A-Z][A-Z0-9]+-\d+", branch):
-        return "main"
-    # Also reject if it contains characters not valid in branch names
-    if re.search(r"[\s~^:?*\[\\]", branch):
-        return "main"
-    return branch
-
-
-
-def _read_repo_snapshot(clone_path: str, max_files: int = 30, max_chars: int = 8000) -> str:
-    """Read key files from a cloned repo to provide context for LLM."""
-    if not clone_path or not os.path.isdir(clone_path):
-        return ""
-
-    snapshot_parts: list[str] = []
-    chars_used = 0
-    files_read = 0
-
-    # Priority files to include first
-    priority_patterns = [
-        "package.json", "pyproject.toml", "setup.py", "requirements.txt",
-        "README.md", "tsconfig.json", ".env.example",
-    ]
-
-    def _read_file_safe(filepath: str, limit: int = 1500) -> str:
-        try:
-            with open(filepath, encoding="utf-8", errors="replace") as fh:
-                content = fh.read(limit)
-            if len(content) == limit:
-                content += "\n...[truncated]"
-            return content
-        except Exception:
-            return ""
-
-    # Read priority files first
-    for pattern in priority_patterns:
-        candidate = os.path.join(clone_path, pattern)
-        if os.path.isfile(candidate) and chars_used < max_chars and files_read < max_files:
-            content = _read_file_safe(candidate)
-            if content:
-                rel = os.path.relpath(candidate, clone_path)
-                snapshot_parts.append(f"=== {rel} ===\n{content}")
-                chars_used += len(content)
-                files_read += 1
-
-    # Walk the tree for source files
-    skip_dirs = {
-        ".git", "node_modules", "__pycache__", ".next", "dist",
-        "build", "out", "venv", ".venv", ".cache",
-    }
-    source_exts = {
-        ".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".md",
-        ".html", ".css", ".scss",
-    }
-
-    for root, dirs, files in os.walk(clone_path):
-        dirs[:] = [d for d in dirs if d not in skip_dirs]
-        for fname in sorted(files):
-            if files_read >= max_files or chars_used >= max_chars:
-                break
-            _, ext = os.path.splitext(fname)
-            if ext not in source_exts:
-                continue
-            fpath = os.path.join(root, fname)
-            rel = os.path.relpath(fpath, clone_path)
-            # Skip if already included as priority
-            if fname in priority_patterns:
-                continue
-            content = _read_file_safe(fpath)
-            if content:
-                snapshot_parts.append(f"=== {rel} ===\n{content}")
-                chars_used += len(content)
-                files_read += 1
-
-    return "\n\n".join(snapshot_parts)
-
-
-def _normalize_dependency_spec(dep: str) -> str:
-    dep = re.sub(r"^[-*]\s*", "", dep.strip().strip("`").rstrip(","))
-    dep = re.sub(r"\s+\([^()]*\)$", "", dep).strip()
-    return dep
-
-
-def _install_plan_dependencies(deps: list[str], language: str, log_fn, cwd: str | None = None):
-    """Install dependencies declared in the plan at runtime (best-effort)."""
-    if not deps:
-        return
-    python_pkgs = []
-    npm_pkgs = []
-    for dep in deps:
-        dep = _normalize_dependency_spec(dep)
-        if not dep:
-            continue
-        # Simple heuristic: if it looks like a PyPI package (no @, no /) it's Python;
-        # if it starts with @ or is a scoped package it's npm.
-        if dep.startswith("@") or "/" in dep or language in ("javascript", "typescript"):
-            npm_pkgs.append(dep)
-        else:
-            python_pkgs.append(dep)
-
-    if python_pkgs:
-        log_fn(f"Installing Python packages: {', '.join(python_pkgs)}")
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet"] + python_pkgs,
-                timeout=120,
-                check=False,
-                cwd=cwd,
-            )
-        except Exception as err:
-            log_fn(f"Warning: pip install failed: {err}")
-
-    if npm_pkgs:
-        log_fn(f"Installing npm packages: {', '.join(npm_pkgs)}")
-        try:
-            subprocess.run(
-                ["npm", "install", "--save"] + npm_pkgs,
-                timeout=120,
-                check=False,
-                cwd=cwd,
-            )
-        except Exception as err:
-            log_fn(f"Warning: npm install failed: {err}")
-
-
-def _install_written_node_dependencies(build_dir: str, log_fn) -> None:
-    """Install npm dependencies after generated package manifests have been written."""
-    root_manifest = _load_package_json(os.path.join(build_dir, "package.json"))
-    if not root_manifest:
-        return
-
-    package_dirs: list[str] = [build_dir]
-    has_workspaces = isinstance(root_manifest.get("workspaces"), (list, dict))
-    if not has_workspaces:
-        for rel_dir in ("client", "server"):
-            if _load_package_json(os.path.join(build_dir, rel_dir, "package.json")):
-                package_dirs.append(os.path.join(build_dir, rel_dir))
-
-    seen_dirs: set[str] = set()
-    for package_dir in package_dirs:
-        if package_dir in seen_dirs:
-            continue
-        seen_dirs.add(package_dir)
-        rel_dir = os.path.relpath(package_dir, build_dir)
-        label = "." if rel_dir == "." else rel_dir
-        log_fn(f"Installing npm dependencies from generated manifests ({label})")
-        try:
-            subprocess.run(
-                ["npm", "install", "--no-fund", "--no-audit"],
-                cwd=package_dir,
-                capture_output=True,
-                text=True,
-                timeout=600,
-                check=True,
-                env={**os.environ, "CI": "true"},
-            )
-        except Exception as err:
-            log_fn(f"Warning: npm install from generated manifests failed in {label}: {err}")
-
-
-def _extract_missing_node_dependency(output: str) -> str:
-    patterns = [
-        r"Cannot find module '([^']+)'",
-        r"Cannot find package '([^']+)'",
-        r"Failed to load url ([^\s]+) \(resolved id: ([^)]+)\)",
-        r"sh: 1: ([A-Za-z0-9._@/-]+): not found",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, output)
-        if not match:
-            continue
-        candidate = match.group(match.lastindex or 1)
-        dep = _normalize_dependency_spec(candidate)
-        if dep and not dep.startswith((".", "/", "node:")):
-            return dep
-    return ""
-
-
-def _install_missing_node_dependency(build_dir: str, dep: str, log_fn) -> bool:
-    dep = _normalize_dependency_spec(dep)
-    if not dep:
-        return False
-    log_fn(f"Auto-installing missing Node dependency: {dep}")
-    try:
-        result = subprocess.run(
-            ["npm", "install", "--save", dep],
-            cwd=build_dir,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,
-            env={**os.environ, "CI": "true"},
-        )
-    except Exception as err:
-        log_fn(f"Auto-install failed for {dep}: {err}")
-        return False
-    if result.returncode == 0:
-        return True
-    stderr_text = (result.stderr or "").strip()[:200]
-    log_fn(f"Auto-install failed for {dep}: {stderr_text or 'unknown error'}")
-    return False
-
-
-def _write_files_to_directory(base_dir: str, files: list[dict]) -> list[str]:
-    """Write generated code files into the specified directory."""
-    if not base_dir:
-        return []
-    os.makedirs(base_dir, exist_ok=True)
-    written: list[str] = []
-    for file_info in files:
-        rel_path = file_info.get("path", "output.txt").lstrip("/")
-        full_path = os.path.join(base_dir, rel_path)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        content = file_info.get("content", "")
-        try:
-            with open(full_path, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            written.append(full_path)
-        except Exception as err:
-            print(f"[{AGENT_ID}] Could not write {full_path}: {err}")
-    return written
-
-
-def _project_uses_python(build_dir: str, language: str) -> bool:
-    return language in ("python", "mixed") or any(
-        os.path.isfile(os.path.join(build_dir, candidate))
-        for candidate in ("requirements.txt", "pyproject.toml", "setup.py")
-    )
-
-
-def _ensure_local_python_env(build_dir: str, language: str, log_fn) -> str:
-    if not _project_uses_python(build_dir, language):
-        return sys.executable
-
-    # Create the venv OUTSIDE the repo directory so that:
-    # 1. Its shebangs use a short, absolute path (avoids OS shebang-length limits)
-    # 2. It is not accidentally committed to the repo
-    # 3. It remains usable if only the repo directory is shared between Docker and host
-    import hashlib
-    import tempfile
-    build_hash = hashlib.md5(build_dir.encode()).hexdigest()[:12]
-    venv_dir = os.path.join(tempfile.gettempdir(), f"constellation-venv-{build_hash}")
-    venv_python = os.path.join(venv_dir, "bin", "python")
-    requirements_path = os.path.join(build_dir, "requirements.txt")
-    install_stamp = os.path.join(venv_dir, ".requirements-installed")
-
-    try:
-        if not os.path.isfile(venv_python):
-            log_fn(f"Creating Python virtual environment at {venv_dir}")
-            subprocess.run(
-                [sys.executable, "-m", "venv", venv_dir],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=True,
-            )
-
-        if os.path.isfile(requirements_path):
-            requirements_mtime = os.path.getmtime(requirements_path)
-            stamp_mtime = os.path.getmtime(install_stamp) if os.path.isfile(install_stamp) else 0
-            if requirements_mtime > stamp_mtime:
-                log_fn("Installing local Python dependencies from requirements.txt")
-                subprocess.run(
-                    [venv_python, "-m", "pip", "install", "--quiet", "-r", requirements_path],
-                    cwd=build_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=180,
-                    check=True,
-                )
-                with open(install_stamp, "w", encoding="utf-8") as handle:
-                    handle.write(local_iso_timestamp())
-        return venv_python
-    except Exception as err:
-        log_fn(f"Warning: could not prepare local Python environment: {err}")
-        return sys.executable
-
-
-def _run_local_git(repo_dir: str, args: list[str], *, check: bool = True) -> tuple[bool, str]:
-    env = build_isolated_git_env(scope=f"{AGENT_ID}-local-git")
-    result = subprocess.run(
-        ["git", "-c", "credential.helper=", *args],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        env=env,
-    )
-    output = (result.stdout or result.stderr or "").strip()
-    if check and result.returncode != 0:
-        raise RuntimeError(output or f"git {' '.join(args)} failed")
-    return result.returncode == 0, output
-
-
-def _local_branch_exists(repo_dir: str, branch_name: str) -> bool:
-    ok, _ = _run_local_git(
-        repo_dir,
-        ["show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
-        check=False,
-    )
-    return ok
-
-
-def _checkout_local_branch(repo_dir: str, branch_name: str, base_branch: str, log_fn) -> None:
-    if _local_branch_exists(repo_dir, branch_name):
-        _run_local_git(repo_dir, ["checkout", branch_name])
-        log_fn(f"Checked out existing local branch: {branch_name}")
-        return
-
-    ok, output = _run_local_git(repo_dir, ["checkout", "-B", branch_name, base_branch], check=False)
-    if not ok:
-        ok, output = _run_local_git(repo_dir, ["checkout", "-b", branch_name], check=False)
-    if not ok:
-        raise RuntimeError(output or f"Could not create local branch {branch_name}")
-    log_fn(f"Created local branch: {branch_name}")
-
-
-def _delete_local_branch(repo_dir: str, branch_name: str, base_branch: str) -> None:
-    _run_local_git(repo_dir, ["checkout", base_branch], check=False)
-    _run_local_git(repo_dir, ["branch", "-D", branch_name], check=False)
-
-
-def _sanitize_branch_component(value: str) -> str:
-    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", value or "")
-    sanitized = sanitized.strip("-._")
-    return sanitized or "task"
-
-
-def _is_docs_or_tests_only(paths: list[str]) -> bool:
-    if not paths:
-        return False
-    for raw_path in paths:
-        path = (raw_path or "").strip().lstrip("/").lower()
-        if not path:
-            continue
-        if path.startswith("docs/") or path.startswith("tests/"):
-            continue
-        if "/tests/" in path or path.endswith(("_test.py", ".spec.ts", ".spec.js", ".test.ts", ".test.js", ".test.tsx", ".test.jsx")):
-            continue
-        if path.endswith((".md", ".rst", ".txt")) or os.path.basename(path) in {"readme.md", "running.md"}:
-            continue
-        return False
-    return True
-
-
-def _classify_branch_kind(
-    task_instruction: str,
-    analysis: dict,
-    planned_paths: list[str],
-    ticket_key: str,
-) -> str:
+def _resolve_jira_context(user_text: str, metadata: dict) -> tuple:
+    """Extract ticket key and Jira content snippet from handed-off metadata."""
+    jira_ctx = metadata.get("jiraContext")
+    if not isinstance(jira_ctx, dict):
+        jira_ctx = {}
+
+    ticket_key = str(jira_ctx.get("ticketKey") or "").strip()
     if not ticket_key:
-        if _is_docs_or_tests_only(planned_paths):
-            return "chore"
-        raise RuntimeError("Feature implementation and issue fixes require a Jira ticket.")
+        ticket_key = str(metadata.get("jiraTicketKey") or "").strip()
+    if not ticket_key:
+        m = re.search(r"\b([A-Z][A-Z0-9]+-\d{2,})\b", user_text or "")
+        ticket_key = m.group(1) if m else ""
 
-    summary_text = " ".join(
-        part for part in [task_instruction, analysis.get("task_summary", "")] if part
-    ).lower()
-    hotfix_markers = ("bug", "fix", "hotfix", "regression", "error", "defect")
-    feature_markers = ("feature", "implement", "build", "create", "add", "develop")
-    if any(marker in summary_text for marker in hotfix_markers) and not any(
-        marker in summary_text for marker in feature_markers
-    ):
-        return "hotfix"
-    return "feature"
-
-
-def _resolve_ticket_key(task_instruction: str, metadata: dict | None = None) -> str:
-    jira_context = (metadata or {}).get("jiraContext")
-    if isinstance(jira_context, dict):
-        ticket_key_from_context = str(jira_context.get("ticketKey") or "").strip()
-        if ticket_key_from_context:
-            return ticket_key_from_context
-
-    ticket_key_from_meta = str((metadata or {}).get("jiraTicketKey") or "").strip()
-    if ticket_key_from_meta:
-        return ticket_key_from_meta
-
-    ticket_match = re.search(r"\b([A-Z][A-Z0-9]+-\d{2,})\b", task_instruction or "")
-    return ticket_match.group(1) if ticket_match else ""
-
-
-def _resolve_jira_context_from_metadata(
-    task_instruction: str,
-    metadata: dict | None = None,
-) -> tuple[str, str]:
-    jira_context = (metadata or {}).get("jiraContext")
-    if not isinstance(jira_context, dict):
-        jira_context = {}
-    ticket_key = _resolve_ticket_key(task_instruction, metadata)
-    content = str(jira_context.get("content") or "").strip()
+    content = str(jira_ctx.get("content") or "").strip()
     return ticket_key, content
 
 
-def _list_remote_branches(
-    task_id: str,
-    repo_url: str,
-    workspace: str,
-    compass_task_id: str,
-    permissions: dict | None = None,
-) -> set[str]:
-    try:
-        result = _call_sync_agent(
-            "scm.branch.list",
-            f"List branches in {repo_url}",
-            task_id,
-            workspace,
-            compass_task_id,
-            permissions=permissions,
-        )
-    except Exception:
-        return set()
-
-    for art in result.get("artifacts", []):
-        text = artifact_text(art)
-        if not text:
-            continue
-        try:
-            branches = json.loads(text)
-        except Exception:
-            continue
-        if isinstance(branches, list):
-            return {
-                str(branch.get("name", "")).strip()
-                for branch in branches
-                if isinstance(branch, dict) and str(branch.get("name", "")).strip()
-            }
-    return set()
-
-
-def _select_branch_name(
-    task_instruction: str,
-    analysis: dict,
-    planned_paths: list[str],
-    ticket_key: str,
-    task_id: str,
-    repo_url: str,
-    clone_path: str,
-    workspace: str,
-    compass_task_id: str,
-    permissions: dict | None = None,
-) -> tuple[str, str]:
-    branch_kind = _classify_branch_kind(task_instruction, analysis, planned_paths, ticket_key)
-    workflow_task_id = _sanitize_branch_component(compass_task_id or task_id)
-    remote_branches = _list_remote_branches(
-        task_id,
-        repo_url,
-        workspace,
-        compass_task_id,
-        permissions=permissions,
-    )
-
-    if branch_kind == "chore":
-        branch_base = f"chore/{workflow_task_id}"
-    else:
-        branch_base = f"{branch_kind}/{_sanitize_branch_component(ticket_key)}_{workflow_task_id}"
-
-    for sequence in range(1, 100):
-        candidate = f"{branch_base}_{sequence}"
-        if candidate in remote_branches:
-            continue
-        if clone_path and _local_branch_exists(clone_path, candidate):
-            continue
-        return candidate, branch_kind
-
-    raise RuntimeError(f"Could not allocate a unique branch name for {branch_base}")
-
-
-def _collect_changed_repo_paths(repo_dir: str, planned_paths: list[str] | None = None) -> list[str]:
-    candidates: list[str] = []
-    for raw_path in planned_paths or []:
-        normalized = _normalize_plan_path(str(raw_path or ""))
-        if normalized:
-            candidates.append(normalized)
-
-    if os.path.isdir(os.path.join(repo_dir, ".git")):
-        ok, status_output = _run_local_git(repo_dir, ["status", "--porcelain"], check=False)
-        if ok and status_output.strip():
-            for line in status_output.splitlines():
-                if len(line) < 4:
-                    continue
-                rel_path = line[3:].strip()
-                if " -> " in rel_path:
-                    rel_path = rel_path.split(" -> ", 1)[1].strip()
-                rel_path = _normalize_plan_path(rel_path.strip('"'))
-                if rel_path:
-                    candidates.append(rel_path)
-
-    unique_paths: list[str] = []
-    seen: set[str] = set()
-    for rel_path in candidates:
-        if rel_path in seen:
-            continue
-        seen.add(rel_path)
-        unique_paths.append(rel_path)
-    return unique_paths
-
-
-def _collect_generated_files_from_directory(base_dir: str, planned_files: list[dict]) -> list[dict]:
-    planned_index = {
-        _normalize_plan_path(str(file_info.get("path", ""))): file_info
-        for file_info in planned_files or []
-        if _normalize_plan_path(str(file_info.get("path", "")))
-    }
-    generated_files: list[dict] = []
-    for rel_path in _collect_changed_repo_paths(base_dir, list(planned_index.keys())):
-        full_path = os.path.join(base_dir, rel_path)
-        if not os.path.isfile(full_path):
-            continue
-        try:
-            with open(full_path, encoding="utf-8", errors="replace") as fh:
-                content = fh.read()
-        except OSError:
-            continue
-        action = str((planned_index.get(rel_path) or {}).get("action") or "modify")
-        generated_files.append({"path": rel_path, "content": content, "action": action})
-    return generated_files
-
-
-# ---------------------------------------------------------------------------
-# Build / test execution with LLM-guided error recovery
-# ---------------------------------------------------------------------------
-
-MAX_BUILD_RETRIES = 3
-
-
-def _detect_build_command(
-    build_dir: str,
-    language: str,
-    python_executable: str | None = None,
-) -> list[str] | None:
-    """Return the command to run tests, or None if no test harness detected."""
-    python_cmd = python_executable or sys.executable
-    # Python: pytest or unittest
-    if language in ("python", "mixed") or any(
-        os.path.isfile(os.path.join(build_dir, f))
-        for f in ("requirements.txt", "pyproject.toml", "setup.py")
-    ):
-        if any(
-            fname.startswith("test_") or fname.endswith("_test.py")
-            for _, _, files in os.walk(build_dir)
-            for fname in files
-        ):
-            return [python_cmd, "-m", "pytest", "--tb=short", "-q", build_dir]
-        # Fall back to running the main module if present
-        for candidate in ("main.py", "app.py", "run.py"):
-            if os.path.isfile(os.path.join(build_dir, candidate)):
-                return [python_cmd, "-c",
-                        f"import ast, sys; ast.parse(open('{os.path.join(build_dir, candidate)}').read());"
-                        f"print('Syntax OK: {candidate}')"]
-    return None
-
-
-def _load_package_json(package_json_path: str) -> dict:
-    if not os.path.isfile(package_json_path):
-        return {}
-    try:
-        with open(package_json_path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _write_package_json(package_json_path: str, data: dict) -> bool:
-    try:
-        with open(package_json_path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
-            fh.write("\n")
-        return True
-    except OSError:
-        return False
-
-
-def _package_uses_jest(manifest: dict) -> bool:
-    scripts = manifest.get("scripts") if isinstance(manifest.get("scripts"), dict) else {}
-    for section_name in ("dependencies", "devDependencies"):
-        section = manifest.get(section_name)
-        if isinstance(section, dict) and "jest" in section:
-            return True
-    script_text = "\n".join(str(value) for value in scripts.values()).lower()
-    return "jest" in script_text
-
-
-def _output_suggests_vitest_jest_dom_issue(output: str) -> bool:
-    lower_output = output.lower()
-    if "vitest" not in lower_output:
-        return False
-    return (
-        "@testing-library/jest-dom" in output
-        and ("expect is not defined" in lower_output or "expect.extend" in output)
-    )
-
-
-def _auto_fix_vitest_jest_dom_setup(build_dir: str, log_fn) -> bool:
-    package_json_path = os.path.join(build_dir, "package.json")
-    manifest = _load_package_json(package_json_path)
-    if not manifest:
-        return False
-
-    scripts = manifest.get("scripts") if isinstance(manifest.get("scripts"), dict) else {}
-    dev_dependencies = manifest.get("devDependencies") if isinstance(manifest.get("devDependencies"), dict) else {}
-    if "vitest" not in "\n".join(str(value) for value in scripts.values()).lower() and "vitest" not in dev_dependencies:
-        return False
-
-    setup_rel_path = "./vitest.setup.js"
-    setup_abs_path = os.path.join(build_dir, "vitest.setup.js")
-    os.makedirs(os.path.dirname(setup_abs_path), exist_ok=True)
-    try:
-        with open(setup_abs_path, "w", encoding="utf-8") as fh:
-            fh.write("import '@testing-library/jest-dom/vitest';\n")
-    except OSError as err:
-        log_fn(f"Vitest jest-dom auto-fix failed to write setup file: {err}")
-        return False
-
-    vitest_config = manifest.get("vitest") if isinstance(manifest.get("vitest"), dict) else {}
-    setup_files = vitest_config.get("setupFiles")
-    if isinstance(setup_files, list):
-        if setup_rel_path not in setup_files:
-            vitest_config["setupFiles"] = [*setup_files, setup_rel_path]
-    elif isinstance(setup_files, str):
-        if setup_files != setup_rel_path:
-            vitest_config["setupFiles"] = [setup_files, setup_rel_path]
-    else:
-        vitest_config["setupFiles"] = setup_rel_path
-    if not vitest_config.get("environment"):
-        vitest_config["environment"] = "jsdom"
-    manifest["vitest"] = vitest_config
-    if not _write_package_json(package_json_path, manifest):
-        log_fn("Vitest jest-dom auto-fix failed to update package.json")
-        return False
-
-    updated_any_test = False
-    test_file_pattern = re.compile(r"\.(test|spec)\.[jt]sx?$")
-    cleanup_patterns = [
-        r"^\s*import ['\"]@testing-library/jest-dom(?:/extend-expect)?['\"];?\s*$",
-        r"^\s*import \* as matchers from ['\"]@testing-library/jest-dom/matchers['\"];?\s*$",
-        r"^\s*import matchers from ['\"]@testing-library/jest-dom/matchers['\"];?\s*$",
-        r"^\s*expect\.extend\(matchers\);?\s*$",
-        r"^\s*// Register jest-dom matchers with Vitest's expect\s*$",
-    ]
-    for root, dirs, files in os.walk(build_dir):
-        dirs[:] = [d for d in dirs if d != "node_modules"]
-        for fname in files:
-            if not test_file_pattern.search(fname):
-                continue
-            full_path = os.path.join(root, fname)
-            try:
-                with open(full_path, encoding="utf-8") as fh:
-                    content = fh.read()
-            except OSError:
-                continue
-            new_content = content
-            for pattern in cleanup_patterns:
-                new_content = re.sub(pattern, "", new_content, flags=re.MULTILINE)
-            new_content = re.sub(r"\n{3,}", "\n\n", new_content).rstrip() + "\n"
-            if new_content == content:
-                continue
-            try:
-                with open(full_path, "w", encoding="utf-8") as fh:
-                    fh.write(new_content)
-                updated_any_test = True
-            except OSError:
-                continue
-
-    log_fn("Applied Vitest + jest-dom auto-fix")
-    return updated_any_test or os.path.isfile(setup_abs_path)
-
-
-def _detect_node_build_steps(build_dir: str) -> list[dict]:
-    """Return npm test/build steps for root or client/server workspaces."""
-    steps: list[dict] = []
-
-    def _append_steps(manifest: dict, cwd: str, label: str, *, include_test: bool, include_build: bool) -> None:
-        scripts = manifest.get("scripts") if isinstance(manifest.get("scripts"), dict) else {}
-        if include_test and "test" in scripts:
-            command = ["npm", "test"]
-            if _package_uses_jest(manifest):
-                command.extend(["--", "--runInBand", "--coverage"])
-            steps.append({"cwd": cwd, "cmd": command, "label": f"{label}:test"})
-        if include_build and "build" in scripts:
-            steps.append({"cwd": cwd, "cmd": ["npm", "run", "build"], "label": f"{label}:build"})
-
-    root_manifest = _load_package_json(os.path.join(build_dir, "package.json"))
-    root_scripts = root_manifest.get("scripts") if isinstance(root_manifest.get("scripts"), dict) else {}
-    root_has_test = "test" in root_scripts
-    root_has_build = "build" in root_scripts
-    if root_manifest:
-        _append_steps(
-            root_manifest,
-            build_dir,
-            "root",
-            include_test=True,
-            include_build=True,
-        )
-
-    for rel_dir in ("client", "server"):
-        manifest = _load_package_json(os.path.join(build_dir, rel_dir, "package.json"))
-        if not manifest:
-            continue
-        _append_steps(
-            manifest,
-            os.path.join(build_dir, rel_dir),
-            rel_dir,
-            include_test=not root_has_test,
-            include_build=not root_has_build,
-        )
-
-    return steps
-
-
-def _run_build(build_dir: str, language: str, python_executable: str | None = None) -> tuple[bool, str]:
-    """Run the build/test command in build_dir. Returns (success, output)."""
-    python_cmd = python_executable or sys.executable
-    node_steps = _detect_node_build_steps(build_dir)
-    if node_steps:
-        import shutil
-
-        if not shutil.which("npm"):
-            return False, "npm not found for Node.js build/test workflow."
-
-        outputs: list[str] = []
-        env = {**os.environ, "CI": "true"}
-        try:
-            for step in node_steps:
-                result = subprocess.run(
-                    step["cmd"],
-                    cwd=step["cwd"],
-                    capture_output=True,
-                    text=True,
-                    timeout=240,
-                    env=env,
-                )
-                step_output = (result.stdout + "\n" + result.stderr).strip()
-                rel_cwd = os.path.relpath(step["cwd"], build_dir)
-                display_cwd = "." if rel_cwd == "." else rel_cwd
-                outputs.append(f"$ {' '.join(step['cmd'])} ({display_cwd})\n{step_output}".strip())
-                if result.returncode != 0:
-                    return False, "\n\n".join(outputs)
-            return True, "\n\n".join(outputs)
-        except subprocess.TimeoutExpired:
-            return False, "Node.js build/test timed out after 240 seconds."
-        except Exception as exc:
-            return False, f"Could not run Node.js build/test workflow: {exc}"
-
-    cmd = _detect_build_command(build_dir, language, python_executable=python_cmd)
-    if cmd is None:
-        # No test harness — validate Python syntax of every .py file
-        errors = []
-        for root, _, files in os.walk(build_dir):
-            for fname in files:
-                if fname.endswith(".py"):
-                    fpath = os.path.join(root, fname)
-                    try:
-                        with open(fpath, encoding="utf-8") as fh:
-                            import ast as _ast
-                            _ast.parse(fh.read())
-                    except SyntaxError as exc:
-                        errors.append(f"{fpath}: {exc}")
-        if errors:
-            return False, "\n".join(errors)
-        return True, "Syntax check passed (no test harness found)."
-
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=build_dir,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        output = (result.stdout + "\n" + result.stderr).strip()
-        # Self-heal: if pytest is missing, install it and retry once
-        if result.returncode != 0 and "No module named pytest" in output:
-            print(f"[{AGENT_ID}] pytest missing — installing...")
-            subprocess.run(
-                [python_cmd, "-m", "pip", "install", "--quiet", "pytest"],
-                timeout=60,
-            )
-            result = subprocess.run(
-                cmd,
-                cwd=build_dir,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            output = (result.stdout + "\n" + result.stderr).strip()
-        return result.returncode == 0, output
-    except subprocess.TimeoutExpired:
-        return False, "Build/test timed out after 120 seconds."
-    except Exception as exc:
-        return False, f"Could not run build command: {exc}"
-
-
-def _read_source_files(build_dir: str, max_files: int = 20) -> list[dict]:
-    """Read all source files from the build directory for LLM context."""
-    files = []
-    skip_dirs = {"__pycache__", ".pytest_cache", "node_modules", ".git", "venv", ".venv"}
-    source_exts = {".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".toml", ".cfg", ".ini", ".txt"}
-    for root, dirs, fnames in os.walk(build_dir):
-        dirs[:] = [d for d in dirs if d not in skip_dirs]
-        for fname in sorted(fnames):
-            if len(files) >= max_files:
-                break
-            _, ext = os.path.splitext(fname)
-            if ext not in source_exts:
-                continue
-            fpath = os.path.join(root, fname)
-            rel = os.path.relpath(fpath, build_dir)
-            try:
-                with open(fpath, encoding="utf-8", errors="replace") as fh:
-                    content = fh.read(4000)
-                files.append({"path": rel, "content": content})
-            except Exception:
-                pass
-    return files
-
-
-def _apply_llm_fixes(build_dir: str, fixes: list[dict]):
-    """Apply LLM-suggested file fixes to the build directory."""
-    for fix in fixes:
-        rel_path = fix.get("path", "").lstrip("/")
-        content = fix.get("content", "")
-        if not rel_path or not content:
-            continue
-        full_path = os.path.join(build_dir, rel_path)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        try:
-            with open(full_path, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            print(f"[{AGENT_ID}] Applied fix to {rel_path}")
-        except Exception as err:
-            print(f"[{AGENT_ID}] Could not apply fix to {rel_path}: {err}")
-
-
-def _fixes_touch_node_manifests(fixes: list[dict]) -> bool:
-    manifest_names = {"package.json", "package-lock.json", "npm-shrinkwrap.json"}
-    for fix in fixes:
-        rel_path = str(fix.get("path", "") or "").strip().lstrip("/")
-        if rel_path and os.path.basename(rel_path) in manifest_names:
-            return True
-    return False
-
-
-def _build_and_test_with_recovery(
-    build_dir: str,
-    task_instruction: str,
-    language: str,
-    log_fn,
-) -> tuple[bool, str, list[dict]]:
-    """
-    Run build/tests in build_dir with up to MAX_BUILD_RETRIES LLM-guided fix cycles.
-    Returns (passed, final_output).
-    """
-    attempts: list[dict] = []
-    output = ""
-    python_executable = _ensure_local_python_env(build_dir, language, log_fn)
-    auto_installed_deps: set[str] = set()
-    vitest_jest_dom_fixed = False
-    for attempt in range(1, MAX_BUILD_RETRIES + 1):
-        log_fn(f"Build/test attempt {attempt}/{MAX_BUILD_RETRIES}")
-        success, output = _run_build(build_dir, language, python_executable=python_executable)
-        attempts.append(
-            {
-                "attempt": attempt,
-                "success": success,
-                "output": output[:4000],
-            }
-        )
-        if success:
-            log_fn(f"Build/test passed on attempt {attempt}")
-            return True, output, attempts
-
-        log_fn(f"Build/test failed (attempt {attempt}): {output[:200]}")
-        if attempt == MAX_BUILD_RETRIES:
-            break
-
-        missing_dep = _extract_missing_node_dependency(output)
-        if missing_dep and missing_dep not in auto_installed_deps:
-            auto_installed_deps.add(missing_dep)
-            if _install_missing_node_dependency(build_dir, missing_dep, log_fn):
-                continue
-
-        if not vitest_jest_dom_fixed and _output_suggests_vitest_jest_dom_issue(output):
-            if _auto_fix_vitest_jest_dom_setup(build_dir, log_fn):
-                vitest_jest_dom_fixed = True
-                continue
-
-        # Ask LLM to diagnose and fix
-        source_files = _read_source_files(build_dir)
-        fix_prompt = prompts.BUILD_FIX_TEMPLATE.format(
-            failure_output=output[:3000],
-            source_files_json=json.dumps(source_files, ensure_ascii=False, indent=2)[:6000],
-            task_instruction=task_instruction[:1000],
-        )
-        fix_response = _run_agentic(
-            fix_prompt,
-            f"[{AGENT_ID}] build-fix-attempt-{attempt}",
-            system_prompt=_build_web_system_prompt(prompts.BUILD_FIX_SYSTEM),
-            timeout=180,
-            max_tokens=8192,
-        )
-        fix_data = _parse_json_from_llm(fix_response)
-        diagnosis = fix_data.get("diagnosis", "unknown")
-        fixes = fix_data.get("fixes") or []
-        log_fn(f"LLM diagnosis: {diagnosis} — {len(fixes)} fix(es) to apply")
-
-        if not fixes:
-            log_fn("LLM produced no fixes — stopping retry loop")
-            break
-
-        _apply_llm_fixes(build_dir, fixes)
-        if _fixes_touch_node_manifests(fixes):
-            _install_written_node_dependencies(build_dir, log_fn)
-
-    final_missing_dep = _extract_missing_node_dependency(output)
-    if final_missing_dep and final_missing_dep not in auto_installed_deps:
-        auto_installed_deps.add(final_missing_dep)
-        if _install_missing_node_dependency(build_dir, final_missing_dep, log_fn):
-            log_fn(f"Build/test final retry after auto-installing {final_missing_dep}")
-            success, output = _run_build(build_dir, language, python_executable=python_executable)
-            attempts.append(
-                {
-                    "attempt": MAX_BUILD_RETRIES + 1,
-                    "success": success,
-                    "output": output[:4000],
-                }
-            )
-            if success:
-                log_fn(f"Build/test passed after final auto-install of {final_missing_dep}")
-                return True, output, attempts
-
-    return False, output, attempts
-
-
-# ---------------------------------------------------------------------------
-# .gitignore generation
-# ---------------------------------------------------------------------------
-
-def _generate_gitignore_content(analysis: dict) -> str:
-    """Generate a .gitignore appropriate for the project's tech stack."""
-    backend = str(analysis.get("backend_framework", "")).lower()
-    frontend = str(analysis.get("frontend_framework", "")).lower()
-    language = str(analysis.get("language", "")).lower()
-
-    lines = []
-    if language == "python" or backend in ("flask", "django", "fastapi"):
-        lines += [
-            "# Python",
-            "__pycache__/",
-            "*.py[cod]",
-            "*$py.class",
-            "*.so",
-            "venv/",
-            ".venv/",
-            "env/",
-            "ENV/",
-            "*.egg",
-            "*.egg-info/",
-            "dist/",
-            "build/",
-            ".eggs/",
-            "",
-            "# Testing",
-            ".pytest_cache/",
-            ".coverage",
-            "htmlcov/",
-            "*.log",
-            "",
-            "# Environment",
-            ".env",
-            ".env.local",
-        ]
-    if frontend not in ("none", "") or language in ("javascript", "typescript"):
-        lines += [
-            "",
-            "# Node.js",
-            "node_modules/",
-            ".npm",
-            "npm-debug.log*",
-            "yarn-error.log*",
-            "",
-            "# Build output",
-            ".next/",
-            "out/",
-        ]
-    lines += [
-        "",
-        "# IDE",
-        ".idea/",
-        ".vscode/",
-        "*.swp",
-        "*.swo",
-        "",
-        "# OS",
-        ".DS_Store",
-        "Thumbs.db",
-    ]
-    return "\n".join(lines) + "\n"
-
-
-# ---------------------------------------------------------------------------
-# UI evidence: design reference download + implementation screenshot
-# ---------------------------------------------------------------------------
-
-def _find_chromium_binary() -> str:
-    import shutil
-
-    return (
-        shutil.which("chromium")
-        or shutil.which("chromium-browser")
-        or shutil.which("google-chrome")
-        or shutil.which("google-chrome-stable")
-        or ""
-    )
-
-
-def _capture_browser_screenshot(url: str, out_path: str, log_fn) -> bool:
-    chromium_bin = _find_chromium_binary()
-    if not chromium_bin:
-        log_fn("chromium not found — skipping browser screenshot")
-        return False
-    try:
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        result = subprocess.run(
-            [
-                chromium_bin,
-                "--headless",
-                "--no-sandbox",
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-                "--hide-scrollbars",
-                "--virtual-time-budget=5000",
-                f"--screenshot={out_path}",
-                "--window-size=1440,1024",
-                url,
-            ],
-            timeout=45,
-            capture_output=True,
-        )
-        if result.returncode == 0 and os.path.isfile(out_path):
-            return True
-        stderr_text = (result.stderr or b"").decode(errors="replace")[:200]
-        log_fn(f"Browser screenshot failed: {stderr_text or 'unknown error'}")
-        return False
-    except Exception as exc:
-        log_fn(f"Browser screenshot error: {exc}")
-        return False
-
-
-def _get_design_reference_details(workspace: str) -> dict:
-    """Return best-effort design reference inputs for screenshot capture."""
-    details = {"thumbnail_url": "", "design_url": "", "local_design_ref": ""}
-    if not workspace:
-        return details
-
-    # Priority: local reference screenshot saved by UI Design Agent
-    local_ref = os.path.join(workspace, "ui-design", "design-reference.png")
-    if os.path.isfile(local_ref):
-        details["local_design_ref"] = local_ref
-
-    design_context = _read_workspace_json(workspace, "team-lead/design-context.json")
-    if design_context.get("url"):
-        details["design_url"] = str(design_context.get("url", ""))
-
-    stitch_path = os.path.join(workspace, "ui-design", "stitch-design.json")
-    if not os.path.isfile(stitch_path):
-        return details
-    try:
-        with open(stitch_path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        # Only use imageUrls when this JSON came from a get_screen call (has screenId).
-        # Project-level stitch data does NOT have screenId; its thumbnailScreenshot is the
-        # project thumbnail (which may show a different screen — e.g. Practice Quiz instead
-        # of Landing Page). Never use project-level thumbnails as design reference images.
-        if data.get("screenId"):
-            image_urls = data.get("imageUrls") or []
-            if image_urls and image_urls[0]:
-                details["thumbnail_url"] = image_urls[0]
-    except Exception:
-        pass
-    return details
-
-
-def _download_url_to_file(url: str, dest_path: str) -> bool:
-    """Download a URL to a local file. Returns True on success."""
-    try:
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urlopen(req, timeout=15) as resp:
-            data = resp.read()
-        with open(dest_path, "wb") as fh:
-            fh.write(data)
-        return os.path.getsize(dest_path) > 0
-    except Exception as exc:
-        print(f"[{AGENT_ID}] download failed ({url[:60]}): {exc}")
-        return False
-
-
-def _detect_ui_launch_plan(build_dir: str, analysis: dict, port: int) -> dict | None:
-    """Return a best-effort local launch plan for taking UI screenshots."""
-    frontend = str((analysis or {}).get("frontend_framework", "") or "").strip().lower()
-    client_pkg_path = os.path.join(build_dir, "client", "package.json")
-    root_pkg_path = os.path.join(build_dir, "package.json")
-    candidate_specs = [
-        ("client", _load_package_json(client_pkg_path), os.path.join(build_dir, "client")),
-        ("root", _load_package_json(root_pkg_path), build_dir),
-    ]
-
-    def _candidate_urls(*ports: int) -> list[str]:
-        urls: list[str] = []
-        seen: set[str] = set()
-        for item_port in ports:
-            for suffix in ("/", "/proj-4"):
-                url = f"http://127.0.0.1:{item_port}{suffix}"
-                if url not in seen:
-                    seen.add(url)
-                    urls.append(url)
-        return urls
-
-    for label, manifest, cwd in candidate_specs:
-        scripts = manifest.get("scripts") if isinstance(manifest.get("scripts"), dict) else {}
-        if not scripts:
-            continue
-        if "preview" in scripts:
-            return {
-                "label": f"{label}:preview",
-                "cwd": cwd,
-                "cmd": ["npm", "run", "preview", "--", "--host", "127.0.0.1", "--port", str(port)],
-                "urls": _candidate_urls(port),
-            }
-        if "dev" in scripts:
-            return {
-                "label": f"{label}:dev",
-                "cwd": cwd,
-                "cmd": ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", str(port)],
-                "urls": _candidate_urls(port, 5173, 3000, 4173),
-            }
-        if "start" in scripts:
-            return {
-                "label": f"{label}:start",
-                "cwd": cwd,
-                "cmd": ["npm", "start"],
-                "urls": _candidate_urls(port, 5173, 3000, 4173),
-            }
-
-    if frontend in {"react", "vue", "nextjs"} and (
-        os.path.isfile(client_pkg_path) or os.path.isfile(root_pkg_path)
-    ):
-        return {
-            "label": "fallback:node-ui",
-            "cwd": build_dir,
-            "cmd": ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", str(port)],
-            "urls": _candidate_urls(port, 5173, 3000, 4173),
-        }
-    return None
-
-
-def _register_generated_artifact(
-    clone_path: str,
-    generated_files: list[dict],
-    source_path: str,
-    repo_rel_path: str,
-    log_fn,
-) -> bool:
-    """Copy a generated artifact into the repo and register it for commit/PR evidence."""
-    import shutil
-
-    if not clone_path or not source_path or not os.path.isfile(source_path):
-        return False
-
-    normalized_rel_path = _normalize_plan_path(repo_rel_path)
-    if not normalized_rel_path:
-        return False
-
-    dest_path = os.path.join(clone_path, normalized_rel_path)
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    if os.path.abspath(source_path) != os.path.abspath(dest_path):
-        shutil.copy2(source_path, dest_path)
-    if not any(_normalize_plan_path(item.get("path", "")) == normalized_rel_path for item in generated_files):
-        generated_files.append({"path": normalized_rel_path, "content": "", "action": "create"})
-    log_fn(f"Registered artifact in repo: {normalized_rel_path}")
-    return True
-
-
-def _register_runtime_repo_artifacts(
-    clone_path: str,
-    generated_files: list[dict],
-    rel_dirs: list[str],
-    log_fn,
-) -> int:
-    """Register runtime-generated files that already exist inside the cloned repo."""
-    if not clone_path:
-        return 0
-
-    registered = 0
-    for rel_dir in rel_dirs:
-        normalized_rel_dir = _normalize_plan_path(rel_dir)
-        if not normalized_rel_dir:
-            continue
-        artifact_dir = os.path.join(clone_path, normalized_rel_dir)
-        if not os.path.isdir(artifact_dir):
-            continue
-
-        for root, _, files in os.walk(artifact_dir):
-            for file_name in files:
-                source_path = os.path.join(root, file_name)
-                repo_rel_path = os.path.relpath(source_path, clone_path)
-                if _register_generated_artifact(
-                    clone_path,
-                    generated_files,
-                    source_path,
-                    repo_rel_path,
-                    log_fn,
-                ):
-                    registered += 1
-    return registered
-
-
-def _take_ui_screenshot(
-    build_dir: str,
-    python_executable: str,
-    out_path: str,
-    log_fn,
-    analysis: dict | None = None,
-    viewport: tuple = (1280, 900),
-) -> bool:
-    """
-    Start the local UI app on a free port and take a headless chromium screenshot.
-    Returns True if a screenshot was successfully saved to out_path.
-    """
-    import shutil
-    import socket
-    import time
-
-    chromium_bin = _find_chromium_binary()
-    if not chromium_bin:
-        log_fn("chromium not found — skipping UI screenshot")
-        return False
-
-    # Find a free port
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-
-    launch_plan = _detect_ui_launch_plan(build_dir, analysis or {}, port)
-    if launch_plan:
-        env = {
-            **os.environ,
-            "CI": "true",
-            "HOST": "127.0.0.1",
-            "PORT": str(port),
-            "BROWSER": "none",
-        }
-        proc = None
-        try:
-            proc = subprocess.Popen(
-                launch_plan["cmd"],
-                cwd=launch_plan["cwd"],
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
-            started_url = ""
-            for _ in range(40):
-                time.sleep(0.5)
-                if proc.poll() is not None:
-                    break
-                for url in launch_plan.get("urls", []):
-                    try:
-                        urlopen(url, timeout=2).read()
-                        started_url = url
-                        break
-                    except Exception:
-                        continue
-                if started_url:
-                    break
-
-            if not started_url:
-                log_fn(
-                    f"UI app did not start for screenshot plan {launch_plan.get('label')} — skipping screenshot"
-                )
-                return False
-
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            _w, _h = viewport
-            result = subprocess.run(
-                [
-                    chromium_bin,
-                    "--headless", "--no-sandbox", "--disable-gpu",
-                    "--disable-dev-shm-usage",
-                    f"--screenshot={out_path}",
-                    f"--window-size={_w},{_h}",
-                    started_url,
-                ],
-                timeout=30,
-                capture_output=True,
-            )
-            if result.returncode == 0 and os.path.isfile(out_path):
-                log_fn(f"Implementation screenshot saved ({os.path.getsize(out_path) // 1024} KB)")
-                return True
-            stderr_text = (result.stderr or b"").decode(errors="replace")[:200]
-            log_fn(f"Screenshot failed: {stderr_text or 'unknown error'}")
-            return False
-        except Exception as exc:
-            log_fn(f"Screenshot error: {exc}")
-            return False
-        finally:
-            if proc is not None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    proc.kill()
-
-    # Auto-detect Flask app module for FLASK_APP env var
-    flask_app_module = "app"
-    for candidate_file, candidate_mod in [
-        ("app/__init__.py", "app"),
-        ("app.py", "app"),
-        ("wsgi.py", "wsgi"),
-    ]:
-        fp = os.path.join(build_dir, candidate_file)
-        if os.path.isfile(fp):
-            try:
-                with open(fp, encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-                if "create_app" in content:
-                    flask_app_module = f"{candidate_mod}:create_app()"
-                elif "Flask(" in content:
-                    flask_app_module = candidate_mod
-                break
-            except Exception:
-                pass
-
-    env = {
-        **os.environ,
-        "FLASK_APP": flask_app_module,
-        "FLASK_ENV": "testing",
-        "FLASK_DEBUG": "0",
-        "PORT": str(port),
-    }
-    url = f"http://127.0.0.1:{port}/"
-
-    proc = None
-    try:
-        # Prefer `flask run` to avoid hard-coded ports in run.py
-        proc = subprocess.Popen(
-            [python_executable, "-m", "flask", "run",
-             "--host=127.0.0.1", f"--port={port}", "--no-debugger"],
-            cwd=build_dir,
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        # Wait up to 10 s for the app to respond
-        started = False
-        for _ in range(20):
-            time.sleep(0.5)
-            if proc.poll() is not None:
-                break
-            try:
-                urlopen(url, timeout=2).read()
-                started = True
-                break
-            except Exception:
-                pass
-
-        if not started:
-            log_fn(f"Flask app did not start on port {port} — skipping screenshot")
-            return False
-
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        _w, _h = viewport
-        result = subprocess.run(
-            [
-                chromium_bin,
-                "--headless", "--no-sandbox", "--disable-gpu",
-                "--disable-dev-shm-usage",
-                f"--screenshot={out_path}",
-                f"--window-size={_w},{_h}",
-                url,
-            ],
-            timeout=30,
-            capture_output=True,
-        )
-        if result.returncode == 0 and os.path.isfile(out_path):
-            log_fn(f"Implementation screenshot saved ({os.path.getsize(out_path) // 1024} KB)")
-            return True
-        stderr_text = (result.stderr or b"").decode(errors="replace")[:200]
-        log_fn(f"Screenshot failed: {stderr_text or 'unknown error'}")
-        return False
-    except Exception as exc:
-        log_fn(f"Screenshot error: {exc}")
-        return False
-    finally:
-        if proc is not None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
+def _prepend_tech_stack_constraints(task_instruction: str, constraints: dict) -> str:
+    if not constraints:
+        return task_instruction
+    lines = ["HARD TECH STACK CONSTRAINTS:"]
+    lang = constraints.get("language")
+    if lang == "python":
+        ver = constraints.get("python_version")
+        lines.append("- Use Python" + ((" " + ver) if ver else "") + ".")
+    if constraints.get("backend_framework"):
+        lines.append("- Use " + constraints["backend_framework"] + " for the backend/web server.")
+    if constraints.get("frontend_framework"):
+        lines.append("- Use " + constraints["frontend_framework"] + " for the frontend.")
+    lines.append("- Do not switch to React, Next.js, or Node.js unless the user explicitly overrides.")
+    if lang == "python":
+        lines.append("- If the target repo is empty or sparse, scaffold the required stack in-place.")
+    block = "\n".join(lines)
+    if block in task_instruction:
+        return task_instruction
+    return block + "\n\n" + task_instruction
 
 
 # ---------------------------------------------------------------------------
 # Main workflow
 # ---------------------------------------------------------------------------
 
-def _build_web_task_prompt(
-    *,
-    user_text: str,
-    workspace: str,
-    compass_task_id: str,
-    web_task_id: str,
-    callback_url: str,
-    acceptance_criteria: list,
-    is_revision: bool,
-    review_issues: list,
-    tech_stack_constraints: dict,
-    design_context: dict,
-    target_repo_url: str,
-    jira_context: str,
-    ticket_key: str,
-    permissions: dict | None,
-) -> str:
-    """Build the task prompt for the agentic runtime."""
-    criteria_text = "\n".join(f"- {c}" for c in acceptance_criteria) if acceptance_criteria else "Not specified."
-    issues_text = "\n".join(f"- {i}" for i in review_issues) if review_issues else ""
-    tech_text = json.dumps(tech_stack_constraints, ensure_ascii=False) if tech_stack_constraints else "None"
-    design_text = str(design_context.get("content") or "") if design_context else ""
-    design_url = str(design_context.get("url") or "") if design_context else ""
-
-    revision_section = ""
-    if is_revision and issues_text:
-        revision_section = f"""
-## REVISION REQUEST
-This is a revision. Fix the following issues from the previous implementation:
-{issues_text}
-"""
-
-    jira_section = ""
-    if ticket_key and jira_context:
-        jira_section = f"""
-## Jira Ticket Context ({ticket_key})
-{jira_context[:3000]}
-"""
-    elif ticket_key:
-        jira_section = f"\n## Jira Ticket\nKey: {ticket_key} (fetch additional context via jira_get_ticket)\n"
-
-    design_section = ""
-    if design_url or design_text:
-        design_section = f"""
-## Design Context
-URL: {design_url or '(see content below)'}
-{design_text[:2000] if design_text else ''}
-"""
-
-    return f"""You are the Web Agent. Implement the following web development task autonomously.
-
-## User Request
-{user_text}
-
-## Acceptance Criteria
-{criteria_text}
-
-## Tech Stack Constraints
-{tech_text}
-{jira_section}{design_section}{revision_section}
-## Your Workflow (follow this order)
-
-### 1. ANALYZE (use report_progress: "Analyzing task")
-- Identify frontend/backend framework, UI library, scope
-- Extract or use provided repo URL: {target_repo_url or '(detect from context)'}
-- If repo URL found: use bash to clone it into the shared workspace (under {workspace}/repo/)
-- Use todo_write to plan implementation steps
-- Use report_progress to announce progress
-
-### 2. GATHER CONTEXT (use report_progress: "Gathering context")
-- If Jira ticket key present ({ticket_key or 'none'}): use jira_get_ticket for ticket details
-- If design URL present: use design_fetch_figma_screen or design_fetch_stitch_screen
-- If repo cloned: use read_file/glob/grep to understand existing code structure
-- Capture repo snapshot for planning
-
-### 3. PLAN (use report_progress: "Planning implementation")
-- Create a detailed implementation plan
-- Use write_file to save plan to {workspace}/web-agent/plan.json
-- Identify all files to create/modify with their paths
-
-### 4. IMPLEMENT (use report_progress: "Implementing")
-- Work inside the cloned repo directory
-- Use write_file and edit_file to create/modify source files
-- Use bash to run builds/tests: validate your changes compile
-- For UI tasks: implement responsive layout matching design spec
-- Run local build/test validation before pushing:
-  - Use bash for `npm install && npm run build` or equivalent
-  - Fix any build errors before proceeding
-- Save implementation evidence to {workspace}/web-agent/
-
-### 5. PUSH & PR (use report_progress: "Creating PR")
-- Use scm_create_branch to create branch (name: feature/{ticket_key or 'task'}-{web_task_id[:8]})
-- Use scm_push_files to push implementation files
-- Use scm_create_pr to create a pull request with:
-  - Title: meaningful description of the change
-  - Description: implementation details + acceptance criteria coverage
-  - Link to Jira ticket if present
-- Save PR URL to {workspace}/web-agent/pr-evidence.json
-
-### 6. JIRA UPDATE (use report_progress: "Updating Jira")
-- If Jira ticket {ticket_key or '(none)'}: use jira_add_comment with PR link
-
-### 7. COMPLETE (use report_progress: "Completing task")
-- Use complete_current_task with:
-  - result: summary of implementation
-  - artifacts: include PR URL evidence with metadata fields:
-    - prUrl: the PR URL
-    - branch: the branch name
-    - jiraInReview: true (if Jira ticket updated)
-
-## Important Rules
-- Always work inside a cloned repo when a repo URL is available
-- Never push directly to main/master/develop/release/* branches
-- Run build validation before creating PR
-- Include PR URL in final artifacts metadata
-- sharedWorkspacePath: {workspace}
-- orchestratorTaskId: {compass_task_id}
-- webAgentTaskId: {web_task_id}
-"""
-
-
-def _run_workflow(task_id: str, message: dict):
+def _run_workflow(task_id: str, message: dict) -> None:
     """
-    Agentic Web Agent workflow driven by the LLM runtime.
-    The LLM uses tools (coding, scm, jira, design, progress, control) to:
-      analyze → gather → plan → implement → push/pr → update jira → complete
+    Agentic Web Agent workflow running in a background thread.
+
+    The agentic runtime (connect-agent, copilot-cli, or claude-code) drives all
+    workflow decisions via tools.  Python code only wires lifecycle callbacks,
+    builds the initial task prompt, and handles I/O with Team Lead / Compass.
     """
     task = task_store.get(task_id)
     if not task:
@@ -2452,136 +271,179 @@ def _run_workflow(task_id: str, message: dict):
     metadata = message.get("metadata", {})
     compass_task_id = metadata.get("orchestratorTaskId", "")
     callback_url = metadata.get("orchestratorCallbackUrl", "")
-    compass_url = resolve_orchestrator_base_url(metadata, agent_directory=agent_directory)
+    orchestrator_url = resolve_orchestrator_base_url(metadata, agent_directory=agent_directory)
     workspace = metadata.get("sharedWorkspacePath", "")
-    permissions = metadata.get("permissions") if isinstance(metadata.get("permissions"), dict) else None
-    acceptance_criteria: list = metadata.get("acceptanceCriteria") or []
-    is_revision: bool = metadata.get("isRevision", False)
-    review_issues: list = metadata.get("reviewIssues") or []
-    tech_stack_constraints: dict = metadata.get("techStackConstraints") or {}
-    design_context_meta: dict = metadata.get("designContext") or {}
-    target_repo_url: str = metadata.get("targetRepoUrl", "")
+    permissions = (
+        metadata.get("permissions")
+        if isinstance(metadata.get("permissions"), dict)
+        else None
+    )
+    acceptance_criteria = list(metadata.get("acceptanceCriteria") or [])
+    is_revision = bool(metadata.get("isRevision", False))
+    review_issues = list(metadata.get("reviewIssues") or [])
+    tech_stack_constraints = dict(metadata.get("techStackConstraints") or {})
+    design_context_meta = dict(metadata.get("designContext") or {})
+    target_repo_url = str(metadata.get("targetRepoUrl", ""))
     exit_rule = PerTaskExitHandler.parse(metadata)
 
-    user_text = _prepend_tech_stack_constraints(extract_text(message) or "", tech_stack_constraints)
-    ticket_key, jira_content = _resolve_jira_context_from_metadata(user_text, metadata)
-    if is_revision and review_issues:
-        issues_text = "\n".join(f"- {issue}" for issue in review_issues)
-        user_text = (
-            f"{user_text}\n\nREVISION REQUEST — please fix the following issues:\n{issues_text}"
-        )
-
-    configure_control_tools(
-        task_context={
-            "taskId": task_id,
-            "agentId": AGENT_ID,
-            "workspacePath": workspace,
-            "permissions": permissions,
-        },
-        complete_fn=lambda result, artifacts: task_store.update_state(
-            task_id, "TASK_STATE_COMPLETED", result
-        ),
-        fail_fn=lambda error: task_store.update_state(task_id, "TASK_STATE_FAILED", error),
-        input_required_fn=lambda question, ctx: task_store.update_state(
-            task_id, "TASK_STATE_INPUT_REQUIRED", question
-        ),
+    user_text = _prepend_tech_stack_constraints(
+        extract_text(message) or "", tech_stack_constraints
     )
+    if is_revision and review_issues:
+        issues_text = "\n".join("- " + issue for issue in review_issues)
+        user_text = user_text + "\n\nREVISION REQUEST -- please fix the following issues:\n" + issues_text
+
+    ticket_key, jira_content = _resolve_jira_context(user_text, metadata)
+
+    runtime_config = build_web_agent_runtime_config()
+    wait_for_input = _make_wait_for_user_input(task_id=task_id, callback_url=callback_url)
+    configure_web_agent_control_tools(
+        task_id=task_id,
+        agent_id=AGENT_ID,
+        workspace=workspace,
+        permissions=permissions,
+        compass_task_id=compass_task_id,
+        callback_url=callback_url,
+        orchestrator_url=orchestrator_url,
+        user_text=user_text,
+        wait_for_input_fn=wait_for_input,
+    )
+
+    def log(phase: str) -> None:
+        ts = local_clock_time()
+        entry = "[" + ts + "] " + phase
+        print("[" + AGENT_ID + "][" + task_id + "] " + phase)
+        _append_workspace_file(workspace, AGENT_ID + "/command-log.txt", entry + "\n")
 
     task_store.update_state(task_id, "TASK_STATE_WORKING", "Web Agent is starting.")
     audit_log("TASK_STARTED", task_id=task_id, compass_task_id=compass_task_id)
 
-    task_prompt = _build_web_task_prompt(
-        user_text=user_text,
-        workspace=workspace,
-        compass_task_id=compass_task_id,
-        web_task_id=task_id,
-        callback_url=callback_url,
-        acceptance_criteria=acceptance_criteria,
-        is_revision=is_revision,
-        review_issues=review_issues,
-        tech_stack_constraints=tech_stack_constraints,
-        design_context=design_context_meta,
-        target_repo_url=target_repo_url,
-        jira_context=jira_content,
-        ticket_key=ticket_key or "",
-        permissions=permissions,
-    )
+    try:
+        task_prompt = build_web_task_prompt(
+            user_text=user_text,
+            workspace=workspace,
+            compass_task_id=compass_task_id,
+            web_task_id=task_id,
+            acceptance_criteria=acceptance_criteria,
+            is_revision=is_revision,
+            review_issues=review_issues,
+            tech_stack_constraints=tech_stack_constraints,
+            design_context=design_context_meta,
+            target_repo_url=target_repo_url,
+            jira_context=jira_content,
+            ticket_key=ticket_key or "",
+            permissions=permissions,
+        )
+    except RuntimeError as err:
+        error_text = str(err)
+        print("[" + AGENT_ID + "][" + task_id + "] Prompt build failed: " + error_text)
+        task_store.update_state(task_id, "TASK_STATE_FAILED", error_text)
+        _notify_callback(callback_url, task_id, "TASK_STATE_FAILED", error_text)
+        _apply_task_exit_rule(task_id, exit_rule)
+        return
 
-    system_prompt = _build_web_system_prompt(prompts.AGENTIC_IMPLEMENT_SYSTEM)
+    system_prompt = build_system_prompt_from_manifest(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+    require_agentic_runtime("Web Agent")
     runtime = get_runtime()
+
+    log("Starting agentic workflow")
 
     try:
         result = runtime.run_agentic(
             task=task_prompt,
             system_prompt=system_prompt,
             cwd=workspace or os.getcwd(),
+            tools=WEB_AGENT_RUNTIME_TOOL_NAMES,
             max_turns=80,
-            timeout=int(os.environ.get("A2A_TASK_TIMEOUT_SECONDS", "1800")),
+            timeout=TASK_TIMEOUT,
         )
-        summary = result.summary or "Web Agent task completed."
-        final_artifacts: list = list(result.artifacts or [])
 
-        summary_artifact = {
-            "name": "web-agent-summary",
-            "artifactType": "text/plain",
-            "parts": [{"text": summary}],
-            "metadata": {
-                "agentId": AGENT_ID,
-                "capability": "web.task.execute",
-                "orchestratorTaskId": compass_task_id,
-                "taskId": task_id,
-            },
-        }
-        final_artifacts.insert(0, summary_artifact)
+        summary = result.summary or "Web Agent task completed."
+        final_artifacts = [
+            build_text_artifact(
+                "web-agent-summary",
+                summary,
+                metadata={
+                    "agentId": AGENT_ID,
+                    "capability": "web.task.execute",
+                    "orchestratorTaskId": compass_task_id,
+                    "taskId": task_id,
+                },
+            )
+        ]
+        if result.artifacts:
+            final_artifacts.extend(result.artifacts)
 
         if result.success:
             task_store.update_state(task_id, "TASK_STATE_COMPLETED", summary)
             task = task_store.get(task_id)
             if task:
                 task.artifacts = final_artifacts
+            log("Task completed successfully")
             audit_log("TASK_COMPLETED", task_id=task_id, compass_task_id=compass_task_id)
         else:
             task_store.update_state(task_id, "TASK_STATE_FAILED", summary)
             task = task_store.get(task_id)
             if task:
                 task.artifacts = final_artifacts
-            audit_log("TASK_FAILED", task_id=task_id, error=summary[:300])
+            log("Task failed: " + summary[:200])
+            audit_log(
+                "TASK_FAILED",
+                task_id=task_id,
+                compass_task_id=compass_task_id,
+                error=summary[:300],
+            )
+
+        _save_workspace_file(
+            workspace,
+            AGENT_ID + "/stage-summary.json",
+            json.dumps(
+                {
+                    "taskId": task_id,
+                    "agentId": AGENT_ID,
+                    "currentPhase": "COMPLETED" if result.success else "FAILED",
+                    "runtimeConfig": runtime_config,
+                    "turnsUsed": result.turns_used,
+                    "updatedAt": local_iso_timestamp(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
 
         _notify_callback(
-            callback_url, task_id,
+            callback_url,
+            task_id,
             "TASK_STATE_COMPLETED" if result.success else "TASK_STATE_FAILED",
-            summary, final_artifacts,
+            summary,
+            final_artifacts,
         )
 
     except Exception as err:
         error_text = str(err)
-        failure_artifacts: list = []
+        failure_artifacts = []
         if isinstance(err, PermissionEscalationRequired):
             failure_artifacts = [build_permission_denied_artifact(err.details, agent_id=AGENT_ID)]
-        print(f"[{AGENT_ID}][{task_id}] FAILED: {error_text}")
-        task_store.update_state(task_id, "TASK_STATE_FAILED", f"Web Agent failed: {error_text[:500]}")
+        print("[" + AGENT_ID + "][" + task_id + "] FAILED: " + error_text)
+        task_store.update_state(
+            task_id, "TASK_STATE_FAILED", "Web Agent failed: " + error_text[:500]
+        )
         task = task_store.get(task_id)
         if task:
             task.artifacts = failure_artifacts
         audit_log("TASK_FAILED", task_id=task_id, error=error_text[:300])
         _notify_callback(
-            callback_url, task_id, "TASK_STATE_FAILED",
-            f"Web Agent failed: {error_text[:500]}", failure_artifacts,
+            callback_url,
+            task_id,
+            "TASK_STATE_FAILED",
+            "Web Agent failed: " + error_text[:500],
+            failure_artifacts,
         )
+
     finally:
         _apply_task_exit_rule(task_id, exit_rule)
-
-
-    """Remove markdown code fences from LLM output."""
-    code = code.strip()
-    if code.startswith("```"):
-        lines = code.splitlines()
-        start = 1
-        end = len(lines)
-        while end > start and lines[end - 1].strip() in ("```", ""):
-            end -= 1
-        code = "\n".join(lines[start:end])
-    return code
 
 
 # ---------------------------------------------------------------------------
@@ -2591,7 +453,7 @@ def _run_workflow(task_id: str, message: dict):
 class WebAgentHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def _send_json(self, code: int, payload: dict):
+    def _send_json(self, code: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -2605,7 +467,7 @@ class WebAgentHandler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         path = urlparse(self.path).path
 
         if path == "/health":
@@ -2630,16 +492,32 @@ class WebAgentHandler(BaseHTTPRequestHandler):
 
         self._send_json(404, {"error": "not_found"})
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         path = urlparse(self.path).path
 
-        # POST /tasks/{id}/ack — parent confirms it received our callback
+        # ACK endpoint -- parent confirms it received the callback
         m_ack = re.fullmatch(r"/tasks/([^/]+)/ack", path)
         if m_ack:
             task_id = m_ack.group(1)
             acked = exit_handler.acknowledge(task_id)
-            print(f"[{AGENT_ID}] Received ACK for task {task_id} (registered={acked})")
+            print("[" + AGENT_ID + "] Received ACK for task " + task_id + " (registered=" + str(acked) + ")")
             self._send_json(200, {"ok": True, "task_id": task_id})
+            return
+
+        # Resume endpoint -- forwarded user reply for INPUT_REQUIRED tasks
+        m_resume = re.fullmatch(r"/tasks/([^/]+)/resume", path)
+        if m_resume:
+            task_id = m_resume.group(1)
+            body = self._read_body()
+            user_reply = str(body.get("reply") or body.get("message") or "").strip()
+            with _INPUT_EVENTS_LOCK:
+                entry = _INPUT_EVENTS.get(task_id)
+            if entry:
+                entry["info"] = user_reply
+                entry["event"].set()
+                self._send_json(200, {"ok": True, "task_id": task_id})
+            else:
+                self._send_json(404, {"error": "task_not_waiting_for_input"})
             return
 
         if path != "/message:send":
@@ -2651,6 +529,19 @@ class WebAgentHandler(BaseHTTPRequestHandler):
         if not message:
             self._send_json(400, {"error": "missing_message"})
             return
+
+        # Resume an INPUT_REQUIRED task when contextId is set
+        context_id = str((message.get("metadata") or {}).get("contextId") or "").strip()
+        if context_id:
+            user_reply = extract_text(message) or ""
+            with _INPUT_EVENTS_LOCK:
+                entry = _INPUT_EVENTS.get(context_id)
+            if entry:
+                entry["info"] = user_reply
+                entry["event"].set()
+                task = task_store.get(context_id)
+                self._send_json(200, {"task": task.to_dict() if task else {"id": context_id}})
+                return
 
         task = task_store.create()
         audit_log(
@@ -2668,36 +559,35 @@ class WebAgentHandler(BaseHTTPRequestHandler):
 
         self._send_json(200, {"task": task.to_dict()})
 
-    def log_message(self, fmt, *args):
+    def log_message(self, fmt, *args) -> None:
         line = args[0] if args else ""
         if any(p in line for p in ("/health", "/.well-known/agent-card.json")):
             return
-        print(
-            f"[{AGENT_ID}] {line} "
-            f"{args[1] if len(args) > 1 else ''} "
-            f"{args[2] if len(args) > 2 else ''}"
-        )
+        a1 = args[1] if len(args) > 1 else ""
+        a2 = args[2] if len(args) > 2 else ""
+        print("[" + AGENT_ID + "] " + line + " " + str(a1) + " " + str(a2))
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-_SERVER: ThreadingHTTPServer | None = None
+_SERVER = None
 
 
-def _schedule_shutdown(delay_seconds: int = 5):
-    def _do_shutdown():
+def _schedule_shutdown(delay_seconds: int = 5) -> None:
+    def _do_shutdown() -> None:
         time.sleep(delay_seconds)
-        print(f"[{AGENT_ID}] Per-task shutdown triggered")
+        print("[" + AGENT_ID + "] Per-task shutdown triggered")
         if _SERVER:
             _SERVER.shutdown()
 
     threading.Thread(target=_do_shutdown, daemon=True).start()
 
-def main():
+
+def main() -> None:
     global _SERVER
-    print(f"[{AGENT_ID}] Web Agent starting on {HOST}:{PORT}")
+    print("[" + AGENT_ID + "] Web Agent starting on " + HOST + ":" + str(PORT))
     agent_directory.start()
     _SERVER = ThreadingHTTPServer((HOST, PORT), WebAgentHandler)
     reporter.start()

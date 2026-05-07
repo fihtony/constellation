@@ -1,69 +1,72 @@
 # Office Agent Default Workflow
 
-## Phases
+## Overview
 
-### 1. Preflight
+The Office Agent workflow is **fully LLM-driven**. The agentic runtime (connect-agent, copilot-cli,
+or claude-code) decides every step based on available tools and the task prompt. Python code only
+handles the A2A protocol boundary, permission enforcement, and lifecycle bookkeeping.
 
-- Validate `requestedCapability` and `officeTargetPaths` from message metadata.
-- Verify all target paths are within the mounted input root.
-- Run directory-level resource scan (`_preflight_scan`): file count, total bytes, oversized files.
-- If limits are exceeded, return a preflight report artifact and stop.
+## Lifecycle
 
-**Exit criteria:** All paths valid, within limits.
+```
+POST /message:send
+  └─► _run_workflow() [background thread]
+        ├─► Permission check
+        ├─► configure_office_control_tools()   # wire lifecycle callbacks
+        ├─► build_system_prompt_from_manifest()
+        ├─► build_office_task_prompt()          # load office/prompts/tasks/process.md
+        └─► runtime.run_agentic()              # LLM takes over from here
+              ├─► list_local_dir / search_local_files
+              ├─► read_local_file / run_local_command
+              ├─► write_local_file / edit_local_file
+              ├─► report_progress (timeline updates)
+              └─► complete_current_task / fail_current_task
+```
 
-### 2. File Collection and Extraction
+## Phases (LLM-driven, not Python-hardcoded)
 
-- Walk target paths and collect supported files.
-- Skip oversized files with a warning.
-- For summarize: extract text preview from each document.
-- For analyze: build statistical profiles (CSV profile, workbook profile).
-- For organize: build inventory + extract text fragments from `.txt` files.
+### 1. Understand the Request
+The LLM reads the task prompt, identifies the capability (`summarize`, `analyze`, or `organize`),
+and determines what tools it needs. No Python branching — the LLM decides.
 
-**Exit criteria:** At least one readable file/profile collected.
+### 2. Explore Target Files
+The LLM uses `list_local_dir`, `search_local_files`, and `run_local_command` to enumerate the target
+paths and understand the file structure before reading anything.
 
-### 3. LLM Processing
+### 3. Process Files
+- **Summarize**: `read_local_file` for each document → produce `summary.md`
+- **Analyze**: `read_local_file` + `run_local_command` for data inspection → produce `analysis.md`
+- **Organize**: `list_local_dir` + `search_local_files` → write `organization-plan.json` → optionally execute with `run_local_command`
 
-- Send collected data to Agentic Runtime with capability-specific prompt.
-- For summarize/analyze: receive `summary_markdown` response.
-- For organize: receive structured `actions` plan.
-- Parse and validate LLM JSON response.
+### 4. Write Output
+The LLM writes results to `{workspace_path}/office-agent/` using `write_local_file`,
+or in-place for INPLACE output mode.
 
-**Exit criteria:** Valid structured response received.
+### 5. Complete
+The LLM calls `complete_current_task` with a text summary and artifact paths.
+Python then sends the A2A callback to Compass with the final state and artifacts.
 
-### 4. Plan Validation (Organize only)
+## Audit Files
 
-- Validate all actions against the whitelist (`mkdir`, `write_text`, `write_fragment`).
-- Canonicalize all destination paths (strip wrapper directories, enforce `files/` root).
-- Verify `write_fragment` references against the inventory.
-- Persist `operations-plan.json` to workspace BEFORE any writes.
+Each run produces these files under `{workspace_path}/office-agent/`:
 
-**Exit criteria:** All actions pass validation; plan persisted.
-
-### 5. Execution
-
-- For summarize/analyze: write Markdown report to output location.
-- For organize: execute actions sequentially; update manifest after each step.
-- Apply conflict-avoidance (timestamp suffix) for existing files.
-- For in-place mode: append per-step progress to `command-log.txt`.
-
-**Exit criteria:** All actions executed or failed gracefully.
-
-### 6. Completion
-
-- Write `warnings.md` if any warnings accumulated.
-- Update `stage-summary.json` with final phase and runtime config.
-- Notify Compass via callback URL with final state and artifacts.
-
-**Exit criteria:** Callback sent, task state set to COMPLETED or FAILED.
+| File | Purpose |
+|------|---------|
+| `command-log.txt` | Timestamped log of major workflow milestones |
+| `stage-summary.json` | Final task state, runtime config, turns used |
+| `summary.md` / `analysis.md` / `organization-report.md` | Primary output |
+| `organization-plan.json` | Organize plan (organize tasks only) |
+| `failure.txt` | Error details (failed tasks only) |
 
 ## Error Handling
 
-- If any phase fails, task transitions to `TASK_STATE_FAILED`.
-- Partial success in folder tasks: completed files produce output, failed files logged in `warnings.md`.
-- Disk space or write errors during organize: stop further writes, preserve manifest for recovery.
-- Runtime timeout: stop processing, return error summary with partial results if available.
+- Permission denied for a target path → task fails immediately with a permission error artifact.
+- Unreadable file during processing → logged as warning, processing continues for other files.
+- Runtime timeout → task fails with partial results in the summary artifact.
+- All failures notify Compass via callback with `TASK_STATE_FAILED`.
 
-## Return Work Limits
+## Rework Policy
 
-Office Agent does not have a review/rework cycle. Each task is single-pass.
+The Office Agent does not have a review/rework cycle. Each task is single-pass.
 If the result is unsatisfactory, the user submits a new task with refined instructions.
+

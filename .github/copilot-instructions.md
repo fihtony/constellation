@@ -726,11 +726,13 @@ Before submitting a new agent, verify:
 | UI Design client (Figma) | `ui-design/figma_client.py` | Agent-local, NOT in `common/` |
 | UI Design client (Stitch) | `ui-design/stitch_client.py` | Agent-local, NOT in `common/` |
 | Compass Agent (control plane) | `compass/app.py` |
+| Compass office routing helpers | `common/compass_office_routing.py` | Path validation and Docker bind-mount helpers for office tasks (state machine removed; LLM uses `validate_office_paths` control tool instead) |
+| Compass completeness gate helpers | `common/compass_completeness.py` | PR evidence extraction, completeness checks, follow-up message builder, task card status derivation |
 | Runtime adapter factory | `common/runtime/adapter.py` | Unified runtime contract + backend factory |
 | Shared runtime env template | `common/.env.example` | Shared default runtime/timezone config loaded before agent-local `.env` |
 | Local time helpers | `common/time_utils.py` | Shared local timestamp helpers for workspace and audit logs |
 | Workspace/debug log helpers | `common/devlog.py` | Shared debug log + workspace stage logging helpers |
-| Copilot CLI backend | `common/runtime/copilot_cli.py` | Primary agentic CLI backend |
+| Copilot CLI backend | `common/runtime/copilot_cli.py` | Primary agentic CLI backend (supports `run_agentic()` via ReAct text loop) |
 | Claude Code backend | `common/runtime/claude_code.py` | Optional compatible backend |
 | Copilot Connect transport wrapper | `common/runtime/copilot_connect.py` | Single-shot compatibility wrapper over the LLM transport used by `connect-agent`; not a selectable runtime backend |
 | Capability Registry | `registry/app.py` |
@@ -767,6 +769,7 @@ Before submitting a new agent, verify:
 - Web Agent branches should use deterministic naming based on Jira key plus orchestrator task id when available; only docs/tests-only changes may use `chore/...` naming without a ticket key.
 - Team Lead review for repo-backed tasks must require clone/branch/PR evidence and should post audit-ready rejection comments to Jira when a delivery is rejected.
 - Boundary agents (Jira, SCM, UI Design, future Jenkins/Stitch-style integrations) must be discovered through Registry capabilities at runtime; do not hardcode their service URLs inside Team Lead or execution agents.
+- Common boundary-tool wrappers must send the standard A2A `message:send` envelope (`message` at the top level plus `configuration.returnImmediately`) and, when the caller expects a synchronous result, poll `/tasks/{id}` until a terminal state before returning. Do not introduce new JSON-RPC-style wrapper envelopes for agent-to-agent tooling.
 - Compass now attaches a task permission snapshot in `message.metadata.permissions` for routed task work. Boundary agents must enforce that snapshot themselves instead of trusting upstream prompt discipline. All agent-to-agent calls must carry permissions through A2A `message.metadata.permissions`; execution agents and Team Lead must not fall back to direct HTTP headers/body fields when calling boundary agents. Direct HTTP convenience endpoints, if retained, are for operator/manual or test-only access paths and must not be the normal inter-agent transport.
 - Development-task SCM protected branches are defined centrally by `common/permissions/development.json > scopeConfig.scm.protectedBranchPatterns` as full regex matches. Default protected branches are `main`, `master`, `develop`, and `release/*`; any other branch name is treated as a development branch unless policy overrides it.
 - The permission system is pre-release and fail-closed by default. In `PERMISSION_ENFORCEMENT=strict`, missing or malformed permission snapshots must reject both read and write boundary operations; do not add compatibility fallbacks that weaken enforcement.
