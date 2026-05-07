@@ -126,7 +126,12 @@ class LaunchPerTaskAgentTool(ConstellationTool):
             )
             with urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            agents = data.get("agents") or []
+            if isinstance(data, list):
+                agents = data
+            elif isinstance(data, dict):
+                agents = data.get("agents") or data.get("items") or []
+            else:
+                agents = []
             if agents:
                 return agents[0]
             return None
@@ -144,7 +149,12 @@ class LaunchPerTaskAgentTool(ConstellationTool):
                 )
                 with urlopen(req, timeout=5) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
-                instances = data.get("instances") or []
+                if isinstance(data, list):
+                    instances = data
+                elif isinstance(data, dict):
+                    instances = data.get("instances") or data.get("items") or []
+                else:
+                    instances = []
                 for inst in instances:
                     if inst.get("status") == "idle":
                         return inst

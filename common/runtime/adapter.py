@@ -85,6 +85,7 @@ class AgentRuntimeAdapter(ABC):
         *,
         system_prompt: str | None = None,
         cwd: str | None = None,
+        extra_allow_roots: list[str] | None = None,
         tools: list[str] | None = None,
         mcp_servers: dict | None = None,
         allowed_tools: list[str] | None = None,
@@ -99,7 +100,7 @@ class AgentRuntimeAdapter(ABC):
         Default implementation raises NotImplementedError.  Backends that
         support agentic mode override this method.
         """
-        del task, system_prompt, cwd, tools, mcp_servers, allowed_tools, disallowed_tools
+        del task, system_prompt, cwd, extra_allow_roots, tools, mcp_servers, allowed_tools, disallowed_tools
         del max_turns, timeout, on_progress, continuation
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support run_agentic(). "

@@ -242,6 +242,7 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
         *,
         system_prompt: str | None = None,
         cwd: str | None = None,
+        extra_allow_roots: list[str] | None = None,
         tools: list[str] | None = None,
         mcp_servers: dict | None = None,
         allowed_tools: list[str] | None = None,
@@ -265,6 +266,7 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
           the caller's responsibility via max_turns / timeout).
         - MCP servers are not supported; the mcp_servers parameter is ignored.
         """
+        del extra_allow_roots
         # --- Pre-flight: verify binary and token are available ---
         token, _ = _resolve_token()
         binary = os.environ.get("COPILOT_CLI_BIN", "copilot").strip() or "copilot"

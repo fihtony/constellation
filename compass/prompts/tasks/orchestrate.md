@@ -25,8 +25,13 @@ Call `check_agent_status` with the chosen capability to verify the agent is avai
 
 If the task is an office task:
 1. Extract absolute file/folder paths from the user request.
+   - Do not use local filesystem tools such as `read_local_file`, `list_local_dir`, `search_local_files`,
+     `read_file`, `glob`, or `grep` to probe user-provided office target paths before launch.
+     Those paths may be valid host paths that are not directly visible inside the Compass runtime sandbox.
 2. Call `validate_office_paths` with the extracted paths and a suitable `output_mode`.
    - If validation fails or paths are missing, call `request_user_input` to ask the user.
+   - If `validate_office_paths` succeeds, do not ask the user to upload/copy the file merely because
+     Compass itself cannot open the path directly.
    - The tool returns `extraBinds` needed for `launch_per_task_agent`.
 3. Ask the user for output mode (`workspace` = safe read-only copy, `inplace` = edit in place)
    via `request_user_input` if not stated in the request.
@@ -75,6 +80,9 @@ Call `fail_current_task` with:
 - A user-friendly explanation of what failed
 - Any partial evidence collected
 - Suggested next steps for the user
+
+Never fail an office task only because Compass cannot directly read a host path like `/Users/...`.
+Use `validate_office_paths` first, then launch the Office Agent with the returned bind mounts.
 
 ---
 

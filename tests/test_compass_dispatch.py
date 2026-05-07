@@ -208,6 +208,8 @@ class CompassDispatchTests(unittest.TestCase):
         self.assertIn("request_user_input", template)
         self.assertIn("validate_office_paths", template)
         self.assertIn("check_agent_status", template)
+        self.assertIn("Do not use local filesystem tools", template)
+        self.assertIn("do not ask the user to upload/copy the file", template)
 
     def test_run_compass_workflow_does_not_accept_workflow_parameter(self):
         """run_compass_workflow() must not have workflow or route_system_prompt params."""

@@ -85,13 +85,28 @@ def _discover_capability_url(capability: str) -> str | None:
         )
         with urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        agents = data.get("agents") or []
+        if isinstance(data, list):
+            agents = data
+        elif isinstance(data, dict):
+            agents = data.get("agents") or data.get("items") or []
+        else:
+            agents = []
         for agent in agents:
             instances = agent.get("instances") or []
             for inst in instances:
-                url = inst.get("url") or agent.get("baseUrl")
+                url = (
+                    inst.get("url")
+                    or inst.get("serviceUrl")
+                    or inst.get("service_url")
+                    or agent.get("baseUrl")
+                    or agent.get("serviceUrl")
+                    or agent.get("service_url")
+                )
                 if url:
                     return url.rstrip("/")
+            card_url = str(agent.get("card_url") or agent.get("cardUrl") or "").strip()
+            if card_url.startswith("http://") or card_url.startswith("https://"):
+                return card_url.rsplit("/.well-known/agent-card.json", 1)[0].rstrip("/")
         return None
     except Exception:  # noqa: BLE001
         return None
