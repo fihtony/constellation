@@ -723,6 +723,7 @@ Before submitting a new agent, verify:
 | UI Design Agent | `ui-design/` | Figma REST API + Google Stitch MCP | port 8040 |
 | Office Agent | `office/` | Local office document execution agent | port 8060 |
 | Office prompts | `office/prompts.py` | ALL LLM prompt strings for Office Agent |
+| Office document tools | `office/tools/document_tools.py` | Agent-local document readers (read_pdf, read_docx, etc.), NOT in `common/` |
 | UI Design client (Figma) | `ui-design/figma_client.py` | Agent-local, NOT in `common/` |
 | UI Design client (Stitch) | `ui-design/stitch_client.py` | Agent-local, NOT in `common/` |
 | Compass Agent (control plane) | `compass/app.py` |
@@ -793,3 +794,7 @@ Before submitting a new agent, verify:
   - Compass ACKs Team Lead after the completeness gate passes (or max revisions reached).
 - Python virtual environments created by Web Agent are placed in `tempfile.gettempdir()/constellation-venv-{hash}`, NOT inside the cloned repo directory, to avoid Docker-path shebang issues when the workspace is accessed locally.
 - Use `LOCAL_TIMEZONE` (preferred) or `TZ` to keep workspace timestamps aligned with the operator's local time.
+- Agent-specific tools must live in the agent directory (e.g. `office/tools/document_tools.py`), NOT in `common/tools/`. Each agent loads its own tools before calling `runtime.run_agentic(tools=TOOL_NAMES)`. The runtime adapter does NOT hardcode domain tool imports — it only loads core shared tools (coding, planning, control, registry, validation). Domain tools (jira, scm, design, document readers) are loaded by the agent that needs them.
+- All LLM-enabled agents MUST use runtime-specific Dockerfiles (e.g. `Dockerfile.connect-agent`, `Dockerfile.copilot-cli`, `Dockerfile.claude-code`). Generic `Dockerfile` files are forbidden for agents that have runtime variants. Only infrastructure services without runtime variants (registry, im-gateway) may use a plain `Dockerfile`.
+- Compass routes office tasks via Registry capability lookup, not by hardcoding the Office Agent URL. The `dispatch_agent_task` tool discovers and launches per-task agents automatically through Registry + Launcher.
+- Office Agent completes a delivery review cycle with Compass: Compass validates output completeness via `aggregate_task_card`, may send revision comments back, and only ACKs the Office Agent after the delivery is accepted (or max revisions exhausted).

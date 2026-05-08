@@ -39,6 +39,7 @@ from common.task_permissions import (
 )
 from common.task_store import TaskStore
 from common.time_utils import local_clock_time, local_iso_timestamp
+from common.devlog import install_stdout_tee, write_initial_stage_summary
 from android.agentic_workflow import (
     ANDROID_AGENT_RUNTIME_TOOL_NAMES,
     build_android_agent_runtime_config,
@@ -167,6 +168,25 @@ def _notify_callback(
         print(f"[{AGENT_ID}] Callback failed: {err}")
 
 
+def _report_progress(orchestrator_url: str, compass_task_id: str, step: str) -> None:
+    """POST a progress step to the orchestrator (best-effort, non-critical)."""
+    if not orchestrator_url or not compass_task_id or not step:
+        return
+    payload = {"step": step, "agentId": AGENT_ID}
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        f"{orchestrator_url.rstrip('/')}/tasks/{compass_task_id}/progress",
+        data=data,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=5):
+            pass
+    except Exception as err:
+        print(f"[{AGENT_ID}] Progress report failed (non-critical): {err}")
+
+
 # ---------------------------------------------------------------------------
 # INPUT_REQUIRED pause / resume
 # ---------------------------------------------------------------------------
@@ -286,6 +306,17 @@ def _run_workflow(task_id: str, message: dict) -> None:
     ticket_key, jira_content = _resolve_jira_context_from_metadata(user_text, metadata)
 
     runtime_config = build_android_agent_runtime_config()
+
+    # --- Workspace init: create dir, write initial stage-summary, tee stdout ---
+    if workspace:
+        os.makedirs(os.path.join(workspace, AGENT_ID), exist_ok=True)
+        write_initial_stage_summary(
+            workspace, AGENT_ID, task_id, AGENT_ID,
+            runtimeConfig=runtime_config,
+        )
+        _log_path = os.path.join(workspace, AGENT_ID, "command-log.txt")
+        install_stdout_tee(_log_path)
+
     wait_for_input = _make_wait_for_user_input(task_id=task_id, callback_url=callback_url)
     configure_android_agent_control_tools(
         task_id=task_id,
@@ -301,9 +332,8 @@ def _run_workflow(task_id: str, message: dict) -> None:
 
     def log(phase: str) -> None:
         ts = local_clock_time()
-        entry = f"[{ts}] {phase}"
-        print(f"[{AGENT_ID}][{task_id}] {phase}")
-        _append_workspace_file(workspace, f"{AGENT_ID}/command-log.txt", entry + "\n")
+        print(f"[{ts}] [{AGENT_ID}] {phase}")  # tee captures this to command-log.txt
+        _report_progress(orchestrator_url, compass_task_id, phase)
 
     task_store.update_state(task_id, "TASK_STATE_WORKING", "Android Agent is starting.")
     audit_log("TASK_STARTED", task_id=task_id, compass_task_id=compass_task_id)

@@ -44,7 +44,7 @@ services:
     image: constellation-compass-agent:latest
     build:
       context: .
-      dockerfile: compass/Dockerfile
+      dockerfile: compass/Dockerfile.connect-agent
     command: ["python3", "compass/app.py"]
     depends_on:
       registry:
@@ -109,7 +109,7 @@ services:
       TZ: "${TZ:-UTC}"
     build:
       context: .
-      dockerfile: jira/Dockerfile
+      dockerfile: jira/Dockerfile.connect-agent
     image: constellation-jira-agent:latest
     labels:
       constellation.agent_id: "jira-agent"
@@ -130,7 +130,7 @@ services:
     image: constellation-scm-agent:latest
     build:
       context: .
-      dockerfile: scm/Dockerfile
+      dockerfile: scm/Dockerfile.connect-agent
     command: ["python3", "scm/app.py"]
     depends_on:
       registry:
@@ -166,7 +166,7 @@ services:
     image: constellation-ui-design-agent:latest
     build:
       context: .
-      dockerfile: ui-design/Dockerfile
+      dockerfile: ui-design/Dockerfile.connect-agent
     command: ["python3", "ui-design/app.py"]
     depends_on:
       registry:

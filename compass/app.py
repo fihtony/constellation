@@ -656,31 +656,30 @@ def _resume_input_required_task(body: dict, message: dict) -> dict | None:
 
     tl_task_id = prior_task.downstream_task_id or ""
     tl_service_url = prior_task.downstream_service_url or ""
+    requesting_agent_id = str(prior_task.router_context.get("inputRequestedBy") or "compass-agent")
 
     if tl_task_id and not tl_service_url:
         try:
-            # Discover the orchestrator agent dynamically via capability lookup
-            # so we never hardcode an agent ID here.
-            tl_agents = registry.find_by_capability("team-lead.task.analyze")
-            tl_agent_ids = [
-                a.get("agent_id") for a in (tl_agents or []) if a.get("agent_id")
-            ]
-            for tl_agent_id in tl_agent_ids:
-                for inst in registry.list_instances(tl_agent_id):
+            for agent in registry.find_any_active() or []:
+                agent_id = agent.get("agent_id")
+                if not agent_id:
+                    continue
+                for inst in registry.list_instances(agent_id):
                     if inst.get("current_task_id") == tl_task_id:
                         tl_service_url = inst.get("service_url", "")
-                        break
+                        if tl_service_url:
+                            break
                 if tl_service_url:
                     break
             if tl_service_url:
-                print(f"[compass] Recovered orchestrator service URL from registry: {tl_service_url}")
+                print(f"[compass] Recovered downstream service URL from registry: {tl_service_url}")
         except Exception as lookup_err:
-            print(f"[compass] Could not look up orchestrator service URL: {lookup_err}")
+            print(f"[compass] Could not look up downstream service URL: {lookup_err}")
 
     if tl_task_id and tl_service_url:
         print(
-            f"[compass] Forwarding user reply to Team Lead "
-            f"(tl_task={tl_task_id}, compass_task={context_id})"
+            f"[compass] Forwarding user reply to downstream agent "
+            f"(task={tl_task_id}, compass_task={context_id}, agent={requesting_agent_id})"
         )
         try:
             _a2a_call(tl_service_url, message, context_id=tl_task_id)
@@ -692,7 +691,7 @@ def _resume_input_required_task(body: dict, message: dict) -> dict | None:
             task_store.add_progress_step(
                 context_id,
                 "User provided additional information. Resuming task.",
-                agent_id="compass-agent",
+                agent_id=requesting_agent_id,
             )
             if getattr(prior_task, "workspace_path", ""):
                 record_workspace_stage(
@@ -701,7 +700,8 @@ def _resume_input_required_task(body: dict, message: dict) -> dict | None:
                     "Received user input and resumed task",
                     task_id=context_id,
                     extra={
-                        "teamLeadTaskId": tl_task_id,
+                        "downstreamTaskId": tl_task_id,
+                        "sourceAgent": requesting_agent_id,
                         "userText": extract_text(message)[:1000],
                         "runtimeConfig": _runtime_config_summary(),
                     },
@@ -709,7 +709,8 @@ def _resume_input_required_task(body: dict, message: dict) -> dict | None:
             audit_log(
                 "TASK_RESUMED",
                 task_id=context_id,
-                tl_task_id=tl_task_id,
+                downstream_task_id=tl_task_id,
+                agent_id=requesting_agent_id,
             )
         except Exception as err:
             print(f"[compass] Failed to forward resume to Team Lead: {err}")
@@ -913,7 +914,22 @@ class CompassHandler(BaseHTTPRequestHandler):
                 "status_message": body.get("statusMessage", ""),
                 "artifacts": body.get("artifacts") or [],
                 "agent_id": body.get("agentId", ""),
+                "service_url": body.get("serviceUrl", ""),
             }
+            task = task_store.get(task_id)
+            if task:
+                task.downstream_task_id = downstream_task_id
+                if payload["service_url"]:
+                    task.downstream_service_url = payload["service_url"]
+                if payload["agent_id"]:
+                    task.router_context = dict(getattr(task, "router_context", {}) or {})
+                    task.router_context["inputRequestedBy"] = payload["agent_id"]
+                if payload["state"] == "TASK_STATE_INPUT_REQUIRED":
+                    task_store.update_state(task_id, "TASK_STATE_INPUT_REQUIRED", payload["status_message"])
+                    if payload["status_message"]:
+                        task_store.add_progress_step(task_id, payload["status_message"], agent_id=payload["agent_id"])
+                elif payload["state"] in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED"} and payload["status_message"]:
+                    task_store.add_progress_step(task_id, payload["status_message"], agent_id=payload["agent_id"])
             audit_log(
                 "TASK_CALLBACK_RECEIVED",
                 task_id=task_id,

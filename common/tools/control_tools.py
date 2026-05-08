@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import threading
 from typing import Any, Callable
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from common.task_permissions import load_permission_grant
 from common.tools.base import ConstellationTool, ToolSchema
 from common.tools.registry import register_tool
 
@@ -112,6 +114,227 @@ def _discover_capability_url(capability: str) -> str | None:
         return None
 
 
+def _discover_live_instance_url(capability: str) -> str | None:
+    """Discover a URL of a live, registered instance for the given capability.
+
+    Unlike _discover_capability_url, this function does NOT fall back to the
+    agent card_url base when no running instances are registered.  Returns None
+    when the capability exists but no instance is currently alive.
+    """
+    try:
+        req = Request(
+            f"{_REGISTRY_URL}/query?capability={capability}",
+            headers={"Accept": "application/json"},
+        )
+        with urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        agents = data if isinstance(data, list) else (data.get("agents") or data.get("items") or [])
+        for agent in agents:
+            for inst in (agent.get("instances") or []):
+                url = (
+                    inst.get("url")
+                    or inst.get("serviceUrl")
+                    or inst.get("service_url")
+                )
+                if url:
+                    return url.rstrip("/")
+        return None  # No live instance — do NOT fall back to card_url
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _is_per_task_agent(capability: str) -> bool:
+    """Return True if the capability belongs to a per-task (on-demand) agent."""
+    try:
+        req = Request(
+            f"{_REGISTRY_URL}/query?capability={capability}",
+            headers={"Accept": "application/json"},
+        )
+        with urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        agents = data if isinstance(data, list) else (data.get("agents") or data.get("items") or [])
+        for agent in agents:
+            if agent.get("execution_mode") == "per-task":
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _split_bind_spec(bind_spec: str) -> tuple[str, str, str]:
+    parts = str(bind_spec or "").split(":")
+    if len(parts) < 2:
+        return "", "", ""
+    if len(parts) == 2:
+        return parts[0], parts[1], ""
+    return parts[0], parts[1], ":".join(parts[2:])
+
+
+def _extract_absolute_paths(text: str) -> list[str]:
+    if not text:
+        return []
+    candidates: list[str] = []
+    for match in re.finditer(r"/[^^\s\"'`<>()\[\]{}]+", text):
+        candidate = match.group(0).rstrip(",.;:!?)]}")
+        if candidate:
+            candidates.append(candidate)
+    return candidates
+
+
+def _infer_office_original_paths(metadata: dict, extra_binds: list[str], task_text: str) -> list[str]:
+    configured_paths = [
+        str(path).strip()
+        for path in (metadata.get("officeHostTargetPaths") or [])
+        if str(path).strip()
+    ]
+    if configured_paths:
+        return configured_paths
+
+    input_root = str(metadata.get("officeInputRoot") or "/app/userdata").strip() or "/app/userdata"
+    host_roots: list[str] = []
+    for bind_spec in extra_binds or []:
+        source, destination, _mode = _split_bind_spec(bind_spec)
+        if not source or not destination:
+            continue
+        if destination == input_root or destination == "/app/userdata":
+            host_roots.append(os.path.realpath(source))
+
+    if not host_roots:
+        return []
+
+    seen: set[str] = set()
+    inferred: list[str] = []
+    sources = [str(task_text or ""), str(_task_context.get("userText") or "")]
+    for source_text in sources:
+        for candidate in _extract_absolute_paths(source_text):
+            real_candidate = os.path.realpath(candidate)
+            if real_candidate in seen:
+                continue
+            for host_root in host_roots:
+                try:
+                    relative = os.path.relpath(real_candidate, host_root)
+                except ValueError:
+                    continue
+                if relative == os.pardir or relative.startswith(f"{os.pardir}{os.sep}"):
+                    continue
+                inferred.append(real_candidate)
+                seen.add(real_candidate)
+                break
+
+    return inferred
+
+
+def _normalize_office_dispatch_metadata(metadata: dict, extra_binds: list[str], task_text: str) -> dict:
+    merged = dict(metadata or {})
+    input_root = str(merged.get("officeInputRoot") or "/app/userdata").strip() or "/app/userdata"
+    original_paths = [str(path).strip() for path in (merged.get("officeTargetPaths") or []) if str(path).strip()]
+    if not original_paths:
+        original_paths = _infer_office_original_paths(merged, extra_binds, task_text)
+    if not original_paths:
+        merged["officeInputRoot"] = input_root
+        return merged
+
+    host_root = ""
+    for bind_spec in extra_binds or []:
+        source, destination, _mode = _split_bind_spec(bind_spec)
+        if destination == input_root:
+            host_root = source
+            break
+        if not host_root and destination == "/app/userdata":
+            host_root = source
+
+    merged.setdefault("officeHostTargetPaths", list(original_paths))
+
+    container_paths: list[str] = []
+    normalized_host_root = os.path.realpath(host_root) if host_root else ""
+    for raw_path in original_paths:
+        candidate = str(raw_path).strip()
+        if not candidate:
+            continue
+        if candidate.startswith(input_root):
+            container_paths.append(os.path.normpath(candidate))
+            continue
+
+        real_path = os.path.realpath(candidate)
+        if normalized_host_root:
+            try:
+                relative = os.path.relpath(real_path, normalized_host_root)
+            except ValueError:
+                relative = os.path.basename(real_path)
+        else:
+            relative = os.path.basename(real_path)
+
+        if relative in ("", "."):
+            mapped_path = input_root
+        elif relative == os.pardir or relative.startswith(f"{os.pardir}{os.sep}"):
+            mapped_path = os.path.join(input_root, os.path.basename(real_path))
+        else:
+            mapped_path = os.path.join(input_root, relative)
+        container_paths.append(os.path.normpath(mapped_path))
+
+    merged["officeTargetPaths"] = container_paths
+    merged["officeInputRoot"] = input_root
+    return merged
+
+
+def _normalize_dispatch_metadata(capability: str, metadata: dict, extra_binds: list[str], task_text: str) -> dict:
+    merged = dict(metadata or {})
+
+    workspace_path = str(_task_context.get("workspacePath") or "").strip()
+    if workspace_path and not merged.get("sharedWorkspacePath"):
+        merged["sharedWorkspacePath"] = workspace_path
+
+    orchestrator_task_id = str(_task_context.get("taskId") or "").strip()
+    if orchestrator_task_id and not merged.get("orchestratorTaskId"):
+        merged["orchestratorTaskId"] = orchestrator_task_id
+
+    # Inject orchestratorCallbackUrl so downstream agents can report progress
+    # and send callbacks back to the parent orchestrator automatically.
+    advertised_url = str(_task_context.get("advertisedUrl") or "").strip()
+    if advertised_url and orchestrator_task_id and not merged.get("orchestratorCallbackUrl"):
+        merged["orchestratorCallbackUrl"] = (
+            f"{advertised_url.rstrip('/')}/tasks/{orchestrator_task_id}/callbacks"
+        )
+
+    permissions = _task_context.get("permissions")
+    if permissions is not None and "permissions" not in merged:
+        merged["permissions"] = permissions
+    if capability.startswith("office.") and merged.get("permissions") is None:
+        merged["permissions"] = load_permission_grant("office").to_dict()
+
+    request_agent = str(_task_context.get("agentId") or "").strip()
+    if request_agent and not merged.get("requestAgent"):
+        merged["requestAgent"] = request_agent
+
+    if capability.startswith("office."):
+        merged = _normalize_office_dispatch_metadata(merged, extra_binds, task_text)
+
+    return merged
+
+
+def _normalize_dispatch_task_text(capability: str, task_text: str, metadata: dict) -> str:
+    if not capability.startswith("office."):
+        return task_text
+
+    target_paths = [str(path).strip() for path in (metadata.get("officeTargetPaths") or []) if str(path).strip()]
+    if not target_paths:
+        return task_text
+
+    host_paths = [str(path).strip() for path in (metadata.get("officeHostTargetPaths") or []) if str(path).strip()]
+    normalized_text = task_text
+    for host_path, container_path in zip(host_paths, target_paths):
+        if host_path and container_path:
+            normalized_text = normalized_text.replace(host_path, container_path)
+
+    mounted_paths = "\n".join(f"- {path}" for path in target_paths)
+    prefix = (
+        "Mounted Office target paths inside the container (authoritative):\n"
+        f"{mounted_paths}\n"
+        "Use only these mounted paths for file access. Ignore any original host paths mentioned in the request.\n\n"
+    )
+    return prefix + normalized_text
+
+
 def _a2a_dispatch(
     agent_url: str,
     capability: str,
@@ -179,7 +402,13 @@ def _poll_task_until_done(agent_url: str, task_id: str, timeout: int = 600) -> d
 # ---------------------------------------------------------------------------
 
 class DispatchAgentTaskTool(ConstellationTool):
-    """Generic version of dispatch_dev_agent — works with any agent capability."""
+    """Generic version of dispatch_dev_agent — works with any agent capability.
+
+    For per-task agents (e.g. office-agent, android-agent) that have no live
+    instance registered yet, pass ``extra_binds`` (the list returned by
+    ``validate_office_paths``) to trigger automatic container launch before
+    dispatch.  This avoids a separate ``launch_per_task_agent`` call.
+    """
 
     @property
     def schema(self) -> ToolSchema:
@@ -188,14 +417,17 @@ class DispatchAgentTaskTool(ConstellationTool):
             description=(
                 "Dispatch a task to another Constellation agent identified by capability. "
                 "The Registry is used for discovery. Returns the task_id and agent_url so "
-                "you can later call wait_for_agent_task and ack_agent_task."
+                "you can later call wait_for_agent_task and ack_agent_task. "
+                "For per-task agents (office-agent, android-agent) with no running instance, "
+                "pass extra_binds (returned by validate_office_paths) to auto-launch the agent "
+                "before dispatch — no separate launch_per_task_agent call is needed."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "capability": {
                         "type": "string",
-                        "description": "Agent capability to dispatch to, e.g. 'android.task.execute'",
+                        "description": "Agent capability to dispatch to, e.g. 'office.data.analyze'",
                     },
                     "task_text": {
                         "type": "string",
@@ -212,6 +444,15 @@ class DispatchAgentTaskTool(ConstellationTool):
                         "type": "string",
                         "description": "Optional parent context ID for task threading.",
                     },
+                    "extra_binds": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Docker bind mounts required by the target agent (returned by "
+                            "validate_office_paths as 'extraBinds'). When provided and no "
+                            "live instance exists, the agent is auto-launched with these mounts."
+                        ),
+                    },
                 },
                 "required": ["capability", "task_text"],
             },
@@ -222,17 +463,40 @@ class DispatchAgentTaskTool(ConstellationTool):
         task_text = str(args.get("task_text") or "").strip()
         metadata = args.get("metadata") or {}
         context_id = str(args.get("context_id") or "").strip() or None
+        extra_binds = list(args.get("extra_binds") or [])
 
         if not capability:
             return self.error("Missing required argument: capability")
         if not task_text:
             return self.error("Missing required argument: task_text")
 
-        agent_url = _discover_capability_url(capability)
+        metadata = _normalize_dispatch_metadata(capability, metadata, extra_binds, task_text)
+        task_text = _normalize_dispatch_task_text(capability, task_text, metadata)
+
+        # Prefer a live registered instance; fall back to card_url only for
+        # persistent agents.  For per-task agents with no live instance, trigger
+        # auto-launch when extra_binds are available.
+        agent_url = _discover_live_instance_url(capability)
+
+        if not agent_url:
+            if extra_binds and _is_per_task_agent(capability):
+                # Auto-launch the per-task agent container with the given bind mounts.
+                launch_url, launch_err = self._auto_launch(capability, extra_binds)
+                if launch_err:
+                    return self.error(
+                        f"Auto-launch failed for '{capability}': {launch_err}. "
+                        "Check that the agent image exists and Docker is accessible."
+                    )
+                agent_url = launch_url
+            else:
+                # Fall back to card_url discovery for persistent agents.
+                agent_url = _discover_capability_url(capability)
+
         if not agent_url:
             return self.error(
                 f"No agent available for capability '{capability}'. "
-                "The agent may not be registered or may be unavailable."
+                "For per-task office agents, call validate_office_paths first and "
+                "pass the returned extraBinds to this tool's extra_binds parameter."
             )
 
         try:
@@ -253,6 +517,33 @@ class DispatchAgentTaskTool(ConstellationTool):
                 ensure_ascii=False,
             )
         )
+
+    def _auto_launch(self, capability: str, extra_binds: list) -> tuple[str, str]:
+        """Launch a per-task agent with the given bind mounts.
+
+        Returns (service_url, error_message).  On success error_message is empty.
+        On failure service_url is empty.
+        """
+        try:
+            from common.tools.launcher_tool import LaunchPerTaskAgentTool
+            tool = LaunchPerTaskAgentTool()
+            task_id = str(_task_context.get("taskId") or f"auto-{int(time.time())}").strip()
+            result = tool.execute({
+                "capability": capability,
+                "task_id": task_id,
+                "extra_binds": extra_binds,
+            })
+            if result.get("isError"):
+                msgs = result.get("content") or [{}]
+                return "", str((msgs[0].get("text") or "launch failed"))
+            content = ((result.get("content") or [{}])[0].get("text") or "")
+            info = json.loads(content)
+            service_url = str(info.get("serviceUrl") or "").strip()
+            if not service_url:
+                return "", "launch succeeded but no serviceUrl in response"
+            return service_url, ""
+        except Exception as exc:  # noqa: BLE001
+            return "", str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -912,6 +1203,18 @@ class ValidateOfficePathsTool(ConstellationTool):
         raw_paths = [str(p).strip() for p in (args.get("target_paths") or []) if str(p).strip()]
         output_mode = str(args.get("output_mode") or "workspace").strip().lower()
         workspace_host_path = str(args.get("workspace_host_path") or "").strip()
+
+        # Translate container-side workspace path (e.g. /app/artifacts/...) to the
+        # corresponding host path so Docker can use it as a bind-mount source when
+        # launching the per-task office agent container.
+        if workspace_host_path and workspace_host_path.startswith("/app/"):
+            try:
+                from common.launcher import get_launcher
+                resolved = get_launcher().resolve_host_path(workspace_host_path)
+                if resolved:
+                    workspace_host_path = resolved
+            except Exception:  # noqa: BLE001
+                pass
 
         allowed_base_paths_env = os.environ.get("OFFICE_ALLOWED_BASE_PATHS", "")
         allowed_base_paths = [

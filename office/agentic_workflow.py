@@ -15,6 +15,11 @@ import os
 from common.runtime.adapter import summarize_runtime_configuration
 from common.tools.control_tools import configure_control_tools
 
+# Import and register document-format reader tools (office-specific).
+# These tools self-register in common.tools.registry on import so the
+# agentic runtime can discover them by name.
+import office.tools.document_tools as _document_tools  # noqa: F401
+
 # ---------------------------------------------------------------------------
 # Tool names exposed to the agentic runtime backend
 # ---------------------------------------------------------------------------
@@ -35,6 +40,11 @@ OFFICE_AGENT_RUNTIME_TOOL_NAMES = [
     # --- Registry / agent status ---
     "registry_query",
     "check_agent_status",
+    # --- Document format readers (PDF, DOCX, PPTX, XLSX) ---
+    "read_pdf",
+    "read_docx",
+    "read_pptx",
+    "read_xlsx",
     # --- Local workspace (canonical names) ---
     "read_local_file",
     "write_local_file",
@@ -88,6 +98,7 @@ def configure_office_control_tools(
     callback_url: str,
     orchestrator_url: str,
     user_text: str,
+    input_required_fn=None,
 ) -> None:
     """Wire lifecycle callbacks into common control_tools for this task.
 
@@ -108,7 +119,7 @@ def configure_office_control_tools(
         },
         complete_fn=lambda result, artifacts: None,
         fail_fn=lambda error: None,
-        input_required_fn=lambda question, context: None,
+        input_required_fn=input_required_fn,
     )
 
 
@@ -141,9 +152,27 @@ def build_office_task_prompt(
     )
 
     if output_mode == "inplace":
-        output_mode_section = (
-            "IN-PLACE — write results directly back into the source files/directory."
-        )
+        if target_paths:
+            # Derive the output directory: use parent dir if target is a file, else use the dir itself.
+            # We cannot call os.path.isfile on container paths from here, so we provide
+            # guidance covering both cases in the prompt.
+            primary = target_paths[0]
+            output_mode_section = (
+                f"IN-PLACE — write results directly into the source directory.\n"
+                f"- For ANALYZE: write `analysis.md` to the **same directory** that contains the "
+                f"target file(s). Example: if target is `{primary}` and it is a file, write "
+                f"to `{os.path.dirname(primary)}/analysis.md`; if it is a directory, write to "
+                f"`{primary}/analysis.md`.\n"
+                f"- For SUMMARIZE: write `summary.md` to the target directory "
+                f"(or the parent directory if target is a file).\n"
+                f"- For ORGANIZE: create named subdirectories and move files within the source "
+                f"directory. Read each file's CONTENT to determine the correct group name — "
+                f"do NOT rely on existing subdirectory names.\n"
+                f"Do NOT write these output files to the workspace path — they must go into the "
+                f"source/user directory so the user can find them there."
+            )
+        else:
+            output_mode_section = "IN-PLACE — write results directly back into the source files/directory."
     elif workspace_path:
         output_mode_section = (
             f"WORKSPACE — write all output artifacts to: {workspace_path}/office-agent/"

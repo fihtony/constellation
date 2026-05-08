@@ -1,8 +1,15 @@
 # Office Agent — Available Tools
 
+## Document Reader Tools
+
+- `read_pdf` — Extract plain text from a PDF file. Prefer this over `run_local_command` with pdfplumber.
+- `read_docx` — Extract plain text from a Word document (.docx). Prefer this over `run_local_command` with python-docx.
+- `read_pptx` — Extract plain text from a PowerPoint presentation (.pptx).
+- `read_xlsx` — Extract data from an Excel spreadsheet (.xlsx) as CSV-formatted text.
+
 ## Local File Tools
 
-- `read_local_file` — Read a local file from the authorized document path.
+- `read_local_file` — Read a local text file from the authorized document path.
 - `write_local_file` — Write a file to an authorized output location.
 - `edit_local_file` — Apply a targeted edit to an existing file.
 - `list_local_dir` — List directory contents within the authorized path.

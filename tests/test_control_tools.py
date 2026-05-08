@@ -66,6 +66,9 @@ class DispatchAgentTaskTests(unittest.TestCase):
     def setUp(self):
         self.tool = get_tool("dispatch_agent_task")
 
+    def tearDown(self):
+        _reset_callbacks()
+
     def test_discover_capability_url_accepts_registry_list_shape(self):
         payload = [
             {
@@ -166,6 +169,140 @@ class DispatchAgentTaskTests(unittest.TestCase):
         msg = captured["body"]["message"]
         self.assertEqual(msg["metadata"]["requestedCapability"], "android.task.execute")
         self.assertEqual(msg["metadata"]["jiraContext"]["ticketKey"], "PROJ-1")
+
+    def test_office_dispatch_infers_target_paths_from_task_context(self):
+        mock_response = {"task": {"id": "task-office", "status": {"state": "submitted"}}}
+        captured = {}
+
+        class _R:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps(mock_response).encode()
+
+        def fake_urlopen(req, timeout=15):
+            captured["body"] = json.loads(req.data.decode())
+            return _R()
+
+        _ctrl.configure_control_tools(
+            task_context={
+                "taskId": "task-parent",
+                "agentId": "compass-agent",
+                "workspacePath": "/app/artifacts/workspaces/task-parent",
+                "permissions": None,
+                "userText": "Analyze /Users/example/tests/data/csv/sales_data.csv and find the top rep.",
+            },
+            complete_fn=None,
+            fail_fn=None,
+            input_required_fn=None,
+        )
+
+        with patch("common.tools.control_tools._discover_capability_url", return_value="http://office-agent:8060"), \
+             patch("common.tools.control_tools.urlopen", side_effect=fake_urlopen):
+            self.tool.execute({
+                "capability": "office.data.analyze",
+                "task_text": "Analyze /Users/example/tests/data/csv/sales_data.csv and find the top rep.",
+                "extra_binds": [
+                    "/Users/example/tests/data/csv:/app/userdata:ro",
+                    "/app/artifacts/workspaces/task-parent:/app/workspace:rw",
+                ],
+            })
+
+        msg = captured["body"]["message"]
+        self.assertEqual(msg["metadata"]["requestedCapability"], "office.data.analyze")
+        self.assertEqual(msg["metadata"]["officeTargetPaths"], ["/app/userdata/sales_data.csv"])
+        self.assertEqual(msg["metadata"]["officeHostTargetPaths"], ["/Users/example/tests/data/csv/sales_data.csv"])
+        self.assertEqual(msg["metadata"]["sharedWorkspacePath"], "/app/artifacts/workspaces/task-parent")
+        self.assertEqual(msg["metadata"]["permissions"]["taskType"], "office")
+        self.assertIn("/app/userdata/sales_data.csv", msg["parts"][0]["text"])
+        self.assertNotIn("/Users/example/tests/data/csv/sales_data.csv", msg["parts"][0]["text"])
+
+    def test_dispatch_injects_orchestrator_callback_url_when_advertised_url_is_set(self):
+        """When advertisedUrl is in task_context, orchestratorCallbackUrl should be injected."""
+        mock_response = {"task": {"id": "task-office-cb", "status": {"state": "submitted"}}}
+        captured = {}
+
+        class _R:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps(mock_response).encode()
+
+        def fake_urlopen(req, timeout=15):
+            captured["body"] = json.loads(req.data.decode())
+            return _R()
+
+        _ctrl.configure_control_tools(
+            task_context={
+                "taskId": "task-cb-parent",
+                "agentId": "compass-agent",
+                "workspacePath": "/app/artifacts/workspaces/task-cb-parent",
+                "advertisedUrl": "http://compass:8080",
+                "permissions": None,
+                "userText": "Analyze /app/userdata/data.csv",
+            },
+            complete_fn=None,
+            fail_fn=None,
+            input_required_fn=None,
+        )
+
+        with patch("common.tools.control_tools._discover_capability_url", return_value="http://office-agent:8060"), \
+             patch("common.tools.control_tools.urlopen", side_effect=fake_urlopen):
+            self.tool.execute({
+                "capability": "office.data.analyze",
+                "task_text": "Analyze /app/userdata/data.csv",
+                "metadata": {"officeTargetPaths": ["/app/userdata/data.csv"]},
+            })
+
+        msg = captured["body"]["message"]
+        self.assertEqual(
+            msg["metadata"]["orchestratorCallbackUrl"],
+            "http://compass:8080/tasks/task-cb-parent/callbacks",
+        )
+        self.assertEqual(msg["metadata"]["orchestratorTaskId"], "task-cb-parent")
+
+    def test_dispatch_does_not_overwrite_existing_orchestrator_callback_url(self):
+        """Caller-provided orchestratorCallbackUrl must not be overwritten."""
+        mock_response = {"task": {"id": "task-office-existing", "status": {"state": "submitted"}}}
+        captured = {}
+
+        class _R:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps(mock_response).encode()
+
+        def fake_urlopen(req, timeout=15):
+            captured["body"] = json.loads(req.data.decode())
+            return _R()
+
+        _ctrl.configure_control_tools(
+            task_context={
+                "taskId": "task-existing-cb",
+                "agentId": "compass-agent",
+                "workspacePath": "/app/artifacts/workspaces/task-existing-cb",
+                "advertisedUrl": "http://compass:8080",
+                "permissions": None,
+                "userText": "Analyze data",
+            },
+            complete_fn=None,
+            fail_fn=None,
+            input_required_fn=None,
+        )
+
+        with patch("common.tools.control_tools._discover_capability_url", return_value="http://office-agent:8060"), \
+             patch("common.tools.control_tools.urlopen", side_effect=fake_urlopen):
+            self.tool.execute({
+                "capability": "office.data.analyze",
+                "task_text": "Analyze /app/userdata/data.csv",
+                "metadata": {
+                    "officeTargetPaths": ["/app/userdata/data.csv"],
+                    "orchestratorCallbackUrl": "http://custom-compass:9090/tasks/custom-task/callbacks",
+                },
+            })
+
+        msg = captured["body"]["message"]
+        self.assertEqual(
+            msg["metadata"]["orchestratorCallbackUrl"],
+            "http://custom-compass:9090/tasks/custom-task/callbacks",
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -63,8 +63,15 @@ _CORE_TOOL_NAMES = [
     "glob",
     "grep",
     "load_skill",
+    "list_skills",
     "todo_write",
     "report_progress",
+    # canonical local-file aliases (same sandbox enforcement)
+    "read_local_file",
+    "write_local_file",
+    "edit_local_file",
+    "list_local_dir",
+    "search_local_files",
 ]
 
 _WRITE_TOOL_NAMES = [
@@ -75,6 +82,31 @@ _WRITE_TOOL_NAMES = [
     "compress",
 ]
 
+# Orchestration and control-plane tools — used by Compass, Team Lead, and any
+# agent that dispatches sub-tasks or manages task lifecycle.
+_CONTROL_TOOL_NAMES = [
+    # Task lifecycle
+    "complete_current_task",
+    "fail_current_task",
+    "request_user_input",
+    "get_task_context",
+    "get_agent_runtime_status",
+    # Agent dispatch and wait
+    "dispatch_agent_task",
+    "wait_for_agent_task",
+    "ack_agent_task",
+    "launch_per_task_agent",
+    # Registry / discovery
+    "registry_query",
+    "list_available_agents",
+    "check_agent_status",
+    # Office path validation and bind-mount helper
+    "validate_office_paths",
+    # Task-card evidence aggregation
+    "aggregate_task_card",
+    "derive_user_facing_status",
+]
+
 _DOMAIN_TOOL_NAMES = [
     "jira_get_ticket",
     "jira_add_comment",
@@ -83,6 +115,14 @@ _DOMAIN_TOOL_NAMES = [
     "scm_create_pr",
     "design_fetch_figma_screen",
     "design_fetch_stitch_screen",
+]
+
+# Document-format readers — PDF, DOCX, PPTX, XLSX.
+_DOCUMENT_TOOL_NAMES = [
+    "read_pdf",
+    "read_docx",
+    "read_pptx",
+    "read_xlsx",
 ]
 
 _BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
@@ -99,7 +139,7 @@ _BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
         "max_timeout_seconds": 600,
     },
     "workspace-write": {
-        "allow_tools": _CORE_TOOL_NAMES + _WRITE_TOOL_NAMES,
+        "allow_tools": _CORE_TOOL_NAMES + _WRITE_TOOL_NAMES + _CONTROL_TOOL_NAMES + _DOCUMENT_TOOL_NAMES,
         "sensitive_path_deny_list": [
             ".env", ".env.*", "*.pem", "*.key", "id_rsa*",
             ".git/config", ".git/credentials", "**/.ssh/**", "**/secrets/**",
@@ -116,7 +156,7 @@ _BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
         "subagent_profile": "workspace-write",
     },
     "design-to-code": {
-        "allow_tools": _CORE_TOOL_NAMES + _WRITE_TOOL_NAMES,
+        "allow_tools": _CORE_TOOL_NAMES + _WRITE_TOOL_NAMES + _CONTROL_TOOL_NAMES + _DOCUMENT_TOOL_NAMES,
         "sensitive_path_deny_list": [
             ".env", ".env.*", "*.pem", "*.key", "id_rsa*",
             ".git/config", ".git/credentials", "**/.ssh/**", "**/secrets/**",
@@ -133,7 +173,7 @@ _BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
         "subagent_profile": "workspace-write",
     },
     "integration-call": {
-        "allow_tools": _CORE_TOOL_NAMES + _WRITE_TOOL_NAMES + _DOMAIN_TOOL_NAMES,
+        "allow_tools": _CORE_TOOL_NAMES + _WRITE_TOOL_NAMES + _CONTROL_TOOL_NAMES + _DOCUMENT_TOOL_NAMES + _DOMAIN_TOOL_NAMES,
         "sensitive_path_deny_list": [
             ".env", ".env.*", "*.pem", "*.key", "id_rsa*",
             ".git/config", ".git/credentials", "**/.ssh/**", "**/secrets/**",
