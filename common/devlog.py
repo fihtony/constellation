@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import threading
 
 from common.time_utils import local_clock_time, local_iso_timestamp
 
@@ -86,3 +88,108 @@ def record_workspace_stage(workspace_path, relative_dir, phase, *, task_id="", e
     summary["updatedAt"] = local_iso_timestamp()
     with open(summary_path, "w", encoding="utf-8") as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Stdout tee — capture all console output to command-log.txt
+# ---------------------------------------------------------------------------
+
+class _TeeToFile:
+    """Write to both the original stdout and a log file.
+
+    Thread-safe: each write acquires a file-level lock so concurrent print()
+    calls from multiple threads never interleave partial lines in the file.
+    Only intended for single-task per-task agents (office, team-lead, web,
+    android) where one tee instance covers the full process lifetime.
+    """
+
+    def __init__(self, original, log_path: str) -> None:
+        self._original = original
+        self._log_path = log_path
+        self._lock = threading.Lock()
+
+    def write(self, text: str) -> int:
+        self._original.write(text)
+        if text:
+            try:
+                with self._lock:
+                    with open(self._log_path, "a", encoding="utf-8", errors="replace") as fh:
+                        fh.write(text)
+            except Exception:  # noqa: BLE001
+                pass
+        return len(text)
+
+    def flush(self) -> None:
+        self._original.flush()
+
+    def fileno(self) -> int:
+        return self._original.fileno()
+
+    def isatty(self) -> bool:
+        try:
+            return self._original.isatty()
+        except Exception:  # noqa: BLE001
+            return False
+
+    def __getattr__(self, name: str):
+        return getattr(self._original, name)
+
+
+def install_stdout_tee(log_path: str) -> _TeeToFile:
+    """Redirect sys.stdout so that ALL print() output is also appended to *log_path*.
+
+    Call this once at the beginning of a per-task agent workflow.  The returned
+    tee object replaces sys.stdout for the lifetime of the process.  The
+    directory for *log_path* is created automatically if it does not exist.
+
+    Returns the installed tee so callers can restore sys.stdout if needed::
+
+        tee = install_stdout_tee("/app/artifacts/.../command-log.txt")
+    """
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    except OSError:
+        pass
+    tee = _TeeToFile(sys.stdout, log_path)
+    sys.stdout = tee
+    return tee
+
+
+# ---------------------------------------------------------------------------
+# Initial stage-summary helper
+# ---------------------------------------------------------------------------
+
+def write_initial_stage_summary(
+    workspace_path: str,
+    relative_dir: str,
+    task_id: str,
+    agent_id: str,
+    **extra,
+) -> None:
+    """Write (or overwrite) stage-summary.json with currentPhase=STARTING.
+
+    Should be called immediately after the agent workspace directory is created,
+    before any long-running work begins, so that the file is always present.
+    Subsequent calls to ``record_workspace_stage`` will update it in-place.
+    """
+    if not workspace_path or not relative_dir:
+        return
+    agent_dir = os.path.join(workspace_path, relative_dir)
+    try:
+        os.makedirs(agent_dir, exist_ok=True)
+    except OSError:
+        return
+    now = local_iso_timestamp()
+    payload: dict = {
+        "taskId": task_id,
+        "agentId": agent_id,
+        "currentPhase": "STARTING",
+        "startedAt": now,
+        "updatedAt": now,
+    }
+    payload.update(extra)
+    try:
+        with open(os.path.join(agent_dir, "stage-summary.json"), "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+    except OSError:
+        pass

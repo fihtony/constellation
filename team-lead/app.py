@@ -35,6 +35,7 @@ from common.registry_client import RegistryClient
 from common.prompt_builder import build_system_prompt_from_manifest
 from common.runtime.adapter import get_runtime, require_agentic_runtime
 from common.task_store import TaskStore
+from common.devlog import install_stdout_tee, write_initial_stage_summary
 
 _THIS_DIR = os.path.dirname(__file__)
 if _THIS_DIR not in sys.path:
@@ -246,6 +247,17 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):
     workspace = ctx.shared_workspace_path
     user_text = ctx.user_text
     runtime_config = build_team_lead_runtime_config()
+
+    # --- Workspace init: create dir, write initial stage-summary, tee stdout ---
+    if workspace:
+        os.makedirs(os.path.join(workspace, "team-lead"), exist_ok=True)
+        write_initial_stage_summary(
+            workspace, "team-lead", team_lead_task_id, AGENT_ID,
+            runtimeConfig=runtime_config,
+        )
+        _log_path = os.path.join(workspace, "team-lead", "command-log.txt")
+        install_stdout_tee(_log_path)
+
     wait_for_user_input = make_wait_for_user_input(
         task_id=team_lead_task_id,
         callback_url=callback_url,
@@ -270,10 +282,9 @@ def _run_workflow(team_lead_task_id: str, ctx: _TaskContext):
 
     def log(phase: str):
         ts = local_clock_time()
-        entry = f"[{ts}] {phase}"
-        ctx.phases_log.append(entry)
-        print(f"[{AGENT_ID}][{team_lead_task_id}] {phase}")
-        _append_workspace_file(workspace, "team-lead/command-log.txt", entry + "\n")
+        entry = f"[{ts}] [{AGENT_ID}] {phase}"
+        ctx.phases_log.append(f"[{ts}] {phase}")
+        print(entry)  # tee captures this to command-log.txt automatically
         _report_progress(orchestrator_url, compass_task_id, phase)
 
     system_prompt = build_system_prompt_from_manifest(os.path.dirname(__file__))

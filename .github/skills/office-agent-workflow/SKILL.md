@@ -50,6 +50,33 @@ handles protocol, permissions, and tool wiring.
 4. Skip macro-enabled formats (`.xlsm`, `.docm`) — note as unsupported.
 5. Call `report_progress` with `"Discovered N files"`
 
+### Extracting Text from Binary Formats
+
+For **PDF** files (`.pdf`), use the dedicated `read_pdf` tool:
+```
+read_pdf(path="/path/to/file.pdf")
+```
+
+For **Word** files (`.docx`), use the dedicated `read_docx` tool:
+```
+read_docx(path="/path/to/file.docx")
+```
+
+For **PowerPoint** files (`.pptx`), use `read_pptx`:
+```
+read_pptx(path="/path/to/file.pptx")
+```
+
+For **Excel** files (`.xlsx`), use `read_xlsx`:
+```
+read_xlsx(path="/path/to/file.xlsx")
+```
+
+These tools are loaded by the Office Agent at startup from `office/tools/document_tools.py`.
+They enforce the sandbox path jail and return extracted plain text directly.
+Do NOT use `run_local_command` with inline Python to read binary documents — always prefer
+the dedicated document reader tools.
+
 ### Step 3a: Summarization (office.document.summarize / office.folder.summarize)
 
 1. Use `read_local_file` to read each file in turn.
@@ -72,15 +99,21 @@ handles protocol, permissions, and tool wiring.
 ### Step 3c: Folder Organization (office.folder.organize)
 
 1. Use `list_local_dir` to enumerate all files.
-2. Group files by logical category (file type, topic, date, project).
+2. Group files by the user's specified criterion (student name, date, file type, topic, etc.).
+   Always follow the user's explicit grouping intent from the task text.
 3. Write the plan to `<workspace>/office-agent/organization-plan.json` using `write_local_file`.
-4. **IN-PLACE mode only**:
-   - Create subdirectories with `run_local_command` using `mkdir -p`
-   - Move files with `run_local_command` using `mv`
-   - Never delete original files
-   - Write `.office-agent-manifest.json` in the source folder for recoverability
-5. **WORKSPACE mode**: only write the plan, do not move files.
-6. Call `report_progress` with `"Organization complete"` or `"Plan written"`
+4. Create the organized output:
+   - **WORKSPACE mode** (source bind is read-only):
+     - Create `<workspace>/office-agent/organized/<group-name>/` directories.
+     - For each file in a group: read its content (`read_local_file` for text, `run_local_command` for PDF/DOCX)
+       and write it to `<workspace>/office-agent/organized/<group-name>/<filename>` using `write_local_file`.
+     - Write `<workspace>/office-agent/organization-report.md` summarizing the groupings.
+   - **IN-PLACE mode** (source bind is read-write):
+     - Create subdirectories inside the source root with `run_local_command` (`mkdir -p`).
+     - Move or copy files with `run_local_command` (`mv`, `cp`).
+     - Never delete original files — copy first, verify, then optionally remove original.
+     - Write `organization-report.md` to `<workspace>/office-agent/` for audit purposes.
+5. Call `report_progress` with `"Organization complete"` or `"Plan written"`
 
 ### Step 4: Completion
 
@@ -119,8 +152,11 @@ handles protocol, permissions, and tool wiring.
 | Extension | Support level |
 |---|---|
 | `.txt`, `.md`, `.csv`, `.json` | Full — use `read_local_file` |
-| `.docx`, `.xlsx`, `.pptx`, `.pdf` | Full — runtime extracts text |
-| `.xls` | Best-effort |
+| `.pdf` | Full — use `read_pdf` tool |
+| `.docx` | Full — use `read_docx` tool |
+| `.pptx` | Full — use `read_pptx` tool |
+| `.xlsx` | Full — use `read_xlsx` tool |
+| `.xls` | Best-effort — use `read_xlsx` tool |
 | `.doc`, `.ppt` | Unsupported — report with guidance |
 | Scanned/OCR-only PDFs | Unsupported — report clearly |
 | `.xlsm`, `.docm` | Rejected — macro safety boundary |
@@ -145,6 +181,7 @@ An Office Agent task is **complete** when ALL of the following are true:
 |---|---|
 | `office/app.py` | A2A protocol, permission enforcement, task lifecycle |
 | `office/agentic_workflow.py` | Tool names, task prompt builder, control tool wiring |
+| `office/tools/document_tools.py` | Office-specific document readers (read_pdf, read_docx, etc.) |
 | `office/prompts/tasks/process.md` | Task prompt template injected into run_agentic() |
 | `office/prompts/system/` | Modular system prompt (role, boundaries, tools, DoD) |
 | `compass/office_routing.py` | Compass-side path validation and Docker bind helpers |

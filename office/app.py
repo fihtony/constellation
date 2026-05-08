@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 from common.env_utils import load_dotenv
 from common.instance_reporter import InstanceReporter
 from common.message_utils import extract_text
+from common.devlog import install_stdout_tee, write_initial_stage_summary
 from office.agentic_workflow import (
     OFFICE_AGENT_RUNTIME_TOOL_NAMES,
     build_office_agent_runtime_config,
@@ -49,6 +50,7 @@ from common.tools import (  # noqa: F401 -- side-effect imports
     skill_tool,
     validation_tools,
 )
+import office.tools.document_tools  # noqa: F401 -- office-specific side-effect import
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -82,6 +84,15 @@ def audit_log(event: str, **kwargs) -> None:
 # ---------------------------------------------------------------------------
 # Workspace helpers
 # ---------------------------------------------------------------------------
+
+
+def _ensure_office_workspace(workspace_path: str) -> None:
+    if not workspace_path:
+        return
+    try:
+        os.makedirs(os.path.join(workspace_path, "office-agent"), exist_ok=True)
+    except OSError as exc:
+        print(f"[{AGENT_ID}] Warning: could not create office workspace folder: {exc}")
 
 
 def _save_workspace_file(workspace_path: str, relative_name: str, content: str) -> None:
@@ -226,6 +237,7 @@ def _notify_callback(callback_url: str, task_id: str, state: str, status_message
         "statusMessage": status_message,
         "artifacts": artifacts or [],
         "agentId": AGENT_ID,
+        "serviceUrl": ADVERTISED_URL,
     }
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = Request(
@@ -309,6 +321,7 @@ def _run_workflow(task_id: str, message: dict) -> None:
     task = task_store.get(task_id)
     if not task:
         return
+    task.workspace_path = workspace_path
 
     capability = str(metadata.get("requestedCapability") or "").strip()
     user_text = extract_text(message)
@@ -317,13 +330,48 @@ def _run_workflow(task_id: str, message: dict) -> None:
     target_paths = [os.path.realpath(p) for p in (metadata.get("officeTargetPaths") or []) if str(p).strip()]
 
     runtime_config = build_office_agent_runtime_config()
+    _ensure_office_workspace(workspace_path)
+    write_initial_stage_summary(
+        workspace_path, "office-agent", task_id, AGENT_ID,
+        runtimeConfig=runtime_config,
+    )
+    if workspace_path:
+        _log_path = os.path.join(workspace_path, "office-agent", "command-log.txt")
+        install_stdout_tee(_log_path)
 
     def log(phase: str) -> None:
         ts = local_clock_time()
-        entry = f"[{ts}] {phase}"
-        print(f"[{AGENT_ID}][{task_id}] {phase}")
-        _append_workspace_file(workspace_path, "office-agent/command-log.txt", entry + "\n")
+        # Print with timestamp — tee captures this to command-log.txt automatically
+        print(f"[{ts}] [{AGENT_ID}] {phase}")
         _report_progress(compass_url, compass_task_id, phase)
+
+    def on_input_required(question: str, context: str | None) -> None:
+        full_question = str(question or "").strip()
+        extra_context = str(context or "").strip()
+        if extra_context:
+            full_question = f"{full_question}\n\n{extra_context}" if full_question else extra_context
+        if not full_question:
+            full_question = "Office Agent requires additional user input before it can continue."
+        task_store.update_state(task_id, "TASK_STATE_INPUT_REQUIRED", full_question)
+        log(f"INPUT_REQUIRED: {full_question[:200]}")
+        _save_workspace_file(
+            workspace_path,
+            "office-agent/stage-summary.json",
+            json.dumps(
+                {
+                    "taskId": task_id,
+                    "agentId": AGENT_ID,
+                    "currentPhase": "INPUT_REQUIRED",
+                    "question": full_question,
+                    "runtimeConfig": runtime_config,
+                    "updatedAt": local_iso_timestamp(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        _notify_callback(callback_url, task_id, "TASK_STATE_INPUT_REQUIRED", full_question, [])
+        audit_log("TASK_INPUT_REQUIRED", task_id=task_id, question=full_question[:300])
 
     # Validate permissions before starting agentic execution
     if target_paths:
@@ -350,6 +398,7 @@ def _run_workflow(task_id: str, message: dict) -> None:
         callback_url=callback_url,
         orchestrator_url=compass_url,
         user_text=user_text,
+        input_required_fn=on_input_required,
     )
 
     task_store.update_state(task_id, "TASK_STATE_WORKING", "Office Agent is processing the request.")
@@ -368,7 +417,11 @@ def _run_workflow(task_id: str, message: dict) -> None:
         agent_dir=_AGENT_DIR,
     )
 
-    cwd = target_paths[0] if target_paths else workspace_path or os.getcwd()
+    # Always use the shared workspace as the working directory so the runtime can
+    # write its state files (e.g. .connect-agent/checkpoints) to a writable path.
+    # The user-data mount (/app/userdata) is read-only and must not be used as cwd.
+    # target_paths are made accessible through extra_allow_roots instead.
+    cwd = workspace_path or os.getcwd()
 
     try:
         log("Starting agentic workflow")
@@ -377,7 +430,7 @@ def _run_workflow(task_id: str, message: dict) -> None:
             task=task_prompt,
             system_prompt=system_prompt,
             cwd=cwd,
-            extra_allow_roots=[workspace_path] if workspace_path else None,
+            extra_allow_roots=list(filter(None, [INPUT_ROOT, workspace_path])),
             tools=OFFICE_AGENT_RUNTIME_TOOL_NAMES,
             max_turns=40,
             timeout=TASK_TIMEOUT,
@@ -385,6 +438,10 @@ def _run_workflow(task_id: str, message: dict) -> None:
 
         summary = result.summary or "Office task completed."
         final_artifacts: list = list(result.artifacts or [])
+
+        current_task = task_store.get(task_id)
+        if current_task and current_task.state == "TASK_STATE_INPUT_REQUIRED":
+            return
 
         summary_artifact = {
             "name": "office-agent-summary",
@@ -474,6 +531,9 @@ def _run_workflow(task_id: str, message: dict) -> None:
         audit_log("TASK_FAILED", task_id=task_id, error=str(err))
 
     finally:
+        current_task = task_store.get(task_id)
+        if current_task and current_task.state == "TASK_STATE_INPUT_REQUIRED":
+            return
         _apply_task_exit_rule(task_id, exit_rule)
 
 
@@ -536,7 +596,33 @@ class OfficeAgentHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "missing_message"})
             return
 
+        context_id = (body.get("contextId") or message.get("contextId") or "").strip()
+        if context_id:
+            prior_task = task_store.get(context_id)
+            if prior_task and prior_task.state == "TASK_STATE_INPUT_REQUIRED":
+                original_message = dict(getattr(prior_task, "original_message", {}) or {})
+                original_text = extract_text(original_message)
+                reply_text = extract_text(message)
+                merged_message = dict(original_message or message)
+                combined_text = (
+                    f"{original_text}\n\n{reply_text}".strip()
+                    if original_text and reply_text
+                    else reply_text or original_text
+                )
+                merged_message["parts"] = [{"text": combined_text}]
+                prior_task.original_message = json.loads(json.dumps(merged_message))
+                task_store.update_state(
+                    context_id,
+                    "TASK_STATE_WORKING",
+                    "User provided additional information. Resuming…",
+                )
+                worker = threading.Thread(target=_run_workflow, args=(context_id, merged_message), daemon=True)
+                worker.start()
+                self._send_json(200, {"task": prior_task.to_dict()})
+                return
+
         task = task_store.create()
+        task.original_message = json.loads(json.dumps(message))
         audit_log(
             "TASK_RECEIVED",
             task_id=task.task_id,

@@ -79,7 +79,9 @@ build_android() {
     backend=$(resolve_backend android)
     local dockerfile="${SCRIPT_DIR}/android/Dockerfile.${backend}"
     if [[ ! -f "$dockerfile" ]]; then
-        dockerfile="${SCRIPT_DIR}/android/Dockerfile"
+        echo "ERROR: Missing Dockerfile for backend '${backend}': ${dockerfile}"
+        echo "Each agent requires a runtime-specific Dockerfile (e.g. Dockerfile.connect-agent)."
+        return 1
     fi
     echo "==> Building android agent image: constellation-android-agent:latest (backend: ${backend})"
     docker build \
@@ -95,7 +97,7 @@ build_web() {
     backend=$(resolve_backend web)
     local dockerfile="${SCRIPT_DIR}/web/Dockerfile.${backend}"
     if [[ ! -f "$dockerfile" ]]; then
-        dockerfile="${SCRIPT_DIR}/web/Dockerfile"
+        echo "ERROR: Missing Dockerfile for backend '${backend}': ${dockerfile}"; echo "Each agent requires a runtime-specific Dockerfile (e.g. Dockerfile.connect-agent)."; return 1
     fi
     echo "==> Building web agent image: constellation-web-agent:latest (backend: ${backend})"
     docker build \
@@ -110,7 +112,7 @@ build_team_lead() {
     backend=$(resolve_backend team-lead)
     local dockerfile="${SCRIPT_DIR}/team-lead/Dockerfile.${backend}"
     if [[ ! -f "$dockerfile" ]]; then
-        dockerfile="${SCRIPT_DIR}/team-lead/Dockerfile"
+        echo "ERROR: Missing Dockerfile for backend '${backend}': ${dockerfile}"; echo "Each agent requires a runtime-specific Dockerfile (e.g. Dockerfile.connect-agent)."; return 1
     fi
     echo "==> Building team-lead agent image: constellation-team-lead-agent:latest (backend: ${backend})"
     docker build \
@@ -129,7 +131,7 @@ build_office() {
     backend=$(resolve_backend office)
     local dockerfile="${SCRIPT_DIR}/office/Dockerfile.${backend}"
     if [[ ! -f "$dockerfile" ]]; then
-        dockerfile="${SCRIPT_DIR}/office/Dockerfile"
+        echo "ERROR: Missing Dockerfile for backend '${backend}': ${dockerfile}"; echo "Each agent requires a runtime-specific Dockerfile (e.g. Dockerfile.connect-agent)."; return 1
     fi
     echo "==> Building office agent image: constellation-office-agent:latest (backend: ${backend})"
     docker build \
@@ -144,7 +146,7 @@ build_compass() {
     backend=$(resolve_backend compass)
     local dockerfile="${SCRIPT_DIR}/compass/Dockerfile.${backend}"
     if [[ ! -f "$dockerfile" ]]; then
-        dockerfile="${SCRIPT_DIR}/compass/Dockerfile"
+        echo "ERROR: Missing Dockerfile for backend '${backend}': ${dockerfile}"; echo "Each agent requires a runtime-specific Dockerfile (e.g. Dockerfile.connect-agent)."; return 1
     fi
     echo "==> Building compass agent image: constellation-compass:latest (backend: ${backend})"
     docker build \
@@ -159,7 +161,7 @@ build_jira() {
     backend=$(resolve_backend jira)
     local dockerfile="${SCRIPT_DIR}/jira/Dockerfile.${backend}"
     if [[ ! -f "$dockerfile" ]]; then
-        dockerfile="${SCRIPT_DIR}/jira/Dockerfile"
+        echo "ERROR: Missing Dockerfile for backend '${backend}': ${dockerfile}"; echo "Each agent requires a runtime-specific Dockerfile (e.g. Dockerfile.connect-agent)."; return 1
     fi
     echo "==> Building jira agent image: constellation-jira-agent:latest (backend: ${backend})"
     docker build \
@@ -174,7 +176,7 @@ build_scm() {
     backend=$(resolve_backend scm)
     local dockerfile="${SCRIPT_DIR}/scm/Dockerfile.${backend}"
     if [[ ! -f "$dockerfile" ]]; then
-        dockerfile="${SCRIPT_DIR}/scm/Dockerfile"
+        echo "ERROR: Missing Dockerfile for backend '${backend}': ${dockerfile}"; echo "Each agent requires a runtime-specific Dockerfile (e.g. Dockerfile.connect-agent)."; return 1
     fi
     echo "==> Building scm agent image: constellation-scm-agent:latest (backend: ${backend})"
     docker build \
@@ -189,7 +191,7 @@ build_ui_design() {
     backend=$(resolve_backend ui-design)
     local dockerfile="${SCRIPT_DIR}/ui-design/Dockerfile.${backend}"
     if [[ ! -f "$dockerfile" ]]; then
-        dockerfile="${SCRIPT_DIR}/ui-design/Dockerfile"
+        echo "ERROR: Missing Dockerfile for backend '${backend}': ${dockerfile}"; echo "Each agent requires a runtime-specific Dockerfile (e.g. Dockerfile.connect-agent)."; return 1
     fi
     echo "==> Building ui-design agent image: constellation-ui-design-agent:latest (backend: ${backend})"
     docker build \

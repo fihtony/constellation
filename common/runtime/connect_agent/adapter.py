@@ -361,12 +361,13 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
             "common.tools.coding_tools": ["bash", "read_file", "write_file", "edit_file", "glob", "grep"],
             "common.tools.planning_tools": ["todo_write", "compress"],
             "common.tools.subagent_tool": ["subagent"],
-            "common.tools.skill_tool": ["load_skill"],
-            # Agent lifecycle and control tools (complete/fail task, dispatch agents, etc.)
+            "common.tools.skill_tool": ["load_skill", "list_skills"],
+            # Agent lifecycle and control tools (complete/fail task, dispatch agents, validate paths, etc.)
             "common.tools.control_tools": [
                 "dispatch_agent_task", "wait_for_agent_task", "ack_agent_task",
                 "complete_current_task", "fail_current_task", "get_task_context",
                 "get_agent_runtime_status", "request_user_input",
+                "validate_office_paths", "aggregate_task_card", "derive_user_facing_status",
             ],
             # Registry / discovery tools (query capabilities, list agents, check health)
             "common.tools.registry_tools": [
@@ -384,9 +385,6 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
                 importlib.reload(module)
 
         domain_module_expectations = {
-            "common.tools.jira_tools": ["jira_get_ticket", "jira_add_comment"],
-            "common.tools.scm_tools": ["scm_create_branch", "scm_push_files", "scm_create_pr"],
-            "common.tools.design_tools": ["design_fetch_figma_screen", "design_fetch_stitch_screen"],
             "common.tools.progress_tools": ["report_progress"],
             "common.tools.launcher_tool": ["launch_per_task_agent"],
         }

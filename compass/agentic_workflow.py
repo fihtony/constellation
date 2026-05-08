@@ -108,6 +108,7 @@ def run_compass_workflow(
             "workspacePath": task.workspace_path or "",
             "permissions": metadata.get("permissions"),
             "userText": user_text[:500],
+            "advertisedUrl": advertised_url,
         },
         complete_fn=_on_complete,
         fail_fn=_on_fail,
