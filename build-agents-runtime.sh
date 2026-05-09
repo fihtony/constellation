@@ -102,7 +102,10 @@ get_image_fingerprint() {
 build_agent() {
     local agent_name="$1"   # e.g. "team-lead"
     local image_name="$2"   # e.g. "constellation-team-lead-agent:latest"
-    local extra_args=("${@:3}")
+    local -a extra_args=()
+    if [[ $# -gt 2 ]]; then
+        extra_args=("${@:3}")
+    fi
 
     local agent_dir="${SCRIPT_DIR}/${agent_name}"
     if [[ ! -d "$agent_dir" ]]; then
@@ -135,13 +138,18 @@ build_agent() {
     fi
 
     echo "==> Building ${image_name} [backend=${BACKEND}, dockerfile=$(basename "$dockerfile")]"
-    docker build \
-        "${extra_args[@]}" \
-        --label "constellation.runtime.fingerprint=${fingerprint}" \
-        --label "constellation.runtime.backend=${BACKEND}" \
-        -t "$image_name" \
-        -f "$dockerfile" \
+    local -a build_cmd=(docker build)
+    if [[ ${#extra_args[@]} -gt 0 ]]; then
+        build_cmd+=("${extra_args[@]}")
+    fi
+    build_cmd+=(
+        --label "constellation.runtime.fingerprint=${fingerprint}"
+        --label "constellation.runtime.backend=${BACKEND}"
+        -t "$image_name"
+        -f "$dockerfile"
         "${SCRIPT_DIR}"
+    )
+    "${build_cmd[@]}"
     echo "    Done: ${image_name}"
 }
 
@@ -167,6 +175,18 @@ build_compass() {
     build_agent "compass" "constellation-compass-agent:latest"
 }
 
+build_jira() {
+    build_agent "jira" "constellation-jira-agent:latest"
+}
+
+build_scm() {
+    build_agent "scm" "constellation-scm-agent:latest"
+}
+
+build_ui_design() {
+    build_agent "ui-design" "constellation-ui-design-agent:latest"
+}
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 for TARGET in "${TARGETS[@]}"; do
     case "$TARGET" in
@@ -175,16 +195,22 @@ for TARGET in "${TARGETS[@]}"; do
         team-lead)     build_team_lead ;;
         office)        build_office ;;
         compass)       build_compass ;;
+        jira)          build_jira ;;
+        scm)           build_scm ;;
+        ui-design)     build_ui_design ;;
         all)
             build_team_lead
             build_web
             build_office
             build_android
             build_compass
+            build_jira
+            build_scm
+            build_ui_design
             ;;
         *)
             echo "ERROR: Unknown target '$TARGET'." >&2
-            echo "Usage: $0 [--backend <backend>] [--force] [team-lead|web|android|office|compass|all]" >&2
+            echo "Usage: $0 [--backend <backend>] [--force] [team-lead|web|android|office|compass|jira|scm|ui-design|all]" >&2
             exit 1
             ;;
     esac
