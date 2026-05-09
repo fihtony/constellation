@@ -35,10 +35,37 @@ Capabilities covered:
 The Office Agent runtime backend drives all decisions below. Python code only
 handles protocol, permissions, and tool wiring.
 
+### Progress Message Quality Rule
+
+**MANDATORY**: Every `report_progress` call MUST include real, specific detail.
+Progress messages are shown directly in the user's UI timeline — they must be
+meaningful and informative, not placeholder labels.
+
+**FORBIDDEN short/vague messages** (never use these):
+- `"start"`, `"starting"`, `"begin"`, `"init"`, `"initialize"`
+- `"discovery"`, `"discover"`, `"scan"`, `"scanning"`
+- `"extract"`, `"extraction"`, `"read"`, `"reading"`
+- `"process"`, `"processing"`, `"work"`, `"working"`
+- `"done"`, `"complete"`, `"finish"`, `"finished"`
+- Any single word or vague two-word phrase
+
+**REQUIRED format**: Every progress message must answer one or more of:
+- *What* is being done (specific action)
+- *What files/data* are involved (names, counts, types)
+- *What was found or produced* (concrete results)
+
+Good examples:
+- `"Scanning /app/userdata/stlouis: found 4 files (2 PDF, 1 DOCX, 1 TXT). Preparing to extract text."`
+- `"Reading decembre-2025-bulletin.pdf (PDF, 8 pages) — extracting content with read_pdf tool"`
+- `"Analysis complete: 1,200 rows, top sales rep is Alice Thompson ($148,500 total). Writing analysis.md."`
+- `"Organizing 12 essays by student name: identified 4 students (Ethan, Yan, Alice, Charlie)."`
+
+---
+
 ### Step 1: Orientation
 
-1. Call `report_progress` with a descriptive message, e.g.:
-   `"Starting <capability>: reading task context and preparing execution plan for <N> target path(s)"`
+1. Call `report_progress` with a DESCRIPTIVE message that names the capability and target, e.g.:
+   `"Office Agent starting: capability=<capability>, target=<path>, output_mode=<mode>. Preparing execution plan."`
 2. Use `todo_write` to record a high-level execution plan with numbered steps.
 3. Use `list_local_dir` to understand the target structure.
 4. If no target paths are available, call `fail_current_task` with a clear message.
@@ -49,8 +76,8 @@ handles protocol, permissions, and tool wiring.
 2. Collect readable files by extension: `.txt`, `.md`, `.csv`, `.json`, `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.xls`
 3. Skip files > 50 MB — note them as warnings.
 4. Skip macro-enabled formats (`.xlsm`, `.docm`) — note as unsupported.
-5. Call `report_progress` with a descriptive message, e.g.:
-   `"Discovered <N> files in <M> directories: <list of file types found>. Beginning content extraction."`
+5. Call `report_progress` with a DESCRIPTIVE message that names the files found, e.g.:
+   `"Discovered 4 files in /app/userdata/stlouis: decembre-2025-bulletin.pdf, fevrier-2026-news.pdf, janvier-2026.docx, README.txt. Beginning content extraction."`
 
 ### Extracting Text from Binary Formats
 
