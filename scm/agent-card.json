@@ -90,9 +90,51 @@
     {
       "id": "scm.git.clone",
       "name": "Git Clone (async)",
-      "description": "Clone a repository to a shared workspace path. Returns immediately; notifies via callback when done.",
+      "description": "Clone a repository to a shared workspace path. Supports depth and full_history options. Returns immediately; notifies via callback when done.",
       "tags": ["scm", "git", "clone"],
       "executionMode": "async"
+    },
+    {
+      "id": "scm.repo.read_file",
+      "name": "Read Remote File",
+      "description": "Read a single file from a remote repository branch/ref via API. Does not require a local clone.",
+      "tags": ["scm", "repository", "read"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.repo.list_dir",
+      "name": "List Remote Directory",
+      "description": "List the contents of a directory in a remote repository branch/ref via API. Does not require a local clone.",
+      "tags": ["scm", "repository", "list"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.code.search",
+      "name": "Search Code",
+      "description": "Search for code matching a query within a repository.",
+      "tags": ["scm", "code", "search"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.ref.compare",
+      "name": "Compare Refs",
+      "description": "Compare two branches or commit SHAs. Returns ahead/behind stats and optionally diff.",
+      "tags": ["scm", "branch", "compare", "diff"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.branch.default",
+      "name": "Get Default Branch",
+      "description": "Return the default branch and list of protected branches for a repository.",
+      "tags": ["scm", "branch", "default"],
+      "executionMode": "sync"
+    },
+    {
+      "id": "scm.branch.rules",
+      "name": "Get Branch Rules",
+      "description": "Return branch protection rules combining provider API data with local policy config.",
+      "tags": ["scm", "branch", "policy", "rules"],
+      "executionMode": "sync"
     }
   ]
 }

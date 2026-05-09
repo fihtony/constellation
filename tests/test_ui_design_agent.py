@@ -4,7 +4,7 @@
 Verifies the agent's HTTP API endpoints for Figma and Stitch:
   - GET /health
   - GET /.well-known/agent-card.json
-  - GET /figma/meta, /figma/pages, /figma/page
+  - GET /figma/meta, /figma/pages, /figma/page, /figma/node
   - GET /stitch/tools, /stitch/project, /stitch/screen, /stitch/screen/image
   - POST /message:send  (A2A interface for Figma and Stitch tasks)
   - GET /tasks/{id}     (task state polling)
@@ -247,8 +247,67 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
         else:
             reporter.fail(f"Agent /figma/page failed (status {status})", str(body)[:200])
 
+    # --- /figma/node — element/component design spec by node ID ---
+    # node_id is extracted from the Figma URL (focus-id preferred over node-id).
+    _node_id_raw = ""
+    if FIGMA_URL and "focus-id=" in FIGMA_URL:
+        _node_id_raw = FIGMA_URL.split("focus-id=")[1].split("&")[0]
+    elif FIGMA_URL and "node-id=" in FIGMA_URL:
+        _node_id_raw = FIGMA_URL.split("node-id=")[1].split("&")[0]
+    _figma_node_id = _node_id_raw.replace("-", ":") if _node_id_raw else ""
+
+    if _figma_node_id:
+        reporter.step(f"GET /figma/node — node_id={_figma_node_id}")
+        query_node = urlencode({"url": FIGMA_URL, "node_id": _figma_node_id})
+        status, body, _ = http_request(
+            f"{agent_url}/figma/node?{query_node}",
+            headers=_permission_headers(),
+        )
+        reporter.show("Figma node", body)
+        body_status = body.get("status", "") if isinstance(body, dict) else ""
+        if status == 200 and body_status == "ok":
+            reporter.ok(
+                f"Agent /figma/node: node_id={body.get('nodeId')}, "
+                f"nodes_keys={list((body.get('nodes') or {}).keys())[:3]}"
+            )
+        elif body_status == "error_429":
+            reporter.info("/figma/node: Figma API rate-limited (429) — transient, not a code bug")
+        else:
+            reporter.fail(
+                f"Agent /figma/node failed (status {status})",
+                str(body)[:200],
+            )
+
+        # Also test node fetch using the URL alone (node_id extracted from URL by the agent)
+        reporter.step("GET /figma/node — node_id from URL (no explicit node_id param)")
+        query_url_only = urlencode({"url": FIGMA_URL})
+        status, body, _ = http_request(
+            f"{agent_url}/figma/node?{query_url_only}",
+            headers=_permission_headers(),
+        )
+        body_status = body.get("status", "") if isinstance(body, dict) else ""
+        if status == 200 and body_status == "ok":
+            reporter.ok(f"Agent /figma/node (url-only): node_id={body.get('nodeId')}")
+        elif body_status == "error_429":
+            reporter.info("/figma/node url-only: rate-limited (429) — transient")
+        elif status == 400:
+            reporter.info("/figma/node url-only: 400 — URL has no embedded node ID (expected if URL has no node-id)")
+        else:
+            reporter.fail(
+                f"Agent /figma/node (url-only) failed (status {status})",
+                str(body)[:200],
+            )
+    else:
+        reporter.skip(
+            "GET /figma/node",
+            "TEST_FIGMA_FILE_URL has no node-id or focus-id — cannot test /figma/node",
+        )
+
     # --- Stitch endpoints ---
-    api_key = _load_stitch_key()
+    try:
+        api_key = _load_stitch_key()
+    except SystemExit:
+        api_key = ""
 
     reporter.step("GET /stitch/tools")
     status, body, _ = http_request(
@@ -314,7 +373,7 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
             reporter.fail(f"Agent /stitch/screen/image failed (status {status})", str(body)[:200])
 
     # --- A2A message interface ---
-    reporter.step("POST /message:send — Figma task")
+    reporter.step("POST /message:send — Figma task (figma.file.meta)")
     status, body, _ = http_request(
         f"{agent_url}/message:send",
         method="POST",
@@ -347,6 +406,49 @@ def run_agent_tests(reporter: Reporter, agent_url: str) -> None:
                 reporter.info(f"Figma A2A task state: {state2}")
     else:
         reporter.fail(f"Figma A2A /message:send failed (status {status})", str(body)[:200])
+
+    # A2A: figma.node.get skill
+    if _figma_node_id:
+        reporter.step(f"POST /message:send — figma.node.get (node {_figma_node_id})")
+        status, body, _ = http_request(
+            f"{agent_url}/message:send",
+            method="POST",
+            payload={
+                "message": {
+                    "messageId": "ui-design-test-figma-node",
+                    "role": "ROLE_USER",
+                    "parts": [{
+                        "text": (
+                            f"Fetch element design spec for Figma node {_figma_node_id} "
+                            f"in file {FIGMA_URL}"
+                        )
+                    }],
+                    "metadata": {
+                        "requestedCapability": "figma.node.get",
+                        "permissions": _DEVELOPMENT_PERMISSIONS,
+                    },
+                }
+            },
+        )
+        reporter.show("Message send (figma.node.get)", body)
+        task = body.get("task", {}) if isinstance(body, dict) else {}
+        if status == 200 and task.get("status", {}).get("state") in (
+            "TASK_STATE_WORKING", "TASK_STATE_COMPLETED"
+        ):
+            task_id = task.get("id", "")
+            reporter.ok(f"figma.node.get A2A task submitted: {task_id}")
+            time.sleep(3)
+            if task_id:
+                status2, body2, _ = http_request(f"{agent_url}/tasks/{task_id}")
+                state2 = (body2.get("task", {}) or {}).get("status", {}).get("state", "")
+                if state2 == "TASK_STATE_COMPLETED":
+                    reporter.ok(f"figma.node.get A2A task completed: {task_id}")
+                else:
+                    reporter.info(f"figma.node.get A2A task state: {state2}")
+        else:
+            reporter.fail(
+                f"figma.node.get A2A /message:send failed (status {status})", str(body)[:200]
+            )
 
     if STITCH_SCREEN_ID:
         reporter.step("POST /message:send — Stitch task")
@@ -429,7 +531,10 @@ def main(argv=None):
         return 0 if reporter.failed == 0 else 1
 
     figma_token = _load_figma_token()
-    stitch_key = _load_stitch_key()
+    try:
+        stitch_key = _load_stitch_key()
+    except SystemExit:
+        stitch_key = ""
     if figma_token:
         os.environ["FIGMA_TOKEN"] = figma_token
     if stitch_key:

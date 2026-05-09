@@ -98,6 +98,11 @@ Parse SSE by splitting lines, finding `data:` prefix, and parsing the JSON value
 | `scm.pr.comment` | `add_issue_comment` | `owner`, `repo`, `issue_number`, `body` |
 | `scm.pr.comment.list` | `issue_read` | `owner`, `repo`, `issue_number`, `method="get_comments"` |
 
+Remote-read supplement:
+- The current GitHub MCP toolset does not cover every Constellation `SCMProvider` method.
+- `GitHubMCPProvider` therefore keeps MCP as the primary backend for repo search, branch, push, and PR flows, but may reuse the GitHub REST-compatible provider logic for required read-only methods such as remote file/dir access, code search, ref comparison, default branch lookup, and branch rules.
+- Treat this as a provider-contract compatibility layer, not as runtime backend fallback between agentic backends.
+
 ## Key Tool Signatures
 
 ### push_files

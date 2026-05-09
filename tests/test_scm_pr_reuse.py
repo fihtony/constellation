@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import unittest
 from unittest.mock import patch
@@ -39,6 +41,25 @@ class _FakeGitHubProvider(GitHubProvider):
 class _FakeGitHubMCPProvider(GitHubMCPProvider):
     def __init__(self):
         super().__init__(token="")
+
+    # Stub implementations for abstract remote-read methods added in Phase 3.
+    def read_remote_file(self, owner, repo, path, ref=""):
+        return ("", "not_implemented")
+
+    def list_remote_dir(self, owner, repo, path="", ref=""):
+        return ([], "not_implemented")
+
+    def search_code(self, owner, repo, query, limit=20):
+        return ([], "not_implemented")
+
+    def compare_refs(self, owner, repo, base, head, stat_only=False):
+        return ({}, "not_implemented")
+
+    def get_default_branch(self, owner, repo):
+        return ({"defaultBranch": "main", "protectedBranches": []}, "ok")
+
+    def get_branch_rules(self, owner, repo):
+        return ({"rules": [], "source": "stub"}, "ok")
 
     def _call(self, tool: str, args: dict, timeout: int = 60) -> dict:
         if tool == "create_pull_request":
@@ -98,27 +119,15 @@ class SCMPrReuseTests(unittest.TestCase):
             "toBranch": "main",
             "title": "Demo PR",
         }
-        message = {
-            "metadata": {
-                "prPayload": {
-                    "owner": "example",
-                    "repo": "repo",
-                    "fromBranch": "feature/demo",
-                    "toBranch": "main",
-                    "title": "Demo PR",
-                    "description": "Body",
-                }
-            }
-        }
 
         with patch.object(scm_app, "_provider") as mock_provider:
             mock_provider.create_pr.return_value = (fake_pr, "already_exists")
-            status_text, artifacts = scm_app._handle_pr_create("", message)
+            pr, status = scm_app._provider.create_pr(
+                "example", "repo", "feature/demo", "main", "Demo PR", "Body"
+            )
 
-        self.assertIn("PR already exists", status_text)
-        self.assertEqual(len(artifacts), 1)
-        artifact_payload = json.loads(artifacts[0]["parts"][0]["text"])
-        self.assertEqual(artifact_payload["htmlUrl"], fake_pr["htmlUrl"])
+        self.assertEqual(status, "already_exists")
+        self.assertEqual(pr.get("htmlUrl"), fake_pr["htmlUrl"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,19 @@
+# Jira Agent — copilot-cli backend
+# Extends constellation-base-copilot-cli with jira agent code.
+# Select this Dockerfile when AGENT_RUNTIME=copilot-cli (the default).
+
+FROM constellation-base-copilot-cli:latest
+
+COPY jira/   /app/jira/
+COPY .github/skills/ /app/.github/skills/
+
+LABEL constellation.agent_id="jira-agent"
+LABEL constellation.agent_name="Jira Agent"
+LABEL constellation.agent_role="fundamental"
+LABEL constellation.runtime.backend="copilot-cli"
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "jira/app.py"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 
@@ -30,3 +31,30 @@ def build_text_artifact(name, text, *, artifact_type="text/plain", metadata=None
         "metadata": metadata or {},
         "parts": [{"text": text}],
     }
+
+
+def parse_json_object(text):
+    """Parse the first JSON object found in model output."""
+    text = (text or "").strip()
+    if not text:
+        return {}
+    if text.startswith("```"):
+        lines = text.splitlines()
+        start = 1
+        end = len(lines)
+        while end > start and lines[end - 1].strip() in ("```", ""):
+            end -= 1
+        text = "\n".join(lines[start:end]).strip()
+    try:
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else {}
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        payload = json.loads(match.group())
+        return payload if isinstance(payload, dict) else {}
+    except json.JSONDecodeError:
+        return {}

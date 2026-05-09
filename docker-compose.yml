@@ -13,6 +13,8 @@ services:
       constellation.agent_id: "capability-registry"
       constellation.agent_name: "Capability Registry"
       constellation.agent_role: "fundamental"
+    volumes:
+      - ./.github/skills:/app/.github/skills:ro
     ports:
       - "9000:9000"
     healthcheck:
@@ -42,7 +44,7 @@ services:
     image: constellation-compass-agent:latest
     build:
       context: .
-      dockerfile: compass/Dockerfile
+      dockerfile: compass/Dockerfile.connect-agent
     command: ["python3", "compass/app.py"]
     depends_on:
       registry:
@@ -107,7 +109,7 @@ services:
       TZ: "${TZ:-UTC}"
     build:
       context: .
-      dockerfile: jira/Dockerfile
+      dockerfile: jira/Dockerfile.connect-agent
     image: constellation-jira-agent:latest
     labels:
       constellation.agent_id: "jira-agent"
@@ -128,7 +130,7 @@ services:
     image: constellation-scm-agent:latest
     build:
       context: .
-      dockerfile: scm/Dockerfile
+      dockerfile: scm/Dockerfile.connect-agent
     command: ["python3", "scm/app.py"]
     depends_on:
       registry:
@@ -164,7 +166,7 @@ services:
     image: constellation-ui-design-agent:latest
     build:
       context: .
-      dockerfile: ui-design/Dockerfile
+      dockerfile: ui-design/Dockerfile.connect-agent
     command: ["python3", "ui-design/app.py"]
     depends_on:
       registry:
@@ -227,7 +229,6 @@ services:
   #     COMPASS_URL: "http://compass:8080"
   #     HEARTBEAT_INTERVAL: "30"
   #     OPENAI_BASE_URL: "http://host.docker.internal:1288/v1"
-  #     ALLOW_MOCK_FALLBACK: "0"
   #     DYNAMIC_AGENT_NETWORK: "constellation-network"
   #     ARTIFACT_ROOT: "/app/artifacts"
   #     DOCKER_SOCKET: "/var/run/docker.sock"

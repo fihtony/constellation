@@ -323,5 +323,75 @@ class TestRateLimiting(unittest.TestCase):
             self.assertEqual(val, 8.0)
 
 
+class TestToolLayerWrappers(unittest.TestCase):
+    """Unit tests for list_pages(), fetch_page(), and fetch_node() — the
+    tool-layer convenience wrappers used by provider_tools.py.
+    """
+
+    @patch("figma_client._figma_get")
+    def test_list_pages_success(self, mock_get):
+        mock_get.return_value = (200, {
+            "document": {"children": [
+                {"id": "0:1", "name": "Page 1", "type": "CANVAS"},
+                {"id": "0:2", "name": "Page 2", "type": "CANVAS"},
+            ]}
+        })
+        pages = figma_client.list_pages("abc123")
+        self.assertIsInstance(pages, list)
+        self.assertEqual(len(pages), 2)
+        self.assertEqual(pages[0]["name"], "Page 1")
+
+    @patch("figma_client._figma_get")
+    def test_list_pages_raises_on_error(self, mock_get):
+        mock_get.return_value = (403, {"err": "forbidden"})
+        with self.assertRaises(RuntimeError) as ctx:
+            figma_client.list_pages("bad-key")
+        self.assertIn("error_403", str(ctx.exception))
+
+    @patch("figma_client._figma_get")
+    def test_fetch_page_success(self, mock_get):
+        # First call (fetch_pages), second call (fetch_nodes)
+        mock_get.side_effect = [
+            (200, {
+                "document": {"children": [
+                    {"id": "0:1", "name": "Home", "type": "CANVAS"},
+                ]}
+            }),
+            (200, {"nodes": {"0:1": {"document": {"type": "CANVAS", "name": "Home"}}}}),
+        ]
+        result = figma_client.fetch_page("abc123", "Home")
+        self.assertIsInstance(result, dict)
+        self.assertIn("page", result)
+        self.assertEqual(result["page"]["name"], "Home")
+
+    @patch("figma_client._figma_get")
+    def test_fetch_page_not_found_raises(self, mock_get):
+        mock_get.return_value = (200, {
+            "document": {"children": [
+                {"id": "0:1", "name": "Home", "type": "CANVAS"},
+            ]}
+        })
+        with self.assertRaises(RuntimeError) as ctx:
+            figma_client.fetch_page("abc123", "NonExistentPageXYZ12345")
+        self.assertIn("page_not_found", str(ctx.exception))
+
+    @patch("figma_client._figma_get")
+    def test_fetch_node_success(self, mock_get):
+        mock_get.return_value = (200, {
+            "nodes": {"1:470": {"document": {"type": "FRAME", "name": "Button"}}}
+        })
+        result = figma_client.fetch_node("abc123", "1:470")
+        self.assertIsInstance(result, dict)
+        self.assertIn("nodes", result)
+        self.assertIn("1:470", result["nodes"])
+
+    @patch("figma_client._figma_get")
+    def test_fetch_node_raises_on_error(self, mock_get):
+        mock_get.return_value = (404, {"err": "not found"})
+        with self.assertRaises(RuntimeError) as ctx:
+            figma_client.fetch_node("abc123", "9:999")
+        self.assertIn("error_404", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

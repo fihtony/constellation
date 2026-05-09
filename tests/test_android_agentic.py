@@ -29,7 +29,6 @@ REPO_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(REPO_ROOT))
 
 os.environ.setdefault("OPENAI_BASE_URL", "http://localhost:1288/v1")
-os.environ.setdefault("ALLOW_MOCK_FALLBACK", "0")
 os.environ.setdefault("AGENT_RUNTIME", "connect-agent")
 
 from common.env_utils import load_dotenv  # noqa: E402
@@ -38,7 +37,8 @@ load_dotenv(REPO_ROOT / "android" / ".env")
 
 from common.runtime.adapter import get_runtime  # noqa: E402
 from common.runtime.connect_agent.verifier import detect_suspicious_binary_artifact_mutations  # noqa: E402
-from android import prompts as android_prompts  # noqa: E402
+from common.prompt_builder import build_system_prompt_from_manifest  # noqa: E402
+from android.agentic_workflow import build_android_task_prompt  # noqa: E402
 
 # ── paths ───────────────────────────────────────────────────────────────────
 DATA_DIR = REPO_ROOT / "tests" / "data" / "android"
@@ -348,16 +348,15 @@ def build_task_prompt(jira: dict, design_spec: str, repo_dir: Path) -> str:
 
     description_text = summary_text[:4000] if summary_text else jira.get("title") or ""
 
-    return android_prompts.ANDROID_AGENTIC_TASK_TEMPLATE.format(
+    return build_android_task_prompt(
+        user_text=description_text,
+        workspace=str(REPO_DIR),
+        compass_task_id="test-compass",
+        android_task_id="test-android",
+        acceptance_criteria=deliverables_text,
+        target_repo_url="",
+        jira_context=jira,
         ticket_key=jira.get("key") or "UNKNOWN",
-        ticket_title=jira.get("title") or "(no title)",
-        ticket_status=jira.get("status") or "Unknown",
-        ticket_description=description_text,
-        design_spec=design_spec,
-        package_name=package_name,
-        build_file=build_file,
-        extra_repo_info=extra_repo_info,
-        deliverables=deliverables_text,
     )
 
 
@@ -817,7 +816,7 @@ def main() -> int:
 
         agentic_result = runtime.run_agentic(
             task=task_prompt,
-            system_prompt=android_prompts.ANDROID_AGENTIC_SYSTEM,
+            system_prompt=build_system_prompt_from_manifest(str(REPO_ROOT / "android")),
             cwd=str(REPO_DIR),
             tools=["bash", "read_file", "write_file", "edit_file", "glob", "grep", "todo_write"],
             max_turns=args.max_turns,
@@ -931,12 +930,12 @@ def main() -> int:
         for gap in assessment["gaps"]:
             print(f"  → {gap}")
         print(
-            "\nSuggested prompt improvements based on gaps:\n"
-            "  • If no Fragment: tighten ANDROID_AGENTIC_SYSTEM to emphasize Fragment+RV over Compose\n"
-            "  • If no tests:    add explicit test class names to ANDROID_AGENTIC_TASK_TEMPLATE deliverables\n"
+            "\nSuggested improvements based on gaps:\n"
+            "  • If no Fragment: tighten system prompt to emphasize Fragment+RV over Compose\n"
+            "  • If no tests:    add explicit test class names to task prompt deliverables\n"
             "  • If no evidence: add docs/evidence/ instructions and real-artifact validation to task template\n"
             "  • If screen is unreachable: add host-navigation wiring and entry-path verification requirements\n"
-            "  • If build fails: review BUILD_FIX_SYSTEM and add Robolectric SDK config hints\n"
+            "  • If build fails: review system prompt BUILD section and add Robolectric SDK config hints\n"
         )
         return 1
     else:

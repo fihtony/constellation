@@ -85,6 +85,7 @@ class AgentRuntimeAdapter(ABC):
         *,
         system_prompt: str | None = None,
         cwd: str | None = None,
+        extra_allow_roots: list[str] | None = None,
         tools: list[str] | None = None,
         mcp_servers: dict | None = None,
         allowed_tools: list[str] | None = None,
@@ -99,7 +100,7 @@ class AgentRuntimeAdapter(ABC):
         Default implementation raises NotImplementedError.  Backends that
         support agentic mode override this method.
         """
-        del task, system_prompt, cwd, tools, mcp_servers, allowed_tools, disallowed_tools
+        del task, system_prompt, cwd, extra_allow_roots, tools, mcp_servers, allowed_tools, disallowed_tools
         del max_turns, timeout, on_progress, continuation
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support run_agentic(). "
@@ -211,7 +212,6 @@ _ALIASES = {
     "connect-agent": "connect-agent",
     "claude": "claude-code",
     "claude-code": "claude-code",
-    "mock": "mock",
 }
 
 _INSTANCES: dict[str, AgentRuntimeAdapter] = {}
@@ -219,7 +219,7 @@ _INSTANCES: dict[str, AgentRuntimeAdapter] = {}
 
 def resolve_backend_name(backend: str | None = None) -> tuple[str, str]:
     requested = (backend or os.environ.get("AGENT_RUNTIME") or "connect-agent").strip().lower()
-    return requested, _ALIASES.get(requested, "connect-agent")
+    return requested, _ALIASES.get(requested, requested)
 
 
 def _copilot_cli_status() -> dict:
@@ -253,11 +253,17 @@ def _claude_code_status() -> dict:
     }
 
 
+def backend_supports_agentic(backend: str | None = None) -> bool:
+    _, effective = resolve_backend_name(backend)
+    return effective in {"connect-agent", "claude-code", "copilot-cli"}
+
+
 def summarize_runtime_configuration(backend: str | None = None) -> dict:
     requested, effective = resolve_backend_name(backend)
     summary = {
         "requestedBackend": requested,
         "effectiveBackend": effective,
+        "supportsAgentic": backend_supports_agentic(effective),
     }
 
     if effective == "copilot-cli":
@@ -267,12 +273,13 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 **cli_status,
                 "model": AgentRuntimeAdapter.resolve_model(
                     os.environ.get("AGENT_MODEL"),
-                    os.environ.get("COPILOT_MODEL"),
-                    os.environ.get("OPENAI_MODEL"),
                     fallback="gpt-5-mini",
                 ),
             }
         )
+        summary["agenticReady"] = bool(cli_status["ready"])
+        if not summary["agenticReady"]:
+            summary["agenticError"] = "Copilot CLI is not ready (token or binary missing)."
         if not cli_status["ready"]:
             summary["error"] = "Copilot CLI is not ready (token or binary missing)."
     elif effective == "claude-code":
@@ -282,11 +289,13 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 **claude_status,
                 "model": AgentRuntimeAdapter.resolve_model(
                     os.environ.get("AGENT_MODEL"),
-                    os.environ.get("CLAUDE_CODE_MODEL"),
                     fallback="claude-haiku-4-5",
                 ),
             }
         )
+        summary["agenticReady"] = bool(claude_status["ready"])
+        if not summary["agenticReady"]:
+            summary["agenticError"] = f"Claude Code binary '{claude_status['binary']}' is not available."
         if not claude_status["ready"]:
             summary["error"] = f"Claude Code binary '{claude_status['binary']}' is not available."
     elif effective == "connect-agent":
@@ -297,7 +306,6 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 "apiKeyConfigured": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
                 "model": AgentRuntimeAdapter.resolve_model(
                     os.environ.get("AGENT_MODEL"),
-                    os.environ.get("OPENAI_MODEL"),
                     fallback="gpt-5-mini",
                 ),
                 "sandboxRoot": os.environ.get("CONNECT_AGENT_SANDBOX_ROOT", ""),
@@ -305,16 +313,26 @@ def summarize_runtime_configuration(backend: str | None = None) -> dict:
                 "timeout": os.environ.get("CONNECT_AGENT_TIMEOUT", "1800"),
             }
         )
-    elif effective == "mock":
-        summary.update(
-            {
-                "model": AgentRuntimeAdapter.resolve_model(
-                    os.environ.get("AGENT_MODEL"),
-                    fallback="mock",
-                ),
-                "customResponseConfigured": bool(os.environ.get("MOCK_RUNTIME_RESPONSE", "").strip()),
-            }
+        summary["agenticReady"] = True
+    else:
+        summary["agenticReady"] = False
+        summary["agenticError"] = f"Unknown runtime backend '{effective}'."
+    return summary
+
+
+def require_agentic_runtime(agent_name: str, backend: str | None = None) -> dict:
+    summary = summarize_runtime_configuration(backend)
+    effective = str(summary.get("effectiveBackend") or "unknown")
+
+    if not summary.get("supportsAgentic"):
+        raise RuntimeError(
+            f"{agent_name} requires an agentic runtime backend, but '{effective}' does not support run_agentic(). "
+            "Configure AGENT_RUNTIME=connect-agent or AGENT_RUNTIME=claude-code for this agent."
         )
+
+    if not summary.get("agenticReady"):
+        detail = str(summary.get("agenticError") or summary.get("error") or "Configured runtime backend is not ready.")
+        raise RuntimeError(f"{agent_name} cannot start agentic execution: {detail}")
 
     return summary
 
@@ -332,10 +350,6 @@ def _load_backend_class(backend: str) -> type[AgentRuntimeAdapter]:
         from common.runtime.connect_agent import ConnectAgentAdapter
 
         return ConnectAgentAdapter
-    if backend == "mock":
-        from common.runtime.mock import MockAdapter
-
-        return MockAdapter
     raise KeyError(backend)
 
 
@@ -351,11 +365,6 @@ def get_runtime(
     3. default ``connect-agent``
     """
     requested, effective_backend = resolve_backend_name(backend)
-
-    if requested not in _ALIASES:
-        print(
-            f"[runtime] Unknown backend '{requested}', falling back to '{effective_backend}'."
-        )
 
     if model:
         os.environ["AGENT_MODEL"] = model

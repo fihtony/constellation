@@ -111,6 +111,7 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
         *,
         system_prompt: str | None = None,
         cwd: str | None = None,
+        extra_allow_roots: list[str] | None = None,
         tools: list[str] | None = None,
         mcp_servers: dict | None = None,
         allowed_tools: list[str] | None = None,
@@ -122,7 +123,7 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
     ) -> AgenticResult:
         # allowed_tools is superseded by the explicit `tools` list; continuation is
         # a no-op for claude-code (it uses --resume via session state files instead).
-        del allowed_tools, continuation
+        del allowed_tools, continuation, extra_allow_roots
         binary = os.environ.get("CLAUDE_CODE_BIN", "claude").strip() or "claude"
         if shutil.which(binary) is None:
             return AgenticResult(

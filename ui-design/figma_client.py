@@ -576,3 +576,52 @@ def extract_design_tokens(file_data: dict) -> dict:
         elif stype == "EFFECT":
             tokens["effects"][name] = style
     return tokens
+
+
+# ---------------------------------------------------------------------------
+# Tool-layer convenience wrappers
+#
+# provider_tools.py registers agentic runtime tools that need a simpler,
+# exception-raising API rather than the (result, status) tuple style used by
+# the internal fetch_* family.  These wrappers translate between the two styles
+# so that tools can use plain try/except without status-string inspection.
+# ---------------------------------------------------------------------------
+
+def list_pages(file_key: str) -> list:
+    """Return the list of pages in a Figma file.
+
+    Wraps fetch_pages() and raises RuntimeError on any API error.
+    Used by the ``figma_list_pages`` agentic tool in provider_tools.py.
+    """
+    pages, status = fetch_pages(file_key)
+    if status != "ok":
+        raise RuntimeError(f"Figma list_pages failed for '{file_key}': {status}")
+    return pages
+
+
+def fetch_page(file_key: str, page_name: str = "") -> dict:
+    """Fetch node data for a named page in a Figma file (fuzzy match).
+
+    Wraps fetch_page_by_name() and raises RuntimeError on error.
+    Used by the ``figma_fetch_page`` agentic tool in provider_tools.py.
+    """
+    result, status = fetch_page_by_name(file_key, page_name)
+    if status not in ("ok",):
+        raise RuntimeError(
+            f"Figma fetch_page failed for '{file_key}'/'{page_name}': {status} — {result}"
+        )
+    return result
+
+
+def fetch_node(file_key: str, node_id: str) -> dict:
+    """Fetch the design spec for a single Figma node by ID.
+
+    Wraps fetch_nodes() and raises RuntimeError on error.
+    Used by the ``figma_fetch_node`` agentic tool in provider_tools.py.
+    """
+    result, status = fetch_nodes(file_key, [node_id])
+    if status != "ok":
+        raise RuntimeError(
+            f"Figma fetch_node failed for '{file_key}' node '{node_id}': {status}"
+        )
+    return result

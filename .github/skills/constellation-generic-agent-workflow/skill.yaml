@@ -1,0 +1,19 @@
+id: constellation-generic-agent-workflow
+version: 1.0.0
+level: generic
+owner: all-agents
+appliesTo:
+  agentRoles: [compass, team-lead, web, android, jira, scm, ui-design, office]
+  workflows: [all]
+  taskTags: [workflow, runtime, agentic]
+  languages: []
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools:
+  - complete_current_task
+  - fail_current_task
+provides:
+  - runtime-first-workflow-guidance
+  - tool-driven-decision-making
+hashPolicy: sha256
+trustLevel: reviewed

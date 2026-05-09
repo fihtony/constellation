@@ -1,0 +1,30 @@
+id: android-compose-delivery
+version: 1.0.0
+level: domain
+owner: android-agent
+appliesTo:
+  agentRoles: [android]
+  workflows: [development, review, validation]
+  taskTags: [android, kotlin, compose, gradle, mobile]
+  languages: [kotlin, java]
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools:
+  - read_local_file
+  - write_local_file
+  - edit_local_file
+  - list_local_dir
+  - search_local_files
+  - run_validation_command
+  - scm_clone_repo
+  - scm_create_branch
+  - scm_push_files
+  - scm_create_pr
+provides:
+  - android-kotlin-guidance
+  - gradle-build-guidance
+  - jetpack-compose-guidance
+  - android-testing-guidance
+  - android-evidence-delivery
+hashPolicy: sha256
+trustLevel: reviewed

@@ -143,21 +143,52 @@ For a typical development workflow targeting a specific screen or section:
 | `FIGMA_CACHE_DIR` | `/tmp/figma_cache` | File-system cache directory |
 | `FIGMA_CACHE_TTL` | `3600` | Cache TTL in seconds |
 
-## Test Targets
+## Tool-Layer Wrapper Functions
 
-```python
-FIGMA_FILE_KEY = "gxd2LNayM2hh3V3qTlcyPF"   # Website Wireframes UI Kit
-FIGMA_NODE_ID  = "1:470"                       # Example element node
-```
+`figma_client.py` provides three exception-raising convenience wrappers for use by
+`provider_tools.py` and agentic runtime tools. They translate the `(result, status)` tuple
+style into a raise-on-error style that tools can consume with plain `try/except`.
 
-Run the test suite:
+| Wrapper | Wraps | Raises on error |
+|---------|-------|-----------------|
+| `list_pages(file_key)` | `fetch_pages(file_key)` | `RuntimeError` with status string |
+| `fetch_page(file_key, page_name)` | `fetch_page_by_name(file_key, page_name)` | `RuntimeError` with status string |
+| `fetch_node(file_key, node_id)` | `fetch_nodes(file_key, [node_id])` | `RuntimeError` with status string |
+
+**Registered agentic tools** (in `provider_tools.py`):
+
+| Tool name | Figma client function | Permission required |
+|-----------|----------------------|---------------------|
+| `figma_list_pages` | `list_pages(file_key)` | `figma.read` |
+| `figma_fetch_page` | `fetch_page(file_key, page_name)` | `figma.read` |
+| `figma_fetch_node` | `fetch_node(file_key, node_id)` | `element.inspect` |
+
+## Test Coverage
+
+| Test file | Coverage |
+|-----------|---------|
+| `tests/test_figma_client.py` | Unit: URL parsing, cache, rate-limit, `extract_ui_specs`, `extract_design_tokens`, `traverse_and_extract`, `list_pages`, `fetch_page`, `fetch_node` wrappers |
+| `tests/test_figma_rest_api.py` | Integration: token validation, file meta, page list (REST + module), node fetch, page-by-name lookup, fuzzy match, full-file download, `extract_design_tokens`, `extract_ui_specs` on real node, all 3 tool wrappers |
+| `tests/test_ui_design_agent.py` | Agent endpoints: `/figma/meta`, `/figma/pages`, `/figma/page`, `/figma/node` (explicit + URL-embedded node_id); A2A skills: `figma.file.meta`, `figma.node.get` |
+
+Run the test suites:
 ```bash
-# Dry-run (no network):
-python3 tests/test_ui_design_agent.py
+# Unit tests (no network):
+FIGMA_MIN_CALL_INTERVAL_SECONDS=0 FIGMA_TOKEN=test-token \
+  PYTHONPATH=.:ui-design python3 -m pytest tests/test_figma_client.py -v
 
-# Full integration (requires running agent + FIGMA_TOKEN):
-python3 tests/test_ui_design_agent.py --integration --figma
+# REST API integration (requires TEST_FIGMA_TOKEN in tests/.env):
+FIGMA_MIN_CALL_INTERVAL_SECONDS=0 python3 tests/test_figma_rest_api.py --integration -v
 
-# Against the container:
-python3 tests/test_ui_design_agent.py --integration --agent-url http://127.0.0.1:8041
+# Agent endpoint integration (requires running agent + TEST_FIGMA_TOKEN):
+FIGMA_MIN_CALL_INTERVAL_SECONDS=0 \
+  python3 tests/test_ui_design_agent.py --integration --agent-url http://127.0.0.1:8040
+
+# Agent endpoint integration against container (build first):
+docker build -t constellation-ui-design-agent:latest -f ui-design/Dockerfile .
+docker run -d --name ui-design-test -p 8040:8040 \
+  -e FIGMA_TOKEN=<token> -e FIGMA_MIN_CALL_INTERVAL_SECONDS=0 \
+  -e PERMISSION_ENFORCEMENT=off -e AGENT_RUNTIME=connect-agent \
+  constellation-ui-design-agent:latest
+python3 tests/test_ui_design_agent.py --integration --agent-url http://localhost:8040
 ```

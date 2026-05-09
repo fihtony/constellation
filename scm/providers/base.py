@@ -94,6 +94,70 @@ class SCMProvider(ABC):
         """Push file changes to a branch. Returns (result_dict, status)."""
 
     # ------------------------------------------------------------------
+    # Remote read operations (no local clone required)
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def read_remote_file(
+        self, owner: str, repo: str, path: str, ref: str = ""
+    ) -> tuple[str, str]:
+        """Read a single file from a remote branch/ref via API.
+
+        Returns (content, status).  status is "ok" on success.
+        Does NOT require a local clone.
+        """
+
+    @abstractmethod
+    def list_remote_dir(
+        self, owner: str, repo: str, path: str = "", ref: str = ""
+    ) -> tuple[list[dict], str]:
+        """List the contents of a directory in a remote branch/ref via API.
+
+        Returns ([{name, path, type, size}, ...], status).
+        Does NOT require a local clone.
+        """
+
+    @abstractmethod
+    def search_code(
+        self, owner: str, repo: str, query: str, limit: int = 20
+    ) -> tuple[list[dict], str]:
+        """Search code in a remote repository.
+
+        Returns ([{path, fragmentText, htmlUrl}, ...], status).
+        """
+
+    @abstractmethod
+    def compare_refs(
+        self,
+        owner: str,
+        repo: str,
+        base: str,
+        head: str,
+        stat_only: bool = False,
+    ) -> tuple[dict, str]:
+        """Compare two branches or commit SHAs.
+
+        Returns (comparison_dict, status).
+        comparison_dict keys: aheadBy, behindBy, totalChangedFiles,
+        additions, deletions, files, diff (if not stat_only).
+        """
+
+    @abstractmethod
+    def get_default_branch(self, owner: str, repo: str) -> tuple[dict, str]:
+        """Return the default branch and known protected branch names.
+
+        Returns ({"defaultBranch": str, "protectedBranches": [str, ...]}, status).
+        """
+
+    @abstractmethod
+    def get_branch_rules(self, owner: str, repo: str) -> tuple[dict, str]:
+        """Return branch protection rules for the repository.
+
+        Returns ({"rules": [...], "source": str}, status).
+        Rules combine local policy config with provider-reported protection data.
+        """
+
+    # ------------------------------------------------------------------
     # Provider identity
     # ------------------------------------------------------------------
 

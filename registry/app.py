@@ -6,17 +6,35 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import re
+import threading
 from urllib.parse import parse_qs, urlparse
 
 from common.registry_store import RegistryStore
+from common.skills_catalog import SkillsCatalog
 
 HOST = os.environ.get("REGISTRY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("REGISTRY_PORT", "9000"))
+# How often (seconds) the registry automatically rescans the skills catalog.
+# Default 60 seconds; set to 0 to disable periodic rescan.
+SKILLS_RESCAN_INTERVAL = int(os.environ.get("SKILLS_RESCAN_INTERVAL", "60"))
 
 store = RegistryStore()
+_skills = SkillsCatalog()
 
 
 def _parse_path(path):
+    # Skills catalog endpoints
+    if path == "/skills/catalog":
+        return "skills_catalog", None, None, None
+    if path == "/skills/catalog/version":
+        return "skills_catalog_version", None, None, None
+    if path == "/skills/query":
+        return "skills_query", None, None, None
+    if path == "/skills/rescan":
+        return "skills_rescan", None, None, None
+    m = re.match(r"^/skills/([^/]+)$", path)
+    if m:
+        return "skill", m.group(1), None, None
     if path == "/topology":
         return "topology", None, None, None
     if path == "/events":
@@ -112,6 +130,26 @@ class RegistryHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if resource == "skills_catalog":
+            self._send_json(200, {
+                "version": _skills.get_version(),
+                "skills": _skills.get_catalog(),
+            })
+            return
+
+        if resource == "skills_catalog_version":
+            self._send_json(200, {"version": _skills.get_version()})
+            return
+
+        if resource == "skill":
+            # agent_id holds the skill id in this context (reused slot)
+            s = _skills.get_skill(agent_id)
+            if s is None:
+                self._send_json(404, {"error": "skill_not_found", "skillId": agent_id})
+            else:
+                self._send_json(200, s)
+            return
+
         self._send_json(404, {"error": "unknown_path"})
 
     def do_POST(self):
@@ -150,6 +188,25 @@ class RegistryHandler(BaseHTTPRequestHandler):
             )
             print(f"[registry] Instance added: {agent_id}/{instance.instance_id} url={instance.service_url}")
             self._send_json(201, instance.to_dict())
+            return
+
+        if resource == "skills_query":
+            result = _skills.query(body)
+            self._send_json(200, result)
+            return
+
+        if resource == "skills_rescan":
+            old_version = _skills.get_version()
+            _skills.scan()
+            new_version = _skills.get_version()
+            count = len(_skills.get_catalog())
+            changed = old_version != new_version
+            print(f"[registry] Skills rescan triggered via API: {count} skills, version={new_version} (changed={changed})")
+            self._send_json(200, {
+                "version": new_version,
+                "skillCount": count,
+                "versionChanged": changed,
+            })
             return
 
         self._send_json(404, {"error": "unknown_path"})
@@ -204,8 +261,42 @@ class RegistryHandler(BaseHTTPRequestHandler):
         print(f"[registry] {line} {args[1] if len(args) > 1 else ''} {args[2] if len(args) > 2 else ''}")
 
 
+def _start_skills_rescan_thread() -> None:
+    """Background thread that periodically rescans the skills catalog.
+
+    Enables hot-upgrade of skills: drop a new SKILL.md + skill.yaml into the
+    mounted ``.github/skills/`` directory and within SKILLS_RESCAN_INTERVAL
+    seconds all agents will see the new skill via ``load_skill`` or the
+    ``/skills/catalog`` endpoint without rebuilding or restarting any container.
+    """
+    if SKILLS_RESCAN_INTERVAL <= 0:
+        return
+
+    def _loop() -> None:
+        while True:
+            import time as _time
+            _time.sleep(SKILLS_RESCAN_INTERVAL)
+            old_version = _skills.get_version()
+            _skills.scan()
+            new_version = _skills.get_version()
+            if old_version != new_version:
+                count = len(_skills.get_catalog())
+                print(
+                    f"[registry] Skills catalog updated: {count} skills, "
+                    f"version={new_version} (was {old_version})"
+                )
+
+    t = threading.Thread(target=_loop, daemon=True, name="skills-rescan")
+    t.start()
+    print(f"[registry] Skills hot-reload enabled (interval={SKILLS_RESCAN_INTERVAL}s, "
+          f"rescan endpoint=POST /skills/rescan)")
+
+
 def main():
     print(f"[registry] Capability Registry starting on {HOST}:{PORT}")
+    _skills.scan()
+    print(f"[registry] Skills catalog loaded: {len(_skills.get_catalog())} skills, version={_skills.get_version()}")
+    _start_skills_rescan_thread()
     server = ThreadingHTTPServer((HOST, PORT), RegistryHandler)
     server.serve_forever()
 

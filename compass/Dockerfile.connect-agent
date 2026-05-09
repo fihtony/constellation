@@ -1,0 +1,18 @@
+# Compass Agent — connect-agent backend
+# Extends constellation-base-connect-agent with compass agent code.
+# Select this Dockerfile when AGENT_RUNTIME=connect-agent.
+
+FROM constellation-base-connect-agent:latest
+
+COPY compass/ /app/compass/
+
+LABEL constellation.agent_id="compass-agent"
+LABEL constellation.agent_name="Compass Agent"
+LABEL constellation.agent_role="fundamental"
+LABEL constellation.runtime.backend="connect-agent"
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "compass/app.py"]
