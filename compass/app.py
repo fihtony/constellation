@@ -69,6 +69,17 @@ launcher = get_launcher()
 policy = PolicyEvaluator()
 COMPASS_API_KEY = os.environ.get("COMPASS_API_KEY", "").strip()
 
+# ---------------------------------------------------------------------------
+# Per-task blocking input waiters
+# ---------------------------------------------------------------------------
+# Maps task_id → (threading.Event, reply_holder) for tasks blocked in
+# wait_for_input_fn.  When the user sends a reply the event is set and the
+# blocked LLM thread unblocks with the reply text.
+_input_waiters: dict[str, tuple[threading.Event, list]] = {}
+_input_waiters_lock = threading.Lock()
+# Default timeout for a blocked input wait (seconds)
+_INPUT_WAIT_TIMEOUT = int(os.environ.get("COMPASS_INPUT_WAIT_TIMEOUT_SECONDS", "600"))
+
 
 # ---------------------------------------------------------------------------
 # Local validation seam used by Compass and targeted tests.
@@ -190,6 +201,28 @@ def _update_state_and_notify(task_id, state, status_message=""):
     return task
 
 
+def _log_task_workspace(task, step: str, agent_id: str = "compass-agent") -> None:
+    """Add a progress step AND write it to the task's compass/command-log.txt.
+
+    Compass is a persistent agent so stdout cannot be teed globally.  Every
+    compass-owned event that should appear in the task's audit trail must call
+    this helper instead of bare ``task_store.add_progress_step``.
+    """
+    task_store.add_progress_step(task.task_id, step, agent_id=agent_id)
+    workspace_path = getattr(task, "workspace_path", "") or ""
+    if workspace_path:
+        record_workspace_stage(
+            workspace_path,
+            "compass",
+            step,
+            task_id=task.task_id,
+            extra={
+                "sourceAgent": agent_id,
+                "runtimeConfig": _runtime_config_summary(),
+            },
+        )
+
+
 def audit_log(event, **kwargs):
     entry = {"ts": local_iso_timestamp(), "event": event, **kwargs}
     print(f"[audit] {json.dumps(entry, ensure_ascii=False)}")
@@ -212,7 +245,7 @@ def _runtime_config_summary():
 def _route_input_required(task, question, router_context):
     task.router_context = dict(router_context or {})
     _update_state_and_notify(task.task_id, "TASK_STATE_INPUT_REQUIRED", question)
-    task_store.add_progress_step(task.task_id, question, agent_id="compass-agent")
+    _log_task_workspace(task, question, agent_id="compass-agent")
     return task.to_dict()
 
 
@@ -229,11 +262,7 @@ def _start_task_worker(task, message, workflow):
     task.pending_workflow = list(workflow)
     task.router_context = dict(getattr(task, "router_context", {}) or {})
     task_store.update_state(task.task_id, "ROUTING", "Routing task…")
-    task_store.add_progress_step(
-        task.task_id,
-        "Task accepted, starting workflow execution.",
-        agent_id="compass-agent",
-    )
+    _log_task_workspace(task, "Task accepted, starting workflow execution.", agent_id="compass-agent")
     worker = threading.Thread(
         target=_run_workflow,
         args=(task.task_id, deep_copy_json(message)),
@@ -512,6 +541,25 @@ def _run_workflow(task_id, message):
     task = task_store.get(task_id)
     if not task:
         return
+
+    def _wait_for_input(question: str) -> str | None:
+        """Blocking wait: signal INPUT_REQUIRED, suspend LLM thread, return user reply."""
+        _update_state_and_notify(task_id, "TASK_STATE_INPUT_REQUIRED", question)
+        t = task_store.get(task_id)
+        if t:
+            _log_task_workspace(t, question, agent_id=AGENT_ID)
+        event = threading.Event()
+        reply_holder: list = [None]
+        with _input_waiters_lock:
+            _input_waiters[task_id] = (event, reply_holder)
+        print(f"[compass] Task {task_id} blocking for user input (timeout={_INPUT_WAIT_TIMEOUT}s)")
+        signaled = event.wait(timeout=_INPUT_WAIT_TIMEOUT)
+        with _input_waiters_lock:
+            _input_waiters.pop(task_id, None)
+        if not signaled:
+            print(f"[compass] Task {task_id} user input wait timed out")
+        return reply_holder[0]
+
     run_compass_workflow(
         task_id=task_id,
         task=task,
@@ -526,6 +574,8 @@ def _run_workflow(task_id, message):
         update_state_and_notify=_update_state_and_notify,
         add_progress_step=task_store.add_progress_step,
         audit_log=audit_log,
+        log_workspace_fn=_log_task_workspace,
+        wait_for_input_fn=_wait_for_input,
     )
 
 
@@ -584,16 +634,8 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
             "runtimeConfig": _runtime_config_summary(),
         },
     )
-    task_store.add_progress_step(
-        task.task_id,
-        "Task created and queued in Compass.",
-        agent_id="compass-agent",
-    )
-    task_store.add_progress_step(
-        task.task_id,
-        f"Created shared workspace: {task.workspace_path}",
-        agent_id="compass-agent",
-    )
+    _log_task_workspace(task, "Task created and queued in Compass.", agent_id="compass-agent")
+    _log_task_workspace(task, f"Created shared workspace: {task.workspace_path}", agent_id="compass-agent")
 
     return _start_task_worker(task, message, workflow)
 
@@ -616,37 +658,45 @@ def _resume_input_required_task(body: dict, message: dict) -> dict | None:
     auto_routed = False
     if not context_id:
         # No contextId supplied (e.g. page was refreshed). Auto-detect if there
-        # is exactly one outstanding INPUT_REQUIRED task that has a waiting
-        # downstream Team Lead — if so, treat this reply as belonging to it.
+        # is exactly one outstanding INPUT_REQUIRED task — either one that has a
+        # downstream Team Lead or one where Compass itself is blocked waiting.
         all_tasks = task_store.list_tasks()
         pending_input = [
             t for t in all_tasks
             if t.state == "TASK_STATE_INPUT_REQUIRED"
-            and getattr(t, "downstream_task_id", None)
+            and (getattr(t, "downstream_task_id", None) or t.task_id in _input_waiters)
         ]
         if len(pending_input) == 1:
             candidate = pending_input[0]
-            # Only auto-route if the downstream Team Lead is still reachable.
-            candidate_svc_url = getattr(candidate, "downstream_service_url", "") or ""
-            if _is_team_lead_reachable(candidate_svc_url):
+            # For Compass-owned waiters, no reachability check is needed.
+            if candidate.task_id in _input_waiters:
                 context_id = candidate.task_id
                 auto_routed = True
                 print(
-                    f"[compass] Auto-routing reply to single pending INPUT_REQUIRED task: {context_id}"
+                    f"[compass] Auto-routing reply to single pending INPUT_REQUIRED task (compass-owned): {context_id}"
                 )
             else:
-                # Team Lead container is gone — mark stale task as failed and let a
-                # new task be created for this message.
-                print(
-                    f"[compass] Stale INPUT_REQUIRED task {candidate.task_id} — "
-                    f"downstream service {candidate_svc_url!r} is unreachable; creating new task"
-                )
-                task_store.update_state(
-                    candidate.task_id,
-                    "TASK_STATE_FAILED",
-                    "Task cancelled: the agent handling this task is no longer running.",
-                )
-                return None
+                # Only auto-route Team Lead tasks if the downstream is still reachable.
+                candidate_svc_url = getattr(candidate, "downstream_service_url", "") or ""
+                if _is_team_lead_reachable(candidate_svc_url):
+                    context_id = candidate.task_id
+                    auto_routed = True
+                    print(
+                        f"[compass] Auto-routing reply to single pending INPUT_REQUIRED task: {context_id}"
+                    )
+                else:
+                    # Team Lead container is gone — mark stale task as failed and let a
+                    # new task be created for this message.
+                    print(
+                        f"[compass] Stale INPUT_REQUIRED task {candidate.task_id} — "
+                        f"downstream service {candidate_svc_url!r} is unreachable; creating new task"
+                    )
+                    task_store.update_state(
+                        candidate.task_id,
+                        "TASK_STATE_FAILED",
+                        "Task cancelled: the agent handling this task is no longer running.",
+                    )
+                    return None
         else:
             return None
 
@@ -721,13 +771,46 @@ def _resume_input_required_task(body: dict, message: dict) -> dict | None:
             )
         return prior_task.to_dict()
 
-    orig_text = extract_text(prior_task.original_message or {})
+    # No downstream Team Lead task — this is a Compass-owned INPUT_REQUIRED.
+    # Check if the Compass agentic workflow is still blocking in wait_for_input_fn.
+    # If so, unblock it with the user's reply text (preferred path).
     new_text = extract_text(message)
+    with _input_waiters_lock:
+        waiter = _input_waiters.get(context_id)
+    if waiter is not None:
+        event, reply_holder = waiter
+        reply_holder[0] = new_text
+        task_store.update_state(
+            context_id,
+            "TASK_STATE_WORKING",
+            "User provided additional information. Resuming…",
+        )
+        task_store.add_progress_step(
+            context_id,
+            "User provided additional information. Resuming task.",
+            agent_id="compass-agent",
+        )
+        if getattr(prior_task, "workspace_path", ""):
+            record_workspace_stage(
+                prior_task.workspace_path,
+                "compass",
+                "Received user input — unblocking agentic workflow",
+                task_id=context_id,
+                extra={"userText": new_text[:1000], "runtimeConfig": _runtime_config_summary()},
+            )
+        audit_log("TASK_RESUMED", task_id=context_id, agent_id="compass-agent")
+        print(f"[compass] Unblocking agentic workflow for task {context_id} with user reply")
+        event.set()
+        return prior_task.to_dict()
+
+    # Fallback: workflow thread is gone (e.g. timed out). Re-launch from scratch
+    # with the combined original + new text so the LLM has full context.
+    orig_text = extract_text(prior_task.original_message or {})
     combined_text = (orig_text + "\n\n" + new_text).strip() if orig_text else new_text
     merged = deep_copy_json(message)
     merged["parts"] = [{"text": combined_text}]
     workflow = prior_task.pending_workflow or [prior_task.router_context.get("requestedCapability") or "team-lead.task.analyze"]
-    print(f"[compass] INPUT_REQUIRED fallback: resuming same task {context_id}")
+    print(f"[compass] INPUT_REQUIRED fallback (no live waiter): re-launching task {context_id}")
     return _start_task_worker(prior_task, merged, workflow)
 
 
@@ -926,10 +1009,13 @@ class CompassHandler(BaseHTTPRequestHandler):
                     task.router_context["inputRequestedBy"] = payload["agent_id"]
                 if payload["state"] == "TASK_STATE_INPUT_REQUIRED":
                     task_store.update_state(task_id, "TASK_STATE_INPUT_REQUIRED", payload["status_message"])
-                    if payload["status_message"]:
-                        task_store.add_progress_step(task_id, payload["status_message"], agent_id=payload["agent_id"])
+                    if payload["status_message"] and task:
+                        _log_task_workspace(task, payload["status_message"], agent_id=payload["agent_id"])
                 elif payload["state"] in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED"} and payload["status_message"]:
-                    task_store.add_progress_step(task_id, payload["status_message"], agent_id=payload["agent_id"])
+                    if task:
+                        _log_task_workspace(task, payload["status_message"], agent_id=payload["agent_id"])
+                    else:
+                        task_store.add_progress_step(task_id, payload["status_message"], agent_id=payload["agent_id"])
             audit_log(
                 "TASK_CALLBACK_RECEIVED",
                 task_id=task_id,

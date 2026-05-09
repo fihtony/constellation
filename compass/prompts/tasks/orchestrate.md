@@ -35,10 +35,13 @@ If the task is an office task:
    - If the user explicitly says "in-place", "modify in place", "write back", or "save to the same folder" → `inplace`
    - Otherwise → default to `workspace` (read-only safe copy into the shared workspace).
    - Only call `request_user_input` if the user's intent about output destination is completely ambiguous.
-3. If output mode is `inplace`, confirm write permission with the user via `request_user_input`.
-   Ask a simple yes/no question. Accept **any affirmative reply** (e.g. "yes", "approve", "allow",
-   "yes approve", "yes. approve write access", etc.) as permission granted. Do NOT require
-   exact phrasing. Do NOT create a todo gate for user confirmation — just ask once and proceed.
+3. If output mode is `inplace`, confirm write permission before dispatching:
+   - **First, check if the user request already contains an affirmative approval** — look for phrases
+     like "yes", "approve", "allow", "approve write access", "permit", "yes. approve write access",
+     "yes approve" anywhere in the user request text. If found, treat write permission as already
+     granted and **skip the confirmation step entirely** — do NOT call `request_user_input`.
+   - If no approval is present in the request text: ask a simple yes/no question via `request_user_input`.
+     Accept **any affirmative reply** as permission granted. Do NOT create a todo gate — ask once and proceed.
 4. Call `validate_office_paths` with:
    - `target_paths`: the extracted absolute paths
    - `output_mode`: `"workspace"` or `"inplace"`
@@ -69,6 +72,9 @@ Call `dispatch_agent_task` with:
 **Critical rules:**
 - Do NOT answer office questions from your own knowledge — ALWAYS dispatch to the Office Agent.
 - Do NOT fabricate task IDs or agent URLs. Use only the `taskId` and `agentUrl` returned by the tool.
+- Do NOT call `launch_per_task_agent` manually. The `dispatch_agent_task` tool auto-launches the Office Agent
+  when `extra_binds` is provided — passing `extraBinds` from `validate_office_paths` is sufficient.
+  Never construct bind mount strings by hand — always use the `extraBinds` from `validate_office_paths` verbatim.
 - The `dispatch_agent_task` tool will automatically launch the Office Agent container if not already running.
 
 Then call `wait_for_agent_task` with the `taskId` and `agentUrl` returned by `dispatch_agent_task`.

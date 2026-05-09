@@ -153,6 +153,13 @@ def _classify_office_question(question: str) -> str:
             "modify.*in.place",
             "confirm.*modify",
             "confirm.*in.place",
+            # "do you permit Compass to write..."
+            "do you permit",
+            "permit.*write",
+            "permit.*modify",
+            "write.*back.*into",
+            "write.*back.*same",
+            "report back into",
         ]
     ) or (
         "confirm" in lowered
@@ -160,6 +167,9 @@ def _classify_office_question(question: str) -> str:
     ) or (
         "permission" in lowered
         and ("access" in lowered or "read" in lowered or "write" in lowered)
+    ) or (
+        "permit" in lowered
+        and ("write" in lowered or "modify" in lowered or "folder" in lowered or "same" in lowered)
     ):
         return "write_confirm"
     if any(
@@ -563,13 +573,22 @@ def test_csv_analysis(reporter: Reporter) -> None:
     if workspace_host is None:
         return
 
-    report_path = workspace_host / "office-agent" / "analysis.md"
+    # Accept analysis.md or any .md/.json file in office-agent/ (LLM may choose the name)
+    _SYSTEM_FILES = {"stage-summary.json", "command-log.txt"}
+    agent_dir = workspace_host / "office-agent"
+    report_path = agent_dir / "analysis.md"
+    if not report_path.is_file():
+        candidates = [
+            f for f in agent_dir.iterdir()
+            if f.is_file() and f.suffix in (".md", ".json") and f.name not in _SYSTEM_FILES
+        ]
+        report_path = candidates[0] if candidates else report_path
     try:
         report_text = report_path.read_text(encoding="utf-8")
     except OSError as exc:
         reporter.fail("CSV analysis report was not written to artifacts/workspaces", str(exc))
         return
-    reporter.ok("CSV analysis report exists under artifacts/workspaces")
+    reporter.ok(f"CSV analysis report exists under artifacts/workspaces ({report_path.name})")
     if expected_top_rep.lower() in report_text.lower():
         reporter.ok(f"CSV analysis names the top sales rep ({expected_top_rep})")
     else:
@@ -719,9 +738,19 @@ def test_csv_analysis_inplace(reporter: Reporter) -> None:
     if workspace_host is None:
         return
 
+    # Accept analysis.md or any .md/.json written into the user folder (LLM may choose name)
+    _SYSTEM_FILES = {"stage-summary.json", "command-log.txt"}
+    _ORIG_FILES = {"sales_data.csv"}
     report_path = target_dir / "analysis.md"
+    if not report_path.is_file():
+        candidates = [
+            f for f in target_dir.iterdir()
+            if f.is_file() and f.suffix in (".md", ".json")
+            and f.name not in _SYSTEM_FILES and f.name not in _ORIG_FILES
+        ]
+        report_path = candidates[0] if candidates else report_path
     if report_path.is_file():
-        reporter.ok("CSV in-place wrote analysis.md into tests/data/csv_rw")
+        reporter.ok(f"CSV in-place wrote {report_path.name} into tests/data/csv_rw")
     else:
         reporter.fail("CSV in-place did not write analysis.md into the user folder", str(report_path))
         return
@@ -730,10 +759,15 @@ def test_csv_analysis_inplace(reporter: Reporter) -> None:
         reporter.ok(f"CSV in-place analysis names the top sales rep ({expected_top_rep})")
     else:
         reporter.fail("CSV in-place analysis did not mention the expected top rep", report_text[:300])
-    if not (workspace_host / "office-agent" / "analysis.md").exists():
+    workspace_non_system = [
+        f for f in (workspace_host / "office-agent").iterdir()
+        if f.is_file() and f.suffix in (".md", ".json") and f.name not in _SYSTEM_FILES
+    ] if (workspace_host / "office-agent").is_dir() else []
+    if not workspace_non_system:
         reporter.ok("CSV in-place kept the final report out of the workspace")
     else:
-        reporter.fail("CSV in-place still wrote the final report into the workspace")
+        reporter.fail("CSV in-place still wrote the final report into the workspace",
+                      str([f.name for f in workspace_non_system]))
     if (workspace_host / "office-agent" / "command-log.txt").is_file() and (workspace_host / "office-agent" / "stage-summary.json").is_file():
         reporter.ok("CSV in-place kept audit files in the workspace")
     else:
@@ -763,10 +797,20 @@ def test_pdf_summary_inplace(reporter: Reporter) -> None:
     if workspace_host is None:
         return
 
-    # Accept summary.md or analysis.md in the user folder
+    # Accept summary.md (preferred) or any report-looking .md or .txt file in the user folder
     summary_path = target_dir / "summary.md"
     if not summary_path.is_file():
         summary_path = target_dir / "analysis.md"
+    if not summary_path.is_file():
+        # Fallback: first .md or .txt file that isn't a system file
+        _SYSTEM = {"stage-summary.json", "command-log.txt"}
+        candidates = [
+            f for f in target_dir.iterdir()
+            if f.is_file() and f.suffix in (".md", ".txt")
+            and f.name not in _SYSTEM
+            and f.stem not in {p.stem for p in target_dir.iterdir() if p.suffix in (".pdf", ".docx")}
+        ]
+        summary_path = candidates[0] if candidates else summary_path
     if summary_path.is_file():
         reporter.ok(f"Document in-place wrote {summary_path.name} into tests/data/stlouis_rw")
     else:

@@ -37,8 +37,9 @@ handles protocol, permissions, and tool wiring.
 
 ### Step 1: Orientation
 
-1. Call `report_progress` with `"Office Agent starting: <capability>"`
-2. Use `todo_write` to record a high-level execution plan.
+1. Call `report_progress` with a descriptive message, e.g.:
+   `"Starting <capability>: reading task context and preparing execution plan for <N> target path(s)"`
+2. Use `todo_write` to record a high-level execution plan with numbered steps.
 3. Use `list_local_dir` to understand the target structure.
 4. If no target paths are available, call `fail_current_task` with a clear message.
 
@@ -48,7 +49,8 @@ handles protocol, permissions, and tool wiring.
 2. Collect readable files by extension: `.txt`, `.md`, `.csv`, `.json`, `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.xls`
 3. Skip files > 50 MB — note them as warnings.
 4. Skip macro-enabled formats (`.xlsm`, `.docm`) — note as unsupported.
-5. Call `report_progress` with `"Discovered N files"`
+5. Call `report_progress` with a descriptive message, e.g.:
+   `"Discovered <N> files in <M> directories: <list of file types found>. Beginning content extraction."`
 
 ### Extracting Text from Binary Formats
 
@@ -79,48 +81,157 @@ the dedicated document reader tools.
 
 ### Step 3a: Summarization (office.document.summarize / office.folder.summarize)
 
-1. Use `read_local_file` to read each file in turn.
-2. For binary or large files, use `run_local_command` with `head -n 200`.
-3. For each document identify: title, key topics, main findings, page count.
-4. Compose a Markdown summary. For multiple docs, add a cross-document synthesis.
-5. Save to `<workspace>/office-agent/summary.md` using `write_local_file`.
-6. Call `report_progress` with `"Summary written"`
+**Goal**: Produce a comprehensive, well-structured summary report that a reader can act on
+without reading the source documents. Quality matters — do not write a shallow one-liner per file.
+
+1. Call `report_progress` with:
+   `"Extracting content from <N> documents: <list of filenames>"`
+2. Read each file in turn using the appropriate tool (`read_local_file`, `read_pdf`, `read_docx`, etc.).
+3. For each document produce a **detailed per-document section** containing:
+   - **Title / file name**
+   - **Document type and audience** (e.g. school bulletin for parents, meeting minutes, course guide)
+   - **Key topics and themes** — substantive bullet points, not vague labels
+   - **Important dates, deadlines, or events** — list them explicitly
+   - **Action items or decisions** (if any)
+   - **Notable quotes or key numbers** (if meaningful)
+   - **Word/page count or row count** (for data context)
+4. After all per-document sections, write a **Cross-Document Synthesis** section:
+   - Common themes across documents
+   - Timeline of key dates/events in chronological order
+   - Overall audience and purpose of the collection
+   - Any contradictions, gaps, or follow-up questions
+5. Write the full report to the output destination determined by Output Mode.
+   - **WORKSPACE mode**: `<workspace>/office-agent/summary.md`
+   - **IN-PLACE mode**: `summary.md` in the target directory
+6. Call `report_progress` with:
+   `"Summary report written: <N> documents processed, <M> key dates identified, output at <path>"`
+
+**Quality bar**: The report must be substantive enough that a reader could:
+- Know the topic and purpose of each document
+- Extract all key dates and events without opening the originals
+- Understand follow-up actions or open questions
 
 ### Step 3b: Data Analysis (office.data.analyze)
 
-1. Use `read_local_file` or `run_local_command` with `head -n 50` for CSV preview.
-2. Identify columns, data types, value ranges, missing values.
-3. Compute statistics: row count, min/max/avg for numeric columns, top categories.
-4. Identify patterns, trends, anomalies relevant to the user request.
-5. Write a Markdown analysis report with an overview table and key findings.
-6. Save to `<workspace>/office-agent/analysis.md` using `write_local_file`.
-7. Call `report_progress` with `"Analysis report written"`
+**Goal**: Produce a polished Markdown analysis report — NOT just a JSON file.
+The final deliverable MUST be a `.md` file. JSON or CSV intermediary files are
+acceptable as scratch work in the workspace, but the user-facing output is always
+a human-readable Markdown report.
+
+1. Call `report_progress` with:
+   `"Reading and profiling <filename>: detecting columns, data types, and row count"`
+2. Use `read_local_file` or `run_local_command` with `head -n 50` for CSV preview.
+3. Identify columns, data types, value ranges, missing values.
+4. Compute statistics: row count, min/max/avg for numeric columns, top categories.
+5. Identify patterns, trends, anomalies relevant to the user request.
+6. Call `report_progress` with:
+   `"Analysis complete: <N> rows, <M> columns. Identified top <entity> and <K> key insights. Writing report."`
+7. Write a **Markdown analysis report** (`analysis.md`) with the following structure:
+   ```markdown
+   # Analysis Report: <filename or dataset name>
+
+   ## Overview
+   - **Source file**: `<filename>`
+   - **Total rows**: N
+   - **Columns**: list of column names
+
+   ## Key Findings
+   - Finding 1 (direct answer to the user question)
+   - Finding 2
+   - ...
+
+   ## Statistical Summary
+   | Column | Min | Max | Mean | Median |
+   |--------|-----|-----|------|--------|
+   ...
+
+   ## Top Categories / Rankings
+   (tables or bullet lists of top values per dimension)
+
+   ## Patterns and Trends
+   (narrative description of notable patterns)
+
+   ## Methodology Notes
+   (brief note on how statistics were computed)
+   ```
+8. Save the `.md` report to the output destination:
+   - **WORKSPACE mode**: `<workspace>/office-agent/analysis.md`
+   - **IN-PLACE mode**: write `analysis.md` to the **same directory** as the target file
+
+**Critical**: The final output file MUST be `analysis.md` (Markdown), not `analysis.json` or
+any other format. Structured JSON data may be written as workspace scratch files but must NOT
+be the only deliverable.
 
 ### Step 3c: Folder Organization (office.folder.organize)
 
-1. Use `list_local_dir` to enumerate all files.
-2. Group files by the user's specified criterion (student name, date, file type, topic, etc.).
-   Always follow the user's explicit grouping intent from the task text.
-3. Write the plan to `<workspace>/office-agent/organization-plan.json` using `write_local_file`.
-4. Create the organized output:
+**Goal**: Reorganize files into a logical structure. When the user specifies criteria, follow them
+exactly. When the user does NOT specify, autonomously determine the best organization strategy by
+scanning file contents and metadata.
+
+#### 3c-1: Strategy Selection
+
+1. Call `report_progress` with:
+   `"Scanning folder structure: inventorying all files to determine best organization strategy"`
+2. Use `list_local_dir` and `search_local_files` to enumerate all files recursively.
+3. **If the user specified organization criteria** (e.g. "by student name", "by date", "by topic"):
+   - Use exactly the user's criteria — do not override it.
+   - Proceed directly to Step 3c-2 with the user's grouping rule.
+4. **If the user did NOT specify criteria** — choose the best strategy autonomously:
+   - Read a sample of file contents (first 20–50 lines each) to detect patterns.
+   - Consider these strategies (pick the one that produces the most meaningful groupings):
+     - **By author/person**: detect names in headers, bylines, or metadata
+     - **By date/period**: detect dates in filenames or file content
+     - **By topic/theme**: detect subject matter from document titles or first paragraphs
+     - **By file type**: group `.pdf`, `.docx`, `.csv`, etc.
+     - **By project/department**: detect project names or organizational units
+   - Choose the strategy that creates ≥2 non-trivial groups with clear, distinct names.
+   - Document your chosen strategy and rationale in `organization-plan.json`.
+5. Call `report_progress` with:
+   `"Strategy selected: organizing by <strategy>. Identified <N> groups: <group names>"`
+
+#### 3c-2: Execute Organization
+
+1. Write the plan to `<workspace>/office-agent/organization-plan.json`:
+   ```json
+   {"strategy": "<chosen strategy>", "rationale": "...",
+    "groups": [{"name": "...", "files": [...]}]}
+   ```
+2. Create the organized output:
    - **WORKSPACE mode** (source bind is read-only):
      - Create `<workspace>/office-agent/organized/<group-name>/` directories.
-     - For each file in a group: read its content (`read_local_file` for text, `run_local_command` for PDF/DOCX)
-       and write it to `<workspace>/office-agent/organized/<group-name>/<filename>` using `write_local_file`.
-     - Write `<workspace>/office-agent/organization-report.md` summarizing the groupings.
+     - For each file: read its content and write it to `organized/<group-name>/<filename>`.
+     - Call `report_progress` with:
+       `"Copying files to organized output: <N> files into <M> group directories"`
    - **IN-PLACE mode** (source bind is read-write):
-     - Create subdirectories inside the source root with `run_local_command` (`mkdir -p`).
-     - Move or copy files with `run_local_command` (`mv`, `cp`).
-     - Never delete original files — copy first, verify, then optionally remove original.
-     - Write `organization-report.md` to `<workspace>/office-agent/` for audit purposes.
-5. Call `report_progress` with `"Organization complete"` or `"Plan written"`
+     - Create subdirectories inside the source root using `run_local_command` (`mkdir -p`).
+     - **Efficiency**: batch-read all files in ONE command to avoid exhausting the turn budget:
+       ```
+       find <target_dir> -type f | sort | xargs -I{} sh -c 'printf "=== {} ===\n"; head -10 "{}"'
+       ```
+     - Determine the group name for every file, then batch-move using `mv` commands.
+     - Do NOT read files one-by-one with `read_local_file` for organize tasks.
+     - Do NOT infer groups from existing subdirectory names.
+     - Call `report_progress` with:
+       `"Reorganizing files in-place: moving <N> files into <M> subdirectories"`
+3. Write `<workspace>/office-agent/organization-report.md` summarizing:
+   - Strategy used and why
+   - Each group: name, file count, list of files
+   - Files that could not be classified (placed in a default/other group)
+4. Call `report_progress` with:
+   `"Organization complete: <N> files reorganized into <M> groups using <strategy> strategy"`
 
 ### Step 4: Completion
 
 1. Write `<workspace>/office-agent/warnings.md` if any files were skipped.
 2. Call `collect_task_evidence` to capture output paths.
 3. Call `check_definition_of_done` with an appropriate checklist.
-4. Call `complete_current_task` with a concise summary and artifact paths.
+4. Call `report_progress` with:
+   `"Validating outputs: confirming all expected files are present and readable"`
+5. Verify outputs by calling `read_local_file` or `list_local_dir` on the output path.
+6. Call `complete_current_task` with:
+   - A concise user-facing summary of what was accomplished
+   - The full output file path(s) as artifacts
+   - Any warnings about skipped or unreadable files
 
 ---
 

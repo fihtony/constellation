@@ -18,7 +18,42 @@ from common.tools.base import ConstellationTool, ToolSchema
 from common.tools.registry import register_tool
 
 _TASK_ID = os.environ.get("TASK_ID", "")
+_AGENT_ID = os.environ.get("AGENT_ID", "")
 _AGENT_DIRECTORY: AgentDirectory | None = None
+
+
+def _get_effective_task_id() -> str:
+    """Return the orchestrator (Compass) task ID for progress reporting.
+
+    Preference order:
+    1. ``compassTaskId`` from the control-tools task context — set explicitly
+       by agent configure_*_control_tools() with the parent compass task ID.
+    2. ``taskId`` from the task context (fallback).
+    3. ``TASK_ID`` env var (legacy / host-process agents).
+    """
+    try:
+        from common.tools.control_tools import _task_context as _ctx  # noqa: PLC0415
+        compass = str(_ctx.get("compassTaskId") or "").strip()
+        if compass:
+            return compass
+        task = str(_ctx.get("taskId") or "").strip()
+        if task:
+            return task
+    except Exception:  # noqa: BLE001
+        pass
+    return _TASK_ID
+
+
+def _get_effective_agent_id() -> str:
+    """Return the agent ID to include in progress payloads."""
+    try:
+        from common.tools.control_tools import _task_context as _ctx  # noqa: PLC0415
+        agent = str(_ctx.get("agentId") or "").strip()
+        if agent:
+            return agent
+    except Exception:  # noqa: BLE001
+        pass
+    return _AGENT_ID
 
 
 def _get_agent_directory() -> AgentDirectory | None:
@@ -96,7 +131,9 @@ class ReportProgressTool(ConstellationTool):
     def execute(self, args: dict) -> dict:
         message = args.get("message", "").strip()
         step = args.get("step", "progress").strip()
-        task_id = args.get("task_id", "").strip() or _TASK_ID
+        # Prefer explicitly passed task_id; fall back to compass task ID from context.
+        task_id = args.get("task_id", "").strip() or _get_effective_task_id()
+        agent_id = args.get("agent_id", "").strip() or _get_effective_agent_id()
 
         if not message:
             return self.error("Missing required argument: message")
@@ -106,7 +143,7 @@ class ReportProgressTool(ConstellationTool):
             print(f"[progress] step={step} msg={message}")
             return self.ok(f"Progress logged locally (no task_id): {message}")
 
-        payload = {"step": step, "message": message}
+        payload = {"step": step, "message": message, "agentId": agent_id}
         orchestrator_base_url = _resolve_progress_base_url(args)
         if not orchestrator_base_url:
             print(f"[progress] step={step} msg={message}")

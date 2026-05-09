@@ -13,7 +13,10 @@ COMPASS_RUNTIME_TOOL_NAMES = [
     "dispatch_agent_task",
     "wait_for_agent_task",
     "ack_agent_task",
-    "launch_per_task_agent",
+    # NOTE: launch_per_task_agent is intentionally excluded.
+    # dispatch_agent_task already auto-launches per-task agents when extra_binds
+    # is provided. Exposing launch_per_task_agent to the LLM causes it to
+    # manually construct bind mounts that differ from validate_office_paths output.
     "complete_current_task",
     "fail_current_task",
     "request_user_input",
@@ -85,21 +88,39 @@ def run_compass_workflow(
     update_state_and_notify,
     add_progress_step,
     audit_log,
+    log_workspace_fn=None,
+    wait_for_input_fn=None,
 ):
     metadata = message.get("metadata") or {}
     user_text = extract_text(message)
 
+    # log_workspace_fn writes to both progress_steps AND task workspace command-log.
+    # Falls back to bare add_progress_step if not provided (test contexts).
+    _log_ws = log_workspace_fn if callable(log_workspace_fn) else (
+        lambda task_obj, step, *, agent_id=agent_id: add_progress_step(task_id, step, agent_id=agent_id)
+    )
+
     def _on_complete(result_text, artifacts):
         update_state_and_notify(task_id, "TASK_STATE_COMPLETED", result_text)
+        task_obj = get_task(task_id)
+        if task_obj:
+            _log_ws(task_obj, "Task completed.", agent_id=agent_id)
         audit_log("TASK_COMPLETED", task_id=task_id, final_state="TASK_STATE_COMPLETED")
 
     def _on_fail(error_message):
         update_state_and_notify(task_id, "TASK_STATE_FAILED", error_message)
+        task_obj = get_task(task_id)
+        if task_obj:
+            _log_ws(task_obj, f"Task failed: {error_message[:200]}", agent_id=agent_id)
         audit_log("TASK_FAILED", task_id=task_id, error=error_message)
 
     def _on_input_required(question, _context):
         update_state_and_notify(task_id, "TASK_STATE_INPUT_REQUIRED", question)
-        add_progress_step(task_id, question, agent_id=agent_id)
+        task_obj = get_task(task_id)
+        if task_obj:
+            _log_ws(task_obj, question, agent_id=agent_id)
+        else:
+            add_progress_step(task_id, question, agent_id=agent_id)
 
     configure_control_tools(
         task_context={
@@ -112,7 +133,11 @@ def run_compass_workflow(
         },
         complete_fn=_on_complete,
         fail_fn=_on_fail,
-        input_required_fn=_on_input_required,
+        # If a blocking wait function is provided, use it exclusively so that
+        # request_user_input blocks the LLM turn loop until the user replies.
+        # Otherwise fall back to the non-blocking INPUT_REQUIRED signal.
+        wait_for_input_fn=wait_for_input_fn if wait_for_input_fn is not None else None,
+        input_required_fn=_on_input_required if wait_for_input_fn is None else None,
     )
 
     task_prompt = build_compass_workflow_prompt(
@@ -126,6 +151,9 @@ def run_compass_workflow(
     system_prompt = build_agent_system_prompt(agent_file)
 
     update_state_and_notify(task_id, "TASK_STATE_WORKING", "Processing request…")
+    task_obj = get_task(task_id)
+    if task_obj:
+        _log_ws(task_obj, "Starting agentic workflow execution.", agent_id=agent_id)
 
     try:
         result = get_runtime().run_agentic(
@@ -142,11 +170,16 @@ def run_compass_workflow(
             if result.success:
                 summary = result.summary or "Workflow completed."
                 update_state_and_notify(task_id, "TASK_STATE_COMPLETED", summary)
+                _log_ws(current_task, "Workflow completed successfully.", agent_id=agent_id)
                 audit_log("TASK_COMPLETED", task_id=task_id, final_state="TASK_STATE_COMPLETED")
             else:
                 error = result.summary or "Workflow failed — runtime did not complete successfully."
                 update_state_and_notify(task_id, "TASK_STATE_FAILED", error)
+                _log_ws(current_task, f"Workflow failed: {error[:200]}", agent_id=agent_id)
                 audit_log("TASK_FAILED", task_id=task_id, error=error)
     except Exception as error:
         update_state_and_notify(task_id, "TASK_STATE_FAILED", f"Workflow error: {error}")
+        err_task = get_task(task_id)
+        if err_task:
+            _log_ws(err_task, f"Workflow error: {str(error)[:200]}", agent_id=agent_id)
         audit_log("TASK_FAILED", task_id=task_id, error=str(error))

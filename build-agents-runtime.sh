@@ -164,7 +164,7 @@ build_office() {
 }
 
 build_compass() {
-    build_agent "compass" "constellation-compass:latest"
+    build_agent "compass" "constellation-compass-agent:latest"
 }
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
