@@ -126,6 +126,7 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
         *,
         system_prompt: str | None = None,
         cwd: str | None = None,
+        extra_allow_roots: list[str] | None = None,
         tools: list[str] | None = None,
         mcp_servers: dict | None = None,
         allowed_tools: list[str] | None = None,
@@ -160,7 +161,11 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
         timeout = min(timeout, profile.max_timeout_seconds)
         token_threshold = int(os.environ.get("CONNECT_AGENT_TOKEN_THRESHOLD", "100000"))
 
-        self._setup_tools(sandbox_root=sandbox_root, profile=profile)
+        self._setup_tools(
+            sandbox_root=sandbox_root,
+            profile=profile,
+            extra_allow_roots=extra_allow_roots,
+        )
         prepared_mcp = prepare_mcp_servers(mcp_servers, profile=profile)
 
         available_tool_names = [tool.schema.name for tool in list_tools()]
@@ -333,19 +338,46 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
     def supports_mcp(self) -> bool:
         return True
 
-    def _setup_tools(self, *, sandbox_root: str, profile: PolicyProfile) -> None:
+    def _setup_tools(
+        self,
+        *,
+        sandbox_root: str,
+        profile: PolicyProfile,
+        extra_allow_roots: list[str] | None = None,
+    ) -> None:
         from common.tools.coding_tools import configure_coding_tools
 
         allow_roots = expand_sandbox_roots(
             profile,
             {"SANDBOX_ROOT": sandbox_root, "ARTIFACT_ROOT": sandbox_root},
         )
+        for root in extra_allow_roots or []:
+            candidate = os.path.abspath(str(root or "").strip())
+            if candidate and candidate not in allow_roots and candidate != sandbox_root:
+                allow_roots.append(candidate)
 
+        # Core tools — always loaded
         module_expectations = {
             "common.tools.coding_tools": ["bash", "read_file", "write_file", "edit_file", "glob", "grep"],
             "common.tools.planning_tools": ["todo_write", "compress"],
             "common.tools.subagent_tool": ["subagent"],
-            "common.tools.skill_tool": ["load_skill"],
+            "common.tools.skill_tool": ["load_skill", "list_skills"],
+            # Agent lifecycle and control tools (complete/fail task, dispatch agents, validate paths, etc.)
+            "common.tools.control_tools": [
+                "dispatch_agent_task", "wait_for_agent_task", "ack_agent_task",
+                "complete_current_task", "fail_current_task", "get_task_context",
+                "get_agent_runtime_status", "request_user_input",
+                "validate_office_paths", "aggregate_task_card", "derive_user_facing_status",
+            ],
+            # Registry / discovery tools (query capabilities, list agents, check health)
+            "common.tools.registry_tools": [
+                "registry_query", "list_available_agents", "check_agent_status",
+            ],
+            # Validation and evidence tools
+            "common.tools.validation_tools": [
+                "run_validation_command", "collect_task_evidence",
+                "check_definition_of_done", "summarize_failure_context",
+            ],
         }
         for module_name, expected_tools in module_expectations.items():
             module = importlib.import_module(module_name)
@@ -353,10 +385,8 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
                 importlib.reload(module)
 
         domain_module_expectations = {
-            "common.tools.jira_tools": ["jira_get_ticket", "jira_add_comment"],
-            "common.tools.scm_tools": ["scm_create_branch", "scm_push_files", "scm_create_pr"],
-            "common.tools.design_tools": ["design_fetch_figma_screen", "design_fetch_stitch_screen"],
             "common.tools.progress_tools": ["report_progress"],
+            "common.tools.launcher_tool": ["launch_per_task_agent"],
         }
         for module_name, expected_tools in domain_module_expectations.items():
             try:

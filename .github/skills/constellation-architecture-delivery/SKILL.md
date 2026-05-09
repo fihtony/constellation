@@ -21,6 +21,7 @@ user-invocable: false
 - Start from explicit inputs and outputs: user request, Jira acceptance criteria, design context, repo boundaries, and registered capabilities.
 - Identify the smallest owning abstraction for the change: route/controller, workflow step, service, persistence adapter, or shared utility.
 - Keep cross-agent boundaries explicit. Fetch external context through boundary agents or MCP integrations already defined by the system; do not bypass them.
+- Resolve orchestrator-facing URLs from `message.metadata.orchestratorCallbackUrl` or Registry-discovered orchestrator capabilities; do not hardcode `COMPASS_URL` in child agents.
 - Preserve existing runtime constraints: audit artifacts, stage summaries, deterministic workspaces, and reviewability.
 - Keep permission policy centralized. If SCM branch protection changes, update `common/permissions/*.json` and the design docs instead of hardcoding new branch names or prefixes in handlers.
 

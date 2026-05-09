@@ -17,7 +17,7 @@ from common.env_utils import (
     resolve_openai_base_url,
     sanitize_credential_env,
 )
-from common.runtime.adapter import get_runtime, summarize_runtime_configuration
+from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 
 
 class RuntimeAdapterTests(unittest.TestCase):
@@ -32,19 +32,18 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.env_patcher.stop()
 
     def test_get_runtime_supports_all_documented_backends(self):
-        for backend in ("connect-agent", "copilot-cli", "claude-code", "mock"):
+        for backend in ("connect-agent", "copilot-cli", "claude-code"):
             runtime = get_runtime(backend)
             self.assertIsNotNone(runtime)
 
-    def test_get_runtime_unknown_backend_falls_back_to_connect(self):
-        runtime = get_runtime("does-not-exist")
-        self.assertEqual(runtime.__class__.__name__, "ConnectAgentAdapter")
+    def test_get_runtime_unknown_backend_raises(self):
+        with self.assertRaises(KeyError):
+            get_runtime("does-not-exist")
 
-    def test_copilot_connect_resolves_to_connect_agent(self):
+    def test_copilot_connect_runtime_is_rejected(self):
         os.environ["AGENT_RUNTIME"] = "copilot-connect"
-        runtime = get_runtime()
-        # copilot-connect is no longer a registered runtime; unknown backends resolve to connect-agent
-        self.assertEqual(runtime.__class__.__name__, "ConnectAgentAdapter")
+        with self.assertRaises(KeyError):
+            get_runtime()
 
     def test_connect_agent_uses_model_override_and_contract(self):
         os.environ["AGENT_RUNTIME"] = "connect-agent"
@@ -141,14 +140,25 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(result["backend_used"], "connect-agent")
         self.assertIn("unreachable", result["summary"])
 
-    def test_mock_runtime_returns_configured_response(self):
-        os.environ["AGENT_RUNTIME"] = "mock"
-        os.environ["MOCK_RUNTIME_RESPONSE"] = '{"summary":"mock ok","artifacts":[],"warnings":[],"next_actions":[]}'
+    def test_connect_agent_setup_tools_includes_extra_allow_roots(self):
+        from common.runtime.connect_agent.adapter import ConnectAgentAdapter
 
-        result = get_runtime().run("hello mock")
+        adapter = ConnectAgentAdapter()
+        profile = adapter._policy_config.profiles["workspace-write"]
 
-        self.assertEqual(result["backend_used"], "mock")
-        self.assertEqual(result["summary"], "mock ok")
+        with tempfile.TemporaryDirectory() as sandbox_root, tempfile.TemporaryDirectory() as shared_workspace:
+            with patch("common.runtime.connect_agent.adapter.is_registered", return_value=True), \
+                 patch("common.tools.coding_tools.configure_coding_tools") as mocked_configure:
+                adapter._setup_tools(
+                    sandbox_root=sandbox_root,
+                    profile=profile,
+                    extra_allow_roots=[shared_workspace, sandbox_root],
+                )
+
+        allow_roots = mocked_configure.call_args.kwargs["allow_roots"]
+        self.assertIn(shared_workspace, allow_roots)
+        self.assertEqual(allow_roots.count(shared_workspace), 1)
+        self.assertNotIn(sandbox_root, allow_roots)
 
     def test_claude_code_fails_when_binary_missing(self):
         os.environ["AGENT_RUNTIME"] = "claude-code"
@@ -165,6 +175,8 @@ class RuntimeAdapterTests(unittest.TestCase):
             summary = summarize_runtime_configuration()
 
         self.assertEqual(summary["effectiveBackend"], "copilot-cli")
+        self.assertTrue(summary["supportsAgentic"])
+        self.assertTrue(summary["agenticReady"])
         self.assertTrue(summary["tokenConfigured"])
         self.assertTrue(summary["tokenSources"]["COPILOT_GITHUB_TOKEN"])
         self.assertNotIn("copilot_token_secret", json.dumps(summary))
@@ -178,6 +190,7 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(summary["requestedBackend"], "copilot-cli")
         self.assertEqual(summary["effectiveBackend"], "copilot-cli")
         self.assertFalse(summary["tokenConfigured"])
+        self.assertTrue(summary["supportsAgentic"])
         self.assertIn("not ready", summary["error"])
 
     def test_resolve_openai_base_url_uses_rancher_host_inside_container(self):
@@ -202,8 +215,67 @@ class RuntimeAdapterTests(unittest.TestCase):
             summary = summarize_runtime_configuration()
 
         self.assertEqual(summary["effectiveBackend"], "connect-agent")
+        self.assertTrue(summary["supportsAgentic"])
+        self.assertTrue(summary["agenticReady"])
         self.assertEqual(summary["resolvedBaseUrl"], "http://host.rancher-desktop.internal:1288/v1")
         self.assertFalse(summary["baseUrlConfigured"])
+
+    def test_runtime_configuration_summary_reports_claude_agentic_readiness(self):
+        os.environ["AGENT_RUNTIME"] = "claude-code"
+
+        with patch("common.runtime.adapter.shutil.which", return_value="/usr/bin/claude"):
+            summary = summarize_runtime_configuration()
+
+        self.assertEqual(summary["effectiveBackend"], "claude-code")
+        self.assertTrue(summary["supportsAgentic"])
+        self.assertTrue(summary["agenticReady"])
+
+    def test_require_agentic_runtime_accepts_ready_copilot_cli(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+        os.environ["COPILOT_GITHUB_TOKEN"] = "copilot_token_test"
+
+        with patch("common.runtime.adapter.shutil.which", return_value="/usr/bin/copilot"):
+            summary = require_agentic_runtime("Team Lead")
+
+        self.assertEqual(summary["effectiveBackend"], "copilot-cli")
+        self.assertTrue(summary["agenticReady"])
+
+    def test_require_agentic_runtime_rejects_unready_copilot_cli(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+
+        with self.assertRaisesRegex(RuntimeError, "cannot start agentic execution"):
+            require_agentic_runtime("Team Lead")
+
+    def test_copilot_cli_run_agentic_executes_tools_until_final_answer(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+        os.environ["COPILOT_GITHUB_TOKEN"] = "copilot_token_test"
+
+        responses = [
+            {
+                "summary": "calling tool",
+                "raw_response": '<tool_call name="demo_tool">{"value": 7}</tool_call>',
+                "warnings": [],
+            },
+            {
+                "summary": "finished",
+                "raw_response": "<final_answer>done after tool call</final_answer>",
+                "warnings": [],
+            },
+        ]
+
+        with patch("common.runtime.copilot_cli.shutil.which", return_value="/usr/bin/copilot"), \
+             patch("common.runtime.copilot_cli.CopilotCliAdapter.run", side_effect=responses) as mocked_run, \
+             patch("common.runtime.copilot_cli._dispatch_tool", return_value="tool ok") as mocked_dispatch:
+            result = get_runtime().run_agentic("do something", tools=["demo_tool"], max_turns=3)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.backend_used, "copilot-cli")
+        self.assertEqual(result.summary, "done after tool call")
+        self.assertEqual(result.turns_used, 2)
+        self.assertEqual(result.tool_calls[0]["name"], "demo_tool")
+        self.assertEqual(result.tool_calls[0]["arguments"], {"value": 7})
+        mocked_dispatch.assert_called_once_with("demo_tool", {"value": 7})
+        self.assertEqual(mocked_run.call_count, 2)
 
     def test_load_dotenv_applies_shared_defaults_and_local_overrides(self):
         with tempfile.TemporaryDirectory() as temp_dir:

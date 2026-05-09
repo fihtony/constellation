@@ -20,8 +20,32 @@
     {
       "id": "orchestrate",
       "name": "Constellation Orchestrator",
-      "description": "Uses the agentic runtime to route user requests, dispatches to Team Lead, Office Agent, Tracker, SCM, Android, and other agents, and summarizes final results for the user.",
+      "description": "Uses the agentic runtime to route user requests, dispatches to Team Lead, Office Agent, Jira, SCM, Android, and other agents, and summarizes final results for the user.",
       "tags": ["compass", "orchestrator", "workflow", "routing", "constellation", "office", "runtime"]
+    },
+    {
+      "id": "orchestrator.progress.report",
+      "name": "Orchestrator Progress Reporting",
+      "description": "Receives major progress updates for orchestrated tasks.",
+      "tags": ["compass", "orchestrator", "progress", "tracking"]
+    },
+    {
+      "id": "orchestrator.task.callback",
+      "name": "Orchestrator Task Callback",
+      "description": "Receives downstream task callbacks for completion, failure, and input-required state changes.",
+      "tags": ["compass", "orchestrator", "callback", "task"]
+    },
+    {
+      "id": "orchestrator.user.interact",
+      "name": "Orchestrator User Interaction",
+      "description": "Bridges agent input-required requests back to the user-facing orchestrator flow.",
+      "tags": ["compass", "orchestrator", "input-required", "user-interaction"]
+    },
+    {
+      "id": "orchestrator.task.status",
+      "name": "Orchestrator Task Status",
+      "description": "Returns orchestrated task status and user-visible progress summaries.",
+      "tags": ["compass", "orchestrator", "status", "tracking"]
     }
   ]
 }

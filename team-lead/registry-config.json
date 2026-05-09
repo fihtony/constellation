@@ -9,9 +9,6 @@
     "mountDockerSocket": true,
     "passThroughEnv": ["ARTIFACT_ROOT", "COPILOT_GITHUB_TOKEN", "TZ"],
     "env": {
-      "AGENT_RUNTIME": "connect-agent",
-      "AGENT_MODEL": "gpt-5-mini",
-      "COMPASS_URL": "http://compass:8080",
       "DYNAMIC_AGENT_NETWORK": "constellation-network"
     }
   },

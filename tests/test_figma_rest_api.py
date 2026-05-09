@@ -2,7 +2,8 @@
 """Figma REST API integration tests.
 
 Tests the Figma REST API directly (no agent) using Personal Access Token auth.
-Validates file metadata, page listing, page-by-name lookup, and node retrieval.
+Validates file metadata, page listing, page-by-name lookup, node retrieval,
+full-file download, extract_ui_specs, and the tool-layer wrapper functions.
 
 Required keys in tests/.env:
   TEST_FIGMA_FILE_URL   Full Figma design URL
@@ -219,6 +220,185 @@ def run_figma_tests(reporter: Reporter) -> None:
 
     reporter.step("List pages via REST API (direct)")
     test_figma_list_pages(reporter, token)
+
+    # Additional coverage: page-by-name lookup
+    if pages:
+        test_figma_page_by_name(reporter, pages)
+
+    # Additional coverage: full-file download
+    test_figma_full_file(reporter)
+
+    # Additional coverage: tool-layer wrappers (list_pages, fetch_page, fetch_node)
+    test_figma_tool_wrappers(reporter, pages, node_id)
+
+    # Additional coverage: extract_ui_specs on real node data
+    if node_id:
+        test_figma_extract_ui_specs(reporter, node_id)
+
+
+def test_figma_page_by_name(reporter: Reporter, pages: list) -> None:
+    """Test figma_client.fetch_page_by_name() with a real page name."""
+    _ui_design_dir = os.path.join(PROJECT_ROOT, "ui-design")
+    if _ui_design_dir not in sys.path:
+        sys.path.insert(0, _ui_design_dir)
+    try:
+        import figma_client
+    except ImportError as exc:
+        reporter.fail("figma_client not importable for page-by-name test", str(exc))
+        return
+
+    if not pages:
+        reporter.skip("fetch_page_by_name", "No pages available to test with")
+        return
+
+    first_page_name = pages[0].get("name", "")
+    reporter.step(f"figma_client.fetch_page_by_name — '{first_page_name}'")
+    result, status = figma_client.fetch_page_by_name(FIGMA_FILE_KEY, first_page_name)
+    reporter.show("fetch_page_by_name", result)
+    if status == "ok":
+        page = result.get("page", {})
+        reporter.ok(
+            f"fetch_page_by_name: matched '{page.get('name')}' — "
+            f"{len(result.get('availablePages', []))} pages available"
+        )
+    elif status == "error_429":
+        reporter.info("fetch_page_by_name: Figma API rate-limited (429) — transient")
+    else:
+        reporter.fail(f"fetch_page_by_name failed: {status}", str(result)[:200])
+
+    # Test fuzzy match: pass a partial/lowercase name
+    partial = first_page_name[:4].lower() if len(first_page_name) >= 4 else first_page_name
+    reporter.step(f"figma_client.fetch_page_by_name — fuzzy '{partial}'")
+    result2, status2 = figma_client.fetch_page_by_name(FIGMA_FILE_KEY, partial)
+    if status2 == "ok":
+        reporter.ok(f"Fuzzy match succeeded: '{result2.get('page', {}).get('name')}'")
+    elif status2 == "error_429":
+        reporter.info("Fuzzy match: rate-limited (429) — transient")
+    elif status2 in ("page_not_found", "no_pages_found"):
+        reporter.info(f"Fuzzy match: no match for '{partial}' — expected for short prefix")
+    else:
+        reporter.fail(f"fetch_page_by_name fuzzy failed: {status2}", str(result2)[:200])
+
+
+def test_figma_full_file(reporter: Reporter) -> None:
+    """Test figma_client.fetch_full_file() — single-call full document download."""
+    _ui_design_dir = os.path.join(PROJECT_ROOT, "ui-design")
+    if _ui_design_dir not in sys.path:
+        sys.path.insert(0, _ui_design_dir)
+    try:
+        import figma_client
+    except ImportError as exc:
+        reporter.fail("figma_client not importable for full-file test", str(exc))
+        return
+
+    reporter.step(f"figma_client.fetch_full_file — file {FIGMA_FILE_KEY}")
+    file_data, status = figma_client.fetch_full_file(FIGMA_FILE_KEY, use_cache=False)
+    reporter.show("fetch_full_file (truncated)", {"name": file_data.get("name"), "status": status})
+    if status == "ok":
+        page_count = len(
+            (file_data.get("document", {}) or {}).get("children", [])
+        )
+        reporter.ok(
+            f"fetch_full_file: file='{file_data.get('name')}', "
+            f"pages={page_count}, styles={len(file_data.get('styles') or {})}"
+        )
+
+        # Test extract_design_tokens on the full file data
+        reporter.step("extract_design_tokens from full file")
+        tokens = figma_client.extract_design_tokens(file_data)
+        reporter.ok(
+            f"extract_design_tokens: "
+            f"colors={len(tokens['colors'])}, "
+            f"typography={len(tokens['typography'])}, "
+            f"effects={len(tokens['effects'])}"
+        )
+    elif status == "error_429":
+        reporter.info("fetch_full_file: Figma API rate-limited (429) — transient")
+    else:
+        reporter.fail(f"fetch_full_file failed: {status}", str(file_data)[:200])
+
+
+def test_figma_tool_wrappers(reporter: Reporter, pages: list, node_id: str | None) -> None:
+    """Test the tool-layer wrappers: list_pages(), fetch_page(), fetch_node()."""
+    _ui_design_dir = os.path.join(PROJECT_ROOT, "ui-design")
+    if _ui_design_dir not in sys.path:
+        sys.path.insert(0, _ui_design_dir)
+    try:
+        import figma_client
+    except ImportError as exc:
+        reporter.fail("figma_client not importable for wrapper tests", str(exc))
+        return
+
+    # list_pages wrapper
+    reporter.step("figma_client.list_pages() wrapper")
+    try:
+        wrapper_pages = figma_client.list_pages(FIGMA_FILE_KEY)
+        reporter.ok(f"list_pages wrapper: {len(wrapper_pages)} pages")
+    except RuntimeError as exc:
+        if "error_429" in str(exc):
+            reporter.info("list_pages wrapper: rate-limited (429) — transient")
+        else:
+            reporter.fail("list_pages wrapper raised unexpected error", str(exc))
+
+    # fetch_page wrapper
+    if pages:
+        first_page_name = pages[0].get("name", "")
+        reporter.step(f"figma_client.fetch_page() wrapper — '{first_page_name}'")
+        try:
+            page_data = figma_client.fetch_page(FIGMA_FILE_KEY, first_page_name)
+            reporter.ok(f"fetch_page wrapper: matched '{page_data.get('page', {}).get('name')}'")
+        except RuntimeError as exc:
+            if "error_429" in str(exc):
+                reporter.info("fetch_page wrapper: rate-limited (429) — transient")
+            else:
+                reporter.fail("fetch_page wrapper raised unexpected error", str(exc))
+
+    # fetch_node wrapper
+    if node_id:
+        reporter.step(f"figma_client.fetch_node() wrapper — node {node_id}")
+        try:
+            node_data = figma_client.fetch_node(FIGMA_FILE_KEY, node_id)
+            reporter.ok(f"fetch_node wrapper: node keys={list(node_data.keys())[:5]}")
+        except RuntimeError as exc:
+            if "error_429" in str(exc):
+                reporter.info("fetch_node wrapper: rate-limited (429) — transient")
+            else:
+                reporter.fail("fetch_node wrapper raised unexpected error", str(exc))
+
+
+def test_figma_extract_ui_specs(reporter: Reporter, node_id: str) -> None:
+    """Fetch a real node from Figma and run extract_ui_specs on it."""
+    _ui_design_dir = os.path.join(PROJECT_ROOT, "ui-design")
+    if _ui_design_dir not in sys.path:
+        sys.path.insert(0, _ui_design_dir)
+    try:
+        import figma_client
+    except ImportError as exc:
+        reporter.fail("figma_client not importable for extract_ui_specs test", str(exc))
+        return
+
+    reporter.step(f"extract_ui_specs on real node {node_id}")
+    try:
+        node_data = figma_client.fetch_node(FIGMA_FILE_KEY, node_id)
+        # The nodes response has: {"nodes": {node_id: {"document": {...}}}}
+        nodes_map = node_data.get("nodes", {})
+        if not nodes_map:
+            reporter.skip("extract_ui_specs", "No nodes in response")
+            return
+        document = next(iter(nodes_map.values()), {}).get("document", {})
+        if not document:
+            reporter.skip("extract_ui_specs", "No document in node response")
+            return
+        specs = figma_client.extract_ui_specs(document)
+        reporter.ok(
+            f"extract_ui_specs: type={specs.get('type')}, name={specs.get('name')}, "
+            f"dimensions={specs.get('dimensions')}"
+        )
+    except RuntimeError as exc:
+        if "error_429" in str(exc):
+            reporter.info("extract_ui_specs: rate-limited (429) — transient")
+        else:
+            reporter.fail("extract_ui_specs test raised unexpected error", str(exc))
 
 
 # ---------------------------------------------------------------------------

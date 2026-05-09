@@ -1,0 +1,27 @@
+# Office Agent — connect-agent backend
+# Extends constellation-base-connect-agent with office agent code and document libs.
+# Select this Dockerfile when AGENT_RUNTIME=connect-agent.
+
+FROM constellation-base-connect-agent:latest
+
+RUN pip install --no-cache-dir \
+    pypdf \
+    pdfplumber \
+    python-docx \
+    python-pptx \
+    openpyxl \
+    xlrd \
+    chardet
+
+COPY office/ /app/office/
+
+LABEL constellation.agent_id="office-agent"
+LABEL constellation.agent_name="Office Agent"
+LABEL constellation.agent_role="execution"
+LABEL constellation.runtime.backend="connect-agent"
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "office/app.py"]

@@ -1,0 +1,17 @@
+id: stitch-mcp-workflow
+version: 1.0.0
+level: agent-specific
+owner: ui-design-agent
+appliesTo:
+  agentRoles: [ui-design, integration]
+  workflows: [design]
+  taskTags: [stitch, google-stitch, mcp, design, screen]
+  languages: []
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools: []
+provides:
+  - stitch-mcp-integration-guidance
+  - design-screen-fetch-workflow
+hashPolicy: sha256
+trustLevel: reviewed

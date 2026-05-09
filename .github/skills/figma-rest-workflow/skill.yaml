@@ -1,0 +1,17 @@
+id: figma-rest-workflow
+version: 1.0.0
+level: agent-specific
+owner: ui-design-agent
+appliesTo:
+  agentRoles: [ui-design, integration]
+  workflows: [design]
+  taskTags: [figma, design, ui, rest-api]
+  languages: []
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools: []
+provides:
+  - figma-rest-api-guidance
+  - design-fetch-workflow
+hashPolicy: sha256
+trustLevel: reviewed

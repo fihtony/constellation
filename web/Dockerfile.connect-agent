@@ -1,0 +1,26 @@
+# Web Agent — connect-agent backend
+# Extends constellation-base-connect-agent with web agent toolchain.
+# Select this Dockerfile when AGENT_RUNTIME=connect-agent.
+
+FROM constellation-base-connect-agent:latest
+
+# Web-specific system dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir flask pytest
+
+COPY web/     /app/web/
+COPY .github/skills/ /app/.github/skills/
+
+LABEL constellation.agent_id="web-agent"
+LABEL constellation.agent_name="Web Agent"
+LABEL constellation.agent_role="execution"
+LABEL constellation.runtime.backend="connect-agent"
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "web/app.py"]

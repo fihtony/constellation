@@ -1,0 +1,19 @@
+id: constellation-architecture-delivery
+version: 1.0.0
+level: generic
+owner: team-lead-agent
+appliesTo:
+  agentRoles: [team-lead, web, android, frontend]
+  workflows: [development, review]
+  taskTags: [architecture, design, planning]
+  languages: []
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools:
+  - read_local_file
+provides:
+  - architecture-guidance
+  - implementation-boundaries
+  - change-impact-analysis
+hashPolicy: sha256
+trustLevel: reviewed

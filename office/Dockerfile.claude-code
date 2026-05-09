@@ -1,0 +1,27 @@
+# Office Agent — claude-code backend
+# Extends constellation-base-claude-code with office agent code and document libs.
+# Select this Dockerfile when AGENT_RUNTIME=claude-code.
+
+FROM constellation-base-claude-code:latest
+
+RUN pip install --no-cache-dir \
+    pypdf \
+    pdfplumber \
+    python-docx \
+    python-pptx \
+    openpyxl \
+    xlrd \
+    chardet
+
+COPY office/ /app/office/
+
+LABEL constellation.agent_id="office-agent"
+LABEL constellation.agent_name="Office Agent"
+LABEL constellation.agent_role="execution"
+LABEL constellation.runtime.backend="claude-code"
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "office/app.py"]

@@ -11,6 +11,9 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 
 from common.task_permissions import load_permission_grant
+# Ensure common scm_tools are registered before scm.provider_tools to avoid
+# test-order-dependent tool registration conflicts in combined test runs.
+import common.tools.scm_tools  # noqa: F401
 from scm import app as scm_app
 
 

@@ -1,0 +1,18 @@
+# UI Design Agent — copilot-cli backend
+# Extends constellation-base-copilot-cli with ui-design agent code.
+# Select this Dockerfile when AGENT_RUNTIME=copilot-cli (the default).
+
+FROM constellation-base-copilot-cli:latest
+
+COPY ui-design/  /app/ui-design/
+
+LABEL constellation.agent_id="ui-design-agent"
+LABEL constellation.agent_name="UI Design Agent"
+LABEL constellation.agent_role="integration"
+LABEL constellation.runtime.backend="copilot-cli"
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "ui-design/app.py"]

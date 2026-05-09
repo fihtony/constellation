@@ -1,0 +1,19 @@
+id: constellation-ui-evidence-delivery
+version: 1.0.0
+level: agent-specific
+owner: web-agent
+appliesTo:
+  agentRoles: [frontend, web, android]
+  workflows: [development]
+  taskTags: [ui, screenshot, evidence, design-fidelity]
+  languages: []
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools:
+  - read_local_file
+  - run_local_command
+provides:
+  - ui-evidence-capture-guidance
+  - screenshot-comparison-checklist
+hashPolicy: sha256
+trustLevel: reviewed

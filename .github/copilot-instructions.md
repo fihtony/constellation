@@ -35,7 +35,7 @@ working together to complete complex engineering tasks.
 | **Compass Agent** | `compass/` | Control-plane entry point. Routes ALL tasks to Team Lead, manages workflow, owns the Web UI. |
 | **Team Lead Agent** | `team-lead/` | Intelligence layer. Analyzes tasks, gathers Jira/design context, plans, dispatches to dev agents, reviews output, and summarizes results. Runs on port 8030. |
 | **Capability Registry** | `registry/` | Agent discovery and instance tracking. All agents register here on startup. |
-| **Tracker Agent** | `jira/` | Integrates with Jira-compatible systems. Fetches tickets, updates status, posts comments. Runs on port 8010 (Docker service name: `tracker`). |
+| **Jira Agent** | `jira/` | Integrates with Jira-compatible systems. Fetches tickets, updates status, posts comments. Runs on port 8010 (Docker service name: `jira`). |
 | **SCM Agent** | `scm/` | Integrates with Git SCM (Bitbucket/GitHub). Repo inspection, branch, PR operations. Runs on port 8020. |
 | **Android Agent** | `android/` | On-demand execution agent. Launched per-task by Team Lead via Docker socket. |
 | **UI Design Agent** | `ui-design/` | Design context agent. Fetches design data from Figma (REST API) and Google Stitch (MCP). Runs on port 8040. |
@@ -155,7 +155,7 @@ with a task object (containing a task ID). Processing continues asynchronously.
     "metadata": {
       "requestedCapability": "my.skill.id",
       "orchestratorTaskId": "parent-task-id",
-      "orchestratorCallbackUrl": "http://compass:8080/tasks/{id}/callbacks",
+      "orchestratorCallbackUrl": "http://<orchestrator-service>/tasks/{id}/callbacks",
       "sharedWorkspacePath": "/app/artifacts/workspaces/task-xxx"
     }
   },
@@ -228,7 +228,7 @@ Returns the current state of a task. Used by the Compass Agent for polling fallb
 **Rules:**
 - `__ADVERTISED_URL__` is a placeholder replaced at runtime with `ADVERTISED_BASE_URL`.
 - `skills[].id` is the capability identifier used by Compass to route tasks.
-- Skill IDs follow dot-notation: `<domain>.<resource>.<action>` (e.g., `tracker.ticket.fetch`).
+- Skill IDs follow dot-notation: `<domain>.<resource>.<action>` (e.g., `jira.ticket.fetch`).
 
 ### 4. registry-config.json
 
@@ -246,7 +246,7 @@ Returns the current state of a task. Used by the Compass Agent for polling fallb
 ```
 
 **`executionMode` values:**
-- `"persistent"` — agent is always running (tracker, scm, compass). Registered once at startup.
+- `"persistent"` — agent is always running (jira, scm, compass). Registered once at startup.
 - `"per-task"` — agent is launched on demand by Compass via Docker socket (android, ios). Must include `launchSpec`.
 
 **For `per-task` agents, add `launchSpec`:**
@@ -370,7 +370,8 @@ def _notify_compass(callback_url, task_id, state, status_message, artifacts):
 
 ### 8. Progress Reporting
 
-Agents SHOULD report major workflow steps to Compass via the progress endpoint.
+Agents SHOULD report major workflow steps to the orchestrator via the progress endpoint.
+Prefer deriving the base service URL from `message.metadata.orchestratorCallbackUrl`; if that is unavailable, discover `orchestrator.progress.report` through Registry. Do not hardcode `COMPASS_URL` in child agents.
 This is displayed in the Web UI timeline.
 
 ```python
@@ -413,8 +414,8 @@ import json
 workspace_path = message.get("metadata", {}).get("sharedWorkspacePath", "")
 
 # Read upstream output
-tracker_dir = os.path.join(workspace_path, "tracker-agent")
-ticket_file = os.path.join(tracker_dir, "ticket.json")
+jira_dir = os.path.join(workspace_path, "jira-agent")
+ticket_file = os.path.join(jira_dir, "ticket.json")
 if os.path.isfile(ticket_file):
     with open(ticket_file, encoding="utf-8") as fh:
         ticket = json.load(fh)
@@ -482,10 +483,10 @@ artifacts = [
 ### 12. LLM Usage
 
 Use `common/runtime/adapter.py` for all agentic LLM/CLI calls. It handles:
-- `connect-agent` as the primary built-in production runtime, using Copilot Connect as its underlying LLM transport
-- `copilot-cli` as an optional compatible CLI backend
+- `copilot-cli` as the shared default runtime backend for LLM-enabled agents
 - `claude-code` as an optional compatible backend
-- Mock fallback when no real backend is available (`ALLOW_MOCK_FALLBACK=1`)
+- `connect-agent` as an explicit transport-backed backend when a workflow selects it
+- fail-fast runtime errors when the configured backend is unavailable or misconfigured
 - Proper timeout and structured result handling
 
 `common/runtime/copilot_connect.py` is a compatibility single-shot wrapper over the Copilot Connect transport. It is not a selectable agentic runtime backend.
@@ -521,7 +522,6 @@ REGISTRY_URL=http://registry:9000
 # OPENAI_BASE_URL=
 OPENAI_MODEL=gpt-5-mini
 OPENAI_API_KEY=
-ALLOW_MOCK_FALLBACK=0  # Set to 1 only for offline/test environments
 
 # Runtime
 HOST=0.0.0.0
@@ -657,7 +657,7 @@ Skill IDs follow the pattern: `<domain>.<resource>.<action>`
 
 | Domain | Examples |
 |--------|---------|
-| `tracker` | `tracker.ticket.fetch`, `tracker.ticket.update`, `tracker.ticket.comment` |
+| `jira` | `jira.ticket.fetch`, `jira.ticket.update`, `jira.ticket.comment` |
 | `scm` | `scm.repo.inspect`, `scm.branch.create`, `scm.pr.create` |
 | `android` | `android.task.execute`, `android.build.run` |
 | `ios` | `ios.task.execute` |
@@ -714,7 +714,7 @@ Before submitting a new agent, verify:
 | Purpose | Path |
 |---------|------|
 | **Team Lead Agent** | `team-lead/` | Intelligence layer: analysis, planning, dispatch, review | port 8030 |
-| Team Lead prompts | `team-lead/prompts.py` | ALL LLM prompt strings for Team Lead |
+| Team Lead prompts | `team-lead/prompts/system/` and `team-lead/prompts/tasks/` | Modular system/task prompt assets for Team Lead |
 | Jira prompts | `jira/prompts.py` | ALL LLM prompt strings for Jira Agent |
 | SCM prompts | `scm/prompts.py` | ALL LLM prompt strings for SCM Agent |
 | UI Design prompts | `ui-design/prompts.py` | ALL LLM prompt strings for UI Design Agent |
@@ -723,14 +723,18 @@ Before submitting a new agent, verify:
 | UI Design Agent | `ui-design/` | Figma REST API + Google Stitch MCP | port 8040 |
 | Office Agent | `office/` | Local office document execution agent | port 8060 |
 | Office prompts | `office/prompts.py` | ALL LLM prompt strings for Office Agent |
+| Office document tools | `office/tools/document_tools.py` | Agent-local document readers (read_pdf, read_docx, etc.), NOT in `common/` |
 | UI Design client (Figma) | `ui-design/figma_client.py` | Agent-local, NOT in `common/` |
 | UI Design client (Stitch) | `ui-design/stitch_client.py` | Agent-local, NOT in `common/` |
 | Compass Agent (control plane) | `compass/app.py` |
+| Compass office routing helpers | `compass/office_routing.py` | Path validation and Docker bind-mount helpers for office tasks (state machine removed; LLM uses `validate_office_paths` control tool instead) |
+| Compass completeness gate helpers | `compass/completeness.py` | PR evidence extraction, completeness checks, follow-up message builder, task card status derivation |
+| Team Lead workflow helpers | `team-lead/agentic_workflow.py` | Runtime tool list, task prompt builder, input-wait helper, and control tool wiring |
 | Runtime adapter factory | `common/runtime/adapter.py` | Unified runtime contract + backend factory |
 | Shared runtime env template | `common/.env.example` | Shared default runtime/timezone config loaded before agent-local `.env` |
 | Local time helpers | `common/time_utils.py` | Shared local timestamp helpers for workspace and audit logs |
 | Workspace/debug log helpers | `common/devlog.py` | Shared debug log + workspace stage logging helpers |
-| Copilot CLI backend | `common/runtime/copilot_cli.py` | Primary agentic CLI backend |
+| Copilot CLI backend | `common/runtime/copilot_cli.py` | Primary agentic CLI backend (supports `run_agentic()` via ReAct text loop) |
 | Claude Code backend | `common/runtime/claude_code.py` | Optional compatible backend |
 | Copilot Connect transport wrapper | `common/runtime/copilot_connect.py` | Single-shot compatibility wrapper over the LLM transport used by `connect-agent`; not a selectable runtime backend |
 | Capability Registry | `registry/app.py` |
@@ -748,7 +752,7 @@ Before submitting a new agent, verify:
 ## Shared Runtime Notes
 
 - LLM-enabled agents (`team-lead`, `web`, `android`, `jira`, `scm`, `ui-design`, `office`) should load shared defaults from `common/.env` first, then apply their local `.env` overrides.
-- Team Lead, Web, and Android are the current per-task agents that intentionally pin the shared runtime baseline in `registry-config.json > launchSpec.env`: `AGENT_RUNTIME=connect-agent` and `AGENT_MODEL=gpt-5-mini`. Other agents should stay on the shared `gpt-5-mini` default unless there is an explicit design change.
+- Shared runtime defaults live in `common/.env`, including `AGENT_RUNTIME`, model selection, and `CONTAINER_RUNTIME`. Team Lead, Web, and Android should inherit that baseline unless a future design change explicitly requires a per-task override in `registry-config.json > launchSpec.env`.
 - Protected GitHub/SCM credential variables (`GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `SCM_TOKEN`, `SCM_USERNAME`, `SCM_PASSWORD`, `TEST_GITHUB_TOKEN`) are file-backed by default. Ambient host values must be ignored unless a launcher or test has already loaded its own `.env` and explicitly marks the child process with `CONSTELLATION_TRUSTED_ENV=1`.
 - Runtime Git commands must use the isolated helper environment from `common.env_utils.build_isolated_git_env()` so agent subprocesses never read host Git credential helpers, host keychains, or user-level `~/.gitconfig`.
 - `copilot-cli` runtime authentication is isolated as well: only `COPILOT_GITHUB_TOKEN` is supported for agent execution. Do not rely on `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth`, or system keychain fallbacks inside agents.
@@ -758,13 +762,16 @@ Before submitting a new agent, verify:
 - `registry` remains a non-agentic control-plane service. `compass` is now an agentic control-plane service for routing, clarification interpretation, and user-facing final summaries, but it must still avoid unbounded external-system reasoning loops and must not bypass registered boundary agents.
 - Task workspaces should keep `command-log.txt` and `stage-summary.json` under each agent subdirectory for auditability; runtime details belong inside `stage-summary.json` as `runtimeConfig`, not in a separate `runtime-config.json` file.
 - The shared `connect-agent` runtime prompt must stay domain-neutral. Task-specific development, design-to-code, office, or audit rules belong in the caller's agent prompt or explicit system prompt override, not in the runtime default prompt.
+- Web Agent and Android Agent now use `runtime.run_agentic()` for the real repository implementation phase. Keep `run()` only for bounded single-shot subtasks such as structured analysis, planning, self-assessment, or summarization.
 - When Team Lead has already fetched Jira or UI-design context, it must pass bounded copies to the downstream dev agent through A2A metadata (`jiraContext`, `designContext`). Dev agents must consume that handed-off context first and only call Jira / UI Design again when they need additional detail beyond the provided payload.
 - Team Lead and Web currently inject the **six** workspace delivery playbooks `constellation-architecture-delivery`, `constellation-frontend-delivery`, `constellation-backend-delivery`, `constellation-database-delivery`, `constellation-code-review-delivery`, and `constellation-testing-delivery` through `build_system_prompt(...)`; their `stage-summary.json` should therefore retain both `runtimeConfig.runtime` and `runtimeConfig.skillPlaybooks` for auditability.
+- `compass` and `team-lead` prompt manifests should also inject `constellation-generic-agent-workflow` ahead of agent-specific guidance, and new prompts/tests should prefer the canonical local workspace tool names `read_local_file`, `write_local_file`, `edit_local_file`, `list_local_dir`, and `search_local_files`. Legacy aliases (`read_file`, `write_file`, `glob`, `grep`) remain compatibility-only and should not be treated as the primary contract in new runtime-first work.
 - In execution task workspaces, generated source files should live in the real cloned repository directory; `web-agent/` and similar agent subdirectories are for metadata and audit artifacts only.
 - For repo-backed development tasks, Team Lead must instruct the dev agent to clone the target repository via the SCM agent into the shared workspace before editing files, and Web Agent must fail fast if a repo URL is present but no shared workspace is available or the clone path escapes that workspace.
 - Web Agent branches should use deterministic naming based on Jira key plus orchestrator task id when available; only docs/tests-only changes may use `chore/...` naming without a ticket key.
 - Team Lead review for repo-backed tasks must require clone/branch/PR evidence and should post audit-ready rejection comments to Jira when a delivery is rejected.
 - Boundary agents (Jira, SCM, UI Design, future Jenkins/Stitch-style integrations) must be discovered through Registry capabilities at runtime; do not hardcode their service URLs inside Team Lead or execution agents.
+- Common boundary-tool wrappers must send the standard A2A `message:send` envelope (`message` at the top level plus `configuration.returnImmediately`) and, when the caller expects a synchronous result, poll `/tasks/{id}` until a terminal state before returning. Do not introduce new JSON-RPC-style wrapper envelopes for agent-to-agent tooling.
 - Compass now attaches a task permission snapshot in `message.metadata.permissions` for routed task work. Boundary agents must enforce that snapshot themselves instead of trusting upstream prompt discipline. All agent-to-agent calls must carry permissions through A2A `message.metadata.permissions`; execution agents and Team Lead must not fall back to direct HTTP headers/body fields when calling boundary agents. Direct HTTP convenience endpoints, if retained, are for operator/manual or test-only access paths and must not be the normal inter-agent transport.
 - Development-task SCM protected branches are defined centrally by `common/permissions/development.json > scopeConfig.scm.protectedBranchPatterns` as full regex matches. Default protected branches are `main`, `master`, `develop`, and `release/*`; any other branch name is treated as a development branch unless policy overrides it.
 - The permission system is pre-release and fail-closed by default. In `PERMISSION_ENFORCEMENT=strict`, missing or malformed permission snapshots must reject both read and write boundary operations; do not add compatibility fallbacks that weaken enforcement.
@@ -787,3 +794,7 @@ Before submitting a new agent, verify:
   - Compass ACKs Team Lead after the completeness gate passes (or max revisions reached).
 - Python virtual environments created by Web Agent are placed in `tempfile.gettempdir()/constellation-venv-{hash}`, NOT inside the cloned repo directory, to avoid Docker-path shebang issues when the workspace is accessed locally.
 - Use `LOCAL_TIMEZONE` (preferred) or `TZ` to keep workspace timestamps aligned with the operator's local time.
+- Agent-specific tools must live in the agent directory (e.g. `office/tools/document_tools.py`), NOT in `common/tools/`. Each agent loads its own tools before calling `runtime.run_agentic(tools=TOOL_NAMES)`. The runtime adapter does NOT hardcode domain tool imports — it only loads core shared tools (coding, planning, control, registry, validation). Domain tools (jira, scm, design, document readers) are loaded by the agent that needs them.
+- All LLM-enabled agents MUST use runtime-specific Dockerfiles (e.g. `Dockerfile.connect-agent`, `Dockerfile.copilot-cli`, `Dockerfile.claude-code`). Generic `Dockerfile` files are forbidden for agents that have runtime variants. Only infrastructure services without runtime variants (registry, im-gateway) may use a plain `Dockerfile`.
+- Compass routes office tasks via Registry capability lookup, not by hardcoding the Office Agent URL. The `dispatch_agent_task` tool discovers and launches per-task agents automatically through Registry + Launcher.
+- Office Agent completes a delivery review cycle with Compass: Compass validates output completeness via `aggregate_task_card`, may send revision comments back, and only ACKs the Office Agent after the delivery is accepted (or max revisions exhausted).

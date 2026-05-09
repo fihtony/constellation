@@ -1,6 +1,10 @@
 """General-purpose coding tools for the Connect Agent runtime.
 
-Provides: bash, read_file, write_file, edit_file, glob, grep.
+Provides legacy tool names (`bash`, `read_file`, `write_file`, `edit_file`,
+`glob`, `grep`) plus runtime-first local-workspace aliases
+(`run_local_command`, `read_local_file`, `write_local_file`,
+`edit_local_file`, `list_local_dir`, `search_local_files`).
+
 All tools follow the ConstellationTool pattern and self-register on import.
 """
 
@@ -381,6 +385,104 @@ class EditFileTool(ConstellationTool):
 
 
 # ===================================================================
+# list_local_dir
+# ===================================================================
+
+class ListLocalDirTool(ConstellationTool):
+    _SKIP_DIRS = {
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".tox",
+        ".gradle",
+        ".connect-agent",
+        ".transcripts",
+        "build",
+        "dist",
+        "out",
+        "target",
+    }
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="list_local_dir",
+            description=(
+                "List files and folders in the local workspace. Returns paths "
+                "relative to the workspace root and appends '/' to directories."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path relative to the workspace root (default: workspace root).",
+                    },
+                    "recursive": {
+                        "type": "boolean",
+                        "description": "Whether to recurse into subdirectories (default: false).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of entries to return (default: 500).",
+                    },
+                },
+            },
+        )
+
+    def execute(self, args: dict) -> dict:
+        path_str = str(args.get("path") or ".")
+        recursive = bool(args.get("recursive", False))
+        limit = min(max(int(args.get("limit", 500)), 1), 5000)
+
+        try:
+            resolved = _resolve(path_str, check_sensitive=False)
+        except SecurityError as exc:
+            return self.error(str(exc))
+
+        if not resolved.is_dir():
+            return self.error(f"Directory not found: {path_str}")
+
+        entries: list[str] = []
+        try:
+            if recursive:
+                for dirpath, dirnames, filenames in os.walk(resolved):
+                    dirnames[:] = [name for name in dirnames if name not in self._SKIP_DIRS]
+                    for name in sorted(dirnames):
+                        rel = os.path.relpath(os.path.join(dirpath, name), _sandbox_root)
+                        entries.append(rel + "/")
+                        if len(entries) >= limit:
+                            break
+                    if len(entries) >= limit:
+                        break
+                    for name in sorted(filenames):
+                        rel = os.path.relpath(os.path.join(dirpath, name), _sandbox_root)
+                        entries.append(rel)
+                        if len(entries) >= limit:
+                            break
+                    if len(entries) >= limit:
+                        break
+            else:
+                for child in sorted(resolved.iterdir(), key=lambda item: item.name):
+                    if child.name in self._SKIP_DIRS:
+                        continue
+                    rel = os.path.relpath(child, _sandbox_root)
+                    entries.append(rel + ("/" if child.is_dir() else ""))
+                    if len(entries) >= limit:
+                        break
+        except OSError as exc:
+            return self.error(f"Could not list directory: {exc}")
+
+        if not entries:
+            return self.ok(f"Directory is empty: {path_str}")
+
+        audit_log("LIST_LOCAL_DIR", path=path_str, recursive=recursive, count=len(entries))
+        return self.ok("\n".join(entries))
+
+
+# ===================================================================
 # glob
 # ===================================================================
 
@@ -584,6 +686,68 @@ class GrepTool(ConstellationTool):
         return self.ok(f"Found {len(results)} match(es):\n{output}{suffix}")
 
 
+class RunLocalCommandTool(BashTool):
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="run_local_command",
+            description=(
+                "Execute a shell command in the local workspace sandbox. Use this for "
+                "validation, inspection, and project-local automation."
+            ),
+            input_schema=super().schema.input_schema,
+        )
+
+
+class ReadLocalFileTool(ReadFileTool):
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="read_local_file",
+            description=(
+                "Read a local workspace file with line numbers. Preferred alias for "
+                "runtime-first agents working from a shared workspace."
+            ),
+            input_schema=super().schema.input_schema,
+        )
+
+
+class WriteLocalFileTool(WriteFileTool):
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="write_local_file",
+            description=(
+                "Write a local workspace file. Preferred alias when creating plans, "
+                "summaries, or evidence files inside the shared workspace."
+            ),
+            input_schema=super().schema.input_schema,
+        )
+
+
+class EditLocalFileTool(EditFileTool):
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="edit_local_file",
+            description="Precisely replace an exact text block inside a local workspace file.",
+            input_schema=super().schema.input_schema,
+        )
+
+
+class SearchLocalFilesTool(GrepTool):
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="search_local_files",
+            description=(
+                "Search the local workspace for text or regex matches. Preferred alias "
+                "for runtime-first agents working from a shared workspace."
+            ),
+            input_schema=super().schema.input_schema,
+        )
+
+
 # ===================================================================
 # Self-register all tools
 # ===================================================================
@@ -592,5 +756,11 @@ register_tool(BashTool())
 register_tool(ReadFileTool())
 register_tool(WriteFileTool())
 register_tool(EditFileTool())
+register_tool(ListLocalDirTool())
 register_tool(GlobTool())
 register_tool(GrepTool())
+register_tool(RunLocalCommandTool())
+register_tool(ReadLocalFileTool())
+register_tool(WriteLocalFileTool())
+register_tool(EditLocalFileTool())
+register_tool(SearchLocalFilesTool())

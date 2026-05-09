@@ -1,0 +1,19 @@
+id: constellation-code-review-delivery
+version: 1.0.0
+level: generic
+owner: team-lead-agent
+appliesTo:
+  agentRoles: [team-lead, web, android, frontend]
+  workflows: [review]
+  taskTags: [review, quality, security, test]
+  languages: []
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools:
+  - read_local_file
+provides:
+  - code-review-checklist
+  - rejection-criteria
+  - pr-review-guidance
+hashPolicy: sha256
+trustLevel: reviewed

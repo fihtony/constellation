@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Allowed real Tracker and SCM targets for integration tests.
+"""Allowed real Jira and SCM targets for integration tests.
 
 This module is the single source of truth for real shared resources that the
 agent regression scripts may touch.
 
-Tracker agent tests:
+Jira agent tests:
 - Read-only: fetch, search, myself on the one allowed ticket.
 - Write-scoped: comment CRUD, field update restore, transition restore,
   assignee restore on the same allowed ticket only.

@@ -1,0 +1,16 @@
+id: copilot-cli-agent
+version: 1.0.0
+level: generic
+owner: team-lead-agent
+appliesTo:
+  agentRoles: [team-lead, web, android, frontend]
+  workflows: [development]
+  taskTags: [copilot-cli, runtime, agentic]
+  languages: []
+runtimeCompatibility:
+  backends: [copilot-cli]
+requiredTools: []
+provides:
+  - copilot-cli-usage-patterns
+hashPolicy: sha256
+trustLevel: reviewed

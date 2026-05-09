@@ -1,0 +1,18 @@
+# UI Design Agent — connect-agent backend
+# Extends constellation-base-connect-agent with ui-design agent code.
+# Select this Dockerfile when AGENT_RUNTIME=connect-agent.
+
+FROM constellation-base-connect-agent:latest
+
+COPY ui-design/  /app/ui-design/
+
+LABEL constellation.agent_id="ui-design-agent"
+LABEL constellation.agent_name="UI Design Agent"
+LABEL constellation.agent_role="integration"
+LABEL constellation.runtime.backend="connect-agent"
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "ui-design/app.py"]

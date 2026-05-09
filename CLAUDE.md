@@ -120,7 +120,6 @@ When Team Lead needs user input it POSTs `TASK_STATE_INPUT_REQUIRED` to Compass.
 | `CONTAINER_RUNTIME` | `docker` |
 | `OPENAI_BASE_URL` | runtime-aware default: `http://localhost:1288/v1` on host, `http://host.docker.internal:1288/v1` in Docker containers, `http://host.rancher-desktop.internal:1288/v1` in Rancher containers |
 | `OPENAI_MODEL` | `gpt-5-mini` |
-| `ALLOW_MOCK_FALLBACK` | — (set to `1` for offline/test mode) |
 
 For launcher agents:
 - Inside containers, always mount the host Docker-compatible socket at `/var/run/docker.sock` and set `DOCKER_SOCKET=/var/run/docker.sock` in the container env.

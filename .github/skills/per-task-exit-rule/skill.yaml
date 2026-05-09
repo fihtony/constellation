@@ -1,0 +1,16 @@
+id: per-task-exit-rule
+version: 1.0.0
+level: generic
+owner: team-lead-agent
+appliesTo:
+  agentRoles: [team-lead, web, android, frontend, office]
+  workflows: [development, review]
+  taskTags: [lifecycle, exit, ack, per-task]
+  languages: []
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools: []
+provides:
+  - per-task-exit-rule-guidance
+hashPolicy: sha256
+trustLevel: reviewed

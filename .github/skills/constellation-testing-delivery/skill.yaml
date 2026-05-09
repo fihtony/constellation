@@ -1,0 +1,19 @@
+id: constellation-testing-delivery
+version: 1.0.0
+level: generic
+owner: team-lead-agent
+appliesTo:
+  agentRoles: [team-lead, web, android, frontend]
+  workflows: [development, review]
+  taskTags: [testing, unit-test, integration-test, e2e]
+  languages: []
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools:
+  - read_local_file
+  - run_local_command
+provides:
+  - testing-strategy-guidance
+  - test-coverage-checklist
+hashPolicy: sha256
+trustLevel: reviewed

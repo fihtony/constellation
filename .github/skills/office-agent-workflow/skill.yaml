@@ -1,0 +1,18 @@
+id: office-agent-workflow
+version: 1.0.0
+level: agent-specific
+owner: office-agent
+appliesTo:
+  agentRoles: [office]
+  workflows: [office]
+  taskTags: [office, document, summarize, analyze]
+  languages: []
+runtimeCompatibility:
+  backends: [connect-agent, copilot-cli, claude-code]
+requiredTools:
+  - read_local_file
+provides:
+  - document-summarization-guidance
+  - data-analysis-patterns
+hashPolicy: sha256
+trustLevel: reviewed
