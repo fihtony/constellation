@@ -230,6 +230,40 @@ def _normalize_office_dispatch_metadata(metadata: dict, extra_binds: list[str], 
     original_paths = [str(path).strip() for path in (merged.get("officeTargetPaths") or []) if str(path).strip()]
     if not original_paths:
         original_paths = _infer_office_original_paths(merged, extra_binds, task_text)
+
+    # Infer officeOutputMode from extra_binds when the caller did not specify it.
+    # If the userdata bind is mounted read-write (:rw), the output mode is inplace.
+    # This ensures the office agent receives the correct mode even when the LLM
+    # caller forgets to set officeOutputMode explicitly in the dispatch metadata.
+    if not merged.get("officeOutputMode"):
+        inferred_mode = "workspace"
+        for bind_spec in extra_binds or []:
+            _src, dst, mode = _split_bind_spec(bind_spec)
+            if dst in (input_root, "/app/userdata"):
+                if mode and mode.lower() in ("rw", "readwrite"):
+                    inferred_mode = "inplace"
+                break
+        merged["officeOutputMode"] = inferred_mode
+
+    # When running in inplace mode the user has explicitly approved write access.
+    # Upgrade the permission grant to include write permission so the office agent
+    # can pass its permission enforcement check. Without this, the default
+    # office.json grant only allows reads and explicitly denies write.
+    if merged.get("officeOutputMode") == "inplace":
+        current_perms = merged.get("permissions")
+        # Replace with inplace-grant if permissions are absent or are the read-only default.
+        # An inplace-grant has "taskType": "office" and includes the write operation.
+        if current_perms is None:
+            merged["permissions"] = load_permission_grant("office-inplace").to_dict()
+        elif isinstance(current_perms, dict):
+            allowed_ops = [
+                op.get("action")
+                for ap in (current_perms.get("allowed") or [])
+                for op in (ap.get("operations") or [])
+                if ap.get("agent") == "office"
+            ]
+            if "write" not in allowed_ops:
+                merged["permissions"] = load_permission_grant("office-inplace").to_dict()
     if not original_paths:
         merged["officeInputRoot"] = input_root
         return merged
@@ -473,23 +507,23 @@ class DispatchAgentTaskTool(ConstellationTool):
         metadata = _normalize_dispatch_metadata(capability, metadata, extra_binds, task_text)
         task_text = _normalize_dispatch_task_text(capability, task_text, metadata)
 
-        # Prefer a live registered instance; fall back to card_url only for
-        # persistent agents.  For per-task agents with no live instance, trigger
-        # auto-launch when extra_binds are available.
-        agent_url = _discover_live_instance_url(capability)
-
-        if not agent_url:
-            if extra_binds and _is_per_task_agent(capability):
-                # Auto-launch the per-task agent container with the given bind mounts.
-                launch_url, launch_err = self._auto_launch(capability, extra_binds)
-                if launch_err:
-                    return self.error(
-                        f"Auto-launch failed for '{capability}': {launch_err}. "
-                        "Check that the agent image exists and Docker is accessible."
-                    )
-                agent_url = launch_url
-            else:
-                # Fall back to card_url discovery for persistent agents.
+        # Per-task agents with bind mounts (office-agent, android-agent) must
+        # always get a fresh container so the correct mounts are applied.
+        # Reusing a live instance would keep the previous task's bind mounts,
+        # causing the new task to see wrong files.
+        if extra_binds and _is_per_task_agent(capability):
+            launch_url, launch_err = self._auto_launch(capability, extra_binds)
+            if launch_err:
+                return self.error(
+                    f"Auto-launch failed for '{capability}': {launch_err}. "
+                    "Check that the agent image exists and Docker is accessible."
+                )
+            agent_url = launch_url
+        else:
+            # Prefer a live registered instance; fall back to card_url only for
+            # persistent agents.
+            agent_url = _discover_live_instance_url(capability)
+            if not agent_url:
                 agent_url = _discover_capability_url(capability)
 
         if not agent_url:

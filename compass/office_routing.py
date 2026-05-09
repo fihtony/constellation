@@ -142,7 +142,11 @@ def build_office_dispatch_context(
     mounted_targets = []
     for host_path in target_paths:
         relative = os.path.relpath(host_path, mount_root)
-        mounted_targets.append(os.path.join(OFFICE_CONTAINER_INPUT_PATH, relative))
+        # os.path.normpath removes trailing "." so a directory target whose
+        # mount_root is itself (relative == ".") returns "/app/userdata" instead
+        # of "/app/userdata/." — the latter confuses the LLM into appending the
+        # original directory name and constructing a wrong container path.
+        mounted_targets.append(os.path.normpath(os.path.join(OFFICE_CONTAINER_INPUT_PATH, relative)))
 
     extra_binds = [f"{mount_root}:{OFFICE_CONTAINER_INPUT_PATH}:{read_mode}"]
     if workspace_host_path:

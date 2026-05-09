@@ -20,6 +20,9 @@ from common.tools.control_tools import configure_control_tools
 # agentic runtime can discover them by name.
 import office.tools.document_tools as _document_tools  # noqa: F401
 
+# Container path where user data is mounted (matches INPUT_ROOT in app.py).
+_USERDATA_ROOT = "/app/userdata"
+
 # ---------------------------------------------------------------------------
 # Tool names exposed to the agentic runtime backend
 # ---------------------------------------------------------------------------
@@ -173,13 +176,50 @@ def build_office_task_prompt(
             )
         else:
             output_mode_section = "IN-PLACE — write results directly back into the source files/directory."
+        userdata_writable_note = "**Yes (IN-PLACE)** — write your output report directly here"
+        # Determine the exact directory where the output report should land.
+        # - For files: use parent dir (e.g. /app/userdata for /app/userdata/sales.csv)
+        # - For directories: use the directory itself (e.g. /app/userdata/stlouis_rw)
+        _primary = target_paths[0] if target_paths else _USERDATA_ROOT
+        _inplace_dir = (
+            os.path.dirname(_primary) if os.path.splitext(_primary)[1] else _primary
+        ) or _USERDATA_ROOT
+        _ws = workspace_path or "(no shared workspace provided)"
+        if "organize" in capability:
+            critical_write_rules = (
+                f"- Read source files from the Target Paths below (under `{_USERDATA_ROOT}/`).\n"
+                f"- **IN-PLACE ORGANIZE mode**: move and reorganize files WITHIN `{_inplace_dir}/` "
+                f"using bash `mv` commands. Do NOT copy files to the workspace.\n"
+                f"- Write `organization-report.md` to `{_ws}/office-agent/` (workspace only).\n"
+                f"- Write all AUDIT files (command-log, stage-summary) to `{_ws}/office-agent/` only."
+            )
+        else:
+            critical_write_rules = (
+                f"- Read source files from the Target Paths below (under `{_USERDATA_ROOT}/`).\n"
+                f"- **IN-PLACE mode**: write your output file (`summary.md` or `analysis.md`) "
+                f"directly into `{_inplace_dir}/` — the directory containing the target files.\n"
+                f"- Write all AUDIT files (command-log, stage-summary) to `{_ws}/office-agent/` only.\n"
+                f"- Do NOT write the output report to the workspace path `{_ws}/office-agent/`."
+            )
     elif workspace_path:
         output_mode_section = (
             f"WORKSPACE — write all output artifacts to: {workspace_path}/office-agent/"
         )
+        userdata_writable_note = "**No** — do NOT write here; mount is read-only"
+        critical_write_rules = (
+            "- Read source files from the Target Paths below (under `/app/userdata/`).\n"
+            "- Write ALL outputs, intermediate files, and analysis results to "
+            f"`{workspace_path}/office-agent/`.\n"
+            "- NEVER attempt to create files or directories under `/app/userdata/` — the mount is read-only."
+        )
     else:
         output_mode_section = (
             "RETURN — return the summary as the task result artifact only."
+        )
+        userdata_writable_note = "**No** — do NOT write here; mount is read-only"
+        critical_write_rules = (
+            "- Read source files from the Target Paths below (under `/app/userdata/`).\n"
+            "- Do not write files — return the result as the task artifact only."
         )
 
     task_template = build_task_prompt(agent_dir, "process")
@@ -196,4 +236,6 @@ def build_office_task_prompt(
         workspace_path=workspace_path or "(no shared workspace provided)",
         task_id=task_id,
         compass_task_id=compass_task_id or "",
+        userdata_writable_note=userdata_writable_note,
+        critical_write_rules=critical_write_rules,
     )

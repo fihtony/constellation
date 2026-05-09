@@ -148,12 +148,12 @@ build_compass() {
     if [[ ! -f "$dockerfile" ]]; then
         echo "ERROR: Missing Dockerfile for backend '${backend}': ${dockerfile}"; echo "Each agent requires a runtime-specific Dockerfile (e.g. Dockerfile.connect-agent)."; return 1
     fi
-    echo "==> Building compass agent image: constellation-compass:latest (backend: ${backend})"
+    echo "==> Building compass agent image: constellation-compass-agent:latest (backend: ${backend})"
     docker build \
-        -t constellation-compass:latest \
+        -t constellation-compass-agent:latest \
         -f "$dockerfile" \
         "${SCRIPT_DIR}"
-    echo "    Done: constellation-compass:latest"
+    echo "    Done: constellation-compass-agent:latest"
 }
 
 build_jira() {

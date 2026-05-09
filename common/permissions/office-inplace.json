@@ -1,0 +1,25 @@
+{
+  "taskType": "office",
+  "version": "1.0",
+  "description": "Permissions for office tasks running in in-place write mode (user has explicitly approved write access).",
+  "allowed": [
+    {
+      "agent": "office",
+      "operations": [
+        {"action": "read", "scope": "task_root", "description": "Read files in the user-specified folder root and its subfolders"},
+        {"action": "write", "scope": "task_root", "description": "Write output files within the user-approved target directory (in-place mode only)"}
+      ]
+    }
+  ],
+  "denied": [
+    {
+      "agent": "office",
+      "operations": [
+        {"action": "delete", "description": "Delete files or directories"},
+        {"action": "access_outside_root", "description": "Access paths outside the specified folder root"}
+      ],
+      "escalation": "require_user_approval"
+    }
+  ],
+  "fallback": "deny_and_escalate"
+}
