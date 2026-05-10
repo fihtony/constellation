@@ -37,6 +37,7 @@ TEAM_LEAD_RUNTIME_TOOL_NAMES = [
     "jira_validate_permissions",
     "design_fetch_figma_screen",
     "design_fetch_stitch_screen",
+    "scm_clone_repo",
     "scm_repo_inspect",
     "scm_read_file",
     "scm_list_dir",

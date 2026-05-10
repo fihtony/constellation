@@ -3,12 +3,15 @@
 ## Information Gathering First
 
 Before planning or dispatching, always check:
+1. Task context via `get_task_context` for attached permissions, workspace, and orchestrator metadata.
 1. Is a Jira ticket key present? → Fetch it via Jira Agent.
 2. Is a design URL (Figma/Stitch) present? → Fetch it via UI Design Agent.
 3. Is a repository URL present? → Inspect it via SCM Agent.
 4. Is the platform (android/ios/web) determinable from the context?
 
 Do NOT ask the user for information that can be inferred from the above sources.
+Do NOT ask the user to confirm a permissions snapshot that already exists in task context.
+Treat a Jira URL in the request as enough information to extract the ticket key and call Jira before asking follow-up questions.
 
 ## Platform Inference Rules
 
@@ -26,6 +29,7 @@ Pause and ask the user when:
 Do NOT pause for:
 - PR strategy, branch naming, or SCM workflow details.
 - Information already available in Jira, design context, or repository metadata.
+- Permissions or workspace information already available from `get_task_context`.
 
 ## Revision Cycle Policy
 

@@ -303,7 +303,19 @@ def _run_workflow(task_id: str, message: dict) -> None:
     review_issues = list(metadata.get("reviewIssues") or [])
     tech_stack_constraints = dict(metadata.get("techStackConstraints") or {})
     design_context_meta = dict(metadata.get("designContext") or {})
-    target_repo_url = str(metadata.get("targetRepoUrl", ""))
+    scm_context_meta = dict(metadata.get("scmContext") or {})
+    target_repo_url = str(
+        metadata.get("targetRepoUrl")
+        or scm_context_meta.get("repoUrl")
+        or ""
+    )
+    repo_workspace_path = str(
+        metadata.get("repoWorkspacePath")
+        or metadata.get("clonedRepoPath")
+        or scm_context_meta.get("repoWorkspacePath")
+        or scm_context_meta.get("workspacePath")
+        or ""
+    )
     exit_rule = PerTaskExitHandler.parse(metadata)
 
     user_text = _prepend_tech_stack_constraints(
@@ -360,6 +372,7 @@ def _run_workflow(task_id: str, message: dict) -> None:
             tech_stack_constraints=tech_stack_constraints,
             design_context=design_context_meta,
             target_repo_url=target_repo_url,
+            repo_workspace_path=repo_workspace_path,
             jira_context=jira_content,
             ticket_key=ticket_key or "",
             permissions=permissions,

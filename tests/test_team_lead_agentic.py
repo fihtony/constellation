@@ -15,6 +15,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from common.tools.native_adapter import get_function_definitions
+
 _TEAM_LEAD_DIR = Path(__file__).resolve().parents[1] / "team-lead"
 import importlib.util
 
@@ -71,6 +73,12 @@ class TeamLeadTaskContextTests(unittest.TestCase):
 class TeamLeadAgentArchitectureTests(unittest.TestCase):
     """Verify the Team Lead Agent uses the agentic runtime pattern."""
 
+    def test_team_lead_import_registers_boundary_tools(self):
+        definitions = get_function_definitions(["jira_get_ticket", "scm_clone_repo"])
+        names = [item["function"]["name"] for item in definitions]
+        self.assertIn("jira_get_ticket", names)
+        self.assertIn("scm_clone_repo", names)
+
     def test_no_legacy_workflow_functions(self):
         """Legacy Python orchestration functions should not exist in the new app."""
         removed_functions = [
@@ -118,6 +126,7 @@ class TeamLeadAgentArchitectureTests(unittest.TestCase):
         """_run_workflow must provide a comprehensive tool list to run_agentic."""
         required_tools = [
             "jira_get_ticket",
+            "scm_clone_repo",
             "scm_repo_inspect",
             "scm_read_file",
             "scm_list_dir",
@@ -236,6 +245,19 @@ class TeamLeadBuildPromptTests(unittest.TestCase):
     def test_prompt_includes_max_review_cycles(self):
         prompt = self._call_prompt(max_review_cycles=3)
         self.assertIn("3", prompt)
+
+    def test_prompt_requires_team_lead_repo_clone_and_handoff(self):
+        prompt = self._call_prompt(
+            user_text="implement jira ticket: https://example.atlassian.net/browse/PROJ-1"
+        )
+        lowered = prompt.lower()
+        self.assertIn("scm_clone_repo", prompt)
+        self.assertIn("get_task_context", prompt)
+        self.assertIn("repoworkspacepath", lowered)
+        self.assertIn("do not instruct the development agent to clone", lowered)
+        self.assertIn("review independently", lowered)
+        self.assertIn("never ask the user to confirm permissions", lowered)
+        self.assertIn("jira url in the original request is enough", lowered)
 
     def test_prompt_no_hardcoded_compass_url(self):
         """Team Lead should never hardcode Compass URL — it's discovered via registry."""

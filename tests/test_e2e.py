@@ -41,7 +41,6 @@ UI_DESIGN_URL = "http://localhost:8040"
 
 TASK_POLL_TIMEOUT = 120
 WORKFLOW_POLL_TIMEOUT = int(os.environ.get("WORKFLOW_POLL_TIMEOUT", "3600"))
-WORKFLOW_AUTO_REPLY_LIMIT = int(os.environ.get("WORKFLOW_AUTO_REPLY_LIMIT", "1"))
 
 VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
 SMOKE_ONLY = "--smoke-only" in sys.argv
@@ -316,6 +315,16 @@ def _read_json_file(path: str):
         return None
 
 
+def _extract_repo_workspace_path(payload: dict | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("repoWorkspacePath", "clonedRepoPath", "workspacePath", "repoPath"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _task_message_text(body: dict | None) -> str:
     parts = (body or {}).get("task", {}).get("status", {}).get("message", {}).get("parts", [])
     if not isinstance(parts, list):
@@ -325,24 +334,6 @@ def _task_message_text(body: dict | None) -> str:
         for part in parts
         if isinstance(part, dict) and part.get("text")
     ).strip()
-
-
-def _auto_reply_for_input_required(body: dict | None) -> str:
-    question = _normalize_text(_task_message_text(body))
-    if not question:
-        return ""
-    if "sample items for contributions" in question or "mock-data json shape" in question:
-        return (
-            "No preferred backend contract is required for this task. Use local mock data only. "
-            "A Kotlin-friendly sample shape is: "
-            "["
-            '{"title":"RRSP contribution","date":"2026-04-15","amount":"$500.00","icon":"ic_contribution"}, '
-            '{"title":"Employer match","date":"2026-04-01","amount":"$250.00","icon":"ic_contribution"}, '
-            '{"title":"TFSA contribution","date":"2026-03-15","amount":"$300.00","icon":"ic_contribution"}'
-            "] "
-            "Optional subtitle/status fields are fine, but keep the UI aligned to the Figma design."
-        )
-    return ""
 
 
 # Non-execution agent directory names (never the dev-agent workspace dir).
@@ -943,18 +934,8 @@ def test_ticket_full_workflow():  # noqa: C901
         warn("SCM repo URL or token missing -- PR verification skipped")
 
     # ── a. Submit task ────────────────────────────────────────────────────
-    # Build rich request including repo + basic acceptance criteria so team-lead
-    # can proceed without asking the user for clarification.
-    _repo_hint = f" using repository {GITHUB_REPO_URL}" if GITHUB_REPO_URL else ""
-    _design_hint = f" The design reference is: {DESIGN_URL}." if DESIGN_URL else ""
-    _request_text = (
-        f"implement jira ticket {JIRA_TICKET_URL}"
-        f"{_repo_hint}."
-        f"{_design_hint}"
-        f" Use the Jira ticket and linked design context as the source of truth."
-        f" If the repository is sparse, scaffold the required implementation in place instead of switching stacks."
-    )
-    step(f"a. Submit 'implement jira ticket {JIRA_TICKET_URL}'")
+    _request_text = f"implement jira ticket: {JIRA_TICKET_URL}"
+    step(f"a. Submit '{_request_text}'")
     s, body = send_message(_request_text, timeout=30)
     show_json("Compass response", body)
     if s != 200:
@@ -973,32 +954,15 @@ def test_ticket_full_workflow():  # noqa: C901
     else:
         show_json("Final task", final)
 
-    auto_reply_count = 0
-    while final and t_state(final) == "TASK_STATE_INPUT_REQUIRED":
-        if auto_reply_count >= WORKFLOW_AUTO_REPLY_LIMIT:
-            break
-        auto_reply = _auto_reply_for_input_required(final)
-        if not auto_reply:
-            break
-        auto_reply_count += 1
-        step(f"a2. Resume task with automated clarification reply #{auto_reply_count}")
-        s, resumed = send_message(auto_reply, timeout=30, context_id=tid)
-        show_json("Resume response", resumed)
-        if s != 200:
-            fail("Compass rejected the automated clarification reply", f"HTTP {s}")
-            break
-        final = poll_task(tid, timeout=WORKFLOW_POLL_TIMEOUT, print_progress=True)
-        if not final:
-            fail(f"Task did not complete within {WORKFLOW_POLL_TIMEOUT}s after clarification")
-            break
-        show_json("Final task after clarification", final)
-
     final_state = t_state(final) if final else "TIMEOUT"
     input_required = final_state == "TASK_STATE_INPUT_REQUIRED"
     if final_state == "TASK_STATE_COMPLETED":
         ok(f"Task completed (state={final_state})")
     elif input_required:
-        warn("Task needs user input -- partial validation follows")
+        fail(
+            "Task asked for clarification instead of proceeding from Jira/design/repo context",
+            _task_message_text(final)[:300],
+        )
     elif final_state == "TASK_STATE_FAILED":
         parts = (final or {}).get("task", {}).get("status", {}).get("message", {}).get("parts", [{}])
         fail("Task failed", (parts[0].get("text", "") if parts else "")[:200])
@@ -1062,6 +1026,7 @@ def test_ticket_full_workflow():  # noqa: C901
     _ws_file_ok(host_ws, "team-lead/command-log.txt", "Team Lead command log")
     plan_path = os.path.join(host_ws, "team-lead/plan.json")
     review_notes_path = os.path.join(host_ws, "team-lead/review-notes.json")
+    repo_context_path = os.path.join(host_ws, "team-lead/repo-context.json")
     if input_required:
         if os.path.isfile(plan_path):
             ok("Team Lead implementation plan saved before clarification")
@@ -1074,6 +1039,7 @@ def test_ticket_full_workflow():  # noqa: C901
     else:
         _ws_file_ok(host_ws, "team-lead/plan.json", "Team Lead implementation plan")
         _ws_file_ok(host_ws, "team-lead/review-notes.json", "Team Lead review notes")
+        _ws_file_ok(host_ws, "team-lead/repo-context.json", "Team Lead repo handoff context")
 
     step("b3. Verify Team Lead runtime target and skill playbooks")
     team_lead_stage_payload = _read_json_file(os.path.join(host_ws, "team-lead/stage-summary.json"))
@@ -1135,9 +1101,11 @@ def test_ticket_full_workflow():  # noqa: C901
     # ── d. Code/repo ──────────────────────────────────────────────────────
     step("d. Verify cloned repo exists in workspace")
     ws_path = Path(host_ws)
+    repo_context_payload = _read_json_file(repo_context_path)
+    repo_workspace_hint = container_to_host(_extract_repo_workspace_path(repo_context_payload))
     # Primary check: cloned repo directory contains .git
     repo_name = SCM_REPO
-    clone_dir = ws_path / repo_name if repo_name else None
+    clone_dir = Path(repo_workspace_hint) if repo_workspace_hint else (ws_path / repo_name if repo_name else None)
     git_dirs = list(ws_path.rglob(".git"))
     if clone_dir and (clone_dir / ".git").is_dir():
         ok(f"Cloned repo found: {clone_dir.name}/.git exists")
@@ -1213,9 +1181,9 @@ def _verify_external(j_status_before, j_comments_before, prs_before,
     comment_event = _latest_completed_jira_event(jira_action_events, "comment")
 
     if fetch_event:
-        ok(f"{agent_label} recorded a completed Jira fetch action")
+        fail(f"{agent_label} redundantly fetched Jira context instead of using Team Lead handoff")
     else:
-        fail(f"{agent_label} did not record a completed Jira fetch action")
+        ok(f"{agent_label} did not redundantly fetch Jira context")
     if assign_event:
         ok(f"{agent_label} recorded a completed Jira assign action")
     else:
@@ -1321,7 +1289,6 @@ def _verify_external(j_status_before, j_comments_before, prs_before,
         # for documentation-only tasks it may legitimately be absent.
         _ws_file_ok_or_warn(host_ws, f"{exec_agent_dir}/test-results.json", f"{agent_label} test results")
         _ws_file_ok(host_ws, f"{exec_agent_dir}/branch-info.json", f"{agent_label} branch info")
-        _ws_file_ok(host_ws, f"{exec_agent_dir}/clone-info.json", f"{agent_label} clone info")
         _ws_file_ok(host_ws, f"{exec_agent_dir}/jira-actions.json", f"{agent_label} Jira action evidence")
         _ws_file_ok(host_ws, f"{exec_agent_dir}/pr-evidence.json", f"{agent_label} PR evidence")
         _ws_file_ok(host_ws, "compass/command-log.txt", "Compass command log")
@@ -1334,6 +1301,7 @@ def _verify_external(j_status_before, j_comments_before, prs_before,
         _ws_file_ok_or_warn(host_ws, "ui-design/command-log.txt", "UI Design Agent command log")
         _ws_file_ok_or_warn(host_ws, "ui-design/stage-summary.json", "UI Design Agent stage summary")
         branch_info_path = os.path.join(host_ws, f"{exec_agent_dir}/branch-info.json")
+        clone_info_path = os.path.join(host_ws, f"{exec_agent_dir}/clone-info.json")
         test_results_path = os.path.join(host_ws, f"{exec_agent_dir}/test-results.json")
         if os.path.isfile(branch_info_path):
             try:
@@ -1344,6 +1312,10 @@ def _verify_external(j_status_before, j_comments_before, prs_before,
                     fail("Branch info missing branch name", str(branch_info)[:200])
             except Exception as exc:
                 fail("Could not parse branch-info.json", str(exc))
+        if os.path.isfile(clone_info_path):
+            fail(f"{agent_label} created redundant clone evidence", clone_info_path)
+        else:
+            ok(f"{agent_label} reused the Team Lead-prepared repo instead of cloning again")
         if os.path.isfile(test_results_path):
             try:
                 test_results = json.loads(Path(test_results_path).read_text(encoding="utf-8"))

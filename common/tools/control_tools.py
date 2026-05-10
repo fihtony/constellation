@@ -130,14 +130,32 @@ def _discover_live_instance_url(capability: str) -> str | None:
             data = json.loads(resp.read().decode("utf-8"))
         agents = data if isinstance(data, list) else (data.get("agents") or data.get("items") or [])
         for agent in agents:
-            for inst in (agent.get("instances") or []):
+            instances = sorted(
+                agent.get("instances") or [],
+                key=lambda inst: (
+                    float(inst.get("last_heartbeat_at") or 0),
+                    float(inst.get("idle_since") or 0),
+                ),
+                reverse=True,
+            )
+            for inst in instances:
                 url = (
                     inst.get("url")
                     or inst.get("serviceUrl")
                     or inst.get("service_url")
                 )
-                if url:
-                    return url.rstrip("/")
+                if not url:
+                    continue
+                candidate_url = str(url).rstrip("/")
+                try:
+                    health_req = Request(
+                        f"{candidate_url}/health",
+                        headers={"Accept": "application/json"},
+                    )
+                    with urlopen(health_req, timeout=2):
+                        return candidate_url
+                except Exception:  # noqa: BLE001
+                    continue
         return None  # No live instance — do NOT fall back to card_url
     except Exception:  # noqa: BLE001
         return None
@@ -507,11 +525,13 @@ class DispatchAgentTaskTool(ConstellationTool):
         metadata = _normalize_dispatch_metadata(capability, metadata, extra_binds, task_text)
         task_text = _normalize_dispatch_task_text(capability, task_text, metadata)
 
+        is_per_task_agent = _is_per_task_agent(capability)
+
         # Per-task agents with bind mounts (office-agent, android-agent) must
         # always get a fresh container so the correct mounts are applied.
         # Reusing a live instance would keep the previous task's bind mounts,
         # causing the new task to see wrong files.
-        if extra_binds and _is_per_task_agent(capability):
+        if is_per_task_agent and extra_binds:
             launch_url, launch_err = self._auto_launch(capability, extra_binds)
             if launch_err:
                 return self.error(
@@ -520,10 +540,18 @@ class DispatchAgentTaskTool(ConstellationTool):
                 )
             agent_url = launch_url
         else:
-            # Prefer a live registered instance; fall back to card_url only for
-            # persistent agents.
+            # Per-task agents without a live instance must be launched on demand.
+            # Falling back to the agent card URL is only valid for persistent agents.
             agent_url = _discover_live_instance_url(capability)
-            if not agent_url:
+            if is_per_task_agent and not agent_url:
+                launch_url, launch_err = self._auto_launch(capability, extra_binds)
+                if launch_err:
+                    return self.error(
+                        f"Auto-launch failed for '{capability}': {launch_err}. "
+                        "Check that the agent image exists and Docker is accessible."
+                    )
+                agent_url = launch_url
+            if not agent_url and not is_per_task_agent:
                 agent_url = _discover_capability_url(capability)
 
         if not agent_url:

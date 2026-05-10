@@ -54,6 +54,12 @@ class WebAgentRuntimeToolTests(unittest.TestCase):
         "list_local_dir",
         "search_local_files",
         "run_local_command",
+        "jira_validate_permissions",
+        "jira_get_myself",
+        "jira_get_transitions",
+        "jira_assign",
+        "jira_transition",
+        "jira_add_comment",
         "scm_clone_repo",
         "scm_create_branch",
         "scm_push_files",
@@ -311,12 +317,14 @@ class BuildWebTaskPromptTests(unittest.TestCase):
                 tech_stack_constraints={},
                 design_context={},
                 target_repo_url="https://github.com/example/repo",
+                repo_workspace_path="/tmp/ws/example-repo",
                 jira_context="",
                 ticket_key="",
                 permissions=None,
             )
             self.assertIn("Build the landing page.", prompt)
             self.assertIn("https://github.com/example/repo", prompt)
+            self.assertIn("/tmp/ws/example-repo", prompt)
         except RuntimeError as exc:
             self.skipTest(f"Template file not found: {exc}")
 
@@ -333,6 +341,7 @@ class BuildWebTaskPromptTests(unittest.TestCase):
                 tech_stack_constraints={},
                 design_context={},
                 target_repo_url="",
+                repo_workspace_path="",
                 jira_context="",
                 ticket_key="",
                 permissions=None,
@@ -354,6 +363,7 @@ class BuildWebTaskPromptTests(unittest.TestCase):
                 tech_stack_constraints={},
                 design_context={},
                 target_repo_url="",
+                repo_workspace_path="/tmp/ws/repo",
                 jira_context="Build the widget feature",
                 ticket_key="PROJ-1",
                 permissions=None,
@@ -394,7 +404,8 @@ class AgentPromptBoundaryTests(unittest.TestCase):
             .lower()
         )
         self.assertIn("never write product code yourself", orchestrate_lower)
-        self.assertIn("clone that repository", orchestrate_lower)
+        self.assertIn("scm_clone_repo", orchestrate_lower)
+        self.assertIn("repoworkspacepath", orchestrate_lower)
         self.assertIn("shared workspace", orchestrate_lower)
         self.assertIn("missing scm evidence is a delivery failure", orchestrate_lower)
 
@@ -416,6 +427,8 @@ class AgentPromptBoundaryTests(unittest.TestCase):
         content = tools_file.read_text(encoding="utf-8").lower()
         self.assertIn("scm_clone_repo", content)
         self.assertIn("scm_create_pr", content)
+        self.assertIn("jira_add_comment", content)
+        self.assertIn("request_agent_clarification", content)
 
     def test_web_system_prompt_boundaries_file_exists(self):
         boundaries_file = _WEB_SYSTEM_DIR / "10-boundaries.md"

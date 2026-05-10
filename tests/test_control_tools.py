@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from urllib.error import URLError
 from unittest.mock import patch, MagicMock
 
 # Import at module level so register_tool() runs once and stays registered.
@@ -106,6 +107,82 @@ class DispatchAgentTaskTests(unittest.TestCase):
 
         self.assertEqual(url, "http://office-agent:8060")
 
+    def test_discover_live_instance_url_skips_unreachable_stale_instance(self):
+        payload = [
+            {
+                "agent_id": "team-lead-agent",
+                "instances": [
+                    {
+                        "service_url": "http://team-lead-agent-task-old:8030",
+                        "last_heartbeat_at": 100,
+                        "idle_since": 100,
+                    },
+                    {
+                        "service_url": "http://team-lead-agent-task-new:8030",
+                        "last_heartbeat_at": 200,
+                        "idle_since": 200,
+                    },
+                ],
+            }
+        ]
+
+        class _QueryResponse:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps(payload).encode()
+
+        class _HealthResponse:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"status": "ok"}'
+
+        def fake_urlopen(req, timeout=5):
+            url = req.full_url
+            if url.endswith("/query?capability=team-lead.task.analyze"):
+                return _QueryResponse()
+            if url == "http://team-lead-agent-task-new:8030/health":
+                return _HealthResponse()
+            if url == "http://team-lead-agent-task-old:8030/health":
+                raise URLError("Name or service not known")
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        with patch("common.tools.control_tools.urlopen", side_effect=fake_urlopen):
+            url = _ctrl._discover_live_instance_url("team-lead.task.analyze")
+
+        self.assertEqual(url, "http://team-lead-agent-task-new:8030")
+
+    def test_discover_live_instance_url_returns_none_when_all_instances_unreachable(self):
+        payload = [
+            {
+                "agent_id": "team-lead-agent",
+                "instances": [
+                    {
+                        "service_url": "http://team-lead-agent-task-old:8030",
+                        "last_heartbeat_at": 100,
+                        "idle_since": 100,
+                    }
+                ],
+            }
+        ]
+
+        class _QueryResponse:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps(payload).encode()
+
+        def fake_urlopen(req, timeout=5):
+            url = req.full_url
+            if url.endswith("/query?capability=team-lead.task.analyze"):
+                return _QueryResponse()
+            if url == "http://team-lead-agent-task-old:8030/health":
+                raise URLError("Name or service not known")
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        with patch("common.tools.control_tools.urlopen", side_effect=fake_urlopen):
+            url = _ctrl._discover_live_instance_url("team-lead.task.analyze")
+
+        self.assertIsNone(url)
+
     def test_missing_capability_returns_error(self):
         result = self.tool.execute({"task_text": "do something"})
         self.assertTrue(result["isError"])
@@ -169,6 +246,28 @@ class DispatchAgentTaskTests(unittest.TestCase):
         msg = captured["body"]["message"]
         self.assertEqual(msg["metadata"]["requestedCapability"], "android.task.execute")
         self.assertEqual(msg["metadata"]["jiraContext"]["ticketKey"], "PROJ-1")
+
+    def test_dispatch_auto_launches_per_task_agent_without_live_instance(self):
+        mock_response = {"task": {"id": "task-tl", "status": {"state": "TASK_STATE_WORKING"}}}
+
+        class _R:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps(mock_response).encode()
+
+        with patch("common.tools.control_tools._is_per_task_agent", return_value=True), \
+             patch("common.tools.control_tools._discover_live_instance_url", return_value=None), \
+             patch.object(self.tool, "_auto_launch", return_value=("http://team-lead-task-123:8030", "")) as auto_launch, \
+             patch("common.tools.control_tools.urlopen", return_value=_R()):
+            result = self.tool.execute({
+                "capability": "team-lead.task.analyze",
+                "task_text": "implement jira ticket: https://example.atlassian.net/browse/PROJ-1",
+            })
+
+        self.assertFalse(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertEqual(payload["agentUrl"], "http://team-lead-task-123:8030")
+        auto_launch.assert_called_once_with("team-lead.task.analyze", [])
 
     def test_office_dispatch_infers_target_paths_from_task_context(self):
         mock_response = {"task": {"id": "task-office", "status": {"state": "submitted"}}}

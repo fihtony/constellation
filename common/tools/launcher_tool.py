@@ -155,9 +155,22 @@ class LaunchPerTaskAgentTool(ConstellationTool):
                     instances = data.get("instances") or data.get("items") or []
                 else:
                     instances = []
+                matched_idle = None
+                fallback_idle = None
                 for inst in instances:
-                    if inst.get("status") == "idle":
-                        return inst
+                    if inst.get("status") != "idle":
+                        continue
+                    if fallback_idle is None:
+                        fallback_idle = inst
+                    container_id = str(inst.get("container_id") or inst.get("containerId") or "").strip()
+                    service_url = str(inst.get("service_url") or inst.get("serviceUrl") or "").strip()
+                    if container_id == container_name or f"http://{container_name}:" in service_url:
+                        matched_idle = inst
+                        break
+                if matched_idle is not None:
+                    return matched_idle
+                if fallback_idle is not None and len(instances) == 1:
+                    return fallback_idle
             except (URLError, OSError):
                 pass
             time.sleep(_LAUNCH_POLL_INTERVAL)

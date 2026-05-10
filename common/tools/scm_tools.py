@@ -11,6 +11,7 @@ import time
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from common.tools.agent_discovery import discover_capability_url
 from common.tools.base import ConstellationTool, ToolSchema
 from common.tools.registry import is_registered, register_tool
 
@@ -23,20 +24,7 @@ _TASK_POLL_INTERVAL = float(os.environ.get("A2A_TASK_POLL_INTERVAL_SECONDS", "1.
 
 def _discover_scm_url(capability: str) -> str | None:
     try:
-        req = Request(
-            f"{_REGISTRY_URL}/query?capability={capability}",
-            headers={"Accept": "application/json"},
-        )
-        with urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        agents = data.get("agents") or []
-        for agent in agents:
-            instances = agent.get("instances") or []
-            for inst in instances:
-                url = inst.get("url") or agent.get("baseUrl")
-                if url:
-                    return url.rstrip("/")
-        return None
+        return discover_capability_url(_REGISTRY_URL, capability)
     except Exception:  # noqa: BLE001
         return None
 

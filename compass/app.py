@@ -32,8 +32,19 @@ from common.per_task_exit import PerTaskExitHandler
 from common.registry_client import RegistryClient
 from common.agent_system_prompt import build_agent_system_prompt as _build_manifest_prompt
 from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
+from common.task_permissions import load_permission_grant
 from common.task_store import TaskStore
 from common.time_utils import local_file_timestamp, local_iso_timestamp
+
+# Tool auto-registration -- import the modules that Compass exposes to run_agentic().
+from common.tools import (  # noqa: F401 -- side-effect imports
+    coding_tools,
+    control_tools,
+    planning_tools,
+    progress_tools,
+    registry_tools,
+    skill_tool,
+)
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -582,7 +593,7 @@ def _run_workflow(task_id, message):
 def route_and_dispatch(message, requested_capability=None, forced_workflow=None):
     task = task_store.create()
     task.workspace_path = _create_shared_workspace(task.task_id)
-    task.original_message = deep_copy_json(message)
+    message = deep_copy_json(message)
     task.router_context = {}
     user_text = extract_text(message)
     task.summary = _truncate_text(user_text, 180)
@@ -617,6 +628,19 @@ def route_and_dispatch(message, requested_capability=None, forced_workflow=None)
         workflow = [requested_capability]
     else:
         workflow = ["team-lead.task.analyze"]
+
+    metadata = message.get("metadata")
+    if metadata is None:
+        metadata = {}
+        message["metadata"] = metadata
+    if not metadata.get("permissions"):
+        primary_capability = workflow[0] if workflow else ""
+        if str(primary_capability).startswith("office."):
+            metadata["permissions"] = load_permission_grant("office").to_dict()
+        else:
+            metadata["permissions"] = load_permission_grant("development").to_dict()
+
+    task.original_message = deep_copy_json(message)
     task.pending_workflow = list(workflow)
     audit_log(
         "TASK_CREATED",

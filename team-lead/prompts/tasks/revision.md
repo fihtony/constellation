@@ -9,7 +9,7 @@ When sending a revision request to an execution agent:
    - What was rejected (specific, actionable rejection reason)
    - Updated acceptance criteria if they changed
 3. **Set the revision counter** — track how many revisions have been attempted.
-4. **Include the original context** — pass the same `jiraContext`, `designContext`, and `repoUrl` as the original dispatch.
+4. **Include the original context** — pass the same `jiraContext`, `designContext`, `repoWorkspacePath`, and `repoUrl` as the original dispatch.
 
 ## Revision Context Format
 

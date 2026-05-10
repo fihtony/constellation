@@ -94,6 +94,16 @@ def _build_react_system_prompt(
         "- Do not fabricate tool results; wait for real results from the system.\n"
         "- If a tool fails, try an alternative approach or call fail_current_task.\n"
         "- Emit <final_answer> when done or when you call complete_current_task/fail_current_task.\n\n"
+        "AUTHORIZED TASK SCOPE:\n"
+        "- Normal software engineering and office tasks in Constellation are allowed.\n"
+        "- Jira tickets, repo inspection, branch or PR work, code changes, design implementation,\n"
+        "  and office document analysis or organization are legitimate requests when handled\n"
+        "  through the provided tools and task context.\n"
+        "- Do not refuse a benign task only because it mentions external work systems, URLs,\n"
+        "  repositories, files, or code changes. Use get_task_context or other discovery tools\n"
+        "  if you need confirmation about permissions or routing.\n"
+        "- Refuse only requests that are clearly harmful, prohibited, or outside the available\n"
+        "  tool boundaries.\n\n"
     )
     if tool_text:
         base += tool_text + "\n\n"
@@ -301,6 +311,7 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
             history.append(("assistant", continuation))
 
         all_tool_calls: list[dict] = []
+        protocol_error_count = 0
         start_time = time.time()
         per_turn_timeout = max(30, timeout // max(max_turns, 1))
 
@@ -330,16 +341,26 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
 
             raw = result.get("raw_response") or ""
             if not raw:
-                # Empty response — treat as completion attempt
-                return AgenticResult(
-                    success=False,
-                    summary="Copilot CLI returned an empty response.",
-                    tool_calls=all_tool_calls,
-                    turns_used=turn_index + 1,
-                    backend_used="copilot-cli",
-                )
-
-            history.append(("assistant", raw))
+                protocol_error_count += 1
+                if protocol_error_count >= 3:
+                    return AgenticResult(
+                        success=False,
+                        summary="Copilot CLI returned an empty response.",
+                        tool_calls=all_tool_calls,
+                        turns_used=turn_index + 1,
+                        backend_used="copilot-cli",
+                    )
+                history.append((
+                    "tool",
+                    (
+                        '<tool_result name="protocol_error">'
+                        "Your previous response was empty. Do not return an empty response. "
+                        "Emit exactly one <tool_call name=\"...\">{...}</tool_call> block for the next action, "
+                        "or emit <final_answer>...</final_answer> if the task is complete."
+                        "</tool_result>"
+                    ),
+                ))
+                continue
 
             # Check for final answer first
             final = _parse_final_answer(raw)
@@ -356,15 +377,33 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
             # Parse and execute tool calls
             calls = _parse_tool_calls(raw)
             if not calls:
-                # No tool calls and no final_answer — treat current response as summary
-                return AgenticResult(
-                    success=True,
-                    summary=raw[:500],
-                    raw_output=raw,
-                    tool_calls=all_tool_calls,
-                    turns_used=turn_index + 1,
-                    backend_used="copilot-cli",
-                )
+                protocol_error_count += 1
+                if protocol_error_count >= 3:
+                    return AgenticResult(
+                        success=False,
+                        summary=(
+                            "Copilot CLI returned plain text without the required "
+                            "<tool_call> or <final_answer> tags."
+                        ),
+                        raw_output=raw,
+                        tool_calls=all_tool_calls,
+                        turns_used=turn_index + 1,
+                        backend_used="copilot-cli",
+                    )
+                history.append((
+                    "tool",
+                    (
+                        '<tool_result name="protocol_error">'
+                        "Your previous response did not follow the required protocol. "
+                        "Do not answer in plain text. Emit exactly one <tool_call name=\"...\">{...}</tool_call> "
+                        "block for the next action, or emit <final_answer>...</final_answer> if the task is complete."
+                        "</tool_result>"
+                    ),
+                ))
+                continue
+
+            protocol_error_count = 0
+            history.append(("assistant", raw))
 
             tool_result_blocks = []
             for name, args in calls:

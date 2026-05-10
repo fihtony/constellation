@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault(
@@ -13,10 +14,23 @@ os.environ.setdefault(
 )
 
 from compass import app as compass_app
+from common.tools.native_adapter import get_function_definitions
+from common.task_permissions import load_permission_grant
 from common.task_store import TaskStore
 
 
 class CompassDispatchTests(unittest.TestCase):
+    def test_compass_import_registers_runtime_tools(self):
+        definitions = get_function_definitions([
+            "dispatch_agent_task",
+            "report_progress",
+            "check_agent_status",
+        ])
+        names = [item["function"]["name"] for item in definitions]
+        self.assertIn("dispatch_agent_task", names)
+        self.assertIn("report_progress", names)
+        self.assertIn("check_agent_status", names)
+
     def test_task_store_list_tasks_returns_newest_first(self):
         store = TaskStore()
         first = store.create()
@@ -180,6 +194,31 @@ class CompassDispatchTests(unittest.TestCase):
         finally:
             compass_app.task_store = original_store
 
+    def test_route_and_dispatch_injects_default_development_permissions(self):
+        original_store = compass_app.task_store
+        compass_app.task_store = TaskStore()
+        try:
+            captured = {}
+
+            def fake_worker(task, message, workflow):
+                captured["message"] = message
+                captured["workflow"] = workflow
+                return task.to_dict()
+
+            message = {"parts": [{"text": "implement jira ticket: https://example.atlassian.net/browse/PROJ-1"}]}
+            with mock.patch.object(compass_app, "_start_task_worker", side_effect=fake_worker), \
+                 mock.patch.object(compass_app, "require_agentic_runtime"), \
+                 mock.patch.object(compass_app, "_create_shared_workspace", return_value="/tmp/ws"):
+                compass_app.route_and_dispatch(message)
+
+            self.assertEqual(captured["workflow"], ["team-lead.task.analyze"])
+            self.assertEqual(
+                captured["message"]["metadata"]["permissions"],
+                load_permission_grant("development").to_dict(),
+            )
+        finally:
+            compass_app.task_store = original_store
+
     def test_build_compass_workflow_prompt_loads_from_orchestrate_md(self):
         """build_compass_workflow_prompt() must load content from orchestrate.md, not hardcode it."""
         from compass.agentic_workflow import build_compass_workflow_prompt
@@ -198,6 +237,8 @@ class CompassDispatchTests(unittest.TestCase):
         self.assertIn("dispatch_agent_task", prompt)
         self.assertIn("aggregate_task_card", prompt)
         self.assertIn("complete_current_task", prompt)
+        self.assertIn("implement jira ticket", prompt.lower())
+        self.assertIn("do not answer the request directly", prompt.lower())
 
     def test_orchestrate_template_has_routing_decision_guidance(self):
         """orchestrate.md must contain routing classification guidance."""
@@ -210,6 +251,61 @@ class CompassDispatchTests(unittest.TestCase):
         self.assertIn("check_agent_status", template)
         self.assertIn("Do not use local filesystem tools", template)
         self.assertIn("do not ask the user to upload/copy the file", template)
+        self.assertIn("Do NOT answer the request directly", template)
+        self.assertIn("implement jira ticket", template)
+
+    def test_run_compass_workflow_fails_closed_when_runtime_skips_control_tools(self):
+        from compass.agentic_workflow import run_compass_workflow
+
+        task = SimpleNamespace(task_id="task-001", workspace_path="/tmp/ws", state="TASK_STATE_WORKING")
+        tasks = {task.task_id: task}
+        states = []
+        progress = []
+        audits = []
+
+        def get_task(task_id):
+            return tasks[task_id]
+
+        def update_state(task_id, state, status_message=""):
+            current = tasks[task_id]
+            current.state = state
+            current.status_message = status_message
+            states.append((state, status_message))
+            return current
+
+        def add_progress_step(task_id, step, agent_id=""):
+            progress.append((task_id, step, agent_id))
+
+        def audit_log(event, **kwargs):
+            audits.append((event, kwargs))
+
+        runtime_result = SimpleNamespace(success=True, summary="I'm sorry, but I cannot assist with that request.")
+
+        with mock.patch("compass.agentic_workflow.configure_control_tools"), \
+             mock.patch("compass.agentic_workflow.build_agent_system_prompt", return_value="system"), \
+             mock.patch("compass.agentic_workflow.get_runtime") as runtime_factory:
+            runtime_factory.return_value.run_agentic.return_value = runtime_result
+            run_compass_workflow(
+                task_id=task.task_id,
+                task=task,
+                message={"parts": [{"text": "implement jira ticket: https://example.atlassian.net/browse/PROJ-1"}]},
+                agent_id="compass-agent",
+                agent_file=compass_app.__file__,
+                advertised_url="http://compass:8080",
+                compass_instance_id="abc123",
+                max_revisions=2,
+                timeout_seconds=30,
+                get_task=get_task,
+                update_state_and_notify=update_state,
+                add_progress_step=add_progress_step,
+                audit_log=audit_log,
+                wait_for_input_fn=lambda question, context: None,
+            )
+
+        self.assertEqual(task.state, "TASK_STATE_FAILED")
+        self.assertEqual(states[-1][0], "TASK_STATE_FAILED")
+        self.assertIn("cannot assist", states[-1][1].lower())
+        self.assertTrue(any(event == "TASK_FAILED" for event, _ in audits))
 
     def test_run_compass_workflow_does_not_accept_workflow_parameter(self):
         """run_compass_workflow() must not have workflow or route_system_prompt params."""
