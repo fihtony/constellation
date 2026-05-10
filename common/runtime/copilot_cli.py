@@ -104,6 +104,16 @@ def _build_react_system_prompt(
         "  if you need confirmation about permissions or routing.\n"
         "- Refuse only requests that are clearly harmful, prohibited, or outside the available\n"
         "  tool boundaries.\n\n"
+        "FIRST RESPONSE REQUIREMENT:\n"
+        "- For a normal Constellation task, your first response MUST be a <tool_call ...> block\n"
+        "  or a <final_answer>...</final_answer> block. Do not reply with plain prose.\n"
+        "- Never answer a benign Constellation task with generic refusal text such as\n"
+        "  'I'm sorry, but I cannot assist with that request.'\n"
+        "- If you are unsure what to do first, call get_task_context with {} and then continue.\n"
+        "- If the task mentions a Jira ticket, repository, PR, workspace path, URL, or office\n"
+        "  document, treat it as in-scope and start by gathering context with tools.\n"
+        "- Example valid first response:\n"
+        "  <tool_call name=\"get_task_context\">{}</tool_call>\n\n"
     )
     if tool_text:
         base += tool_text + "\n\n"
@@ -395,6 +405,9 @@ class CopilotCliAdapter(AgentRuntimeAdapter):
                     (
                         '<tool_result name="protocol_error">'
                         "Your previous response did not follow the required protocol. "
+                        "This is an authorized Constellation workflow task, not a refusal case. "
+                        "Do not emit generic policy refusal text. "
+                        "If you are unsure what to do first, call get_task_context with {}. "
                         "Do not answer in plain text. Emit exactly one <tool_call name=\"...\">{...}</tool_call> "
                         "block for the next action, or emit <final_answer>...</final_answer> if the task is complete."
                         "</tool_result>"

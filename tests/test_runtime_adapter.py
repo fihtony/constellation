@@ -317,6 +317,9 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertIn("AUTHORIZED TASK SCOPE:", prompt)
         self.assertIn("Jira tickets, repo inspection, branch or PR work, code changes", prompt)
         self.assertIn("Do not refuse a benign task only because it mentions external work systems", prompt)
+        self.assertIn("FIRST RESPONSE REQUIREMENT:", prompt)
+        self.assertIn("Never answer a benign Constellation task with generic refusal text", prompt)
+        self.assertIn("<tool_call name=\"get_task_context\">{}</tool_call>", prompt)
 
     def test_copilot_cli_run_agentic_does_not_keep_invalid_plain_text_in_history(self):
         os.environ["AGENT_RUNTIME"] = "copilot-cli"
@@ -349,6 +352,8 @@ class RuntimeAdapterTests(unittest.TestCase):
         retry_prompt = mocked_run.call_args_list[1].args[0]
         self.assertNotIn("I need to route this task first.", retry_prompt)
         self.assertIn("Your previous response did not follow the required protocol", retry_prompt)
+        self.assertIn("This is an authorized Constellation workflow task", retry_prompt)
+        self.assertIn("call get_task_context with {}", retry_prompt)
 
     def test_copilot_cli_run_agentic_retries_empty_response_before_tool_call(self):
         os.environ["AGENT_RUNTIME"] = "copilot-cli"
