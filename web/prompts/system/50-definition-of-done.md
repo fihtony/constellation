@@ -25,10 +25,14 @@ A task is complete when ALL of the following are true:
 ## Evidence
 
 - [ ] `collect_task_evidence` completed — logs, diffs, and artifact paths captured.
+- [ ] If design context was provided, evidence includes design-reference and implementation-comparison material.
 - [ ] PR URL included in the artifact metadata.
 - [ ] Branch name included in the artifact metadata.
 - [ ] Validation results (passed/failed) included in the summary.
+- [ ] A self-assessment against the handed-off Jira/design context is recorded as evidence for Team Lead review.
 
 ## Jira
 
-- [ ] If a Jira ticket was provided and `jiraInReview` was requested: ticket status updated via `jira_add_comment` or transition.
+- [ ] If a Jira ticket was provided: Jira write permissions were validated before mutation.
+- [ ] If a Jira ticket was provided: assignee updated when work started or when handoff required it.
+- [ ] If a Jira ticket was provided and a PR was created: ticket status transitioned appropriately and a completion comment was added.

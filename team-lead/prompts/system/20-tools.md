@@ -16,6 +16,7 @@
 | `jira_validate_permissions` | Check if a Jira action is allowed by current permissions |
 | `design_fetch_figma_screen` | Fetch design specs from Figma |
 | `design_fetch_stitch_screen` | Fetch design specs from Google Stitch |
+| `scm_clone_repo` | Clone the target repository into the shared workspace before dev dispatch |
 | `scm_repo_inspect` | Inspect remote repo metadata (default branch, languages, build system) |
 | `scm_read_file` | Read a remote repo file without cloning |
 | `scm_list_dir` | Inspect a remote repo directory without cloning |
@@ -74,9 +75,11 @@
 - Use `registry_query` to discover boundary agent URLs at runtime.
 - Use `report_progress` at the start of each major workflow step.
 - Use `jira_get_ticket` to gather context instead of dispatching to the Jira agent for simple fetches.
+- Use `scm_clone_repo` for repo-backed tasks before dispatching a development agent; the Team Lead owns the initial clone handoff.
 - Use `jira_transition` to move tickets to "In Review" after a PR is created.
 - Use `jira_validate_permissions` before performing write operations on Jira tickets.
 - Use `request_user_input` only after exhausting all other sources of clarification.
+- Pass `repoWorkspacePath`, `jiraContext`, and `designContext` downstream when the initial handoff is already complete; do not ask the execution agent to re-clone or re-fetch by default.
 - Prefer the `*_local_*` tool names for shared-workspace artifacts and plans; keep legacy aliases only for compatibility with older prompts.
 
 ## Disabled / Forbidden Tool Patterns

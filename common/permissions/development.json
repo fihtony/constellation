@@ -17,10 +17,12 @@
       "agent": "jira",
       "operations": [
         {"action": "read", "scope": "*", "description": "Read all ticket fields (summary, description, assignee, status, history, labels, etc.)"},
+        {"action": "ticket.read", "scope": "*", "description": "Read Jira ticket data through runtime tools and provider wrappers"},
         {"action": "comment.add", "scope": "*", "description": "Add a comment to the ticket"},
         {"action": "comment.update", "scope": "self", "description": "Update a comment added by this task"},
         {"action": "issue.update.labels", "scope": "*", "description": "Update ticket labels for workflow metadata"},
         {"action": "transition", "scope": "*", "description": "Change ticket status (e.g. To Do -> In Progress -> In Review)"},
+        {"action": "ticket.transition", "scope": "*", "description": "Transition a Jira ticket through provider tools"},
         {"action": "assignee.update", "scope": "*", "description": "Change ticket assignee"}
       ]
     },

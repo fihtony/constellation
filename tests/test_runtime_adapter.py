@@ -17,6 +17,7 @@ from common.env_utils import (
     resolve_openai_base_url,
     sanitize_credential_env,
 )
+from common.runtime.copilot_cli import _build_react_system_prompt
 from common.runtime.adapter import get_runtime, require_agentic_runtime, summarize_runtime_configuration
 
 
@@ -276,6 +277,142 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(result.tool_calls[0]["arguments"], {"value": 7})
         mocked_dispatch.assert_called_once_with("demo_tool", {"value": 7})
         self.assertEqual(mocked_run.call_count, 2)
+
+    def test_copilot_cli_run_agentic_retries_plain_text_before_tool_call(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+        os.environ["COPILOT_GITHUB_TOKEN"] = "copilot_token_test"
+
+        responses = [
+            {
+                "summary": "plain text",
+                "raw_response": "I need to route this task first.",
+                "warnings": [],
+            },
+            {
+                "summary": "calling tool",
+                "raw_response": '<tool_call name="demo_tool">{"value": 9}</tool_call>',
+                "warnings": [],
+            },
+            {
+                "summary": "finished",
+                "raw_response": "<final_answer>done after retry</final_answer>",
+                "warnings": [],
+            },
+        ]
+
+        with patch("common.runtime.copilot_cli.shutil.which", return_value="/usr/bin/copilot"), \
+             patch("common.runtime.copilot_cli.CopilotCliAdapter.run", side_effect=responses) as mocked_run, \
+             patch("common.runtime.copilot_cli._dispatch_tool", return_value="tool ok") as mocked_dispatch:
+            result = get_runtime().run_agentic("do something", tools=["demo_tool"], max_turns=4)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.summary, "done after retry")
+        self.assertEqual(result.turns_used, 3)
+        mocked_dispatch.assert_called_once_with("demo_tool", {"value": 9})
+        self.assertEqual(mocked_run.call_count, 3)
+
+    def test_copilot_cli_react_prompt_marks_normal_constellation_work_as_authorized(self):
+        prompt = _build_react_system_prompt("Agent prompt", "demo_tool")
+
+        self.assertIn("AUTHORIZED TASK SCOPE:", prompt)
+        self.assertIn("Jira tickets, repo inspection, branch or PR work, code changes", prompt)
+        self.assertIn("Do not refuse a benign task only because it mentions external work systems", prompt)
+
+    def test_copilot_cli_run_agentic_does_not_keep_invalid_plain_text_in_history(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+        os.environ["COPILOT_GITHUB_TOKEN"] = "copilot_token_test"
+
+        responses = [
+            {
+                "summary": "plain text",
+                "raw_response": "I need to route this task first.",
+                "warnings": [],
+            },
+            {
+                "summary": "calling tool",
+                "raw_response": '<tool_call name="demo_tool">{"value": 9}</tool_call>',
+                "warnings": [],
+            },
+            {
+                "summary": "finished",
+                "raw_response": "<final_answer>done after retry</final_answer>",
+                "warnings": [],
+            },
+        ]
+
+        with patch("common.runtime.copilot_cli.shutil.which", return_value="/usr/bin/copilot"), \
+             patch("common.runtime.copilot_cli.CopilotCliAdapter.run", side_effect=responses) as mocked_run, \
+             patch("common.runtime.copilot_cli._dispatch_tool", return_value="tool ok"):
+            result = get_runtime().run_agentic("do something", tools=["demo_tool"], max_turns=4)
+
+        self.assertTrue(result.success)
+        retry_prompt = mocked_run.call_args_list[1].args[0]
+        self.assertNotIn("I need to route this task first.", retry_prompt)
+        self.assertIn("Your previous response did not follow the required protocol", retry_prompt)
+
+    def test_copilot_cli_run_agentic_retries_empty_response_before_tool_call(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+        os.environ["COPILOT_GITHUB_TOKEN"] = "copilot_token_test"
+
+        responses = [
+            {
+                "summary": "empty",
+                "raw_response": "",
+                "warnings": ["Copilot CLI returned an empty response."],
+            },
+            {
+                "summary": "calling tool",
+                "raw_response": '<tool_call name="demo_tool">{"value": 11}</tool_call>',
+                "warnings": [],
+            },
+            {
+                "summary": "finished",
+                "raw_response": "<final_answer>done after empty retry</final_answer>",
+                "warnings": [],
+            },
+        ]
+
+        with patch("common.runtime.copilot_cli.shutil.which", return_value="/usr/bin/copilot"), \
+             patch("common.runtime.copilot_cli.CopilotCliAdapter.run", side_effect=responses) as mocked_run, \
+             patch("common.runtime.copilot_cli._dispatch_tool", return_value="tool ok") as mocked_dispatch:
+            result = get_runtime().run_agentic("do something", tools=["demo_tool"], max_turns=4)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.summary, "done after empty retry")
+        self.assertEqual(result.turns_used, 3)
+        mocked_dispatch.assert_called_once_with("demo_tool", {"value": 11})
+        retry_prompt = mocked_run.call_args_list[1].args[0]
+        self.assertIn("Your previous response was empty", retry_prompt)
+
+    def test_copilot_cli_run_agentic_fails_after_repeated_plain_text(self):
+        os.environ["AGENT_RUNTIME"] = "copilot-cli"
+        os.environ["COPILOT_GITHUB_TOKEN"] = "copilot_token_test"
+
+        responses = [
+            {
+                "summary": "plain text",
+                "raw_response": "I cannot help with that.",
+                "warnings": [],
+            },
+            {
+                "summary": "plain text again",
+                "raw_response": "Still not using the required tags.",
+                "warnings": [],
+            },
+            {
+                "summary": "plain text third time",
+                "raw_response": "No tool calls here either.",
+                "warnings": [],
+            },
+        ]
+
+        with patch("common.runtime.copilot_cli.shutil.which", return_value="/usr/bin/copilot"), \
+             patch("common.runtime.copilot_cli.CopilotCliAdapter.run", side_effect=responses):
+            result = get_runtime().run_agentic("do something", tools=["demo_tool"], max_turns=4)
+
+        self.assertFalse(result.success)
+        self.assertIn("required <tool_call> or <final_answer>", result.summary)
+        self.assertEqual(result.turns_used, 3)
 
     def test_load_dotenv_applies_shared_defaults_and_local_overrides(self):
         with tempfile.TemporaryDirectory() as temp_dir:

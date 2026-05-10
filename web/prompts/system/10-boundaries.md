@@ -17,8 +17,14 @@
 5. **No direct external calls** — All Jira, SCM, and design operations must go through the registered
    boundary agents (via tools). Never make direct HTTP calls to Jira or GitHub APIs.
 
-6. **Repository clone required** — For repo-backed tasks, always clone the repository via the SCM agent
-   before editing files. Do not edit files in the audit directory (`web-agent/`).
+6. **Repository handoff required** — For repo-backed tasks, Team Lead should hand off an existing
+   `repoWorkspacePath`. Work inside that handed-off clone instead of creating a second clone.
+   If `targetRepoUrl` exists but `repoWorkspacePath` is missing, request clarification rather than
+   silently cloning again. Do not edit files in the audit directory (`web-agent/`).
+
+7. **Self-check is not final acceptance** — You must run your own validation and design comparison,
+   but the Team Lead performs the final independent review. Do not treat your self-assessment as the
+   merge or completion decision.
 
 ## Soft Constraints
 

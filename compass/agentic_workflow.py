@@ -166,17 +166,26 @@ def run_compass_workflow(
         )
 
         current_task = get_task(task_id)
-        if current_task and current_task.state not in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED"):
-            if result.success:
-                summary = result.summary or "Workflow completed."
-                update_state_and_notify(task_id, "TASK_STATE_COMPLETED", summary)
-                _log_ws(current_task, "Workflow completed successfully.", agent_id=agent_id)
-                audit_log("TASK_COMPLETED", task_id=task_id, final_state="TASK_STATE_COMPLETED")
-            else:
-                error = result.summary or "Workflow failed — runtime did not complete successfully."
-                update_state_and_notify(task_id, "TASK_STATE_FAILED", error)
-                _log_ws(current_task, f"Workflow failed: {error[:200]}", agent_id=agent_id)
-                audit_log("TASK_FAILED", task_id=task_id, error=error)
+        if current_task:
+            current_state = current_task.state
+            if current_state == "TASK_STATE_WORKING":
+                if result.success:
+                    error = (
+                        result.summary
+                        or "Workflow exited without calling complete_current_task or dispatching a downstream task."
+                    )
+                    update_state_and_notify(task_id, "TASK_STATE_FAILED", error)
+                    _log_ws(
+                        current_task,
+                        "Workflow failed: runtime exited without using control tools to finish the task.",
+                        agent_id=agent_id,
+                    )
+                    audit_log("TASK_FAILED", task_id=task_id, error=error)
+                else:
+                    error = result.summary or "Workflow failed — runtime did not complete successfully."
+                    update_state_and_notify(task_id, "TASK_STATE_FAILED", error)
+                    _log_ws(current_task, f"Workflow failed: {error[:200]}", agent_id=agent_id)
+                    audit_log("TASK_FAILED", task_id=task_id, error=error)
     except Exception as error:
         update_state_and_notify(task_id, "TASK_STATE_FAILED", f"Workflow error: {error}")
         err_task = get_task(task_id)

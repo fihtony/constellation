@@ -37,6 +37,10 @@ from common.runtime.adapter import get_runtime, require_agentic_runtime
 from common.task_store import TaskStore
 from common.devlog import install_stdout_tee, write_initial_stage_summary
 
+# Tool auto-registration -- import the Team Lead tool barrel so runtime.run_agentic()
+# can expose Jira/SCM/design/control tools in this process.
+from common.tools import team_lead_tools  # noqa: F401
+
 _THIS_DIR = os.path.dirname(__file__)
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)

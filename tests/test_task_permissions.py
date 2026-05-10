@@ -101,10 +101,12 @@ def test_load_development_permissions():
     assert grant.task_type == "development"
     # Jira read should be allowed
     assert grant.is_allowed("jira", "read")
+    assert grant.is_allowed("jira", "ticket.read")
     # Comment add should be allowed
     assert grant.is_allowed("jira", "comment.add")
     # Transition should be allowed
     assert grant.is_allowed("jira", "transition")
+    assert grant.is_allowed("jira", "ticket.transition")
     # Labels update should be allowed
     assert grant.is_allowed("jira", "issue.update.labels")
     # Summary update should be denied
@@ -173,6 +175,9 @@ def test_load_missing_task_type():
 def test_check_allowed_operation():
     grant = load_permission_grant("development")
     allowed, reason = grant.check("jira", "read")
+    assert allowed
+    assert reason == "allowed"
+    allowed, reason = grant.check("jira", "ticket.read")
     assert allowed
     assert reason == "allowed"
 
