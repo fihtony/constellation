@@ -1,0 +1,11 @@
+id: code-review
+name: "Code Review"
+description: "Code quality review covering correctness, security, tests, and requirements compliance"
+version: "1.0.0"
+tags: ["review", "quality", "security"]
+priority: 15
+allowed_tools:
+  - read_file
+  - search_code
+  - glob
+  - grep

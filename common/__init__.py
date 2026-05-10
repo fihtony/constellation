@@ -1,1 +1,0 @@
-"""Shared runtime helpers for the Constellation multi-agent system."""

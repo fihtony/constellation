@@ -1,0 +1,28 @@
+# Permissions: Development tasks (read-write SCM)
+allowed_tools:
+  - read_file
+  - write_file
+  - edit_file
+  - run_command
+  - search_code
+  - glob
+  - grep
+  - scm_clone
+  - scm_branch
+  - scm_commit
+  - scm_push
+  - scm_create_pr
+  - dispatch_agent
+  - query_registry
+
+denied_tools: []
+
+scm: read-write
+filesystem: workspace-only
+
+custom:
+  protected_branch_patterns:
+    - "^main$"
+    - "^master$"
+    - "^develop$"
+    - "^release/.*$"

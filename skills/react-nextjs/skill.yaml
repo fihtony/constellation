@@ -1,0 +1,12 @@
+id: react-nextjs
+name: "React & Next.js Development"
+description: "Frontend development with React 18+ and Next.js 14+ App Router"
+version: "1.0.0"
+tags: ["frontend", "react", "nextjs", "typescript"]
+priority: 10
+allowed_tools:
+  - read_file
+  - write_file
+  - edit_file
+  - run_command
+  - search_code

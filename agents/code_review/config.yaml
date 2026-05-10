@@ -1,0 +1,14 @@
+agent_id: code-review
+name: "Code Review Agent"
+description: "Independent code review: quality, security, tests, requirements compliance"
+mode: task
+execution_mode: per-task
+runtime_backend: connect-agent
+model: gpt-5-mini
+default_skills:
+  - code-review
+tools:
+  - read_file
+  - search_code
+permissions:
+  scm: read

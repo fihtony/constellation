@@ -1,0 +1,24 @@
+agent_id: web-dev
+name: "Web Dev Agent"
+description: "Full-stack web development: clone, branch, implement, test, PR"
+mode: task
+execution_mode: per-task
+runtime_backend: connect-agent
+model: gpt-5-mini
+default_skills:
+  - react-nextjs
+  - testing
+tools:
+  - read_file
+  - write_file
+  - edit_file
+  - run_command
+  - search_code
+  - scm_clone
+  - scm_branch
+  - scm_commit
+  - scm_push
+  - scm_create_pr
+permissions:
+  scm: read-write
+  filesystem: workspace-only

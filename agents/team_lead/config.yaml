@@ -1,0 +1,13 @@
+agent_id: team-lead
+name: "Team Lead Agent"
+description: "Intelligence layer: analysis, planning, dispatch, code review coordination"
+mode: task
+execution_mode: persistent
+runtime_backend: connect-agent
+model: gpt-5-mini
+tools:
+  - dispatch_agent
+  - query_registry
+  - jira_fetch
+  - design_fetch
+port: 8030

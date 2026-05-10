@@ -1,0 +1,11 @@
+agent_id: compass
+name: "Compass Agent"
+description: "Control plane: task classification, permission check, routing, and user summary"
+mode: chat
+execution_mode: persistent
+runtime_backend: connect-agent
+model: gpt-5-mini
+tools:
+  - dispatch_agent
+  - query_registry
+port: 8000

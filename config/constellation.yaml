@@ -1,0 +1,28 @@
+# Constellation v2 — main configuration
+# This file is loaded by all agents on startup.
+
+project:
+  name: constellation
+  version: "2.0.0"
+
+# Default runtime backend for all agents
+runtime:
+  backend: connect-agent
+  model: gpt-5-mini
+
+# Skills directory
+skills:
+  directory: skills
+
+# Data directory (SQLite DBs, artifacts)
+data:
+  directory: data
+
+# Container settings
+container:
+  runtime: rancher           # docker | rancher
+  network: constellation-network
+
+# Registry service
+registry:
+  url: http://registry:9000
