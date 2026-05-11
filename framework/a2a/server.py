@@ -96,6 +96,17 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                 self._handle_ack(task_id)
                 return
 
+        # POST /tasks/{id}/resume
+        if path.endswith("/resume"):
+            parts = path.split("/")
+            if len(parts) >= 3:
+                task_id = parts[2]
+                body = self._read_json_body()
+                if body is None:
+                    return
+                self._handle_resume(task_id, body)
+                return
+
         self._send_json(404, {"error": "Not found"})
 
     # -- Endpoint handlers (override in subclasses if needed) ----------------
@@ -148,6 +159,25 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         agent_id = self.agent.definition.agent_id if self.agent else "unknown"
         print(f"[{agent_id}] ACK received for task {task_id}")
         self._send_json(200, {"status": "ok"})
+
+    def _handle_resume(self, task_id: str, body: dict) -> None:
+        """Resume a paused (INPUT_REQUIRED) task with user-provided input."""
+        import asyncio
+
+        agent_id = self.agent.definition.agent_id if self.agent else "unknown"
+        resume_value = body.get("input", body.get("resume_value", ""))
+        print(f"[{agent_id}] Resume request for task {task_id}")
+
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                self.agent.resume_task(task_id, resume_value)
+            )
+            self._send_json(200, result)
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+        finally:
+            loop.close()
 
     # -- Helpers --------------------------------------------------------------
 

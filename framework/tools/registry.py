@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from framework.permissions import PermissionEngine
@@ -35,6 +35,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, "BaseTool"] = {}
         self._permission_engine: "PermissionEngine | None" = None
+        self._plugin_manager: "Any | None" = None
 
     # ------------------------------------------------------------------
     # Permission gate
@@ -44,6 +45,11 @@ class ToolRegistry:
         """Attach a PermissionEngine.  All subsequent execute calls will be
         checked against it before the tool runs."""
         self._permission_engine = engine
+        return self
+
+    def set_plugin_manager(self, pm: "Any") -> "ToolRegistry":
+        """Attach a PluginManager for tool lifecycle callbacks."""
+        self._plugin_manager = pm
         return self
 
     # ------------------------------------------------------------------
@@ -91,6 +97,8 @@ class ToolRegistry:
         """Execute a tool synchronously.  Returns the result as a JSON string.
 
         Permission check is applied first when a PermissionEngine is set.
+        Plugin before_tool_call / after_tool_call hooks are fired when a
+        PluginManager is attached.
         If the tool's execute_sync raises, the error is caught and returned
         as ``{"error": "..."}`` so the LLM can react to failures gracefully.
         """
@@ -109,6 +117,14 @@ class ToolRegistry:
 
         kwargs = self._parse_args(arguments)
 
+        # Plugin: before_tool_call (may short-circuit)
+        if self._plugin_manager:
+            override = self._plugin_manager.fire_sync(
+                "before_tool_call", name, kwargs, {}
+            )
+            if override is not None:
+                return json.dumps(override) if isinstance(override, dict) else str(override)
+
         try:
             result = tool.execute_sync(**kwargs)
         except NotImplementedError:
@@ -117,6 +133,12 @@ class ToolRegistry:
         except Exception as exc:
             logger.warning("[registry] Tool '%s' raised %s: %s", name, type(exc).__name__, exc)
             return json.dumps({"error": str(exc)})
+
+        output = result.output if not result.error else json.dumps({"error": result.error})
+
+        # Plugin: after_tool_call
+        if self._plugin_manager:
+            self._plugin_manager.fire_sync("after_tool_call", name, output, {})
 
         if result.error:
             return json.dumps({"error": result.error})

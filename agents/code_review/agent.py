@@ -13,6 +13,7 @@ import threading
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 from framework.workflow import Workflow, START, END
+from framework.state import Channel, append_reducer
 from agents.code_review.nodes import (
     load_pr_context,
     review_quality,
@@ -21,6 +22,17 @@ from agents.code_review.nodes import (
     review_requirements,
     generate_report,
 )
+
+# ---------------------------------------------------------------------------
+# State schema — declares how review issues accumulate
+# ---------------------------------------------------------------------------
+
+_code_review_state_schema = {
+    "quality_issues": Channel(reducer=append_reducer),
+    "security_issues": Channel(reducer=append_reducer),
+    "test_issues": Channel(reducer=append_reducer),
+    "requirement_gaps": Channel(reducer=append_reducer),
+}
 
 # ---------------------------------------------------------------------------
 # Workflow definition
@@ -36,6 +48,7 @@ code_review_workflow = Workflow(
         (review_requirements, generate_report),
         (generate_report, END),
     ],
+    state_schema=_code_review_state_schema,
 )
 
 # ---------------------------------------------------------------------------

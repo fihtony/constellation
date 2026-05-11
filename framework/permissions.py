@@ -73,3 +73,23 @@ class PermissionEngine:
             custom=data.get("custom", {}),
         )
         return cls(ps)
+    @classmethod
+    def from_yaml(cls, path: str) -> "PermissionEngine":
+        """Load a PermissionEngine from a YAML config file.
+
+        The YAML schema mirrors ``PermissionSet``:
+
+        .. code-block:: yaml
+
+            allowed_tools: [read_file, write_file, ...]
+            denied_tools: []
+            scm: read-write
+            filesystem: workspace-only
+            custom:
+              protected_branch_patterns: ["^main$", "^master$"]
+        """
+        import yaml  # type: ignore[import-untyped]
+
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        return cls.from_dict(data)

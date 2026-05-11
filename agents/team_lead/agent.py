@@ -21,6 +21,7 @@ import threading
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 from framework.workflow import Workflow, START, END
+from framework.state import Channel, append_reducer
 from agents.team_lead.nodes import (
     receive_task,
     analyze_requirements,
@@ -33,6 +34,14 @@ from agents.team_lead.nodes import (
     escalate_to_user,
 )
 from agents.team_lead.tools import register_team_lead_tools
+
+# ---------------------------------------------------------------------------
+# State schema — declares how keys are merged across nodes
+# ---------------------------------------------------------------------------
+
+_team_lead_state_schema = {
+    "required_skills": Channel(reducer=append_reducer),
+}
 
 # ---------------------------------------------------------------------------
 # Workflow definition (graph-first)
@@ -55,6 +64,7 @@ team_lead_workflow = Workflow(
         (report_success, END),
         (escalate_to_user, END),
     ],
+    state_schema=_team_lead_state_schema,
 )
 
 # ---------------------------------------------------------------------------
@@ -130,6 +140,8 @@ class TeamLeadAgent(BaseAgent):
         def _run() -> None:
             import asyncio
 
+            from framework.errors import InterruptSignal
+
             loop = asyncio.new_event_loop()
             try:
                 config = RunConfig(
@@ -165,6 +177,18 @@ class TeamLeadAgent(BaseAgent):
                 if callback_url:
                     _send_callback(
                         callback_url, task.id, result, self.definition.agent_id
+                    )
+            except InterruptSignal as sig:
+                task_store.pause_task(
+                    task.id,
+                    question=sig.question,
+                    interrupt_metadata=sig.metadata,
+                )
+                # Send INPUT_REQUIRED callback if URL provided
+                callback_url = meta.get("orchestratorCallbackUrl", "")
+                if callback_url:
+                    _send_input_required_callback(
+                        callback_url, task.id, sig.question, self.definition.agent_id
                     )
             except Exception as e:
                 task_store.fail_task(task.id, str(e))
@@ -217,3 +241,29 @@ def _send_callback(
             pass
     except Exception as exc:
         print(f"[team-lead] Callback failed: {exc}")
+
+
+def _send_input_required_callback(
+    callback_url: str, task_id: str, question: str, agent_id: str
+) -> None:
+    """POST INPUT_REQUIRED callback to orchestrator (best-effort)."""
+    from urllib.request import Request, urlopen
+
+    payload = {
+        "downstreamTaskId": task_id,
+        "state": "TASK_STATE_INPUT_REQUIRED",
+        "statusMessage": question,
+        "agentId": agent_id,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = Request(
+        callback_url,
+        data=data,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=10):
+            pass
+    except Exception as exc:
+        print(f"[team-lead] INPUT_REQUIRED callback failed: {exc}")

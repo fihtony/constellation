@@ -126,6 +126,52 @@ class BaseAgent:
         """A2A ``GET /tasks/{id}`` handler."""
         raise NotImplementedError
 
+    async def resume_task(self, task_id: str, resume_value: Any) -> dict:
+        """Resume a task that was paused for user input.
+
+        Subclasses with graph workflows should override this to call
+        ``CompiledWorkflow.resume()`` with the checkpoint service.
+        Default implementation transitions the task back to WORKING and
+        re-invokes the workflow from the checkpoint.
+        """
+        from framework.errors import InterruptSignal
+        from framework.workflow import RunConfig
+
+        task_store = self.services.task_store
+        if task_store is None:
+            raise RuntimeError("No task store available")
+
+        task = task_store.get_task(task_id)
+        if task is None:
+            raise RuntimeError(f"Task {task_id} not found")
+
+        task_store.resume_task(task_id)
+
+        if self._compiled_workflow and self.checkpoint_service:
+            config = RunConfig(
+                session_id=task_id,
+                thread_id=task_id,
+                checkpoint_service=self.checkpoint_service,
+                event_store=self.event_store,
+                plugin_manager=self.plugin_manager,
+            )
+            try:
+                result = await self._compiled_workflow.resume(config, resume_value)
+                task_store.complete_task(task_id, message="Resumed and completed")
+                return task_store.get_task_dict(task_id)
+            except InterruptSignal as sig:
+                task_store.pause_task(
+                    task_id,
+                    question=sig.question,
+                    interrupt_metadata=sig.metadata,
+                )
+                return task_store.get_task_dict(task_id)
+            except Exception as exc:
+                task_store.fail_task(task_id, str(exc))
+                return task_store.get_task_dict(task_id)
+
+        return task_store.get_task_dict(task_id)
+
     # -- Internal ------------------------------------------------------------
 
     async def _register(self) -> None:

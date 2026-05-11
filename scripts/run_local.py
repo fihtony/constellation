@@ -24,6 +24,9 @@ from framework.checkpoint import InMemoryCheckpointer
 from framework.skills import SkillsRegistry
 from framework.plugin import PluginManager
 from framework.agent import AgentServices
+from framework.task_store import InMemoryTaskStore
+from framework.config import load_agent_config
+from framework.permissions import PermissionEngine
 
 
 # Agent registry
@@ -34,12 +37,41 @@ AGENTS = {
     "code-review": ("agents.code_review.agent", "CodeReviewAgent", "code_review_definition"),
 }
 
+# Map agent IDs to permission profiles
+_PERMISSION_PROFILES: dict[str, str] = {
+    "web-dev": "development",
+    "code-review": "read_only",
+}
 
-def create_services(skills_dir: str = "skills") -> AgentServices:
-    """Create shared services for local development."""
+
+def create_services(
+    agent_id: str,
+    skills_dir: str = "skills",
+) -> AgentServices:
+    """Create shared services for local development.
+
+    Injects TaskStore, loads PermissionEngine from config if available,
+    and binds it to the global ToolRegistry.
+    """
     skills_registry = SkillsRegistry()
     if os.path.isdir(skills_dir):
         skills_registry.load_directory(skills_dir)
+
+    # Load agent config to display at startup
+    config = load_agent_config(agent_id)
+    print(f"[{agent_id}] Config loaded: runtime={config.get('runtime.backend')}, "
+          f"model={config.get('runtime.model')}")
+
+    # Bootstrap PermissionEngine from YAML profile
+    profile = _PERMISSION_PROFILES.get(agent_id)
+    if profile:
+        perm_path = os.path.join("config", "permissions", f"{profile}.yaml")
+        if os.path.isfile(perm_path):
+            engine = PermissionEngine.from_yaml(perm_path)
+            # Bind to global ToolRegistry
+            from framework.tools.registry import get_registry
+            get_registry().set_permission_engine(engine)
+            print(f"[{agent_id}] Permission profile loaded: {profile}")
 
     return AgentServices(
         session_service=InMemorySessionService(),
@@ -50,6 +82,7 @@ def create_services(skills_dir: str = "skills") -> AgentServices:
         checkpoint_service=InMemoryCheckpointer(),
         runtime=None,  # No LLM in local dev by default
         registry_client=None,
+        task_store=InMemoryTaskStore(),
     )
 
 
@@ -69,7 +102,7 @@ async def main():
     agent_class = getattr(mod, class_name)
     agent_def = getattr(mod, def_name)
 
-    services = create_services(args.skills_dir)
+    services = create_services(args.agent, args.skills_dir)
     agent = agent_class(agent_def, services)
 
     print(f"[{args.agent}] Starting agent on port {args.port}...")

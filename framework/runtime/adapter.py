@@ -93,8 +93,13 @@ class AgentRuntimeAdapter(ABC):
         timeout: int = 1800,
         on_progress: Callable[[str], None] | None = None,
         continuation: str | None = None,
+        plugin_manager: Any = None,
     ) -> AgenticResult:
         """Autonomous multi-turn execution with tool access.
+
+        ``plugin_manager``, when provided, fires ``before_llm_call``,
+        ``after_llm_response``, ``before_tool_call``, and ``after_tool_call``
+        hooks around each LLM and tool invocation in the ReAct loop.
 
         Default: raises NotImplementedError.
         """

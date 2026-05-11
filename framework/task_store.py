@@ -92,6 +92,21 @@ class TaskStore(ABC):
         """Mark task failed with error message."""
         self.update_state(task_id, TaskState.FAILED, error)
 
+    def pause_task(
+        self,
+        task_id: str,
+        question: str = "",
+        interrupt_metadata: dict | None = None,
+    ) -> None:
+        """Mark task as requiring user input (interrupt)."""
+        self.update_state(task_id, TaskState.INPUT_REQUIRED, question)
+        if interrupt_metadata:
+            self.update_metadata(task_id, {"_interrupt": interrupt_metadata})
+
+    def resume_task(self, task_id: str) -> None:
+        """Transition task from INPUT_REQUIRED back to WORKING."""
+        self.update_state(task_id, TaskState.WORKING, "Resumed")
+
     def get_task_dict(self, task_id: str) -> dict:
         """Return task as A2A wire-format dict, or a FAILED stub if missing."""
         task = self.get_task(task_id)

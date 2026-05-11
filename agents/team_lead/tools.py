@@ -13,6 +13,12 @@ from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
 
 
+def _resolve_agent_url(env_var: str, default: str, capability: str = "") -> str:
+    """Resolve an agent's URL via Registry discovery, falling back to env var."""
+    # TODO: when RegistryClient is wired into tools, use capability lookup
+    return os.environ.get(env_var, default)
+
+
 # ---------------------------------------------------------------------------
 # Tool: fetch_jira_ticket
 # ---------------------------------------------------------------------------
@@ -34,7 +40,7 @@ class FetchJiraTicket(BaseTool):
     }
 
     def execute_sync(self, ticket_key: str = "") -> ToolResult:
-        jira_url = os.environ.get("JIRA_AGENT_URL", "http://jira:8010")
+        jira_url = _resolve_agent_url("JIRA_AGENT_URL", "http://jira:8010", "jira.ticket.fetch")
         try:
             from framework.a2a.client import dispatch_sync
             result = dispatch_sync(
@@ -87,7 +93,7 @@ class FetchDesign(BaseTool):
         stitch_project_id: str = "",
         screen_name: str = "",
     ) -> ToolResult:
-        ui_url = os.environ.get("UI_DESIGN_AGENT_URL", "http://ui-design:8040")
+        ui_url = _resolve_agent_url("UI_DESIGN_AGENT_URL", "http://ui-design:8040", "figma.file.fetch")
         try:
             from framework.a2a.client import dispatch_sync
             if figma_url:
@@ -164,7 +170,7 @@ class DispatchWebDev(BaseTool):
         repo_url: str = "",
         revision_feedback: str = "",
     ) -> ToolResult:
-        web_dev_url = os.environ.get("WEB_DEV_AGENT_URL", "http://web-dev:8050")
+        web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "http://web-dev:8050", "web-dev.task.execute")
         meta: dict[str, Any] = {}
         if jira_context:
             meta["jiraContext"] = jira_context
@@ -236,12 +242,12 @@ class DispatchCodeReview(BaseTool):
         diff_summary: str = "",
         requirements: str = "",
     ) -> ToolResult:
-        review_url = os.environ.get("CODE_REVIEW_AGENT_URL", "http://code-review:8050")
+        review_url = _resolve_agent_url("CODE_REVIEW_AGENT_URL", "http://code-review:8050", "review.code.check")
         meta: dict[str, Any] = {}
         if pr_url:
             meta["prUrl"] = pr_url
         if requirements:
-            meta["requirements"] = requirements
+            meta["originalRequirements"] = requirements
 
         try:
             from framework.a2a.client import dispatch_sync

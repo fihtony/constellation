@@ -63,6 +63,7 @@ class RunConfig:
     checkpoint_service: Any = None  # CheckpointService
     event_store: Any = None         # EventStore
     plugin_manager: Any = None      # PluginManager
+    permission_engine: Any = None   # PermissionEngine (bound to global ToolRegistry)
     max_steps: int = 100
     timeout_seconds: int = 3600
 
@@ -159,6 +160,12 @@ class WorkflowRunner:
     async def run(self, state: dict) -> dict:
         """Execute from START until END or interrupt."""
         current_node = START
+
+        # Bind PermissionEngine to the global ToolRegistry so that all tool
+        # calls made during this workflow run are permission-checked.
+        if self.config.permission_engine:
+            from framework.tools.registry import get_registry
+            get_registry().set_permission_engine(self.config.permission_engine)
 
         # Restore from checkpoint if available
         if self.config.checkpoint_service:

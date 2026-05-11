@@ -76,3 +76,25 @@ class PluginManager:
                     exc_info=True,
                 )
         return None
+
+    def fire_sync(self, event: str, *args: Any, **kwargs: Any) -> Any:
+        """Fire a plugin event synchronously.
+
+        Safe to call from background threads or synchronous code paths
+        (e.g. the ReAct agentic loop inside ConnectAgentAdapter).  Always
+        creates a dedicated event loop so it does not interfere with any
+        existing running loop on the current thread.
+        """
+        import asyncio
+
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(self.fire(event, *args, **kwargs))
+        except Exception:
+            logger.warning(
+                "PluginManager.fire_sync(%s) raised an exception", event,
+                exc_info=True,
+            )
+            return None
+        finally:
+            loop.close()

@@ -86,8 +86,10 @@ async def gather_context(state: dict) -> dict:
     jira_key = state.get("jira_key", "")
     if jira_key and not jira_context:
         try:
-            result = registry.execute_sync("fetch_jira_ticket", ticket_key=jira_key)
-            payload = json.loads(result.output) if result.output else {}
+            result_str = registry.execute_sync(
+                "fetch_jira_ticket", {"ticket_key": jira_key}
+            )
+            payload = json.loads(result_str) if result_str else {}
             if not payload.get("error"):
                 jira_context = payload
         except Exception as exc:
@@ -98,13 +100,13 @@ async def gather_context(state: dict) -> dict:
     stitch_id = state.get("stitch_project_id", "")
     if (figma_url or stitch_id) and not design_context:
         try:
-            kwargs: dict[str, str] = {}
+            args: dict[str, str] = {}
             if figma_url:
-                kwargs["figma_url"] = figma_url
+                args["figma_url"] = figma_url
             elif stitch_id:
-                kwargs["stitch_project_id"] = stitch_id
-            result = registry.execute_sync("fetch_design", **kwargs)
-            payload = json.loads(result.output) if result.output else {}
+                args["stitch_project_id"] = stitch_id
+            result_str = registry.execute_sync("fetch_design", args)
+            payload = json.loads(result_str) if result_str else {}
             if not payload.get("error"):
                 design_context = payload
         except Exception as exc:
@@ -177,15 +179,17 @@ async def dispatch_dev_agent(state: dict) -> dict:
     task_description = _build_dev_brief(state)
 
     try:
-        result = registry.execute_sync(
+        result_str = registry.execute_sync(
             "dispatch_web_dev",
-            task_description=task_description,
-            jira_context=state.get("jira_context", {}),
-            design_context=state.get("design_context"),
-            repo_url=state.get("repo_url", ""),
-            revision_feedback=revision_feedback,
+            {
+                "task_description": task_description,
+                "jira_context": state.get("jira_context", {}),
+                "design_context": state.get("design_context"),
+                "repo_url": state.get("repo_url", ""),
+                "revision_feedback": revision_feedback,
+            },
         )
-        payload = json.loads(result.output) if result.output else {}
+        payload = json.loads(result_str) if result_str else {}
     except Exception as exc:
         print(f"[team-lead] Dev dispatch failed: {exc}")
         payload = {"status": "error", "message": str(exc)}
@@ -213,13 +217,15 @@ async def review_result(state: dict) -> dict:
     dev_result = state.get("dev_result", {})
 
     try:
-        result = registry.execute_sync(
+        result_str = registry.execute_sync(
             "dispatch_code_review",
-            pr_url=pr_url,
-            diff_summary=dev_result.get("summary", ""),
-            requirements=state.get("analysis_summary", ""),
+            {
+                "pr_url": pr_url,
+                "diff_summary": dev_result.get("summary", ""),
+                "requirements": state.get("analysis_summary", "") or state.get("user_request", ""),
+            },
         )
-        payload = json.loads(result.output) if result.output else {}
+        payload = json.loads(result_str) if result_str else {}
     except Exception as exc:
         print(f"[team-lead] Code review dispatch failed: {exc}")
         payload = {"verdict": "error", "message": str(exc)}
@@ -358,65 +364,4 @@ async def handle_question(state: dict) -> dict:
     return {"route": "user_needed", "escalation_reason": "Clarification needed from user."}
 
 
-async def dispatch_code_review(state: dict) -> dict:
-    """Dispatch to the Code Review Agent.
 
-    MVP placeholder — full implementation dispatches via A2A.
-    """
-    # TODO: dispatch to review.code.check via A2A
-    return {
-        "review_result": {
-            "verdict": "approved",
-            "comments": [],
-        },
-        "review_verdict": "approved",
-        "review_comments": [],
-    }
-
-
-async def evaluate_review(state: dict) -> dict:
-    """Evaluate code review result and decide next action."""
-    review_cycles = state.get("review_cycles", 0) + 1
-    max_cycles = state.get("max_review_cycles", 2)
-    verdict = state.get("review_verdict", "rejected")
-
-    if verdict == "approved":
-        return {"route": "approved", "review_cycles": review_cycles}
-    if review_cycles >= max_cycles:
-        return {
-            "route": "max_revisions",
-            "review_cycles": review_cycles,
-            "escalation_reason": f"Max review cycles ({max_cycles}) reached.",
-        }
-    return {
-        "route": "needs_revision",
-        "review_cycles": review_cycles,
-        "revision_instructions": state.get("review_comments", []),
-    }
-
-
-async def request_revision(state: dict) -> dict:
-    """Send revision request back to the dev agent."""
-    return {
-        "revision_requested": True,
-        "review_feedback": state.get("review_comments", []),
-    }
-
-
-async def report_success(state: dict) -> dict:
-    """Report successful task completion."""
-    pr_url = state.get("pr_url", "N/A")
-    return {
-        "success": True,
-        "summary": f"Task completed successfully. PR: {pr_url}",
-    }
-
-
-async def escalate_to_user(state: dict) -> dict:
-    """Escalate to user for input or report failure."""
-    from framework.workflow import interrupt
-
-    reason = state.get("escalation_reason", "Unknown reason")
-    interrupt(question=f"Unable to proceed: {reason}", escalation_type="user_input")
-    # unreachable — interrupt raises
-    return {}

@@ -88,8 +88,13 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
         timeout: int = 1800,
         on_progress=None,
         continuation: str | None = None,
+        plugin_manager=None,
     ) -> AgenticResult:
         """Multi-turn autonomous execution with tool calling.
+
+        When *plugin_manager* is provided, fires plugin events around each LLM
+        call (``before_llm_call`` / ``after_llm_response``) and each tool
+        execution (``before_tool_call`` / ``after_tool_call``) in the ReAct loop.
 
         This is a simplified agentic loop for v2 MVP.  The full v1
         implementation with policy profiles, checkpoints, and sub-agents
@@ -117,6 +122,11 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
         while turns_used < max_turns and time.time() < deadline:
             turns_used += 1
 
+            # --- Plugin: before_llm_call ---
+            if plugin_manager:
+                last_content = messages[-1].get("content", "") or ""
+                plugin_manager.fire_sync("before_llm_call", last_content, ctx={})
+
             try:
                 response = call_chat_completion(
                     messages,
@@ -137,6 +147,11 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
             message = choice.get("message", {})
             finish_reason = choice.get("finish_reason", "stop")
 
+            # --- Plugin: after_llm_response ---
+            if plugin_manager:
+                llm_content = message.get("content", "") or ""
+                plugin_manager.fire_sync("after_llm_response", llm_content, ctx={})
+
             # Append assistant message to history
             messages.append(message)
 
@@ -152,8 +167,21 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
                         "turn": turns_used,
                     })
 
-                    # Execute the tool (placeholder — tools must be registered)
+                    # --- Plugin: before_tool_call ---
+                    if plugin_manager:
+                        import json as _json
+                        try:
+                            parsed_args = _json.loads(tool_args) if tool_args else {}
+                        except Exception:
+                            parsed_args = {}
+                        plugin_manager.fire_sync("before_tool_call", tool_name, parsed_args, ctx={})
+
+                    # Execute the tool
                     tool_result = self._execute_tool(tool_name, tool_args)
+
+                    # --- Plugin: after_tool_call ---
+                    if plugin_manager:
+                        plugin_manager.fire_sync("after_tool_call", tool_name, tool_result, ctx={})
 
                     messages.append({
                         "role": "tool",
