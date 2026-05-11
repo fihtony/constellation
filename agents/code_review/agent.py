@@ -95,6 +95,14 @@ class CodeReviewAgent(BaseAgent):
 
             loop = asyncio.new_event_loop()
             try:
+                # Recall relevant past reviews for context
+                pr_url_for_recall = metadata.get("prUrl", "") or metadata.get("repoUrl", "code review")
+                memory_context = loop.run_until_complete(
+                    self.recall_task_context(pr_url_for_recall)
+                )
+                if memory_context:
+                    state["memory_context"] = memory_context
+
                 config = RunConfig(
                     session_id=task.id,
                     thread_id=task.id,
@@ -121,6 +129,14 @@ class CodeReviewAgent(BaseAgent):
                     )
                 ]
                 task_store.complete_task(task.id, artifacts=artifacts)
+
+                # Consolidate review findings into memory
+                loop.run_until_complete(
+                    self.consolidate_task_result(
+                        summary=result.get("report_summary", ""),
+                        tags=["code-review", result.get("verdict", "")],
+                    )
+                )
 
                 # Send callback if URL provided
                 callback_url = metadata.get("orchestratorCallbackUrl", "")

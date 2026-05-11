@@ -23,6 +23,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from framework.permissions import PermissionEngine
     from framework.tools.base import BaseTool, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,17 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, "BaseTool"] = {}
+        self._permission_engine: "PermissionEngine | None" = None
+
+    # ------------------------------------------------------------------
+    # Permission gate
+    # ------------------------------------------------------------------
+
+    def set_permission_engine(self, engine: "PermissionEngine") -> "ToolRegistry":
+        """Attach a PermissionEngine.  All subsequent execute calls will be
+        checked against it before the tool runs."""
+        self._permission_engine = engine
+        return self
 
     # ------------------------------------------------------------------
     # Registration
@@ -78,9 +90,19 @@ class ToolRegistry:
     def execute_sync(self, name: str, arguments: str | dict) -> str:
         """Execute a tool synchronously.  Returns the result as a JSON string.
 
+        Permission check is applied first when a PermissionEngine is set.
         If the tool's execute_sync raises, the error is caught and returned
         as ``{"error": "..."}`` so the LLM can react to failures gracefully.
         """
+        # Permission gate (fail-closed)
+        if self._permission_engine:
+            from framework.errors import PermissionDeniedError
+            try:
+                self._permission_engine.require_tool(name)
+            except PermissionDeniedError as exc:
+                logger.warning("[registry] Permission denied for tool '%s': %s", name, exc)
+                return json.dumps({"error": str(exc)})
+
         tool = self._tools.get(name)
         if not tool:
             return json.dumps({"error": f"Tool '{name}' is not registered"})
@@ -101,7 +123,19 @@ class ToolRegistry:
         return result.output
 
     async def execute(self, name: str, arguments: str | dict) -> str:
-        """Execute a tool asynchronously.  Returns a JSON string."""
+        """Execute a tool asynchronously.  Returns a JSON string.
+
+        Permission check is applied first when a PermissionEngine is set.
+        """
+        # Permission gate (fail-closed)
+        if self._permission_engine:
+            from framework.errors import PermissionDeniedError
+            try:
+                self._permission_engine.require_tool(name)
+            except PermissionDeniedError as exc:
+                logger.warning("[registry] Permission denied for tool '%s': %s", name, exc)
+                return json.dumps({"error": str(exc)})
+
         tool = self._tools.get(name)
         if not tool:
             return json.dumps({"error": f"Tool '{name}' is not registered"})

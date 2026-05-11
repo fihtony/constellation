@@ -137,3 +137,59 @@ class BaseAgent:
             await client.register_agent(self.definition.agent_id)
         except Exception as exc:  # noqa: BLE001
             print(f"[{self.definition.agent_id}] Registry registration failed: {exc}")
+
+    # -- Memory helpers -------------------------------------------------------
+
+    async def recall_task_context(
+        self,
+        query: str,
+        scope_id: str = "",
+        limit: int = 5,
+    ) -> str:
+        """Search long-term memory for context relevant to *query*.
+
+        Returns a formatted string of the top *limit* matching entries,
+        or an empty string if memory is unavailable or nothing matches.
+
+        Call this **before** starting a task workflow to inject prior
+        knowledge into the initial state.
+        """
+        if not self.memory_service:
+            return ""
+        try:
+            entries = await self.memory_service.search(
+                query,
+                scope="agent",
+                scope_id=scope_id or self.definition.agent_id,
+                limit=limit,
+            )
+            if not entries:
+                return ""
+            lines = [f"- {e.content}" for e in entries]
+            return "Relevant past knowledge:\n" + "\n".join(lines)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{self.definition.agent_id}] Memory recall failed: {exc}")
+            return ""
+
+    async def consolidate_task_result(
+        self,
+        summary: str,
+        tags: list[str] | None = None,
+        scope_id: str = "",
+    ) -> None:
+        """Persist *summary* to long-term memory for future task recall.
+
+        Call this **after** a task completes (success or failure) to enable
+        future tasks to benefit from the accumulated experience.
+        """
+        if not self.memory_service or not summary:
+            return
+        try:
+            await self.memory_service.add(
+                content=summary,
+                scope="agent",
+                scope_id=scope_id or self.definition.agent_id,
+                tags=tags or [],
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{self.definition.agent_id}] Memory consolidation failed: {exc}")

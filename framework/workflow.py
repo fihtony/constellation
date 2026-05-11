@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Union
 
 from framework.errors import InterruptSignal, MaxStepsExceeded
+from framework.state import StateSchema, merge_state
 
 # ---------------------------------------------------------------------------
 # Sentinels
@@ -87,10 +88,11 @@ class Workflow:
         self,
         name: str,
         edges: list[tuple],
-        state_schema: type | None = None,
+        state_schema: type | StateSchema | None = None,
     ):
         self.name = name
         self.edges = edges
+        # Accept either a type hint (backward compat) or a StateSchema dict.
         self.state_schema = state_schema or dict
 
     def compile(self) -> CompiledWorkflow:
@@ -194,9 +196,10 @@ class WorkflowRunner:
                     )
                 raise
 
-            # Merge result into state
+            # Merge result into state (schema-aware if declared)
             if isinstance(result, dict):
-                state.update(result)
+                schema = self.workflow.state_schema if isinstance(self.workflow.state_schema, dict) else None
+                merge_state(state, result, schema)
 
             # Record event
             if self.config.event_store:
@@ -246,7 +249,8 @@ class WorkflowRunner:
         node_fn = self.workflow.nodes.get(current_node)
         result = await _call_node(node_fn, state)
         if isinstance(result, dict):
-            state.update(result)
+            schema = self.workflow.state_schema if isinstance(self.workflow.state_schema, dict) else None
+            merge_state(state, result, schema)
 
         # Continue from the next transition
         next_node = self._resolve_next(current_node, state)
@@ -302,7 +306,8 @@ class WorkflowRunner:
                 raise
 
             if isinstance(result, dict):
-                state.update(result)
+                schema = self.workflow.state_schema if isinstance(self.workflow.state_schema, dict) else None
+                merge_state(state, result, schema)
 
             if self.config.event_store:
                 await self.config.event_store.append(

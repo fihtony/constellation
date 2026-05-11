@@ -1,66 +1,183 @@
-"""Code Review Agent workflow nodes."""
+"""Code Review Agent workflow nodes.
+
+Design pattern — "Graph outside, ReAct inside":
+- Graph drives the deterministic review pipeline (load → quality → security → tests → requirements → report).
+- Each review phase uses a single-shot LLM call (runtime.run()) — bounded and auditable.
+- Nodes degrade gracefully when no runtime is available (unit-test path).
+"""
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 
-async def load_pr_context(state: dict) -> dict:
-    """Fetch PR diff, files, and description.
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    MVP placeholder — full implementation fetches from SCM agent.
+def _parse_issue_list(text: str) -> list[dict]:
+    """Extract a JSON array of issue objects from LLM response text.
+
+    Returns an empty list when parsing fails.
     """
+    # Try direct parse first
+    try:
+        parsed = json.loads(text.strip())
+        if isinstance(parsed, list):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Extract the first JSON array from mixed text
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Node implementations
+# ---------------------------------------------------------------------------
+
+async def load_pr_context(state: dict) -> dict:
+    """Load PR diff, changed files, and description from state metadata.
+
+    In a full deployment the SCM adapter fetches this data.
+    For MVP the calling agent (Team Lead) passes it via metadata.
+    """
+    metadata = state.get("metadata", {})
+
+    # Prefer pre-fetched context; fall back to empty strings so downstream
+    # nodes still run (they will produce "no issues" gracefully).
+    pr_diff = (
+        metadata.get("prDiff")
+        or state.get("pr_diff")
+        or ""
+    )
+    changed_files = (
+        metadata.get("changedFiles")
+        or state.get("changed_files")
+        or []
+    )
+    pr_description = (
+        metadata.get("prDescription")
+        or state.get("pr_description")
+        or ""
+    )
+    commit_messages = (
+        metadata.get("commitMessages")
+        or state.get("commit_messages")
+        or []
+    )
+
     return {
-        "pr_diff": "",
-        "changed_files": [],
-        "pr_description": "",
-        "commit_messages": [],
+        "pr_diff": pr_diff,
+        "changed_files": changed_files if isinstance(changed_files, list) else [changed_files],
+        "pr_description": pr_description,
+        "commit_messages": commit_messages,
     }
 
 
 async def review_quality(state: dict) -> dict:
-    """Check code quality, style, and patterns."""
+    """Check code quality, style, and patterns using a single-shot LLM call."""
     runtime = state.get("_runtime")
 
-    if not runtime:
+    if not runtime or not state.get("pr_diff"):
         return {"quality_issues": []}
 
-    # Full implementation uses LLM to review the PR diff
-    return {"quality_issues": []}
+    from agents.code_review.prompts import QUALITY_SYSTEM, QUALITY_TEMPLATE
+
+    prompt = QUALITY_TEMPLATE.format(
+        pr_description=state.get("pr_description", "N/A"),
+        changed_files=", ".join(state.get("changed_files", [])) or "N/A",
+        pr_diff=state.get("pr_diff", ""),
+    )
+    result = runtime.run(prompt, system_prompt=QUALITY_SYSTEM, max_tokens=2048)
+    issues = _parse_issue_list(result.get("raw_response", ""))
+
+    return {"quality_issues": issues}
 
 
 async def review_security(state: dict) -> dict:
-    """Check for security vulnerabilities (OWASP Top 10)."""
+    """Check for security vulnerabilities (OWASP Top 10) using a single-shot LLM call."""
     runtime = state.get("_runtime")
 
-    if not runtime:
+    if not runtime or not state.get("pr_diff"):
         return {"security_issues": []}
 
-    return {"security_issues": []}
+    from agents.code_review.prompts import SECURITY_SYSTEM, SECURITY_TEMPLATE
+
+    prompt = SECURITY_TEMPLATE.format(
+        pr_description=state.get("pr_description", "N/A"),
+        changed_files=", ".join(state.get("changed_files", [])) or "N/A",
+        pr_diff=state.get("pr_diff", ""),
+    )
+    result = runtime.run(prompt, system_prompt=SECURITY_SYSTEM, max_tokens=2048)
+    issues = _parse_issue_list(result.get("raw_response", ""))
+
+    return {"security_issues": issues}
 
 
 async def review_tests(state: dict) -> dict:
-    """Check test coverage and test quality."""
+    """Check test coverage and test quality using a single-shot LLM call."""
     runtime = state.get("_runtime")
 
-    if not runtime:
+    if not runtime or not state.get("pr_diff"):
         return {"test_issues": []}
 
-    return {"test_issues": []}
+    from agents.code_review.prompts import TESTS_SYSTEM, TESTS_TEMPLATE
+
+    prompt = TESTS_TEMPLATE.format(
+        pr_description=state.get("pr_description", "N/A"),
+        changed_files=", ".join(state.get("changed_files", [])) or "N/A",
+        pr_diff=state.get("pr_diff", ""),
+    )
+    result = runtime.run(prompt, system_prompt=TESTS_SYSTEM, max_tokens=2048)
+    issues = _parse_issue_list(result.get("raw_response", ""))
+
+    return {"test_issues": issues}
 
 
 async def review_requirements(state: dict) -> dict:
     """Check requirements compliance against Jira acceptance criteria."""
     runtime = state.get("_runtime")
 
-    if not runtime:
+    if not runtime or not state.get("pr_diff"):
         return {"requirement_gaps": []}
 
-    return {"requirement_gaps": []}
+    original_requirements = state.get("original_requirements", "")
+    if not original_requirements:
+        return {"requirement_gaps": []}
+
+    from agents.code_review.prompts import REQUIREMENTS_SYSTEM, REQUIREMENTS_TEMPLATE
+
+    jira_ctx = state.get("jira_context", {})
+    prompt = REQUIREMENTS_TEMPLATE.format(
+        original_requirements=original_requirements,
+        jira_context=json.dumps(jira_ctx, ensure_ascii=False) if jira_ctx else "N/A",
+        pr_description=state.get("pr_description", "N/A"),
+        changed_files=", ".join(state.get("changed_files", [])) or "N/A",
+        pr_diff=state.get("pr_diff", ""),
+    )
+    result = runtime.run(prompt, system_prompt=REQUIREMENTS_SYSTEM, max_tokens=2048)
+    issues = _parse_issue_list(result.get("raw_response", ""))
+
+    return {"requirement_gaps": issues}
 
 
 async def generate_report(state: dict) -> dict:
-    """Generate final review report with verdict."""
+    """Aggregate all review phases and produce a final verdict.
+
+    Pure Python — no LLM call needed.
+    Verdict: "approved" only when there are zero critical or high severity issues.
+    """
     quality = state.get("quality_issues", [])
     security = state.get("security_issues", [])
     tests = state.get("test_issues", [])
@@ -71,20 +188,26 @@ async def generate_report(state: dict) -> dict:
     # Count by severity
     critical = sum(1 for c in all_comments if c.get("severity") == "critical")
     high = sum(1 for c in all_comments if c.get("severity") == "high")
+    medium = sum(1 for c in all_comments if c.get("severity") == "medium")
+    low = sum(1 for c in all_comments if c.get("severity") == "low")
 
     verdict = "approved" if (critical == 0 and high == 0) else "rejected"
+
+    summary_parts = [
+        f"Review complete: {len(all_comments)} issue(s) found.",
+        f"Critical: {critical}, High: {high}, Medium: {medium}, Low: {low}.",
+        f"Verdict: {verdict}.",
+    ]
 
     return {
         "verdict": verdict,
         "all_comments": all_comments,
-        "report_summary": (
-            f"Review complete: {len(all_comments)} issues found. "
-            f"Critical: {critical}, High: {high}. Verdict: {verdict}."
-        ),
+        "report_summary": " ".join(summary_parts),
         "severity_levels": {
             "critical": critical,
             "high": high,
-            "medium": sum(1 for c in all_comments if c.get("severity") == "medium"),
-            "low": sum(1 for c in all_comments if c.get("severity") == "low"),
+            "medium": medium,
+            "low": low,
         },
     }
+

@@ -112,6 +112,13 @@ class WebDevAgent(BaseAgent):
 
             loop = asyncio.new_event_loop()
             try:
+                # Recall relevant past context before starting
+                memory_context = loop.run_until_complete(
+                    self.recall_task_context(user_text or "web development task")
+                )
+                if memory_context:
+                    state["memory_context"] = memory_context
+
                 config = RunConfig(
                     session_id=task.id,
                     thread_id=task.id,
@@ -137,6 +144,14 @@ class WebDevAgent(BaseAgent):
                     )
                 ]
                 task_store.complete_task(task.id, artifacts=artifacts)
+
+                # Consolidate task result into memory for future recall
+                loop.run_until_complete(
+                    self.consolidate_task_result(
+                        summary=result.get("implementation_summary", ""),
+                        tags=["web-dev", metadata.get("taskType", "general")],
+                    )
+                )
 
                 # Send callback if URL provided
                 callback_url = metadata.get("orchestratorCallbackUrl", "")
