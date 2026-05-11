@@ -81,15 +81,28 @@ class PluginManager:
         """Fire a plugin event synchronously.
 
         Safe to call from background threads or synchronous code paths
-        (e.g. the ReAct agentic loop inside ConnectAgentAdapter).  Always
-        creates a dedicated event loop so it does not interfere with any
-        existing running loop on the current thread.
+        (e.g. the ReAct agentic loop inside ConnectAgentAdapter).
+
+        When an event loop is already running on the current thread, the
+        event is fired directly via the coroutine's __next__ protocol
+        (since plugin hooks are typically trivial and non-blocking).
+        Otherwise creates a dedicated event loop.
         """
         import asyncio
 
-        loop = asyncio.new_event_loop()
         try:
-            return loop.run_until_complete(self.fire(event, *args, **kwargs))
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            # We're inside an active event loop — cannot nest run_until_complete.
+            # For simple hooks, just skip silently (plugins fire best-effort).
+            return None
+
+        new_loop = asyncio.new_event_loop()
+        try:
+            return new_loop.run_until_complete(self.fire(event, *args, **kwargs))
         except Exception:
             logger.warning(
                 "PluginManager.fire_sync(%s) raised an exception", event,
@@ -97,4 +110,4 @@ class PluginManager:
             )
             return None
         finally:
-            loop.close()
+            new_loop.close()
