@@ -113,9 +113,17 @@ async def main():
     from framework.a2a.server import A2ARequestHandler
     from http.server import HTTPServer
 
+    _card_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        module_path.replace(".", "/").rsplit("/", 1)[0],
+        "agent-card.json",
+    )
+    _adv_url = f"http://localhost:{args.port}"
+
     class AgentHandler(A2ARequestHandler):
-        _agent = agent
-        _agent_id = agent_def.agent_id
+        agent = agent  # noqa: F811
+        advertised_url = _adv_url
+        agent_card_path = _card_path
 
     server = HTTPServer(("0.0.0.0", args.port), AgentHandler)
     print(f"[{args.agent}] HTTP server listening on 0.0.0.0:{args.port}")

@@ -4,9 +4,12 @@
 
 agent_id: jira
 name: "Jira Agent"
-description: "Boundary adapter: Jira ticket fetch, search, comment via Jira Cloud REST API v3"
+description: "Boundary adapter: Jira ticket fetch, search, comment (REST + MCP)"
 mode: single_turn
 execution_mode: persistent
+
+# Backend: rest (default) | mcp (Atlassian Rovo MCP with REST fallback)
+backend: rest
 
 # runtime and model inherit from global constellation.yaml:
 #   runtime.backend: connect-agent
@@ -20,3 +23,5 @@ capabilities:
   - jira.ticket.search
   - jira.ticket.comment
   - jira.ticket.update
+  - jira.ticket.transition
+  - jira.transitions.list

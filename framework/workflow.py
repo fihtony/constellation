@@ -219,12 +219,14 @@ class WorkflowRunner:
                     },
                 )
 
+            # Fire plugin: after_node (use the name of the just-executed node)
+            executed_node = current_node
+
             # Determine next node via transition table
             current_node = self._resolve_next(current_node, state)
 
-            # Fire plugin: after_node
             if self.config.plugin_manager:
-                await self.config.plugin_manager.fire("after_node", current_node, state)
+                await self.config.plugin_manager.fire("after_node", executed_node, state)
 
             # Checkpoint after each step
             if self.config.checkpoint_service:
@@ -233,6 +235,11 @@ class WorkflowRunner:
                     self.config.thread_id,
                     {"state": state, "next_node": current_node},
                 )
+
+        # Clean up permission engine binding to avoid global state leaking
+        if self.config.permission_engine:
+            from framework.tools.registry import get_registry
+            get_registry().set_permission_engine(None)
 
         return state
 
@@ -323,10 +330,13 @@ class WorkflowRunner:
                     content={"node": current_node},
                 )
 
+            # Fire plugin: after_node (use the name of the just-executed node)
+            executed_node = current_node
+
             current_node = self._resolve_next(current_node, state)
 
             if self.config.plugin_manager:
-                await self.config.plugin_manager.fire("after_node", current_node, state)
+                await self.config.plugin_manager.fire("after_node", executed_node, state)
 
             if self.config.checkpoint_service:
                 await self.config.checkpoint_service.save(

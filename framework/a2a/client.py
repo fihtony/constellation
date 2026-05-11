@@ -147,6 +147,7 @@ class A2AClient:
                     TaskState.COMPLETED.value,
                     TaskState.FAILED.value,
                     TaskState.CANCELLED.value,
+                    TaskState.INPUT_REQUIRED.value,
                 }:
                     return result
             except Exception:
@@ -241,7 +242,10 @@ def dispatch_sync(
     # Poll until terminal state
     poll_url = f"{url.rstrip('/')}/tasks/{task_id}"
     deadline = time.time() + timeout
-    terminal = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELLED"}
+    terminal = {
+        "TASK_STATE_COMPLETED", "TASK_STATE_FAILED",
+        "TASK_STATE_CANCELLED", "TASK_STATE_INPUT_REQUIRED",
+    }
 
     while time.time() < deadline:
         get_req = urllib.request.Request(poll_url, method="GET")
