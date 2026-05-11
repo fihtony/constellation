@@ -67,7 +67,8 @@ async def setup_workspace(state: dict) -> dict:
             repo_url=repo_url,
             jira_context=json.dumps(jira_context, ensure_ascii=False) if jira_context else "N/A",
         )
-        result = runtime.run(prompt, system_prompt=SETUP_SYSTEM)
+        result = runtime.run(prompt, system_prompt=SETUP_SYSTEM,
+                             plugin_manager=state.get("_plugin_manager"))
         data = _safe_json(result.get("raw_response", ""), fallback={})
         branch_name = data.get("branch_name", "feature/task")
 
@@ -131,6 +132,7 @@ async def implement_changes(state: dict) -> dict:
         tools=allowed_tools,
         max_turns=20,
         timeout=600,
+        plugin_manager=state.get("_plugin_manager"),
     )
 
     # Extract changed file names from tool_calls log
@@ -179,6 +181,7 @@ async def run_tests(state: dict) -> dict:
         cwd=repo_path or None,
         max_turns=5,
         timeout=120,
+        plugin_manager=state.get("_plugin_manager"),
     )
 
     data = _safe_json(result.summary, fallback={})
@@ -237,6 +240,7 @@ async def fix_tests(state: dict) -> dict:
         cwd=state.get("repo_path") or None,
         max_turns=15,
         timeout=300,
+        plugin_manager=state.get("_plugin_manager"),
     )
 
     return {
@@ -278,7 +282,8 @@ async def create_pr(state: dict) -> dict:
         implementation_summary=state.get("implementation_summary", ""),
         changed_files=", ".join(state.get("changes_made", [])) or "various files",
     )
-    desc_result = runtime.run(desc_prompt, system_prompt=PR_DESCRIPTION_SYSTEM)
+    desc_result = runtime.run(desc_prompt, system_prompt=PR_DESCRIPTION_SYSTEM,
+                              plugin_manager=state.get("_plugin_manager"))
     pr_meta = _safe_json(desc_result.get("raw_response", ""), fallback={})
     pr_title = pr_meta.get("title", "Implement task changes")
     pr_description = pr_meta.get("description", state.get("implementation_summary", ""))
@@ -300,6 +305,7 @@ async def create_pr(state: dict) -> dict:
         cwd=repo_path or None,
         max_turns=10,
         timeout=120,
+        plugin_manager=state.get("_plugin_manager"),
     )
 
     pr_data = _safe_json(push_result.summary, fallback={})

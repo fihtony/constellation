@@ -185,3 +185,78 @@ class TestWorkflowCheckpoint:
         assert saved is not None
         assert saved["state"]["a"] is True
         assert saved["state"]["b"] is True
+
+
+# ---------------------------------------------------------------------------
+# Plugin after_node name-level assertion tests
+# ---------------------------------------------------------------------------
+
+class _RecordingPluginManager:
+    """Minimal PluginManager that records all fired events."""
+
+    def __init__(self):
+        self.events: list[tuple[str, str]] = []  # (event_type, node_name)
+
+    async def fire(self, event: str, node_name: str, state: dict):
+        self.events.append((event, node_name))
+
+
+class TestWorkflowPluginNodeNames:
+    """Verify that before_node / after_node fire with the correct node name."""
+
+    @pytest.mark.asyncio
+    async def test_after_node_fires_with_executed_node(self):
+        """after_node must receive the node that just executed, not the next one."""
+        pm = _RecordingPluginManager()
+
+        wf = Workflow(name="plugin_test", edges=[
+            (START, step_a, step_b),
+            (step_b, END),
+        ])
+        compiled = wf.compile()
+
+        await compiled.invoke(
+            {"input": "test"},
+            RunConfig(plugin_manager=pm),
+        )
+
+        before_events = [(e, n) for e, n in pm.events if e == "before_node"]
+        after_events = [(e, n) for e, n in pm.events if e == "after_node"]
+
+        # before_node should fire for step_a and step_b
+        assert ("before_node", "step_a") in before_events
+        assert ("before_node", "step_b") in before_events
+
+        # after_node should fire for step_a and step_b (the executed nodes)
+        assert ("after_node", "step_a") in after_events
+        assert ("after_node", "step_b") in after_events
+
+        # after_node should NOT fire with __END__
+        after_names = [n for _, n in after_events]
+        assert "__END__" not in after_names
+
+    @pytest.mark.asyncio
+    async def test_before_after_pairing(self):
+        """Every before_node should have a matching after_node for the same name."""
+        pm = _RecordingPluginManager()
+
+        wf = Workflow(name="pair_test", edges=[
+            (START, step_a, step_b),
+            (step_b, step_c),
+            (step_c, END),
+        ])
+        compiled = wf.compile()
+
+        await compiled.invoke(
+            {},
+            RunConfig(plugin_manager=pm),
+        )
+
+        before_names = [n for e, n in pm.events if e == "before_node"]
+        after_names = [n for e, n in pm.events if e == "after_node"]
+
+        # Same set of names (may include __START__ sentinel)
+        assert before_names == after_names
+        # Business nodes are present in order
+        biz_before = [n for n in before_names if not n.startswith("__")]
+        assert biz_before == ["step_a", "step_b", "step_c"]

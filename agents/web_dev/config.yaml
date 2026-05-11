@@ -29,3 +29,4 @@ tools:
 permissions:
   scm: read-write
   filesystem: workspace-only
+permission_profile: development

@@ -46,23 +46,36 @@ web_dev_workflow = Workflow(
 )
 
 # ---------------------------------------------------------------------------
-# Agent definition
+# Agent definition — derived from config.yaml (single source of truth)
 # ---------------------------------------------------------------------------
 
-web_dev_definition = AgentDefinition(
-    agent_id="web-dev",
-    name="Web Dev Agent",
-    description="Full-stack web development: clone, branch, implement, test, PR",
-    mode=AgentMode.TASK,
-    execution_mode=ExecutionMode.PER_TASK,
-    workflow=web_dev_workflow,
-    skills=["react-nextjs", "testing"],
-    tools=[
-        "read_file", "write_file", "edit_file", "search_code", "run_command",
-        "scm_clone", "scm_branch", "scm_commit", "scm_push", "scm_create_pr",
-    ],
-    permissions={"scm": "read-write", "filesystem": "workspace-only"},
-)
+def _build_web_dev_definition() -> AgentDefinition:
+    """Build Web Dev's AgentDefinition from YAML config + workflow."""
+    from framework.config import build_agent_definition_from_config
+
+    try:
+        cfg = build_agent_definition_from_config("web-dev")
+    except Exception:
+        cfg = {}
+    return AgentDefinition(
+        agent_id=cfg.get("agent_id", "web-dev"),
+        name=cfg.get("name", "Web Dev Agent"),
+        description=cfg.get("description", "Full-stack web development: clone, branch, implement, test, PR"),
+        mode=AgentMode.TASK,
+        execution_mode=ExecutionMode.PER_TASK,
+        workflow=web_dev_workflow,
+        skills=cfg.get("skills", ["react-nextjs", "testing"]),
+        tools=cfg.get("tools", [
+            "read_file", "write_file", "edit_file", "search_code", "run_command",
+            "scm_clone", "scm_branch", "scm_commit", "scm_push", "scm_create_pr",
+        ]),
+        permissions=cfg.get("permissions", {"scm": "read-write", "filesystem": "workspace-only"}),
+        permission_profile=cfg.get("permission_profile", "development"),
+        config=cfg.get("config", {}),
+    )
+
+
+web_dev_definition = _build_web_dev_definition()
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +108,7 @@ class WebDevAgent(BaseAgent):
             "_task_id": task.id,
             "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,
+            "_plugin_manager": self.plugin_manager,
             "user_request": user_text,
             "repo_url": metadata.get("repoUrl", ""),
             "branch_name": metadata.get("branchName", ""),
@@ -119,12 +133,8 @@ class WebDevAgent(BaseAgent):
                 if memory_context:
                     state["memory_context"] = memory_context
 
-                config = RunConfig(
-                    session_id=task.id,
-                    thread_id=task.id,
-                    checkpoint_service=self.checkpoint_service,
-                    event_store=self.event_store,
-                    plugin_manager=self.plugin_manager,
+                config = self._build_run_config(
+                    task.id,
                     max_steps=30,
                     timeout_seconds=600,
                 )

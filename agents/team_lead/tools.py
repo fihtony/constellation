@@ -16,37 +16,14 @@ from framework.tools.registry import get_registry
 def _discover_via_registry(capability: str) -> str:
     """Look up the first healthy instance URL for *capability* from the Registry.
 
-    Calls ``GET <REGISTRY_URL>/query?capability=<capability>`` and returns the
-    ``serviceUrl`` of the first active instance.  Returns an empty string if
-    the registry is unreachable or has no matching instance.
+    Uses the v2 RegistryClient abstraction for cached, config-aware discovery.
     """
     try:
-        import urllib.request
-        registry_url = (
-            os.environ.get("REGISTRY_URL")
-            or os.environ.get("CONSTELLATION_REGISTRY_URL")
-            or ""
-        )
-        if not registry_url:
-            from framework.config import load_global_config
-            cfg = load_global_config()
-            registry_url = (cfg.get("registry") or {}).get("url", "")
-        if not registry_url:
-            return ""
-
-        url = f"{registry_url.rstrip('/')}/query?capability={capability}"
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-
-        # Registry returns a list of instance objects or a dict with "instances"
-        instances = body if isinstance(body, list) else body.get("instances", [])
-        for inst in instances:
-            svc_url = inst.get("serviceUrl") or inst.get("service_url") or ""
-            if svc_url:
-                return svc_url
+        from framework.registry_client import RegistryClient
+        client = RegistryClient.from_config()
+        return client.discover(capability)
     except Exception:
-        pass  # registry unreachable — fall through to defaults
+        pass
     return ""
 
 

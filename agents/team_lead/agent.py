@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import threading
+from typing import Any
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 from framework.workflow import Workflow, START, END
@@ -62,33 +63,51 @@ team_lead_workflow = Workflow(
         }),
         (request_revision, dispatch_dev_agent),  # loop back
         (report_success, END),
-        (escalate_to_user, END),
+        (escalate_to_user, {
+            "user_responded": dispatch_dev_agent,  # resume: user provided guidance
+        }),
     ],
     state_schema=_team_lead_state_schema,
 )
 
 # ---------------------------------------------------------------------------
-# Agent definition
+# Agent definition — derived from config.yaml (single source of truth)
 # ---------------------------------------------------------------------------
 
-team_lead_definition = AgentDefinition(
-    agent_id="team-lead",
-    name="Team Lead Agent",
-    description=(
-        "Intelligence layer: analysis, context gathering, planning, "
-        "dev dispatch, code review coordination (graph-first, ReAct-inside-nodes)"
-    ),
-    mode=AgentMode.TASK,
-    execution_mode=ExecutionMode.PERSISTENT,
-    workflow=team_lead_workflow,
-    tools=[
-        "fetch_jira_ticket",
-        "fetch_design",
-        "dispatch_web_dev",
-        "dispatch_code_review",
-        "request_clarification",
-    ],
-)
+def _build_team_lead_definition() -> AgentDefinition:
+    """Build Team Lead's AgentDefinition from YAML config + workflow."""
+    from framework.config import build_agent_definition_from_config
+
+    try:
+        cfg = build_agent_definition_from_config("team-lead")
+    except Exception:
+        # Fallback if config loading fails (e.g. in minimal test environments)
+        cfg = {}
+    return AgentDefinition(
+        agent_id=cfg.get("agent_id", "team-lead"),
+        name=cfg.get("name", "Team Lead Agent"),
+        description=cfg.get(
+            "description",
+            "Intelligence layer: analysis, context gathering, planning, "
+            "dev dispatch, code review coordination (graph-first, ReAct-inside-nodes)",
+        ),
+        mode=AgentMode.TASK,
+        execution_mode=ExecutionMode.PERSISTENT,
+        workflow=team_lead_workflow,
+        tools=cfg.get("tools", [
+            "fetch_jira_ticket",
+            "fetch_design",
+            "dispatch_web_dev",
+            "dispatch_code_review",
+            "request_clarification",
+        ]),
+        permission_profile=cfg.get("permission_profile", ""),
+        permissions=cfg.get("permissions", {}),
+        config=cfg.get("config", {}),
+    )
+
+
+team_lead_definition = _build_team_lead_definition()
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +153,7 @@ class TeamLeadAgent(BaseAgent):
             "_agent_id": self.definition.agent_id,
             "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,
+            "_plugin_manager": self.plugin_manager,
         }
 
         # Run workflow in background thread
@@ -144,12 +164,8 @@ class TeamLeadAgent(BaseAgent):
 
             loop = asyncio.new_event_loop()
             try:
-                config = RunConfig(
-                    session_id=task.id,
-                    thread_id=task.id,
-                    checkpoint_service=self.checkpoint_service,
-                    event_store=self.event_store,
-                    plugin_manager=self.plugin_manager,
+                config = self._build_run_config(
+                    task.id,
                     max_steps=50,
                     timeout_seconds=900,
                 )
@@ -203,6 +219,68 @@ class TeamLeadAgent(BaseAgent):
     async def get_task(self, task_id: str) -> dict:
         """Return real task state from TaskStore."""
         return self.services.task_store.get_task_dict(task_id)
+
+    async def resume_task(self, task_id: str, resume_value: Any) -> dict:
+        """Resume a paused Team Lead task and send callback on completion.
+
+        Overrides BaseAgent.resume_task() to add callback delivery
+        (both COMPLETED and re-interrupted INPUT_REQUIRED).
+        """
+        from framework.a2a.protocol import Artifact
+        from framework.errors import InterruptSignal
+
+        task_store = self.services.task_store
+        task = task_store.get_task(task_id)
+        if task is None:
+            raise RuntimeError(f"Task {task_id} not found")
+
+        callback_url = (task.metadata or {}).get("orchestratorCallbackUrl", "")
+        task_store.resume_task(task_id)
+
+        if self._compiled_workflow and self.checkpoint_service:
+            config = self._build_run_config(task_id, max_steps=50, timeout_seconds=900)
+            try:
+                result = await self._compiled_workflow.resume(config, resume_value)
+                summary = (
+                    result.get("report_summary")
+                    or result.get("analysis_summary")
+                    or "Resumed and completed"
+                ) if isinstance(result, dict) else "Resumed and completed"
+                artifacts = [
+                    Artifact(
+                        name="team-lead-response",
+                        artifact_type="text/plain",
+                        parts=[{"text": summary}],
+                        metadata={
+                            "agentId": self.definition.agent_id,
+                            "orchestratorTaskId": (task.metadata or {}).get("orchestratorTaskId", ""),
+                            "prUrl": result.get("pr_url", "") if isinstance(result, dict) else "",
+                            "branch": result.get("branch_name", "") if isinstance(result, dict) else "",
+                        },
+                    )
+                ]
+                task_store.complete_task(task_id, artifacts=artifacts, message=summary)
+
+                if callback_url:
+                    _send_callback(
+                        callback_url, task_id,
+                        result if isinstance(result, dict) else {},
+                        self.definition.agent_id,
+                    )
+            except InterruptSignal as sig:
+                task_store.pause_task(
+                    task_id,
+                    question=sig.question,
+                    interrupt_metadata=sig.metadata,
+                )
+                if callback_url:
+                    _send_input_required_callback(
+                        callback_url, task_id, sig.question, self.definition.agent_id,
+                    )
+            except Exception as exc:
+                task_store.fail_task(task_id, str(exc))
+
+        return task_store.get_task_dict(task_id)
 
 
 def _send_callback(

@@ -72,6 +72,7 @@ async def test_ui_design_adapter_fetch(figma_client, figma_file_url):
     from framework.plugin import PluginManager
     from framework.session import InMemorySessionService
     from framework.skills import SkillsRegistry
+    from framework.task_store import InMemoryTaskStore
     from agents.ui_design.adapter import UIDesignAgentAdapter, ui_design_definition
 
     services = AgentServices(
@@ -83,6 +84,7 @@ async def test_ui_design_adapter_fetch(figma_client, figma_file_url):
         checkpoint_service=InMemoryCheckpointer(),
         runtime=None,
         registry_client=None,
+        task_store=InMemoryTaskStore(),
     )
     adapter = UIDesignAgentAdapter(
         definition=ui_design_definition,

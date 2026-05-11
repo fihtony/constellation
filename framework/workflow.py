@@ -176,70 +176,72 @@ class WorkflowRunner:
                 state = saved["state"]
                 current_node = saved["next_node"]
 
-        while current_node != END:
-            if self._steps_taken >= self.config.max_steps:
-                raise MaxStepsExceeded(
-                    f"Workflow '{self.workflow.name}' exceeded max_steps={self.config.max_steps}"
-                )
-            self._steps_taken += 1
+        try:
+            while current_node != END:
+                if self._steps_taken >= self.config.max_steps:
+                    raise MaxStepsExceeded(
+                        f"Workflow '{self.workflow.name}' exceeded max_steps={self.config.max_steps}"
+                    )
+                self._steps_taken += 1
 
-            # Resolve the node function
-            node_fn = self.workflow.nodes.get(current_node)
+                # Resolve the node function
+                node_fn = self.workflow.nodes.get(current_node)
 
-            # Fire plugin: before_node
-            if self.config.plugin_manager:
-                await self.config.plugin_manager.fire("before_node", current_node, state)
+                # Fire plugin: before_node
+                if self.config.plugin_manager:
+                    await self.config.plugin_manager.fire("before_node", current_node, state)
 
-            # Execute node
-            try:
-                result = await _call_node(node_fn, state)
-            except InterruptSignal as sig:
-                # Persist checkpoint so we can resume later
+                # Execute node
+                try:
+                    result = await _call_node(node_fn, state)
+                except InterruptSignal as sig:
+                    # Persist checkpoint so we can resume later
+                    if self.config.checkpoint_service:
+                        await self.config.checkpoint_service.save(
+                            self.config.session_id,
+                            self.config.thread_id,
+                            {"state": state, "next_node": current_node, "interrupt": sig.question},
+                        )
+                    raise
+
+                # Merge result into state (schema-aware if declared)
+                if isinstance(result, dict):
+                    schema = self.workflow.state_schema if isinstance(self.workflow.state_schema, dict) else None
+                    merge_state(state, result, schema)
+
+                # Record event
+                if self.config.event_store:
+                    await self.config.event_store.append(
+                        session_id=self.config.session_id,
+                        event_type="node_completed",
+                        content={
+                            "node": current_node,
+                            "result_keys": list(result.keys()) if isinstance(result, dict) else None,
+                        },
+                    )
+
+                # Fire plugin: after_node (use the name of the just-executed node)
+                executed_node = current_node
+
+                # Determine next node via transition table
+                current_node = self._resolve_next(current_node, state)
+
+                if self.config.plugin_manager:
+                    await self.config.plugin_manager.fire("after_node", executed_node, state)
+
+                # Checkpoint after each step
                 if self.config.checkpoint_service:
                     await self.config.checkpoint_service.save(
                         self.config.session_id,
                         self.config.thread_id,
-                        {"state": state, "next_node": current_node, "interrupt": sig.question},
+                        {"state": state, "next_node": current_node},
                     )
-                raise
-
-            # Merge result into state (schema-aware if declared)
-            if isinstance(result, dict):
-                schema = self.workflow.state_schema if isinstance(self.workflow.state_schema, dict) else None
-                merge_state(state, result, schema)
-
-            # Record event
-            if self.config.event_store:
-                await self.config.event_store.append(
-                    session_id=self.config.session_id,
-                    event_type="node_completed",
-                    content={
-                        "node": current_node,
-                        "result_keys": list(result.keys()) if isinstance(result, dict) else None,
-                    },
-                )
-
-            # Fire plugin: after_node (use the name of the just-executed node)
-            executed_node = current_node
-
-            # Determine next node via transition table
-            current_node = self._resolve_next(current_node, state)
-
-            if self.config.plugin_manager:
-                await self.config.plugin_manager.fire("after_node", executed_node, state)
-
-            # Checkpoint after each step
-            if self.config.checkpoint_service:
-                await self.config.checkpoint_service.save(
-                    self.config.session_id,
-                    self.config.thread_id,
-                    {"state": state, "next_node": current_node},
-                )
-
-        # Clean up permission engine binding to avoid global state leaking
-        if self.config.permission_engine:
-            from framework.tools.registry import get_registry
-            get_registry().set_permission_engine(None)
+        finally:
+            # Clean up permission engine binding to avoid global state leaking.
+            # This runs on normal exit, interrupt, and exception paths.
+            if self.config.permission_engine:
+                from framework.tools.registry import get_registry
+                get_registry().set_permission_engine(None)
 
         return state
 
@@ -254,35 +256,46 @@ class WorkflowRunner:
         if not saved:
             raise RuntimeError("No checkpoint found to resume from")
 
+        # Re-bind PermissionEngine for the resumed run
+        if self.config.permission_engine:
+            from framework.tools.registry import get_registry
+            get_registry().set_permission_engine(self.config.permission_engine)
+
         state = saved["state"]
         state["_resume_value"] = resume_value
         # Re-enter at the same node that interrupted
         current_node = saved["next_node"]
 
-        # Re-execute the interrupted node (it should check _resume_value)
-        node_fn = self.workflow.nodes.get(current_node)
-        result = await _call_node(node_fn, state)
-        if isinstance(result, dict):
-            schema = self.workflow.state_schema if isinstance(self.workflow.state_schema, dict) else None
-            merge_state(state, result, schema)
+        try:
+            # Re-execute the interrupted node (it should check _resume_value)
+            node_fn = self.workflow.nodes.get(current_node)
+            result = await _call_node(node_fn, state)
+            if isinstance(result, dict):
+                schema = self.workflow.state_schema if isinstance(self.workflow.state_schema, dict) else None
+                merge_state(state, result, schema)
 
-        # Continue from the next transition
-        next_node = self._resolve_next(current_node, state)
+            # Continue from the next transition
+            next_node = self._resolve_next(current_node, state)
 
-        # Remove the resume sentinel
-        state.pop("_resume_value", None)
+            # Remove the resume sentinel
+            state.pop("_resume_value", None)
 
-        # Checkpoint
-        if self.config.checkpoint_service:
-            await self.config.checkpoint_service.save(
-                self.config.session_id, self.config.thread_id,
-                {"state": state, "next_node": next_node},
-            )
+            # Checkpoint
+            if self.config.checkpoint_service:
+                await self.config.checkpoint_service.save(
+                    self.config.session_id, self.config.thread_id,
+                    {"state": state, "next_node": next_node},
+                )
 
-        # Continue normal execution
-        saved_steps = self._steps_taken
-        self._steps_taken = 0
-        return await self._run_from(next_node, state)
+            # Continue normal execution
+            saved_steps = self._steps_taken
+            self._steps_taken = 0
+            return await self._run_from(next_node, state)
+        finally:
+            # Clean up permission engine binding
+            if self.config.permission_engine:
+                from framework.tools.registry import get_registry
+                get_registry().set_permission_engine(None)
 
     # -- Internal helpers ---------------------------------------------------
 

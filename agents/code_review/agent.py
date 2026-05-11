@@ -52,20 +52,33 @@ code_review_workflow = Workflow(
 )
 
 # ---------------------------------------------------------------------------
-# Agent definition
+# Agent definition — derived from config.yaml (single source of truth)
 # ---------------------------------------------------------------------------
 
-code_review_definition = AgentDefinition(
-    agent_id="code-review",
-    name="Code Review Agent",
-    description="Independent code review: quality, security, tests, requirements compliance",
-    mode=AgentMode.TASK,
-    execution_mode=ExecutionMode.PER_TASK,
-    workflow=code_review_workflow,
-    skills=["code-review"],
-    tools=["read_file", "search_code"],
-    permissions={"scm": "read"},
-)
+def _build_code_review_definition() -> AgentDefinition:
+    """Build Code Review's AgentDefinition from YAML config + workflow."""
+    from framework.config import build_agent_definition_from_config
+
+    try:
+        cfg = build_agent_definition_from_config("code-review")
+    except Exception:
+        cfg = {}
+    return AgentDefinition(
+        agent_id=cfg.get("agent_id", "code-review"),
+        name=cfg.get("name", "Code Review Agent"),
+        description=cfg.get("description", "Independent code review: quality, security, tests, requirements compliance"),
+        mode=AgentMode.TASK,
+        execution_mode=ExecutionMode.PER_TASK,
+        workflow=code_review_workflow,
+        skills=cfg.get("skills", ["code-review"]),
+        tools=cfg.get("tools", ["read_file", "search_code"]),
+        permissions=cfg.get("permissions", {"scm": "read"}),
+        permission_profile=cfg.get("permission_profile", "read_only"),
+        config=cfg.get("config", {}),
+    )
+
+
+code_review_definition = _build_code_review_definition()
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +109,7 @@ class CodeReviewAgent(BaseAgent):
             "_task_id": task.id,
             "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,
+            "_plugin_manager": self.plugin_manager,
             "pr_url": metadata.get("prUrl", ""),
             "repo_url": metadata.get("repoUrl", ""),
             "jira_context": metadata.get("jiraContext", {}),
@@ -116,12 +130,8 @@ class CodeReviewAgent(BaseAgent):
                 if memory_context:
                     state["memory_context"] = memory_context
 
-                config = RunConfig(
-                    session_id=task.id,
-                    thread_id=task.id,
-                    checkpoint_service=self.checkpoint_service,
-                    event_store=self.event_store,
-                    plugin_manager=self.plugin_manager,
+                config = self._build_run_config(
+                    task.id,
                     max_steps=20,
                     timeout_seconds=300,
                 )

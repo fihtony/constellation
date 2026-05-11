@@ -82,15 +82,21 @@ def _find_project_root() -> Path:
 # ---------------------------------------------------------------------------
 
 # Map of env var name → config path (dot-separated)
+# NOTE: Order matters.  Generic / unprefixed vars are listed first so they
+# can be overridden by the more-specific ``CONSTELLATION_*`` variants which
+# come later (last-write-wins).
 _ENV_OVERRIDES: dict[str, str] = {
+    # --- unprefixed (lower priority) ---
+    "OPENAI_MODEL": "runtime.model",
+    "REGISTRY_URL": "registry.url",
+    "CONTAINER_RUNTIME": "container.runtime",
+    # --- CONSTELLATION-prefixed (higher priority) ---
     "CONSTELLATION_RUNTIME_BACKEND": "runtime.backend",
     "CONSTELLATION_RUNTIME_MODEL": "runtime.model",
-    "OPENAI_MODEL": "runtime.model",
     "CONSTELLATION_REGISTRY_URL": "registry.url",
-    "REGISTRY_URL": "registry.url",
     "CONSTELLATION_CONTAINER_RUNTIME": "container.runtime",
-    "CONTAINER_RUNTIME": "container.runtime",
     "CONSTELLATION_DATA_DIR": "data.directory",
+    # --- identity / network (no priority conflict) ---
     "AGENT_ID": "agent_id",
     "PORT": "port",
     "HOST": "host",
@@ -234,6 +240,7 @@ def build_agent_definition_from_config(
         "skills": data.get("default_skills", data.get("skills", [])),
         "tools": data.get("tools", []),
         "permissions": data.get("permissions", {}),
+        "permission_profile": data.get("permission_profile", ""),
         "runtime_backend": data.get("runtime_backend", cfg.get("runtime.backend", "connect-agent")),
         "model": data.get("model", cfg.get("runtime.model", "gpt-5-mini")),
         "config": data,

@@ -13,8 +13,9 @@ execution_mode: persistent
 #   runtime.model: gpt-5-mini
 
 tools:
-  - dispatch_agent
-  - query_registry
-  - jira_fetch
-  - design_fetch
+  - fetch_jira_ticket
+  - fetch_design
+  - dispatch_web_dev
+  - dispatch_code_review
+  - request_clarification
 port: 8030

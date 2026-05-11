@@ -99,7 +99,8 @@ async def review_quality(state: dict) -> dict:
         changed_files=", ".join(state.get("changed_files", [])) or "N/A",
         pr_diff=state.get("pr_diff", ""),
     )
-    result = runtime.run(prompt, system_prompt=QUALITY_SYSTEM, max_tokens=2048)
+    result = runtime.run(prompt, system_prompt=QUALITY_SYSTEM, max_tokens=2048,
+                         plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
 
     return {"quality_issues": issues}
@@ -119,7 +120,8 @@ async def review_security(state: dict) -> dict:
         changed_files=", ".join(state.get("changed_files", [])) or "N/A",
         pr_diff=state.get("pr_diff", ""),
     )
-    result = runtime.run(prompt, system_prompt=SECURITY_SYSTEM, max_tokens=2048)
+    result = runtime.run(prompt, system_prompt=SECURITY_SYSTEM, max_tokens=2048,
+                         plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
 
     return {"security_issues": issues}
@@ -139,7 +141,8 @@ async def review_tests(state: dict) -> dict:
         changed_files=", ".join(state.get("changed_files", [])) or "N/A",
         pr_diff=state.get("pr_diff", ""),
     )
-    result = runtime.run(prompt, system_prompt=TESTS_SYSTEM, max_tokens=2048)
+    result = runtime.run(prompt, system_prompt=TESTS_SYSTEM, max_tokens=2048,
+                         plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
 
     return {"test_issues": issues}
@@ -166,7 +169,8 @@ async def review_requirements(state: dict) -> dict:
         changed_files=", ".join(state.get("changed_files", [])) or "N/A",
         pr_diff=state.get("pr_diff", ""),
     )
-    result = runtime.run(prompt, system_prompt=REQUIREMENTS_SYSTEM, max_tokens=2048)
+    result = runtime.run(prompt, system_prompt=REQUIREMENTS_SYSTEM, max_tokens=2048,
+                         plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
 
     return {"requirement_gaps": issues}

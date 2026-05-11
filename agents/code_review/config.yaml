@@ -19,3 +19,4 @@ tools:
   - search_code
 permissions:
   scm: read
+permission_profile: read_only

@@ -91,6 +91,7 @@ async def test_jira_adapter_fetch(jira_client, jira_ticket_key):
     from framework.plugin import PluginManager
     from framework.session import InMemorySessionService
     from framework.skills import SkillsRegistry
+    from framework.task_store import InMemoryTaskStore
     from agents.jira.adapter import JiraAgentAdapter, jira_definition
 
     services = AgentServices(
@@ -102,11 +103,12 @@ async def test_jira_adapter_fetch(jira_client, jira_ticket_key):
         checkpoint_service=InMemoryCheckpointer(),
         runtime=None,
         registry_client=None,
+        task_store=InMemoryTaskStore(),
     )
     adapter = JiraAgentAdapter(
         definition=jira_definition,
         services=services,
-        jira_client=jira_client,
+        jira_provider=jira_client,
     )
 
     message = {

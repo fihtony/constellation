@@ -49,6 +49,7 @@ async def analyze_requirements(state: dict) -> dict:
         prompt=prompt,
         system_prompt=ANALYSIS_SYSTEM,
         max_tokens=2048,
+        plugin_manager=state.get("_plugin_manager"),
     )
 
     raw = result.get("raw_response", "")
@@ -146,6 +147,7 @@ async def create_plan(state: dict) -> dict:
         prompt=prompt,
         system_prompt=PLANNING_SYSTEM,
         max_tokens=2048,
+        plugin_manager=state.get("_plugin_manager"),
     )
 
     raw = result.get("raw_response", "")
@@ -287,20 +289,52 @@ async def report_success(state: dict) -> dict:
 
 
 async def escalate_to_user(state: dict) -> dict:
-    """Escalate to user after max revision attempts."""
+    """Escalate to user after max revision attempts.
+
+    On first entry, raises InterruptSignal so the workflow pauses and the
+    orchestrator can forward the question to the user.
+
+    On resume, ``_resume_value`` contains the user's guidance.  The node
+    consumes it and returns a route that feeds the user input back into the
+    revision loop so ``dispatch_dev_agent`` can apply the feedback.
+    """
+    # ------------------------------------------------------------------
+    # Resume path: _resume_value was set by WorkflowRunner.resume()
+    # ------------------------------------------------------------------
+    resume_value = state.get("_resume_value")
+    if resume_value is not None:
+        return {
+            "revision_feedback": (
+                f"User guidance after escalation: {resume_value}"
+            ),
+            "revision_count": 0,  # reset so the loop can run again
+            "route": "user_responded",
+        }
+
+    # ------------------------------------------------------------------
+    # First entry: interrupt
+    # ------------------------------------------------------------------
+    from framework.workflow import interrupt
+
     revision_count = state.get("revision_count", 0)
     review = state.get("review_result", {})
 
-    return {
-        "report_summary": (
-            f"Task requires user intervention after {revision_count} revision attempts.\n"
-            f"Last review verdict: {review.get('verdict', 'unknown')}\n"
-            f"PR: {state.get('pr_url', 'N/A')}\n"
-            f"Please review the remaining issues and provide guidance."
-        ),
-        "success": False,
-        "escalated": True,
-    }
+    question = (
+        f"Task requires user intervention after {revision_count} revision attempts.\n"
+        f"Last review verdict: {review.get('verdict', 'unknown')}\n"
+        f"PR: {state.get('pr_url', 'N/A')}\n"
+        f"Please review the remaining issues and provide guidance."
+    )
+
+    interrupt(
+        question,
+        revision_count=revision_count,
+        pr_url=state.get("pr_url", ""),
+        review_verdict=review.get("verdict", "unknown"),
+    )
+
+    # unreachable — interrupt() raises InterruptSignal
+    return {}
 
 
 # ---------------------------------------------------------------------------

@@ -26,7 +26,6 @@ from framework.plugin import PluginManager
 from framework.agent import AgentServices
 from framework.task_store import InMemoryTaskStore
 from framework.config import load_agent_config
-from framework.permissions import PermissionEngine
 
 
 # Agent registry
@@ -37,12 +36,6 @@ AGENTS = {
     "code-review": ("agents.code_review.agent", "CodeReviewAgent", "code_review_definition"),
 }
 
-# Map agent IDs to permission profiles
-_PERMISSION_PROFILES: dict[str, str] = {
-    "web-dev": "development",
-    "code-review": "read_only",
-}
-
 
 def create_services(
     agent_id: str,
@@ -50,8 +43,8 @@ def create_services(
 ) -> AgentServices:
     """Create shared services for local development.
 
-    Injects TaskStore, loads PermissionEngine from config if available,
-    and binds it to the global ToolRegistry.
+    Permission binding is handled by BaseAgent.start() via the agent's
+    permission_profile in its AgentDefinition — no manual binding here.
     """
     skills_registry = SkillsRegistry()
     if os.path.isdir(skills_dir):
@@ -61,17 +54,6 @@ def create_services(
     config = load_agent_config(agent_id)
     print(f"[{agent_id}] Config loaded: runtime={config.get('runtime.backend')}, "
           f"model={config.get('runtime.model')}")
-
-    # Bootstrap PermissionEngine from YAML profile
-    profile = _PERMISSION_PROFILES.get(agent_id)
-    if profile:
-        perm_path = os.path.join("config", "permissions", f"{profile}.yaml")
-        if os.path.isfile(perm_path):
-            engine = PermissionEngine.from_yaml(perm_path)
-            # Bind to global ToolRegistry
-            from framework.tools.registry import get_registry
-            get_registry().set_permission_engine(engine)
-            print(f"[{agent_id}] Permission profile loaded: {profile}")
 
     return AgentServices(
         session_service=InMemorySessionService(),

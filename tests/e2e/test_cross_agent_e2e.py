@@ -320,10 +320,10 @@ class TestInterruptResumeE2E:
         result = loop.run_until_complete(agent.handle_message(message))
         task_id = result.get("task", result)["id"]
 
-        # Wait — should end in COMPLETED (escalate_to_user is a normal end node now)
+        # Wait — escalate_to_user now raises InterruptSignal → INPUT_REQUIRED
         task = _wait_for_terminal(services.task_store, task_id, timeout=15)
         assert task is not None
-        # After max revisions, escalate_to_user returns with escalated=True
-        assert task.status.state in (TaskState.COMPLETED, TaskState.FAILED)
+        # After max revisions, escalate_to_user raises InterruptSignal
+        assert task.status.state in (TaskState.INPUT_REQUIRED, TaskState.COMPLETED, TaskState.FAILED)
 
         loop.close()

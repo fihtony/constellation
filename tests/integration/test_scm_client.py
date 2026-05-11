@@ -75,6 +75,7 @@ async def test_scm_adapter_repo_inspect(scm_client, scm_project_repo):
     from framework.plugin import PluginManager
     from framework.session import InMemorySessionService
     from framework.skills import SkillsRegistry
+    from framework.task_store import InMemoryTaskStore
     from agents.scm.adapter import SCMAgentAdapter, scm_definition
 
     project, repo = scm_project_repo
@@ -88,6 +89,7 @@ async def test_scm_adapter_repo_inspect(scm_client, scm_project_repo):
         checkpoint_service=InMemoryCheckpointer(),
         runtime=None,
         registry_client=None,
+        task_store=InMemoryTaskStore(),
     )
     adapter = SCMAgentAdapter(
         definition=scm_definition,

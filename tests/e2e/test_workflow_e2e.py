@@ -136,22 +136,41 @@ def test_runtime_factory_unknown_raises():
 
 @pytest.mark.asyncio
 async def test_jira_adapter_direct_mode_mock():
-    """JiraAgentAdapter dispatches correctly with a mock JiraClient."""
+    """JiraAgentAdapter dispatches correctly with a mock JiraProvider."""
     from agents.jira.adapter import JiraAgentAdapter, jira_definition
-    from framework.tools.base import ToolResult
+    from agents.jira.providers.base import JiraProvider
 
-    class MockJiraClient:
-        def fetch_ticket(self, key):
-            return {"key": key, "fields": {"summary": "Mock ticket"}}, "ok"
+    class MockJiraProvider(JiraProvider):
+        def fetch_issue(self, ticket_key):
+            return {"key": ticket_key, "fields": {"summary": "Mock ticket"}}, "ok"
 
         def get_myself(self):
             return {"displayName": "Test User"}, "ok"
+
+        def search_issues(self, jql, max_results=10, fields=None):
+            return {"issues": [], "total": 0}, "ok"
+
+        def get_transitions(self, ticket_key):
+            return [], "ok"
+
+        def transition_issue(self, ticket_key, transition_name):
+            return None, "not_found"
+
+        def add_comment(self, ticket_key, text, adf_body=None):
+            return "1", "ok"
+
+        def update_issue_fields(self, ticket_key, fields):
+            return {"ticketKey": ticket_key}, "updated"
+
+        @property
+        def backend_name(self):
+            return "mock"
 
     services = _make_services()
     adapter = JiraAgentAdapter(
         definition=jira_definition,
         services=services,
-        jira_client=MockJiraClient(),
+        jira_provider=MockJiraProvider(),
     )
 
     msg = {

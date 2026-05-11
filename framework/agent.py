@@ -55,6 +55,7 @@ class AgentDefinition:
     skills: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
     permissions: dict = field(default_factory=dict)
+    permission_profile: str = ""  # YAML profile name (e.g. "development", "read_only")
     runtime_backend: str = "connect-agent"
     model: str = "gpt-5-mini"
     workflow: Any = None  # Workflow instance or None
@@ -104,13 +105,15 @@ class BaseAgent:
         self.task_store = services.task_store
 
         self._compiled_workflow = None
+        self._permission_engine: Any = None  # Loaded in start()
 
     # -- Lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
-        """Initialize agent: compile workflow, register with Registry."""
+        """Initialize agent: compile workflow, load permissions, register with Registry."""
         if self.definition.workflow:
             self._compiled_workflow = self.definition.workflow.compile()
+        self._load_permission_engine()
         await self._register()
 
     async def stop(self) -> None:
@@ -133,9 +136,12 @@ class BaseAgent:
         ``CompiledWorkflow.resume()`` with the checkpoint service.
         Default implementation transitions the task back to WORKING and
         re-invokes the workflow from the checkpoint.
+
+        The resumed workflow result is used to build artifacts and completion
+        state, not just a hardcoded "Resumed and completed" string.
         """
+        from framework.a2a.protocol import Artifact
         from framework.errors import InterruptSignal
-        from framework.workflow import RunConfig
 
         task_store = self.services.task_store
         if task_store is None:
@@ -148,16 +154,31 @@ class BaseAgent:
         task_store.resume_task(task_id)
 
         if self._compiled_workflow and self.checkpoint_service:
-            config = RunConfig(
-                session_id=task_id,
-                thread_id=task_id,
-                checkpoint_service=self.checkpoint_service,
-                event_store=self.event_store,
-                plugin_manager=self.plugin_manager,
-            )
+            config = self._build_run_config(task_id)
             try:
                 result = await self._compiled_workflow.resume(config, resume_value)
-                task_store.complete_task(task_id, message="Resumed and completed")
+                # Build artifacts from the resumed workflow result
+                summary = ""
+                if isinstance(result, dict):
+                    summary = (
+                        result.get("report_summary")
+                        or result.get("implementation_summary")
+                        or result.get("summary")
+                        or "Resumed and completed"
+                    )
+                artifacts = [
+                    Artifact(
+                        name=f"{self.definition.agent_id}-resumed",
+                        artifact_type="text/plain",
+                        parts=[{"text": summary}],
+                        metadata={
+                            "agentId": self.definition.agent_id,
+                            "taskId": task_id,
+                            "resumed": True,
+                        },
+                    )
+                ]
+                task_store.complete_task(task_id, artifacts=artifacts, message=summary)
                 return task_store.get_task_dict(task_id)
             except InterruptSignal as sig:
                 task_store.pause_task(
@@ -173,6 +194,69 @@ class BaseAgent:
         return task_store.get_task_dict(task_id)
 
     # -- Internal ------------------------------------------------------------
+
+    def _load_permission_engine(self) -> None:
+        """Load PermissionEngine from the agent's permission_profile and bind
+        it to the global ToolRegistry so all tool calls are gated.
+
+        The profile name maps to ``config/permissions/<profile>.yaml``.
+        Also accepts a ``permissions`` dict for inline permission sets.
+        """
+        profile = self.definition.permission_profile
+        perms_dict = self.definition.permissions
+
+        if not profile and not perms_dict:
+            return
+
+        from framework.permissions import PermissionEngine
+
+        engine: PermissionEngine | None = None
+
+        if profile:
+            import os
+            from pathlib import Path
+
+            # Look for the YAML file relative to project root
+            root = Path(__file__).resolve().parent.parent
+            perm_path = root / "config" / "permissions" / f"{profile}.yaml"
+            if perm_path.is_file():
+                engine = PermissionEngine.from_yaml(str(perm_path))
+                print(f"[{self.definition.agent_id}] Permission profile loaded: {profile}")
+
+        if engine is None and perms_dict:
+            from framework.permissions import PermissionEngine
+            engine = PermissionEngine.from_dict(perms_dict)
+            print(f"[{self.definition.agent_id}] Permission engine loaded from definition")
+
+        if engine:
+            self._permission_engine = engine
+            from framework.tools.registry import get_registry
+            get_registry().set_permission_engine(engine)
+
+    def _build_run_config(
+        self,
+        task_id: str,
+        *,
+        max_steps: int = 50,
+        timeout_seconds: int = 900,
+    ) -> "Any":
+        """Build a standard RunConfig for workflow invocation.
+
+        Centralizes session/checkpoint/event/plugin/permission wiring so
+        agent subclasses don't duplicate this boilerplate.
+        """
+        from framework.workflow import RunConfig
+
+        return RunConfig(
+            session_id=task_id,
+            thread_id=task_id,
+            checkpoint_service=self.checkpoint_service,
+            event_store=self.event_store,
+            plugin_manager=self.plugin_manager,
+            permission_engine=self._permission_engine,
+            max_steps=max_steps,
+            timeout_seconds=timeout_seconds,
+        )
 
     async def _register(self) -> None:
         """Register with the Capability Registry (best-effort)."""
