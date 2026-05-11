@@ -170,3 +170,90 @@ class A2AClient:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=self._timeout) as resp:
             return json.loads(resp.read())
+
+
+# ---------------------------------------------------------------------------
+# Synchronous convenience helper for use inside ToolRegistry.execute_sync()
+# ---------------------------------------------------------------------------
+
+def dispatch_sync(
+    url: str,
+    capability: str,
+    message_parts: list[dict],
+    metadata: dict | None = None,
+    *,
+    timeout: int = 300,
+    poll_interval: int = 2,
+) -> dict:
+    """Send an A2A task synchronously and block until it completes.
+
+    Designed for use inside ``BaseTool.execute_sync()`` where async code
+    cannot be awaited.  Uses ``urllib`` (stdlib) — no event loop required.
+
+    Parameters
+    ----------
+    url:
+        Base URL of the target agent (e.g. ``http://team-lead:8030``).
+    capability:
+        Skill ID to set in ``metadata.requestedCapability``.
+    message_parts:
+        List of message part dicts (e.g. ``[{"text": "..."}]``).
+    metadata:
+        Extra metadata fields merged with requestedCapability.
+    timeout:
+        Maximum seconds to wait for task completion.
+    poll_interval:
+        Seconds between polling GET /tasks/{id}.
+
+    Returns
+    -------
+    dict
+        The completed task dict (``task.artifacts`` contains results).
+    """
+    import uuid
+
+    meta = {**(metadata or {}), "requestedCapability": capability}
+    envelope = {
+        "message": {
+            "messageId": str(uuid.uuid4()),
+            "role": "ROLE_USER",
+            "parts": message_parts,
+            "metadata": meta,
+        },
+        "configuration": {"returnImmediately": True},
+    }
+
+    data = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{url.rstrip('/')}/message:send",
+        data=data,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        response = json.loads(resp.read())
+
+    task_data = response.get("task", response)
+    task_id = task_data.get("id", "")
+    if not task_id:
+        return response
+
+    # Poll until terminal state
+    poll_url = f"{url.rstrip('/')}/tasks/{task_id}"
+    deadline = time.time() + timeout
+    terminal = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELLED"}
+
+    while time.time() < deadline:
+        get_req = urllib.request.Request(poll_url, method="GET")
+        try:
+            with urllib.request.urlopen(get_req, timeout=30) as resp:
+                result = json.loads(resp.read())
+            state = result.get("task", result).get("status", {}).get("state", "")
+            if state in terminal:
+                return result
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+
+    raise TimeoutError(f"Task {task_id} did not complete within {timeout}s")
+

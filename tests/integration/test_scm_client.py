@@ -92,7 +92,6 @@ async def test_scm_adapter_repo_inspect(scm_client, scm_project_repo):
     adapter = SCMAgentAdapter(
         definition=scm_definition,
         services=services,
-        dispatch_mode="direct",
         scm_client=scm_client,
     )
 

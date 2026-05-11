@@ -1,13 +1,12 @@
-"""Jira Agent adapter — boundary agent proxy for v2 framework.
+"""Jira Agent adapter — boundary agent for Jira Cloud REST API v3.
 
-Supports two dispatch modes:
-  direct  (default) — calls JiraClient directly (fast, no HTTP hop, ideal for
-                       tests and in-process execution)
-  a2a               — forwards via A2AClient to the v1 Jira Agent HTTP service
+Dispatches capabilities directly via JiraClient (in-process).
+Inject a custom ``jira_client`` for testing.
 """
 from __future__ import annotations
 
 import json
+import os
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 
@@ -23,37 +22,27 @@ jira_definition = AgentDefinition(
 
 
 class JiraAgentAdapter(BaseAgent):
-    """Proxy adapter for the Jira boundary service.
+    """Proxy adapter for Jira Cloud REST API v3.
 
     Parameters
     ----------
-    existing_agent_url:
-        URL of the running v1 Jira Agent HTTP service (a2a mode).
-    dispatch_mode:
-        ``direct`` — call JiraClient in-process.
-        ``a2a``    — forward via A2AClient.
     jira_client:
-        Optional pre-constructed JiraClient (direct mode only).
-        If None, constructed from JIRA_BASE_URL / JIRA_TOKEN / JIRA_EMAIL.
+        Optional pre-constructed JiraClient (for testing / DI).
+        Falls back to JIRA_BASE_URL / JIRA_TOKEN / JIRA_EMAIL env vars.
     """
 
     def __init__(
         self,
         definition: AgentDefinition,
         services: AgentServices,
-        existing_agent_url: str = "http://jira:8010",
-        dispatch_mode: str = "direct",
         jira_client=None,
     ):
         super().__init__(definition, services)
-        self._existing_agent_url = existing_agent_url
-        self._dispatch_mode = dispatch_mode
         self._jira_client = jira_client
 
     def _get_client(self):
         if self._jira_client:
             return self._jira_client
-        import os
         from agents.jira.client import JiraClient
         return JiraClient(
             base_url=os.environ.get("JIRA_BASE_URL", ""),
@@ -62,32 +51,33 @@ class JiraAgentAdapter(BaseAgent):
         )
 
     async def handle_message(self, message: dict) -> dict:
-        """Dispatch a Jira task based on the requested capability."""
-        from framework.a2a.protocol import Artifact, Task, TaskState, TaskStatus
+        from framework.a2a.protocol import Artifact, TaskState, TaskStatus
 
-        task = Task()
+        task_store = self.services.task_store
         capability = (message.get("metadata") or {}).get("requestedCapability", "")
         parts = message.get("parts") or []
         text = next((p.get("text", "") for p in parts if p.get("text")), "")
+        meta = message.get("metadata") or {}
 
-        if self._dispatch_mode == "a2a":
-            return await self._forward_a2a(message, task)
+        task = task_store.create_task(
+            agent_id=self.definition.agent_id,
+            metadata={"capability": capability},
+        )
 
-        result = self._dispatch_direct(capability, text, message)
-        task.status = TaskStatus(state=TaskState.COMPLETED)
-        task.artifacts = [Artifact(
+        result = self._dispatch(capability, text, meta)
+        artifacts = [Artifact(
             name="jira-result",
             artifact_type="application/json",
             parts=[{"text": json.dumps(result, ensure_ascii=False)}],
             metadata={"agentId": "jira", "capability": capability, "taskId": task.id},
         )]
-        return task.to_dict()
+        task_store.complete_task(task.id, artifacts=artifacts)
+        return task_store.get_task_dict(task.id)
 
-    def _dispatch_direct(self, capability: str, text: str, message: dict) -> dict:
+    def _dispatch(self, capability: str, text: str, meta: dict) -> dict:
         client = self._get_client()
-        meta = message.get("metadata") or {}
 
-        if capability in ("jira.ticket.fetch", "jira.issue.fetch"):
+        if capability in ("jira.ticket.fetch", "jira.ticket.get"):
             key = meta.get("ticketKey") or text.strip()
             data, status = client.fetch_ticket(key)
             return {"ticket": data, "status": status}
@@ -103,35 +93,12 @@ class JiraAgentAdapter(BaseAgent):
             data, status = client.add_comment(key, comment)
             return {"comment": data, "status": status}
 
-        if capability == "jira.myself":
-            data, status = client.get_myself()
-            return {"user": data, "status": status}
+        if capability == "jira.transitions.list":
+            key = meta.get("ticketKey") or text.strip()
+            data, status = client.get_transitions(key)
+            return {"transitions": data, "status": status}
 
-        if text.strip():
-            data, status = client.fetch_ticket(text.strip())
-            return {"ticket": data, "status": status}
-
-        return {"error": f"Unknown Jira capability: {capability}"}
-
-    async def _forward_a2a(self, message: dict, task) -> dict:
-        from framework.a2a.client import A2AClient
-        from framework.a2a.protocol import Artifact, TaskState, TaskStatus
-        client = A2AClient()
-        try:
-            result = await client.dispatch(url=self._existing_agent_url, message=message, wait=True)
-            task.status = TaskStatus(state=TaskState.COMPLETED)
-            # Re-wrap raw artifact dicts as Artifact objects
-            raw = (result.get("task") or result).get("artifacts", [])
-            task.artifacts = [
-                Artifact(name=a.get("name", ""), artifact_type=a.get("artifactType", "text/plain"),
-                         parts=a.get("parts", []), metadata=a.get("metadata", {}))
-                for a in raw
-            ]
-        except Exception as exc:
-            task.status = TaskStatus(state=TaskState.FAILED)
-            task.artifacts = [Artifact(name="error", artifact_type="text/plain",
-                                       parts=[{"text": str(exc)}], metadata={"agentId": "jira"})]
-        return task.to_dict()
+        return {"error": f"Unknown Jira capability: {capability!r}"}
 
     async def get_task(self, task_id: str) -> dict:
-        return {"task": {"id": task_id, "status": {"state": "TASK_STATE_WORKING"}}}
+        return self.services.task_store.get_task_dict(task_id)

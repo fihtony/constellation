@@ -1,0 +1,347 @@
+"""Team Lead Agent tools — Python implementations called by the LLM via ReAct.
+
+The LLM decides when and in what order to call these tools.  No predefined
+workflow orchestration — intelligence comes from the LLM + instructions.
+"""
+from __future__ import annotations
+
+import json
+import os
+from typing import Any
+
+from framework.tools.base import BaseTool, ToolResult
+from framework.tools.registry import get_registry
+
+
+# ---------------------------------------------------------------------------
+# Tool: fetch_jira_ticket
+# ---------------------------------------------------------------------------
+
+class FetchJiraTicket(BaseTool):
+    """Fetch a Jira ticket for context before planning."""
+
+    name = "fetch_jira_ticket"
+    description = "Fetch the details of a Jira ticket (summary, description, status, labels)."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "ticket_key": {
+                "type": "string",
+                "description": "Jira ticket key, e.g. PROJ-123.",
+            }
+        },
+        "required": ["ticket_key"],
+    }
+
+    def execute_sync(self, ticket_key: str = "") -> ToolResult:
+        jira_url = os.environ.get("JIRA_AGENT_URL", "http://jira:8010")
+        try:
+            from framework.a2a.client import dispatch_sync
+            result = dispatch_sync(
+                url=jira_url,
+                capability="jira.ticket.fetch",
+                message_parts=[{"text": ticket_key}],
+                metadata={"ticketKey": ticket_key},
+            )
+            artifacts = result.get("task", result).get("artifacts", [])
+            payload = _first_artifact_json(artifacts)
+            return ToolResult(output=json.dumps(payload))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"error": str(exc), "ticketKey": ticket_key}))
+
+
+# ---------------------------------------------------------------------------
+# Tool: fetch_design
+# ---------------------------------------------------------------------------
+
+class FetchDesign(BaseTool):
+    """Fetch design context from Figma or Google Stitch."""
+
+    name = "fetch_design"
+    description = (
+        "Fetch design specification from a Figma URL or a Google Stitch project. "
+        "Provide either figma_url or stitch_project_id."
+    )
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "figma_url": {
+                "type": "string",
+                "description": "Full Figma file URL.",
+            },
+            "stitch_project_id": {
+                "type": "string",
+                "description": "Google Stitch project ID.",
+            },
+            "screen_name": {
+                "type": "string",
+                "description": "Screen name for Stitch (optional).",
+            },
+        },
+        "required": [],
+    }
+
+    def execute_sync(
+        self,
+        figma_url: str = "",
+        stitch_project_id: str = "",
+        screen_name: str = "",
+    ) -> ToolResult:
+        ui_url = os.environ.get("UI_DESIGN_AGENT_URL", "http://ui-design:8040")
+        try:
+            from framework.a2a.client import dispatch_sync
+            if figma_url:
+                capability = "figma.file.fetch"
+                meta: dict[str, Any] = {"figmaUrl": figma_url}
+                text = figma_url
+            elif stitch_project_id:
+                capability = "stitch.screen.fetch" if screen_name else "stitch.screens.list"
+                meta = {
+                    "stitchProjectId": stitch_project_id,
+                    "screenName": screen_name,
+                }
+                text = stitch_project_id
+            else:
+                return ToolResult(output=json.dumps({"error": "No design URL or project ID provided"}))
+
+            result = dispatch_sync(
+                url=ui_url,
+                capability=capability,
+                message_parts=[{"text": text}],
+                metadata=meta,
+            )
+            artifacts = result.get("task", result).get("artifacts", [])
+            payload = _first_artifact_json(artifacts)
+            return ToolResult(output=json.dumps(payload))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"error": str(exc)}))
+
+
+# ---------------------------------------------------------------------------
+# Tool: dispatch_web_dev
+# ---------------------------------------------------------------------------
+
+class DispatchWebDev(BaseTool):
+    """Dispatch a web development task to the Web Dev Agent."""
+
+    name = "dispatch_web_dev"
+    description = (
+        "Dispatch a web development implementation task to the Web Dev Agent. "
+        "Include all gathered context: Jira ticket details, design spec, repo URL."
+    )
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "task_description": {
+                "type": "string",
+                "description": "Full implementation task description with context.",
+            },
+            "jira_context": {
+                "type": "object",
+                "description": "Jira ticket data (from fetch_jira_ticket). Optional.",
+            },
+            "design_context": {
+                "type": "object",
+                "description": "Design spec data (from fetch_design). Optional.",
+            },
+            "repo_url": {
+                "type": "string",
+                "description": "Git repository URL. Optional.",
+            },
+            "revision_feedback": {
+                "type": "string",
+                "description": "Code review rejection reason for revision. Optional.",
+            },
+        },
+        "required": ["task_description"],
+    }
+
+    def execute_sync(
+        self,
+        task_description: str = "",
+        jira_context: dict | None = None,
+        design_context: dict | None = None,
+        repo_url: str = "",
+        revision_feedback: str = "",
+    ) -> ToolResult:
+        web_dev_url = os.environ.get("WEB_DEV_AGENT_URL", "http://web-dev:8050")
+        meta: dict[str, Any] = {}
+        if jira_context:
+            meta["jiraContext"] = jira_context
+        if design_context:
+            meta["designContext"] = design_context
+        if repo_url:
+            meta["repoUrl"] = repo_url
+        if revision_feedback:
+            meta["revisionFeedback"] = revision_feedback
+
+        try:
+            from framework.a2a.client import dispatch_sync
+            result = dispatch_sync(
+                url=web_dev_url,
+                capability="web-dev.task.execute",
+                message_parts=[{"text": task_description}],
+                metadata=meta,
+                timeout=600,
+            )
+            task = result.get("task", result)
+            artifacts = task.get("artifacts", [])
+            summary = _extract_text(artifacts) or "Dev task completed."
+            pr_url = _find_metadata(artifacts, "prUrl")
+            branch = _find_metadata(artifacts, "branch")
+            return ToolResult(output=json.dumps({
+                "status": "completed",
+                "summary": summary,
+                "prUrl": pr_url,
+                "branch": branch,
+            }))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"status": "error", "message": str(exc)}))
+
+
+# ---------------------------------------------------------------------------
+# Tool: dispatch_code_review
+# ---------------------------------------------------------------------------
+
+class DispatchCodeReview(BaseTool):
+    """Dispatch the dev agent output to the Code Review Agent."""
+
+    name = "dispatch_code_review"
+    description = (
+        "Send the dev agent's output (PR URL or diff) to the Code Review Agent "
+        "for quality, security, and requirements validation."
+    )
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "pr_url": {
+                "type": "string",
+                "description": "Pull request URL to review.",
+            },
+            "diff_summary": {
+                "type": "string",
+                "description": "Summary of the changes made.",
+            },
+            "requirements": {
+                "type": "string",
+                "description": "Original requirements to check compliance against.",
+            },
+        },
+        "required": [],
+    }
+
+    def execute_sync(
+        self,
+        pr_url: str = "",
+        diff_summary: str = "",
+        requirements: str = "",
+    ) -> ToolResult:
+        review_url = os.environ.get("CODE_REVIEW_AGENT_URL", "http://code-review:8050")
+        meta: dict[str, Any] = {}
+        if pr_url:
+            meta["prUrl"] = pr_url
+        if requirements:
+            meta["requirements"] = requirements
+
+        try:
+            from framework.a2a.client import dispatch_sync
+            result = dispatch_sync(
+                url=review_url,
+                capability="review.code.check",
+                message_parts=[{"text": diff_summary or pr_url}],
+                metadata=meta,
+                timeout=300,
+            )
+            artifacts = result.get("task", result).get("artifacts", [])
+            payload = _first_artifact_json(artifacts) or {"verdict": "unknown"}
+            return ToolResult(output=json.dumps(payload))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"verdict": "error", "message": str(exc)}))
+
+
+# ---------------------------------------------------------------------------
+# Tool: request_clarification
+# ---------------------------------------------------------------------------
+
+class RequestClarification(BaseTool):
+    """Ask the user for clarification when the request is ambiguous."""
+
+    name = "request_clarification"
+    description = (
+        "Ask the user a question to clarify missing or ambiguous information "
+        "before proceeding.  Returns the user's answer."
+    )
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The question to ask the user.",
+            }
+        },
+        "required": ["question"],
+    }
+
+    def execute_sync(self, question: str = "") -> ToolResult:
+        # In production this triggers INPUT_REQUIRED via the workflow interrupt mechanism.
+        # For now, signal the LLM that user input is needed.
+        return ToolResult(output=json.dumps({
+            "status": "input_required",
+            "question": question,
+            "instruction": (
+                "Pause and present this question to the user before continuing."
+            ),
+        }))
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+_TOOLS = [
+    FetchJiraTicket(),
+    FetchDesign(),
+    DispatchWebDev(),
+    DispatchCodeReview(),
+    RequestClarification(),
+]
+TOOL_NAMES = [t.name for t in _TOOLS]
+
+
+def register_team_lead_tools() -> None:
+    """Register Team Lead tools into the global ToolRegistry (idempotent)."""
+    registry = get_registry()
+    existing = {s["function"]["name"] for s in registry.list_schemas()}
+    for tool in _TOOLS:
+        if tool.name not in existing:
+            registry.register(tool)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _extract_text(artifacts: list[dict]) -> str:
+    for art in artifacts:
+        for part in art.get("parts", []):
+            if "text" in part:
+                return part["text"]
+    return ""
+
+
+def _first_artifact_json(artifacts: list[dict]) -> dict:
+    text = _extract_text(artifacts)
+    if text:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {"raw": text}
+    return {}
+
+
+def _find_metadata(artifacts: list[dict], key: str) -> str:
+    for art in artifacts:
+        val = art.get("metadata", {}).get(key)
+        if val:
+            return val
+    return ""

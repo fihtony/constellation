@@ -1,9 +1,17 @@
 """Web Dev Agent — full-stack development execution.
 
-Clones a repository, creates a branch, implements changes, runs tests,
-fixes failures, creates a PR, and reports results back to Team Lead.
+Architecture: **Graph outside, ReAct inside**.
+
+Uses a declarative graph workflow for the macro lifecycle:
+  setup_workspace → analyze_task → implement_changes → run_tests → create_pr → report
+
+Individual nodes (especially implement_changes and fix_tests) use bounded
+ReAct via the runtime for open-ended code generation and repair.
 """
 from __future__ import annotations
+
+import json
+import threading
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 from framework.workflow import Workflow, START, END
@@ -62,23 +70,30 @@ web_dev_definition = AgentDefinition(
 # ---------------------------------------------------------------------------
 
 class WebDevAgent(BaseAgent):
-    """Web Dev Agent implementation."""
+    """Web Dev Agent implementation with graph-first lifecycle."""
 
     async def handle_message(self, message: dict) -> dict:
-        from framework.a2a.protocol import Task, TaskState
-
-        session = await self.session_service.create(self.definition.agent_id)
-        task = Task(task_id=session.session_id, state=TaskState.WORKING)
+        from framework.a2a.protocol import Artifact
+        from framework.workflow import RunConfig
 
         msg = message.get("message", message)
         parts = msg.get("parts", [])
         user_text = parts[0].get("text", "") if parts else ""
         metadata = msg.get("metadata", {})
 
+        # Create task via TaskStore
+        task_store = self.services.task_store
+        task = task_store.create_task(
+            agent_id=self.definition.agent_id,
+            metadata={
+                "orchestratorTaskId": metadata.get("orchestratorTaskId", ""),
+                "orchestratorCallbackUrl": metadata.get("orchestratorCallbackUrl", ""),
+            },
+        )
+
         state = {
-            "_task_id": task.task_id,
-            "_session_id": session.session_id,
-            "_runtime": self.runtime,
+            "_task_id": task.id,
+            "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,
             "user_request": user_text,
             "repo_url": metadata.get("repoUrl", ""),
@@ -92,36 +107,91 @@ class WebDevAgent(BaseAgent):
             "metadata": metadata,
         }
 
-        import threading
-
-        def _run():
+        def _run() -> None:
             import asyncio
+
             loop = asyncio.new_event_loop()
             try:
-                result = loop.run_until_complete(
-                    self._compiled_workflow.invoke(state)
+                config = RunConfig(
+                    session_id=task.id,
+                    thread_id=task.id,
+                    checkpoint_service=self.checkpoint_service,
+                    event_store=self.event_store,
+                    plugin_manager=self.plugin_manager,
+                    max_steps=30,
+                    timeout_seconds=600,
                 )
-                task.state = TaskState.COMPLETED
-                task.artifacts = [{
-                    "name": "web-dev-result",
-                    "artifactType": "text/plain",
-                    "parts": [{"text": result.get("implementation_summary", "Done.")}],
-                    "metadata": {
-                        "agentId": self.definition.agent_id,
-                        "prUrl": result.get("pr_url", ""),
-                        "branch": result.get("branch_name", ""),
-                    },
-                }]
+                result = loop.run_until_complete(
+                    self._compiled_workflow.invoke(state, config)
+                )
+                artifacts = [
+                    Artifact(
+                        name="web-dev-result",
+                        artifact_type="text/plain",
+                        parts=[{"text": result.get("implementation_summary", "Done.")}],
+                        metadata={
+                            "agentId": self.definition.agent_id,
+                            "prUrl": result.get("pr_url", ""),
+                            "branch": result.get("branch_name", ""),
+                        },
+                    )
+                ]
+                task_store.complete_task(task.id, artifacts=artifacts)
+
+                # Send callback if URL provided
+                callback_url = metadata.get("orchestratorCallbackUrl", "")
+                if callback_url:
+                    _send_callback(
+                        callback_url, task.id, result, self.definition.agent_id
+                    )
             except Exception as e:
-                task.state = TaskState.FAILED
-                task.status_message = str(e)
+                task_store.fail_task(task.id, str(e))
             finally:
                 loop.close()
 
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()
 
-        return task.to_dict()
+        return task_store.get_task_dict(task.id)
 
     async def get_task(self, task_id: str) -> dict:
-        return {"task": {"id": task_id, "status": {"state": "TASK_STATE_WORKING"}}}
+        """Return real task state from TaskStore."""
+        return self.services.task_store.get_task_dict(task_id)
+
+
+def _send_callback(
+    callback_url: str, task_id: str, result: dict, agent_id: str
+) -> None:
+    """POST completion callback to orchestrator (best-effort)."""
+    from urllib.request import Request, urlopen
+
+    payload = {
+        "downstreamTaskId": task_id,
+        "state": "TASK_STATE_COMPLETED",
+        "statusMessage": result.get("implementation_summary", ""),
+        "artifacts": [
+            {
+                "name": "web-dev-result",
+                "artifactType": "text/plain",
+                "parts": [{"text": result.get("implementation_summary", "")}],
+                "metadata": {
+                    "agentId": agent_id,
+                    "prUrl": result.get("pr_url", ""),
+                    "branch": result.get("branch_name", ""),
+                },
+            }
+        ],
+        "agentId": agent_id,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = Request(
+        callback_url,
+        data=data,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=10):
+            pass
+    except Exception as exc:
+        print(f"[web-dev] Callback failed: {exc}")

@@ -1,19 +1,19 @@
-"""SCM Agent adapter — boundary agent proxy for v2 framework.
+"""SCM Agent adapter — boundary agent for Bitbucket Server REST 1.0.
 
-Supports two dispatch modes:
-  direct  (default) — calls BitbucketClient directly (fast, in-process)
-  a2a               — forwards via A2AClient to the v1 SCM Agent HTTP service
+Dispatches capabilities directly via BitbucketClient (in-process).
+Inject a custom ``scm_client`` for testing.
 """
 from __future__ import annotations
 
 import json
+import os
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 
 scm_definition = AgentDefinition(
     agent_id="scm",
     name="SCM Agent",
-    description="Boundary adapter: repo inspect, branch list, PR operations",
+    description="Boundary adapter: repo inspect, branch list/create, PR operations",
     mode=AgentMode.SINGLE_TURN,
     execution_mode=ExecutionMode.PERSISTENT,
     workflow=None,
@@ -22,37 +22,27 @@ scm_definition = AgentDefinition(
 
 
 class SCMAgentAdapter(BaseAgent):
-    """Proxy adapter for the SCM boundary service.
+    """Proxy adapter for Bitbucket Server REST API 1.0.
 
     Parameters
     ----------
-    existing_agent_url:
-        URL of the running v1 SCM Agent (a2a mode).
-    dispatch_mode:
-        ``direct`` — call BitbucketClient in-process.
-        ``a2a``    — forward via A2AClient.
     scm_client:
-        Optional pre-constructed BitbucketClient (direct mode only).
-        If None, constructed from SCM_BASE_URL / SCM_TOKEN / SCM_USERNAME env vars.
+        Optional pre-constructed BitbucketClient (for testing / DI).
+        Falls back to SCM_BASE_URL / SCM_TOKEN / SCM_USERNAME env vars.
     """
 
     def __init__(
         self,
         definition: AgentDefinition,
         services: AgentServices,
-        existing_agent_url: str = "http://scm:8020",
-        dispatch_mode: str = "direct",
         scm_client=None,
     ):
         super().__init__(definition, services)
-        self._existing_agent_url = existing_agent_url
-        self._dispatch_mode = dispatch_mode
         self._scm_client = scm_client
 
     def _get_client(self):
         if self._scm_client:
             return self._scm_client
-        import os
         from agents.scm.client import BitbucketClient
         return BitbucketClient(
             base_url=os.environ.get("SCM_BASE_URL", ""),
@@ -61,31 +51,38 @@ class SCMAgentAdapter(BaseAgent):
         )
 
     async def handle_message(self, message: dict) -> dict:
-        from framework.a2a.protocol import Artifact, Task, TaskState, TaskStatus
+        from framework.a2a.protocol import Artifact, TaskState, TaskStatus
 
-        task = Task()
+        task_store = self.services.task_store
         capability = (message.get("metadata") or {}).get("requestedCapability", "")
         parts = message.get("parts") or []
         text = next((p.get("text", "") for p in parts if p.get("text")), "")
 
-        if self._dispatch_mode == "a2a":
-            return await self._forward_a2a(message, task)
+        task = task_store.create_task(
+            agent_id=self.definition.agent_id,
+            metadata={"capability": capability},
+        )
 
-        result = self._dispatch_direct(capability, text, message)
-        task.status = TaskStatus(state=TaskState.COMPLETED)
-        task.artifacts = [Artifact(
+        result = self._dispatch(capability, text, message)
+        artifacts = [Artifact(
             name="scm-result",
             artifact_type="application/json",
             parts=[{"text": json.dumps(result, ensure_ascii=False)}],
             metadata={"agentId": "scm", "capability": capability, "taskId": task.id},
         )]
-        return task.to_dict()
+        task_store.complete_task(task.id, artifacts=artifacts)
+        return task_store.get_task_dict(task.id)
 
-    def _dispatch_direct(self, capability: str, text: str, message: dict) -> dict:
+    def _dispatch(self, capability: str, text: str, message: dict) -> dict:
         client = self._get_client()
         meta = message.get("metadata") or {}
-        project = meta.get("project", "")
-        repo = meta.get("repo", "")
+        project = meta.get("project") or ""
+        repo = meta.get("repo") or ""
+
+        if not project or not repo:
+            if "/" in text:
+                parts = text.strip().split("/", 1)
+                project, repo = parts[0], parts[1]
 
         if capability in ("scm.repo.inspect", "scm.repo.get"):
             data, status = client.get_repo(project, repo)
@@ -96,9 +93,9 @@ class SCMAgentAdapter(BaseAgent):
             return {"branches": data, "status": status}
 
         if capability == "scm.branch.create":
-            branch = meta.get("branch", "")
-            from_ref = meta.get("fromRef", "main")
-            data, status = client.create_branch(project, repo, branch, from_ref)
+            branch_name = meta.get("branchName") or meta.get("branch") or ""
+            from_branch = meta.get("fromBranch") or meta.get("fromRef") or "main"
+            data, status = client.create_branch(project, repo, branch_name, from_branch)
             return {"branch": data, "status": status}
 
         if capability == "scm.pr.list":
@@ -106,35 +103,14 @@ class SCMAgentAdapter(BaseAgent):
             return {"prs": data, "status": status}
 
         if capability == "scm.pr.create":
-            data, status = client.create_pr(
-                project, repo,
-                from_branch=meta.get("fromBranch", ""),
-                to_branch=meta.get("toBranch", "main"),
-                title=meta.get("title", ""),
-                description=meta.get("description", ""),
-            )
+            title = meta.get("title") or text.strip()
+            source = meta.get("sourceBranch") or meta.get("fromBranch") or ""
+            target = meta.get("targetBranch") or meta.get("toBranch") or "main"
+            description = meta.get("description") or ""
+            data, status = client.create_pr(project, repo, title, source, target, description)
             return {"pr": data, "status": status}
 
-        return {"error": f"Unknown SCM capability: {capability}"}
-
-    async def _forward_a2a(self, message: dict, task) -> dict:
-        from framework.a2a.client import A2AClient
-        from framework.a2a.protocol import Artifact, TaskState, TaskStatus
-        client = A2AClient()
-        try:
-            result = await client.dispatch(url=self._existing_agent_url, message=message, wait=True)
-            task.status = TaskStatus(state=TaskState.COMPLETED)
-            raw = (result.get("task") or result).get("artifacts", [])
-            task.artifacts = [
-                Artifact(name=a.get("name", ""), artifact_type=a.get("artifactType", "text/plain"),
-                         parts=a.get("parts", []), metadata=a.get("metadata", {}))
-                for a in raw
-            ]
-        except Exception as exc:
-            task.status = TaskStatus(state=TaskState.FAILED)
-            task.artifacts = [Artifact(name="error", artifact_type="text/plain",
-                                       parts=[{"text": str(exc)}], metadata={"agentId": "scm"})]
-        return task.to_dict()
+        return {"error": f"Unknown SCM capability: {capability!r}"}
 
     async def get_task(self, task_id: str) -> dict:
-        return {"task": {"id": task_id, "status": {"state": "TASK_STATE_WORKING"}}}
+        return self.services.task_store.get_task_dict(task_id)

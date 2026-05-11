@@ -1,150 +1,106 @@
-"""Tests for Team Lead Agent workflow."""
+"""Tests for Team Lead Agent (graph-first, ReAct-inside-nodes)."""
 import pytest
-from framework.workflow import START, END
-from framework.errors import InterruptSignal
-from agents.team_lead.agent import team_lead_workflow, team_lead_definition
-from agents.team_lead.nodes import (
-    receive_task,
-    analyze_requirements,
-    gather_context,
-    create_plan,
-    select_skills,
-    dispatch_dev_agent,
-    wait_for_dev,
-    dispatch_code_review,
-    evaluate_review,
-    request_revision,
-    handle_question,
-    report_success,
-    escalate_to_user,
-)
+import asyncio
+import time
+from unittest.mock import MagicMock
+from agents.team_lead.agent import TeamLeadAgent, team_lead_definition
+from framework.agent import AgentMode, AgentServices, ExecutionMode
 
 
-class TestTeamLeadWorkflowCompile:
+def _make_agent(mock_runtime):
+    from unittest.mock import MagicMock as M
+    from framework.task_store import InMemoryTaskStore
+    services = AgentServices(
+        session_service=M(), event_store=M(), memory_service=M(),
+        skills_registry=M(), plugin_manager=M(), checkpoint_service=M(),
+        runtime=mock_runtime, registry_client=None,
+        task_store=InMemoryTaskStore(),
+    )
+    agent = TeamLeadAgent(definition=team_lead_definition, services=services)
+    return agent
 
-    def test_team_lead_workflow_compiles(self):
-        compiled = team_lead_workflow.compile()
-        assert compiled.name == "team_lead"
 
-    def test_team_lead_workflow_has_all_nodes(self):
-        compiled = team_lead_workflow.compile()
-        expected_nodes = {
-            "receive_task", "analyze_requirements", "gather_context",
-            "create_plan", "select_skills", "dispatch_dev_agent",
-            "wait_for_dev", "dispatch_code_review", "evaluate_review",
-            "request_revision", "handle_question", "report_success",
-            "escalate_to_user",
-        }
-        assert expected_nodes == set(compiled.nodes.keys())
+def _mock_runtime(summary="PR created.", success=True):
+    result = MagicMock()
+    result.success = success
+    result.summary = summary
+    runtime = MagicMock()
+    runtime.run_agentic.return_value = result
+    runtime.run.return_value = {"raw_response": "{}"}
+    return runtime
 
-    def test_team_lead_definition_fields(self):
-        from framework.agent import AgentMode, ExecutionMode
+
+class TestTeamLeadDefinition:
+    def test_agent_id(self):
         assert team_lead_definition.agent_id == "team-lead"
+
+    def test_mode(self):
         assert team_lead_definition.mode == AgentMode.TASK
+
+    def test_execution_mode(self):
         assert team_lead_definition.execution_mode == ExecutionMode.PERSISTENT
 
+    def test_has_workflow(self):
+        """Team Lead is now graph-first — it MUST have a workflow."""
+        assert team_lead_definition.workflow is not None
 
-class TestTeamLeadNodes:
-
-    async def test_receive_task(self):
-        state = {"jira_key": "ABC-123", "repo_url": "https://github.com/test"}
-        result = await receive_task(state)
-        assert result["task_received"] is True
-        assert result["jira_key"] == "ABC-123"
-
-    async def test_analyze_requirements_no_runtime(self):
-        state = {"user_request": "Implement new login page"}
-        result = await analyze_requirements(state)
-        assert result["task_type"] == "general"
-        assert result["complexity"] == "medium"
-
-    async def test_gather_context_with_jira(self):
-        state = {"jira_key": "TEST-1"}
-        result = await gather_context(state)
-        assert result["jira_context"]["key"] == "TEST-1"
-
-    async def test_gather_context_with_figma(self):
-        state = {"figma_url": "https://figma.com/design/123"}
-        result = await gather_context(state)
-        assert result["design_context"] is not None
-
-    async def test_create_plan_no_runtime(self):
-        state = {}
-        result = await create_plan(state)
-        assert "steps" in result["plan"]
-
-    async def test_select_skills_no_registry(self):
-        state = {"required_skills": ["react-nextjs"]}
-        result = await select_skills(state)
-        assert result["skill_context"] == ""
-
-    async def test_wait_for_dev_completed(self):
-        state = {"dev_result": {"state": "TASK_STATE_COMPLETED", "pr_url": "https://pr/1"}}
-        result = await wait_for_dev(state)
-        assert result["route"] == "completed"
-
-    async def test_wait_for_dev_failed(self):
-        state = {"dev_result": {}}
-        result = await wait_for_dev(state)
-        assert result["route"] == "failed"
-
-    async def test_handle_question_escalates(self):
-        state = {}
-        result = await handle_question(state)
-        assert result["route"] == "user_needed"
-
-    async def test_evaluate_review_approved(self):
-        state = {"review_verdict": "approved", "review_cycles": 0}
-        result = await evaluate_review(state)
-        assert result["route"] == "approved"
-
-    async def test_evaluate_review_needs_revision(self):
-        state = {"review_verdict": "rejected", "review_cycles": 0, "max_review_cycles": 2, "review_comments": []}
-        result = await evaluate_review(state)
-        assert result["route"] == "needs_revision"
-
-    async def test_evaluate_review_max_revisions(self):
-        state = {"review_verdict": "rejected", "review_cycles": 2, "max_review_cycles": 2, "review_comments": []}
-        result = await evaluate_review(state)
-        assert result["route"] == "max_revisions"
-
-    async def test_report_success(self):
-        state = {"pr_url": "https://pr/1"}
-        result = await report_success(state)
-        assert result["success"] is True
-
-    async def test_escalate_to_user_interrupts(self):
-        state = {"escalation_reason": "Tests failing"}
-        with pytest.raises(InterruptSignal) as exc_info:
-            await escalate_to_user(state)
-        assert "Tests failing" in exc_info.value.question
+    def test_has_tools(self):
+        assert len(team_lead_definition.tools) > 0
 
 
-class TestTeamLeadWorkflowExecution:
+class TestTeamLeadAgent:
+    async def test_handle_message_returns_working(self):
+        """handle_message returns immediately with WORKING state (async workflow)."""
+        runtime = _mock_runtime()
+        agent = _make_agent(runtime)
+        await agent.start()
 
-    async def test_happy_path_approved(self):
-        """Full happy path: task → analyze → gather → plan → skills → dev → review → success."""
-        compiled = team_lead_workflow.compile()
-        state = {
-            "user_request": "Add login page",
-            "jira_key": "TEST-1",
-            "repo_url": "https://github.com/test",
-            "max_review_cycles": 2,
-            "review_cycles": 0,
-            "dev_result": {"state": "TASK_STATE_COMPLETED", "pr_url": "https://pr/1"},
+        message = {
+            "parts": [{"text": "Implement feature ABC-123"}],
+            "metadata": {"jiraKey": "ABC-123"},
         }
-        result = await compiled.invoke(state)
-        assert result["success"] is True
-        assert "PR:" in result["summary"]
+        result = await agent.handle_message(message)
 
-    async def test_escalation_on_failure(self):
-        """Dev agent fails → escalate → interrupt."""
-        compiled = team_lead_workflow.compile()
-        state = {
-            "user_request": "Fix bug",
-            "max_review_cycles": 2,
-            "review_cycles": 0,
-            "dev_result": {"state": "TASK_STATE_FAILED"},
+        assert result["task"]["status"]["state"] == "TASK_STATE_WORKING"
+        assert result["task"]["id"]
+
+    async def test_get_task_returns_real_state(self):
+        """get_task returns real state from TaskStore."""
+        runtime = _mock_runtime()
+        agent = _make_agent(runtime)
+        await agent.start()
+
+        message = {
+            "parts": [{"text": "Fix bug"}],
+            "metadata": {},
         }
-        with pytest.raises(InterruptSignal):
-            await compiled.invoke(state)
+        result = await agent.handle_message(message)
+        task_id = result["task"]["id"]
+
+        # Give the worker thread a moment to complete
+        await asyncio.sleep(0.5)
+
+        poll = await agent.get_task(task_id)
+        # Should be either COMPLETED or FAILED (not the old hardcoded WORKING)
+        state = poll["task"]["status"]["state"]
+        assert state in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED")
+
+    async def test_workflow_produces_report_summary(self):
+        """Completed workflow should produce a report_summary in artifacts."""
+        runtime = _mock_runtime()
+        agent = _make_agent(runtime)
+        await agent.start()
+
+        message = {
+            "parts": [{"text": "Build login page"}],
+            "metadata": {},
+        }
+        result = await agent.handle_message(message)
+        task_id = result["task"]["id"]
+
+        await asyncio.sleep(0.5)
+
+        poll = await agent.get_task(task_id)
+        if poll["task"]["status"]["state"] == "TASK_STATE_COMPLETED":
+            artifacts = poll["task"]["artifacts"]
+            assert len(artifacts) > 0

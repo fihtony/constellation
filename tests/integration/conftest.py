@@ -144,7 +144,7 @@ def figma_file_url() -> str:
 
 @pytest.fixture(scope="session")
 def figma_client(figma_token):
-    from agents.ui_design.client import FigmaClient
+    from agents.ui_design.clients.figma_rest import FigmaClient
     # Use minimal rate limiting in tests (1 second interval)
     return FigmaClient(token=figma_token, min_call_interval=1.0)
 

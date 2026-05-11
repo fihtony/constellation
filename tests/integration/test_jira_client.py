@@ -106,7 +106,6 @@ async def test_jira_adapter_fetch(jira_client, jira_ticket_key):
     adapter = JiraAgentAdapter(
         definition=jira_definition,
         services=services,
-        dispatch_mode="direct",
         jira_client=jira_client,
     )
 

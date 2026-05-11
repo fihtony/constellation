@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from framework.plugin import PluginManager
     from framework.session import SessionService
     from framework.skills import SkillsRegistry
+    from framework.task_store import TaskStore
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +73,7 @@ class AgentServices:
     checkpoint_service: CheckpointService
     runtime: Any  # AgentRuntimeAdapter
     registry_client: Any  # RegistryClient or None
+    task_store: TaskStore = None  # type: ignore[assignment]
     launcher: Any = None  # Launcher or None
 
 
@@ -99,6 +101,7 @@ class BaseAgent:
         self.plugin_manager = services.plugin_manager
         self.checkpoint_service = services.checkpoint_service
         self.runtime = services.runtime
+        self.task_store = services.task_store
 
         self._compiled_workflow = None
 

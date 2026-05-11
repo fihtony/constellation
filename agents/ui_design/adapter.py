@@ -1,19 +1,20 @@
-"""UI Design Agent adapter — boundary agent proxy for v2 framework.
+"""UI Design Agent adapter -- routes design requests to Figma or Stitch.
 
-Supports two dispatch modes:
-  direct  (default) — calls FigmaClient directly (fast, in-process)
-  a2a               — forwards via A2AClient to the v1 UI Design Agent HTTP service
+  figma.*   -> Figma REST API v1 (FigmaClient)
+  stitch.*  -> Google Stitch MCP (StitchMcpClient)
+  design.*  -> auto-routes by URL pattern
 """
 from __future__ import annotations
 
 import json
+import os
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 
 ui_design_definition = AgentDefinition(
     agent_id="ui-design",
     name="UI Design Agent",
-    description="Boundary adapter: Figma design context fetch (REST)",
+    description="Boundary adapter: Figma REST and Google Stitch MCP design context",
     mode=AgentMode.SINGLE_TURN,
     execution_mode=ExecutionMode.PERSISTENT,
     workflow=None,
@@ -22,75 +23,95 @@ ui_design_definition = AgentDefinition(
 
 
 class UIDesignAgentAdapter(BaseAgent):
-    """Proxy adapter for the UI Design boundary service.
+    """Design context adapter supporting Figma REST and Google Stitch MCP.
 
     Parameters
     ----------
-    existing_agent_url:
-        URL of the running v1 UI Design Agent (a2a mode).
-    dispatch_mode:
-        ``direct`` — call FigmaClient in-process.
-        ``a2a``    — forward via A2AClient.
     figma_client:
-        Optional pre-constructed FigmaClient (direct mode only).
-        If None, constructed from FIGMA_TOKEN env var.
+        Optional pre-constructed FigmaClient (for testing / DI).
+        Falls back to FIGMA_TOKEN env var.
+    stitch_client:
+        Optional pre-constructed StitchMcpClient (for testing / DI).
+        Falls back to STITCH_API_KEY env var.
     """
 
     def __init__(
         self,
         definition: AgentDefinition,
         services: AgentServices,
-        existing_agent_url: str = "http://ui-design:8040",
-        dispatch_mode: str = "direct",
         figma_client=None,
+        stitch_client=None,
     ):
         super().__init__(definition, services)
-        self._existing_agent_url = existing_agent_url
-        self._dispatch_mode = dispatch_mode
         self._figma_client = figma_client
-
-    def _get_client(self):
-        if self._figma_client:
-            return self._figma_client
-        import os
-        from agents.ui_design.client import FigmaClient
-        return FigmaClient(token=os.environ.get("FIGMA_TOKEN", ""))
+        self._stitch_client = stitch_client
 
     async def handle_message(self, message: dict) -> dict:
-        from framework.a2a.protocol import Artifact, Task, TaskState, TaskStatus
+        from framework.a2a.protocol import Artifact, TaskState, TaskStatus
 
-        task = Task()
-        capability = (message.get("metadata") or {}).get("requestedCapability", "")
+        task_store = self.services.task_store
+        cap = (message.get("metadata") or {}).get("requestedCapability", "")
         parts = message.get("parts") or []
         text = next((p.get("text", "") for p in parts if p.get("text")), "")
 
-        if self._dispatch_mode == "a2a":
-            return await self._forward_a2a(message, task)
+        task = task_store.create_task(
+            agent_id=self.definition.agent_id,
+            metadata={"capability": cap},
+        )
 
-        result = self._dispatch_direct(capability, text, message)
-        task.status = TaskStatus(state=TaskState.COMPLETED)
-        task.artifacts = [Artifact(
+        result = self._dispatch(cap, text, message)
+        artifacts = [Artifact(
             name="design-result",
             artifact_type="application/json",
             parts=[{"text": json.dumps(result, ensure_ascii=False)}],
-            metadata={"agentId": "ui-design", "capability": capability, "taskId": task.id},
+            metadata={"agentId": "ui-design", "capability": cap, "taskId": task.id},
         )]
-        return task.to_dict()
+        task_store.complete_task(task.id, artifacts=artifacts)
+        return task_store.get_task_dict(task.id)
 
-    def _dispatch_direct(self, capability: str, text: str, message: dict) -> dict:
-        client = self._get_client()
+    async def get_task(self, task_id: str) -> dict:
+        return self.services.task_store.get_task_dict(task_id)
+
+    # ------------------------------------------------------------------
+    # Routing
+    # ------------------------------------------------------------------
+
+    def _dispatch(self, cap: str, text: str, message: dict) -> dict:
         meta = message.get("metadata") or {}
-        file_url = meta.get("figmaUrl") or meta.get("fileUrl") or text.strip()
+        if cap.startswith("figma."):
+            return self._dispatch_figma(cap, text, meta)
+        if cap.startswith("stitch."):
+            return self._dispatch_stitch(cap, text, meta)
+        if cap.startswith("design."):
+            url = meta.get("designUrl") or text.strip()
+            if "figma.com" in url.lower():
+                return self._dispatch_figma("figma.file.fetch", url, meta)
+            return self._dispatch_stitch("stitch.screen.fetch", url, meta)
+        if "figma.com" in text.lower():
+            return self._dispatch_figma("figma.file.fetch", text, meta)
+        return {"error": f"Unknown UI Design capability: {cap!r}"}
 
-        if capability in ("figma.page.fetch", "figma.file.fetch", "figma.design.fetch"):
-            data, status = client.get_file(file_url)
+    # ------------------------------------------------------------------
+    # Figma REST
+    # ------------------------------------------------------------------
+
+    def _get_figma(self):
+        if self._figma_client:
+            return self._figma_client
+        from agents.ui_design.clients.figma_rest import FigmaClient
+        return FigmaClient(token=os.environ.get("FIGMA_TOKEN", ""))
+
+    def _dispatch_figma(self, cap: str, text: str, meta: dict) -> dict:
+        client = self._get_figma()
+        url = meta.get("figmaUrl") or meta.get("fileUrl") or text.strip()
+
+        if cap in ("figma.page.fetch", "figma.file.fetch", "figma.design.fetch"):
+            data, status = client.get_file(url)
             if not data:
                 return {"error": f"Figma fetch failed: {status}"}
-            # Return lightweight summary
-            doc = data.get("document", {})
             pages = [
                 {"id": c.get("id"), "name": c.get("name")}
-                for c in doc.get("children", [])
+                for c in data.get("document", {}).get("children", [])
             ]
             return {
                 "name": data.get("name", ""),
@@ -99,40 +120,61 @@ class UIDesignAgentAdapter(BaseAgent):
                 "status": status,
             }
 
-        if capability == "figma.pages.list":
-            pages, status = client.list_pages(file_url)
+        if cap == "figma.pages.list":
+            pages, status = client.list_pages(url)
             return {"pages": pages, "status": status}
 
-        if capability == "figma.node.fetch":
+        if cap == "figma.node.fetch":
             node_id = meta.get("nodeId") or ""
-            data, status = client.get_node(file_url, node_id)
+            data, status = client.get_node(url, node_id)
             return {"node": data, "status": status}
 
-        # Default: fetch file
-        if file_url:
-            data, status = client.get_file(file_url)
-            return {"file": data, "status": status}
+        if cap == "figma.styles.fetch":
+            data, status = client.get_file_styles(url)
+            return {"styles": data, "status": status}
 
-        return {"error": f"Unknown UI Design capability: {capability}"}
+        data, status = client.get_file(url)
+        return {"file": data, "status": status}
 
-    async def _forward_a2a(self, message: dict, task) -> dict:
-        from framework.a2a.client import A2AClient
-        from framework.a2a.protocol import Artifact, TaskState, TaskStatus
-        client = A2AClient()
-        try:
-            result = await client.dispatch(url=self._existing_agent_url, message=message, wait=True)
-            task.status = TaskStatus(state=TaskState.COMPLETED)
-            raw = (result.get("task") or result).get("artifacts", [])
-            task.artifacts = [
-                Artifact(name=a.get("name", ""), artifact_type=a.get("artifactType", "text/plain"),
-                         parts=a.get("parts", []), metadata=a.get("metadata", {}))
-                for a in raw
-            ]
-        except Exception as exc:
-            task.status = TaskStatus(state=TaskState.FAILED)
-            task.artifacts = [Artifact(name="error", artifact_type="text/plain",
-                                       parts=[{"text": str(exc)}], metadata={"agentId": "ui-design"})]
-        return task.to_dict()
+    # ------------------------------------------------------------------
+    # Google Stitch MCP
+    # ------------------------------------------------------------------
 
-    async def get_task(self, task_id: str) -> dict:
-        return {"task": {"id": task_id, "status": {"state": "TASK_STATE_WORKING"}}}
+    def _get_stitch(self):
+        if self._stitch_client:
+            return self._stitch_client
+        from agents.ui_design.clients.stitch_mcp import StitchMcpClient
+        return StitchMcpClient(api_key=os.environ.get("STITCH_API_KEY", ""))
+
+    def _dispatch_stitch(self, cap: str, text: str, meta: dict) -> dict:
+        client = self._get_stitch()
+        project_id = meta.get("stitchProjectId") or meta.get("projectId") or text.strip()
+        screen_id = meta.get("stitchScreenId") or meta.get("screenId") or ""
+        screen_name = meta.get("screenName") or ""
+
+        if cap == "stitch.project.get":
+            data, status = client.get_project(project_id)
+            return {"project": data, "status": status}
+
+        if cap == "stitch.screens.list":
+            screens, status = client.list_screens(project_id)
+            return {"screens": screens, "status": status}
+
+        if cap == "stitch.screen.fetch":
+            if not screen_id and screen_name:
+                screen, fs = client.find_screen_by_name(project_id, screen_name)
+                if not screen:
+                    return {"error": f"Screen not found ({fs})"}
+                screen_id = screen["id"]
+            data, status = client.get_screen(project_id, screen_id)
+            return {"screen": data, "status": status}
+
+        if cap == "stitch.screen.image":
+            data, status = client.get_screen_image(project_id, screen_id)
+            return {"image": data, "status": status}
+
+        if cap == "stitch.tools.list":
+            tools, status = client.list_tools()
+            return {"tools": tools, "status": status}
+
+        return {"error": f"Unknown Stitch capability: {cap!r}"}

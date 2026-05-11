@@ -36,6 +36,7 @@ def _make_services(runtime=None):
     from framework.plugin import PluginManager
     from framework.session import InMemorySessionService
     from framework.skills import SkillsRegistry
+    from framework.task_store import InMemoryTaskStore
 
     return AgentServices(
         session_service=InMemorySessionService(),
@@ -46,6 +47,7 @@ def _make_services(runtime=None):
         checkpoint_service=InMemoryCheckpointer(),
         runtime=runtime,
         registry_client=None,
+        task_store=InMemoryTaskStore(),
     )
 
 
@@ -149,7 +151,6 @@ async def test_jira_adapter_direct_mode_mock():
     adapter = JiraAgentAdapter(
         definition=jira_definition,
         services=services,
-        dispatch_mode="direct",
         jira_client=MockJiraClient(),
     )
 
@@ -185,7 +186,6 @@ async def test_scm_adapter_direct_mode_mock():
     adapter = SCMAgentAdapter(
         definition=scm_definition,
         services=services,
-        dispatch_mode="direct",
         scm_client=MockSCMClient(),
     )
 
@@ -226,7 +226,6 @@ async def test_ui_design_adapter_direct_mode_mock():
     adapter = UIDesignAgentAdapter(
         definition=ui_design_definition,
         services=services,
-        dispatch_mode="direct",
         figma_client=MockFigmaClient(),
     )
 
@@ -315,8 +314,13 @@ def test_react_agentic_loop_with_mock_llm():
             }]
         }
 
+    import framework.runtime.connect_agent.adapter as _adapter_mod
+
     original_call = _transport.call_chat_completion
+    # Patch both the transport module attribute AND the adapter module's local
+    # reference so the mock takes effect regardless of import order.
     _transport.call_chat_completion = _mock_llm
+    _adapter_mod.call_chat_completion = _mock_llm
 
     try:
         adapter = ConnectAgentAdapter()
@@ -328,6 +332,7 @@ def test_react_agentic_loop_with_mock_llm():
         )
     finally:
         _transport.call_chat_completion = original_call
+        _adapter_mod.call_chat_completion = original_call
         _reg._default_registry = original_registry
 
     assert result.success, f"ReAct loop failed: {result.summary}"
@@ -342,80 +347,155 @@ def test_react_agentic_loop_with_mock_llm():
 # TC-07: Compass classify_task node (no LLM, heuristic fallback)
 # =============================================================================
 
-@pytest.mark.asyncio
-async def test_compass_classify_task_heuristic():
-    """classify_task node classifies development/office tasks via heuristic."""
-    from agents.compass.nodes import classify_task
-
-    dev_state = {"user_request": "Implement jira ticket PROJ-123 and create a PR"}
-    result = await classify_task(dev_state)
-    assert result.get("task_classification") == "development"
-
-    office_state = {"user_request": "Summarize this PDF document"}
-    result2 = await classify_task(office_state)
-    assert result2.get("task_classification") == "office"
-
-    general_state = {"user_request": "Hello, how are you?"}
-    result3 = await classify_task(general_state)
-    assert result3.get("task_classification") == "general"
-
-
 # =============================================================================
-# TC-08: Full compass workflow (in-memory, no LLM)
+# TC-07: CompassAgent handles a development task request (mock runtime)
 # =============================================================================
 
 @pytest.mark.asyncio
-async def test_compass_workflow_full_in_memory():
-    """Compass workflow executes all nodes in-memory without LLM."""
-    from agents.compass.agent import CompassAgent
-    from agents.compass.agent import compass_definition
-    from framework.workflow import WorkflowRunner
+async def test_compass_handles_development_task_mock_runtime():
+    """CompassAgent routes a development task using a mock LLM runtime.
+
+    Sends a real task request; does NOT embed any agent instructions.
+    """
+    from agents.compass.agent import CompassAgent, compass_definition
+    from framework.runtime.adapter import AgenticResult
+
+    class MockRuntime:
+        def run_agentic(self, task, **kwargs):
+            return AgenticResult(
+                success=True,
+                summary="Development task dispatched to Team Lead. Implementation completed.",
+                turns_used=2,
+                tool_calls=[{"tool": "dispatch_development_task", "arguments": "{}", "turn": 1}],
+                backend_used="mock",
+            )
+
+    services = _make_services(runtime=MockRuntime())
+    compass = CompassAgent(compass_definition, services)
+
+    response = await compass.handle_message({
+        "parts": [{"text": "Implement the login feature for PROJ-123"}],
+        "metadata": {},
+    })
+    task = response["task"]
+    assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+    summary = task["artifacts"][0]["parts"][0]["text"]
+    assert len(summary) > 0
+    print(f"[e2e] Compass summary: {summary!r}")
+
+
+# =============================================================================
+# TC-08: UIDesignAgentAdapter routes Stitch capabilities correctly
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_ui_design_routes_stitch_capability():
+    """UIDesignAgentAdapter dispatches stitch.* capabilities to the Stitch backend."""
+    from agents.ui_design.adapter import UIDesignAgentAdapter, ui_design_definition
+
+    class MockStitchClient:
+        def list_screens(self, project_id, **kwargs):
+            return [{"id": "screen-001", "name": "Home Screen"}], "ok"
+
+        def get_screen(self, project_id, screen_id, **kwargs):
+            return {"id": screen_id, "name": "Home Screen", "code": "..."}, "ok"
+
+        def find_screen_by_name(self, project_id, name, **kwargs):
+            return {"id": "screen-001", "name": name}, "ok"
 
     services = _make_services()
-    agent = CompassAgent(compass_definition, services)
-    await agent.start()
+    adapter = UIDesignAgentAdapter(
+        definition=ui_design_definition,
+        services=services,
+        stitch_client=MockStitchClient(),
+    )
 
-    initial_state = {
-        "user_request": "What is the capital of France?",
-        "session_id": "test-e2e-001",
+    msg = {
+        "parts": [{"text": "13629074018280446337"}],
+        "metadata": {
+            "requestedCapability": "stitch.screens.list",
+            "stitchProjectId": "13629074018280446337",
+        },
     }
-    from framework.workflow import RunConfig
-    config = RunConfig(session_id="test-e2e-001", thread_id="thread-001")
-    runner = WorkflowRunner(agent._compiled_workflow, config)
-    final_state = await runner.run(initial_state)
-
-    assert final_state is not None
-    # Compass should produce a user-facing reply
-    assert "final_response" in final_state or "task_classification" in final_state
-    print(f"[e2e] Compass final state keys: {list(final_state.keys())}")
+    response = await adapter.handle_message(msg)
+    task = response["task"]
+    assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+    result = json.loads(task["artifacts"][0]["parts"][0]["text"])
+    assert result["status"] == "ok"
+    assert len(result["screens"]) == 1
+    assert result["screens"][0]["name"] == "Home Screen"
 
 
 # =============================================================================
-# TC-09: Live E2E with real LLM — classify and respond
+# TC-09: CompassAgent handles an unclear request and could ask for clarification
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_compass_handles_unclear_request_mock_runtime():
+    """CompassAgent handles a vague task request gracefully.
+
+    An unclear request is a valid test case — the agent should either ask
+    for clarification or handle it gracefully.
+    """
+    from agents.compass.agent import CompassAgent, compass_definition
+    from framework.runtime.adapter import AgenticResult
+
+    class MockRuntime:
+        def run_agentic(self, task, **kwargs):
+            # Simulate LLM asking for clarification on vague request
+            return AgenticResult(
+                success=True,
+                summary=(
+                    "Could you provide more details? "
+                    "Which Jira ticket or repository should I work on?"
+                ),
+                turns_used=1,
+                tool_calls=[],
+                backend_used="mock",
+            )
+
+    services = _make_services(runtime=MockRuntime())
+    compass = CompassAgent(compass_definition, services)
+
+    response = await compass.handle_message({
+        "parts": [{"text": "fix the bug"}],
+        "metadata": {},
+    })
+    task = response["task"]
+    assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+    summary = task["artifacts"][0]["parts"][0]["text"]
+    # Agent should acknowledge the request (clarification or routing)
+    assert len(summary) > 0
+
+
+# =============================================================================
+# TC-10: Live E2E with real LLM — compass handles development task
 # =============================================================================
 
 @pytest.mark.live
 @pytest.mark.asyncio
-async def test_compass_classify_with_real_llm(llm_available, llm_base_url, llm_model):
-    """classify_task node uses real LLM when runtime is available."""
+async def test_compass_with_real_llm_development_task(llm_available, llm_base_url, llm_model):
+    """CompassAgent uses real LLM to handle a development task request."""
     if not llm_available:
         pytest.skip(f"LLM not reachable at {llm_base_url}")
 
     os.environ.setdefault("OPENAI_BASE_URL", llm_base_url)
     os.environ.setdefault("OPENAI_MODEL", llm_model)
 
+    from agents.compass.agent import CompassAgent, compass_definition
     from framework.runtime.adapter import get_runtime
-    from agents.compass.nodes import classify_task
 
     runtime = get_runtime("connect-agent", model=llm_model)
+    services = _make_services(runtime=runtime)
+    compass = CompassAgent(compass_definition, services)
 
-    state = {
-        "_runtime": runtime,
-        "user_request": "Implement the feature from PROJ-456 and open a pull request",
-    }
-    result = await classify_task(state)
-    classification = result.get("task_classification", "")
-    assert classification in ("development", "office", "general"), (
-        f"Unexpected classification: {classification!r}"
-    )
-    print(f"[e2e-live] LLM classified as: {classification!r}")
+    response = await compass.handle_message({
+        "parts": [{"text": "Implement the search feature for PROJ-456"}],
+        "metadata": {},
+    })
+    task = response["task"]
+    assert task["status"]["state"] in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED")
+    summary = task["artifacts"][0]["parts"][0]["text"]
+    assert len(summary) > 0
+    print(f"[e2e-live] Compass response: {summary[:200]!r}")
+

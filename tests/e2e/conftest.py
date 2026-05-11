@@ -45,6 +45,7 @@ def agent_services():
     from framework.plugin import PluginManager
     from framework.session import InMemorySessionService
     from framework.skills import SkillsRegistry
+    from framework.task_store import InMemoryTaskStore
 
     return AgentServices(
         session_service=InMemorySessionService(),
@@ -55,6 +56,7 @@ def agent_services():
         checkpoint_service=InMemoryCheckpointer(),
         runtime=None,
         registry_client=None,
+        task_store=InMemoryTaskStore(),
     )
 
 

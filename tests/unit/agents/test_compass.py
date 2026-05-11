@@ -1,148 +1,100 @@
-"""Tests for Compass Agent workflow."""
+"""Tests for Compass Agent (LLM-driven ReAct)."""
 import pytest
-from framework.workflow import START, END
-from agents.compass.agent import compass_workflow, compass_definition
-from agents.compass.nodes import (
-    classify_task,
-    check_permissions,
-    dispatch_task,
-    wait_for_result,
-    completeness_gate,
-    summarize_for_user,
-    handle_office_task,
-)
+from unittest.mock import MagicMock
+from agents.compass.agent import CompassAgent, compass_definition
+from framework.agent import AgentMode, AgentServices, ExecutionMode
 
 
-class TestCompassWorkflowCompile:
-    """Test that the Compass workflow compiles correctly."""
+def _make_agent(mock_runtime):
+    from unittest.mock import MagicMock as M
+    from framework.task_store import InMemoryTaskStore
+    services = AgentServices(
+        session_service=M(), event_store=M(), memory_service=M(),
+        skills_registry=M(), plugin_manager=M(), checkpoint_service=M(),
+        runtime=mock_runtime, registry_client=None,
+        task_store=InMemoryTaskStore(),
+    )
+    return CompassAgent(definition=compass_definition, services=services)
 
-    def test_compass_workflow_compiles(self):
-        compiled = compass_workflow.compile()
-        assert compiled.name == "compass"
 
-    def test_compass_workflow_has_all_nodes(self):
-        compiled = compass_workflow.compile()
-        expected_nodes = {
-            "classify_task", "check_permissions", "dispatch_task",
-            "wait_for_result", "completeness_gate", "summarize_for_user",
-            "handle_office_task",
-        }
-        assert expected_nodes == set(compiled.nodes.keys())
+def _mock_runtime(summary="Task dispatched.", success=True):
+    result = MagicMock()
+    result.success = success
+    result.summary = summary
+    runtime = MagicMock()
+    runtime.run_agentic.return_value = result
+    return runtime
 
-    def test_compass_definition_fields(self):
-        from framework.agent import AgentMode, ExecutionMode
+
+class TestCompassDefinition:
+    def test_agent_id(self):
         assert compass_definition.agent_id == "compass"
+
+    def test_mode(self):
         assert compass_definition.mode == AgentMode.CHAT
+
+    def test_execution_mode(self):
         assert compass_definition.execution_mode == ExecutionMode.PERSISTENT
 
+    def test_no_workflow(self):
+        assert compass_definition.workflow is None
 
-class TestClassifyTask:
-    """Test classify_task node with heuristic fallback (no runtime)."""
-
-    async def test_classify_development(self):
-        state = {"user_request": "Fix bug in Jira ticket ABC-123"}
-        result = await classify_task(state)
-        assert result["task_classification"] == "development"
-
-    async def test_classify_office(self):
-        state = {"user_request": "Summarize the PDF document in my folder"}
-        result = await classify_task(state)
-        assert result["task_classification"] == "office"
-
-    async def test_classify_general(self):
-        state = {"user_request": "What is the weather today?"}
-        result = await classify_task(state)
-        assert result["task_classification"] == "general"
-
-    async def test_classify_code_keywords(self):
-        state = {"user_request": "Create a new feature branch for implementation"}
-        result = await classify_task(state)
-        assert result["task_classification"] == "development"
+    def test_has_tools(self):
+        assert len(compass_definition.tools) > 0
 
 
-class TestCheckPermissions:
+class TestCompassAgent:
+    async def test_handles_development_task(self):
+        runtime = _mock_runtime("Development task dispatched to Team Lead.")
+        agent = _make_agent(runtime)
 
-    async def test_permissions_always_allowed_in_mvp(self):
-        state = {"task_classification": "development"}
-        result = await check_permissions(state)
-        assert result["permissions_check"]["allowed"] is True
-
-
-class TestDispatchTask:
-
-    async def test_dispatch_routes_by_classification(self):
-        for classification in ["development", "office", "general"]:
-            state = {"task_classification": classification}
-            result = await dispatch_task(state)
-            assert result["route"] == classification
-
-
-class TestCompletenessGate:
-
-    async def test_complete_with_pr(self):
-        state = {"dev_result": {"pr_url": "https://github.com/test/pr/1", "success": True}}
-        result = await completeness_gate(state)
-        assert result["route"] == "complete"
-        assert result["completeness_score"] == 1.0
-
-    async def test_incomplete_no_pr(self):
-        state = {"dev_result": {"success": False}}
-        result = await completeness_gate(state)
-        assert result["route"] == "incomplete"
-
-    async def test_gives_up_after_retries(self):
-        state = {"dev_result": {"success": False}, "_completeness_retries": 2}
-        result = await completeness_gate(state)
-        assert result["route"] == "complete"  # gives up
-
-
-class TestSummarizeForUser:
-
-    async def test_summarize_general_no_runtime(self):
-        state = {"task_classification": "general", "user_request": "hello"}
-        result = await summarize_for_user(state)
-        assert "unable" in result["user_summary"].lower()
-
-    async def test_summarize_development(self):
-        state = {
-            "task_classification": "development",
-            "dev_result": {"pr_url": "https://github.com/pr/1", "summary": "Fixed bug."},
+        message = {
+            "parts": [{"text": "Fix bug in Jira ticket ABC-123"}],
+            "metadata": {},
         }
-        result = await summarize_for_user(state)
-        assert "PR:" in result["user_summary"]
+        result = await agent.handle_message(message)
 
-    async def test_summarize_office(self):
-        state = {
-            "task_classification": "office",
-            "office_result": {"summary": "3 documents processed."},
+        assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+        artifacts = result["task"]["artifacts"]
+        assert any("dispatched" in a["parts"][0]["text"].lower() for a in artifacts)
+        runtime.run_agentic.assert_called_once()
+
+    async def test_handles_office_task(self):
+        runtime = _mock_runtime("Office document summarized.")
+        agent = _make_agent(runtime)
+
+        message = {
+            "parts": [{"text": "Summarize the PDF in my documents folder"}],
+            "metadata": {},
         }
-        result = await summarize_for_user(state)
-        assert "3 documents" in result["user_summary"]
+        result = await agent.handle_message(message)
 
+        assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+        runtime.run_agentic.assert_called_once()
 
-class TestCompassWorkflowExecution:
-    """Integration test: run entire workflow with heuristic classification."""
+    async def test_failed_result_maps_to_failed_state(self):
+        runtime = _mock_runtime("Something went wrong.", success=False)
+        agent = _make_agent(runtime)
 
-    async def test_general_task_flow(self):
-        compiled = compass_workflow.compile()
-        state = {"user_request": "What time is it?"}
-        result = await compiled.invoke(state)
-        assert result["task_classification"] == "general"
-        assert "user_summary" in result
+        message = {"parts": [{"text": "Do something"}], "metadata": {}}
+        result = await agent.handle_message(message)
 
-    async def test_development_task_flow(self):
-        compiled = compass_workflow.compile()
-        state = {
-            "user_request": "Fix the bug in Jira ticket ABC-123",
-            "dev_result": {"pr_url": "https://github.com/pr/1", "success": True},
-        }
-        result = await compiled.invoke(state)
-        assert result["task_classification"] == "development"
-        assert result["route"] == "complete"
+        assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
 
-    async def test_office_task_flow(self):
-        compiled = compass_workflow.compile()
-        state = {"user_request": "Summarize the PDF files in my documents folder"}
-        result = await compiled.invoke(state)
-        assert result["task_classification"] == "office"
-        assert "user_summary" in result
+    async def test_get_task_nonexistent_returns_failed(self):
+        """Non-existent task ID returns FAILED from TaskStore."""
+        agent = _make_agent(MagicMock())
+        result = await agent.get_task("task-001")
+        assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
+
+    async def test_get_task_returns_real_state(self):
+        """After handle_message, get_task returns real completed state."""
+        runtime = _mock_runtime("Done.")
+        agent = _make_agent(runtime)
+
+        message = {"parts": [{"text": "Hello"}], "metadata": {}}
+        result = await agent.handle_message(message)
+        task_id = result["task"]["id"]
+
+        poll = await agent.get_task(task_id)
+        assert poll["task"]["status"]["state"] == "TASK_STATE_COMPLETED"

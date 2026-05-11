@@ -798,3 +798,107 @@ Before submitting a new agent, verify:
 - All LLM-enabled agents MUST use runtime-specific Dockerfiles (e.g. `Dockerfile.connect-agent`, `Dockerfile.copilot-cli`, `Dockerfile.claude-code`). Generic `Dockerfile` files are forbidden for agents that have runtime variants. Only infrastructure services without runtime variants (registry, im-gateway) may use a plain `Dockerfile`.
 - Compass routes office tasks via Registry capability lookup, not by hardcoding the Office Agent URL. The `dispatch_agent_task` tool discovers and launches per-task agents automatically through Registry + Launcher.
 - Office Agent completes a delivery review cycle with Compass: Compass validates output completeness via `aggregate_task_card`, may send revision comments back, and only ACKs the Office Agent after the delivery is accepted (or max revisions exhausted).
+
+---
+
+## v2 Redesign Architecture (framework/ and agents/)
+
+The v2 codebase lives in `framework/`, `agents/`, `skills/`, `config/`, `scripts/`, and `tests/`. It coexists with v1 code under the repository root (`compass/`, `team-lead/`, `common/`, `registry/`, etc.). v1 is NOT modified.
+
+### Core Design Principle: Graph outside, ReAct inside
+
+This is the fundamental architecture decision. Every agent implementation must follow it.
+
+**Graph (workflow) handles macro lifecycle** — deterministic state transitions, branching, looping (review cycles), interrupt/resume, and checkpoint recovery. Defined declaratively via `Workflow(edges=[...])`.
+
+**ReAct (LLM) handles micro decisions within nodes** — reasoning, tool selection, context interpretation, code generation. Used via `runtime.run()` (single-shot) or `runtime.run_agentic()` (multi-turn tool loop).
+
+#### When to use Graph (workflow)
+
+- The agent has **identifiable lifecycle stages** (analyze → plan → execute → review → report)
+- State transitions are **deterministic** — the next step depends on the current step's output, not on open-ended reasoning
+- The workflow includes **loops** (e.g., review → revision → re-review)
+- The workflow needs **interrupt/resume** for human-in-the-loop
+- You need **checkpoint persistence** for crash recovery
+
+#### When to use ReAct (LLM-driven)
+
+- The task is **open-ended** — the agent doesn't know the exact steps in advance
+- User requests are **diverse and unpredictable** (e.g., Compass receiving arbitrary user messages)
+- The agent needs to **choose tools dynamically** based on context
+- A single node within a graph needs to reason about which sub-tools to call
+
+#### Agent Classification (fixed)
+
+| Agent | Orchestration | Rationale |
+|-------|--------------|-----------|
+| Compass | **ReAct-first** (`workflow=None`) | Open-ended user entry point, diverse request types |
+| Team Lead | **Graph-first** | Deterministic stages: receive → analyze → gather → plan → dispatch → review → report |
+| Web Dev | **Graph-first** | Deterministic stages: setup → analyze → implement → test → fix → PR → report |
+| Code Review | **Graph-first** | Deterministic stages: load PR → quality → security → tests → requirements → report |
+| Jira / SCM / UI Design | **Direct adapter** | Controlled API proxy, no orchestration needed |
+
+### TaskStore Requirement
+
+Every agent MUST use `TaskStore` for task lifecycle management. The `AgentServices` dataclass includes a `task_store` field.
+
+**Rules:**
+- Create tasks via `task_store.create_task(agent_id=...)` — NOT by constructing `Task()` objects directly
+- Return real task state from `get_task()` via `task_store.get_task_dict(task_id)`
+- Mark completion via `task_store.complete_task(task_id, artifacts, message)`
+- Mark failure via `task_store.fail_task(task_id, error)`
+- Available backends: `InMemoryTaskStore` (dev/test), `SqliteTaskStore` (production MVP)
+
+### Callback Requirement
+
+Graph-first agents (Team Lead, Web Dev, Code Review) MUST send A2A callbacks on completion:
+
+```python
+callback_url = message.get("metadata", {}).get("orchestratorCallbackUrl", "")
+if callback_url:
+    _send_callback(callback_url, task.id, result, agent_id)
+```
+
+### v2 Directory Structure
+
+```
+constellation/
+├── framework/           # Shared framework (workflow, session, events, skills, plugins, TaskStore)
+│   ├── agent.py         # BaseAgent, AgentServices, AgentDefinition
+│   ├── workflow.py      # Workflow, CompiledWorkflow, WorkflowRunner, interrupt
+│   ├── task_store.py    # TaskStore (InMemory + SQLite)
+│   ├── session.py       # SessionService (InMemory + SQLite)
+│   ├── event_store.py   # EventStore (InMemory + SQLite)
+│   ├── checkpoint.py    # CheckpointService (InMemory + SQLite)
+│   ├── skills.py        # SkillsRegistry
+│   ├── plugin.py        # PluginManager
+│   ├── permissions.py   # PermissionEngine
+│   ├── a2a/             # A2A protocol types, HTTP server, client
+│   ├── runtime/         # Multi-backend runtime adapter (connect-agent, copilot-cli, etc.)
+│   └── tools/           # BaseTool, ToolRegistry
+├── agents/              # All v2 agent implementations
+│   ├── compass/         # ReAct-first control plane
+│   ├── team_lead/       # Graph-first intelligence layer
+│   ├── web_dev/         # Graph-first dev execution
+│   ├── code_review/     # Graph-first review pipeline
+│   ├── jira/            # Direct adapter
+│   ├── scm/             # Direct adapter
+│   └── ui_design/       # Direct adapter (Figma + Stitch)
+├── skills/              # Skill definitions (skill.yaml + instructions.md)
+├── config/              # Global config (constellation.yaml, permissions/)
+├── scripts/             # Launch scripts
+└── tests/               # Unit (126+), integration, E2E
+```
+
+### v2 Testing
+
+```bash
+# Run all unit tests (no external dependencies)
+source .venv/bin/activate && python -m pytest tests/unit/ -v
+
+# Run integration tests (needs API credentials in tests/.env)
+python -m pytest tests/integration/ -m live -v
+
+# Run E2E tests (mock scenarios)
+python -m pytest tests/e2e/ -v
+```

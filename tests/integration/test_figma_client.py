@@ -50,7 +50,7 @@ def test_figma_list_pages(figma_client, figma_file_url):
 
 def test_figma_parse_file_key(figma_file_url):
     """FigmaClient.parse_file_key() extracts the key from a URL."""
-    from agents.ui_design.client import FigmaClient
+    from agents.ui_design.clients.figma_rest import FigmaClient
     key = FigmaClient.parse_file_key(figma_file_url)
     assert key, "Expected a non-empty file key"
     assert " " not in key, f"File key contains spaces: {key!r}"
@@ -87,7 +87,6 @@ async def test_ui_design_adapter_fetch(figma_client, figma_file_url):
     adapter = UIDesignAgentAdapter(
         definition=ui_design_definition,
         services=services,
-        dispatch_mode="direct",
         figma_client=figma_client,
     )
 

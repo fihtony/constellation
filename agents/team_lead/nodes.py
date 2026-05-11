@@ -1,25 +1,33 @@
 """Team Lead Agent workflow nodes.
 
+Architecture: **Graph outside, ReAct inside**.
+
 Each node is an async function that receives the workflow state dict and returns
-a dict of state updates.
+a dict of state updates.  Nodes that need open-ended reasoning use the runtime
+for single-shot LLM calls or bounded ReAct; the graph controls the macro flow.
 """
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 
 async def receive_task(state: dict) -> dict:
     """Parse and validate the incoming task request."""
+    user_request = state.get("user_request", "")
     return {
         "task_received": True,
         "jira_key": state.get("jira_key", ""),
         "repo_url": state.get("repo_url", ""),
+        "figma_url": state.get("figma_url", ""),
+        "revision_count": 0,
+        "max_revisions": 3,
     }
 
 
 async def analyze_requirements(state: dict) -> dict:
-    """Analyze the incoming task using LLM + context."""
+    """Analyze the incoming task using LLM (single-shot ReAct-inside-node)."""
     runtime = state.get("_runtime")
     user_request = state.get("user_request", "")
 
@@ -37,7 +45,7 @@ async def analyze_requirements(state: dict) -> dict:
         user_request=user_request,
         jira_key=state.get("jira_key", "N/A"),
     )
-    result = await runtime.run(
+    result = runtime.run(
         prompt=prompt,
         system_prompt=ANALYSIS_SYSTEM,
         max_tokens=2048,
@@ -63,21 +71,44 @@ async def analyze_requirements(state: dict) -> dict:
 
 
 async def gather_context(state: dict) -> dict:
-    """Gather Jira ticket + design context via boundary agents.
+    """Gather Jira ticket + design context via boundary agent tools.
 
-    In MVP this is a placeholder.  Full implementation uses A2A client to
-    dispatch to Jira and UI Design agents.
+    Uses the registered tools (fetch_jira_ticket, fetch_design) to call
+    boundary agents via A2A dispatch.
     """
-    jira_context = {}
-    design_context = None
+    from framework.tools.registry import get_registry
 
-    # TODO: dispatch to jira.ticket.fetch via A2A client
-    if state.get("jira_key"):
-        jira_context = {"key": state["jira_key"], "status": "pending"}
+    registry = get_registry()
+    jira_context = state.get("jira_context") or {}
+    design_context = state.get("design_context")
 
-    # TODO: dispatch to figma.page.fetch via A2A client
-    if state.get("figma_url"):
-        design_context = {"url": state["figma_url"], "status": "pending"}
+    # Fetch Jira ticket if key provided and not already present
+    jira_key = state.get("jira_key", "")
+    if jira_key and not jira_context:
+        try:
+            result = registry.execute_sync("fetch_jira_ticket", ticket_key=jira_key)
+            payload = json.loads(result.output) if result.output else {}
+            if not payload.get("error"):
+                jira_context = payload
+        except Exception as exc:
+            print(f"[team-lead] Jira fetch failed: {exc}")
+
+    # Fetch design context if URL provided and not already present
+    figma_url = state.get("figma_url", "")
+    stitch_id = state.get("stitch_project_id", "")
+    if (figma_url or stitch_id) and not design_context:
+        try:
+            kwargs: dict[str, str] = {}
+            if figma_url:
+                kwargs["figma_url"] = figma_url
+            elif stitch_id:
+                kwargs["stitch_project_id"] = stitch_id
+            result = registry.execute_sync("fetch_design", **kwargs)
+            payload = json.loads(result.output) if result.output else {}
+            if not payload.get("error"):
+                design_context = payload
+        except Exception as exc:
+            print(f"[team-lead] Design fetch failed: {exc}")
 
     return {
         "jira_context": jira_context,
@@ -86,7 +117,7 @@ async def gather_context(state: dict) -> dict:
 
 
 async def create_plan(state: dict) -> dict:
-    """Create a development plan based on analysis and context."""
+    """Create a development plan based on analysis and context (LLM single-shot)."""
     runtime = state.get("_runtime")
 
     if not runtime:
@@ -109,7 +140,7 @@ async def create_plan(state: dict) -> dict:
         task_type=state.get("task_type", "general"),
         complexity=state.get("complexity", "medium"),
     )
-    result = await runtime.run(
+    result = runtime.run(
         prompt=prompt,
         system_prompt=PLANNING_SYSTEM,
         max_tokens=2048,
@@ -121,31 +152,184 @@ async def create_plan(state: dict) -> dict:
     except (json.JSONDecodeError, TypeError):
         plan = {"steps": [{"step": 1, "action": raw or "Execute task"}]}
 
-    return {"plan": plan}
-
-
-async def select_skills(state: dict) -> dict:
-    """Select relevant skills for the dev agent."""
+    # Build skill context
     skills_registry = state.get("_skills_registry")
     required = state.get("required_skills", [])
-
     skill_context = ""
     if skills_registry and required:
         skill_context = skills_registry.build_prompt_context(required)
 
-    return {"skill_context": skill_context}
+    return {
+        "plan": plan,
+        "skill_context": skill_context,
+    }
 
 
 async def dispatch_dev_agent(state: dict) -> dict:
-    """Dispatch task to a dev agent (Web Dev, Android, etc.).
+    """Dispatch task to a dev agent (Web Dev, Android, etc.) via A2A tool.
 
-    MVP placeholder — full implementation dispatches via A2A to a per-task agent.
+    Passes all gathered context so the dev agent does not re-fetch.
     """
-    # TODO: use A2A client to dispatch to web.task.execute
+    from framework.tools.registry import get_registry
+
+    registry = get_registry()
+    revision_feedback = state.get("revision_feedback", "")
+    task_description = _build_dev_brief(state)
+
+    try:
+        result = registry.execute_sync(
+            "dispatch_web_dev",
+            task_description=task_description,
+            jira_context=state.get("jira_context", {}),
+            design_context=state.get("design_context"),
+            repo_url=state.get("repo_url", ""),
+            revision_feedback=revision_feedback,
+        )
+        payload = json.loads(result.output) if result.output else {}
+    except Exception as exc:
+        print(f"[team-lead] Dev dispatch failed: {exc}")
+        payload = {"status": "error", "message": str(exc)}
+
     return {
         "dev_dispatched": True,
-        "dev_result": state.get("dev_result", {}),
+        "dev_result": payload,
+        "pr_url": payload.get("prUrl", ""),
+        "branch_name": payload.get("branch", ""),
     }
+
+
+async def review_result(state: dict) -> dict:
+    """Review the dev agent output via Code Review Agent.
+
+    Returns a route:
+      - "approved": review passed
+      - "needs_revision": review rejected, revision count < max
+      - "need_user_input": max revisions reached, escalate
+    """
+    from framework.tools.registry import get_registry
+
+    registry = get_registry()
+    pr_url = state.get("pr_url", "")
+    dev_result = state.get("dev_result", {})
+
+    try:
+        result = registry.execute_sync(
+            "dispatch_code_review",
+            pr_url=pr_url,
+            diff_summary=dev_result.get("summary", ""),
+            requirements=state.get("analysis_summary", ""),
+        )
+        payload = json.loads(result.output) if result.output else {}
+    except Exception as exc:
+        print(f"[team-lead] Code review dispatch failed: {exc}")
+        payload = {"verdict": "error", "message": str(exc)}
+
+    verdict = payload.get("verdict", "rejected")
+    revision_count = state.get("revision_count", 0)
+
+    if verdict == "approved":
+        route = "approved"
+    elif revision_count >= state.get("max_revisions", 3):
+        route = "need_user_input"
+    else:
+        route = "needs_revision"
+
+    return {
+        "review_result": payload,
+        "review_verdict": verdict,
+        "route": route,
+    }
+
+
+async def request_revision(state: dict) -> dict:
+    """Prepare revision feedback for the dev agent and loop back."""
+    review = state.get("review_result", {})
+    comments = review.get("comments", [])
+    summary = review.get("summary", review.get("message", ""))
+
+    feedback_lines = []
+    if summary:
+        feedback_lines.append(f"Review summary: {summary}")
+    for c in comments[:10]:  # Limit to top 10 comments
+        feedback_lines.append(f"- [{c.get('severity', 'info')}] {c.get('message', '')}")
+
+    return {
+        "revision_feedback": "\n".join(feedback_lines) or "Code review rejected. Please fix issues.",
+        "revision_count": state.get("revision_count", 0) + 1,
+    }
+
+
+async def report_success(state: dict) -> dict:
+    """Build final success report."""
+    pr_url = state.get("pr_url", "N/A")
+    branch = state.get("branch_name", "N/A")
+    analysis = state.get("analysis_summary", "")
+    verdict = state.get("review_verdict", "approved")
+    revision_count = state.get("revision_count", 0)
+
+    return {
+        "report_summary": (
+            f"Task completed successfully.\n"
+            f"Analysis: {analysis}\n"
+            f"PR: {pr_url}\n"
+            f"Branch: {branch}\n"
+            f"Review verdict: {verdict}\n"
+            f"Revisions: {revision_count}"
+        ),
+        "success": True,
+    }
+
+
+async def escalate_to_user(state: dict) -> dict:
+    """Escalate to user after max revision attempts."""
+    revision_count = state.get("revision_count", 0)
+    review = state.get("review_result", {})
+
+    return {
+        "report_summary": (
+            f"Task requires user intervention after {revision_count} revision attempts.\n"
+            f"Last review verdict: {review.get('verdict', 'unknown')}\n"
+            f"PR: {state.get('pr_url', 'N/A')}\n"
+            f"Please review the remaining issues and provide guidance."
+        ),
+        "success": False,
+        "escalated": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _build_dev_brief(state: dict) -> str:
+    """Assemble a comprehensive dev agent brief from all gathered context."""
+    parts = [f"Task: {state.get('user_request', '')}"]
+
+    analysis = state.get("analysis_summary", "")
+    if analysis:
+        parts.append(f"\nAnalysis:\n{analysis}")
+
+    plan = state.get("plan", {})
+    if plan:
+        parts.append(f"\nPlan:\n{json.dumps(plan, indent=2, ensure_ascii=False)}")
+
+    jira = state.get("jira_context", {})
+    if jira:
+        parts.append(f"\nJira context:\n{json.dumps(jira, indent=2, ensure_ascii=False)}")
+
+    design = state.get("design_context")
+    if design:
+        parts.append(f"\nDesign context:\n{json.dumps(design, indent=2, ensure_ascii=False)}")
+
+    skill_ctx = state.get("skill_context", "")
+    if skill_ctx:
+        parts.append(f"\nSkill guidance:\n{skill_ctx}")
+
+    revision = state.get("revision_feedback", "")
+    if revision:
+        parts.append(f"\nRevision feedback:\n{revision}")
+
+    return "\n".join(parts)
 
 
 async def wait_for_dev(state: dict) -> dict:

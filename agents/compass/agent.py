@@ -1,124 +1,77 @@
-"""Compass Agent — control plane entry point.
+"""Compass Agent -- LLM-driven control plane entry point.
 
-Routes user requests to the appropriate downstream agent (Team Lead for
-development tasks, Office Agent for document tasks, or direct LLM for general
-questions).  Manages the completeness gate and final user summary.
+Architecture: **ReAct-first** (appropriate for open-ended user interaction).
+
+Uses the ReAct pattern (run_agentic + tools) for user request classification
+and routing.  The LLM decides what to do next based on the user request and
+the registered tools.
+
+All tasks are persisted via TaskStore so that ``GET /tasks/{id}`` returns
+real state (not a stub).
+
+Instructions (system prompt) live in:
+  agents/compass/instructions/system.md
+
+Tools live in:
+  agents/compass/tools.py
 """
 from __future__ import annotations
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
-from framework.workflow import Workflow, START, END
-from agents.compass.nodes import (
-    classify_task,
-    check_permissions,
-    dispatch_task,
-    wait_for_result,
-    completeness_gate,
-    summarize_for_user,
-    handle_office_task,
-)
-
-# ---------------------------------------------------------------------------
-# Workflow definition
-# ---------------------------------------------------------------------------
-
-compass_workflow = Workflow(
-    name="compass",
-    edges=[
-        (START, classify_task, check_permissions),
-        (check_permissions, dispatch_task),
-        (dispatch_task, {
-            "development": wait_for_result,
-            "office": handle_office_task,
-            "general": summarize_for_user,
-        }),
-        (wait_for_result, completeness_gate),
-        (completeness_gate, {
-            "complete": summarize_for_user,
-            "incomplete": wait_for_result,
-        }),
-        (handle_office_task, summarize_for_user),
-        (summarize_for_user, END),
-    ],
-)
-
-# ---------------------------------------------------------------------------
-# Agent definition
-# ---------------------------------------------------------------------------
+from agents.compass.tools import TOOL_NAMES, register_compass_tools
 
 compass_definition = AgentDefinition(
     agent_id="compass",
     name="Compass Agent",
-    description="Control plane: task classification, permission check, routing, and user summary",
+    description="Control plane: task classification, routing, and user summary (ReAct-first)",
     mode=AgentMode.CHAT,
     execution_mode=ExecutionMode.PERSISTENT,
-    workflow=compass_workflow,
-    tools=["dispatch_agent", "query_registry"],
+    workflow=None,
+    tools=TOOL_NAMES,
 )
 
 
-# ---------------------------------------------------------------------------
-# Agent class
-# ---------------------------------------------------------------------------
-
 class CompassAgent(BaseAgent):
-    """Compass Agent implementation."""
+    """Compass Agent -- routes requests via LLM ReAct reasoning."""
 
     async def handle_message(self, message: dict) -> dict:
-        """Receive a user message, run the compass workflow, return a task dict."""
-        from framework.a2a.protocol import Task, TaskState, Message
+        from framework.a2a.protocol import Artifact, TaskState
+        from framework.instructions import load_instructions
+        from framework.runtime.adapter import get_runtime
 
-        session = await self.session_service.create(self.definition.agent_id)
-        task = Task(
-            task_id=session.session_id,
-            state=TaskState.WORKING,
+        register_compass_tools()
+
+        parts = message.get("parts") or []
+        user_text = next((p.get("text", "") for p in parts if p.get("text")), "")
+
+        # Create task via TaskStore
+        task_store = self.services.task_store
+        task = task_store.create_task(agent_id=self.definition.agent_id)
+
+        system_prompt = load_instructions("compass")
+        runtime = self.services.runtime or get_runtime()
+        agentic_result = runtime.run_agentic(
+            task=user_text,
+            tools=TOOL_NAMES,
+            system_prompt=system_prompt,
+            max_turns=20,
+            timeout=300,
         )
 
-        # Build initial state
-        user_text = ""
-        msg = message.get("message", message)
-        parts = msg.get("parts", [])
-        if parts:
-            user_text = parts[0].get("text", "")
+        artifacts = [Artifact(
+            name="compass-response",
+            artifact_type="text/plain",
+            parts=[{"text": agentic_result.summary or ""}],
+            metadata={"agentId": "compass"},
+        )]
 
-        state = {
-            "_task_id": task.task_id,
-            "_session_id": session.session_id,
-            "_runtime": self.runtime,
-            "_skills_registry": self.skills_registry,
-            "user_request": user_text,
-            "metadata": msg.get("metadata", {}),
-        }
+        if agentic_result.success:
+            task_store.complete_task(task.id, artifacts=artifacts)
+        else:
+            task_store.fail_task(task.id, agentic_result.summary or "Agent failed")
 
-        # Run asynchronously
-        import threading
-
-        def _run():
-            import asyncio
-            loop = asyncio.new_event_loop()
-            try:
-                result = loop.run_until_complete(
-                    self._compiled_workflow.invoke(state)
-                )
-                task.state = TaskState.COMPLETED
-                task.artifacts = [{
-                    "name": "compass-response",
-                    "artifactType": "text/plain",
-                    "parts": [{"text": result.get("user_summary", "Task completed.")}],
-                    "metadata": {"agentId": self.definition.agent_id},
-                }]
-            except Exception as e:
-                task.state = TaskState.FAILED
-                task.status_message = str(e)
-            finally:
-                loop.close()
-
-        worker = threading.Thread(target=_run, daemon=True)
-        worker.start()
-
-        return task.to_dict()
+        return task_store.get_task_dict(task.id)
 
     async def get_task(self, task_id: str) -> dict:
-        """Return current task state."""
-        # In a full implementation, look up task from task store
-        return {"task": {"id": task_id, "status": {"state": "TASK_STATE_WORKING"}}}
+        """Return real task state from TaskStore."""
+        return self.services.task_store.get_task_dict(task_id)
