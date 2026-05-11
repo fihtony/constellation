@@ -82,7 +82,7 @@ def test_jira_get_transitions(jira_client, jira_ticket_key):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_jira_adapter_fetch(jira_client, jira_ticket_key):
+async def test_jira_adapter_fetch(jira_provider, jira_ticket_key):
     """JiraAgentAdapter in direct mode correctly handles jira.ticket.fetch."""
     from framework.agent import AgentDefinition, AgentMode, AgentServices, ExecutionMode
     from framework.checkpoint import InMemoryCheckpointer
@@ -108,7 +108,7 @@ async def test_jira_adapter_fetch(jira_client, jira_ticket_key):
     adapter = JiraAgentAdapter(
         definition=jira_definition,
         services=services,
-        jira_provider=jira_client,
+        jira_provider=jira_provider,
     )
 
     message = {

@@ -82,6 +82,15 @@ def jira_client(jira_token, jira_email, jira_ticket_url):
 
 
 @pytest.fixture(scope="session")
+def jira_provider(jira_client):
+    """Wrap the JiraClient into a JiraRESTProvider for adapter tests."""
+    from agents.jira.providers.rest import JiraRESTProvider
+    provider = JiraRESTProvider.__new__(JiraRESTProvider)
+    provider._client = jira_client
+    return provider
+
+
+@pytest.fixture(scope="session")
 def jira_ticket_key(jira_ticket_url) -> str:
     from agents.jira.client import JiraClient
     return JiraClient.parse_ticket_key(jira_ticket_url)

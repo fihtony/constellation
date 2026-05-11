@@ -1,7 +1,8 @@
 """Jira REST API v3 provider — wraps JiraClient into the JiraProvider interface.
 
-This is a thin adapter around the existing ``agents.jira.client.JiraClient``
-so it conforms to the pluggable provider contract.
+This is a thin adapter around ``agents.jira.client.JiraClient`` so it conforms
+to the pluggable provider contract while reusing the client's scoped-cloud
+request handling.
 """
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ class JiraRESTProvider(JiraProvider):
         email: str = "",
         auth_mode: str = "basic",
         corp_ca_bundle: str = "",
+        cloud_id: str = "",
+        api_base_url: str = "",
     ) -> None:
         self._client = JiraClient(
             base_url=base_url,
@@ -26,6 +29,8 @@ class JiraRESTProvider(JiraProvider):
             email=email,
             auth_mode=auth_mode,
             corp_ca_bundle=corp_ca_bundle,
+            cloud_id=cloud_id,
+            api_base_url=api_base_url,
         )
 
     # -- JiraProvider interface ---------------------------------------------
@@ -47,34 +52,36 @@ class JiraRESTProvider(JiraProvider):
     def transition_issue(
         self, ticket_key: str, transition_name: str
     ) -> tuple[str | None, str]:
-        # REST provider resolves transition name → id and POSTs
         transitions, status = self._client.get_transitions(ticket_key)
         if status != "ok":
             return None, f"could_not_fetch_transitions: {status}"
+
         target_lower = transition_name.strip().lower()
         match = None
-        for t in transitions:
-            if not isinstance(t, dict):
+        for transition in transitions:
+            if not isinstance(transition, dict):
                 continue
-            name = t.get("name", "")
+            name = transition.get("name", "")
             if name.lower() == target_lower or name.lower().startswith(target_lower):
-                match = t
+                match = transition
                 break
+
         if not match:
             available = [t.get("name") for t in transitions if isinstance(t, dict)]
             return None, f"transition_not_found (available: {available})"
-        tid = match.get("id")
-        if not tid:
+
+        transition_id = match.get("id")
+        if not transition_id:
             return None, "transition_missing_id"
-        # POST transition
-        from urllib.error import HTTPError
-        try:
-            self._client._post(f"/issue/{ticket_key}/transitions", {"transition": {"id": tid}})
-            return tid, f"transitioned_to:{match.get('name', transition_name)}"
-        except HTTPError as exc:
-            return None, f"HTTP {exc.code}"
-        except Exception as exc:
-            return None, str(exc)
+
+        request_status, _body = self._client.request(
+            "POST",
+            f"issue/{ticket_key}/transitions",
+            {"transition": {"id": transition_id}},
+        )
+        if request_status in (200, 204):
+            return transition_id, f"transitioned_to:{match.get('name', transition_name)}"
+        return None, f"HTTP {request_status}"
 
     def add_comment(
         self, ticket_key: str, text: str, adf_body: dict | None = None
@@ -88,14 +95,14 @@ class JiraRESTProvider(JiraProvider):
     ) -> tuple[dict | None, str]:
         if not fields:
             return None, "missing_fields"
-        from urllib.error import HTTPError
-        try:
-            self._client._request("PUT", f"/issue/{ticket_key}", {"fields": fields})
+        request_status, _body = self._client.request(
+            "PUT",
+            f"issue/{ticket_key}",
+            {"fields": fields},
+        )
+        if request_status in (200, 204):
             return {"ticketKey": ticket_key}, "updated"
-        except HTTPError as exc:
-            return None, f"HTTP {exc.code}"
-        except Exception as exc:
-            return None, str(exc)
+        return None, f"HTTP {request_status}"
 
     @property
     def backend_name(self) -> str:

@@ -327,3 +327,102 @@ class TestInterruptResumeE2E:
         assert task.status.state in (TaskState.INPUT_REQUIRED, TaskState.COMPLETED, TaskState.FAILED)
 
         loop.close()
+
+    def test_team_lead_resume_after_escalation_completes(self):
+        """After escalation → INPUT_REQUIRED, resume with user input completes the task."""
+        from agents.team_lead.agent import TeamLeadAgent, team_lead_definition
+
+        services = _make_services()
+        agent = TeamLeadAgent(team_lead_definition, services)
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(agent.start())
+
+        from framework.tools.registry import get_registry
+        registry = get_registry()
+
+        review_call_count = {"n": 0}
+
+        # Web dev always succeeds
+        mock_web = MagicMock()
+        mock_web.name = "dispatch_web_dev"
+        mock_web.execute_sync.return_value = MagicMock(
+            output=json.dumps({
+                "status": "completed",
+                "summary": "Implemented changes",
+                "prUrl": "https://github.com/org/repo/pull/99",
+                "branch": "feat/resume-test",
+            }),
+            error="",
+        )
+        mock_web.to_openai_schema.return_value = {
+            "type": "function",
+            "function": {"name": "dispatch_web_dev", "parameters": {}},
+        }
+
+        def mock_review_execute(**kwargs):
+            review_call_count["n"] += 1
+            # First 3+ calls: reject (to force escalation via max_revisions=3)
+            # After resume: approve
+            if review_call_count["n"] <= 4:
+                return MagicMock(
+                    output=json.dumps({
+                        "verdict": "rejected",
+                        "comments": [{"severity": "high", "message": "Needs work"}],
+                        "summary": "Rejected",
+                    }),
+                    error="",
+                )
+            return MagicMock(
+                output=json.dumps({
+                    "verdict": "approved",
+                    "comments": [],
+                    "summary": "Looks good after user guidance",
+                }),
+                error="",
+            )
+
+        mock_review = MagicMock()
+        mock_review.name = "dispatch_code_review"
+        mock_review.execute_sync.side_effect = mock_review_execute
+        mock_review.to_openai_schema.return_value = {
+            "type": "function",
+            "function": {"name": "dispatch_code_review", "parameters": {}},
+        }
+
+        registry.register(mock_web)
+        registry.register(mock_review)
+
+        # Phase 1: send task — should hit max revisions and escalate
+        message = {
+            "message": {
+                "parts": [{"text": "Implement feature with forced escalation then resume"}],
+                "metadata": {},
+            }
+        }
+        result = loop.run_until_complete(agent.handle_message(message))
+        task_id = result.get("task", result)["id"]
+
+        task = _wait_for_terminal(services.task_store, task_id, timeout=15)
+        assert task is not None
+        assert task.status.state == TaskState.INPUT_REQUIRED, (
+            f"Expected INPUT_REQUIRED but got {task.status.state}"
+        )
+
+        # Phase 2: resume with user guidance — should loop back and eventually complete
+        resume_result = loop.run_until_complete(
+            agent.resume_task(task_id, "Please focus on error handling in the login module")
+        )
+        resume_task = resume_result.get("task", resume_result)
+        # After resume, poll for terminal state
+        final_task = _wait_for_terminal(services.task_store, task_id, timeout=15)
+        assert final_task is not None
+        assert final_task.status.state == TaskState.COMPLETED, (
+            f"Expected COMPLETED after resume but got {final_task.status.state}"
+        )
+
+        # Verify artifacts exist with report
+        assert len(final_task.artifacts) > 0
+        artifact_text = final_task.artifacts[0].parts[0].get("text", "")
+        assert artifact_text, "Expected non-empty artifact text after resume"
+
+        loop.close()

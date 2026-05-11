@@ -127,6 +127,15 @@ class TestLoadAgentConfig:
         cfg = load_agent_config("team-lead", project_dir)
         assert cfg.get("runtime.model") == "gpt-6"
 
+    def test_constellation_prefix_beats_openai_model(self, project_dir, monkeypatch):
+        """CONSTELLATION_RUNTIME_MODEL should win over OPENAI_MODEL."""
+        from framework.config import load_agent_config
+
+        monkeypatch.setenv("OPENAI_MODEL", "gpt-low-priority")
+        monkeypatch.setenv("CONSTELLATION_RUNTIME_MODEL", "gpt-high-priority")
+        cfg = load_agent_config("team-lead", project_dir)
+        assert cfg.get("runtime.model") == "gpt-high-priority"
+
     def test_cli_override(self, project_dir):
         from framework.config import load_agent_config
 
