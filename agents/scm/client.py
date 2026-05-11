@@ -41,21 +41,43 @@ def _detect_provider(base_url: str) -> str:
 def _parse_bb_project_repo(repo_url: str) -> tuple[str, str, str]:
     """Parse host, project key, and repo slug from a Bitbucket Server browse URL.
 
-    E.g. ``https://bitbucket.corp.com/projects/PROJ/repos/my-repo/browse``
-       → (``https://bitbucket.corp.com``, ``PROJ``, ``my-repo``)
+    Supports both project repos and personal (user) repos:
+      ``https://bitbucket.corp.com/projects/PROJ/repos/my-repo/browse``
+        → (``https://bitbucket.corp.com``, ``PROJ``, ``my-repo``)
+      ``https://bitbucket.corp.com/users/jdoe/repos/my-repo/browse``
+        → (``https://bitbucket.corp.com``, ``~jdoe``, ``my-repo``)
+
+    The ``~username`` notation is the Bitbucket Server convention for personal
+    project keys in REST API calls.
     """
     parsed = urlparse(repo_url)
     host = f"{parsed.scheme}://{parsed.netloc}"
     parts = parsed.path.strip("/").split("/")
-    # Expected: projects/<KEY>/repos/<slug>[/...]
+
+    project = ""
+    repo = ""
+
+    # Try /projects/<KEY>/repos/<slug> first
     try:
         proj_idx = parts.index("projects")
         project = parts[proj_idx + 1]
         repos_idx = parts.index("repos")
         repo = parts[repos_idx + 1]
+        return host, project, repo
     except (ValueError, IndexError):
-        project = ""
-        repo = ""
+        pass
+
+    # Try /users/<username>/repos/<slug> (personal repos)
+    try:
+        user_idx = parts.index("users")
+        username = parts[user_idx + 1]
+        repos_idx = parts.index("repos")
+        repo = parts[repos_idx + 1]
+        project = f"~{username}"
+        return host, project, repo
+    except (ValueError, IndexError):
+        pass
+
     return host, project, repo
 
 
