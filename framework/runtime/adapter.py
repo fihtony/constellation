@@ -76,8 +76,14 @@ class AgentRuntimeAdapter(ABC):
         model: str | None = None,
         timeout: int = 120,
         max_tokens: int = 4096,
+        plugin_manager: Any = None,
     ) -> dict:
-        """Execute a single prompt and return the standard result dict."""
+        """Execute a single prompt and return the standard result dict.
+
+        When *plugin_manager* is provided, implementations SHOULD fire
+        ``before_llm_call`` before the request and ``after_llm_response``
+        after receiving the response.
+        """
         ...
 
     def run_agentic(

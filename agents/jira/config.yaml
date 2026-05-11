@@ -1,0 +1,22 @@
+# Jira Agent — agent-specific configuration
+# Inherits all unset keys from config/constellation.yaml (global defaults).
+# Credentials belong in agents/jira/.env (never in this file).
+
+agent_id: jira
+name: "Jira Agent"
+description: "Boundary adapter: Jira ticket fetch, search, comment via Jira Cloud REST API v3"
+mode: single_turn
+execution_mode: persistent
+
+# runtime and model inherit from global constellation.yaml:
+#   runtime.backend: connect-agent
+#   runtime.model: gpt-5-mini
+
+port: 8010
+
+# Capabilities exposed via A2A skill IDs
+capabilities:
+  - jira.ticket.fetch
+  - jira.ticket.search
+  - jira.ticket.comment
+  - jira.ticket.update

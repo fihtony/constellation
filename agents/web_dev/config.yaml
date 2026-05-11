@@ -1,10 +1,17 @@
+# Web Dev Agent — agent-specific configuration
+# Inherits all unset keys from config/constellation.yaml (global defaults).
+# Credentials/port overrides belong in agents/web_dev/.env.
+
 agent_id: web-dev
 name: "Web Dev Agent"
 description: "Full-stack web development: clone, branch, implement, test, PR"
 mode: task
 execution_mode: per-task
-runtime_backend: connect-agent
-model: gpt-5-mini
+
+# runtime and model inherit from global constellation.yaml:
+#   runtime.backend: connect-agent
+#   runtime.model: gpt-5-mini
+
 default_skills:
   - react-nextjs
   - testing

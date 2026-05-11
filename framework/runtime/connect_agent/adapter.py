@@ -63,6 +63,7 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
         model: str | None = None,
         timeout: int = 120,
         max_tokens: int = 4096,
+        plugin_manager=None,
     ) -> dict:
         return run_single_shot(
             prompt,
@@ -73,6 +74,7 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
             max_tokens=max_tokens,
             default_system=DEFAULT_SINGLE_SHOT_SYSTEM,
             backend_used="connect-agent",
+            plugin_manager=plugin_manager,
         )
 
     def run_agentic(

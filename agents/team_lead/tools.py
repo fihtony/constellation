@@ -13,10 +13,33 @@ from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
 
 
-def _resolve_agent_url(env_var: str, default: str, capability: str = "") -> str:
-    """Resolve an agent's URL via Registry discovery, falling back to env var."""
-    # TODO: when RegistryClient is wired into tools, use capability lookup
-    return os.environ.get(env_var, default)
+def _resolve_agent_url(env_var: str, config_key: str, default: str, capability: str = "") -> str:
+    """Resolve an agent's URL with a defined priority order:
+
+    1. Environment variable (``env_var``) — highest priority, deployment-time override.
+    2. Global config ``services.<config_key>`` from constellation.yaml.
+    3. Hardcoded ``default`` — fallback for bare-metal / test runs.
+
+    When a RegistryClient is wired into tools (future), capability lookup will
+    be the preferred path and env/config will become fallbacks.
+    """
+    # Priority 1: env var override
+    env_val = os.environ.get(env_var)
+    if env_val:
+        return env_val
+
+    # Priority 2: global config services section
+    try:
+        from framework.config import load_global_config
+        global_cfg = load_global_config()
+        services = global_cfg.get("services") or {}
+        cfg_url = services.get(config_key, "").strip()
+        if cfg_url:
+            return cfg_url
+    except Exception:
+        pass
+
+    return default
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +63,7 @@ class FetchJiraTicket(BaseTool):
     }
 
     def execute_sync(self, ticket_key: str = "") -> ToolResult:
-        jira_url = _resolve_agent_url("JIRA_AGENT_URL", "http://jira:8010", "jira.ticket.fetch")
+        jira_url = _resolve_agent_url("JIRA_AGENT_URL", "jira_agent_url", "http://jira:8010", "jira.ticket.fetch")
         try:
             from framework.a2a.client import dispatch_sync
             result = dispatch_sync(
@@ -93,7 +116,7 @@ class FetchDesign(BaseTool):
         stitch_project_id: str = "",
         screen_name: str = "",
     ) -> ToolResult:
-        ui_url = _resolve_agent_url("UI_DESIGN_AGENT_URL", "http://ui-design:8040", "figma.file.fetch")
+        ui_url = _resolve_agent_url("UI_DESIGN_AGENT_URL", "ui_design_agent_url", "http://ui-design:8040", "figma.file.fetch")
         try:
             from framework.a2a.client import dispatch_sync
             if figma_url:
@@ -170,7 +193,7 @@ class DispatchWebDev(BaseTool):
         repo_url: str = "",
         revision_feedback: str = "",
     ) -> ToolResult:
-        web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "http://web-dev:8050", "web-dev.task.execute")
+        web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", "web-dev.task.execute")
         meta: dict[str, Any] = {}
         if jira_context:
             meta["jiraContext"] = jira_context
@@ -242,7 +265,7 @@ class DispatchCodeReview(BaseTool):
         diff_summary: str = "",
         requirements: str = "",
     ) -> ToolResult:
-        review_url = _resolve_agent_url("CODE_REVIEW_AGENT_URL", "http://code-review:8050", "review.code.check")
+        review_url = _resolve_agent_url("CODE_REVIEW_AGENT_URL", "code_review_agent_url", "http://code-review:8050", "review.code.check")
         meta: dict[str, Any] = {}
         if pr_url:
             meta["prUrl"] = pr_url

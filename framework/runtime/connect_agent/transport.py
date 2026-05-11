@@ -75,8 +75,13 @@ def run_single_shot(
     max_tokens: int = 4096,
     default_system: str,
     backend_used: str,
+    plugin_manager=None,
 ) -> dict:
-    """Single-shot prompt → response via chat-completion."""
+    """Single-shot prompt → response via chat-completion.
+
+    When *plugin_manager* is provided, fires ``before_llm_call`` before the
+    request and ``after_llm_response`` after receiving the response.
+    """
     effective_model = AgentRuntimeAdapter.resolve_model(
         model,
         os.environ.get("AGENT_MODEL"),
@@ -92,6 +97,10 @@ def run_single_shot(
         {"role": "system", "content": effective_system},
         {"role": "user", "content": prompt},
     ]
+
+    # Plugin: before_llm_call
+    if plugin_manager:
+        plugin_manager.fire_sync("before_llm_call", prompt, ctx={})
 
     try:
         response_payload = call_chat_completion(
@@ -125,4 +134,9 @@ def run_single_shot(
         )
 
     raw = extract_text(response_payload)
+
+    # Plugin: after_llm_response
+    if plugin_manager:
+        plugin_manager.fire_sync("after_llm_response", raw, ctx={})
+
     return AgentRuntimeAdapter.build_result(raw, backend_used=backend_used)
