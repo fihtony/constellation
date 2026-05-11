@@ -13,22 +13,63 @@ from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
 
 
+def _discover_via_registry(capability: str) -> str:
+    """Look up the first healthy instance URL for *capability* from the Registry.
+
+    Calls ``GET <REGISTRY_URL>/query?capability=<capability>`` and returns the
+    ``serviceUrl`` of the first active instance.  Returns an empty string if
+    the registry is unreachable or has no matching instance.
+    """
+    try:
+        import urllib.request
+        registry_url = (
+            os.environ.get("REGISTRY_URL")
+            or os.environ.get("CONSTELLATION_REGISTRY_URL")
+            or ""
+        )
+        if not registry_url:
+            from framework.config import load_global_config
+            cfg = load_global_config()
+            registry_url = (cfg.get("registry") or {}).get("url", "")
+        if not registry_url:
+            return ""
+
+        url = f"{registry_url.rstrip('/')}/query?capability={capability}"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+
+        # Registry returns a list of instance objects or a dict with "instances"
+        instances = body if isinstance(body, list) else body.get("instances", [])
+        for inst in instances:
+            svc_url = inst.get("serviceUrl") or inst.get("service_url") or ""
+            if svc_url:
+                return svc_url
+    except Exception:
+        pass  # registry unreachable — fall through to defaults
+    return ""
+
+
 def _resolve_agent_url(env_var: str, config_key: str, default: str, capability: str = "") -> str:
     """Resolve an agent's URL with a defined priority order:
 
-    1. Environment variable (``env_var``) — highest priority, deployment-time override.
-    2. Global config ``services.<config_key>`` from constellation.yaml.
-    3. Hardcoded ``default`` — fallback for bare-metal / test runs.
-
-    When a RegistryClient is wired into tools (future), capability lookup will
-    be the preferred path and env/config will become fallbacks.
+    1. Environment variable (``env_var``) — highest priority, deployment override.
+    2. Capability Registry discovery via ``/query?capability=<capability>``.
+    3. Global config ``services.<config_key>`` from constellation.yaml.
+    4. Hardcoded ``default`` — last-resort fallback for bare-metal / test runs.
     """
-    # Priority 1: env var override
+    # Priority 1: explicit env var override
     env_val = os.environ.get(env_var)
     if env_val:
         return env_val
 
-    # Priority 2: global config services section
+    # Priority 2: Registry capability discovery (preferred at runtime)
+    if capability:
+        discovered = _discover_via_registry(capability)
+        if discovered:
+            return discovered
+
+    # Priority 3: global config services section
     try:
         from framework.config import load_global_config
         global_cfg = load_global_config()

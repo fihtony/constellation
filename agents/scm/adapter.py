@@ -1,6 +1,12 @@
-"""SCM Agent adapter — boundary agent for Bitbucket Server REST 1.0.
+"""SCM Agent adapter — boundary agent for source control operations.
 
-Dispatches capabilities directly via BitbucketClient (in-process).
+Supports three backends (selected via SCM_BACKEND env var or auto-detected
+from SCM_BASE_URL):
+  bitbucket   — Bitbucket Server REST 1.0 (default)
+  github-rest — GitHub REST API v3
+  github-mcp  — GitHub MCP (falls back to github-rest in v2)
+
+Dispatches capabilities directly via the appropriate client (in-process).
 Inject a custom ``scm_client`` for testing.
 """
 from __future__ import annotations
@@ -13,7 +19,7 @@ from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent
 scm_definition = AgentDefinition(
     agent_id="scm",
     name="SCM Agent",
-    description="Boundary adapter: repo inspect, branch list/create, PR operations",
+    description="Boundary adapter: repo inspect, branch list/create, PR operations (Bitbucket/GitHub)",
     mode=AgentMode.SINGLE_TURN,
     execution_mode=ExecutionMode.PERSISTENT,
     workflow=None,
@@ -22,12 +28,12 @@ scm_definition = AgentDefinition(
 
 
 class SCMAgentAdapter(BaseAgent):
-    """Proxy adapter for Bitbucket Server REST API 1.0.
+    """Proxy adapter for SCM backends (Bitbucket Server REST, GitHub REST, GitHub MCP).
 
     Parameters
     ----------
     scm_client:
-        Optional pre-constructed BitbucketClient (for testing / DI).
+        Optional pre-constructed client (for testing / DI).
         Falls back to SCM_BASE_URL / SCM_TOKEN / SCM_USERNAME env vars.
     """
 
@@ -43,11 +49,13 @@ class SCMAgentAdapter(BaseAgent):
     def _get_client(self):
         if self._scm_client:
             return self._scm_client
-        from agents.scm.client import BitbucketClient
-        return BitbucketClient(
+        from agents.scm.client import create_scm_client
+        return create_scm_client(
             base_url=os.environ.get("SCM_BASE_URL", ""),
             token=os.environ.get("SCM_TOKEN", ""),
             username=os.environ.get("SCM_USERNAME", ""),
+            default_project=os.environ.get("SCM_DEFAULT_PROJECT", ""),
+            ca_bundle=os.environ.get("SCM_CA_BUNDLE", ""),
         )
 
     async def handle_message(self, message: dict) -> dict:
@@ -107,8 +115,15 @@ class SCMAgentAdapter(BaseAgent):
             source = meta.get("sourceBranch") or meta.get("fromBranch") or ""
             target = meta.get("targetBranch") or meta.get("toBranch") or "main"
             description = meta.get("description") or ""
-            data, status = client.create_pr(project, repo, title, source, target, description)
-            return {"pr": data, "status": status}
+            # Args order: (project/owner, repo, from_branch, to_branch, title, description)
+            data, status = client.create_pr(project, repo, source, target, title, description)
+            pr_url = ""
+            if isinstance(data, dict):
+                # Bitbucket: links.self[0].href  |  GitHub: links.self[0].href (normalised)
+                links = data.get("links", {}).get("self", [])
+                if links:
+                    pr_url = links[0].get("href", "")
+            return {"pr": data, "status": status, "prUrl": pr_url}
 
         return {"error": f"Unknown SCM capability: {capability!r}"}
 
