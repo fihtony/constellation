@@ -1,4 +1,5 @@
 """Tests for Compass Agent (LLM-driven ReAct)."""
+import json
 import pytest
 from unittest.mock import MagicMock
 from agents.compass.agent import CompassAgent, compass_definition
@@ -98,3 +99,94 @@ class TestCompassAgent:
 
         poll = await agent.get_task(task_id)
         assert poll["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+
+    async def test_handle_message_accepts_a2a_envelope(self):
+        runtime = _mock_runtime("Development task dispatched to Team Lead.")
+        agent = _make_agent(runtime)
+
+        message = {
+            "message": {
+                "parts": [{"text": "Implement PROJ-123"}],
+                "metadata": {},
+            }
+        }
+        result = await agent.handle_message(message)
+
+        assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+        runtime.run_agentic.assert_called_once()
+
+
+class TestCompassTools:
+    def test_dispatch_development_task_prefers_registry_discovery(self, monkeypatch):
+        from agents.compass.tools import DispatchDevelopmentTask
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                assert capability == "team-lead.task.analyze"
+                return "http://registry-team-lead:8030"
+
+        dispatched = {}
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+
+        def _dispatch_sync(url, capability, message_parts, metadata, **kwargs):
+            dispatched["url"] = url
+            dispatched["capability"] = capability
+            dispatched["metadata"] = metadata
+            return {
+                "task": {
+                    "artifacts": [
+                        {
+                            "parts": [{"text": "Task completed."}],
+                            "metadata": {},
+                        }
+                    ]
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        result = DispatchDevelopmentTask().execute_sync(
+            task_description="Implement PROJ-123",
+            jira_key="PROJ-123",
+        )
+
+        payload = json.loads(result.output)
+        assert payload["status"] == "completed"
+        assert dispatched["url"] == "http://registry-team-lead:8030"
+        assert dispatched["capability"] == "team-lead.task.analyze"
+        assert dispatched["metadata"]["jiraKey"] == "PROJ-123"
+
+    def test_dispatch_development_task_propagates_failed_team_lead_state(self, monkeypatch):
+        from agents.compass.tools import DispatchDevelopmentTask
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return "http://registry-team-lead:8030"
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+
+        monkeypatch.setattr(
+            "framework.a2a.client.dispatch_sync",
+            lambda **kwargs: {
+                "task": {
+                    "status": {
+                        "state": "TASK_STATE_FAILED",
+                        "message": {"parts": [{"text": "Jira ticket not accessible: PROJ-123"}]},
+                    },
+                    "artifacts": [],
+                }
+            },
+        )
+
+        result = DispatchDevelopmentTask().execute_sync(task_description="Implement PROJ-123")
+        payload = json.loads(result.output)
+        assert payload["status"] == "error"
+        assert payload["state"] == "TASK_STATE_FAILED"
+        assert "Jira ticket not accessible" in payload["message"]

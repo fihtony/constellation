@@ -90,7 +90,10 @@ class FetchJiraTicket(BaseTool):
                 message_parts=[{"text": ticket_key}],
                 metadata={"ticketKey": ticket_key},
             )
-            artifacts = result.get("task", result).get("artifacts", [])
+            task = result.get("task", result)
+            if _task_state(task) != "TASK_STATE_COMPLETED":
+                return ToolResult(output=json.dumps({"error": _task_error(task, f"Jira fetch failed: {ticket_key}")}))
+            artifacts = task.get("artifacts", [])
             payload = _first_artifact_json(artifacts)
             return ToolResult(output=json.dumps(payload))
         except Exception as exc:
@@ -157,7 +160,10 @@ class FetchDesign(BaseTool):
                 message_parts=[{"text": text}],
                 metadata=meta,
             )
-            artifacts = result.get("task", result).get("artifacts", [])
+            task = result.get("task", result)
+            if _task_state(task) != "TASK_STATE_COMPLETED":
+                return ToolResult(output=json.dumps({"error": _task_error(task, "Design fetch failed")}))
+            artifacts = task.get("artifacts", [])
             payload = _first_artifact_json(artifacts)
             return ToolResult(output=json.dumps(payload))
         except Exception as exc:
@@ -201,7 +207,14 @@ class CloneRepo(BaseTool):
                 metadata={"repoUrl": repo_url, "targetPath": target_path},
                 timeout=120,
             )
-            artifacts = result.get("task", result).get("artifacts", [])
+            task = result.get("task", result)
+            if _task_state(task) != "TASK_STATE_COMPLETED":
+                return ToolResult(output=json.dumps({
+                    "error": _task_error(task, f"Clone failed: {repo_url}"),
+                    "repoUrl": repo_url,
+                    "targetPath": target_path,
+                }))
+            artifacts = task.get("artifacts", [])
             payload = _first_artifact_json(artifacts)
             return ToolResult(output=json.dumps(payload))
         except Exception as exc:
@@ -342,6 +355,13 @@ class DispatchWebDev(BaseTool):
                 timeout=600,
             )
             task = result.get("task", result)
+            task_state = _task_state(task)
+            if task_state != "TASK_STATE_COMPLETED":
+                return ToolResult(output=json.dumps({
+                    "status": "error",
+                    "state": task_state,
+                    "message": _task_error(task, "Web Dev task failed"),
+                }))
             artifacts = task.get("artifacts", [])
             summary = _extract_text(artifacts) or "Dev task completed."
             pr_url = _find_metadata(artifacts, "prUrl")
@@ -445,7 +465,13 @@ class DispatchCodeReview(BaseTool):
                 metadata=meta,
                 timeout=300,
             )
-            artifacts = result.get("task", result).get("artifacts", [])
+            task = result.get("task", result)
+            if _task_state(task) != "TASK_STATE_COMPLETED":
+                return ToolResult(output=json.dumps({
+                    "verdict": "error",
+                    "message": _task_error(task, "Code review task failed"),
+                }))
+            artifacts = task.get("artifacts", [])
             payload = _first_artifact_json(artifacts) or {"verdict": "unknown"}
             return ToolResult(output=json.dumps(payload))
         except Exception as exc:
@@ -539,3 +565,15 @@ def _find_metadata(artifacts: list[dict], key: str) -> str:
         if val:
             return val
     return ""
+
+
+def _task_state(task: dict) -> str:
+    return task.get("status", {}).get("state", "")
+
+
+def _task_error(task: dict, default: str) -> str:
+    parts = task.get("status", {}).get("message", {}).get("parts", [])
+    for part in parts:
+        if "text" in part and part["text"]:
+            return part["text"]
+    return default

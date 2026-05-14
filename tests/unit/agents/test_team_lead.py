@@ -2,6 +2,7 @@
 import pytest
 import asyncio
 import time
+import json
 from unittest.mock import MagicMock
 from agents.team_lead.agent import TeamLeadAgent, team_lead_definition
 from framework.agent import AgentMode, AgentServices, ExecutionMode
@@ -104,3 +105,70 @@ class TestTeamLeadAgent:
         if poll["task"]["status"]["state"] == "TASK_STATE_COMPLETED":
             artifacts = poll["task"]["artifacts"]
             assert len(artifacts) > 0
+
+
+class TestGatherContextFailures:
+    async def test_gather_context_fails_when_jira_fetch_fails(self, monkeypatch, tmp_path):
+        from agents.team_lead.nodes import gather_context
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                assert name == "fetch_jira_ticket"
+                return json.dumps({"error": "401 unauthorized"})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        with pytest.raises(RuntimeError, match="Jira ticket not accessible"):
+            await gather_context({
+                "jira_key": "PROJ-123",
+                "workspace_path": str(tmp_path),
+            })
+
+    async def test_gather_context_fails_when_repo_clone_fails(self, monkeypatch, tmp_path):
+        from agents.team_lead.nodes import gather_context
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                if name == "clone_repo":
+                    return json.dumps({"error": "clone failed"})
+                return json.dumps({})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        with pytest.raises(RuntimeError, match="Repo clone failed"):
+            await gather_context({
+                "repo_url": "https://example.com/org/repo.git",
+                "workspace_path": str(tmp_path),
+            })
+
+
+class TestTeamLeadTools:
+    def test_dispatch_web_dev_propagates_failed_task_state(self, monkeypatch):
+        from agents.team_lead.tools import DispatchWebDev
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return "http://web-dev:8050"
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+
+        monkeypatch.setattr(
+            "framework.a2a.client.dispatch_sync",
+            lambda **kwargs: {
+                "task": {
+                    "status": {
+                        "state": "TASK_STATE_FAILED",
+                        "message": {"parts": [{"text": "Web Dev task failed"}]},
+                    },
+                    "artifacts": [],
+                }
+            },
+        )
+
+        result = DispatchWebDev().execute_sync(task_description="Implement live e2e change")
+        payload = json.loads(result.output)
+        assert payload["status"] == "error"
+        assert payload["state"] == "TASK_STATE_FAILED"

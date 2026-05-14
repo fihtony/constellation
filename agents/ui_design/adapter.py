@@ -50,8 +50,9 @@ class UIDesignAgentAdapter(BaseAgent):
         from framework.a2a.protocol import Artifact, TaskState, TaskStatus
 
         task_store = self.services.task_store
-        cap = (message.get("metadata") or {}).get("requestedCapability", "")
-        parts = message.get("parts") or []
+        msg = message.get("message", message)
+        cap = (msg.get("metadata") or {}).get("requestedCapability", "")
+        parts = msg.get("parts") or []
         text = next((p.get("text", "") for p in parts if p.get("text")), "")
 
         task = task_store.create_task(
@@ -59,7 +60,7 @@ class UIDesignAgentAdapter(BaseAgent):
             metadata={"capability": cap},
         )
 
-        result = self._dispatch(cap, text, message)
+        result = self._dispatch(cap, text, msg)
         artifacts = [Artifact(
             name="design-result",
             artifact_type="application/json",

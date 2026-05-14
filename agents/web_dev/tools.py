@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+from urllib.parse import urlparse
 
 from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
@@ -62,6 +63,56 @@ def _dispatch_jira(capability: str, ticket_key: str = "", **meta) -> dict:
         return {}
     except Exception as exc:
         return {"error": str(exc)}
+
+
+def _dispatch_scm(capability: str, text: str = "", **meta) -> dict:
+    """Dispatch an SCM capability via A2A."""
+    scm_url = _resolve_agent_url(capability, "SCM_AGENT_URL", "http://scm:8020")
+    try:
+        from framework.a2a.client import dispatch_sync
+
+        result = dispatch_sync(
+            url=scm_url,
+            capability=capability,
+            message_parts=[{"text": text}],
+            metadata=meta,
+        )
+        artifacts = result.get("task", result).get("artifacts", [])
+        if artifacts:
+            parts = artifacts[0].get("parts", [])
+            if parts:
+                return json.loads(parts[0].get("text", "{}"))
+        return {}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _parse_repo_coordinates(repo_url: str) -> tuple[str, str]:
+    """Infer SCM project/owner and repo name from a repository URL."""
+    parts = [part for part in urlparse(repo_url).path.split("/") if part]
+    if not parts:
+        return "", ""
+
+    if "projects" in parts and "repos" in parts:
+        project_idx = parts.index("projects")
+        repo_idx = parts.index("repos")
+        if project_idx + 1 < len(parts) and repo_idx + 1 < len(parts):
+            return parts[project_idx + 1], parts[repo_idx + 1]
+
+    if "users" in parts and "repos" in parts:
+        owner_idx = parts.index("users")
+        repo_idx = parts.index("repos")
+        if owner_idx + 1 < len(parts) and repo_idx + 1 < len(parts):
+            return parts[owner_idx + 1], parts[repo_idx + 1]
+
+    if len(parts) >= 2:
+        owner = parts[0]
+        repo = parts[1]
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        return owner, repo
+
+    return "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +230,72 @@ class JiraListComments(BaseTool):
         return ToolResult(output=json.dumps(result))
 
 
+class SCMPush(BaseTool):
+    """Push a local branch to the remote via SCM Agent."""
+
+    name = "scm_push"
+    description = "Push a local branch to the remote repository through the SCM Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_path": {"type": "string", "description": "Local repository path"},
+            "branch": {"type": "string", "description": "Local branch name"},
+        },
+        "required": ["repo_path", "branch"],
+    }
+
+    def execute_sync(self, repo_path: str = "", branch: str = "") -> ToolResult:
+        result = _dispatch_scm(
+            "scm.branch.push",
+            text=branch,
+            repoPath=repo_path,
+            branch=branch,
+        )
+        return ToolResult(output=json.dumps(result))
+
+
+class SCMCreatePR(BaseTool):
+    """Create a PR through the SCM Agent using the repo URL to derive coordinates."""
+
+    name = "scm_create_pr"
+    description = "Create a pull request through the SCM Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string", "description": "Repository URL used to derive project/owner and repo"},
+            "source_branch": {"type": "string", "description": "Source branch name"},
+            "target_branch": {"type": "string", "description": "Target branch name", "default": "main"},
+            "title": {"type": "string", "description": "Pull request title"},
+            "description": {"type": "string", "description": "Pull request description"},
+        },
+        "required": ["repo_url", "source_branch", "title", "description"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        source_branch: str = "",
+        target_branch: str = "main",
+        title: str = "",
+        description: str = "",
+    ) -> ToolResult:
+        project, repo = _parse_repo_coordinates(repo_url)
+        if not project or not repo:
+            return ToolResult(output=json.dumps({"error": "Unable to infer project/repo from repo_url"}))
+
+        result = _dispatch_scm(
+            "scm.pr.create",
+            text=title,
+            project=project,
+            repo=repo,
+            sourceBranch=source_branch,
+            targetBranch=target_branch,
+            title=title,
+            description=description,
+        )
+        return ToolResult(output=json.dumps(result))
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -193,5 +310,7 @@ def register_web_dev_tools():
         JiraListTransitions,
         JiraGetTokenUser,
         JiraListComments,
+        SCMPush,
+        SCMCreatePR,
     ):
         registry.register(tool_cls())

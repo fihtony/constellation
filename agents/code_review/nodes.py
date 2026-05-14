@@ -88,7 +88,9 @@ async def load_pr_context(state: dict) -> dict:
     # Write review start log
     if workspace_path:
         review_dir = os.path.join(workspace_path, "code-review")
+        checkpoints_dir = os.path.join(review_dir, "review-checkpoints")
         os.makedirs(review_dir, exist_ok=True)
+        os.makedirs(checkpoints_dir, exist_ok=True)
         try:
             log_file = os.path.join(review_dir, "task-log.json")
             with open(log_file, "w", encoding="utf-8") as fh:
@@ -101,6 +103,21 @@ async def load_pr_context(state: dict) -> dict:
                     "data": {
                         "pr_url": metadata.get("prUrl", ""),
                         "changed_files_count": len(changed_files) if isinstance(changed_files, list) else 0,
+                        "has_jira_context": bool(jira_context),
+                        "has_design_context": bool(design_context),
+                    },
+                }, fh, ensure_ascii=False, indent=2)
+
+            checkpoint_file = os.path.join(checkpoints_dir, "review-start.json")
+            with open(checkpoint_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "checkpoint_id": "CP_REVIEW_STARTED",
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "agent_id": "code-review",
+                    "state": {
+                        "pr_url": metadata.get("prUrl", ""),
+                        "workspace_path": workspace_path,
+                        "context_manifest_path": context_manifest_path,
                         "has_jira_context": bool(jira_context),
                         "has_design_context": bool(design_context),
                     },
@@ -251,6 +268,8 @@ async def generate_report(state: dict) -> dict:
         },
         "checked_artifacts": [
             p for p in [
+                "team_lead/jira-ticket.json" if state.get("jira_context") else "",
+                "team_lead/design-spec.json" if state.get("design_context") else "",
                 state.get("context_manifest_path", ""),
                 "web-agent/self-assessment.json",
                 "web-agent/pr-evidence.json",
@@ -262,7 +281,9 @@ async def generate_report(state: dict) -> dict:
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
         review_dir = os.path.join(workspace_path, "code-review")
+        checkpoints_dir = os.path.join(review_dir, "review-checkpoints")
         os.makedirs(review_dir, exist_ok=True)
+        os.makedirs(checkpoints_dir, exist_ok=True)
         try:
             report_file = os.path.join(review_dir, "review-report.json")
             with open(report_file, "w", encoding="utf-8") as fh:
@@ -274,6 +295,19 @@ async def generate_report(state: dict) -> dict:
                     },
                     "data": report,
                 }, fh, ensure_ascii=False, indent=2)
+
+            checkpoint_file = os.path.join(checkpoints_dir, "review-summary.json")
+            with open(checkpoint_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "checkpoint_id": "CP_REVIEW_SUMMARIZED",
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "agent_id": "code-review",
+                    "state": {
+                        "verdict": verdict,
+                        "severity_levels": report["severity_levels"],
+                        "checked_artifacts": report["checked_artifacts"],
+                    },
+                }, fh, ensure_ascii=False, indent=2)
         except OSError:
             pass
 
@@ -282,5 +316,6 @@ async def generate_report(state: dict) -> dict:
         "all_comments": all_comments,
         "report_summary": " ".join(summary_parts),
         "severity_levels": report["severity_levels"],
+        "checked_artifacts": report["checked_artifacts"],
     }
 

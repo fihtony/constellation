@@ -63,8 +63,9 @@ class SCMAgentAdapter(BaseAgent):
         from framework.a2a.protocol import Artifact, TaskState, TaskStatus
 
         task_store = self.services.task_store
-        capability = (message.get("metadata") or {}).get("requestedCapability", "")
-        parts = message.get("parts") or []
+        msg = message.get("message", message)
+        capability = (msg.get("metadata") or {}).get("requestedCapability", "")
+        parts = msg.get("parts") or []
         text = next((p.get("text", "") for p in parts if p.get("text")), "")
 
         task = task_store.create_task(
@@ -72,7 +73,7 @@ class SCMAgentAdapter(BaseAgent):
             metadata={"capability": capability},
         )
 
-        result = self._dispatch(capability, text, message)
+        result = self._dispatch(capability, text, msg)
         artifacts = [Artifact(
             name="scm-result",
             artifact_type="application/json",

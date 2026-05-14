@@ -41,7 +41,8 @@ class CompassAgent(BaseAgent):
 
         register_compass_tools()
 
-        parts = message.get("parts") or []
+        msg = message.get("message", message)
+        parts = msg.get("parts") or []
         user_text = next((p.get("text", "") for p in parts if p.get("text")), "")
 
         # Create task via TaskStore

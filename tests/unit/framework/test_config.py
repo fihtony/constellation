@@ -1,8 +1,6 @@
 """Unit tests for framework/config.py — unified layered configuration loader."""
 from __future__ import annotations
 
-import os
-import tempfile
 import textwrap
 
 import pytest
@@ -11,7 +9,6 @@ import pytest
 @pytest.fixture()
 def project_dir(tmp_path):
     """Create a minimal project directory with global and agent configs."""
-    # Global config
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     (config_dir / "constellation.yaml").write_text(textwrap.dedent("""\
@@ -20,7 +17,7 @@ def project_dir(tmp_path):
           version: "2.0.0"
         runtime:
           backend: connect-agent
-          model: gpt-5-mini
+          model: gpt-5.4-mini
         skills:
           directory: skills
         data:
@@ -32,7 +29,6 @@ def project_dir(tmp_path):
           url: http://registry:9000
     """))
 
-    # Agent config — team_lead
     agent_dir = tmp_path / "agents" / "team_lead"
     agent_dir.mkdir(parents=True)
     (agent_dir / "config.yaml").write_text(textwrap.dedent("""\
@@ -42,14 +38,13 @@ def project_dir(tmp_path):
         mode: task
         execution_mode: persistent
         runtime_backend: connect-agent
-        model: gpt-5-mini
+        model: gpt-5.4-mini
         tools:
           - dispatch_agent
           - query_registry
         port: 8030
     """))
 
-    # Agent config — web_dev (with skills)
     wd_dir = tmp_path / "agents" / "web_dev"
     wd_dir.mkdir(parents=True)
     (wd_dir / "config.yaml").write_text(textwrap.dedent("""\
@@ -57,7 +52,7 @@ def project_dir(tmp_path):
         name: "Web Dev Agent"
         mode: task
         execution_mode: per-task
-        model: gpt-5-mini
+        model: gpt-5.4-mini
         default_skills:
           - react-nextjs
           - testing
@@ -68,7 +63,6 @@ def project_dir(tmp_path):
           scm: read-write
     """))
 
-    # Permissions
     perm_dir = config_dir / "permissions"
     perm_dir.mkdir()
     (perm_dir / "development.yaml").write_text(textwrap.dedent("""\
@@ -90,7 +84,7 @@ class TestLoadGlobalConfig:
         cfg = load_global_config(project_dir)
         assert cfg.get("project.name") == "constellation"
         assert cfg.get("runtime.backend") == "connect-agent"
-        assert cfg.get("runtime.model") == "gpt-5-mini"
+        assert cfg.get("runtime.model") == "gpt-5.4-mini"
         assert cfg.get("container.runtime") == "docker"
 
     def test_missing_file_returns_empty(self, tmp_path):
@@ -105,11 +99,9 @@ class TestLoadAgentConfig:
         from framework.config import load_agent_config
 
         cfg = load_agent_config("team-lead", project_dir)
-        # Agent-specific values
         assert cfg.get("agent_id") == "team-lead"
         assert cfg.get("name") == "Team Lead Agent"
         assert cfg.get("port") == 8030
-        # Global values inherited
         assert cfg.get("project.name") == "constellation"
         assert cfg.get("container.network") == "constellation-network"
 
@@ -118,7 +110,7 @@ class TestLoadAgentConfig:
         from framework.config import load_agent_config
 
         cfg = load_agent_config("team-lead", project_dir)
-        assert cfg.get("model") == "gpt-5-mini"
+        assert cfg.get("model") == "gpt-5.4-mini"
 
     def test_env_override(self, project_dir, monkeypatch):
         from framework.config import load_agent_config
@@ -139,9 +131,7 @@ class TestLoadAgentConfig:
     def test_cli_override(self, project_dir):
         from framework.config import load_agent_config
 
-        cfg = load_agent_config(
-            "team-lead", project_dir, overrides={"port": 9999}
-        )
+        cfg = load_agent_config("team-lead", project_dir, overrides={"port": 9999})
         assert cfg.get("port") == 9999
 
     def test_nonexistent_agent_returns_global(self, project_dir):
@@ -156,17 +146,17 @@ class TestBuildAgentDefinitionFromConfig:
     def test_builds_definition_dict(self, project_dir):
         from framework.config import build_agent_definition_from_config
 
-        defn = build_agent_definition_from_config("team-lead", project_dir)
-        assert defn["agent_id"] == "team-lead"
-        assert defn["name"] == "Team Lead Agent"
-        assert defn["mode"] == "task"
-        assert "dispatch_agent" in defn["tools"]
+        definition = build_agent_definition_from_config("team-lead", project_dir)
+        assert definition["agent_id"] == "team-lead"
+        assert definition["name"] == "Team Lead Agent"
+        assert definition["mode"] == "task"
+        assert "dispatch_agent" in definition["tools"]
 
     def test_skills_from_default_skills(self, project_dir):
         from framework.config import build_agent_definition_from_config
 
-        defn = build_agent_definition_from_config("web-dev", project_dir)
-        assert defn["skills"] == ["react-nextjs", "testing"]
+        definition = build_agent_definition_from_config("web-dev", project_dir)
+        assert definition["skills"] == ["react-nextjs", "testing"]
 
 
 class TestDeepMerge:
@@ -218,7 +208,6 @@ class TestConstellationConfig:
         from framework.config import load_global_config
 
         cfg = load_global_config(project_dir)
-        d = cfg.to_dict()
-        d["new_key"] = "value"
-        # Original config data is not affected
+        data = cfg.to_dict()
+        data["new_key"] = "value"
         assert "new_key" not in cfg.data

@@ -119,10 +119,12 @@ async def gather_context(state: dict) -> dict:
                 "fetch_jira_ticket", {"ticket_key": jira_key}
             )
             payload = json.loads(result_str) if result_str else {}
-            if not payload.get("error"):
-                jira_context = payload
+            if payload.get("error"):
+                raise RuntimeError(f"Jira ticket not accessible: {payload['error']}")
+            jira_context = payload
         except Exception as exc:
             print(f"[team-lead] Jira fetch failed: {exc}")
+            raise RuntimeError(f"Jira ticket not accessible: {jira_key}") from exc
 
     # Write Jira ticket to workspace
     if jira_context and workspace_path:
@@ -155,10 +157,12 @@ async def gather_context(state: dict) -> dict:
                 args["stitch_project_id"] = stitch_id
             result_str = registry.execute_sync("fetch_design", args)
             payload = json.loads(result_str) if result_str else {}
-            if not payload.get("error"):
-                design_context = payload
+            if payload.get("error"):
+                raise RuntimeError(f"Design context unavailable: {payload['error']}")
+            design_context = payload
         except Exception as exc:
             print(f"[team-lead] Design fetch failed: {exc}")
+            raise RuntimeError("Design context unavailable") from exc
 
     # Write design context to workspace
     if design_context and workspace_path:
@@ -200,12 +204,18 @@ async def gather_context(state: dict) -> dict:
             )
             clone_payload = json.loads(clone_result_str) if clone_result_str else {}
             if clone_payload.get("error"):
-                print(f"[team-lead] Repo clone failed: {clone_payload['error']}")
-            else:
-                repo_cloned = True
-                print(f"[team-lead] Repo cloned: {repo_name} → {repo_path}")
+                raise RuntimeError(clone_payload["error"])
+
+            repo_exists = os.path.isdir(repo_path)
+            repo_has_files = repo_exists and any(os.scandir(repo_path))
+            if not repo_exists or not repo_has_files:
+                raise RuntimeError("cloned repository path is missing or empty")
+
+            repo_cloned = True
+            print(f"[team-lead] Repo cloned: {repo_name} → {repo_path}")
         except Exception as exc:
             print(f"[team-lead] Repo clone failed: {exc}")
+            raise RuntimeError(f"Repo clone failed: {repo_url}") from exc
 
     # Write context manifest
     context_manifest_path = ""

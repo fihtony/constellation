@@ -60,7 +60,7 @@ def _env(key: str, default: str = "") -> str:
 
 # Set LLM env
 os.environ.setdefault("OPENAI_BASE_URL", _env("OPENAI_BASE_URL", "http://localhost:1288/v1"))
-os.environ.setdefault("OPENAI_MODEL", _env("OPENAI_MODEL", "gpt-5-mini"))
+os.environ.setdefault("OPENAI_MODEL", _env("OPENAI_MODEL", "gpt-5.4-mini"))
 os.environ.setdefault("OPENAI_API_KEY", _env("OPENAI_API_KEY", ""))
 os.environ.setdefault("AGENT_RUNTIME", "connect-agent")
 

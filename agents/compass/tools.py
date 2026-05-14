@@ -13,6 +13,20 @@ from typing import Any
 from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
 
+
+def _resolve_team_lead_url() -> str:
+    """Resolve the Team Lead endpoint via Registry before falling back."""
+    try:
+        from framework.registry_client import RegistryClient
+
+        discovered = RegistryClient.from_config().discover("team-lead.task.analyze")
+        if discovered:
+            return discovered
+    except Exception:
+        pass
+
+    return os.environ.get("TEAM_LEAD_URL", "http://team-lead:8030")
+
 # ---------------------------------------------------------------------------
 # Tool: dispatch_development_task
 # ---------------------------------------------------------------------------
@@ -56,7 +70,7 @@ class DispatchDevelopmentTask(BaseTool):
         repo_url: str = "",
         design_url: str = "",
     ) -> ToolResult:
-        team_lead_url = os.environ.get("TEAM_LEAD_URL", "http://team-lead:8030")
+        team_lead_url = _resolve_team_lead_url()
         meta: dict[str, Any] = {}
         if jira_key:
             meta["jiraKey"] = jira_key
@@ -74,6 +88,13 @@ class DispatchDevelopmentTask(BaseTool):
                 metadata=meta,
             )
             task = result.get("task", result)
+            task_state = task.get("status", {}).get("state", "")
+            if task_state and task_state != "TASK_STATE_COMPLETED":
+                return ToolResult(output=json.dumps({
+                    "status": "error",
+                    "state": task_state,
+                    "message": _extract_status_text(task) or f"Team Lead ended in {task_state}",
+                }))
             artifacts = task.get("artifacts", [])
             summary = _extract_text(artifacts) or "Task completed."
             return ToolResult(output=json.dumps({"status": "completed", "summary": summary}))
@@ -156,4 +177,12 @@ def _extract_text(artifacts: list[dict]) -> str:
         for part in art.get("parts", []):
             if "text" in part:
                 return part["text"]
+    return ""
+
+
+def _extract_status_text(task: dict) -> str:
+    parts = task.get("status", {}).get("message", {}).get("parts", [])
+    for part in parts:
+        if "text" in part:
+            return part["text"]
     return ""

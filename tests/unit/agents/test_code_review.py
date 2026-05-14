@@ -113,6 +113,21 @@ class TestLoadPrContext:
         assert result["changed_files"] == []
         assert result["pr_description"] == ""
 
+    async def test_writes_review_start_checkpoint(self, tmp_path):
+        state = {
+            "metadata": {
+                "prUrl": "https://example.com/pr/1",
+                "workspacePath": str(tmp_path),
+                "contextManifestPath": "team_lead/context-manifest.json",
+                "jiraContext": {"key": "PROJ-123"},
+            }
+        }
+
+        await load_pr_context(state)
+
+        checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-start.json"
+        assert checkpoint_file.exists()
+
 
 class TestReviewQuality:
 
@@ -283,6 +298,25 @@ class TestGenerateReport:
         }
         result = await generate_report(state)
         assert "approved" in result["report_summary"].lower()
+
+    async def test_writes_review_summary_checkpoint_and_checked_artifacts(self, tmp_path):
+        state = {
+            "quality_issues": [],
+            "security_issues": [],
+            "test_issues": [],
+            "requirement_gaps": [],
+            "workspace_path": str(tmp_path),
+            "context_manifest_path": "team_lead/context-manifest.json",
+            "jira_context": {"key": "PROJ-123"},
+            "design_context": {"screen": "Login"},
+        }
+
+        result = await generate_report(state)
+
+        checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-summary.json"
+        assert checkpoint_file.exists()
+        assert "team_lead/jira-ticket.json" in result["checked_artifacts"]
+        assert "team_lead/design-spec.json" in result["checked_artifacts"]
 
 
 class TestCodeReviewWorkflowExecution:

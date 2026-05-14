@@ -97,10 +97,11 @@ class JiraAgentAdapter(BaseAgent):
         from framework.a2a.protocol import Artifact, TaskState, TaskStatus
 
         task_store = self.services.task_store
-        capability = (message.get("metadata") or {}).get("requestedCapability", "")
-        parts = message.get("parts") or []
+        msg = message.get("message", message)
+        capability = (msg.get("metadata") or {}).get("requestedCapability", "")
+        parts = msg.get("parts") or []
         text = next((p.get("text", "") for p in parts if p.get("text")), "")
-        meta = message.get("metadata") or {}
+        meta = msg.get("metadata") or {}
 
         task = task_store.create_task(
             agent_id=self.definition.agent_id,

@@ -520,7 +520,7 @@ REGISTRY_URL=http://registry:9000
 #   localhost on host, host.docker.internal in Docker,
 #   host.rancher-desktop.internal in Rancher
 # OPENAI_BASE_URL=
-OPENAI_MODEL=gpt-5-mini
+OPENAI_MODEL=gpt-5.4-mini
 OPENAI_API_KEY=
 
 # Runtime

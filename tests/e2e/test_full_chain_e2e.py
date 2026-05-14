@@ -195,6 +195,26 @@ def _make_stub_code_review_tool():
     return StubDispatchCodeReview()
 
 
+def _make_stub_jira_tool():
+    """Return a stub fetch_jira_ticket tool for fail-fast Team Lead tests."""
+    from framework.tools.base import BaseTool, ToolResult
+
+    class StubFetchJiraTicket(BaseTool):
+        name = "fetch_jira_ticket"
+        description = "Stub: returns a minimal Jira ticket payload."
+        parameters_schema = {"type": "object", "properties": {}, "required": []}
+
+        def execute_sync(self, ticket_key: str = "") -> ToolResult:
+            return ToolResult(output=json.dumps({
+                "key": ticket_key or "PROJ-123",
+                "summary": "Stub Jira ticket",
+                "description": "Stubbed ticket for full-chain tests.",
+                "acceptanceCriteria": ["Create the requested change"],
+            }))
+
+    return StubFetchJiraTicket()
+
+
 # ---------------------------------------------------------------------------
 # TC-11: Team Lead → (stub) Web Dev → (stub) Code Review
 # ---------------------------------------------------------------------------
@@ -219,8 +239,10 @@ async def test_team_lead_to_web_dev_to_code_review_full_chain():
     await team_lead_agent.start()
 
     registry = get_registry()
+    original_jira = registry.get("fetch_jira_ticket")
     original_web_dev = registry.get("dispatch_web_dev")
     original_code_review = registry.get("dispatch_code_review")
+    registry.register(_make_stub_jira_tool())
     registry.register(_make_stub_web_dev_tool())
     registry.register(_make_stub_code_review_tool())
 
@@ -261,6 +283,10 @@ async def test_team_lead_to_web_dev_to_code_review_full_chain():
         print(f"\n[e2e-chain] Team Lead report:\n{report[:400]}")
 
     finally:
+        if original_jira:
+            registry.register(original_jira)
+        else:
+            registry.unregister("fetch_jira_ticket")
         if original_web_dev:
             registry.register(original_web_dev)
         else:
@@ -348,8 +374,10 @@ async def test_full_chain_compass_to_code_review():
     await compass_agent.start()
 
     registry = get_registry()
+    original_jira = registry.get("fetch_jira_ticket")
     original_web_dev = registry.get("dispatch_web_dev")
     original_code_review = registry.get("dispatch_code_review")
+    registry.register(_make_stub_jira_tool())
     registry.register(_make_stub_web_dev_tool())
     registry.register(_make_stub_code_review_tool())
 
@@ -379,6 +407,10 @@ async def test_full_chain_compass_to_code_review():
         print(f"[e2e-full] TL report: {_tl_summary[0][:200]}")
 
     finally:
+        if original_jira:
+            registry.register(original_jira)
+        else:
+            registry.unregister("fetch_jira_ticket")
         if original_web_dev:
             registry.register(original_web_dev)
         else:

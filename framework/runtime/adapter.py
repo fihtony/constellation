@@ -5,7 +5,7 @@ All agents that need LLM reasoning should call ``get_runtime().run(...)``
 instead of invoking a raw LLM API directly.
 
 Default backend: ``connect-agent`` (uses Copilot Connect / OpenAI-compatible API).
-Model default: ``gpt-5-mini``.
+Model default: ``gpt-5.4-mini``.
 """
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ class AgenticCheckpoint:
 # Abstract base
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "gpt-5-mini"
+DEFAULT_MODEL = "gpt-5.4-mini"
 DEFAULT_BACKEND = "connect-agent"
 
 

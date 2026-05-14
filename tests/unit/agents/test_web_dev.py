@@ -3,6 +3,7 @@ import json
 import pytest
 from framework.workflow import START, END
 from agents.web_dev.agent import web_dev_workflow, web_dev_definition
+from agents.web_dev.tools import SCMCreatePR, register_web_dev_tools
 from agents.web_dev.nodes import (
     setup_workspace,
     analyze_task,
@@ -262,4 +263,45 @@ class TestWebDevWorkflowExecution:
         assert "implementation_plan" in result
         assert "test_results" in result
         assert "success" in result
+
+
+class TestWebDevBoundaryTools:
+
+    def test_register_web_dev_tools_includes_scm_tools(self):
+        from framework.tools.registry import get_registry
+
+        register_web_dev_tools()
+        registry = get_registry()
+        assert registry.get("scm_push") is not None
+        assert registry.get("scm_create_pr") is not None
+
+    def test_scm_create_pr_derives_bitbucket_coordinates(self, monkeypatch):
+        dispatched = {}
+
+        def _dispatch_sync(url, capability, message_parts, metadata, **kwargs):
+            dispatched["capability"] = capability
+            dispatched["metadata"] = metadata
+            return {
+                "task": {
+                    "artifacts": [
+                        {"parts": [{"text": json.dumps({"prUrl": "https://bitbucket/pr/42", "status": 201})}]}
+                    ]
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        result = SCMCreatePR().execute_sync(
+            repo_url="https://bitbucket.example.com/projects/PROJ/repos/web-ui-test/browse",
+            source_branch="feature/proj-123",
+            target_branch="main",
+            title="PROJ-123: add login page",
+            description="PR body",
+        )
+
+        payload = json.loads(result.output)
+        assert payload["prUrl"] == "https://bitbucket/pr/42"
+        assert dispatched["capability"] == "scm.pr.create"
+        assert dispatched["metadata"]["project"] == "PROJ"
+        assert dispatched["metadata"]["repo"] == "web-ui-test"
 
