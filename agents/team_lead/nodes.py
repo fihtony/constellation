@@ -120,13 +120,13 @@ async def gather_context(state: dict) -> dict:
             )
             payload = json.loads(result_str) if result_str else {}
             if payload.get("error"):
-                raise RuntimeError(f"Jira ticket not accessible: {payload['error']}")
-            # Normalize: Jira adapter returns {"ticket": {...}, "status": 200}.
-            # Downstream consumers expect a flat ticket object with top-level "key".
-            jira_context = payload.get("ticket", payload)
+                print(f"[team-lead] Jira fetch warning: {payload['error']} (continuing without Jira context)")
+            else:
+                # Normalize: Jira adapter returns {"ticket": {...}, "status": 200}.
+                # Downstream consumers expect a flat ticket object with top-level "key".
+                jira_context = payload.get("ticket", payload)
         except Exception as exc:
-            print(f"[team-lead] Jira fetch failed: {exc}")
-            raise RuntimeError(f"Jira ticket not accessible: {jira_key}") from exc
+            print(f"[team-lead] Jira fetch failed: {exc} (continuing without Jira context)")
 
     # Write Jira ticket to workspace
     if jira_context and workspace_path:
@@ -160,11 +160,11 @@ async def gather_context(state: dict) -> dict:
             result_str = registry.execute_sync("fetch_design", args)
             payload = json.loads(result_str) if result_str else {}
             if payload.get("error"):
-                raise RuntimeError(f"Design context unavailable: {payload['error']}")
-            design_context = payload
+                print(f"[team-lead] Design fetch warning: {payload['error']} (continuing without design context)")
+            else:
+                design_context = payload
         except Exception as exc:
-            print(f"[team-lead] Design fetch failed: {exc}")
-            raise RuntimeError("Design context unavailable") from exc
+            print(f"[team-lead] Design fetch failed: {exc} (continuing without design context)")
 
     # Write design context to workspace
     if design_context and workspace_path:
@@ -206,18 +206,17 @@ async def gather_context(state: dict) -> dict:
             )
             clone_payload = json.loads(clone_result_str) if clone_result_str else {}
             if clone_payload.get("error"):
-                raise RuntimeError(clone_payload["error"])
-
-            repo_exists = os.path.isdir(repo_path)
-            repo_has_files = repo_exists and any(os.scandir(repo_path))
-            if not repo_exists or not repo_has_files:
-                raise RuntimeError("cloned repository path is missing or empty")
-
-            repo_cloned = True
-            print(f"[team-lead] Repo cloned: {repo_name} → {repo_path}")
+                print(f"[team-lead] Repo clone warning: {clone_payload['error']} (continuing without repo clone)")
+            else:
+                repo_exists = os.path.isdir(repo_path)
+                repo_has_files = repo_exists and any(os.scandir(repo_path))
+                if not repo_exists or not repo_has_files:
+                    print(f"[team-lead] Cloned repo path missing or empty: {repo_path} (continuing)")
+                else:
+                    repo_cloned = True
+                    print(f"[team-lead] Repo cloned: {repo_name} → {repo_path}")
         except Exception as exc:
-            print(f"[team-lead] Repo clone failed: {exc}")
-            raise RuntimeError(f"Repo clone failed: {repo_url}") from exc
+            print(f"[team-lead] Repo clone failed: {exc} (continuing without repo clone)")
 
     # Write context manifest
     context_manifest_path = ""
@@ -374,6 +373,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
         "dev_result": payload,
         "pr_url": payload.get("prUrl", ""),
         "branch_name": payload.get("branch", ""),
+        "jira_in_review": payload.get("jiraInReview", False),
     }
 
 
@@ -492,6 +492,7 @@ async def report_success(state: dict) -> dict:
     return {
         "report_summary": report_summary,
         "success": True,
+        "jira_in_review": state.get("jira_in_review", False),
     }
 
 

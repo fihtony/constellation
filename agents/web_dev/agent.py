@@ -185,7 +185,7 @@ class WebDevAgent(BaseAgent):
                             "agentId": self.definition.agent_id,
                             "prUrl": result.get("pr_url", ""),
                             "branch": result.get("branch_name", ""),
-                            "jiraInReview": result.get("jira_updated", False),
+                            "jiraInReview": result.get("jira_in_review", False),
                         },
                     )
                 ]
@@ -239,7 +239,7 @@ def _send_callback(
                     "agentId": agent_id,
                     "prUrl": result.get("pr_url", ""),
                     "branch": result.get("branch_name", ""),
-                    "jiraInReview": result.get("jira_updated", False),
+                    "jiraInReview": result.get("jira_in_review", False),
                 },
             }
         ],

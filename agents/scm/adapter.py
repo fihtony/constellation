@@ -16,6 +16,7 @@ import os
 import subprocess
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
+from framework.env_utils import build_isolated_git_env
 
 scm_definition = AgentDefinition(
     agent_id="scm",
@@ -150,24 +151,27 @@ class SCMAgentAdapter(BaseAgent):
     # Git subprocess operations
     # ------------------------------------------------------------------
 
-    def _build_auth_url(self, repo_url: str) -> str:
-        """Build an authenticated clone URL with token embedded."""
-        from urllib.parse import urlparse, urlunparse
+    def _build_auth_header(self, repo_url: str) -> str:
+        """Build a git http.extraHeader value for credentials.
+
+        Returns an ``Authorization: ...`` header string for use with
+        ``git -c http.extraHeader=<value>``.  Credentials are NOT
+        embedded in the remote URL.
+        """
+        import base64
+        from urllib.parse import urlparse
 
         token = os.environ.get("SCM_TOKEN", "")
-        parsed = urlparse(repo_url)
-        # For Bitbucket bearer: embed token in URL
-        # For GitHub: embed token as username
-        if "github" in parsed.netloc.lower():
-            authed = parsed._replace(netloc=f"{token}@{parsed.netloc}")
+        netloc = urlparse(repo_url).netloc.lower()
+        if "github" in netloc:
+            return f"Authorization: Bearer {token}"
+        # Bitbucket Server / Data Center: HTTP Basic auth
+        username = os.environ.get("SCM_USERNAME", "")
+        if username:
+            creds = base64.b64encode(f"{username}:{token}".encode()).decode()
         else:
-            # Bitbucket: use HTTP header via git config or embed in URL
-            username = os.environ.get("SCM_USERNAME", "")
-            if username:
-                authed = parsed._replace(netloc=f"{username}:{token}@{parsed.netloc}")
-            else:
-                authed = parsed._replace(netloc=f"x-token-auth:{token}@{parsed.netloc}")
-        return urlunparse(authed)
+            creds = base64.b64encode(f"x-token-auth:{token}".encode()).decode()
+        return f"Authorization: Basic {creds}"
 
     def _handle_clone(self, meta: dict) -> dict:
         """Clone a repository to a target path."""
@@ -179,27 +183,31 @@ class SCMAgentAdapter(BaseAgent):
         # Strip /browse suffix from Bitbucket URLs
         clean_url = repo_url.split("/browse")[0].rstrip("/")
 
-        # Build authenticated clone URL
-        auth_url = self._build_auth_url(clean_url)
+        # Pass auth via git config header — no credentials in URL
+        auth_header = self._build_auth_header(clean_url)
 
         try:
             os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
             result = subprocess.run(
-                ["git", "clone", "--depth", "1", auth_url, target_path],
+                ["git", "-c", f"http.extraHeader={auth_header}",
+                 "clone", "--depth", "1", clean_url, target_path],
                 capture_output=True, text=True, timeout=120,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                env=build_isolated_git_env(),
             )
             if result.returncode != 0:
+                # stderr from git will not contain credentials (they are in -c, not in URL)
+                stderr_safe = result.stderr.strip()[:400]
                 return {
                     "cloned": False,
-                    "error": result.stderr.strip()[:500],
+                    "error": "Clone failed — check SCM_TOKEN and SCM_USERNAME.",
+                    "detail": stderr_safe,
                     "status": "clone_failed",
                 }
             return {"cloned": True, "path": target_path, "status": "ok"}
         except subprocess.TimeoutExpired:
             return {"cloned": False, "error": "clone timed out", "status": "timeout"}
         except Exception as exc:
-            return {"cloned": False, "error": str(exc)[:500], "status": "error"}
+            return {"cloned": False, "error": str(exc)[:200], "status": "error"}
 
     def _handle_push(self, meta: dict) -> dict:
         """Push a local branch to the remote."""
@@ -209,35 +217,35 @@ class SCMAgentAdapter(BaseAgent):
             return {"error": "repoPath and branch are required", "status": "error"}
 
         try:
-            # Set the push URL with auth
             remote_url = subprocess.run(
                 ["git", "-C", repo_path, "remote", "get-url", "origin"],
                 capture_output=True, text=True, timeout=10,
             ).stdout.strip()
-            if remote_url:
-                auth_url = self._build_auth_url(remote_url)
-                subprocess.run(
-                    ["git", "-C", repo_path, "remote", "set-url", "origin", auth_url],
-                    capture_output=True, text=True, timeout=10,
-                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-                )
+
+            # Pass auth via git config header — no credentials stored in the remote URL
+            auth_header = self._build_auth_header(remote_url) if remote_url else ""
+            cmd = ["git", "-C", repo_path]
+            if auth_header:
+                cmd += ["-c", f"http.extraHeader={auth_header}"]
+            cmd += ["push", "-u", "origin", branch]
 
             result = subprocess.run(
-                ["git", "-C", repo_path, "push", "-u", "origin", branch],
-                capture_output=True, text=True, timeout=120,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                cmd, capture_output=True, text=True, timeout=120,
+                env=build_isolated_git_env(),
             )
             if result.returncode != 0:
+                stderr_safe = result.stderr.strip()[:400]
                 return {
                     "pushed": False,
-                    "error": result.stderr.strip()[:500],
+                    "error": "Push failed — check SCM_TOKEN and SCM_USERNAME.",
+                    "detail": stderr_safe,
                     "status": "push_failed",
                 }
             return {"pushed": True, "branch": branch, "status": "ok"}
         except subprocess.TimeoutExpired:
             return {"pushed": False, "error": "push timed out", "status": "timeout"}
         except Exception as exc:
-            return {"pushed": False, "error": str(exc)[:500], "status": "error"}
+            return {"pushed": False, "error": str(exc)[:200], "status": "error"}
 
     async def get_task(self, task_id: str) -> dict:
         return self.services.task_store.get_task_dict(task_id)

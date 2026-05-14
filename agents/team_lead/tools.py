@@ -346,11 +346,15 @@ class DispatchWebDev(BaseTool):
             summary = _extract_text(artifacts) or "Dev task completed."
             pr_url = _find_metadata(artifacts, "prUrl")
             branch = _find_metadata(artifacts, "branch")
+            jira_in_review_raw = _find_metadata(artifacts, "jiraInReview")
+            # _find_metadata returns a string; normalise to bool
+            jira_in_review = jira_in_review_raw in (True, "True", "true", "1")
             return ToolResult(output=json.dumps({
                 "status": "completed",
                 "summary": summary,
                 "prUrl": pr_url,
                 "branch": branch,
+                "jiraInReview": jira_in_review,
             }))
         except Exception as exc:
             return ToolResult(output=json.dumps({"status": "error", "message": str(exc)}))
@@ -419,14 +423,6 @@ class DispatchCodeReview(BaseTool):
             meta["prUrl"] = pr_url
         if requirements:
             meta["originalRequirements"] = requirements
-        if jira_context:
-            meta["jiraContext"] = jira_context
-        if design_context:
-            meta["designContext"] = design_context
-        if workspace_path:
-            meta["workspacePath"] = workspace_path
-        if context_manifest_path:
-            meta["contextManifestPath"] = context_manifest_path
         if jira_context:
             meta["jiraContext"] = jira_context
         if design_context:

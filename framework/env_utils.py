@@ -71,3 +71,43 @@ def env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# ---------------------------------------------------------------------------
+# Isolated Git environment
+# ---------------------------------------------------------------------------
+
+# Env vars that carry Git credentials or affect credential discovery.
+# These must be scrubbed before spawning git subprocesses in agents so that
+# host keychains, user ~/.gitconfig, and system credential helpers are never
+# consulted — only the explicit token passed via the authenticated URL.
+_GIT_CREDENTIAL_VARS = frozenset({
+    "GIT_ASKPASS", "SSH_ASKPASS", "GIT_CREDENTIAL_HELPER",
+    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+    "GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN",
+    "SCM_TOKEN", "SCM_USERNAME", "SCM_PASSWORD",
+    "GCM_CREDENTIAL_STORE", "CREDENTIAL_HELPER",
+    "HOME",  # prevents ~/.gitconfig from being read
+})
+
+
+def build_isolated_git_env(**extra: str) -> dict[str, str]:
+    """Build a minimal subprocess environment for git operations.
+
+    Strips host Git credential helpers, keychains, user ~/.gitconfig, and
+    ambient GitHub tokens from the environment.  The caller passes the auth
+    token via an authenticated remote URL instead.
+
+    ``extra`` key/value pairs are merged in last (use to override PATH,
+    GIT_TERMINAL_PROMPT=0, etc.).
+    """
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in _GIT_CREDENTIAL_VARS:
+            continue
+        env[key] = value
+
+    # Always disable interactive prompts in git subprocesses
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.update(extra)
+    return env

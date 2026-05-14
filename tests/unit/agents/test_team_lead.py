@@ -108,23 +108,28 @@ class TestTeamLeadAgent:
 
 
 class TestGatherContextFailures:
-    async def test_gather_context_fails_when_jira_fetch_fails(self, monkeypatch, tmp_path):
+    async def test_gather_context_continues_when_jira_fetch_fails(self, monkeypatch, tmp_path):
+        """Jira fetch failure is best-effort — workflow continues without Jira context."""
         from agents.team_lead.nodes import gather_context
 
         class StubRegistry:
             def execute_sync(self, name, args):
-                assert name == "fetch_jira_ticket"
-                return json.dumps({"error": "401 unauthorized"})
+                if name == "fetch_jira_ticket":
+                    return json.dumps({"error": "401 unauthorized"})
+                return json.dumps({})
 
         monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
 
-        with pytest.raises(RuntimeError, match="Jira ticket not accessible"):
-            await gather_context({
-                "jira_key": "PROJ-123",
-                "workspace_path": str(tmp_path),
-            })
+        # Should NOT raise — best-effort continuation
+        result = await gather_context({
+            "jira_key": "PROJ-123",
+            "workspace_path": str(tmp_path),
+        })
+        # jira_context should remain empty/None
+        assert not result.get("jira_context")
 
-    async def test_gather_context_fails_when_repo_clone_fails(self, monkeypatch, tmp_path):
+    async def test_gather_context_continues_when_repo_clone_fails(self, monkeypatch, tmp_path):
+        """Repo clone failure is best-effort — workflow continues without clone."""
         from agents.team_lead.nodes import gather_context
 
         class StubRegistry:
@@ -135,11 +140,13 @@ class TestGatherContextFailures:
 
         monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
 
-        with pytest.raises(RuntimeError, match="Repo clone failed"):
-            await gather_context({
-                "repo_url": "https://example.com/org/repo.git",
-                "workspace_path": str(tmp_path),
-            })
+        # Should NOT raise — best-effort continuation
+        result = await gather_context({
+            "repo_url": "https://example.com/org/repo.git",
+            "workspace_path": str(tmp_path),
+        })
+        # repo_cloned should be False in the manifest
+        assert result.get("repo_cloned") is False or result.get("repo_cloned") is None
 
 
 class TestTeamLeadTools:

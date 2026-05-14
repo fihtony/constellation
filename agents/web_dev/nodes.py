@@ -110,23 +110,28 @@ async def prepare_jira(state: dict) -> dict:
         token_user = user_data.get("emailAddress", user_data.get("displayName", ""))
 
     # Transition to "In Progress" if not already
-    if original_status.lower() not in ("in progress",):
+    if original_status.lower() not in ("in progress", "in development", "in dev"):
         transitions_result = _call_boundary_tool(
             state, "jira_list_transitions", {"ticket_key": jira_key}
         )
         transitions = transitions_result.get("transitions", [])
-        can_transition = any(
-            t.get("name", "").lower() in ("in progress", "start progress")
-            for t in transitions
-            if isinstance(t, dict)
+        _IN_PROGRESS_NAMES = {
+            "in progress", "start progress", "in development", "in dev",
+            "start development", "start", "begin", "begin work",
+        }
+        in_progress_match = next(
+            (t for t in transitions
+             if isinstance(t, dict) and t.get("name", "").lower() in _IN_PROGRESS_NAMES),
+            None,
         )
-        if can_transition:
+        if in_progress_match:
             _call_boundary_tool(
                 state, "jira_transition",
-                {"ticket_key": jira_key, "transition_name": "In Progress"},
+                {"ticket_key": jira_key, "transition_name": in_progress_match["name"]},
             )
         else:
-            print(f"[web-dev] Cannot transition {jira_key} to In Progress; skipping")
+            avail = [t.get("name") for t in transitions if isinstance(t, dict)]
+            print(f"[web-dev] Cannot transition {jira_key} to In Progress; available: {avail}")
 
     # Update assignee to token user
     if token_user and token_user != original_assignee:
@@ -255,6 +260,27 @@ async def analyze_task(state: dict) -> dict:
     """
     # Team Lead already performed deep analysis — reuse it
     plan = state.get("analysis") or state.get("user_request", "")
+
+    # Write implementation-plan.json to workspace for auditability
+    workspace_path = state.get("workspace_path", "")
+    if workspace_path:
+        import time as _time
+        agent_dir = os.path.join(workspace_path, "web-agent")
+        os.makedirs(agent_dir, exist_ok=True)
+        try:
+            plan_file = os.path.join(agent_dir, "implementation-plan.json")
+            with open(plan_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "web-dev",
+                        "step": "analyze_task",
+                        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": {"implementation_plan": plan},
+                }, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
     return {
         "implementation_plan": plan,
     }
@@ -354,6 +380,27 @@ async def run_tests(state: dict) -> dict:
     data = _safe_json(result.summary, fallback={})
     failed = data.get("failed", 0)
     test_passed = int(failed) == 0 and result.success
+
+    # Write per-cycle test results for auditability
+    workspace_path = state.get("workspace_path", "")
+    if workspace_path:
+        import time as _time
+        results_dir = os.path.join(workspace_path, "web-agent", "test-results")
+        os.makedirs(results_dir, exist_ok=True)
+        try:
+            cycle_file = os.path.join(results_dir, f"test-run-{test_cycles}.json")
+            with open(cycle_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "web-dev",
+                        "step": "run_tests",
+                        "cycle": test_cycles,
+                        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": data,
+                }, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
 
     if test_passed:
         return {
@@ -670,15 +717,20 @@ async def update_jira(state: dict) -> dict:
         state, "jira_list_transitions", {"ticket_key": jira_key}
     )
     transitions = transitions_result.get("transitions", [])
-    can_review = any(
-        t.get("name", "").lower() in ("in review", "review", "code review")
-        for t in transitions
-        if isinstance(t, dict)
+    _IN_REVIEW_NAMES = {
+        "in review", "review", "code review", "ready for review",
+        "pending review", "awaiting review",
+    }
+    in_review_match = next(
+        (t for t in transitions
+         if isinstance(t, dict) and t.get("name", "").lower() in _IN_REVIEW_NAMES),
+        None,
     )
+    can_review = bool(in_review_match)
     if can_review:
         _call_boundary_tool(
             state, "jira_transition",
-            {"ticket_key": jira_key, "transition_name": "In Review"},
+            {"ticket_key": jira_key, "transition_name": in_review_match["name"]},
         )
 
     # Write jira-update-log.json to workspace
@@ -706,7 +758,7 @@ async def update_jira(state: dict) -> dict:
         except OSError:
             pass
 
-    return {"jira_updated": True}
+    return {"jira_updated": True, "jira_in_review": can_review}
 
 
 async def create_pr(state: dict) -> dict:
@@ -770,7 +822,10 @@ async def create_pr(state: dict) -> dict:
             "description": pr_description,
         },
     )
-    pr_data = pr_payload
+    # SCM adapter returns camelCase prUrl; snake_case pr_url is a fallback
+    pr_url = pr_payload.get("prUrl") or pr_payload.get("pr_url", "")
+    pr_number = pr_payload.get("prNumber") or pr_payload.get("pr_number", 0)
+    commit_hash = pr_payload.get("commitHash") or pr_payload.get("commit_hash", "")
 
     # Write pr-evidence.json to workspace
     workspace_path = state.get("workspace_path", "")
@@ -788,11 +843,11 @@ async def create_pr(state: dict) -> dict:
                         "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     },
                     "data": {
-                        "pr_url": pr_data.get("pr_url", ""),
-                        "pr_number": pr_data.get("pr_number", 0),
+                        "pr_url": pr_url,
+                        "pr_number": pr_number,
                         "branch": branch_name,
                         "title": pr_title,
-                        "commit_hash": pr_data.get("commit_hash", ""),
+                        "commit_hash": commit_hash,
                         "files_changed": len(state.get("changes_made", [])),
                         "test_status": state.get("test_status", "unknown"),
                         "self_assessment_score": state.get("self_assessment", {}).get("score", "N/A"),
@@ -803,11 +858,11 @@ async def create_pr(state: dict) -> dict:
             pass
 
     return {
-        "pr_url": pr_data.get("pr_url", ""),
-        "pr_number": pr_data.get("pr_number", 0),
+        "pr_url": pr_url,
+        "pr_number": pr_number,
         "pr_title": pr_title,
         "pr_description": pr_description,
-        "commit_hash": pr_data.get("commit_hash", ""),
+        "commit_hash": commit_hash,
     }
 
 

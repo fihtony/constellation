@@ -97,8 +97,10 @@ async def wait_for_result(state: dict) -> dict:
 async def completeness_gate(state: dict) -> dict:
     """Evaluate whether the downstream result is complete."""
     dev_result = state.get("dev_result", {})
-    pr_url = dev_result.get("pr_url")
+    # Team Lead returns camelCase keys in dev_result
+    pr_url = dev_result.get("prUrl") or dev_result.get("pr_url")
     success = dev_result.get("success", False)
+    jira_in_review = dev_result.get("jiraInReview") or dev_result.get("jira_in_review", False)
 
     if pr_url and success:
         return {"completeness_score": 1.0, "route": "complete"}
