@@ -152,6 +152,17 @@ def _set_env_from_config(cfg: dict) -> None:
     os.environ["AGENT_RUNTIME"] = "connect-agent"
     os.environ.setdefault("OPENAI_API_KEY", "")
     os.environ.setdefault("ARTIFACT_ROOT", "artifacts/")
+    # Jira credentials — adapters read JIRA_* vars, not TEST_JIRA_* vars
+    os.environ["JIRA_BASE_URL"] = cfg["jira_base_url"]
+    os.environ["JIRA_TOKEN"] = cfg["jira_token"]
+    os.environ["JIRA_EMAIL"] = cfg["jira_email"]
+    os.environ["JIRA_BACKEND"] = "rest"
+    # SCM credentials — adapters read SCM_* / SCM_BACKEND vars
+    os.environ["SCM_BASE_URL"] = cfg["scm_base_url"]
+    os.environ["SCM_TOKEN"] = cfg["scm_token"]
+    os.environ["SCM_BACKEND"] = cfg["scm_backend"]
+    if cfg.get("figma_token"):
+        os.environ["FIGMA_TOKEN"] = cfg["figma_token"]
 
 
 # ---------------------------------------------------------------------------
@@ -203,21 +214,28 @@ async def test_full_development_task_jira_to_pr():
     assert task_state in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_INPUT_REQUIRED"), \
         f"Task did not complete: {task_state}"
 
-    # If completed, verify artifacts contain prUrl and branch
+    print(f"[live-e2e] Task completed: {task_state}")
+    artifacts = final["task"].get("artifacts", [])
+    print(f"[live-e2e] Artifacts: {json.dumps(artifacts, indent=2, default=str)}")
+
     if task_state == "TASK_STATE_COMPLETED":
-        artifacts = final["task"].get("artifacts", [])
         assert len(artifacts) > 0, "No artifacts returned"
         meta = artifacts[0].get("metadata", {})
-        # prUrl and branch should be propagated
-        assert "agentId" in meta
 
-        # Verify workspace files were created
-        workspace_path = os.path.join(
-            "artifacts/", "compass-live-e2e", task_id
-        )
-        # At minimum, team_lead directory should exist if workspace was used
-        print(f"[live-e2e] Task completed: {task_state}")
-        print(f"[live-e2e] Artifacts: {json.dumps(artifacts, indent=2, default=str)}")
+        # Verify required metadata fields per design doc §11 / copilot-instructions.md
+        assert "agentId" in meta, "agentId missing from artifact metadata"
+        pr_url = meta.get("prUrl", "")
+        branch = meta.get("branch", "")
+        assert pr_url, \
+            f"prUrl missing from artifact metadata (meta={meta})"
+        assert branch, \
+            f"branch missing from artifact metadata (meta={meta})"
+        assert "jiraInReview" in meta, \
+            f"jiraInReview flag missing from artifact metadata (meta={meta})"
+
+        print(f"[live-e2e] PR URL: {pr_url}")
+        print(f"[live-e2e] Branch: {branch}")
+        print(f"[live-e2e] jiraInReview: {meta.get('jiraInReview')}")
 
 
 # ---------------------------------------------------------------------------
@@ -285,9 +303,9 @@ async def test_jira_unavailable_fails_without_mock_fallback():
     from framework.task_store import InMemoryTaskStore
     from agents.team_lead.agent import TeamLeadAgent, team_lead_definition
 
-    # Override Jira token with invalid value
-    original_token = os.environ.get("TEST_JIRA_TOKEN", "")
-    os.environ["TEST_JIRA_TOKEN"] = "invalid-token-for-testing"
+    # Override Jira token with invalid value — adapter reads JIRA_TOKEN
+    original_token = os.environ.get("JIRA_TOKEN", "")
+    os.environ["JIRA_TOKEN"] = "invalid-token-for-testing"
 
     try:
         task_store = InMemoryTaskStore()
@@ -325,9 +343,9 @@ async def test_jira_unavailable_fails_without_mock_fallback():
 
     finally:
         if original_token:
-            os.environ["TEST_JIRA_TOKEN"] = original_token
+            os.environ["JIRA_TOKEN"] = original_token
         else:
-            os.environ.pop("TEST_JIRA_TOKEN", None)
+            os.environ.pop("JIRA_TOKEN", None)
 
 
 # ---------------------------------------------------------------------------

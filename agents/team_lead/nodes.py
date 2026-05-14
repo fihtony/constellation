@@ -121,7 +121,9 @@ async def gather_context(state: dict) -> dict:
             payload = json.loads(result_str) if result_str else {}
             if payload.get("error"):
                 raise RuntimeError(f"Jira ticket not accessible: {payload['error']}")
-            jira_context = payload
+            # Normalize: Jira adapter returns {"ticket": {...}, "status": 200}.
+            # Downstream consumers expect a flat ticket object with top-level "key".
+            jira_context = payload.get("ticket", payload)
         except Exception as exc:
             print(f"[team-lead] Jira fetch failed: {exc}")
             raise RuntimeError(f"Jira ticket not accessible: {jira_key}") from exc

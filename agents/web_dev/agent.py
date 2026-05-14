@@ -28,6 +28,7 @@ from agents.web_dev.nodes import (
     create_pr,
     update_jira,
     report_result,
+    pause_for_user_input,
 )
 
 # ---------------------------------------------------------------------------
@@ -49,6 +50,7 @@ web_dev_workflow = Workflow(
         (self_assess, {
             "pass": capture_screenshot,
             "fail": fix_gaps,
+            "need_user_input": pause_for_user_input,
         }),
         (fix_gaps, run_tests),
         (capture_screenshot, create_pr),
@@ -136,6 +138,11 @@ class WebDevAgent(BaseAgent):
             "workspace_path": metadata.get("workspacePath", ""),
             "branch_name": metadata.get("branchName", ""),
             "jira_context": metadata.get("jiraContext", {}),
+            # Derive jira_key from jiraContext so prepare_jira / update_jira can resolve it
+            "jira_key": (
+                (metadata.get("jiraContext") or {}).get("key", "")
+                or metadata.get("jiraKey", "")
+            ),
             "design_context": metadata.get("designContext"),
             "skill_context": metadata.get("skillContext", ""),
             "context_manifest_path": metadata.get("contextManifestPath", ""),
@@ -178,6 +185,7 @@ class WebDevAgent(BaseAgent):
                             "agentId": self.definition.agent_id,
                             "prUrl": result.get("pr_url", ""),
                             "branch": result.get("branch_name", ""),
+                            "jiraInReview": result.get("jira_updated", False),
                         },
                     )
                 ]
@@ -231,6 +239,7 @@ def _send_callback(
                     "agentId": agent_id,
                     "prUrl": result.get("pr_url", ""),
                     "branch": result.get("branch_name", ""),
+                    "jiraInReview": result.get("jira_updated", False),
                 },
             }
         ],

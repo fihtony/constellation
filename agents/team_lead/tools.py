@@ -280,26 +280,6 @@ class DispatchWebDev(BaseTool):
                 "type": "string",
                 "description": "Code review rejection reason for revision. Optional.",
             },
-            "repo_path": {
-                "type": "string",
-                "description": "Local path to cloned repository. Optional.",
-            },
-            "workspace_path": {
-                "type": "string",
-                "description": "Shared workspace path. Optional.",
-            },
-            "context_manifest_path": {
-                "type": "string",
-                "description": "Relative path to context-manifest.json. Optional.",
-            },
-            "jira_files": {
-                "type": "array",
-                "description": "List of Jira artifact file paths in workspace. Optional.",
-            },
-            "design_files": {
-                "type": "array",
-                "description": "List of design artifact file paths in workspace. Optional.",
-            },
             "definition_of_done": {
                 "type": "object",
                 "description": "Acceptance gate criteria (build, tests, PR, screenshot). Optional.",

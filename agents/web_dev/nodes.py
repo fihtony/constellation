@@ -505,11 +505,11 @@ async def self_assess(state: dict) -> dict:
         }
 
     if assess_cycles >= max_assess_cycles:
-        # Exhausted assess cycles — proceed with last result
+        # Exhausted assess cycles and still failing — escalate to user
         return {
             "self_assessment": data,
             "assess_cycles": assess_cycles,
-            "route": "pass",
+            "route": "need_user_input",
         }
 
     return {
@@ -747,27 +747,30 @@ async def create_pr(state: dict) -> dict:
     pr_title = pr_meta.get("title", "Implement task changes")
     pr_description = pr_meta.get("description", state.get("implementation_summary", ""))
 
-    # Step 2: Push branch and create PR (agentic — uses SCM tools)
+    # Step 2: Push branch then create PR via SCM boundary tools (not open agentic).
+    # Design doc §4.3: Dev Agent must use scm.branch.push + scm.pr.create
+    # through the SCM Agent boundary; never direct git push or GitHub API.
     repo_path = state.get("repo_path", "")
     repo_url = state.get("repo_url", "")
     branch_name = state.get("branch_name", "feature/task")
 
-    push_result = runtime.run_agentic(
-        task=(
-            f"Push branch '{branch_name}' to remote and create a pull request.\n"
-            f"Repository: {repo_url}\n"
-            f"Local path: {repo_path}\n"
-            f"PR title: {pr_title}\n"
-            f"PR description:\n{pr_description}\n\n"
-            "Return a JSON object with keys: pr_url, pr_number, commit_hash."
-        ),
-        cwd=repo_path or None,
-        max_turns=10,
-        timeout=120,
-        plugin_manager=state.get("_plugin_manager"),
+    push_payload = _call_boundary_tool(
+        state, "scm_push", {"repo_path": repo_path, "branch": branch_name}
     )
+    if push_payload.get("error"):
+        print(f"[web-dev] scm_push failed: {push_payload['error']}")
 
-    pr_data = _safe_json(push_result.summary, fallback={})
+    pr_payload = _call_boundary_tool(
+        state, "scm_create_pr",
+        {
+            "repo_url": repo_url,
+            "source_branch": branch_name,
+            "target_branch": "main",
+            "title": pr_title,
+            "description": pr_description,
+        },
+    )
+    pr_data = pr_payload
 
     # Write pr-evidence.json to workspace
     workspace_path = state.get("workspace_path", "")
@@ -834,4 +837,38 @@ async def report_result(state: dict) -> dict:
         "pr_url": pr_url,
         "branch_name": branch_name,
     }
+
+
+async def pause_for_user_input(state: dict) -> dict:
+    """Pause the workflow and ask the orchestrator for guidance.
+
+    Raised after self-assessment exhausts retries with unresolved gaps.
+    On resume (``_resume_value`` set by WorkflowRunner.resume()), the node
+    consumes the user guidance and sets ``route = "user_responded"`` so the
+    workflow loops back through implement_changes.
+    """
+    resume_value = state.get("_resume_value")
+    if resume_value is not None:
+        return {
+            "revision_feedback": f"User guidance after self-assessment escalation: {resume_value}",
+            "assess_cycles": 0,  # reset so the loop can run again
+            "route": "user_responded",
+        }
+
+    from framework.workflow import interrupt
+
+    assessment = state.get("self_assessment", {})
+    gaps = assessment.get("gaps", [])
+    gap_text = "\n".join(f"- {g}" for g in gaps[:10]) if gaps else "No specific gaps."
+
+    interrupt(
+        f"Self-assessment could not resolve all gaps after maximum retries.\n"
+        f"Remaining gaps:\n{gap_text}\n"
+        "Please review and provide guidance on how to proceed.",
+        assessment_score=assessment.get("score"),
+        gaps=gaps,
+    )
+
+    # unreachable — interrupt() raises InterruptSignal
+    return {}
 

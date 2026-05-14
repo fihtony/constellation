@@ -28,6 +28,7 @@ class TestWebDevWorkflowCompile:
             "prepare_jira", "setup_workspace", "analyze_task", "implement_changes",
             "run_tests", "fix_tests", "self_assess", "fix_gaps",
             "capture_screenshot", "create_pr", "update_jira", "report_result",
+            "pause_for_user_input",
         }
         assert expected_nodes == set(compiled.nodes.keys())
 
@@ -201,23 +202,37 @@ class TestWebDevNodes:
         assert "pr_url" in result
 
     async def test_create_pr_with_runtime(self):
-        from framework.runtime.adapter import AgenticResult
+        from framework.tools.registry import get_registry
+        from framework.tools.base import BaseTool, ToolResult
+
+        class _MockSCMPush(BaseTool):
+            name = "scm_push"
+            description = "mock push"
+            parameters_schema = {"type": "object", "properties": {}, "required": []}
+            def execute_sync(self, **kw) -> ToolResult:
+                return ToolResult(output='{"pushed": true}')
+
+        class _MockSCMCreatePR(BaseTool):
+            name = "scm_create_pr"
+            description = "mock create pr"
+            parameters_schema = {"type": "object", "properties": {}, "required": []}
+            def execute_sync(self, **kw) -> ToolResult:
+                return ToolResult(output='{"pr_url": "https://github.com/org/repo/pull/42", "pr_number": 42, "commit_hash": "abc123"}')
+
+        registry = get_registry()
+        registry.register(_MockSCMPush())
+        registry.register(_MockSCMCreatePR())
 
         class _MockRuntime:
             def run(self, prompt, **kw):
                 return {"raw_response": '{"title": "Add login page", "description": "## Summary\\nAdded login."}'}
 
-            def run_agentic(self, task, **kw):
-                return AgenticResult(
-                    success=True,
-                    summary='{"pr_url": "https://github.com/org/repo/pull/42", "pr_number": 42, "commit_hash": "abc123"}',
-                    backend_used="mock",
-                )
-
         state = {
             "_runtime": _MockRuntime(),
             "user_request": "Add login",
             "branch_name": "feature/login",
+            "repo_url": "https://github.com/org/repo",
+            "repo_path": "/tmp/repo",
             "implementation_summary": "Added login form",
             "changes_made": ["src/login.py"],
             "jira_context": {"key": "ABC-123"},
