@@ -78,42 +78,81 @@ def env_flag(name: str, default: bool = False) -> bool:
 # ---------------------------------------------------------------------------
 
 # Env vars that carry Git credentials or affect credential discovery.
-# These must be scrubbed before spawning git subprocesses in agents so that
-# host keychains, user ~/.gitconfig credential-helper entries, and ambient
-# GitHub tokens are never consulted — only the explicit token passed via
-# http.extraHeader (or credential.helper store) is used.
-#
-# HOME is intentionally NOT in this list.  Stripping HOME breaks corporate
-# SSL CA bundle and proxy settings that git reads from ~/.gitconfig, causing
-# connection timeouts on proxied networks.  Instead, callers pass
-# ``-c credential.helper=`` to git directly to disable interactive lookups.
+# Stripped before spawning git subprocesses so that host keychains,
+# user ~/.gitconfig credential-helper entries, and ambient GitHub tokens
+# are never consulted.  Auth is passed explicitly via http.extraHeader.
 _GIT_CREDENTIAL_VARS = frozenset({
-    "GIT_ASKPASS", "SSH_ASKPASS", "GIT_CREDENTIAL_HELPER",
-    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+    "HOME", "XDG_CONFIG_HOME",                     # override with isolated dirs
+    "GIT_ASKPASS", "SSH_ASKPASS",
+    "GIT_CREDENTIAL_HELPER", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
     "GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN",
     "SCM_TOKEN", "SCM_USERNAME", "SCM_PASSWORD",
     "GCM_CREDENTIAL_STORE", "CREDENTIAL_HELPER",
-    # HOME is intentionally kept to preserve SSL CA and proxy config.
+    "GCM_INTERACTIVE",
 })
 
 
-def build_isolated_git_env(**extra: str) -> dict[str, str]:
-    """Build a minimal subprocess environment for git operations.
+def isolated_runtime_home(scope: str = "git") -> str:
+    """Return a per-scope temporary HOME directory for git subprocesses.
 
-    Strips host Git credential helpers, keychains, user ~/.gitconfig, and
-    ambient GitHub tokens from the environment.  The caller passes the auth
-    token via an authenticated remote URL instead.
-
-    ``extra`` key/value pairs are merged in last (use to override PATH,
-    GIT_TERMINAL_PROMPT=0, etc.).
+    The directory is created if it does not exist.  Using a per-scope HOME
+    ensures git never reads the host user's ~/.gitconfig or macOS Keychain.
     """
-    env: dict[str, str] = {}
-    for key, value in os.environ.items():
-        if key in _GIT_CREDENTIAL_VARS:
-            continue
-        env[key] = value
+    import re
+    safe_scope = re.sub(r"[^a-zA-Z0-9_-]", "-", scope).strip("-") or "default"
+    home = os.path.join(_ISOLATED_RUNTIME_ROOT, safe_scope)
+    os.makedirs(home, exist_ok=True)
+    return home
 
-    # Always disable interactive prompts in git subprocesses
-    env["GIT_TERMINAL_PROMPT"] = "0"
+
+def build_isolated_git_env(scope: str = "git", **extra: str) -> dict[str, str]:
+    """Build a fully isolated subprocess environment for git operations.
+
+    Strategy (mirrors v1 common/env_utils.py):
+    - Strip all credential and HOME-related env vars.
+    - Set HOME to a per-scope temp directory so git cannot reach
+      ~/.gitconfig, macOS Keychain, or any OS credential helper.
+    - Write a minimal .gitconfig-isolated that disables credential helpers
+      and trusts all directories (avoids dubious-ownership errors on
+      bind-mounted workspaces).
+    - Set GIT_CONFIG_GLOBAL to that file and GIT_CONFIG_NOSYSTEM=1 so
+      /etc/gitconfig is also ignored.
+    - Disable all interactive prompts.
+
+    The caller injects auth via ``git -c http.extraHeader=Authorization: ...``
+    in the command itself — credentials never appear in the remote URL.
+
+    ``scope`` differentiates the isolated HOME directory per agent/workflow.
+    ``extra`` key/value pairs are merged in last.
+    """
+    # Start from process env, strip credential vars
+    env: dict[str, str] = {k: v for k, v in os.environ.items()
+                            if k not in _GIT_CREDENTIAL_VARS}
+
+    # Isolated HOME — no host ~/.gitconfig or OS credential helper
+    home = isolated_runtime_home(scope)
+    xdg_config_home = os.path.join(home, ".config")
+    os.makedirs(xdg_config_home, exist_ok=True)
+
+    # Write a minimal isolated gitconfig once per scope
+    git_config_path = os.path.join(home, ".gitconfig-isolated")
+    if not os.path.exists(git_config_path):
+        with open(git_config_path, "w", encoding="utf-8") as fh:
+            fh.write(
+                "[safe]\n\tdirectory = *\n"
+                "[credential]\n\thelper =\n"
+            )
+
+    env.update({
+        "HOME": home,
+        "XDG_CONFIG_HOME": xdg_config_home,
+        "GIT_CONFIG_GLOBAL": git_config_path,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS": "",
+        "GCM_INTERACTIVE": "never",
+    })
     env.update(extra)
     return env

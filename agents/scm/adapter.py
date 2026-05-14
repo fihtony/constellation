@@ -231,17 +231,16 @@ class SCMAgentAdapter(BaseAgent):
         clean_url = repo_url.split("/browse")[0].rstrip("/")
         git_url = self._to_git_clone_url(clean_url)
 
-        # Pass auth via git config header — no credentials in URL
+        # Auth via http.extraHeader — credentials are NEVER in the remote URL
         auth_header = self._build_auth_header(git_url)
-
-        # Build git -c args: credential.helper reset + auth header + optional CA bundle
-        git_cfg = [
-            "-c", "credential.helper=",  # disable interactive credential lookups
-            "-c", f"http.extraHeader={auth_header}",
-        ]
+        git_cfg = ["-c", f"http.extraHeader={auth_header}"]
         ca_bundle = os.environ.get("SCM_CA_BUNDLE", "")
         if ca_bundle and os.path.isfile(ca_bundle):
             git_cfg += ["-c", f"http.sslCAInfo={ca_bundle}"]
+
+        # build_isolated_git_env sets isolated HOME, GIT_CONFIG_GLOBAL, and
+        # GIT_CONFIG_NOSYSTEM=1 so macOS Keychain / host ~/.gitconfig are never used.
+        git_env = build_isolated_git_env(scope="scm-clone")
 
         print(f"[scm] Cloning {git_url} → {target_path}")
         try:
@@ -249,7 +248,7 @@ class SCMAgentAdapter(BaseAgent):
             result = subprocess.run(
                 ["git", *git_cfg, "clone", "--depth", "1", git_url, target_path],
                 capture_output=True, text=True, timeout=120,
-                env=build_isolated_git_env(),
+                env=git_env,
             )
             if result.returncode != 0:
                 # stderr from git will not contain credentials (they are in -c, not in URL)
@@ -279,10 +278,9 @@ class SCMAgentAdapter(BaseAgent):
                 capture_output=True, text=True, timeout=10,
             ).stdout.strip()
 
-            # Pass auth via git config header — no credentials stored in the remote URL
+            # Auth via http.extraHeader — credentials are NEVER in the remote URL
             auth_header = self._build_auth_header(remote_url) if remote_url else ""
-            cmd = ["git", "-C", repo_path,
-                   "-c", "credential.helper="]  # disable interactive credential lookups
+            cmd = ["git", "-C", repo_path]
             if auth_header:
                 cmd += ["-c", f"http.extraHeader={auth_header}"]
             ca_bundle = os.environ.get("SCM_CA_BUNDLE", "")
@@ -290,10 +288,14 @@ class SCMAgentAdapter(BaseAgent):
                 cmd += ["-c", f"http.sslCAInfo={ca_bundle}"]
             cmd += ["push", "-u", "origin", branch]
 
+            # build_isolated_git_env sets isolated HOME, GIT_CONFIG_GLOBAL, and
+            # GIT_CONFIG_NOSYSTEM=1 so macOS Keychain / host ~/.gitconfig are never used.
+            git_env = build_isolated_git_env(scope="scm-push")
+
             print(f"[scm] Pushing branch {branch} in {repo_path}")
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=120,
-                env=build_isolated_git_env(),
+                env=git_env,
             )
             if result.returncode != 0:
                 stderr_safe = result.stderr.strip()[:400]
