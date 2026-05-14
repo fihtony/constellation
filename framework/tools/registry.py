@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -30,21 +31,44 @@ logger = logging.getLogger(__name__)
 
 
 class ToolRegistry:
-    """Thread-safe registry mapping tool names to BaseTool instances."""
+    """Thread-safe registry mapping tool names to BaseTool instances.
+
+    The permission engine is stored in **thread-local** storage so that
+    multi-agent in-process setups (tests, connect-agent runtime) can run
+    multiple agents concurrently without one agent's permission policy
+    blocking another agent's tool calls.
+
+    CompiledWorkflow.run() installs/clears the engine around each workflow
+    execution on the calling thread.  Other threads are unaffected.
+    """
 
     def __init__(self) -> None:
         self._tools: dict[str, "BaseTool"] = {}
-        self._permission_engine: "PermissionEngine | None" = None
+        self._tl = threading.local()   # thread-local permission engine
         self._plugin_manager: "Any | None" = None
 
     # ------------------------------------------------------------------
-    # Permission gate
+    # Permission gate — thread-local accessors
     # ------------------------------------------------------------------
 
-    def set_permission_engine(self, engine: "PermissionEngine") -> "ToolRegistry":
-        """Attach a PermissionEngine.  All subsequent execute calls will be
-        checked against it before the tool runs."""
-        self._permission_engine = engine
+    @property
+    def _permission_engine(self) -> "PermissionEngine | None":
+        """Return the permission engine for the *current thread* only."""
+        return getattr(self._tl, "engine", None)
+
+    @_permission_engine.setter
+    def _permission_engine(self, engine: "PermissionEngine | None") -> None:
+        self._tl.engine = engine
+
+    def set_permission_engine(self, engine: "PermissionEngine | None") -> "ToolRegistry":
+        """Set the permission engine for the *current thread* only.
+
+        This is called by CompiledWorkflow.run() immediately before and after
+        each workflow execution, scoping the permission check to the agent's
+        own execution thread.  Concurrent agents running in other threads are
+        not affected.
+        """
+        self._tl.engine = engine
         return self
 
     def set_plugin_manager(self, pm: "Any") -> "ToolRegistry":
