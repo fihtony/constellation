@@ -79,15 +79,21 @@ def env_flag(name: str, default: bool = False) -> bool:
 
 # Env vars that carry Git credentials or affect credential discovery.
 # These must be scrubbed before spawning git subprocesses in agents so that
-# host keychains, user ~/.gitconfig, and system credential helpers are never
-# consulted — only the explicit token passed via the authenticated URL.
+# host keychains, user ~/.gitconfig credential-helper entries, and ambient
+# GitHub tokens are never consulted — only the explicit token passed via
+# http.extraHeader (or credential.helper store) is used.
+#
+# HOME is intentionally NOT in this list.  Stripping HOME breaks corporate
+# SSL CA bundle and proxy settings that git reads from ~/.gitconfig, causing
+# connection timeouts on proxied networks.  Instead, callers pass
+# ``-c credential.helper=`` to git directly to disable interactive lookups.
 _GIT_CREDENTIAL_VARS = frozenset({
     "GIT_ASKPASS", "SSH_ASKPASS", "GIT_CREDENTIAL_HELPER",
     "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
     "GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN",
     "SCM_TOKEN", "SCM_USERNAME", "SCM_PASSWORD",
     "GCM_CREDENTIAL_STORE", "CREDENTIAL_HELPER",
-    "HOME",  # prevents ~/.gitconfig from being read
+    # HOME is intentionally kept to preserve SSL CA and proxy config.
 })
 
 

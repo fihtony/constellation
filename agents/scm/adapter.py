@@ -173,6 +173,53 @@ class SCMAgentAdapter(BaseAgent):
             creds = base64.b64encode(f"x-token-auth:{token}".encode()).decode()
         return f"Authorization: Basic {creds}"
 
+    def _to_git_clone_url(self, repo_url: str) -> str:
+        """Convert a Bitbucket browser URL to a valid git clone URL.
+
+        Bitbucket Server:
+          Browser URL:  https://host/users/userabc/repos/web-ui-test
+          Clone URL:    https://host/scm/~userabc/web-ui-test.git
+          Or:           https://host/projects/PROJ/repos/my-repo
+          Clone URL:    https://host/scm/proj/my-repo.git
+
+        GitHub:
+          Browser URL already valid for git — just ensure no /browse suffix.
+        """
+        from urllib.parse import urlparse
+        parsed = urlparse(repo_url)
+        netloc = parsed.netloc.lower()
+
+        # GitHub: clone URL equals browser URL (with .git optional)
+        if "github" in netloc:
+            return repo_url
+
+        # Bitbucket Server: derive /scm/<project>/<repo>.git path
+        path_parts = [p for p in parsed.path.split("/") if p]
+
+        try:
+            # /users/<username>/repos/<slug>
+            user_idx = path_parts.index("users")
+            username = path_parts[user_idx + 1]
+            repos_idx = path_parts.index("repos")
+            slug = path_parts[repos_idx + 1]
+            project = f"~{username}"
+            return f"{parsed.scheme}://{parsed.netloc}/scm/{project.lower()}/{slug}.git"
+        except (ValueError, IndexError):
+            pass
+
+        try:
+            # /projects/<KEY>/repos/<slug>
+            proj_idx = path_parts.index("projects")
+            project = path_parts[proj_idx + 1]
+            repos_idx = path_parts.index("repos")
+            slug = path_parts[repos_idx + 1]
+            return f"{parsed.scheme}://{parsed.netloc}/scm/{project.lower()}/{slug}.git"
+        except (ValueError, IndexError):
+            pass
+
+        # Fallback: use URL as-is (may not work but avoids silent wrong URL)
+        return repo_url
+
     def _handle_clone(self, meta: dict) -> dict:
         """Clone a repository to a target path."""
         repo_url = meta.get("repoUrl", "")
@@ -180,17 +227,27 @@ class SCMAgentAdapter(BaseAgent):
         if not repo_url or not target_path:
             return {"error": "repoUrl and targetPath are required", "status": "error"}
 
-        # Strip /browse suffix from Bitbucket URLs
+        # Strip /browse suffix then convert browser URL → git clone URL
         clean_url = repo_url.split("/browse")[0].rstrip("/")
+        git_url = self._to_git_clone_url(clean_url)
 
         # Pass auth via git config header — no credentials in URL
-        auth_header = self._build_auth_header(clean_url)
+        auth_header = self._build_auth_header(git_url)
 
+        # Build git -c args: credential.helper reset + auth header + optional CA bundle
+        git_cfg = [
+            "-c", "credential.helper=",  # disable interactive credential lookups
+            "-c", f"http.extraHeader={auth_header}",
+        ]
+        ca_bundle = os.environ.get("SCM_CA_BUNDLE", "")
+        if ca_bundle and os.path.isfile(ca_bundle):
+            git_cfg += ["-c", f"http.sslCAInfo={ca_bundle}"]
+
+        print(f"[scm] Cloning {git_url} → {target_path}")
         try:
             os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
             result = subprocess.run(
-                ["git", "-c", f"http.extraHeader={auth_header}",
-                 "clone", "--depth", "1", clean_url, target_path],
+                ["git", *git_cfg, "clone", "--depth", "1", git_url, target_path],
                 capture_output=True, text=True, timeout=120,
                 env=build_isolated_git_env(),
             )
@@ -224,11 +281,16 @@ class SCMAgentAdapter(BaseAgent):
 
             # Pass auth via git config header — no credentials stored in the remote URL
             auth_header = self._build_auth_header(remote_url) if remote_url else ""
-            cmd = ["git", "-C", repo_path]
+            cmd = ["git", "-C", repo_path,
+                   "-c", "credential.helper="]  # disable interactive credential lookups
             if auth_header:
                 cmd += ["-c", f"http.extraHeader={auth_header}"]
+            ca_bundle = os.environ.get("SCM_CA_BUNDLE", "")
+            if ca_bundle and os.path.isfile(ca_bundle):
+                cmd += ["-c", f"http.sslCAInfo={ca_bundle}"]
             cmd += ["push", "-u", "origin", branch]
 
+            print(f"[scm] Pushing branch {branch} in {repo_path}")
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=120,
                 env=build_isolated_git_env(),

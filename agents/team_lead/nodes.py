@@ -206,7 +206,9 @@ async def gather_context(state: dict) -> dict:
             )
             clone_payload = json.loads(clone_result_str) if clone_result_str else {}
             if clone_payload.get("error"):
-                print(f"[team-lead] Repo clone warning: {clone_payload['error']} (continuing without repo clone)")
+                detail = clone_payload.get("detail", "")
+                detail_msg = f" | git: {detail}" if detail else ""
+                print(f"[team-lead] Repo clone warning: {clone_payload['error']}{detail_msg} (continuing without repo clone)")
             else:
                 repo_exists = os.path.isdir(repo_path)
                 repo_has_files = repo_exists and any(os.scandir(repo_path))

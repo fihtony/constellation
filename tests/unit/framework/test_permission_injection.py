@@ -101,8 +101,15 @@ class TestPermissionAutoLoading:
         assert agent._permission_engine.check_scm_write() is True
         assert agent._permission_engine.check_tool("rm_file") is False
 
-    def test_binds_to_tool_registry(self):
-        """Permission engine is bound to the global ToolRegistry."""
+    def test_does_not_bind_to_global_registry(self):
+        """Permission engine must NOT be bound to the global ToolRegistry at startup.
+
+        The engine is scoped to individual workflow runs via RunConfig.  Installing
+        it globally at agent start would pollute the registry for other agents
+        sharing the same process (e.g. in-process tests, connect-agent runtime).
+        CompiledWorkflow.run() is responsible for installing and clearing the engine
+        around each workflow execution window.
+        """
         from framework.tools.registry import get_registry
 
         defn = AgentDefinition(
@@ -111,14 +118,17 @@ class TestPermissionAutoLoading:
             description="test",
             permission_profile="development",
         )
+        # Ensure the global registry starts clean for this test
+        get_registry().set_permission_engine(None)
+
         agent = _DummyAgent(defn, _make_services())
         agent._load_permission_engine()
 
         registry = get_registry()
-        assert registry._permission_engine is agent._permission_engine
-
-        # Clean up global state
-        registry.set_permission_engine(None)
+        # After _load_permission_engine, the global registry must remain un-gated.
+        # The engine lives in agent._permission_engine and is applied by RunConfig.
+        assert registry._permission_engine is None
+        assert agent._permission_engine is not None
 
 
 class TestBuildRunConfig:

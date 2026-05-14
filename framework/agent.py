@@ -230,8 +230,14 @@ class BaseAgent:
 
         if engine:
             self._permission_engine = engine
-            from framework.tools.registry import get_registry
-            get_registry().set_permission_engine(engine)
+            # NOTE: Do NOT install the engine on the global ToolRegistry here.
+            # The engine is passed through RunConfig and installed only during
+            # the agent's own workflow execution window (CompiledWorkflow.run()
+            # calls get_registry().set_permission_engine(...) before each run
+            # and clears it with set_permission_engine(None) on completion).
+            # Installing it here permanently would pollute the global registry
+            # and block other agents' tools when multiple agents share one
+            # process (e.g. in-process tests or the connect-agent runtime).
 
     def _build_run_config(
         self,
