@@ -254,6 +254,47 @@ class BitbucketClient:
         except Exception as exc:
             return {}, str(exc)
 
+    def get_pr(
+        self,
+        project: str,
+        repo: str,
+        pr_id: str | int,
+        timeout: int = 15,
+    ) -> tuple[dict, str]:
+        """Get a single pull request by ID."""
+        try:
+            data = self._get(
+                f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}",
+                timeout=timeout,
+            )
+            return data, "ok"
+        except HTTPError as exc:
+            return {}, f"HTTP {exc.code}"
+        except Exception as exc:
+            return {}, str(exc)
+
+    def add_pr_comment(
+        self,
+        project: str,
+        repo: str,
+        pr_id: str | int,
+        text: str,
+        timeout: int = 15,
+    ) -> tuple[dict, str]:
+        """Add a general comment to a pull request."""
+        payload = {"text": text}
+        try:
+            data = self._post(
+                f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments",
+                payload,
+                timeout=timeout,
+            )
+            return data, "ok"
+        except HTTPError as exc:
+            return {}, f"HTTP {exc.code}"
+        except Exception as exc:
+            return {}, str(exc)
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -447,6 +488,47 @@ class GitHubClient:
                     "links": {"self": [{"href": body.get("html_url", "")}]},
                 }, "ok"
             return body, f"http_{status}"
+        except Exception as exc:
+            return {}, str(exc)
+
+    def get_pr(
+        self, owner: str, repo: str, pr_id: str | int, timeout: int = 15
+    ) -> tuple[dict, str]:
+        """Get a single pull request by number."""
+        try:
+            status, body = self._request(
+                "GET", f"repos/{owner}/{repo}/pulls/{pr_id}", timeout=timeout
+            )
+            if status == 200:
+                return {
+                    "id": body.get("number"),
+                    "title": body.get("title"),
+                    "state": body.get("state"),
+                    "links": {"self": [{"href": body.get("html_url", "")}]},
+                }, "ok"
+            return {}, f"http_{status}"
+        except Exception as exc:
+            return {}, str(exc)
+
+    def add_pr_comment(
+        self,
+        owner: str,
+        repo: str,
+        pr_id: str | int,
+        text: str,
+        timeout: int = 15,
+    ) -> tuple[dict, str]:
+        """Add a comment to a pull request (via issues API)."""
+        try:
+            status, body = self._request(
+                "POST",
+                f"repos/{owner}/{repo}/issues/{pr_id}/comments",
+                {"body": text},
+                timeout=timeout,
+            )
+            if status in (200, 201):
+                return {"id": body.get("id"), "body": text}, "ok"
+            return {}, f"http_{status}"
         except Exception as exc:
             return {}, str(exc)
 

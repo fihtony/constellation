@@ -483,6 +483,12 @@ class JiraMCPProvider(JiraProvider):
             return None, f"update_failed: {text[:150]}"
         return {"ticketKey": ticket_key}, "updated"
 
+    def list_comments(
+        self, ticket_key: str, max_results: int = 50
+    ) -> tuple[list, str]:
+        # MCP does not expose a list_comments tool; fallback to REST
+        return self._rest.list_comments(ticket_key, max_results)
+
     @property
     def backend_name(self) -> str:
         return "mcp"

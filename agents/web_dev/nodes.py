@@ -12,6 +12,7 @@ Design pattern — "Graph outside, ReAct inside":
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
@@ -39,9 +40,116 @@ def _safe_json(text: str, fallback: Any = None) -> Any:
         return fallback
 
 
+def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
+    """Call a boundary agent tool via the global ToolRegistry.
+
+    Returns the parsed JSON payload or an error dict.
+    """
+    from framework.tools.registry import get_registry
+
+    registry = get_registry()
+    try:
+        result_str = registry.execute_sync(tool_name, args)
+        return json.loads(result_str) if result_str else {}
+    except Exception as exc:
+        print(f"[web-dev] Tool {tool_name} failed: {exc}")
+        return {"error": str(exc)}
+
+
 # ---------------------------------------------------------------------------
 # Node implementations
 # ---------------------------------------------------------------------------
+
+async def prepare_jira(state: dict) -> dict:
+    """Update Jira before implementation starts.
+
+    Actions:
+    1. Discover Jira Agent through Registry (via boundary tools).
+    2. Resolve the token user identity.
+    3. List available transitions.
+    4. Transition the ticket to "In Progress" when reachable.
+    5. Set assignee to the token user by default.
+    6. Add a pickup comment.
+
+    Idempotency:
+    - Skip the transition if the ticket is already in "In Progress".
+    - Skip the assignee update if the assignee already matches the token user.
+    """
+    jira_context = state.get("jira_context", {})
+    jira_key = (
+        jira_context.get("key")
+        or jira_context.get("ticket_key")
+        or state.get("jira_key", "")
+    )
+
+    if not jira_key:
+        return {"jira_prepared": False, "jira_prepare_skipped": "no_jira_key"}
+
+    # Resolve original status for rollback
+    original_status = ""
+    original_assignee = ""
+    if isinstance(jira_context, dict):
+        fields = jira_context.get("fields", jira_context)
+        original_status = (
+            fields.get("status", {}).get("name", "")
+            if isinstance(fields.get("status"), dict)
+            else str(fields.get("status", ""))
+        )
+        assignee = fields.get("assignee") or {}
+        original_assignee = (
+            assignee.get("emailAddress", assignee.get("displayName", ""))
+            if isinstance(assignee, dict)
+            else str(assignee)
+        )
+
+    # Resolve token user
+    token_user = ""
+    token_user_result = _call_boundary_tool(state, "jira_get_token_user", {})
+    if not token_user_result.get("error"):
+        user_data = token_user_result.get("user", {})
+        token_user = user_data.get("emailAddress", user_data.get("displayName", ""))
+
+    # Transition to "In Progress" if not already
+    if original_status.lower() not in ("in progress",):
+        transitions_result = _call_boundary_tool(
+            state, "jira_list_transitions", {"ticket_key": jira_key}
+        )
+        transitions = transitions_result.get("transitions", [])
+        can_transition = any(
+            t.get("name", "").lower() in ("in progress", "start progress")
+            for t in transitions
+            if isinstance(t, dict)
+        )
+        if can_transition:
+            _call_boundary_tool(
+                state, "jira_transition",
+                {"ticket_key": jira_key, "transition_name": "In Progress"},
+            )
+        else:
+            print(f"[web-dev] Cannot transition {jira_key} to In Progress; skipping")
+
+    # Update assignee to token user
+    if token_user and token_user != original_assignee:
+        _call_boundary_tool(
+            state, "jira_update",
+            {"ticket_key": jira_key, "fields": {"assignee": {"emailAddress": token_user}}},
+        )
+
+    # Add pickup comment
+    _call_boundary_tool(
+        state, "jira_comment",
+        {
+            "ticket_key": jira_key,
+            "comment": f"Development agent (web-dev) has picked up this ticket.",
+        },
+    )
+
+    return {
+        "jira_prepared": True,
+        "jira_original_status": original_status,
+        "jira_original_assignee": original_assignee,
+        "jira_token_user": token_user,
+    }
 
 async def setup_workspace(state: dict) -> dict:
     """Clone repository and create a working branch.
@@ -158,7 +266,7 @@ async def run_tests(state: dict) -> dict:
     """
     runtime = state.get("_runtime")
     test_cycles = state.get("test_cycles", 0) + 1
-    max_test_cycles = 3
+    max_test_cycles = 5
 
     if not runtime:
         # Unit-test path: always pass
@@ -248,6 +356,252 @@ async def fix_tests(state: dict) -> dict:
         "fix_summary": result.summary,
         "agentic_success": result.success,
     }
+
+
+async def self_assess(state: dict) -> dict:
+    """Run requirement-aware and design-aware self assessment.
+
+    Evaluation dimensions:
+    1. Acceptance criteria coverage.
+    2. Component-by-component UI design alignment for UI tasks.
+    3. Build status.
+    4. Test status and newly added test coverage.
+    5. Code quality and obvious risk review.
+
+    Pass threshold: score >= 0.9.
+    """
+    runtime = state.get("_runtime")
+    assess_cycles = state.get("assess_cycles", 0) + 1
+    max_assess_cycles = 3
+
+    if not runtime:
+        return {
+            "self_assessment": {
+                "score": 0.95,
+                "verdict": "pass",
+                "gaps": [],
+                "component_checks": [],
+                "criteria_checks": [],
+            },
+            "assess_cycles": assess_cycles,
+            "route": "pass",
+        }
+
+    from agents.web_dev.prompts import SELF_ASSESS_SYSTEM, SELF_ASSESS_TEMPLATE
+
+    jira_ctx = state.get("jira_context", {})
+    design_ctx = state.get("design_context") or {}
+    acceptance_criteria = []
+    if isinstance(jira_ctx, dict):
+        fields = jira_ctx.get("fields", jira_ctx)
+        acceptance_criteria = fields.get("acceptanceCriteria", [])
+        if not acceptance_criteria and fields.get("description"):
+            acceptance_criteria = [fields["description"]]
+
+    prompt = SELF_ASSESS_TEMPLATE.format(
+        acceptance_criteria=json.dumps(acceptance_criteria, ensure_ascii=False),
+        design_context=json.dumps(design_ctx, ensure_ascii=False) if design_ctx else "N/A (not a UI task)",
+        implementation_summary=state.get("implementation_summary", ""),
+        test_results=json.dumps(state.get("test_results", {}), ensure_ascii=False),
+        changed_files="\n".join(state.get("changes_made", [])) or "unknown",
+    )
+
+    result = runtime.run(
+        prompt, system_prompt=SELF_ASSESS_SYSTEM,
+        max_tokens=2048,
+        plugin_manager=state.get("_plugin_manager"),
+    )
+
+    data = _safe_json(result.get("raw_response", ""), fallback={})
+    score = float(data.get("score", 0))
+    verdict = data.get("verdict", "fail")
+    gaps = data.get("gaps", [])
+
+    if score >= 0.9 and verdict != "fail":
+        return {
+            "self_assessment": data,
+            "assess_cycles": assess_cycles,
+            "route": "pass",
+        }
+
+    if assess_cycles >= max_assess_cycles:
+        # Exhausted assess cycles — proceed with last result
+        return {
+            "self_assessment": data,
+            "assess_cycles": assess_cycles,
+            "route": "pass",
+        }
+
+    return {
+        "self_assessment": data,
+        "assess_cycles": assess_cycles,
+        "route": "fail",
+    }
+
+
+async def fix_gaps(state: dict) -> dict:
+    """Fix self-assessment gaps before re-running tests and self-assessment."""
+    runtime = state.get("_runtime")
+
+    if not runtime:
+        return {"fix_gaps_attempted": True}
+
+    from agents.web_dev.prompts import FIX_GAPS_SYSTEM, FIX_GAPS_TEMPLATE
+
+    assessment = state.get("self_assessment", {})
+    gaps = assessment.get("gaps", [])
+    changed_files = state.get("changes_made", [])
+
+    prompt = FIX_GAPS_TEMPLATE.format(
+        gaps="\n".join(f"- {g}" for g in gaps) if gaps else "No specific gaps listed.",
+        repo_path=state.get("repo_path", ""),
+        changed_files="\n".join(changed_files) if changed_files else "unknown",
+    )
+
+    result = runtime.run_agentic(
+        task=prompt,
+        system_prompt=FIX_GAPS_SYSTEM,
+        cwd=state.get("repo_path") or None,
+        max_turns=15,
+        timeout=300,
+        plugin_manager=state.get("_plugin_manager"),
+    )
+
+    return {
+        "fix_gaps_attempted": True,
+        "fix_gaps_summary": result.summary,
+        "agentic_success": result.success,
+    }
+
+
+async def capture_screenshot(state: dict) -> dict:
+    """Capture implementation screenshots for human review only.
+
+    No automatic visual diff is required in the current phase.
+    Skips if screenshot_required is False in definition_of_done.
+    """
+    definition_of_done = state.get("definition_of_done", {})
+    screenshot_required = definition_of_done.get("screenshot_required", True)
+
+    if not screenshot_required:
+        return {"screenshot_captured": False, "screenshots": []}
+
+    runtime = state.get("_runtime")
+    if not runtime:
+        return {"screenshot_captured": False, "screenshots": []}
+
+    repo_path = state.get("repo_path", "")
+    workspace_path = state.get("workspace_path", "")
+    screenshot_dir = os.path.join(workspace_path, "web-agent", "screenshots")
+
+    try:
+        os.makedirs(screenshot_dir, exist_ok=True)
+    except OSError:
+        pass
+
+    # Best-effort screenshot via agentic runtime
+    result = runtime.run_agentic(
+        task=(
+            "Take a screenshot of the implemented UI.\n"
+            f"1. Start the dev server in {repo_path} (npm run dev or similar).\n"
+            "2. Wait for it to be ready.\n"
+            "3. Use a headless browser to capture a screenshot.\n"
+            f"4. Save screenshots to {screenshot_dir}/\n"
+            "Return JSON: {\"screenshots\": [\"path1.png\", ...], \"captured\": true}\n"
+            "If screenshot fails, return {\"screenshots\": [], \"captured\": false}"
+        ),
+        cwd=repo_path or None,
+        max_turns=10,
+        timeout=120,
+        plugin_manager=state.get("_plugin_manager"),
+    )
+
+    data = _safe_json(result.summary, fallback={})
+    screenshots = data.get("screenshots", [])
+    captured = data.get("captured", bool(screenshots))
+
+    return {
+        "screenshot_captured": captured,
+        "screenshots": screenshots,
+    }
+
+
+async def update_jira(state: dict) -> dict:
+    """Update Jira after development is complete.
+
+    Actions:
+    1. Add a completion comment with PR URL, test results, self-assessment score.
+    2. Transition ticket to "In Review".
+
+    Idempotency:
+    - Check if a comment with the PR URL already exists before adding.
+    """
+    jira_context = state.get("jira_context", {})
+    jira_key = (
+        jira_context.get("key")
+        or jira_context.get("ticket_key")
+        or state.get("jira_key", "")
+    )
+
+    if not jira_key:
+        return {"jira_updated": False, "jira_update_skipped": "no_jira_key"}
+
+    pr_url = state.get("pr_url", "N/A")
+    branch = state.get("branch_name", "N/A")
+    test_results = state.get("test_results", {})
+    assessment = state.get("self_assessment", {})
+    changes = state.get("changes_made", [])
+
+    # Build completion comment
+    comment_text = (
+        f"Development completed by web-dev agent.\n"
+        f"PR: {pr_url}\n"
+        f"Branch: {branch}\n"
+        f"Test results: {test_results.get('passed', 0)} passed, "
+        f"{test_results.get('failed', 0)} failed\n"
+        f"Self-assessment score: {assessment.get('score', 'N/A')}\n"
+        f"Changes: {len(changes)} files modified"
+    )
+
+    # Idempotency: check if comment with PR URL already exists
+    existing = _call_boundary_tool(
+        state, "jira_list_comments", {"ticket_key": jira_key}
+    )
+    already_commented = False
+    for c in existing.get("comments", []):
+        body = ""
+        if isinstance(c, dict):
+            body = c.get("body", "")
+            if isinstance(body, dict):
+                # ADF body — check rendered text
+                body = json.dumps(body)
+        if pr_url and pr_url != "N/A" and pr_url in str(body):
+            already_commented = True
+            break
+
+    if not already_commented:
+        _call_boundary_tool(
+            state, "jira_comment",
+            {"ticket_key": jira_key, "comment": comment_text},
+        )
+
+    # Transition to "In Review"
+    transitions_result = _call_boundary_tool(
+        state, "jira_list_transitions", {"ticket_key": jira_key}
+    )
+    transitions = transitions_result.get("transitions", [])
+    can_review = any(
+        t.get("name", "").lower() in ("in review", "review", "code review")
+        for t in transitions
+        if isinstance(t, dict)
+    )
+    if can_review:
+        _call_boundary_tool(
+            state, "jira_transition",
+            {"ticket_key": jira_key, "transition_name": "In Review"},
+        )
+
+    return {"jira_updated": True}
 
 
 async def create_pr(state: dict) -> dict:

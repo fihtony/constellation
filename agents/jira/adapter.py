@@ -153,6 +153,15 @@ class JiraAgentAdapter(BaseAgent):
             data, status = provider.transition_issue(key, transition_name)
             return {"transitionId": data, "status": status}
 
+        if capability == "jira.user.me":
+            data, status = provider.get_myself()
+            return {"user": data, "status": status}
+
+        if capability == "jira.comment.list":
+            key = meta.get("ticketKey") or text.strip()
+            data, status = provider.list_comments(key)
+            return {"comments": data, "status": status}
+
         return {"error": f"Unknown Jira capability: {capability!r}"}
 
     async def get_task(self, task_id: str) -> dict:

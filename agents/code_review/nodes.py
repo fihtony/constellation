@@ -4,11 +4,14 @@ Design pattern — "Graph outside, ReAct inside":
 - Graph drives the deterministic review pipeline (load → quality → security → tests → requirements → report).
 - Each review phase uses a single-shot LLM call (runtime.run()) — bounded and auditable.
 - Nodes degrade gracefully when no runtime is available (unit-test path).
+- Checkpoints are saved after load and after the final report for crash recovery.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from typing import Any
 
 
@@ -47,41 +50,74 @@ def _parse_issue_list(text: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 async def load_pr_context(state: dict) -> dict:
-    """Load PR diff, changed files, and description from state metadata.
+    """Load PR diff, changed files, description, and Jira/design context.
 
-    In a full deployment the SCM adapter fetches this data.
+    In a full deployment the SCM adapter fetches PR data.
     For MVP the calling agent (Team Lead) passes it via metadata.
+    Also loads Jira and design context for requirements-aware review.
     """
     metadata = state.get("metadata", {})
 
-    # Prefer pre-fetched context; fall back to empty strings so downstream
-    # nodes still run (they will produce "no issues" gracefully).
-    pr_diff = (
-        metadata.get("prDiff")
-        or state.get("pr_diff")
+    # PR context
+    pr_diff = metadata.get("prDiff") or state.get("pr_diff") or ""
+    changed_files = metadata.get("changedFiles") or state.get("changed_files") or []
+    pr_description = metadata.get("prDescription") or state.get("pr_description") or ""
+    commit_messages = metadata.get("commitMessages") or state.get("commit_messages") or []
+
+    # Jira and design context (passed by Team Lead)
+    jira_context = metadata.get("jiraContext") or state.get("jira_context") or {}
+    design_context = metadata.get("designContext") or state.get("design_context") or {}
+    workspace_path = metadata.get("workspacePath") or state.get("workspace_path") or ""
+    context_manifest_path = (
+        metadata.get("contextManifestPath")
+        or state.get("context_manifest_path")
         or ""
     )
-    changed_files = (
-        metadata.get("changedFiles")
-        or state.get("changed_files")
-        or []
-    )
-    pr_description = (
-        metadata.get("prDescription")
-        or state.get("pr_description")
-        or ""
-    )
-    commit_messages = (
-        metadata.get("commitMessages")
-        or state.get("commit_messages")
-        or []
-    )
+
+    # Extract original requirements from Jira context
+    original_requirements = state.get("original_requirements", "")
+    if not original_requirements and jira_context:
+        fields = jira_context.get("fields", jira_context)
+        criteria = fields.get("acceptanceCriteria", [])
+        desc = fields.get("description", "")
+        if criteria:
+            original_requirements = "\n".join(f"- {c}" for c in criteria)
+        elif desc:
+            original_requirements = desc
+
+    # Write review start log
+    if workspace_path:
+        review_dir = os.path.join(workspace_path, "code-review")
+        os.makedirs(review_dir, exist_ok=True)
+        try:
+            log_file = os.path.join(review_dir, "task-log.json")
+            with open(log_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "code-review",
+                        "step": "load_pr_context",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": {
+                        "pr_url": metadata.get("prUrl", ""),
+                        "changed_files_count": len(changed_files) if isinstance(changed_files, list) else 0,
+                        "has_jira_context": bool(jira_context),
+                        "has_design_context": bool(design_context),
+                    },
+                }, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
 
     return {
         "pr_diff": pr_diff,
         "changed_files": changed_files if isinstance(changed_files, list) else [changed_files],
         "pr_description": pr_description,
         "commit_messages": commit_messages,
+        "jira_context": jira_context,
+        "design_context": design_context,
+        "original_requirements": original_requirements,
+        "workspace_path": workspace_path,
+        "context_manifest_path": context_manifest_path,
     }
 
 
@@ -181,6 +217,7 @@ async def generate_report(state: dict) -> dict:
 
     Pure Python — no LLM call needed.
     Verdict: "approved" only when there are zero critical or high severity issues.
+    Writes review-report.json to the workspace for audit.
     """
     quality = state.get("quality_issues", [])
     security = state.get("security_issues", [])
@@ -203,15 +240,47 @@ async def generate_report(state: dict) -> dict:
         f"Verdict: {verdict}.",
     ]
 
-    return {
+    report = {
         "verdict": verdict,
         "all_comments": all_comments,
-        "report_summary": " ".join(summary_parts),
         "severity_levels": {
             "critical": critical,
             "high": high,
             "medium": medium,
             "low": low,
         },
+        "checked_artifacts": [
+            p for p in [
+                state.get("context_manifest_path", ""),
+                "web-agent/self-assessment.json",
+                "web-agent/pr-evidence.json",
+            ] if p
+        ],
+    }
+
+    # Write review report to workspace
+    workspace_path = state.get("workspace_path", "")
+    if workspace_path:
+        review_dir = os.path.join(workspace_path, "code-review")
+        os.makedirs(review_dir, exist_ok=True)
+        try:
+            report_file = os.path.join(review_dir, "review-report.json")
+            with open(report_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "code-review",
+                        "step": "generate_report",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": report,
+                }, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    return {
+        "verdict": verdict,
+        "all_comments": all_comments,
+        "report_summary": " ".join(summary_parts),
+        "severity_levels": report["severity_levels"],
     }
 

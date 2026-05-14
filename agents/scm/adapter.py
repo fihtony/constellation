@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 
@@ -125,7 +126,117 @@ class SCMAgentAdapter(BaseAgent):
                     pr_url = links[0].get("href", "")
             return {"pr": data, "status": status, "prUrl": pr_url}
 
+        if capability == "scm.pr.get":
+            pr_id = meta.get("prId") or meta.get("prNumber") or text.strip()
+            data, status = client.get_pr(project, repo, pr_id)
+            return {"pr": data, "status": status}
+
+        if capability == "scm.pr.comment":
+            pr_id = meta.get("prId") or meta.get("prNumber") or ""
+            comment_text = meta.get("comment") or text.strip()
+            data, status = client.add_pr_comment(project, repo, pr_id, comment_text)
+            return {"comment": data, "status": status}
+
+        if capability == "scm.repo.clone":
+            return self._handle_clone(meta)
+
+        if capability == "scm.branch.push":
+            return self._handle_push(meta)
+
         return {"error": f"Unknown SCM capability: {capability!r}"}
+
+    # ------------------------------------------------------------------
+    # Git subprocess operations
+    # ------------------------------------------------------------------
+
+    def _build_auth_url(self, repo_url: str) -> str:
+        """Build an authenticated clone URL with token embedded."""
+        from urllib.parse import urlparse, urlunparse
+
+        token = os.environ.get("SCM_TOKEN", "")
+        parsed = urlparse(repo_url)
+        # For Bitbucket bearer: embed token in URL
+        # For GitHub: embed token as username
+        if "github" in parsed.netloc.lower():
+            authed = parsed._replace(netloc=f"{token}@{parsed.netloc}")
+        else:
+            # Bitbucket: use HTTP header via git config or embed in URL
+            username = os.environ.get("SCM_USERNAME", "")
+            if username:
+                authed = parsed._replace(netloc=f"{username}:{token}@{parsed.netloc}")
+            else:
+                authed = parsed._replace(netloc=f"x-token-auth:{token}@{parsed.netloc}")
+        return urlunparse(authed)
+
+    def _handle_clone(self, meta: dict) -> dict:
+        """Clone a repository to a target path."""
+        repo_url = meta.get("repoUrl", "")
+        target_path = meta.get("targetPath", "")
+        if not repo_url or not target_path:
+            return {"error": "repoUrl and targetPath are required", "status": "error"}
+
+        # Strip /browse suffix from Bitbucket URLs
+        clean_url = repo_url.split("/browse")[0].rstrip("/")
+
+        # Build authenticated clone URL
+        auth_url = self._build_auth_url(clean_url)
+
+        try:
+            os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", auth_url, target_path],
+                capture_output=True, text=True, timeout=120,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )
+            if result.returncode != 0:
+                return {
+                    "cloned": False,
+                    "error": result.stderr.strip()[:500],
+                    "status": "clone_failed",
+                }
+            return {"cloned": True, "path": target_path, "status": "ok"}
+        except subprocess.TimeoutExpired:
+            return {"cloned": False, "error": "clone timed out", "status": "timeout"}
+        except Exception as exc:
+            return {"cloned": False, "error": str(exc)[:500], "status": "error"}
+
+    def _handle_push(self, meta: dict) -> dict:
+        """Push a local branch to the remote."""
+        repo_path = meta.get("repoPath", "")
+        branch = meta.get("branch", "")
+        if not repo_path or not branch:
+            return {"error": "repoPath and branch are required", "status": "error"}
+
+        try:
+            # Set the push URL with auth
+            remote_url = subprocess.run(
+                ["git", "-C", repo_path, "remote", "get-url", "origin"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            if remote_url:
+                auth_url = self._build_auth_url(remote_url)
+                subprocess.run(
+                    ["git", "-C", repo_path, "remote", "set-url", "origin", auth_url],
+                    capture_output=True, text=True, timeout=10,
+                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                )
+
+            result = subprocess.run(
+                ["git", "-C", repo_path, "push", "-u", "origin", branch],
+                capture_output=True, text=True, timeout=120,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )
+            if result.returncode != 0:
+                return {
+                    "pushed": False,
+                    "error": result.stderr.strip()[:500],
+                    "status": "push_failed",
+                }
+            return {"pushed": True, "branch": branch, "status": "ok"}
+        except subprocess.TimeoutExpired:
+            return {"pushed": False, "error": "push timed out", "status": "timeout"}
+        except Exception as exc:
+            return {"pushed": False, "error": str(exc)[:500], "status": "error"}
 
     async def get_task(self, task_id: str) -> dict:
         return self.services.task_store.get_task_dict(task_id)

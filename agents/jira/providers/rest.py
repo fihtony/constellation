@@ -104,6 +104,11 @@ class JiraRESTProvider(JiraProvider):
             return {"ticketKey": ticket_key}, "updated"
         return None, f"HTTP {request_status}"
 
+    def list_comments(
+        self, ticket_key: str, max_results: int = 50
+    ) -> tuple[list, str]:
+        return self._client.list_comments(ticket_key, max_results)
+
     @property
     def backend_name(self) -> str:
         return "rest"

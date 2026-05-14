@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any
 
 
@@ -21,6 +22,7 @@ async def receive_task(state: dict) -> dict:
         "jira_key": state.get("jira_key", ""),
         "repo_url": state.get("repo_url", ""),
         "figma_url": state.get("figma_url", ""),
+        "stitch_project_id": state.get("stitch_project_id", ""),
         "revision_count": 0,
         "max_revisions": 3,
     }
@@ -76,12 +78,19 @@ async def gather_context(state: dict) -> dict:
 
     Uses the registered tools (fetch_jira_ticket, fetch_design) to call
     boundary agents via A2A dispatch.
+
+    Writes context-manifest.json to the workspace with file paths for
+    downstream agents.
     """
     from framework.tools.registry import get_registry
 
     registry = get_registry()
     jira_context = state.get("jira_context") or {}
     design_context = state.get("design_context")
+    workspace_path = state.get("workspace_path", "")
+
+    jira_files = []
+    design_files = []
 
     # Fetch Jira ticket if key provided and not already present
     jira_key = state.get("jira_key", "")
@@ -95,6 +104,25 @@ async def gather_context(state: dict) -> dict:
                 jira_context = payload
         except Exception as exc:
             print(f"[team-lead] Jira fetch failed: {exc}")
+
+    # Write Jira ticket to workspace
+    if jira_context and workspace_path:
+        tl_dir = os.path.join(workspace_path, "team_lead")
+        os.makedirs(tl_dir, exist_ok=True)
+        jira_file = os.path.join(tl_dir, "jira-ticket.json")
+        try:
+            with open(jira_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "team-lead",
+                        "step": "gather_context",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": jira_context,
+                }, fh, ensure_ascii=False, indent=2)
+            jira_files.append("team_lead/jira-ticket.json")
+        except OSError as exc:
+            print(f"[team-lead] Failed to write jira-ticket.json: {exc}")
 
     # Fetch design context if URL provided and not already present
     figma_url = state.get("figma_url", "")
@@ -113,9 +141,71 @@ async def gather_context(state: dict) -> dict:
         except Exception as exc:
             print(f"[team-lead] Design fetch failed: {exc}")
 
+    # Write design context to workspace
+    if design_context and workspace_path:
+        tl_dir = os.path.join(workspace_path, "team_lead")
+        os.makedirs(tl_dir, exist_ok=True)
+        design_file = os.path.join(tl_dir, "design-spec.json")
+        try:
+            with open(design_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "team-lead",
+                        "step": "gather_context",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": design_context,
+                }, fh, ensure_ascii=False, indent=2)
+            design_files.append("team_lead/design-spec.json")
+        except OSError as exc:
+            print(f"[team-lead] Failed to write design-spec.json: {exc}")
+
+    # Derive repo name from URL
+    repo_url = state.get("repo_url", "")
+    repo_name = ""
+    if repo_url:
+        parts = [p for p in repo_url.rstrip("/").split("/") if p]
+        # Strip /browse suffix for Bitbucket
+        if parts and parts[-1] == "browse":
+            parts.pop()
+        repo_name = parts[-1] if parts else "repo"
+    repo_path = os.path.join(workspace_path, repo_name) if repo_name else ""
+
+    # Write context manifest
+    context_manifest_path = ""
+    if workspace_path:
+        tl_dir = os.path.join(workspace_path, "team_lead")
+        os.makedirs(tl_dir, exist_ok=True)
+        manifest = {
+            "metadata": {
+                "agent_id": "team-lead",
+                "step": "gather_context",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            },
+            "data": {
+                "workspace_root": workspace_path,
+                "jira_files": jira_files,
+                "design_files": design_files,
+                "repo_path": repo_path,
+                "repo_name": repo_name,
+            },
+        }
+        manifest_file = os.path.join(tl_dir, "context-manifest.json")
+        try:
+            with open(manifest_file, "w", encoding="utf-8") as fh:
+                json.dump(manifest, fh, ensure_ascii=False, indent=2)
+            context_manifest_path = "team_lead/context-manifest.json"
+        except OSError as exc:
+            print(f"[team-lead] Failed to write context-manifest.json: {exc}")
+
     return {
         "jira_context": jira_context,
         "design_context": design_context,
+        "repo_name": repo_name,
+        "repo_path": repo_path,
+        "jira_files": jira_files,
+        "design_files": design_files,
+        "context_manifest_path": context_manifest_path,
     }
 
 
@@ -172,7 +262,8 @@ async def create_plan(state: dict) -> dict:
 async def dispatch_dev_agent(state: dict) -> dict:
     """Dispatch task to a dev agent (Web Dev, Android, etc.) via A2A tool.
 
-    Passes all gathered context so the dev agent does not re-fetch.
+    Passes all gathered context including workspace_paths so the dev agent
+    does not re-fetch or guess file locations.
     """
     from framework.tools.registry import get_registry
 
@@ -188,6 +279,11 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "jira_context": state.get("jira_context", {}),
                 "design_context": state.get("design_context"),
                 "repo_url": state.get("repo_url", ""),
+                "repo_path": state.get("repo_path", ""),
+                "workspace_path": state.get("workspace_path", ""),
+                "context_manifest_path": state.get("context_manifest_path", ""),
+                "jira_files": state.get("jira_files", []),
+                "design_files": state.get("design_files", []),
                 "revision_feedback": revision_feedback,
             },
         )
@@ -207,6 +303,9 @@ async def dispatch_dev_agent(state: dict) -> dict:
 async def review_result(state: dict) -> dict:
     """Review the dev agent output via Code Review Agent.
 
+    Passes Jira context, design context, and workspace paths to the
+    Code Review Agent for comprehensive review.
+
     Returns a route:
       - "approved": review passed
       - "needs_revision": review rejected, revision count < max
@@ -225,6 +324,10 @@ async def review_result(state: dict) -> dict:
                 "pr_url": pr_url,
                 "diff_summary": dev_result.get("summary", ""),
                 "requirements": state.get("analysis_summary", "") or state.get("user_request", ""),
+                "jira_context": state.get("jira_context", {}),
+                "design_context": state.get("design_context"),
+                "workspace_path": state.get("workspace_path", ""),
+                "context_manifest_path": state.get("context_manifest_path", ""),
             },
         )
         payload = json.loads(result_str) if result_str else {}

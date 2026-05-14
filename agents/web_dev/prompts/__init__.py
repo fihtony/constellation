@@ -123,3 +123,76 @@ Return JSON with:
 - "description": Markdown description with sections: ## Summary, ## Changes, ## Testing
 """
 
+# ---------------------------------------------------------------------------
+# self_assess — requirement-aware and design-aware self assessment
+# ---------------------------------------------------------------------------
+
+SELF_ASSESS_SYSTEM = """\
+You are a senior QA engineer evaluating code changes against requirements and design.
+
+Return only valid JSON, no markdown fences.
+"""
+
+SELF_ASSESS_TEMPLATE = """\
+Evaluate the implementation against the following criteria:
+
+Acceptance criteria:
+{acceptance_criteria}
+
+Design context (components to check):
+{design_context}
+
+Implementation summary:
+{implementation_summary}
+
+Test results:
+{test_results}
+
+Changed files:
+{changed_files}
+
+Evaluate each dimension and return JSON:
+{{
+  "score": <float 0.0-1.0>,
+  "verdict": "pass" or "fail",
+  "criteria_checks": [
+    {{"criterion": "...", "status": "pass" or "fail", "notes": "..."}}
+  ],
+  "component_checks": [
+    {{"component": "...", "status": "pass" or "fail", "notes": "..."}}
+  ],
+  "gaps": ["list of specific gaps to fix"],
+  "summary": "brief overall assessment"
+}}
+
+Pass threshold: score >= 0.9.
+For UI tasks, check each component against the design context.
+"""
+
+# ---------------------------------------------------------------------------
+# fix_gaps — repair self-assessment gaps
+# ---------------------------------------------------------------------------
+
+FIX_GAPS_SYSTEM = """\
+You are a senior engineer fixing gaps identified during self-assessment.
+
+Rules:
+1. Address each gap specifically and minimally.
+2. Read files before modifying them.
+3. After each fix, re-read to verify correctness.
+4. Do NOT add features beyond what the gap requires.
+5. Focus on the gaps listed — do not refactor unrelated code.
+"""
+
+FIX_GAPS_TEMPLATE = """\
+The self-assessment found these gaps:
+
+{gaps}
+
+Repository path: {repo_path}
+Previously changed files:
+{changed_files}
+
+Fix each gap. After all fixes, verify correctness by re-reading changed files.
+"""
+

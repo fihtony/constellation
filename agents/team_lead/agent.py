@@ -17,6 +17,7 @@ Tools live in:
 from __future__ import annotations
 
 import json
+import os
 import threading
 from typing import Any
 
@@ -140,6 +141,13 @@ class TeamLeadAgent(BaseAgent):
         )
 
         # Build initial workflow state
+        artifact_root = os.environ.get("ARTIFACT_ROOT", "artifacts/")
+        workspace_path = os.path.join(
+            artifact_root,
+            f"compass-{meta.get('orchestratorTaskId', 'default')[:8]}",
+            task.id,
+        )
+
         state = {
             "user_request": user_text,
             "jira_key": meta.get("jiraKey", ""),
@@ -148,6 +156,7 @@ class TeamLeadAgent(BaseAgent):
             "stitch_project_id": meta.get("stitchProjectId", ""),
             "jira_context": meta.get("jiraContext", {}),
             "design_context": meta.get("designContext"),
+            "workspace_path": workspace_path,
             "metadata": meta,
             "_task_id": task.id,
             "_agent_id": self.definition.agent_id,

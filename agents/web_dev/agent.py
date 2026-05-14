@@ -16,12 +16,17 @@ import threading
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 from framework.workflow import Workflow, START, END
 from agents.web_dev.nodes import (
+    prepare_jira,
     setup_workspace,
     analyze_task,
     implement_changes,
     run_tests,
     fix_tests,
+    self_assess,
+    fix_gaps,
+    capture_screenshot,
     create_pr,
+    update_jira,
     report_result,
 )
 
@@ -32,15 +37,23 @@ from agents.web_dev.nodes import (
 web_dev_workflow = Workflow(
     name="web_dev",
     edges=[
-        (START, setup_workspace, analyze_task),
+        (START, prepare_jira, setup_workspace),
+        (setup_workspace, analyze_task),
         (analyze_task, implement_changes),
         (implement_changes, run_tests),
         (run_tests, {
-            "pass": create_pr,
+            "pass": self_assess,
             "fail": fix_tests,
         }),
         (fix_tests, run_tests),
-        (create_pr, report_result),
+        (self_assess, {
+            "pass": capture_screenshot,
+            "fail": fix_gaps,
+        }),
+        (fix_gaps, run_tests),
+        (capture_screenshot, create_pr),
+        (create_pr, update_jira),
+        (update_jira, report_result),
         (report_result, END),
     ],
 )
@@ -68,6 +81,8 @@ def _build_web_dev_definition() -> AgentDefinition:
         tools=cfg.get("tools", [
             "read_file", "write_file", "edit_file", "search_code", "run_command",
             "scm_clone", "scm_branch", "scm_commit", "scm_push", "scm_create_pr",
+            "jira_transition", "jira_comment", "jira_update",
+            "jira_list_transitions", "jira_get_token_user", "jira_list_comments",
         ]),
         permissions=cfg.get("permissions", {"scm": "read-write", "filesystem": "workspace-only"}),
         permission_profile=cfg.get("permission_profile", "development"),
@@ -84,6 +99,12 @@ web_dev_definition = _build_web_dev_definition()
 
 class WebDevAgent(BaseAgent):
     """Web Dev Agent implementation with graph-first lifecycle."""
+
+    async def start(self) -> None:
+        """Initialize agent and register boundary tools."""
+        await super().start()
+        from agents.web_dev.tools import register_web_dev_tools
+        register_web_dev_tools()
 
     async def handle_message(self, message: dict) -> dict:
         from framework.a2a.protocol import Artifact

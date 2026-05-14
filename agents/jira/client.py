@@ -215,6 +215,15 @@ class JiraClient:
             return data.get("transitions", []), "ok"
         return [], self._status_message(status, data)
 
+    def list_comments(self, key: str, max_results: int = 50) -> tuple[list, str]:
+        """List comments on a ticket."""
+        status, data = self.request(
+            "GET", f"issue/{key}/comment?maxResults={max_results}"
+        )
+        if status == 200:
+            return data.get("comments", []), "ok"
+        return [], self._status_message(status, data)
+
     def _expand_issue_documents(self, issues: list[dict]) -> list[dict]:
         """Hydrate issue-id-only search results into full issue documents."""
         expanded: list[dict] = []

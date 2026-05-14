@@ -47,6 +47,12 @@ class JiraProvider(ABC):
     ) -> tuple[dict | None, str]:
         """Update issue fields. Returns (result_dict | None, status)."""
 
+    @abstractmethod
+    def list_comments(
+        self, ticket_key: str, max_results: int = 50
+    ) -> tuple[list, str]:
+        """List comments on a ticket. Returns (comments_list, status)."""
+
     @property
     def backend_name(self) -> str:
         """Return the backend identifier."""
