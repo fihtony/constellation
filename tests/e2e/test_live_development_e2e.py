@@ -299,7 +299,7 @@ def _register_live_boundary_tools(cfg: dict, workspace_path: str = "") -> None:
                     }
                     result = loop.run_until_complete(agent.handle_message(msg))
                     task_id = result["task"]["id"]
-                    deadline = time.monotonic() + 600
+                    deadline = time.monotonic() + 900
                     while time.monotonic() < deadline:
                         td = wd_task_store.get_task_dict(task_id)
                         state = td["task"]["status"]["state"]
@@ -307,19 +307,26 @@ def _register_live_boundary_tools(cfg: dict, workspace_path: str = "") -> None:
                             break
                         time.sleep(2.0)
                     final_td = wd_task_store.get_task_dict(task_id)
+                    final_state = final_td["task"]["status"]["state"]
                     arts = final_td["task"].get("artifacts", [])
+                    print(f"[live-e2e] Web Dev final state: {final_state}, artifacts: {len(arts)}")
+                    if final_td["task"]["status"].get("message"):
+                        msg_parts = final_td["task"]["status"]["message"].get("parts", [])
+                        for p in msg_parts[:2]:
+                            print(f"[live-e2e] Web Dev status message: {p.get('text', '')[:300]}")
                     pr_url = ""
                     branch = ""
                     jira_in_review = False
                     for art in arts:
                         m = art.get("metadata", {})
+                        print(f"[live-e2e] Web Dev artifact metadata: {json.dumps(m)[:200]}")
                         pr_url = pr_url or m.get("prUrl", "")
                         branch = branch or m.get("branch", "")
                         jir = m.get("jiraInReview")
                         if jir:
                             jira_in_review = jir in (True, "True", "true", "1")
                     summary = arts[0].get("parts", [{}])[0].get("text", "Web dev completed.") if arts else "Web dev completed."
-                    final_state = final_td["task"]["status"]["state"]
+                    print(f"[live-e2e] Web Dev result: prUrl={pr_url!r} branch={branch!r} jiraInReview={jira_in_review}")
                     return {
                         "status": "completed" if final_state == "TASK_STATE_COMPLETED" else "error",
                         "summary": summary,
@@ -327,12 +334,23 @@ def _register_live_boundary_tools(cfg: dict, workspace_path: str = "") -> None:
                         "branch": branch,
                         "jiraInReview": jira_in_review,
                     }
+                except Exception as exc:
+                    import traceback
+                    print(f"[live-e2e] Web Dev _run_web_dev exception: {exc}")
+                    traceback.print_exc()
+                    return {
+                        "status": "error",
+                        "summary": str(exc),
+                        "prUrl": "",
+                        "branch": "",
+                        "jiraInReview": False,
+                    }
                 finally:
                     loop.close()
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(_run_web_dev)
-                result_dict = future.result(timeout=660)
+                result_dict = future.result(timeout=960)
             return ToolResult(output=json.dumps(result_dict))
 
     class _MockDispatchCodeReview(BaseTool):

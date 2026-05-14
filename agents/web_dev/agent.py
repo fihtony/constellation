@@ -106,7 +106,9 @@ class WebDevAgent(BaseAgent):
         """Initialize agent and register boundary tools."""
         await super().start()
         from agents.web_dev.tools import register_web_dev_tools
+        from agents.web_dev.coding_tools import register_web_dev_coding_tools
         register_web_dev_tools()
+        register_web_dev_coding_tools()
 
     async def handle_message(self, message: dict) -> dict:
         from framework.a2a.protocol import Artifact
@@ -154,6 +156,14 @@ class WebDevAgent(BaseAgent):
             "definition_of_done": metadata.get("definitionOfDone", {}),
             "test_cycles": 0,
             "metadata": metadata,
+            # Populate _allowed_tools from the permission engine so run_agentic
+            # only exposes the development-profile tool list to the LLM, rather
+            # than the entire global registry.
+            "_allowed_tools": (
+                self._permission_engine.permissions.allowed_tools[:]
+                if self._permission_engine
+                else None
+            ),
         }
 
         def _run() -> None:

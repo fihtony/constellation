@@ -81,6 +81,7 @@ async def prepare_jira(state: dict) -> dict:
         or jira_context.get("ticket_key")
         or state.get("jira_key", "")
     )
+    print(f"[web-dev] prepare_jira: jira_key={jira_key!r}")
 
     if not jira_key:
         return {"jira_prepared": False, "jira_prepare_skipped": "no_jira_key"}
@@ -199,6 +200,7 @@ async def setup_workspace(state: dict) -> dict:
     workspace_path = state.get("workspace_path", "")
     branch_name = state.get("branch_name", "")
     task_id = state.get("_task_id", "unknown")
+    print(f"[web-dev] setup_workspace: repo_path={repo_path!r} workspace_path={workspace_path!r}")
 
     # Use workspace_path from Team Lead; only fall back to temp if missing
     if not workspace_path:
@@ -258,6 +260,7 @@ async def analyze_task(state: dict) -> dict:
     Reuses the analysis already provided by Team Lead (via state["analysis"]).
     Falls back to a simple echo of the user request when nothing is provided.
     """
+    print("[web-dev] analyze_task: reusing Team Lead analysis")
     # Team Lead already performed deep analysis — reuse it
     plan = state.get("analysis") or state.get("user_request", "")
 
@@ -318,6 +321,7 @@ async def implement_changes(state: dict) -> dict:
     )
 
     allowed_tools = state.get("_allowed_tools")  # enforced by PermissionEngine upstream
+    print(f"[web-dev] implement_changes: repo_path={state.get('repo_path', '')!r} allowed_tools={allowed_tools}")
     result = runtime.run_agentic(
         task=prompt,
         system_prompt=IMPLEMENT_SYSTEM,
@@ -327,6 +331,7 @@ async def implement_changes(state: dict) -> dict:
         timeout=600,
         plugin_manager=state.get("_plugin_manager"),
     )
+    print(f"[web-dev] implement_changes done: success={result.success} turns={result.turns_used} changes={len(result.tool_calls)}")
 
     # Extract changed file names from tool_calls log
     changes_made = sorted({
@@ -363,6 +368,7 @@ async def run_tests(state: dict) -> dict:
         }
 
     repo_path = state.get("repo_path", "")
+    print(f"[web-dev] run_tests: cycle={test_cycles} repo_path={repo_path!r}")
     result = runtime.run_agentic(
         task=(
             "Run the project's test suite and report results.\n"
@@ -811,6 +817,8 @@ async def create_pr(state: dict) -> dict:
     )
     if push_payload.get("error"):
         print(f"[web-dev] scm_push failed: {push_payload['error']}")
+    else:
+        print(f"[web-dev] scm_push OK: branch={branch_name!r}")
 
     pr_payload = _call_boundary_tool(
         state, "scm_create_pr",
@@ -826,6 +834,7 @@ async def create_pr(state: dict) -> dict:
     pr_url = pr_payload.get("prUrl") or pr_payload.get("pr_url", "")
     pr_number = pr_payload.get("prNumber") or pr_payload.get("pr_number", 0)
     commit_hash = pr_payload.get("commitHash") or pr_payload.get("commit_hash", "")
+    print(f"[web-dev] create_pr done: prUrl={pr_url!r} prNumber={pr_number} error={pr_payload.get('error', '')}")
 
     # Write pr-evidence.json to workspace
     workspace_path = state.get("workspace_path", "")
@@ -873,6 +882,7 @@ async def report_result(state: dict) -> dict:
     changes = state.get("changes_made", [])
     pr_title = state.get("pr_title", "")
     test_status = state.get("test_status", "unknown")
+    print(f"[web-dev] report_result: prUrl={pr_url!r} branch={branch_name!r} test_status={test_status!r} changes={len(changes)}")
 
     summary_parts = [
         f"Implementation complete.",

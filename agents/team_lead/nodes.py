@@ -370,12 +370,22 @@ async def dispatch_dev_agent(state: dict) -> dict:
         print(f"[team-lead] Dev dispatch failed: {exc}")
         payload = {"status": "error", "message": str(exc)}
 
+    pr_url = payload.get("prUrl", "")
+    branch_name = payload.get("branch", "")
+    jira_in_review = payload.get("jiraInReview", False)
+    print(
+        f"[team-lead] Dev dispatch result: status={payload.get('status','?')} "
+        f"prUrl={pr_url!r} branch={branch_name!r} jiraInReview={jira_in_review}"
+    )
+    if payload.get("error"):
+        print(f"[team-lead] Dev dispatch error detail: {payload['error']}")
+
     return {
         "dev_dispatched": True,
         "dev_result": payload,
-        "pr_url": payload.get("prUrl", ""),
-        "branch_name": payload.get("branch", ""),
-        "jira_in_review": payload.get("jiraInReview", False),
+        "pr_url": pr_url,
+        "branch_name": branch_name,
+        "jira_in_review": jira_in_review,
     }
 
 
