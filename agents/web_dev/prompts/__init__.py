@@ -119,8 +119,27 @@ Files changed: {changed_files}
 
 Write a pull request title and description.
 Return JSON with:
-- "title": short PR title (≤72 chars, imperative mood)
-- "description": Markdown description with sections: ## Summary, ## Changes, ## Testing
+- "title": short PR title (≤72 chars, imperative mood, prefixed with Jira key)
+- "description": Markdown description following this template:
+
+## {{jira_key}}: {{summary}}
+
+### Changes
+{{implementation_summary}}
+
+### Files Changed
+{{files_changed_list}}
+
+### Test Results
+- Passed: {{test_passed}}
+- Failed: {{test_failed}}
+
+### Self-Assessment
+- Score: {{assessment_score}}
+- Remaining gaps: {{gaps_list}}
+
+### Jira Ticket
+[{{jira_key}}]({{jira_url}})
 """
 
 # ---------------------------------------------------------------------------

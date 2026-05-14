@@ -811,6 +811,7 @@ async def create_pr(state: dict) -> dict:
 async def report_result(state: dict) -> dict:
     """Return final result summary."""
     pr_url = state.get("pr_url", "N/A")
+    branch_name = state.get("branch_name", "N/A")
     changes = state.get("changes_made", [])
     pr_title = state.get("pr_title", "")
     test_status = state.get("test_status", "unknown")
@@ -830,5 +831,7 @@ async def report_result(state: dict) -> dict:
         "state": "TASK_STATE_COMPLETED",
         "summary": " ".join(summary_parts),
         "implementation_summary": " ".join(summary_parts),
+        "pr_url": pr_url,
+        "branch_name": branch_name,
     }
 

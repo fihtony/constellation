@@ -34,36 +34,55 @@ async def analyze_requirements(state: dict) -> dict:
     user_request = state.get("user_request", "")
 
     if not runtime:
-        return {
-            "task_type": "general",
-            "complexity": "medium",
-            "required_skills": [],
-            "analysis_summary": user_request,
-        }
-
-    from agents.team_lead.prompts.analysis import ANALYSIS_SYSTEM, ANALYSIS_TEMPLATE
-
-    prompt = ANALYSIS_TEMPLATE.format(
-        user_request=user_request,
-        jira_key=state.get("jira_key", "N/A"),
-    )
-    result = runtime.run(
-        prompt=prompt,
-        system_prompt=ANALYSIS_SYSTEM,
-        max_tokens=2048,
-        plugin_manager=state.get("_plugin_manager"),
-    )
-
-    raw = result.get("raw_response", "")
-    try:
-        analysis = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
         analysis = {
             "task_type": "general",
             "complexity": "medium",
             "skills": [],
-            "summary": raw or user_request,
+            "summary": user_request,
         }
+    else:
+        from agents.team_lead.prompts.analysis import ANALYSIS_SYSTEM, ANALYSIS_TEMPLATE
+
+        prompt = ANALYSIS_TEMPLATE.format(
+            user_request=user_request,
+            jira_key=state.get("jira_key", "N/A"),
+        )
+        result = runtime.run(
+            prompt=prompt,
+            system_prompt=ANALYSIS_SYSTEM,
+            max_tokens=2048,
+            plugin_manager=state.get("_plugin_manager"),
+        )
+
+        raw = result.get("raw_response", "")
+        try:
+            analysis = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            analysis = {
+                "task_type": "general",
+                "complexity": "medium",
+                "skills": [],
+                "summary": raw or user_request,
+            }
+
+    # Write analysis.json to workspace
+    workspace_path = state.get("workspace_path", "")
+    if workspace_path:
+        tl_dir = os.path.join(workspace_path, "team_lead")
+        os.makedirs(tl_dir, exist_ok=True)
+        try:
+            analysis_file = os.path.join(tl_dir, "analysis.json")
+            with open(analysis_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "team-lead",
+                        "step": "analyze_requirements",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": analysis,
+                }, fh, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            print(f"[team-lead] Failed to write analysis.json: {exc}")
 
     return {
         "task_type": analysis.get("task_type", "general"),
@@ -323,6 +342,14 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "jira_files": state.get("jira_files", []),
                 "design_files": state.get("design_files", []),
                 "revision_feedback": revision_feedback,
+                "definition_of_done": state.get("plan", {}).get("definition_of_done", {
+                    "build_must_pass": True,
+                    "tests_must_pass": True,
+                    "self_assessment_required": True,
+                    "jira_state_management": True,
+                    "pr_required": True,
+                    "screenshot_required": state.get("task_type", "") in ("feature", "ui", "frontend"),
+                }),
             },
         )
         payload = json.loads(result_str) if result_str else {}

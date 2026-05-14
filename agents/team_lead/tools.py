@@ -287,6 +287,10 @@ class DispatchWebDev(BaseTool):
                 "type": "array",
                 "description": "List of design artifact file paths in workspace. Optional.",
             },
+            "definition_of_done": {
+                "type": "object",
+                "description": "Acceptance gate criteria (build, tests, PR, screenshot). Optional.",
+            },
         },
         "required": ["task_description"],
     }
@@ -303,6 +307,7 @@ class DispatchWebDev(BaseTool):
         jira_files: list | None = None,
         design_files: list | None = None,
         revision_feedback: str = "",
+        definition_of_done: dict | None = None,
     ) -> ToolResult:
         web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", "web-dev.task.execute")
         meta: dict[str, Any] = {}
@@ -324,6 +329,8 @@ class DispatchWebDev(BaseTool):
             meta["designFiles"] = design_files
         if revision_feedback:
             meta["revisionFeedback"] = revision_feedback
+        if definition_of_done:
+            meta["definitionOfDone"] = definition_of_done
 
         try:
             from framework.a2a.client import dispatch_sync

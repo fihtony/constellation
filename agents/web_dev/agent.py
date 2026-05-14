@@ -144,6 +144,7 @@ class WebDevAgent(BaseAgent):
             "task_type": metadata.get("taskType", "general"),
             "analysis": metadata.get("analysis", ""),
             "revision_feedback": metadata.get("revisionFeedback", ""),
+            "definition_of_done": metadata.get("definitionOfDone", {}),
             "test_cycles": 0,
             "metadata": metadata,
         }
