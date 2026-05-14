@@ -171,6 +171,23 @@ async def gather_context(state: dict) -> dict:
         repo_name = parts[-1] if parts else "repo"
     repo_path = os.path.join(workspace_path, repo_name) if repo_name else ""
 
+    # Clone repo via SCM Agent (A2A)
+    repo_cloned = False
+    if repo_url and repo_path:
+        try:
+            clone_result_str = registry.execute_sync(
+                "clone_repo",
+                {"repo_url": repo_url, "target_path": repo_path},
+            )
+            clone_payload = json.loads(clone_result_str) if clone_result_str else {}
+            if clone_payload.get("error"):
+                print(f"[team-lead] Repo clone failed: {clone_payload['error']}")
+            else:
+                repo_cloned = True
+                print(f"[team-lead] Repo cloned: {repo_name} → {repo_path}")
+        except Exception as exc:
+            print(f"[team-lead] Repo clone failed: {exc}")
+
     # Write context manifest
     context_manifest_path = ""
     if workspace_path:
@@ -188,6 +205,7 @@ async def gather_context(state: dict) -> dict:
                 "design_files": design_files,
                 "repo_path": repo_path,
                 "repo_name": repo_name,
+                "repo_cloned": repo_cloned,
             },
         }
         manifest_file = os.path.join(tl_dir, "context-manifest.json")
@@ -203,6 +221,7 @@ async def gather_context(state: dict) -> dict:
         "design_context": design_context,
         "repo_name": repo_name,
         "repo_path": repo_path,
+        "repo_cloned": repo_cloned,
         "jira_files": jira_files,
         "design_files": design_files,
         "context_manifest_path": context_manifest_path,
@@ -252,6 +271,25 @@ async def create_plan(state: dict) -> dict:
     skill_context = ""
     if skills_registry and required:
         skill_context = skills_registry.build_prompt_context(required)
+
+    # Write delivery-plan.json to workspace
+    workspace_path = state.get("workspace_path", "")
+    if workspace_path:
+        tl_dir = os.path.join(workspace_path, "team_lead")
+        os.makedirs(tl_dir, exist_ok=True)
+        try:
+            plan_file = os.path.join(tl_dir, "delivery-plan.json")
+            with open(plan_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "team-lead",
+                        "step": "create_plan",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": plan,
+                }, fh, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            print(f"[team-lead] Failed to write delivery-plan.json: {exc}")
 
     return {
         "plan": plan,
@@ -378,15 +416,42 @@ async def report_success(state: dict) -> dict:
     verdict = state.get("review_verdict", "approved")
     revision_count = state.get("revision_count", 0)
 
+    report_summary = (
+        f"Task completed successfully.\n"
+        f"Analysis: {analysis}\n"
+        f"PR: {pr_url}\n"
+        f"Branch: {branch}\n"
+        f"Review verdict: {verdict}\n"
+        f"Revisions: {revision_count}"
+    )
+
+    # Write final-report.json to workspace
+    workspace_path = state.get("workspace_path", "")
+    if workspace_path:
+        tl_dir = os.path.join(workspace_path, "team_lead")
+        os.makedirs(tl_dir, exist_ok=True)
+        try:
+            report_file = os.path.join(tl_dir, "final-report.json")
+            with open(report_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "team-lead",
+                        "step": "report_success",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": {
+                        "pr_url": pr_url,
+                        "branch": branch,
+                        "analysis": analysis,
+                        "review_verdict": verdict,
+                        "revision_count": revision_count,
+                    },
+                }, fh, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            print(f"[team-lead] Failed to write final-report.json: {exc}")
+
     return {
-        "report_summary": (
-            f"Task completed successfully.\n"
-            f"Analysis: {analysis}\n"
-            f"PR: {pr_url}\n"
-            f"Branch: {branch}\n"
-            f"Review verdict: {verdict}\n"
-            f"Revisions: {revision_count}"
-        ),
+        "report_summary": report_summary,
         "success": True,
     }
 

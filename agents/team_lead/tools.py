@@ -165,6 +165,54 @@ class FetchDesign(BaseTool):
 
 
 # ---------------------------------------------------------------------------
+# Tool: clone_repo
+# ---------------------------------------------------------------------------
+
+class CloneRepo(BaseTool):
+    """Clone a code repository to a target path via SCM Agent."""
+
+    name = "clone_repo"
+    description = "Clone a Git repository to a local workspace path via the SCM Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {
+                "type": "string",
+                "description": "Git repository URL to clone.",
+            },
+            "target_path": {
+                "type": "string",
+                "description": "Local filesystem path to clone into.",
+            },
+        },
+        "required": ["repo_url", "target_path"],
+    }
+
+    def execute_sync(self, repo_url: str = "", target_path: str = "") -> ToolResult:
+        scm_url = _resolve_agent_url(
+            "SCM_AGENT_URL", "scm_agent_url", "http://scm:8020", "scm.repo.clone"
+        )
+        try:
+            from framework.a2a.client import dispatch_sync
+            result = dispatch_sync(
+                url=scm_url,
+                capability="scm.repo.clone",
+                message_parts=[{"text": repo_url}],
+                metadata={"repoUrl": repo_url, "targetPath": target_path},
+                timeout=120,
+            )
+            artifacts = result.get("task", result).get("artifacts", [])
+            payload = _first_artifact_json(artifacts)
+            return ToolResult(output=json.dumps(payload))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({
+                "error": str(exc),
+                "repoUrl": repo_url,
+                "targetPath": target_path,
+            }))
+
+
+# ---------------------------------------------------------------------------
 # Tool: dispatch_web_dev
 # ---------------------------------------------------------------------------
 
@@ -195,9 +243,49 @@ class DispatchWebDev(BaseTool):
                 "type": "string",
                 "description": "Git repository URL. Optional.",
             },
+            "repo_path": {
+                "type": "string",
+                "description": "Local clone path. Optional.",
+            },
+            "workspace_path": {
+                "type": "string",
+                "description": "Shared workspace root. Optional.",
+            },
+            "context_manifest_path": {
+                "type": "string",
+                "description": "Path to context-manifest.json. Optional.",
+            },
+            "jira_files": {
+                "type": "array",
+                "description": "Jira context file paths. Optional.",
+            },
+            "design_files": {
+                "type": "array",
+                "description": "Design context file paths. Optional.",
+            },
             "revision_feedback": {
                 "type": "string",
                 "description": "Code review rejection reason for revision. Optional.",
+            },
+            "repo_path": {
+                "type": "string",
+                "description": "Local path to cloned repository. Optional.",
+            },
+            "workspace_path": {
+                "type": "string",
+                "description": "Shared workspace path. Optional.",
+            },
+            "context_manifest_path": {
+                "type": "string",
+                "description": "Relative path to context-manifest.json. Optional.",
+            },
+            "jira_files": {
+                "type": "array",
+                "description": "List of Jira artifact file paths in workspace. Optional.",
+            },
+            "design_files": {
+                "type": "array",
+                "description": "List of design artifact file paths in workspace. Optional.",
             },
         },
         "required": ["task_description"],
@@ -209,6 +297,11 @@ class DispatchWebDev(BaseTool):
         jira_context: dict | None = None,
         design_context: dict | None = None,
         repo_url: str = "",
+        repo_path: str = "",
+        workspace_path: str = "",
+        context_manifest_path: str = "",
+        jira_files: list | None = None,
+        design_files: list | None = None,
         revision_feedback: str = "",
     ) -> ToolResult:
         web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", "web-dev.task.execute")
@@ -219,6 +312,16 @@ class DispatchWebDev(BaseTool):
             meta["designContext"] = design_context
         if repo_url:
             meta["repoUrl"] = repo_url
+        if repo_path:
+            meta["repoPath"] = repo_path
+        if workspace_path:
+            meta["workspacePath"] = workspace_path
+        if context_manifest_path:
+            meta["contextManifestPath"] = context_manifest_path
+        if jira_files:
+            meta["jiraFiles"] = jira_files
+        if design_files:
+            meta["designFiles"] = design_files
         if revision_feedback:
             meta["revisionFeedback"] = revision_feedback
 
@@ -273,6 +376,22 @@ class DispatchCodeReview(BaseTool):
                 "type": "string",
                 "description": "Original requirements to check compliance against.",
             },
+            "jira_context": {
+                "type": "object",
+                "description": "Jira context for requirements-aware review. Optional.",
+            },
+            "design_context": {
+                "type": "object",
+                "description": "Design context for review. Optional.",
+            },
+            "workspace_path": {
+                "type": "string",
+                "description": "Shared workspace root. Optional.",
+            },
+            "context_manifest_path": {
+                "type": "string",
+                "description": "Path to context-manifest.json. Optional.",
+            },
         },
         "required": [],
     }
@@ -282,6 +401,10 @@ class DispatchCodeReview(BaseTool):
         pr_url: str = "",
         diff_summary: str = "",
         requirements: str = "",
+        jira_context: dict | None = None,
+        design_context: dict | None = None,
+        workspace_path: str = "",
+        context_manifest_path: str = "",
     ) -> ToolResult:
         review_url = _resolve_agent_url("CODE_REVIEW_AGENT_URL", "code_review_agent_url", "http://code-review:8050", "review.code.check")
         meta: dict[str, Any] = {}
@@ -289,6 +412,22 @@ class DispatchCodeReview(BaseTool):
             meta["prUrl"] = pr_url
         if requirements:
             meta["originalRequirements"] = requirements
+        if jira_context:
+            meta["jiraContext"] = jira_context
+        if design_context:
+            meta["designContext"] = design_context
+        if workspace_path:
+            meta["workspacePath"] = workspace_path
+        if context_manifest_path:
+            meta["contextManifestPath"] = context_manifest_path
+        if jira_context:
+            meta["jiraContext"] = jira_context
+        if design_context:
+            meta["designContext"] = design_context
+        if workspace_path:
+            meta["workspacePath"] = workspace_path
+        if context_manifest_path:
+            meta["contextManifestPath"] = context_manifest_path
 
         try:
             from framework.a2a.client import dispatch_sync
@@ -348,6 +487,7 @@ class RequestClarification(BaseTool):
 _TOOLS = [
     FetchJiraTicket(),
     FetchDesign(),
+    CloneRepo(),
     DispatchWebDev(),
     DispatchCodeReview(),
     RequestClarification(),

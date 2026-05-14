@@ -24,8 +24,9 @@ class TestWebDevWorkflowCompile:
     def test_web_dev_workflow_has_all_nodes(self):
         compiled = web_dev_workflow.compile()
         expected_nodes = {
-            "setup_workspace", "analyze_task", "implement_changes",
-            "run_tests", "fix_tests", "create_pr", "report_result",
+            "prepare_jira", "setup_workspace", "analyze_task", "implement_changes",
+            "run_tests", "fix_tests", "self_assess", "fix_gaps",
+            "capture_screenshot", "create_pr", "update_jira", "report_result",
         }
         assert expected_nodes == set(compiled.nodes.keys())
 
@@ -167,7 +168,7 @@ class TestWebDevNodes:
             def run_agentic(self, task, **kw):
                 return AgenticResult(success=True, summary='{"passed": 0, "failed": 1}', backend_used="mock")
 
-        state = {"_runtime": _MockRuntime(), "test_cycles": 2}  # already at max-1
+        state = {"_runtime": _MockRuntime(), "test_cycles": 4}  # already at max-1
         result = await run_tests(state)
         assert result["route"] == "pass"  # proceed despite failure
 

@@ -144,6 +144,32 @@ async def prepare_jira(state: dict) -> dict:
         },
     )
 
+    # Write jira-prepare-log.json
+    workspace_path = state.get("workspace_path", "")
+    if workspace_path:
+        import time as _time
+        agent_dir = os.path.join(workspace_path, "web-agent")
+        os.makedirs(agent_dir, exist_ok=True)
+        try:
+            log_file = os.path.join(agent_dir, "jira-prepare-log.json")
+            with open(log_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "web-dev",
+                        "step": "prepare_jira",
+                        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": {
+                        "jira_key": jira_key,
+                        "jira_original_status": original_status,
+                        "jira_original_assignee": original_assignee,
+                        "jira_token_user": token_user,
+                        "jira_prepared": True,
+                    },
+                }, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
     return {
         "jira_prepared": True,
         "jira_original_status": original_status,
@@ -152,7 +178,11 @@ async def prepare_jira(state: dict) -> dict:
     }
 
 async def setup_workspace(state: dict) -> dict:
-    """Clone repository and create a working branch.
+    """Create a working branch in the cloned repository.
+
+    The repo is already cloned by Team Lead (via SCM Agent) into repo_path.
+    This node verifies the repo exists and creates or checks out a local
+    development branch.
 
     Uses runtime.run() to derive a deterministic branch name from the task
     description and Jira context.  Falls back to metadata values when no
@@ -160,11 +190,16 @@ async def setup_workspace(state: dict) -> dict:
     """
     runtime = state.get("_runtime")
     repo_url = state.get("repo_url", "")
+    repo_path = state.get("repo_path", "")
+    workspace_path = state.get("workspace_path", "")
     branch_name = state.get("branch_name", "")
     task_id = state.get("_task_id", "unknown")
 
-    workspace_path = f"/tmp/constellation/{task_id}"
-    repo_path = f"{workspace_path}/repo"
+    # Use workspace_path from Team Lead; only fall back to temp if missing
+    if not workspace_path:
+        workspace_path = f"/tmp/constellation/{task_id}"
+    if not repo_path:
+        repo_path = os.path.join(workspace_path, "repo")
 
     # If branch_name already provided by Team Lead, skip LLM call
     if not branch_name and runtime:
@@ -179,6 +214,30 @@ async def setup_workspace(state: dict) -> dict:
                              plugin_manager=state.get("_plugin_manager"))
         data = _safe_json(result.get("raw_response", ""), fallback={})
         branch_name = data.get("branch_name", "feature/task")
+
+    # Write git setup log
+    if workspace_path:
+        agent_dir = os.path.join(workspace_path, "web-agent")
+        os.makedirs(agent_dir, exist_ok=True)
+        try:
+            import time as _time
+            log_file = os.path.join(agent_dir, "git-setup-log.json")
+            with open(log_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "web-dev",
+                        "step": "setup_workspace",
+                        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": {
+                        "repo_url": repo_url,
+                        "repo_path": repo_path,
+                        "branch_name": branch_name or "feature/task",
+                        "repo_exists": os.path.isdir(repo_path),
+                    },
+                }, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
 
     return {
         "workspace_path": workspace_path,
@@ -417,6 +476,27 @@ async def self_assess(state: dict) -> dict:
     verdict = data.get("verdict", "fail")
     gaps = data.get("gaps", [])
 
+    # Write self-assessment.json to workspace
+    workspace_path = state.get("workspace_path", "")
+    if workspace_path:
+        import time as _time
+        agent_dir = os.path.join(workspace_path, "web-agent")
+        os.makedirs(agent_dir, exist_ok=True)
+        try:
+            sa_file = os.path.join(agent_dir, "self-assessment.json")
+            with open(sa_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "web-dev",
+                        "step": "self_assess",
+                        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "version": assess_cycles,
+                    },
+                    "data": data,
+                }, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
     if score >= 0.9 and verdict != "fail":
         return {
             "self_assessment": data,
@@ -601,6 +681,31 @@ async def update_jira(state: dict) -> dict:
             {"ticket_key": jira_key, "transition_name": "In Review"},
         )
 
+    # Write jira-update-log.json to workspace
+    workspace_path = state.get("workspace_path", "")
+    if workspace_path:
+        import time as _time
+        agent_dir = os.path.join(workspace_path, "web-agent")
+        os.makedirs(agent_dir, exist_ok=True)
+        try:
+            log_file = os.path.join(agent_dir, "jira-update-log.json")
+            with open(log_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "web-dev",
+                        "step": "update_jira",
+                        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": {
+                        "jira_key": jira_key,
+                        "pr_url": pr_url,
+                        "comment_added": not already_commented,
+                        "transition_attempted": can_review,
+                    },
+                }, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
     return {"jira_updated": True}
 
 
@@ -663,6 +768,36 @@ async def create_pr(state: dict) -> dict:
     )
 
     pr_data = _safe_json(push_result.summary, fallback={})
+
+    # Write pr-evidence.json to workspace
+    workspace_path = state.get("workspace_path", "")
+    if workspace_path:
+        import time as _time
+        agent_dir = os.path.join(workspace_path, "web-agent")
+        os.makedirs(agent_dir, exist_ok=True)
+        try:
+            evidence_file = os.path.join(agent_dir, "pr-evidence.json")
+            with open(evidence_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "web-dev",
+                        "step": "create_pr",
+                        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": {
+                        "pr_url": pr_data.get("pr_url", ""),
+                        "pr_number": pr_data.get("pr_number", 0),
+                        "branch": branch_name,
+                        "title": pr_title,
+                        "commit_hash": pr_data.get("commit_hash", ""),
+                        "files_changed": len(state.get("changes_made", [])),
+                        "test_status": state.get("test_status", "unknown"),
+                        "self_assessment_score": state.get("self_assessment", {}).get("score", "N/A"),
+                        "screenshot_included": state.get("screenshot_captured", False),
+                    },
+                }, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
 
     return {
         "pr_url": pr_data.get("pr_url", ""),

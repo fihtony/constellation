@@ -162,6 +162,9 @@ async def test_jira_adapter_direct_mode_mock():
         def update_issue_fields(self, ticket_key, fields):
             return {"ticketKey": ticket_key}, "updated"
 
+        def list_comments(self, ticket_key, max_results=50):
+            return {"comments": [], "total": 0}, "ok"
+
         @property
         def backend_name(self):
             return "mock"

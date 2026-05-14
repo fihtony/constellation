@@ -64,6 +64,12 @@ class StubJiraProvider(JiraProvider):
         self.calls.append(("update_issue_fields", {"ticket_key": ticket_key, "fields": fields}))
         return {"ticketKey": ticket_key}, "updated"
 
+    def list_comments(
+        self, ticket_key: str, max_results: int = 50
+    ) -> tuple[dict, str]:
+        self.calls.append(("list_comments", {"ticket_key": ticket_key}))
+        return {"comments": [], "total": 0}, "ok"
+
     @property
     def backend_name(self) -> str:
         return "stub"

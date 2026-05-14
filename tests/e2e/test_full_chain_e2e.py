@@ -150,6 +150,11 @@ def _make_stub_web_dev_tool():
             jira_context: dict | None = None,
             design_context=None,
             repo_url: str = "",
+            repo_path: str = "",
+            workspace_path: str = "",
+            context_manifest_path: str = "",
+            jira_files: list | None = None,
+            design_files: list | None = None,
             revision_feedback: str = "",
         ) -> ToolResult:
             return ToolResult(output=json.dumps({
@@ -176,6 +181,10 @@ def _make_stub_code_review_tool():
             pr_url: str = "",
             diff_summary: str = "",
             requirements: str = "",
+            jira_context: dict | None = None,
+            design_context: dict | None = None,
+            workspace_path: str = "",
+            context_manifest_path: str = "",
         ) -> ToolResult:
             return ToolResult(output=json.dumps({
                 "verdict": "approved",
