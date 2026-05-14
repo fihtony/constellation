@@ -74,7 +74,7 @@ def _infer_scm_base_url(repo_url: str) -> str:
 
 
 def _extract_jira_key(ticket_url: str) -> str:
-    """Extract Jira key like DMPP-2903 from a browse URL."""
+    """Extract Jira key like PROJ-2900 from a browse URL."""
     parts = urlparse(ticket_url).path.rstrip("/").split("/")
     return parts[-1] if parts else ""
 

@@ -189,8 +189,41 @@ def _setup_jira_tool():
 
 def _setup_dev_tools():
     """Register simplified dev and code review tools that simulate success."""
+    import os
+
     from framework.tools.base import BaseTool, ToolResult
     from framework.tools.registry import get_registry
+
+    class MockCloneRepo(BaseTool):
+        name = "clone_repo"
+        description = "Clone a repository into the local workspace (mock for E2E)."
+        parameters_schema = {
+            "type": "object",
+            "properties": {
+                "repo_url": {"type": "string"},
+                "target_path": {"type": "string"},
+            },
+            "required": ["repo_url", "target_path"],
+        }
+
+        def execute_sync(self, **kwargs) -> ToolResult:
+            repo_url = kwargs.get("repo_url", "")
+            target_path = kwargs.get("target_path", "")
+            print(f"  [clone-repo-mock] Repo: {repo_url}")
+            print(f"  [clone-repo-mock] Target: {target_path}")
+            if not target_path:
+                return ToolResult(output=json.dumps({"error": "target_path is required"}))
+
+            os.makedirs(target_path, exist_ok=True)
+            placeholder = os.path.join(target_path, "README.mock.md")
+            with open(placeholder, "w", encoding="utf-8") as fh:
+                fh.write("Mock repository content for live E2E script.\n")
+
+            return ToolResult(output=json.dumps({
+                "status": "completed",
+                "repoUrl": repo_url,
+                "targetPath": target_path,
+            }))
 
     class MockWebDev(BaseTool):
         name = "dispatch_web_dev"
@@ -281,7 +314,7 @@ def _setup_dev_tools():
             }))
 
     registry = get_registry()
-    for tool_cls in [MockWebDev, MockCodeReview, MockDesign, MockClarification]:
+    for tool_cls in [MockCloneRepo, MockWebDev, MockCodeReview, MockDesign, MockClarification]:
         tool = tool_cls()
         registry.unregister(tool.name)
         registry.register(tool)
