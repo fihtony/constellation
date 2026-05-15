@@ -190,6 +190,25 @@ def _is_api_token_denied(text: str) -> bool:
     return "you don't have permission to connect via api token" in text.lower()
 
 
+def _is_mcp_fallback_needed(resp: dict, text: str) -> bool:
+    """Check if this MCP response/error should trigger a REST API fallback.
+
+    Returns True when:
+    - The API token is explicitly denied by the MCP server
+    - The tool name is not registered (-32602 / "not found")
+    - MCP is unavailable (init/connection failure returned as error dict)
+    """
+    if _is_api_token_denied(text):
+        return True
+    # JSON-RPC invalid params (-32602) or explicit "not found" from MCP server
+    if "-32602" in text or "not found" in text.lower():
+        return True
+    # Empty text with a top-level "error" key = connection/init failure
+    if not text and "error" in resp:
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # JiraMCPProvider
 # ---------------------------------------------------------------------------
@@ -275,13 +294,20 @@ class JiraMCPProvider(JiraProvider):
         return self._session
 
     def _call(self, tool: str, args: dict, timeout: int = 30) -> dict:
-        """Thread-safe MCP tool call with auto-reconnect on failure."""
+        """Thread-safe MCP tool call with auto-reconnect on one failure.
+
+        Returns an error dict instead of raising so callers can apply the
+        REST fallback via _is_mcp_fallback_needed().
+        """
         with self._lock:
             try:
                 return self._get_session().call(tool, args, timeout)
-            except Exception:
+            except Exception as exc:
                 self._session = None
-                return self._get_session().call(tool, args, timeout)
+                try:
+                    return self._get_session().call(tool, args, timeout)
+                except Exception as exc2:
+                    return {"error": {"code": -1, "message": f"mcp_unavailable: {exc2}"}}
 
     def close(self) -> None:
         """Close the MCP session."""
@@ -344,7 +370,7 @@ class JiraMCPProvider(JiraProvider):
         })
         if _is_error(resp):
             text = _extract_text(resp)
-            if _is_api_token_denied(text):
+            if _is_mcp_fallback_needed(resp, text):
                 return self._rest.fetch_issue(ticket_key)
             return None, f"fetch_failed: {text[:150]}"
         text = _extract_text(resp)
@@ -371,7 +397,7 @@ class JiraMCPProvider(JiraProvider):
         resp = self._call("searchJiraIssuesUsingJql", args)
         if _is_error(resp):
             text = _extract_text(resp)
-            if _is_api_token_denied(text):
+            if _is_mcp_fallback_needed(resp, text):
                 return self._rest.search_issues(jql, max_results, fields)
             return {"error": text[:200]}, f"error: {text[:100]}"
         text = _extract_text(resp)
@@ -422,7 +448,7 @@ class JiraMCPProvider(JiraProvider):
         })
         if _is_error(resp):
             text = _extract_text(resp)
-            if _is_api_token_denied(text):
+            if _is_mcp_fallback_needed(resp, text):
                 return self._rest.transition_issue(ticket_key, transition_name)
             return None, f"transition_failed: {text[:150]}"
         return tid, f"transitioned_to:{transition_label}"
@@ -453,7 +479,7 @@ class JiraMCPProvider(JiraProvider):
         })
         if _is_error(resp):
             text_resp = _extract_text(resp)
-            if _is_api_token_denied(text_resp):
+            if _is_mcp_fallback_needed(resp, text_resp):
                 return self._rest.add_comment(ticket_key, text, adf_body)
             return None, f"add_failed: {text_resp[:150]}"
         resp_text = _extract_text(resp)
@@ -478,7 +504,7 @@ class JiraMCPProvider(JiraProvider):
         })
         if _is_error(resp):
             text = _extract_text(resp)
-            if _is_api_token_denied(text):
+            if _is_mcp_fallback_needed(resp, text):
                 return self._rest.update_issue_fields(ticket_key, fields)
             return None, f"update_failed: {text[:150]}"
         return {"ticketKey": ticket_key}, "updated"

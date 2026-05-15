@@ -621,12 +621,8 @@ def create_scm_client(
 
     if resolved_backend in ("github-rest", "github", "github-mcp"):
         if resolved_backend == "github-mcp":
-            import warnings
-            warnings.warn(
-                "SCM_BACKEND=github-mcp: full MCP support not yet available in v2 adapter; "
-                "falling back to github-rest.",
-                stacklevel=2,
-            )
+            from agents.scm.providers.github_mcp import GitHubMCPProvider
+            return GitHubMCPProvider(token=token)
         return GitHubClient(token=token)
 
     # Default: Bitbucket Server

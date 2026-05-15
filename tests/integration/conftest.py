@@ -3,6 +3,12 @@
 Loads credentials from tests/.env and creates session-scoped fixtures.
 Tests are automatically skipped when the relevant credentials are absent.
 
+Default backends:
+  SCM   → GitHub MCP  (GitHubMCPProvider)   — requires TEST_SCM_TOKEN (alias: TEST_GITHUB_TOKEN)
+                                              and TEST_SCM_REPO_URL  (alias: TEST_GITHUB_REPO_URL)
+  Jira  → Atlassian Rovo MCP (JiraMCPProvider) — requires TEST_JIRA_TOKEN + TEST_JIRA_EMAIL
+  Stitch → Google Stitch MCP (StitchMcpClient) — requires TEST_STITCH_API_KEY
+
 Usage
 -----
   pytest tests/integration/ -v             # skip unconfigured tests
@@ -44,7 +50,7 @@ def _env(key: str, default: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Jira fixtures
+# Jira fixtures — default to MCP backend
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
@@ -72,7 +78,49 @@ def jira_ticket_url() -> str:
 
 
 @pytest.fixture(scope="session")
+def jira_base_url(jira_ticket_url) -> str:
+    """Extract the Jira site root URL from the ticket URL."""
+    if "/browse/" in jira_ticket_url:
+        return jira_ticket_url.split("/browse/")[0].rstrip("/")
+    return jira_ticket_url.rstrip("/")
+
+
+@pytest.fixture(scope="session")
+def jira_ticket_key(jira_ticket_url) -> str:
+    if "/browse/" in jira_ticket_url:
+        return jira_ticket_url.split("/browse/")[1].split("/")[0].split("?")[0].strip()
+    return ""
+
+
+@pytest.fixture(scope="session")
+def jira_provider(jira_token, jira_email, jira_base_url):
+    """JiraMCPProvider — the default Jira backend for v2 integration tests."""
+    from agents.jira.providers.mcp import JiraMCPProvider
+    return JiraMCPProvider(
+        base_url=jira_base_url,
+        token=jira_token,
+        email=jira_email,
+    )
+
+
+@pytest.fixture(scope="session")
+def jira_rest_provider(jira_token, jira_email, jira_base_url):
+    """JiraRESTProvider — direct REST backend, available for comparison tests."""
+    from agents.jira.providers.rest import JiraRESTProvider
+    from agents.jira.client import JiraClient
+    client = JiraClient(
+        base_url=jira_base_url,
+        token=jira_token,
+        email=jira_email,
+    )
+    provider = JiraRESTProvider.__new__(JiraRESTProvider)
+    provider._client = client
+    return provider
+
+
+@pytest.fixture(scope="session")
 def jira_client(jira_token, jira_email, jira_ticket_url):
+    """Legacy JiraClient fixture kept for backward-compat with existing tests."""
     from agents.jira.client import JiraClient
     return JiraClient.from_ticket_url(
         ticket_url=jira_ticket_url,
@@ -81,54 +129,67 @@ def jira_client(jira_token, jira_email, jira_ticket_url):
     )
 
 
-@pytest.fixture(scope="session")
-def jira_provider(jira_client):
-    """Wrap the JiraClient into a JiraRESTProvider for adapter tests."""
-    from agents.jira.providers.rest import JiraRESTProvider
-    provider = JiraRESTProvider.__new__(JiraRESTProvider)
-    provider._client = jira_client
-    return provider
-
-
-@pytest.fixture(scope="session")
-def jira_ticket_key(jira_ticket_url) -> str:
-    from agents.jira.client import JiraClient
-    return JiraClient.parse_ticket_key(jira_ticket_url)
-
-
 # ---------------------------------------------------------------------------
-# SCM / Bitbucket fixtures
+# SCM fixtures — default to GitHub MCP backend
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
 def scm_repo_url() -> str:
-    val = _env("TEST_GITHUB_REPO_URL")
+    val = _env("TEST_SCM_REPO_URL") or _env("TEST_GITHUB_REPO_URL")
     if not val:
-        pytest.skip("TEST_GITHUB_REPO_URL not set in tests/.env")
+        pytest.skip("TEST_SCM_REPO_URL (or TEST_GITHUB_REPO_URL) not set in tests/.env")
     return val
 
 
 @pytest.fixture(scope="session")
 def scm_token() -> str:
-    val = _env("TEST_GITHUB_TOKEN")
+    val = _env("TEST_SCM_TOKEN") or _env("TEST_GITHUB_TOKEN")
     if not val:
-        pytest.skip("TEST_GITHUB_TOKEN not set in tests/.env")
+        pytest.skip("TEST_SCM_TOKEN (or TEST_GITHUB_TOKEN) not set in tests/.env")
     return val
 
 
-@pytest.fixture(scope="session")
-def scm_client(scm_repo_url, scm_token):
-    from agents.scm.client import BitbucketClient
-    return BitbucketClient.from_repo_url(
-        repo_url=scm_repo_url,
-        token=scm_token,
-    )
+def _parse_github_owner_repo(url: str) -> tuple[str, str]:
+    """Parse (owner, repo) from a GitHub repo URL."""
+    url = url.strip().rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    parts = [p for p in url.split("/") if p and ":" not in p]
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    return "", ""
 
 
 @pytest.fixture(scope="session")
-def scm_project_repo(scm_repo_url) -> tuple[str, str]:
-    from agents.scm.client import BitbucketClient
-    return BitbucketClient.parse_project_repo(scm_repo_url)
+def scm_owner(scm_repo_url) -> str:
+    owner, _ = _parse_github_owner_repo(scm_repo_url)
+    return owner
+
+
+@pytest.fixture(scope="session")
+def scm_repo_name(scm_repo_url) -> str:
+    _, repo = _parse_github_owner_repo(scm_repo_url)
+    return repo
+
+
+@pytest.fixture(scope="session")
+def scm_client(scm_token):
+    """GitHubMCPProvider — the default SCM client for v2 integration tests."""
+    from agents.scm.providers.github_mcp import GitHubMCPProvider
+    return GitHubMCPProvider(token=scm_token)
+
+
+@pytest.fixture(scope="session")
+def scm_rest_client(scm_token):
+    """GitHubClient — GitHub REST API backend, available for comparison tests."""
+    from agents.scm.client import GitHubClient
+    return GitHubClient(token=scm_token)
+
+
+@pytest.fixture(scope="session")
+def scm_project_repo(scm_owner, scm_repo_name) -> tuple[str, str]:
+    """Return (owner, repo_name) — equivalent of Bitbucket (project, repo)."""
+    return scm_owner, scm_repo_name
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +217,47 @@ def figma_client(figma_token):
     from agents.ui_design.clients.figma_rest import FigmaClient
     # Use minimal rate limiting in tests (1 second interval)
     return FigmaClient(token=figma_token, min_call_interval=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Google Stitch MCP fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def stitch_api_key() -> str:
+    val = _env("TEST_STITCH_API_KEY")
+    if not val:
+        pytest.skip("TEST_STITCH_API_KEY not set in tests/.env")
+    return val
+
+
+@pytest.fixture(scope="session")
+def stitch_project_url() -> str:
+    val = _env("TEST_STITCH_PROJECT_URL")
+    if not val:
+        pytest.skip("TEST_STITCH_PROJECT_URL not set in tests/.env")
+    return val
+
+
+@pytest.fixture(scope="session")
+def stitch_project_id(stitch_project_url) -> str:
+    """Extract project ID from a Stitch project URL."""
+    if "/projects/" in stitch_project_url:
+        after = stitch_project_url.split("/projects/")[1]
+        return after.split("/")[0].split("?")[0]
+    return stitch_project_url
+
+
+@pytest.fixture(scope="session")
+def stitch_screen_id() -> str:
+    return _env("TEST_STITCH_SCREEN_ID", "")
+
+
+@pytest.fixture(scope="session")
+def stitch_client(stitch_api_key):
+    """StitchMcpClient — Google Stitch MCP backend."""
+    from agents.ui_design.clients.stitch_mcp import StitchMcpClient
+    return StitchMcpClient(api_key=stitch_api_key)
 
 
 # ---------------------------------------------------------------------------

@@ -2,9 +2,9 @@
 
 Supports three backends (selected via SCM_BACKEND env var or auto-detected
 from SCM_BASE_URL):
-  bitbucket   — Bitbucket Server REST 1.0 (default)
+  bitbucket   — Bitbucket Server REST 1.0 (default for Bitbucket hosts)
   github-rest — GitHub REST API v3
-  github-mcp  — GitHub MCP (falls back to github-rest in v2)
+  github-mcp  — GitHub MCP (default for GitHub hosts)
 
 Dispatches capabilities directly via the appropriate client (in-process).
 Inject a custom ``scm_client`` for testing.
@@ -52,12 +52,18 @@ class SCMAgentAdapter(BaseAgent):
         if self._scm_client:
             return self._scm_client
         from agents.scm.client import create_scm_client
+        base_url = os.environ.get("SCM_BASE_URL", "")
+        backend = os.environ.get("SCM_BACKEND", "")
+        # Auto-select github-mcp for GitHub URLs when no explicit backend is set
+        if not backend and "github" in base_url.lower():
+            backend = "github-mcp"
         return create_scm_client(
-            base_url=os.environ.get("SCM_BASE_URL", ""),
+            base_url=base_url,
             token=os.environ.get("SCM_TOKEN", ""),
             username=os.environ.get("SCM_USERNAME", ""),
             default_project=os.environ.get("SCM_DEFAULT_PROJECT", ""),
             ca_bundle=os.environ.get("SCM_CA_BUNDLE", ""),
+            backend=backend,
         )
 
     async def handle_message(self, message: dict) -> dict:

@@ -1,8 +1,8 @@
 """Jira Agent adapter — boundary agent for Jira Cloud.
 
 Supports two backends:
-  - ``rest`` (default) — direct Jira Cloud REST API v3 calls.
-  - ``mcp``  — Atlassian Rovo MCP server with REST fallback.
+  - ``mcp``  (default) — Atlassian Rovo MCP server with REST fallback.
+  - ``rest``           — direct Jira Cloud REST API v3 calls.
 
 Backend selection via ``JIRA_BACKEND`` env var or ``jira_backend`` constructor arg.
 Inject a custom provider for testing via ``jira_provider``.
@@ -85,7 +85,7 @@ class JiraAgentAdapter(BaseAgent):
     ):
         super().__init__(definition, services)
         self._provider = jira_provider
-        self._backend = jira_backend or os.environ.get("JIRA_BACKEND", "rest")
+        self._backend = jira_backend or os.environ.get("JIRA_BACKEND", "mcp")
 
     def _get_provider(self):
         if self._provider:

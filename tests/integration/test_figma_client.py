@@ -106,6 +106,9 @@ async def test_ui_design_adapter_fetch(figma_client, figma_file_url):
     assert len(artifacts) >= 1
     import json
     result = json.loads(artifacts[0]["parts"][0]["text"])
+    err = result.get("error", "")
+    if "429" in str(err):
+        pytest.skip(f"Figma API rate-limited (429) — try again later: {err}")
     assert result.get("status") == "ok", f"Unexpected: {result}"
     assert "pages" in result, "Expected 'pages' in result"
     print(f"[ui-design-adapter] Figma fetch OK: {result.get('name', '')!r}")
