@@ -26,4 +26,13 @@ Task type: {task_type}
 Complexity: {complexity}
 Jira context: {jira_context}
 
+Design context (metadata): {design_context}
+Design HTML path (available in workspace): {design_code_path}
+
+Notes:
+- If design_code_path is provided, the web-dev agent MUST read and implement every \
+component shown in that HTML file (navigation, hero, feature cards, footer, etc.).
+- For UI/frontend tasks, set screenshot_required=true in definition_of_done.
+- The web-dev agent must verify all npm packages exist before adding to package.json.
+
 Produce a JSON plan with numbered steps and a definition_of_done object."""

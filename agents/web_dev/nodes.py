@@ -483,7 +483,7 @@ async def implement_changes(state: dict) -> dict:
     if _design_code_path and os.path.isfile(_design_code_path):
         try:
             with open(_design_code_path, encoding="utf-8") as _f:
-                _design_code_ref = _f.read()[:5000]
+                _design_code_ref = _f.read()
         except Exception:
             pass
 
@@ -588,16 +588,24 @@ async def run_tests(state: dict) -> dict:
     result = runtime.run_agentic(
         task=(
             "Run the project's test suite and report results.\n"
-            "1. Detect the test runner (pytest, jest, mvn test, gradle test, etc.).\n"
-            "2. Run tests with verbose output.\n"
-            "3. Return a JSON summary: "
+            "MANDATORY pre-flight steps (in order):\n"
+            "1. Check if package.json exists in the repo root.\n"
+            "   If yes: run_command('npm install', cwd=<repo_path>) to install dependencies.\n"
+            "   If npm install fails (e.g. package not found), read the error,\n"
+            "   remove the invalid package from package.json, and re-run npm install.\n"
+            "2. Run build to verify no compilation errors:\n"
+            "   run_command('npm run build', cwd=<repo_path>)\n"
+            "   If build fails, fix the error first.\n"
+            "3. Detect the test runner (vitest, jest, pytest, mvn test, gradle test, etc.).\n"
+            "4. Run tests with verbose output.\n"
+            "5. Return a JSON summary: "
             '{"passed": N, "failed": N, "errors": [...], "output": "...last 50 lines..."}'
         ),
         cwd=repo_path or None,
         # Only expose shell/file tools — no Jira/SCM schemas to keep payload small
-        tools=["run_command", "read_file", "glob"],
-        max_turns=5,
-        timeout=120,
+        tools=["run_command", "read_file", "write_file", "edit_file", "glob"],
+        max_turns=12,
+        timeout=240,
         plugin_manager=state.get("_plugin_manager"),
     )
 
@@ -745,8 +753,7 @@ async def self_assess(state: dict) -> dict:
         try:
             with open(design_code_path, encoding="utf-8") as _f:
                 design_html = _f.read()
-            # Keep first 4000 chars — enough to extract component structure
-            design_code_snippet = design_html[:4000]
+            design_code_snippet = design_html
         except Exception:
             pass
 

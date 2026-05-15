@@ -312,11 +312,15 @@ async def create_plan(state: dict) -> dict:
 
     from agents.team_lead.prompts.planning import PLANNING_SYSTEM, PLANNING_TEMPLATE
 
+    _design_ctx = state.get("design_context")
+    _design_ctx_str = json.dumps(_design_ctx, ensure_ascii=False)[:800] if _design_ctx else "N/A"
     prompt = PLANNING_TEMPLATE.format(
         analysis=state.get("analysis_summary", ""),
         jira_context=json.dumps(state.get("jira_context", {}), ensure_ascii=False),
         task_type=state.get("task_type", "general"),
         complexity=state.get("complexity", "medium"),
+        design_context=_design_ctx_str,
+        design_code_path=state.get("design_code_path", "N/A"),
     )
     result = runtime.run(
         prompt=prompt,

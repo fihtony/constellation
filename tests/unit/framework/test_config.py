@@ -16,8 +16,8 @@ def project_dir(tmp_path):
           name: constellation
           version: "2.0.0"
         runtime:
-          backend: connect-agent
-          model: gpt-5-mini
+          backend: claude-code
+          model: claude-haiku-4-5-20251001
         skills:
           directory: skills
         data:
@@ -37,8 +37,8 @@ def project_dir(tmp_path):
         description: "Intelligence layer"
         mode: task
         execution_mode: persistent
-        runtime_backend: connect-agent
-        model: gpt-5-mini
+        runtime_backend: claude-code
+        model: claude-haiku-4-5-20251001
         tools:
           - dispatch_agent
           - query_registry
@@ -83,8 +83,8 @@ class TestLoadGlobalConfig:
 
         cfg = load_global_config(project_dir)
         assert cfg.get("project.name") == "constellation"
-        assert cfg.get("runtime.backend") == "connect-agent"
-        assert cfg.get("runtime.model") == "gpt-5-mini"
+        assert cfg.get("runtime.backend") == "claude-code"
+        assert cfg.get("runtime.model") == "claude-haiku-4-5-20251001"
         assert cfg.get("container.runtime") == "docker"
 
     def test_missing_file_returns_empty(self, tmp_path):
@@ -110,7 +110,7 @@ class TestLoadAgentConfig:
         from framework.config import load_agent_config
 
         cfg = load_agent_config("team-lead", project_dir)
-        assert cfg.get("model") == "gpt-5-mini"
+        assert cfg.get("model") == "claude-haiku-4-5-20251001"
 
     def test_env_override(self, project_dir, monkeypatch):
         from framework.config import load_agent_config

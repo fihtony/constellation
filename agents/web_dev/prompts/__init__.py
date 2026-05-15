@@ -61,7 +61,23 @@ Greenfield guidance (repo is empty or README-only):
 - Choose the tech stack from the Jira context or task description.
 - Create: project config file (package.json / pyproject.toml / build.gradle), \
 at least one source file, and at least one test file.
-- Do NOT run npm install or pip install — just create the files.
+
+npm/package.json rules (MANDATORY — prevent hallucinated packages):
+- Before adding ANY package to package.json, verify it exists on npm:
+  run_command("npm info <package-name> version", cwd=<repo_path>)
+  If the command returns an error or empty output, the package does NOT exist — \
+  do NOT add it to package.json.
+- After creating/updating package.json, run: run_command("npm install", cwd=<repo_path>)
+  If npm install fails (package not found), remove the offending package immediately.
+- After npm install succeeds, run: run_command("npm run build", cwd=<repo_path>)
+  If build fails, fix the error before moving on.
+- For testing, use the correct packages for the framework:
+  - Vite+React → vitest + @testing-library/react + jsdom (NOT vitest-environment-jsdom)
+  - Next.js → jest + @testing-library/react + jest-environment-jsdom
+- If you create postcss.config.js referencing tailwindcss, you MUST add \
+"tailwindcss" and "autoprefixer" to devDependencies in package.json first. \
+  Verify both exist: `npm info tailwindcss version` and `npm info autoprefixer version`.
+- NEVER commit .vite/ or node_modules/ directories — ensure .gitignore excludes them.
 """
 
 IMPLEMENT_TEMPLATE = """\
@@ -97,9 +113,22 @@ Prior knowledge (from memory):
 
 Implement the changes described above. Follow the CRITICAL SPEED RULES in your \
 system prompt — start writing files within the first 3 turns.
-For UI tasks: use the Design HTML reference above as the authoritative guide. \
-Implement EVERY major section/component visible in that HTML (header, hero, nav, \
-cards, footer, etc.). Match class names and structure as closely as possible.
+
+For UI tasks — MANDATORY steps (in order):
+1. Parse the Design HTML reference above completely. Identify EVERY component: \
+navigation bar, hero section, feature cards, CTA sections, footer, etc.
+2. Extract design tokens from the HTML: color variables (CSS custom properties), \
+fonts (font-family), spacing values, and layout grid. Use them EXACTLY.
+3. Implement each component faithfully — match class names, color values, \
+typography, and layout as close as possible to the design.
+4. Verify npm packages before adding them (see npm rules in system prompt).
+5. Run: run_command("npm install", cwd=<repo_path>) — fix any install errors.
+6. Run: run_command("npm run build", cwd=<repo_path>) — fix any build errors.
+7. Stage and commit ALL changes:
+   run_command("git add -A", cwd=<repo_path>)
+   run_command("git commit -m 'feat: ...'", cwd=<repo_path>)
+
+For non-UI tasks:
 After implementation, stage and commit ALL changes:
   run_command("git add -A", cwd=<repo_path>)
   run_command("git commit -m 'feat: ...'", cwd=<repo_path>)
@@ -196,7 +225,7 @@ Acceptance criteria:
 Design context (metadata):
 {design_context}
 
-Design HTML reference (first 4000 chars — parse to extract components):
+Design HTML reference (full — parse to extract ALL components):
 {design_code_snippet}
 
 Implementation summary:

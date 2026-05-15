@@ -116,7 +116,7 @@ def _set_env_from_config(cfg: dict) -> None:
     """Populate env vars so agents can discover services."""
     os.environ["OPENAI_BASE_URL"] = cfg["openai_base_url"]
     os.environ["OPENAI_MODEL"] = cfg["openai_model"]
-    os.environ["AGENT_RUNTIME"] = "connect-agent"
+    os.environ["AGENT_RUNTIME"] = "claude-code"
     os.environ.setdefault("OPENAI_API_KEY", "")
     os.environ.setdefault("ARTIFACT_ROOT", "artifacts/")
     os.environ["JIRA_BASE_URL"] = cfg["jira_base_url"]
@@ -153,8 +153,8 @@ def _make_services(runtime=None, task_store=None):
     from framework.task_store import InMemoryTaskStore
 
     effective_runtime = runtime or get_runtime(
-        "connect-agent",
-        model=os.environ.get("OPENAI_MODEL", "gpt-5-mini"),
+        "claude-code",
+        model=os.environ.get("OPENAI_MODEL", "claude-haiku-4-5-20251001"),
     )
 
     return AgentServices(
@@ -566,26 +566,31 @@ async def test_implement_jira_ticket_full_workflow():
     _set_env_from_config(cfg)
 
     # Deterministic workspace path under artifacts/
-    workspace_path = os.path.join(
-        os.path.abspath(os.environ.get("ARTIFACT_ROOT", "artifacts")),
-        "live-e2e",
-    )
+    artifact_root = os.path.abspath(os.environ.get("ARTIFACT_ROOT", "artifacts"))
+    workspace_path = os.path.join(artifact_root, "live-e2e")
     os.makedirs(workspace_path, exist_ok=True)
 
-    # Tee all test output to a log file under artifacts/ (not /tmp/)
+    # Log file lives at artifacts/live-e2e-run.log — OUTSIDE the workspace so it
+    # survives the _cleanup_for_fresh_run() call that wipes artifacts/live-e2e/.
     import logging as _logging
-    _log_file = os.path.join(workspace_path, "test-run.log")
+    import sys as _sys
+    _log_file = os.path.join(artifact_root, "live-e2e-run.log")
     _file_handler = _logging.FileHandler(_log_file, mode="w", encoding="utf-8")
     _file_handler.setLevel(_logging.DEBUG)
     _root_logger = _logging.getLogger()
     _root_logger.addHandler(_file_handler)
 
-    print("\n" + "=" * 70)
-    print(f"[live-e2e] WORKSPACE: {workspace_path}")
-    print(f"[live-e2e] Jira key: {cfg['jira_key']}")
-    print(f"[live-e2e] SCM backend: {cfg['scm_backend']}")
-    print(f"[live-e2e] Model: {cfg['openai_model']}")
-    print("=" * 70)
+    # Force stdout to line-buffer so every print() appears immediately even when
+    # piped (avoids block-buffer swallowing all output until process exit).
+    _sys.stdout.reconfigure(line_buffering=True)
+
+    print("\n" + "=" * 70, flush=True)
+    print(f"[live-e2e] WORKSPACE: {workspace_path}", flush=True)
+    print(f"[live-e2e] Log: {_log_file}", flush=True)
+    print(f"[live-e2e] Jira key: {cfg['jira_key']}", flush=True)
+    print(f"[live-e2e] SCM backend: {cfg['scm_backend']}", flush=True)
+    print(f"[live-e2e] Model: {cfg['openai_model']}", flush=True)
+    print("=" * 70, flush=True)
 
     # ---- Pre-run cleanup: wipe workspace + delete remote test branches ----
     _cleanup_for_fresh_run(cfg, workspace_path)
@@ -600,11 +605,11 @@ async def test_implement_jira_ticket_full_workflow():
     )
     myself, jira_auth_status = jira_provider.get_myself()
     assert jira_auth_status == "ok", f"Jira auth failed: {jira_auth_status}"
-    print(f"[live-e2e] Jira auth OK: {myself.get('displayName', '?')}")
+    print(f"[live-e2e] Jira auth OK: {myself.get('displayName', '?')}", flush=True)
 
     ticket, ticket_status = jira_provider.fetch_issue(cfg["jira_key"])
     assert ticket_status == "ok" and ticket, f"Cannot fetch ticket {cfg['jira_key']}: {ticket_status}"
-    print(f"[live-e2e] Ticket fetched: {cfg['jira_key']}")
+    print(f"[live-e2e] Ticket fetched: {cfg['jira_key']}", flush=True)
 
     # ---- Preflight: verify SCM clone ----
     import shutil
@@ -626,7 +631,7 @@ async def test_implement_jira_ticket_full_workflow():
             f"Hint: set TEST_SCM_USERNAME=<your-bitbucket-username> in tests/.env if PAT Bearer fails"
         )
     shutil.rmtree(_preflight_clone_dir, ignore_errors=True)
-    print(f"[live-e2e] SCM preflight clone OK: {cfg['scm_repo_url']}")
+    print(f"[live-e2e] SCM preflight clone OK: {cfg['scm_repo_url']}", flush=True)
 
     # ---- Register all live tools ----
     _register_live_jira_scm_tools(cfg)
@@ -661,16 +666,16 @@ async def test_implement_jira_ticket_full_workflow():
         },
     }
 
-    print(f"[live-e2e] Sending request to Compass...")
+    print(f"[live-e2e] Sending request to Compass...", flush=True)
     compass_result = await compass_agent.handle_message(message)
     compass_state = compass_result["task"]["status"]["state"]
-    print(f"[live-e2e] Compass finished: {compass_state}")
+    print(f"[live-e2e] Compass finished: {compass_state}", flush=True)
 
     assert compass_state in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED"), \
         f"Compass did not reach terminal state: {compass_state}"
 
     # ---- Wait for Team Lead ----
-    print("[live-e2e] Waiting for Team Lead to complete...")
+    print("[live-e2e] Waiting for Team Lead to complete...", flush=True)
     try:
         final = tl_result_queue.get(timeout=2400)
     except queue.Empty:

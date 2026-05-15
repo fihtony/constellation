@@ -272,4 +272,4 @@ def llm_base_url() -> str:
 
 @pytest.fixture(scope="session")
 def llm_model() -> str:
-    return _env("OPENAI_MODEL", "gpt-5-mini")
+    return _env("OPENAI_MODEL", "claude-haiku-4-5-20251001")
