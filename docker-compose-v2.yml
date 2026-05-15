@@ -1,0 +1,70 @@
+# Constellation v2 — Docker Compose
+# Orchestrates all agents in the new framework architecture.
+
+services:
+
+  # -----------------------------------------------------------------------
+  # Compass Agent — control plane entry point (port 8000)
+  # -----------------------------------------------------------------------
+  compass:
+    image: constellation-v2-compass:latest
+    build:
+      context: .
+      dockerfile: agents/compass/Dockerfile
+    depends_on:
+      team-lead:
+        condition: service_healthy
+    environment:
+      AGENT_ID: "compass"
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      AGENT_RUNTIME: "connect-agent"
+      AGENT_MODEL: "gpt-5-mini"
+    labels:
+      constellation.agent_id: "compass"
+      constellation.agent_name: "Compass Agent"
+      constellation.agent_role: "fundamental"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+    networks:
+      - constellation-v2
+
+  # -----------------------------------------------------------------------
+  # Team Lead Agent — intelligence layer (port 8030)
+  # -----------------------------------------------------------------------
+  team-lead:
+    image: constellation-v2-team-lead:latest
+    build:
+      context: .
+      dockerfile: agents/team_lead/Dockerfile
+    environment:
+      AGENT_ID: "team-lead"
+      HOST: "0.0.0.0"
+      PORT: "8030"
+      AGENT_RUNTIME: "connect-agent"
+      AGENT_MODEL: "gpt-5-mini"
+    labels:
+      constellation.agent_id: "team-lead"
+      constellation.agent_name: "Team Lead Agent"
+      constellation.agent_role: "fundamental"
+    ports:
+      - "8030:8030"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8030/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+    networks:
+      - constellation-v2
+
+networks:
+  constellation-v2:
+    driver: bridge
+    name: constellation-v2-network

@@ -1,0 +1,38 @@
+# Constellation v2 — main configuration
+# This file is loaded by all agents on startup.
+
+project:
+  name: constellation
+  version: "2.0.0"
+
+# Default runtime backend for all agents
+runtime:
+  backend: connect-agent
+  model: gpt-5-mini
+
+# Skills directory
+skills:
+  directory: skills
+
+# Data directory (SQLite DBs, artifacts)
+data:
+  directory: data
+
+# Container settings
+container:
+  runtime: rancher           # docker | rancher
+  network: constellation-network
+
+# Registry service
+registry:
+  url: http://registry:9000
+
+# Downstream agent service URLs (env vars of the same name take precedence)
+# Agents use these for A2A capability dispatch; override via .env or env vars.
+services:
+  jira_agent_url: http://jira:8010
+  scm_agent_url: http://scm:8020
+  ui_design_agent_url: http://ui-design:8040
+  web_dev_agent_url: http://web-dev:8050
+  code_review_agent_url: http://code-review:8060
+

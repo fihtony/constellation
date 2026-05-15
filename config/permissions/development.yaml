@@ -1,0 +1,36 @@
+# Permissions: Development tasks (read-write SCM)
+allowed_tools:
+  - read_file
+  - write_file
+  - edit_file
+  - run_command
+  - search_code
+  - glob
+  - grep
+  - scm_clone
+  - clone_repo
+  - scm_branch
+  - scm_commit
+  - scm_push
+  - scm_create_pr
+  - dispatch_agent
+  - query_registry
+  # Jira boundary tools (called by workflow nodes, not LLM directly)
+  - jira_list_transitions
+  - jira_transition
+  - jira_comment
+  - jira_update
+  - jira_get_token_user
+  - jira_list_comments
+
+denied_tools: []
+
+scm: read-write
+filesystem: workspace-only
+
+custom:
+  protected_branch_patterns:
+    - "^main$"
+    - "^master$"
+    - "^develop$"
+    - "^release/.*$"

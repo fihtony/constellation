@@ -10,6 +10,7 @@ __pycache__/
 .Python
 .pytest_cache/
 .pytest*
+v1/
 
 # Session and temporary data (cleared after each run)
 tmp/

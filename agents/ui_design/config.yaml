@@ -1,0 +1,24 @@
+# UI Design Agent — agent-specific configuration
+# Inherits all unset keys from config/constellation.yaml (global defaults).
+# Credentials belong in agents/ui_design/.env (never in this file).
+
+agent_id: ui-design
+name: "UI Design Agent"
+description: "Boundary adapter: Figma REST API v1 and Google Stitch MCP design context"
+mode: single_turn
+execution_mode: persistent
+
+# runtime and model inherit from global constellation.yaml:
+#   runtime.backend: connect-agent
+#   runtime.model: gpt-5-mini
+
+port: 8040
+
+# Capabilities exposed via A2A skill IDs
+capabilities:
+  - figma.file.fetch
+  - figma.page.fetch
+  - figma.node.get
+  - stitch.screen.list
+  - stitch.screen.fetch
+  - design.context.fetch

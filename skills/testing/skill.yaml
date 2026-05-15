@@ -1,0 +1,12 @@
+id: testing
+name: "Testing Strategy"
+description: "Test planning and implementation for unit, integration, and E2E tests"
+version: "1.0.0"
+tags: ["testing", "quality"]
+priority: 8
+allowed_tools:
+  - read_file
+  - write_file
+  - edit_file
+  - run_command
+  - search_code

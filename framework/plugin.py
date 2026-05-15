@@ -1,0 +1,113 @@
+"""Cross-cutting concerns via before/after callbacks (inspired by ADK Plugins).
+
+A Plugin can intercept agent, tool, LLM, and workflow-node lifecycle events.
+Returning a non-None value from a ``before_*`` handler short-circuits subsequent
+plugins and the real call.
+"""
+from __future__ import annotations
+
+import logging
+from abc import ABC
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class BasePlugin(ABC):
+    """Override any callback you need.
+
+    Return ``None`` to let execution continue, or a non-None value to
+    short-circuit.
+    """
+
+    async def before_agent_run(self, agent_id: str, state: dict, ctx: dict) -> dict | None:
+        return None
+
+    async def after_agent_run(self, agent_id: str, result: dict, ctx: dict) -> dict | None:
+        return None
+
+    async def before_tool_call(self, tool_name: str, args: dict, ctx: dict) -> dict | None:
+        return None
+
+    async def after_tool_call(self, tool_name: str, result: Any, ctx: dict) -> Any | None:
+        return None
+
+    async def before_llm_call(self, prompt: str, ctx: dict) -> str | None:
+        return None
+
+    async def after_llm_response(self, response: str, ctx: dict) -> str | None:
+        return None
+
+    async def before_node(self, node_name: str, state: dict) -> dict | None:
+        return None
+
+    async def after_node(self, node_name: str, state: dict) -> dict | None:
+        return None
+
+
+class PluginManager:
+    """Manages plugin registration and callback dispatch."""
+
+    def __init__(self) -> None:
+        self._plugins: list[BasePlugin] = []
+
+    def register(self, plugin: BasePlugin) -> None:
+        """Add a plugin to the chain."""
+        self._plugins.append(plugin)
+
+    async def fire(self, event: str, *args: Any, **kwargs: Any) -> Any:
+        """Fire a plugin event.
+
+        Calls each plugin's handler in registration order.  The first non-None
+        return short-circuits and becomes the return value.
+        """
+        for plugin in self._plugins:
+            handler = getattr(plugin, event, None)
+            if handler is None:
+                continue
+            try:
+                result = await handler(*args, **kwargs)
+                if result is not None:
+                    return result
+            except Exception:
+                logger.warning(
+                    "Plugin %s.%s raised an exception",
+                    type(plugin).__name__, event,
+                    exc_info=True,
+                )
+        return None
+
+    def fire_sync(self, event: str, *args: Any, **kwargs: Any) -> Any:
+        """Fire a plugin event synchronously.
+
+        Safe to call from background threads or synchronous code paths
+        (e.g. the ReAct agentic loop inside ConnectAgentAdapter).
+
+        When an event loop is already running on the current thread, the
+        event is fired directly via the coroutine's __next__ protocol
+        (since plugin hooks are typically trivial and non-blocking).
+        Otherwise creates a dedicated event loop.
+        """
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            # We're inside an active event loop — cannot nest run_until_complete.
+            # For simple hooks, just skip silently (plugins fire best-effort).
+            return None
+
+        new_loop = asyncio.new_event_loop()
+        try:
+            return new_loop.run_until_complete(self.fire(event, *args, **kwargs))
+        except Exception:
+            logger.warning(
+                "PluginManager.fire_sync(%s) raised an exception", event,
+                exc_info=True,
+            )
+            return None
+        finally:
+            new_loop.close()

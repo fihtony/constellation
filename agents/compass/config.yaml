@@ -1,0 +1,18 @@
+# Compass Agent — agent-specific configuration
+# Inherits all unset keys from config/constellation.yaml (global defaults).
+# Credentials/port overrides belong in agents/compass/.env.
+
+agent_id: compass
+name: "Compass Agent"
+description: "Control plane: task classification, permission check, routing, and user summary"
+mode: chat
+execution_mode: persistent
+
+# runtime and model inherit from global constellation.yaml:
+#   runtime.backend: connect-agent
+#   runtime.model: gpt-5-mini
+
+tools:
+  - dispatch_agent
+  - query_registry
+port: 8000

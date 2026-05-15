@@ -1,0 +1,17 @@
+# Permissions: Read-only tasks (no SCM write)
+allowed_tools:
+  - read_file
+  - search_code
+  - glob
+  - grep
+  - query_registry
+
+denied_tools:
+  - write_file
+  - edit_file
+  - run_command
+  - scm_push
+  - scm_create_pr
+
+scm: read
+filesystem: workspace-only
