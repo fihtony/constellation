@@ -88,6 +88,10 @@ code_review_definition = _build_code_review_definition()
 class CodeReviewAgent(BaseAgent):
     """Code Review Agent implementation with graph-first lifecycle."""
 
+    async def start(self) -> None:
+        await super().start()
+        _register_code_review_dispatch(self)
+
     async def handle_message(self, message: dict) -> dict:
         from framework.a2a.protocol import Artifact
         from framework.workflow import RunConfig
@@ -214,3 +218,110 @@ def _send_callback(
             pass
     except Exception as exc:
         print(f"[code-review] Callback failed: {exc}")
+
+
+def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None:
+    """Register in-process dispatch_code_review tool (overrides HTTP version)."""
+    import asyncio
+    import time
+    from framework.tools.base import BaseTool, ToolResult
+    from framework.tools.registry import get_registry
+
+    class InProcessDispatchCodeReview(BaseTool):
+        name = "dispatch_code_review"
+        description = (
+            "Send the dev agent's output (PR URL or diff) to the Code Review Agent "
+            "for quality, security, and requirements validation."
+        )
+        parameters_schema = {
+            "type": "object",
+            "properties": {
+                "pr_url": {"type": "string"},
+                "diff_summary": {"type": "string"},
+                "requirements": {"type": "string"},
+                "jira_context": {"type": "object"},
+                "design_context": {"type": "object"},
+                "workspace_path": {"type": "string"},
+                "context_manifest_path": {"type": "string"},
+            },
+            "required": [],
+        }
+
+        def execute_sync(
+            self,
+            pr_url: str = "",
+            diff_summary: str = "",
+            requirements: str = "",
+            jira_context=None,
+            design_context=None,
+            workspace_path: str = "",
+            context_manifest_path: str = "",
+            **kw,
+        ) -> ToolResult:
+            task_id_holder: dict = {}
+
+            def _run() -> None:
+                loop = asyncio.new_event_loop()
+                try:
+                    msg = {
+                        "message": {
+                            "parts": [{"text": diff_summary or pr_url}],
+                            "metadata": {
+                                "prUrl": pr_url,
+                                "originalRequirements": requirements,
+                                "jiraContext": jira_context or {},
+                                "designContext": design_context or {},
+                                "workspacePath": workspace_path,
+                                "contextManifestPath": context_manifest_path,
+                            },
+                        }
+                    }
+                    result = loop.run_until_complete(code_review_agent.handle_message(msg))
+                    task_id_holder["task_id"] = result["task"]["id"]
+                except Exception as exc:
+                    task_id_holder["error"] = str(exc)
+                finally:
+                    loop.close()
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(timeout=10.0)
+
+            task_id = task_id_holder.get("task_id")
+            if not task_id:
+                err = task_id_holder.get("error", "Task ID unavailable")
+                print(f"[code-review-dispatch] Failed to start: {err}")
+                return ToolResult(output=json.dumps({"verdict": "error", "message": err}))
+
+            print(f"[code-review-dispatch] Task started: {task_id}")
+            deadline = time.monotonic() + 600
+            while time.monotonic() < deadline:
+                td = code_review_agent.services.task_store.get_task_dict(task_id)
+                state = td["task"]["status"]["state"]
+                if state in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED"):
+                    arts = td["task"].get("artifacts", [])
+                    payload: dict = {}
+                    for art in arts:
+                        for part in art.get("parts", []):
+                            if "text" in part:
+                                try:
+                                    payload = json.loads(part["text"])
+                                except Exception:
+                                    payload = {"verdict": "unknown", "raw": part["text"]}
+                                break
+                        if payload:
+                            break
+                    verdict = payload.get("verdict", "unknown")
+                    print(f"[code-review-dispatch] Done: state={state} verdict={verdict}")
+                    return ToolResult(output=json.dumps(payload or {"verdict": verdict}))
+                time.sleep(2.0)
+
+            return ToolResult(output=json.dumps({"verdict": "error", "message": "Code review timed out"}))
+
+    registry = get_registry()
+    try:
+        registry.unregister("dispatch_code_review")
+    except Exception:
+        pass
+    registry.register(InProcessDispatchCodeReview())
+    print("[code-review] Registered in-process dispatch_code_review")

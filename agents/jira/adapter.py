@@ -87,6 +87,11 @@ class JiraAgentAdapter(BaseAgent):
         self._provider = jira_provider
         self._backend = jira_backend or os.environ.get("JIRA_BACKEND", "mcp")
 
+    async def start(self) -> None:
+        await super().start()
+        from agents.jira.tools import register_jira_tools
+        register_jira_tools()
+
     def _get_provider(self):
         if self._provider:
             return self._provider

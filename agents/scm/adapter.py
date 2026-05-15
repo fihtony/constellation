@@ -48,6 +48,11 @@ class SCMAgentAdapter(BaseAgent):
         super().__init__(definition, services)
         self._scm_client = scm_client
 
+    async def start(self) -> None:
+        await super().start()
+        from agents.scm.tools import register_scm_tools
+        register_scm_tools()
+
     def _get_client(self):
         if self._scm_client:
             return self._scm_client
