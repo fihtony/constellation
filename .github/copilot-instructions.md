@@ -803,7 +803,7 @@ Before submitting a new agent, verify:
 
 ## v2 Redesign Architecture (framework/ and agents/)
 
-The v2 codebase lives in `framework/`, `agents/`, `skills/`, `config/`, `scripts/`, and `tests/`. It coexists with v1 code under the repository root (`compass/`, `team-lead/`, `common/`, `registry/`, etc.). v1 is NOT modified.
+The v2 codebase lives in `framework/`, `agents/`, `skills/`, `config/`, `scripts/`, and `tests/`. Legacy v1 code is preserved under `v1/`. v2 work must not reintroduce the old root-level v1 tree into the active redesign layout.
 
 ### Core Design Principle: Graph outside, ReAct inside
 
@@ -886,8 +886,10 @@ constellation/
 │   └── ui_design/       # Direct adapter (Figma + Stitch)
 ├── skills/              # Skill definitions (skill.yaml + instructions.md)
 ├── config/              # Global config (constellation.yaml, permissions/)
+├── plugins/             # Optional extension points and integrations
 ├── scripts/             # Launch scripts
-└── tests/               # Unit (126+), integration, E2E
+├── tests/               # Unit, integration, E2E
+└── v1/                  # Archived v1 codebase kept for reference and compatibility
 ```
 
 ### v2 Testing
