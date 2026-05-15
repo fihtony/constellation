@@ -352,9 +352,23 @@ def _register_live_jira_scm_tools(cfg: dict) -> None:
             })
             return ToolResult(output=json.dumps(result))
 
+    class _LiveSCMListBranches(BaseTool):
+        name = "scm_list_branches"
+        description = "List remote branches (live SCM)."
+        parameters_schema = {"type": "object", "properties": {"repo_url": {"type": "string"}}, "required": ["repo_url"]}
+        def execute_sync(self, repo_url: str = "") -> ToolResult:
+            from agents.scm.adapter import SCMAgentAdapter, scm_definition
+            from agents.web_dev.tools import _parse_repo_coordinates
+            adapter = SCMAgentAdapter(definition=scm_definition, services=_make_services())
+            project, repo = _parse_repo_coordinates(repo_url)
+            result = adapter._dispatch("scm.branch.list", f"{project}/{repo}", {
+                "metadata": {"project": project, "repo": repo, "token": cfg["scm_token"]}
+            })
+            return ToolResult(output=json.dumps(result))
+
     for tool in (_LiveJiraTransition(), _LiveJiraComment(), _LiveJiraUpdate(),
                  _LiveJiraListTransitions(), _LiveJiraGetTokenUser(), _LiveJiraListComments(),
-                 _LiveSCMPush(), _LiveSCMCreatePR()):
+                 _LiveSCMListBranches(), _LiveSCMPush(), _LiveSCMCreatePR()):
         registry.register(tool)
 
 
@@ -593,8 +607,8 @@ async def test_implement_jira_ticket_full_workflow():
     print(f"[live-e2e] Ticket fetched: {cfg['jira_key']}")
 
     # ---- Preflight: verify SCM clone ----
-    import tempfile, shutil
-    _preflight_clone_dir = os.path.join(tempfile.gettempdir(), "constellation-preflight-clone")
+    import shutil
+    _preflight_clone_dir = os.path.join(workspace_path, "preflight-clone")
     if os.path.isdir(_preflight_clone_dir):
         shutil.rmtree(_preflight_clone_dir, ignore_errors=True)
     from agents.scm.adapter import SCMAgentAdapter, scm_definition

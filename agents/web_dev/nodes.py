@@ -332,6 +332,24 @@ async def setup_workspace(state: dict) -> dict:
         else:
             branch_name = f"feature/{task_suffix}"
 
+    # -- Check remote for branch name conflicts; add _<n> suffix when taken --
+    # Must not delete or alter existing remote branches or PRs.
+    if branch_name and repo_url:
+        remote_result = _call_boundary_tool(state, "scm_list_branches", {"repo_url": repo_url})
+        remote_branch_names = {
+            b.get("displayId", "") for b in remote_result.get("branches", [])
+        }
+        if branch_name in remote_branch_names:
+            n = 2
+            while f"{branch_name}_{n}" in remote_branch_names:
+                n += 1
+            new_name = f"{branch_name}_{n}"
+            print(
+                f"[web-dev] setup_workspace: branch {branch_name!r} exists on remote, "
+                f"using {new_name!r} to avoid conflict"
+            )
+            branch_name = new_name
+
     # Actually create / checkout the branch in the cloned repo
     branch_created = False
     if repo_path and os.path.isdir(repo_path) and branch_name:

@@ -231,6 +231,32 @@ class JiraListComments(BaseTool):
         return ToolResult(output=json.dumps(result))
 
 
+class SCMListBranches(BaseTool):
+    """List remote branches for a repository via SCM Agent."""
+
+    name = "scm_list_branches"
+    description = "List remote branches for a repository through the SCM Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string", "description": "Repository URL"},
+        },
+        "required": ["repo_url"],
+    }
+
+    def execute_sync(self, repo_url: str = "") -> ToolResult:
+        project, repo = _parse_repo_coordinates(repo_url)
+        if not project or not repo:
+            return ToolResult(output=json.dumps({"branches": [], "error": "Cannot infer project/repo from repo_url"}))
+        result = _dispatch_scm(
+            "scm.branch.list",
+            text=f"{project}/{repo}",
+            project=project,
+            repo=repo,
+        )
+        return ToolResult(output=json.dumps(result))
+
+
 class SCMPush(BaseTool):
     """Push a local branch to the remote via SCM Agent."""
 
@@ -311,6 +337,7 @@ def register_web_dev_tools():
         JiraListTransitions,
         JiraGetTokenUser,
         JiraListComments,
+        SCMListBranches,
         SCMPush,
         SCMCreatePR,
     ):
