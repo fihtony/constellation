@@ -141,12 +141,16 @@ class TeamLeadAgent(BaseAgent):
         )
 
         # Build initial workflow state
-        artifact_root = os.environ.get("ARTIFACT_ROOT", "artifacts/")
-        workspace_path = os.path.join(
-            artifact_root,
-            f"compass-{meta.get('orchestratorTaskId', 'default')[:8]}",
-            task.id,
-        )
+        # Honour workspacePath from orchestrator metadata (Compass / E2E test);
+        # only construct a default path when none is provided.
+        workspace_path = meta.get("workspacePath", "") or meta.get("workspace_path", "")
+        if not workspace_path:
+            artifact_root = os.environ.get("ARTIFACT_ROOT", "artifacts/")
+            workspace_path = os.path.join(
+                artifact_root,
+                f"compass-{meta.get('orchestratorTaskId', 'default')[:8]}",
+                task.id,
+            )
 
         state = {
             "user_request": user_text,

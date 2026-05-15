@@ -157,21 +157,30 @@ class SCMAgentAdapter(BaseAgent):
         Returns an ``Authorization: ...`` header string for use with
         ``git -c http.extraHeader=<value>``.  Credentials are NOT
         embedded in the remote URL.
+
+        Auth strategy:
+          GitHub: Bearer token (PAT or OAuth)
+          Bitbucket Server + username: Basic base64(username:token)
+          Bitbucket Server + no username: Bearer token (PAT, Bitbucket Server 6.4+)
         """
         import base64
         from urllib.parse import urlparse
 
         token = os.environ.get("SCM_TOKEN", "")
         netloc = urlparse(repo_url).netloc.lower()
+        username = os.environ.get("SCM_USERNAME", "")
+
         if "github" in netloc:
             return f"Authorization: Bearer {token}"
-        # Bitbucket Server / Data Center: HTTP Basic auth
-        username = os.environ.get("SCM_USERNAME", "")
+
+        # Bitbucket Server / Data Center
         if username:
+            # username:PAT Basic auth
             creds = base64.b64encode(f"{username}:{token}".encode()).decode()
-        else:
-            creds = base64.b64encode(f"x-token-auth:{token}".encode()).decode()
-        return f"Authorization: Basic {creds}"
+            return f"Authorization: Basic {creds}"
+
+        # PAT-only Bearer auth (Bitbucket Server 6.4+ / Data Center)
+        return f"Authorization: Bearer {token}"
 
     def _to_git_clone_url(self, repo_url: str) -> str:
         """Convert a Bitbucket browser URL to a valid git clone URL.

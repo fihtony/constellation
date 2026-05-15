@@ -1,4 +1,5 @@
 """Tests for the Jira Agent adapter — REST and MCP provider pattern."""
+from __future__ import annotations
 import json
 
 import pytest

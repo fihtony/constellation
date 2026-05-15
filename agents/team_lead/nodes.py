@@ -208,17 +208,23 @@ async def gather_context(state: dict) -> dict:
             if clone_payload.get("error"):
                 detail = clone_payload.get("detail", "")
                 detail_msg = f" | git: {detail}" if detail else ""
-                print(f"[team-lead] Repo clone warning: {clone_payload['error']}{detail_msg} (continuing without repo clone)")
+                raise RuntimeError(
+                    f"Repo clone FAILED for {repo_url!r}: "
+                    f"{clone_payload['error']}{detail_msg}"
+                )
             else:
                 repo_exists = os.path.isdir(repo_path)
                 repo_has_files = repo_exists and any(os.scandir(repo_path))
                 if not repo_exists or not repo_has_files:
-                    print(f"[team-lead] Cloned repo path missing or empty: {repo_path} (continuing)")
-                else:
-                    repo_cloned = True
-                    print(f"[team-lead] Repo cloned: {repo_name} → {repo_path}")
+                    raise RuntimeError(
+                        f"Repo clone reported success but path is missing or empty: {repo_path!r}"
+                    )
+                repo_cloned = True
+                print(f"[team-lead] Repo cloned: {repo_name} → {repo_path}")
+        except RuntimeError:
+            raise  # propagate clone failures — they are fatal for the workflow
         except Exception as exc:
-            print(f"[team-lead] Repo clone failed: {exc} (continuing without repo clone)")
+            raise RuntimeError(f"Repo clone raised unexpected error for {repo_url!r}: {exc}") from exc
 
     # Write context manifest
     context_manifest_path = ""

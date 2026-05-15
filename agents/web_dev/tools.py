@@ -103,7 +103,8 @@ def _parse_repo_coordinates(repo_url: str) -> tuple[str, str]:
         owner_idx = parts.index("users")
         repo_idx = parts.index("repos")
         if owner_idx + 1 < len(parts) and repo_idx + 1 < len(parts):
-            return parts[owner_idx + 1], parts[repo_idx + 1]
+            # Bitbucket Server personal repos use ~username as the project key in REST API
+            return f"~{parts[owner_idx + 1]}", parts[repo_idx + 1]
 
     if len(parts) >= 2:
         owner = parts[0]

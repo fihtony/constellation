@@ -242,6 +242,6 @@ def build_agent_definition_from_config(
         "permissions": data.get("permissions", {}),
         "permission_profile": data.get("permission_profile", ""),
         "runtime_backend": data.get("runtime_backend", cfg.get("runtime.backend", "connect-agent")),
-        "model": data.get("model", cfg.get("runtime.model", "gpt-5.4-mini")),
+        "model": data.get("model", cfg.get("runtime.model", "gpt-5-mini")),
         "config": data,
     }

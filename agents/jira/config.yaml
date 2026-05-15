@@ -13,7 +13,7 @@ backend: rest
 
 # runtime and model inherit from global constellation.yaml:
 #   runtime.backend: connect-agent
-#   runtime.model: gpt-5.4-mini
+#   runtime.model: gpt-5-mini
 
 port: 8010
 

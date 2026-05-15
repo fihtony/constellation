@@ -1,4 +1,7 @@
 """Framework-level exception hierarchy."""
+from __future__ import annotations
+
+from typing import Optional
 
 
 class ConstellationError(Exception):
@@ -21,7 +24,7 @@ class InterruptSignal(WorkflowError):
         metadata: optional dict for structured interrupt context.
     """
 
-    def __init__(self, question: str, metadata: dict | None = None):
+    def __init__(self, question: str, metadata: Optional[dict] = None):
         super().__init__(question)
         self.question = question
         self.metadata = metadata or {}

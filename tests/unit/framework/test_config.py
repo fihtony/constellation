@@ -17,7 +17,7 @@ def project_dir(tmp_path):
           version: "2.0.0"
         runtime:
           backend: connect-agent
-          model: gpt-5.4-mini
+          model: gpt-5-mini
         skills:
           directory: skills
         data:
@@ -38,7 +38,7 @@ def project_dir(tmp_path):
         mode: task
         execution_mode: persistent
         runtime_backend: connect-agent
-        model: gpt-5.4-mini
+        model: gpt-5-mini
         tools:
           - dispatch_agent
           - query_registry
@@ -52,7 +52,7 @@ def project_dir(tmp_path):
         name: "Web Dev Agent"
         mode: task
         execution_mode: per-task
-        model: gpt-5.4-mini
+        model: gpt-5-mini
         default_skills:
           - react-nextjs
           - testing
@@ -84,7 +84,7 @@ class TestLoadGlobalConfig:
         cfg = load_global_config(project_dir)
         assert cfg.get("project.name") == "constellation"
         assert cfg.get("runtime.backend") == "connect-agent"
-        assert cfg.get("runtime.model") == "gpt-5.4-mini"
+        assert cfg.get("runtime.model") == "gpt-5-mini"
         assert cfg.get("container.runtime") == "docker"
 
     def test_missing_file_returns_empty(self, tmp_path):
@@ -110,7 +110,7 @@ class TestLoadAgentConfig:
         from framework.config import load_agent_config
 
         cfg = load_agent_config("team-lead", project_dir)
-        assert cfg.get("model") == "gpt-5.4-mini"
+        assert cfg.get("model") == "gpt-5-mini"
 
     def test_env_override(self, project_dir, monkeypatch):
         from framework.config import load_agent_config

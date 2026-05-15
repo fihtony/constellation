@@ -1,7 +1,7 @@
 """Connect Agent runtime adapter.
 
 Provides both ``run()`` (single-shot) and ``run_agentic()`` (multi-turn
-autonomous execution with tool calling).  Default model: gpt-5.4-mini.
+autonomous execution with tool calling).  Default model: gpt-5-mini.
 """
 from __future__ import annotations
 

@@ -8,7 +8,7 @@ project:
 # Default runtime backend for all agents
 runtime:
   backend: connect-agent
-  model: gpt-5.4-mini
+  model: gpt-5-mini
 
 # Skills directory
 skills:

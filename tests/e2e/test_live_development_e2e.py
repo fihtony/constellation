@@ -130,7 +130,7 @@ def _make_services(runtime=None, task_store=None):
 
     effective_runtime = runtime or get_runtime(
         "connect-agent",
-        model=os.environ.get("OPENAI_MODEL", "gpt-5.4-mini"),
+        model=os.environ.get("OPENAI_MODEL", "gpt-5-mini"),
     )
 
     return AgentServices(
@@ -270,7 +270,7 @@ def _register_live_boundary_tools(cfg: dict, workspace_path: str = "") -> None:
                         skills_registry=SkillsRegistry(),
                         plugin_manager=PluginManager(),
                         checkpoint_service=InMemoryCheckpointer(),
-                        runtime=get_runtime("connect-agent", model=os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")),
+                        runtime=get_runtime("connect-agent", model=os.environ.get("OPENAI_MODEL", "gpt-5-mini")),
                         registry_client=None,
                         task_store=wd_task_store,
                     )

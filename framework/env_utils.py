@@ -141,6 +141,8 @@ def build_isolated_git_env(scope: str = "git", **extra: str) -> dict[str, str]:
             fh.write(
                 "[safe]\n\tdirectory = *\n"
                 "[credential]\n\thelper =\n"
+                "[user]\n\tname = constellation-agent\n"
+                "\temail = constellation@noreply.local\n"
             )
 
     env.update({

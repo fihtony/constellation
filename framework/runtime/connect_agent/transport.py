@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 from framework.env_utils import resolve_openai_base_url
 from framework.runtime.adapter import AgentRuntimeAdapter
 
-DEFAULT_MODEL = "gpt-5.4-mini"
+DEFAULT_MODEL = "gpt-5-mini"
 
 
 def _debug_logging_enabled() -> bool:

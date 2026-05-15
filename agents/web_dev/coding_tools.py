@@ -262,8 +262,10 @@ class RunCommandTool(BaseTool):
         self,
         command: str = "",
         cwd: str | None = None,
-        timeout: int = 120,
+        timeout: int = 60,
     ) -> ToolResult:
+        # Hard-cap: prevent LLM from blocking for too long
+        timeout = min(int(timeout), 60)
         if not command.strip():
             return ToolResult(error="command is required")
 
