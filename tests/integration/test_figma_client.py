@@ -21,6 +21,8 @@ pytestmark = pytest.mark.live
 def test_figma_get_file(figma_client, figma_file_url):
     """FigmaClient.get_file() returns file metadata with at least one page."""
     data, status = figma_client.get_file(figma_file_url)
+    if status == "HTTP 429":
+        pytest.skip("Figma API rate-limited (429) — try again later")
     assert status == "ok", f"Expected 'ok' but got {status!r}"
     assert isinstance(data, dict), "Expected a dict from get_file()"
     assert "name" in data, "File metadata missing 'name'"
@@ -37,6 +39,8 @@ def test_figma_get_file(figma_client, figma_file_url):
 def test_figma_list_pages(figma_client, figma_file_url):
     """FigmaClient.list_pages() returns a non-empty list."""
     pages, status = figma_client.list_pages(figma_file_url)
+    if status == "HTTP 429":
+        pytest.skip("Figma API rate-limited (429) — try again later")
     assert status == "ok", f"Expected 'ok' but got {status!r}"
     assert isinstance(pages, list), "Expected a list of pages"
     assert len(pages) >= 1, "Expected at least one page"

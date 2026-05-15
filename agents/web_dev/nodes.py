@@ -91,6 +91,58 @@ def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
         return {"error": str(exc)}
 
 
+def _git_commit_all_pending(repo_path: str, jira_key: str) -> None:
+    """Stage all pending changes and commit if anything is staged.
+
+    Called inside create_pr before scm_push to ensure every file written by
+    the agentic implement_changes loop is committed — even when the LLM only
+    ran 'git commit <specific-file>' instead of 'git add -A && git commit'.
+    """
+    if not repo_path or not os.path.isdir(repo_path):
+        return
+    try:
+        import subprocess
+        from framework.env_utils import build_isolated_git_env
+        git_env = build_isolated_git_env(scope="web-dev-commit")
+
+        # Stage all untracked/modified files
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=repo_path, env=git_env,
+            capture_output=True, text=True, timeout=30,
+        )
+
+        # Check if there is anything staged
+        status_result = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=repo_path, env=git_env,
+            capture_output=True, text=True, timeout=10,
+        )
+        staged_files = [f for f in status_result.stdout.strip().splitlines() if f]
+
+        if staged_files:
+            commit_msg = f"feat({jira_key or 'task'}): implement changes"
+            r = subprocess.run(
+                ["git", "commit", "-m", commit_msg],
+                cwd=repo_path, env=git_env,
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                print(f"[web-dev] committed {len(staged_files)} pending file(s): {staged_files[:8]}")
+            else:
+                print(f"[web-dev] commit failed: {r.stderr.strip()[:200]}")
+        else:
+            # Confirm there is at least one commit on the branch
+            log_result = subprocess.run(
+                ["git", "log", "--oneline", "-1"],
+                cwd=repo_path, env=git_env,
+                capture_output=True, text=True, timeout=10,
+            )
+            print(f"[web-dev] no pending changes; last commit: {log_result.stdout.strip()[:120]!r}")
+    except Exception as exc:
+        print(f"[web-dev] _git_commit_all_pending error (non-fatal): {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Node implementations
 # ---------------------------------------------------------------------------
@@ -237,9 +289,13 @@ async def setup_workspace(state: dict) -> dict:
     task_id = state.get("_task_id", "unknown")
     print(f"[web-dev] setup_workspace: repo_path={repo_path!r} workspace_path={workspace_path!r}")
 
-    # Use workspace_path from Team Lead; only fall back to temp if missing
+    # Use workspace_path from Team Lead; only fall back to artifacts/ if missing
     if not workspace_path:
-        workspace_path = f"/tmp/constellation/{task_id}"
+        workspace_path = os.path.join(
+            os.path.abspath(os.environ.get("ARTIFACT_ROOT", "artifacts")),
+            f"workspace-{task_id}",
+        )
+        os.makedirs(workspace_path, exist_ok=True)
     if not repo_path:
         repo_path = os.path.join(workspace_path, "repo")
 
@@ -400,6 +456,19 @@ async def implement_changes(state: dict) -> dict:
     if len(impl_plan) > 4000:
         impl_plan = impl_plan[:4000] + "...(truncated)"
 
+    # Load design HTML code from workspace for component reference
+    _design_code_ref = "N/A"
+    _design_code_path = state.get("design_code_path", "")
+    _workspace_path = state.get("workspace_path", "")
+    if not _design_code_path and _workspace_path:
+        _design_code_path = os.path.join(_workspace_path, "team_lead", "design-code.html")
+    if _design_code_path and os.path.isfile(_design_code_path):
+        try:
+            with open(_design_code_path, encoding="utf-8") as _f:
+                _design_code_ref = _f.read()[:5000]
+        except Exception:
+            pass
+
     # Pre-scan repo so LLM doesn't waste turns on exploration
     _repo_path = state.get("repo_path", "")
     _repo_files_section: str
@@ -428,6 +497,7 @@ async def implement_changes(state: dict) -> dict:
         implementation_plan=impl_plan,
         jira_context=jira_for_prompt,
         design_context=str(state.get("design_context", "N/A")),
+        design_code_reference=_design_code_ref,
         skill_context=state.get("skill_context", ""),
         memory_context=state.get("memory_context", ""),
     )
@@ -635,6 +705,33 @@ async def self_assess(state: dict) -> dict:
 
     jira_ctx = state.get("jira_context", {})
     design_ctx = state.get("design_context") or {}
+    workspace_path = state.get("workspace_path", "")
+
+    # Try to load full design context from workspace file (more complete than state copy)
+    if workspace_path:
+        design_spec_path = os.path.join(workspace_path, "team_lead", "design-spec.json")
+        if os.path.isfile(design_spec_path):
+            try:
+                with open(design_spec_path, encoding="utf-8") as _f:
+                    spec_data = json.load(_f)
+                design_ctx = spec_data.get("data", design_ctx) or design_ctx
+            except Exception:
+                pass
+
+    # Load design HTML code for component-by-component comparison
+    design_code_snippet = ""
+    design_code_path = state.get("design_code_path", "")
+    if not design_code_path and workspace_path:
+        design_code_path = os.path.join(workspace_path, "team_lead", "design-code.html")
+    if design_code_path and os.path.isfile(design_code_path):
+        try:
+            with open(design_code_path, encoding="utf-8") as _f:
+                design_html = _f.read()
+            # Keep first 4000 chars — enough to extract component structure
+            design_code_snippet = design_html[:4000]
+        except Exception:
+            pass
+
     acceptance_criteria = []
     if isinstance(jira_ctx, dict):
         fields = jira_ctx.get("fields", jira_ctx)
@@ -653,7 +750,8 @@ async def self_assess(state: dict) -> dict:
 
     prompt = SELF_ASSESS_TEMPLATE.format(
         acceptance_criteria=ac_str,
-        design_context=json.dumps(design_ctx, ensure_ascii=False)[:500] if design_ctx else "N/A (not a UI task)",
+        design_context=json.dumps(design_ctx, ensure_ascii=False)[:800] if design_ctx else "N/A (not a UI task)",
+        design_code_snippet=design_code_snippet or "N/A (no design HTML available)",
         implementation_summary=str(state.get("implementation_summary", ""))[:1000],
         test_results=json.dumps(state.get("test_results", {}), ensure_ascii=False)[:500],
         changed_files="\n".join(state.get("changes_made", [])) or "unknown",
@@ -952,6 +1050,10 @@ async def create_pr(state: dict) -> dict:
     repo_path = state.get("repo_path", "")
     repo_url = state.get("repo_url", "")
     branch_name = state.get("branch_name", "feature/task")
+
+    # Deterministic commit: stage ALL pending changes before push so files
+    # written by the agentic implement_changes loop are not left untracked.
+    _git_commit_all_pending(repo_path, jira_key or "task")
 
     push_payload = _call_boundary_tool(
         state, "scm_push", {"repo_path": repo_path, "branch": branch_name}

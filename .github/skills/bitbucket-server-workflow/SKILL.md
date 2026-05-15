@@ -115,7 +115,7 @@ user-invocable: true
 
 ## Test Scope
 
-- Use the project and repo values from `tests/.env` (`TEST_GITHUB_REPO_URL`, `TEST_GITHUB_TOKEN`) for all live Bitbucket Server integration tests.
+- Use the project and repo values from `tests/.env` (`TEST_SCM_REPO_URL`, `TEST_SCM_TOKEN`) for all live Bitbucket Server integration tests.
 - The integration regression (`tests/test_scm_agent.py`) covers all 21 TCs:
   - TC-01  Git auth: `git ls-remote` with Bearer token
   - TC-02  Health: `/health`

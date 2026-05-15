@@ -82,8 +82,12 @@ Implementation plan:
 Jira context:
 {jira_context}
 
-Design context:
+Design context (metadata):
 {design_context}
+
+Design HTML reference (actual HTML source from the design tool — use this to \
+implement the exact component structure, class names, and layout):
+{design_code_reference}
 
 Skill context:
 {skill_context}
@@ -93,7 +97,12 @@ Prior knowledge (from memory):
 
 Implement the changes described above. Follow the CRITICAL SPEED RULES in your \
 system prompt — start writing files within the first 3 turns.
-After implementation, stage and commit all changes using run_command.
+For UI tasks: use the Design HTML reference above as the authoritative guide. \
+Implement EVERY major section/component visible in that HTML (header, hero, nav, \
+cards, footer, etc.). Match class names and structure as closely as possible.
+After implementation, stage and commit ALL changes:
+  run_command("git add -A", cwd=<repo_path>)
+  run_command("git commit -m 'feat: ...'", cwd=<repo_path>)
 """
 
 # ---------------------------------------------------------------------------
@@ -184,8 +193,11 @@ Evaluate the implementation against the following criteria:
 Acceptance criteria:
 {acceptance_criteria}
 
-Design context (components to check):
+Design context (metadata):
 {design_context}
+
+Design HTML reference (first 4000 chars — parse to extract components):
+{design_code_snippet}
 
 Implementation summary:
 {implementation_summary}
@@ -196,7 +208,17 @@ Test results:
 Changed files:
 {changed_files}
 
-Evaluate each dimension and return JSON:
+Instructions:
+1. For each acceptance criterion, check whether it is satisfied by the changed files.
+2. Parse the Design HTML reference to identify EVERY major component (e.g. header, \
+nav, hero section, feature cards, CTA button, footer, forms, images). \
+For each component, check whether it is present and correct in the changed files.
+3. Score 0.9+ ONLY if ALL acceptance criteria are met AND all identified design \
+components are present in the implementation. List specific gaps for anything missing.
+4. In "gaps", be precise: name the missing component or failing criterion \
+so it can be fixed directly.
+
+Return only valid JSON, no markdown fences:
 {{
   "score": <float 0.0-1.0>,
   "verdict": "pass" or "fail",
@@ -204,14 +226,13 @@ Evaluate each dimension and return JSON:
     {{"criterion": "...", "status": "pass" or "fail", "notes": "..."}}
   ],
   "component_checks": [
-    {{"component": "...", "status": "pass" or "fail", "notes": "..."}}
+    {{"component": "<component from design HTML>", "status": "present" or "missing" or "incomplete", "notes": "..."}}
   ],
-  "gaps": ["list of specific gaps to fix"],
+  "gaps": ["specific gap 1", "specific gap 2"],
   "summary": "brief overall assessment"
 }}
 
 Pass threshold: score >= 0.9.
-For UI tasks, check each component against the design context.
 """
 
 # ---------------------------------------------------------------------------

@@ -350,7 +350,7 @@ async def run_team_lead_workflow(
         "parts": [{"text": f"Implement {jira_ticket_url}"}],
         "metadata": {
             "jiraKey": jira_key,
-            "repoUrl": _env("TEST_GITHUB_REPO_URL", ""),
+            "repoUrl": _env("TEST_SCM_REPO_URL", ""),
         },
     }
 
@@ -557,7 +557,7 @@ async def main():
     print(f"  LLM: {os.environ.get('OPENAI_BASE_URL')}")
     print(f"  Model: {os.environ.get('OPENAI_MODEL')}")
     print(f"  Jira Ticket: {_env('TEST_JIRA_TICKET_URL')}")
-    print(f"  Repo: {_env('TEST_GITHUB_REPO_URL')}")
+    print(f"  Repo: {_env('TEST_SCM_REPO_URL')}")
     print("=" * 70 + "\n")
 
     # Step 1: Check LLM

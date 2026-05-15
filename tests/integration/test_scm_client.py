@@ -1,7 +1,7 @@
 """Integration tests for SCM clients (GitHub MCP + REST) against GitHub.
 
 All tests call the real GitHub instance configured in tests/.env.
-They are automatically skipped when TEST_GITHUB_REPO_URL / TEST_GITHUB_TOKEN
+They are automatically skipped when TEST_SCM_REPO_URL / TEST_SCM_TOKEN
 are absent.
 
 Default backend: GitHubMCPProvider (github-mcp).
@@ -23,8 +23,8 @@ pytestmark = pytest.mark.live
 def test_scm_get_repo(scm_client, scm_project_repo):
     """GitHubMCPProvider.get_repo() returns the repo metadata dict."""
     owner, repo = scm_project_repo
-    assert owner, "Could not parse owner from TEST_GITHUB_REPO_URL"
-    assert repo, "Could not parse repo slug from TEST_GITHUB_REPO_URL"
+    assert owner, "Could not parse owner from TEST_SCM_REPO_URL"
+    assert repo, "Could not parse repo slug from TEST_SCM_REPO_URL"
 
     data, status = scm_client.get_repo(owner, repo)
     assert status == "ok", f"Expected 'ok' but got {status!r}"

@@ -89,12 +89,42 @@ def _extract_jira_key(ticket_url: str) -> str:
     return parts[-1] if parts else ""
 
 
+def _extract_stitch_project_id(url: str) -> str:
+    """Extract Stitch project ID from a URL like https://stitch.withgoogle.com/projects/12345."""
+    if not url:
+        return ""
+    parts = [p for p in urlparse(url).path.split("/") if p]
+    if "projects" in parts:
+        idx = parts.index("projects")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    # Might already be a bare project ID
+    return url if url.isdigit() else ""
+
+
 def _load_live_config() -> dict:
-    """Load and validate all live E2E config from tests/.env."""
+    """Load and validate all live E2E config from tests/.env.
+
+    Accepts both TEST_GITHUB_REPO_URL (legacy) and TEST_SCM_REPO_URL, and
+    both TEST_GITHUB_TOKEN (legacy) and TEST_SCM_TOKEN, to be compatible
+    with both naming conventions in tests/.env.
+    """
     jira_ticket_url = _require_env("TEST_JIRA_TICKET_URL")
-    scm_repo_url = _require_env("TEST_GITHUB_REPO_URL")
+    # Accept both legacy TEST_GITHUB_REPO_URL and canonical TEST_SCM_REPO_URL
+    scm_repo_url = _env("TEST_GITHUB_REPO_URL") or _env("TEST_SCM_REPO_URL")
+    if not scm_repo_url:
+        pytest.skip("Missing required env var: TEST_GITHUB_REPO_URL or TEST_SCM_REPO_URL")
+    # Accept both legacy TEST_GITHUB_TOKEN and canonical TEST_SCM_TOKEN
+    scm_token = _env("TEST_GITHUB_TOKEN") or _env("TEST_SCM_TOKEN")
+    if not scm_token:
+        pytest.skip("Missing required env var: TEST_GITHUB_TOKEN or TEST_SCM_TOKEN")
     # Derive SCM username from URL when not explicitly set in .env
     scm_username = _env("TEST_SCM_USERNAME", "") or _extract_scm_username(scm_repo_url)
+    # Stitch design context (optional — used for UI tasks)
+    stitch_project_url = _env("TEST_STITCH_PROJECT_URL", "")
+    stitch_project_id = _extract_stitch_project_id(stitch_project_url)
+    stitch_screen_id = _env("TEST_STITCH_SCREEN_ID", "")
+    stitch_api_key = _env("TEST_STITCH_API_KEY", "")
     return {
         "jira_ticket_url": jira_ticket_url,
         "jira_base_url": _infer_jira_base_url(jira_ticket_url),
@@ -104,10 +134,14 @@ def _load_live_config() -> dict:
         "scm_repo_url": scm_repo_url,
         "scm_backend": _infer_scm_backend(scm_repo_url),
         "scm_base_url": _infer_scm_base_url(scm_repo_url),
-        "scm_token": _require_env("TEST_GITHUB_TOKEN"),
+        "scm_token": scm_token,
         "scm_username": scm_username,
         "figma_url": _env("TEST_FIGMA_FILE_URL", ""),
         "figma_token": _env("TEST_FIGMA_TOKEN", ""),
+        "stitch_project_url": stitch_project_url,
+        "stitch_project_id": stitch_project_id,
+        "stitch_screen_id": stitch_screen_id,
+        "stitch_api_key": stitch_api_key,
         "openai_base_url": _require_env("OPENAI_BASE_URL"),
         "openai_model": _require_env("OPENAI_MODEL"),
     }
@@ -178,6 +212,8 @@ def _set_env_from_config(cfg: dict) -> None:
         os.environ["SCM_USERNAME"] = cfg["scm_username"]
     if cfg.get("figma_token"):
         os.environ["FIGMA_TOKEN"] = cfg["figma_token"]
+    if cfg.get("stitch_api_key"):
+        os.environ["STITCH_API_KEY"] = cfg["stitch_api_key"]
 
 
 def _register_live_boundary_tools(cfg: dict, workspace_path: str = "") -> None:
@@ -229,11 +265,66 @@ def _register_live_boundary_tools(cfg: dict, workspace_path: str = "") -> None:
             })
             return ToolResult(output=json.dumps(result))
 
-    class _MockFetchDesign(BaseTool):
+    class _LiveFetchDesign(BaseTool):
+        """Live design context fetch: Stitch MCP or Figma REST.
+
+        Falls back to empty context gracefully when no credentials are
+        available so non-UI tasks are not blocked.
+        """
         name = "fetch_design"
-        description = "Fetch design context (no-op for non-UI tasks)."
-        parameters_schema = {"type": "object", "properties": {}, "required": []}
-        def execute_sync(self, **kw) -> ToolResult:
+        description = "Fetch design context from Figma or Google Stitch (live)."
+        parameters_schema = {
+            "type": "object",
+            "properties": {
+                "stitch_project_id": {"type": "string"},
+                "figma_url": {"type": "string"},
+                "screen_name": {"type": "string"},
+            },
+            "required": [],
+        }
+
+        def execute_sync(
+            self,
+            stitch_project_id: str = "",
+            figma_url: str = "",
+            screen_name: str = "",
+        ) -> ToolResult:
+            if stitch_project_id:
+                stitch_api_key = cfg.get("stitch_api_key", "")
+                if not stitch_api_key:
+                    print("[live-e2e] STITCH_API_KEY not set — skipping Stitch fetch")
+                    return ToolResult(output=json.dumps({}))
+                try:
+                    from agents.ui_design.clients.stitch_mcp import StitchMcpClient
+                    client = StitchMcpClient(api_key=stitch_api_key)
+                    stitch_screen_id = cfg.get("stitch_screen_id", "")
+                    if stitch_screen_id:
+                        data, status = client.get_screen(stitch_project_id, stitch_screen_id)
+                        if status == "ok":
+                            print(f"[live-e2e] Stitch screen fetched: project={stitch_project_id} screen={stitch_screen_id}")
+                            return ToolResult(output=json.dumps({"screen": data, "status": status, "source": "stitch"}))
+                        print(f"[live-e2e] Stitch screen fetch failed ({status}), falling back to list")
+                    # Fall back to listing all screens for broader context
+                    screens, status = client.list_screens(stitch_project_id)
+                    print(f"[live-e2e] Stitch screens listed: {len(screens)} screens, status={status}")
+                    return ToolResult(output=json.dumps({"screens": screens, "status": status, "source": "stitch"}))
+                except Exception as exc:
+                    print(f"[live-e2e] Stitch fetch error: {exc}")
+                    return ToolResult(output=json.dumps({"error": str(exc)}))
+            if figma_url:
+                figma_token = cfg.get("figma_token", "")
+                if not figma_token:
+                    print("[live-e2e] FIGMA_TOKEN not set — skipping Figma fetch")
+                    return ToolResult(output=json.dumps({}))
+                try:
+                    from agents.ui_design.clients.figma_rest import FigmaClient
+                    client = FigmaClient(token=figma_token)
+                    data, status = client.get_file(figma_url)
+                    print(f"[live-e2e] Figma file fetched: status={status}")
+                    return ToolResult(output=json.dumps({"file": data, "status": status, "source": "figma"}))
+                except Exception as exc:
+                    print(f"[live-e2e] Figma fetch error: {exc}")
+                    return ToolResult(output=json.dumps({"error": str(exc)}))
             return ToolResult(output=json.dumps({}))
 
     class _MockDispatchWebDev(BaseTool):
@@ -360,7 +451,7 @@ def _register_live_boundary_tools(cfg: dict, workspace_path: str = "") -> None:
         def execute_sync(self, **kw) -> ToolResult:
             return ToolResult(output=json.dumps({"verdict": "approved", "summary": "Auto-approved for live E2E test."}))
 
-    for tool in (_LiveFetchJiraTicket(), _LiveCloneRepo(), _MockFetchDesign(),
+    for tool in (_LiveFetchJiraTicket(), _LiveCloneRepo(), _LiveFetchDesign(),
                  _MockDispatchWebDev(), _MockDispatchCodeReview()):
         registry.register(tool)
 
@@ -552,6 +643,10 @@ def _register_compass_tools_for_e2e(cfg: dict, workspace_path: str, tl_result_qu
                                 "jiraKey": effective_jira_key,
                                 "repoUrl": effective_repo_url,
                                 "workspacePath": workspace_path,
+                                # Pass Stitch design context so Team Lead can fetch design specs
+                                "stitchProjectId": cfg.get("stitch_project_id", ""),
+                                "stitchScreenId": cfg.get("stitch_screen_id", ""),
+                                "figmaUrl": cfg.get("figma_url", ""),
                             },
                         }
                     }
@@ -735,6 +830,73 @@ async def test_full_development_task_jira_to_pr():
     print(f"[live-e2e] PR URL: {pr_url}")
     print(f"[live-e2e] Branch: {branch}")
     print(f"[live-e2e] jiraInReview: {jira_in_review}")
+
+    # ------------------------------------------------------------------
+    # Workspace checkpoint assertions (design doc §6.1 and user checkpoints)
+    # ------------------------------------------------------------------
+
+    # CP-1: Jira ticket saved to workspace
+    jira_ticket_file = os.path.join(workspace_path, "team_lead", "jira-ticket.json")
+    assert os.path.isfile(jira_ticket_file), \
+        f"[CP-1] Jira ticket not saved to workspace: {jira_ticket_file}"
+    with open(jira_ticket_file, encoding="utf-8") as fh:
+        jira_ticket_data = json.load(fh)
+    assert jira_ticket_data.get("data"), f"[CP-1] jira-ticket.json has no 'data' key: {jira_ticket_data}"
+    print(f"[live-e2e] CP-1 PASS: jira-ticket.json exists in workspace")
+
+    # CP-2: Context manifest saved
+    manifest_file = os.path.join(workspace_path, "team_lead", "context-manifest.json")
+    assert os.path.isfile(manifest_file), \
+        f"[CP-2] context-manifest.json not saved: {manifest_file}"
+    with open(manifest_file, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    assert manifest.get("data", {}).get("repo_path"), \
+        f"[CP-2] context-manifest.json missing repo_path: {manifest}"
+    print(f"[live-e2e] CP-2 PASS: context-manifest.json exists, repo_path={manifest['data']['repo_path']!r}")
+
+    # CP-2b: Design context saved (only required when Stitch/Figma config is present)
+    if cfg.get("stitch_project_id") or cfg.get("figma_url"):
+        design_spec_file = os.path.join(workspace_path, "team_lead", "design-spec.json")
+        if os.path.isfile(design_spec_file):
+            print(f"[live-e2e] CP-2b PASS: design-spec.json exists in workspace")
+        else:
+            print(f"[live-e2e] CP-2b WARN: design-spec.json not found (design fetch may have failed gracefully)")
+
+    # CP-3: Repo cloned to workspace
+    repo_name = manifest.get("data", {}).get("repo_name", "")
+    repo_path_ws = manifest.get("data", {}).get("repo_path", "")
+    assert repo_path_ws and os.path.isdir(repo_path_ws), \
+        f"[CP-3] Repo not cloned to workspace: repo_path={repo_path_ws!r}"
+    assert any(os.scandir(repo_path_ws)), \
+        f"[CP-3] Repo directory is empty: {repo_path_ws}"
+    print(f"[live-e2e] CP-3 PASS: repo cloned at {repo_path_ws!r}")
+
+    # CP-4: Team Lead delivery plan
+    plan_file = os.path.join(workspace_path, "team_lead", "delivery-plan.json")
+    assert os.path.isfile(plan_file), \
+        f"[CP-4] delivery-plan.json not saved: {plan_file}"
+    print(f"[live-e2e] CP-4 PASS: delivery-plan.json exists")
+
+    # CP-5/6: Web dev workspace artifacts
+    web_agent_dir = os.path.join(workspace_path, "web-agent")
+    if os.path.isdir(web_agent_dir):
+        jira_prep_file = os.path.join(web_agent_dir, "jira-prepare-log.json")
+        if os.path.isfile(jira_prep_file):
+            print(f"[live-e2e] CP-5 PASS: web-agent/jira-prepare-log.json exists")
+        else:
+            print(f"[live-e2e] CP-5 WARN: web-agent/jira-prepare-log.json not found")
+
+        pr_evidence_file = os.path.join(web_agent_dir, "pr-evidence.json")
+        if os.path.isfile(pr_evidence_file):
+            with open(pr_evidence_file, encoding="utf-8") as fh:
+                pr_evidence = json.load(fh)
+            saved_pr_url = pr_evidence.get("data", {}).get("pr_url", "")
+            print(f"[live-e2e] CP-8 PASS: web-agent/pr-evidence.json exists, pr_url={saved_pr_url!r}")
+        else:
+            print(f"[live-e2e] CP-8 WARN: web-agent/pr-evidence.json not found")
+    else:
+        print(f"[live-e2e] CP-5/8 INFO: web-agent/ dir not found (web dev ran in separate process)")
+
     print(f"[live-e2e] TC-L01 PASSED")
 
 

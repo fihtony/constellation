@@ -146,6 +146,7 @@ class WebDevAgent(BaseAgent):
                 or metadata.get("jiraKey", "")
             ),
             "design_context": metadata.get("designContext"),
+            "design_code_path": metadata.get("designCodePath", ""),
             "skill_context": metadata.get("skillContext", ""),
             "context_manifest_path": metadata.get("contextManifestPath", ""),
             "jira_files": metadata.get("jiraFiles", []),

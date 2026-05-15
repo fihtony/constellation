@@ -210,8 +210,8 @@ python3 tests/test_github_mcp.py --integration -v
 ```
 
 All tests read config exclusively from `tests/.env`:
-- `TEST_GITHUB_TOKEN` — GitHub PAT
-- `TEST_GITHUB_REPO_URL` — target repo URL
+- `TEST_SCM_TOKEN` — GitHub PAT
+- `TEST_SCM_REPO_URL` — target repo URL
 
 Treat `tests/.env` as the only valid source of GitHub credentials during MCP testing. Shell-exported GitHub tokens and host keychain state are out of policy.
 

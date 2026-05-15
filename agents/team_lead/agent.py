@@ -158,6 +158,7 @@ class TeamLeadAgent(BaseAgent):
             "repo_url": meta.get("repoUrl", ""),
             "figma_url": meta.get("designUrl", "") or meta.get("figmaUrl", ""),
             "stitch_project_id": meta.get("stitchProjectId", ""),
+            "stitch_screen_id": meta.get("stitchScreenId", ""),
             "jira_context": meta.get("jiraContext", {}),
             "design_context": meta.get("designContext"),
             "workspace_path": workspace_path,

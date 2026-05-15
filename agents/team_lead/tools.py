@@ -123,9 +123,13 @@ class FetchDesign(BaseTool):
                 "type": "string",
                 "description": "Google Stitch project ID.",
             },
+            "stitch_screen_id": {
+                "type": "string",
+                "description": "Google Stitch screen ID (optional, fetches a specific screen).",
+            },
             "screen_name": {
                 "type": "string",
-                "description": "Screen name for Stitch (optional).",
+                "description": "Screen name for Stitch (optional, used when screen_id is unknown).",
             },
         },
         "required": [],
@@ -135,6 +139,7 @@ class FetchDesign(BaseTool):
         self,
         figma_url: str = "",
         stitch_project_id: str = "",
+        stitch_screen_id: str = "",
         screen_name: str = "",
     ) -> ToolResult:
         ui_url = _resolve_agent_url("UI_DESIGN_AGENT_URL", "ui_design_agent_url", "http://ui-design:8040", "figma.file.fetch")
@@ -145,9 +150,13 @@ class FetchDesign(BaseTool):
                 meta: dict[str, Any] = {"figmaUrl": figma_url}
                 text = figma_url
             elif stitch_project_id:
-                capability = "stitch.screen.fetch" if screen_name else "stitch.screens.list"
+                if stitch_screen_id or screen_name:
+                    capability = "stitch.screen.fetch"
+                else:
+                    capability = "stitch.screens.list"
                 meta = {
                     "stitchProjectId": stitch_project_id,
+                    "stitchScreenId": stitch_screen_id,
                     "screenName": screen_name,
                 }
                 text = stitch_project_id

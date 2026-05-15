@@ -177,7 +177,11 @@ class SCMAgentAdapter(BaseAgent):
         username = os.environ.get("SCM_USERNAME", "")
 
         if "github" in netloc:
-            return f"Authorization: Bearer {token}"
+            # GitHub git-over-HTTPS: Basic auth with x-access-token as username.
+            # This works for both classic PATs and fine-grained PATs.
+            # Bearer/token scheme only works for GitHub Apps, not PATs in git ops.
+            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            return f"Authorization: Basic {basic}"
 
         # Bitbucket Server / Data Center
         if username:
@@ -258,6 +262,15 @@ class SCMAgentAdapter(BaseAgent):
         git_env = build_isolated_git_env(scope="scm-clone")
 
         print(f"[scm] Cloning {git_url} → {target_path}")
+        # Reuse existing clone rather than fail when the directory is already present
+        if os.path.isdir(target_path) and os.path.isdir(os.path.join(target_path, ".git")):
+            print(f"[scm] Target already a git repo, reusing existing clone: {target_path}")
+            return {"cloned": True, "path": target_path, "status": "ok", "reused": True}
+        # Remove stale empty (or broken) target dir so git clone does not fail
+        if os.path.isdir(target_path):
+            import shutil as _shutil
+            _shutil.rmtree(target_path, ignore_errors=True)
+            print(f"[scm] Removed stale target directory: {target_path}")
         try:
             os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
             result = subprocess.run(

@@ -110,6 +110,7 @@ async def gather_context(state: dict) -> dict:
 
     jira_files = []
     design_files = []
+    design_code_path = ""
 
     # Fetch Jira ticket if key provided and not already present
     jira_key = state.get("jira_key", "")
@@ -150,6 +151,7 @@ async def gather_context(state: dict) -> dict:
     # Fetch design context if URL provided and not already present
     figma_url = state.get("figma_url", "")
     stitch_id = state.get("stitch_project_id", "")
+    stitch_screen_id = state.get("stitch_screen_id", "")
     if (figma_url or stitch_id) and not design_context:
         try:
             args: dict[str, str] = {}
@@ -157,6 +159,8 @@ async def gather_context(state: dict) -> dict:
                 args["figma_url"] = figma_url
             elif stitch_id:
                 args["stitch_project_id"] = stitch_id
+                if stitch_screen_id:
+                    args["stitch_screen_id"] = stitch_screen_id
             result_str = registry.execute_sync("fetch_design", args)
             payload = json.loads(result_str) if result_str else {}
             if payload.get("error"):
@@ -184,6 +188,28 @@ async def gather_context(state: dict) -> dict:
             design_files.append("team_lead/design-spec.json")
         except OSError as exc:
             print(f"[team-lead] Failed to write design-spec.json: {exc}")
+
+        # Download design HTML source code when available (Stitch htmlCode.downloadUrl).
+        # This gives the Web Dev agent the exact component structure from the design tool.
+        try:
+            from urllib.request import Request as _Req, urlopen as _urlopen
+            design_data = design_context.get("design") or design_context
+            html_download_url = (design_data.get("htmlCode") or {}).get("downloadUrl", "")
+            if html_download_url:
+                req = _Req(
+                    html_download_url,
+                    headers={"User-Agent": "constellation-team-lead/1.0"},
+                )
+                with _urlopen(req, timeout=30) as resp:
+                    html_content = resp.read().decode("utf-8", errors="replace")
+                code_file = os.path.join(tl_dir, "design-code.html")
+                with open(code_file, "w", encoding="utf-8") as fh:
+                    fh.write(html_content)
+                design_files.append("team_lead/design-code.html")
+                design_code_path = code_file
+                print(f"[team-lead] Design HTML downloaded: {len(html_content)} chars → {code_file}")
+        except Exception as exc:
+            print(f"[team-lead] Design HTML download failed (non-fatal): {exc}")
 
     # Derive repo name from URL
     repo_url = state.get("repo_url", "")
@@ -241,6 +267,7 @@ async def gather_context(state: dict) -> dict:
                 "workspace_root": workspace_path,
                 "jira_files": jira_files,
                 "design_files": design_files,
+                "design_code_path": design_code_path,
                 "repo_path": repo_path,
                 "repo_name": repo_name,
                 "repo_cloned": repo_cloned,
@@ -262,6 +289,7 @@ async def gather_context(state: dict) -> dict:
         "repo_cloned": repo_cloned,
         "jira_files": jira_files,
         "design_files": design_files,
+        "design_code_path": design_code_path,
         "context_manifest_path": context_manifest_path,
     }
 
@@ -354,6 +382,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "task_description": task_description,
                 "jira_context": state.get("jira_context", {}),
                 "design_context": state.get("design_context"),
+                "design_code_path": state.get("design_code_path", ""),
                 "repo_url": state.get("repo_url", ""),
                 "repo_path": state.get("repo_path", ""),
                 "workspace_path": state.get("workspace_path", ""),

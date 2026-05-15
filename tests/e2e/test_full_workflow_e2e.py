@@ -101,6 +101,12 @@ def _load_live_config() -> dict:
         "scm_username": _env("TEST_SCM_USERNAME", ""),
         "figma_url": _env("TEST_FIGMA_FILE_URL", ""),
         "figma_token": _env("TEST_FIGMA_TOKEN", ""),
+        # Google Stitch design context (preferred for CSTL-1)
+        "stitch_project_url": _env("TEST_STITCH_PROJECT_URL", ""),
+        "stitch_project_id": _env("TEST_STITCH_PROJECT_URL", "").rstrip("/").split("/")[-1]
+            if _env("TEST_STITCH_PROJECT_URL", "") else "",
+        "stitch_screen_id": _env("TEST_STITCH_SCREEN_ID", ""),
+        "stitch_api_key": _env("TEST_STITCH_API_KEY", ""),
         "openai_base_url": _require_env("OPENAI_BASE_URL"),
         "openai_model": _env("OPENAI_MODEL", "gpt-5-mini"),
     }
@@ -127,6 +133,8 @@ def _set_env_from_config(cfg: dict) -> None:
         del os.environ["SCM_USERNAME"]  # ensure clean PAT Bearer auth
     if cfg.get("figma_token"):
         os.environ["FIGMA_TOKEN"] = cfg["figma_token"]
+    if cfg.get("stitch_api_key"):
+        os.environ["STITCH_API_KEY"] = cfg["stitch_api_key"]
 
 
 # ---------------------------------------------------------------------------
@@ -200,11 +208,42 @@ def _register_live_boundary_tools(cfg: dict) -> None:
             })
             return ToolResult(output=json.dumps(result))
 
-    class _MockFetchDesign(BaseTool):
+    class _LiveFetchDesign(BaseTool):
         name = "fetch_design"
-        description = "Fetch design context (no-op for non-UI tasks)."
-        parameters_schema = {"type": "object", "properties": {}, "required": []}
-        def execute_sync(self, **kw) -> ToolResult:
+        description = "Fetch design context from Google Stitch MCP or Figma."
+        parameters_schema = {
+            "type": "object",
+            "properties": {
+                "stitch_project_id": {"type": "string"},
+                "stitch_screen_id": {"type": "string"},
+                "figma_url": {"type": "string"},
+                "screen_name": {"type": "string"},
+            },
+            "required": [],
+        }
+        def execute_sync(self, stitch_project_id: str = "", stitch_screen_id: str = "",
+                         figma_url: str = "", screen_name: str = "", **kw) -> ToolResult:
+            # Resolve effective IDs (prefer caller args, fall back to test config)
+            eff_project_id = stitch_project_id or cfg.get("stitch_project_id", "")
+            eff_screen_id = stitch_screen_id or cfg.get("stitch_screen_id", "")
+            if eff_project_id:
+                from agents.ui_design.clients.stitch_mcp import StitchMcpClient
+                client = StitchMcpClient(api_key=cfg.get("stitch_api_key", ""))
+                if eff_screen_id:
+                    print(f"[live-design] Fetching Stitch screen project={eff_project_id} screen={eff_screen_id}")
+                    data, status = client.get_screen(eff_project_id, eff_screen_id)
+                else:
+                    print(f"[live-design] Listing Stitch screens project={eff_project_id}")
+                    data, status = client.list_screens(eff_project_id)
+                print(f"[live-design] Stitch fetch status={status}")
+                return ToolResult(output=json.dumps({"design": data, "status": status}))
+            if figma_url and cfg.get("figma_token"):
+                from agents.ui_design.clients.figma import FigmaClient
+                client = FigmaClient(token=cfg["figma_token"])
+                data, status = client.get_file(figma_url)
+                print(f"[live-design] Figma fetch status={status}")
+                return ToolResult(output=json.dumps({"design": data, "status": status}))
+            print("[live-design] No design source configured, returning empty context")
             return ToolResult(output=json.dumps({}))
 
     class _MockDispatchCodeReview(BaseTool):
@@ -214,7 +253,7 @@ def _register_live_boundary_tools(cfg: dict) -> None:
         def execute_sync(self, **kw) -> ToolResult:
             return ToolResult(output=json.dumps({"verdict": "approved", "summary": "Auto-approved for live E2E test."}))
 
-    for tool in (_LiveFetchJiraTicket(), _LiveCloneRepo(), _MockFetchDesign(), _MockDispatchCodeReview()):
+    for tool in (_LiveFetchJiraTicket(), _LiveCloneRepo(), _LiveFetchDesign(), _MockDispatchCodeReview()):
         registry.register(tool)
 
 
@@ -332,6 +371,7 @@ def _register_live_dispatch_web_dev(cfg: dict) -> None:
         parameters_schema = {"type": "object", "properties": {}, "required": []}
 
         def execute_sync(self, task_description: str = "", jira_context=None, design_context=None,
+                         design_code_path: str = "",
                          repo_url: str = "", repo_path: str = "", workspace_path: str = "",
                          context_manifest_path: str = "", jira_files=None, design_files=None,
                          revision_feedback: str = "", definition_of_done=None) -> ToolResult:
@@ -361,6 +401,7 @@ def _register_live_dispatch_web_dev(cfg: dict) -> None:
                             "metadata": {
                                 "jiraContext": jira_context or {},
                                 "designContext": design_context,
+                                "designCodePath": design_code_path,
                                 "repoUrl": repo_url,
                                 "repoPath": repo_path,
                                 "workspacePath": workspace_path,
@@ -427,6 +468,69 @@ def _register_live_dispatch_web_dev(cfg: dict) -> None:
     registry.register(_LiveDispatchWebDev())
 
 
+def _cleanup_for_fresh_run(cfg: dict, workspace_path: str) -> None:
+    """Remove workspace artifacts and remote feature branches left from previous runs.
+
+    This ensures each test run starts from a clean state:
+     - No stale local workspace files that would suppress re-fetches
+     - No remote branches with old commits that would block PR creation
+     (GitHub rejects PR creation when the feature branch == main tip)
+
+    Credentials are sent via Authorization header — never embedded in URLs.
+    """
+    import shutil
+    from urllib.request import Request, urlopen
+    from urllib.parse import urlparse
+
+    # 1. Wipe local workspace (jira/stitch/repo artifacts from previous runs)
+    if os.path.isdir(workspace_path):
+        print(f"[live-e2e] Cleaning workspace: {workspace_path}")
+        shutil.rmtree(workspace_path, ignore_errors=True)
+    os.makedirs(workspace_path, exist_ok=True)
+
+    # 2. Delete remote feature branches for this Jira key from GitHub
+    #    (Avoids "No commits between main and feature/..." PR error)
+    parsed = urlparse(cfg.get("scm_repo_url", ""))
+    path_parts = [p for p in parsed.path.strip("/").split("/") if p]
+    if len(path_parts) < 2 or "github" not in parsed.netloc.lower():
+        return  # Only supported for GitHub
+    owner, repo_name = path_parts[0], path_parts[1].rstrip(".git")
+    jira_prefix = f"feature/{cfg['jira_key'].lower()}"
+    token = cfg.get("scm_token", "")
+    if not token:
+        return
+
+    try:
+        list_req = Request(
+            f"https://api.github.com/repos/{owner}/{repo_name}/branches?per_page=100",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github.v3+json",
+            },
+        )
+        with urlopen(list_req, timeout=15) as resp:
+            branches = json.load(resp)
+        for b in branches:
+            name = b.get("name", "")
+            if name.lower().startswith(jira_prefix):
+                del_req = Request(
+                    f"https://api.github.com/repos/{owner}/{repo_name}/git/refs/heads/{name}",
+                    method="DELETE",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github.v3+json",
+                    },
+                )
+                try:
+                    with urlopen(del_req, timeout=10):
+                        pass
+                    print(f"[live-e2e] Deleted remote branch: {name}")
+                except Exception as exc:
+                    print(f"[live-e2e] Could not delete branch {name}: {exc}")
+    except Exception as exc:
+        print(f"[live-e2e] Branch cleanup error (non-fatal): {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Main test
 # ---------------------------------------------------------------------------
@@ -454,12 +558,23 @@ async def test_implement_jira_ticket_full_workflow():
     )
     os.makedirs(workspace_path, exist_ok=True)
 
+    # Tee all test output to a log file under artifacts/ (not /tmp/)
+    import logging as _logging
+    _log_file = os.path.join(workspace_path, "test-run.log")
+    _file_handler = _logging.FileHandler(_log_file, mode="w", encoding="utf-8")
+    _file_handler.setLevel(_logging.DEBUG)
+    _root_logger = _logging.getLogger()
+    _root_logger.addHandler(_file_handler)
+
     print("\n" + "=" * 70)
     print(f"[live-e2e] WORKSPACE: {workspace_path}")
     print(f"[live-e2e] Jira key: {cfg['jira_key']}")
     print(f"[live-e2e] SCM backend: {cfg['scm_backend']}")
     print(f"[live-e2e] Model: {cfg['openai_model']}")
     print("=" * 70)
+
+    # ---- Pre-run cleanup: wipe workspace + delete remote test branches ----
+    _cleanup_for_fresh_run(cfg, workspace_path)
 
     # ---- Preflight: verify Jira credentials ----
     from agents.jira.providers.rest import JiraRESTProvider
@@ -622,6 +737,7 @@ def _validate_workspace_artifacts(workspace_path: str, jira_key: str) -> None:
 
     # Team Lead artifacts
     _check_artifact("team_lead/jira-ticket.json")
+    _check_artifact("team_lead/design-spec.json")  # CP-2: Stitch/Figma design content
     _check_artifact("team_lead/analysis.json", ["task_type"])
     _check_artifact("team_lead/delivery-plan.json")
     ctx = _check_artifact("team_lead/context-manifest.json")
@@ -736,6 +852,11 @@ def _register_compass_dispatch(cfg: dict, workspace_path: str, tl_result_queue: 
                                 "jiraKey": effective_jira_key,
                                 "repoUrl": effective_repo_url,
                                 "workspacePath": workspace_path,
+                                # Pass design source: prefer Stitch, fall back to Figma.
+                                # Never pass both — Team Lead only uses the first available.
+                                "stitchProjectId": cfg.get("stitch_project_id", ""),
+                                "stitchScreenId": cfg.get("stitch_screen_id", ""),
+                                "figmaUrl": cfg.get("figma_url", "") if not cfg.get("stitch_project_id") else "",
                             },
                         }
                     }
