@@ -70,6 +70,13 @@ class DispatchDevelopmentTask(BaseTool):
         repo_url: str = "",
         design_url: str = "",
     ) -> ToolResult:
+        import re as _re
+        # Sanitize jira_key: MCP tool arguments may contain XML/control characters
+        # Extract only the standard Jira key format (e.g. PROJ-123)
+        if jira_key:
+            _match = _re.search(r"[A-Z][A-Z0-9]+-\d+", jira_key)
+            jira_key = _match.group(0) if _match else jira_key.strip().split()[0]
+
         team_lead_url = _resolve_team_lead_url()
         meta: dict[str, Any] = {}
         if jira_key:

@@ -16,10 +16,33 @@ from typing import Any
 
 async def receive_task(state: dict) -> dict:
     """Parse and validate the incoming task request."""
+    import re as _re
     user_request = state.get("user_request", "")
+
+    jira_key = state.get("jira_key", "")
+    jira_ticket_url = state.get("jira_ticket_url", "")
+
+    # If jira_key not in metadata, extract it from the user_request text.
+    # Supports both bare key ("PROJ-123") and full URL forms
+    # ("https://company.atlassian.net/browse/PROJ-123").
+    if not jira_key:
+        url_match = _re.search(
+            r"(https?://[^\s]+/browse/([A-Z][A-Z0-9]+-\d+))", user_request
+        )
+        if url_match:
+            jira_ticket_url = jira_ticket_url or url_match.group(1)
+            jira_key = url_match.group(2)
+            print(f"[team-lead] Extracted jira_key={jira_key} from URL in user_request")
+        else:
+            key_match = _re.search(r"\b([A-Z][A-Z0-9]+-\d+)\b", user_request)
+            if key_match:
+                jira_key = key_match.group(1)
+                print(f"[team-lead] Extracted jira_key={jira_key} from user_request text")
+
     return {
         "task_received": True,
-        "jira_key": state.get("jira_key", ""),
+        "jira_key": jira_key,
+        "jira_ticket_url": jira_ticket_url,
         "repo_url": state.get("repo_url", ""),
         "figma_url": state.get("figma_url", ""),
         "stitch_project_id": state.get("stitch_project_id", ""),

@@ -246,14 +246,103 @@ def _register_live_boundary_tools(cfg: dict) -> None:
             print("[live-design] No design source configured, returning empty context")
             return ToolResult(output=json.dumps({}))
 
-    class _MockDispatchCodeReview(BaseTool):
-        name = "dispatch_code_review"
-        description = "Auto-approve code review (live E2E stub)."
-        parameters_schema = {"type": "object", "properties": {}, "required": []}
-        def execute_sync(self, **kw) -> ToolResult:
-            return ToolResult(output=json.dumps({"verdict": "approved", "summary": "Auto-approved for live E2E test."}))
+    class _LiveDispatchCodeReview(BaseTool):
+        """Run an independent code review using the code_review agent.
 
-    for tool in (_LiveFetchJiraTicket(), _LiveCloneRepo(), _LiveFetchDesign(), _MockDispatchCodeReview()):
+        Fetches PR diff from GitHub and runs the full review pipeline.
+        Falls back to auto-approve if the review agent errors.
+        """
+        name = "dispatch_code_review"
+        description = "Dispatch code review agent for independent assessment."
+        parameters_schema = {
+            "type": "object",
+            "properties": {
+                "pr_url": {"type": "string"},
+                "diff_summary": {"type": "string"},
+                "requirements": {"type": "string"},
+                "jira_context": {"type": "object"},
+                "design_context": {"type": "object"},
+                "workspace_path": {"type": "string"},
+            },
+            "required": [],
+        }
+
+        def execute_sync(self, pr_url: str = "", diff_summary: str = "",
+                        requirements: str = "", jira_context: dict | None = None,
+                        design_context: dict | None = None, workspace_path: str = "",
+                        **kw) -> ToolResult:
+            import requests as _req
+            print(f"[live-review] Starting independent code review for PR: {pr_url}")
+
+            # Fetch PR diff from GitHub API
+            pr_diff = ""
+            changed_files = []
+            pr_description = diff_summary or ""
+            if pr_url and "github.com" in pr_url:
+                try:
+                    # Extract owner/repo/pr_number from URL
+                    parts = pr_url.rstrip("/").split("/")
+                    idx = parts.index("pull")
+                    pr_number = parts[idx + 1]
+                    repo_path_parts = parts[parts.index("github.com") + 1: idx]
+                    owner_repo = "/".join(repo_path_parts)
+                    github_token = cfg.get("scm_token", "")
+                    headers = {"Authorization": f"token {github_token}", "Accept": "application/vnd.github.v3.diff"}
+                    diff_resp = _req.get(
+                        f"https://api.github.com/repos/{owner_repo}/pulls/{pr_number}",
+                        headers=headers, timeout=30,
+                    )
+                    if diff_resp.ok:
+                        pr_diff = diff_resp.text[:8000]  # limit size
+                    # Fetch changed files
+                    files_resp = _req.get(
+                        f"https://api.github.com/repos/{owner_repo}/pulls/{pr_number}/files",
+                        headers={"Authorization": f"token {github_token}", "Accept": "application/vnd.github.v3+json"},
+                        timeout=30,
+                    )
+                    if files_resp.ok:
+                        files_data = files_resp.json()
+                        changed_files = [f.get("filename", "") for f in files_data if isinstance(f, dict)]
+                    print(f"[live-review] Fetched PR diff ({len(pr_diff)} chars), {len(changed_files)} files")
+                except Exception as exc:
+                    print(f"[live-review] Failed to fetch PR diff: {exc}")
+
+            # Run code_review agent workflow
+            try:
+                from agents.code_review.agent import code_review_workflow
+                from framework.runtime.adapter import get_runtime
+
+                cr_runtime = get_runtime(
+                    cfg.get("agent_runtime", "claude-code"),
+                    model=cfg.get("model", "claude-haiku-4-5-20251001"),
+                )
+                cr_state = {
+                    "_runtime": cr_runtime,
+                    "metadata": {
+                        "prUrl": pr_url,
+                        "prDiff": pr_diff,
+                        "changedFiles": changed_files,
+                        "prDescription": pr_description,
+                        "jiraContext": jira_context or {},
+                        "designContext": design_context or {},
+                        "workspacePath": workspace_path,
+                    },
+                }
+                import asyncio
+                loop = asyncio.new_event_loop()
+                final_state = loop.run_until_complete(
+                    code_review_workflow.run(cr_state)
+                )
+                loop.close()
+                verdict = final_state.get("review_verdict", final_state.get("verdict", "approved"))
+                summary = final_state.get("report_summary", "Code review completed.")
+                print(f"[live-review] Code review verdict: {verdict}")
+                return ToolResult(output=json.dumps({"verdict": verdict, "summary": summary}))
+            except Exception as exc:
+                print(f"[live-review] Code review agent error (fallback approve): {exc}")
+                return ToolResult(output=json.dumps({"verdict": "approved", "summary": f"Auto-approved (review error: {exc})."}))
+
+    for tool in (_LiveFetchJiraTicket(), _LiveCloneRepo(), _LiveFetchDesign(), _LiveDispatchCodeReview()):
         registry.register(tool)
 
 
@@ -843,7 +932,28 @@ def _register_compass_dispatch(cfg: dict, workspace_path: str, tl_result_queue: 
 
         def execute_sync(self, task_description: str = "", jira_key: str = "",
                          repo_url: str = "", design_url: str = "") -> ToolResult:
-            effective_jira_key = jira_key or cfg["jira_key"]
+            import re as _re
+            # Sanitize jira_key: extract standard Jira key format (e.g. PROJ-123)
+            if jira_key:
+                _m = _re.search(r"[A-Z][A-Z0-9]+-\d+", jira_key)
+                jira_key = _m.group(0) if _m else ""
+            # If jira_key not passed by Compass, extract from task_description text
+            if not jira_key:
+                _m = _re.search(r"[A-Z][A-Z0-9]+-\d+", task_description)
+                if _m:
+                    jira_key = _m.group(0)
+            # No default fallback — TEST_JIRA_TICKET_URL must be set for this to work
+            if not jira_key:
+                print("[compass-mock] ERROR: No valid Jira key found in dispatch request")
+                return ToolResult(output=json.dumps({
+                    "status": "error",
+                    "message": (
+                        "No valid Jira key found in dispatch request. "
+                        "Ensure TEST_JIRA_TICKET_URL is set in tests/.env and the "
+                        "task description includes the Jira ticket key or URL."
+                    ),
+                }))
+            effective_jira_key = jira_key
             effective_repo_url = repo_url or cfg["scm_repo_url"]
             print(f"[compass-mock] dispatch: jira={effective_jira_key} repo={effective_repo_url}")
 

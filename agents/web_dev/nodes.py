@@ -91,7 +91,7 @@ def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
         return {"error": str(exc)}
 
 
-def _git_commit_all_pending(repo_path: str, jira_key: str) -> None:
+def _git_commit_all_pending(repo_path: str, jira_key: str) -> list[str]:
     """Stage all pending changes and commit if anything is staged.
 
     Called inside create_pr before scm_push to ensure every file written by
@@ -99,7 +99,7 @@ def _git_commit_all_pending(repo_path: str, jira_key: str) -> None:
     ran 'git commit <specific-file>' instead of 'git add -A && git commit'.
     """
     if not repo_path or not os.path.isdir(repo_path):
-        return
+        return []
     try:
         import subprocess
         from framework.env_utils import build_isolated_git_env
@@ -131,16 +131,27 @@ def _git_commit_all_pending(repo_path: str, jira_key: str) -> None:
                 print(f"[web-dev] committed {len(staged_files)} pending file(s): {staged_files[:8]}")
             else:
                 print(f"[web-dev] commit failed: {r.stderr.strip()[:200]}")
+            return staged_files
         else:
-            # Confirm there is at least one commit on the branch
+            # Confirm there is at least one commit on the branch, and list its changed files
             log_result = subprocess.run(
                 ["git", "log", "--oneline", "-1"],
                 cwd=repo_path, env=git_env,
                 capture_output=True, text=True, timeout=10,
             )
             print(f"[web-dev] no pending changes; last commit: {log_result.stdout.strip()[:120]!r}")
+            # Get files from HEAD commit (agent already committed during run_agentic)
+            diff_result = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD~1..HEAD"],
+                cwd=repo_path, env=git_env,
+                capture_output=True, text=True, timeout=10,
+            )
+            if diff_result.returncode == 0:
+                return [f for f in diff_result.stdout.strip().splitlines() if f]
+            return []
     except Exception as exc:
         print(f"[web-dev] _git_commit_all_pending error (non-fatal): {exc}")
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -228,12 +239,18 @@ async def prepare_jira(state: dict) -> dict:
             {"ticket_key": jira_key, "fields": {"assignee": {"emailAddress": token_user}}},
         )
 
-    # Add pickup comment
+    # Add pickup comment with task_id
+    _task_id = state.get("_task_id", "unknown")
     _call_boundary_tool(
         state, "jira_comment",
         {
             "ticket_key": jira_key,
-            "comment": f"Development agent (web-dev) has picked up this ticket.",
+            "comment": (
+                f"🤖 Development agent (web-dev) has picked up this ticket.\n"
+                f"Task ID: {_task_id}\n"
+                f"Assignee: {token_user or 'unknown'}\n"
+                f"Status: In Progress"
+            ),
         },
     )
 
@@ -897,19 +914,26 @@ async def capture_screenshot(state: dict) -> dict:
         pass
 
     # Best-effort screenshot via agentic runtime
+    # CRITICAL: screenshots MUST be saved to workspace screenshot_dir, NOT inside the git repo
     result = runtime.run_agentic(
         task=(
             "Take a screenshot of the implemented UI.\n"
-            f"1. Start the dev server in {repo_path} (npm run dev or similar).\n"
-            "2. Wait for it to be ready.\n"
-            "3. Use a headless browser to capture a screenshot.\n"
-            f"4. Save screenshots to {screenshot_dir}/\n"
+            f"1. Make sure dependencies are installed: run_command('npm install', cwd='{repo_path}').\n"
+            f"2. Start the dev server: run_command('npm run dev -- --port 5179 &', cwd='{repo_path}').\n"
+            "   Wait 3 seconds for startup.\n"
+            "3. Use playwright or a headless browser to capture a screenshot at http://localhost:5179.\n"
+            f"   Save desktop screenshot to: {screenshot_dir}/landing-desktop.png\n"
+            "   (Optional) If you can resize viewport, also save mobile at 375px width: "
+            f"{screenshot_dir}/landing-mobile.png\n"
+            f"4. IMPORTANT: Save screenshots ONLY to {screenshot_dir}/ — do NOT save inside "
+            f"the git repo at {repo_path}.\n"
+            "5. Stop the dev server after capturing.\n"
             "Return JSON: {\"screenshots\": [\"path1.png\", ...], \"captured\": true}\n"
             "If screenshot fails, return {\"screenshots\": [], \"captured\": false}"
         ),
         cwd=repo_path or None,
-        max_turns=10,
-        timeout=120,
+        max_turns=12,
+        timeout=180,
         plugin_manager=state.get("_plugin_manager"),
     )
 
@@ -946,18 +970,38 @@ async def update_jira(state: dict) -> dict:
     pr_url = state.get("pr_url", "N/A")
     branch = state.get("branch_name", "N/A")
     test_results = state.get("test_results", {})
+    test_status = state.get("test_status", "unknown")
     assessment = state.get("self_assessment", {})
     changes = state.get("changes_made", [])
+    _task_id = state.get("_task_id", "unknown")
 
-    # Build completion comment
+    # Build test summary (accurate from actual results or test_status)
+    if test_status == "skip":
+        test_summary = "Skipped (max cycles reached)"
+    elif test_status == "pass":
+        passed = test_results.get("passed", "?")
+        failed = test_results.get("failed", 0)
+        test_summary = f"{passed} passed, {failed} failed"
+    else:
+        passed = test_results.get("passed", 0)
+        failed = test_results.get("failed", "?")
+        test_summary = f"{passed} passed, {failed} failed"
+
+    score = assessment.get("score", "N/A")
+    verdict = assessment.get("verdict", "N/A")
+    score_str = f"{score:.2f}" if isinstance(score, float) else str(score)
+
+    # Build hyperlink PR reference
+    pr_link = f"[{pr_url}]({pr_url})" if pr_url and pr_url != "N/A" else "N/A"
+
     comment_text = (
-        f"Development completed by web-dev agent.\n"
-        f"PR: {pr_url}\n"
-        f"Branch: {branch}\n"
-        f"Test results: {test_results.get('passed', 0)} passed, "
-        f"{test_results.get('failed', 0)} failed\n"
-        f"Self-assessment score: {assessment.get('score', 'N/A')}\n"
-        f"Changes: {len(changes)} files modified"
+        f"✅ Development completed by web-dev agent.\n\n"
+        f"**Task ID:** {_task_id}\n"
+        f"**PR:** {pr_link}\n"
+        f"**Branch:** `{branch}`\n"
+        f"**Test results:** {test_summary}\n"
+        f"**Self-assessment:** {score_str} ({verdict})\n"
+        f"**Files changed:** {len(changes)}"
     )
 
     # Idempotency: check if comment with PR URL already exists
@@ -1056,12 +1100,27 @@ async def create_pr(state: dict) -> dict:
     )
 
     # Step 1: Generate PR description (single-shot LLM)
+    _assessment = state.get("self_assessment", {})
+    _test_results = state.get("test_results", {})
+    _screenshots = state.get("screenshots", [])
+    _jira_url = ""
+    if jira_key:
+        _jira_ctx = state.get("jira_context", {})
+        if isinstance(_jira_ctx, dict):
+            _jira_url = _jira_ctx.get("url", "") or f"https://tarch.atlassian.net/browse/{jira_key}"
     desc_prompt = PR_DESCRIPTION_TEMPLATE.format(
         user_request=state.get("user_request", ""),
         branch_name=state.get("branch_name", "feature/task"),
         jira_key=jira_key or "N/A",
+        jira_url=_jira_url or "N/A",
         implementation_summary=state.get("implementation_summary", ""),
-        changed_files=", ".join(state.get("changes_made", [])) or "various files",
+        changed_files=", ".join(all_changes[:20]) or "various files",
+        test_status=state.get("test_status", "unknown"),
+        test_results=json.dumps(_test_results),
+        assessment_score=_assessment.get("score", "N/A"),
+        assessment_verdict=_assessment.get("verdict", "N/A"),
+        assessment_gaps=", ".join(_assessment.get("gaps", [])) or "none",
+        screenshot_paths=", ".join(_screenshots) or "none captured",
     )
     desc_result = runtime.run(desc_prompt, system_prompt=PR_DESCRIPTION_SYSTEM,
                               plugin_manager=state.get("_plugin_manager"))
@@ -1078,7 +1137,10 @@ async def create_pr(state: dict) -> dict:
 
     # Deterministic commit: stage ALL pending changes before push so files
     # written by the agentic implement_changes loop are not left untracked.
-    _git_commit_all_pending(repo_path, jira_key or "task")
+    committed_files = _git_commit_all_pending(repo_path, jira_key or "task")
+    # Merge with changes tracked from tool_calls (union of both sources)
+    existing_changes = state.get("changes_made", [])
+    all_changes = sorted(set(existing_changes) | set(committed_files))
 
     push_payload = _call_boundary_tool(
         state, "scm_push", {"repo_path": repo_path, "branch": branch_name}
@@ -1130,7 +1192,8 @@ async def create_pr(state: dict) -> dict:
                         "branch": branch_name,
                         "title": pr_title,
                         "commit_hash": commit_hash,
-                        "files_changed": len(state.get("changes_made", [])),
+                        "files_changed": len(all_changes),
+                        "changed_files": all_changes[:30],
                         "test_status": state.get("test_status", "unknown"),
                         "self_assessment_score": state.get("self_assessment", {}).get("score", "N/A"),
                         "screenshot_included": state.get("screenshot_captured", False),
@@ -1145,6 +1208,7 @@ async def create_pr(state: dict) -> dict:
         "pr_title": pr_title,
         "pr_description": pr_description,
         "commit_hash": commit_hash,
+        "changes_made": all_changes,
     }
 
 

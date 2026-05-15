@@ -78,6 +78,44 @@ npm/package.json rules (MANDATORY — prevent hallucinated packages):
 "tailwindcss" and "autoprefixer" to devDependencies in package.json first. \
   Verify both exist: `npm info tailwindcss version` and `npm info autoprefixer version`.
 - NEVER commit .vite/ or node_modules/ directories — ensure .gitignore excludes them.
+
+.gitignore rules (MANDATORY — create this file early):
+Always create a comprehensive .gitignore BEFORE writing any other files. It MUST include:
+  node_modules/
+  dist/
+  build/
+  .vite/
+  .env
+  *.local
+  coverage/
+  __pycache__/
+  *.png
+  *.jpg
+  *.jpeg
+  *.gif
+  screenshots/
+  e2e/evidence/
+  FINAL_VERIFICATION.md
+  IMPLEMENTATION_EVIDENCE.md
+  VERIFICATION_SUMMARY.txt
+  *.log
+
+Test organization rules (MANDATORY — follow framework best practices):
+- Vite+React: ALL tests (unit + integration) go in src/ alongside the components:
+    src/components/__tests__/ComponentName.test.jsx
+    src/pages/__tests__/PageName.test.jsx
+  Use one test file per component. Do NOT create a separate top-level tests/ folder.
+- E2E tests using Playwright go in e2e/ folder (separate from unit tests is acceptable).
+- Do NOT create both e2e/ AND src/__tests__/ for the same unit tests — use ONE location.
+
+Workspace vs git rules (MANDATORY — keep git repo clean):
+- Put ALL implementation documentation in the workspace (NOT in the git repo):
+    workspace/web-agent/IMPLEMENTATION_EVIDENCE.md
+    workspace/web-agent/FINAL_VERIFICATION.md
+    workspace/web-agent/VERIFICATION_SUMMARY.txt
+- Put ALL screenshots in workspace/web-agent/screenshots/ (NOT in git repo)
+- Only commit: source code, test files, config files (package.json, vite.config.js, etc.), .gitignore
+- NEVER commit: screenshots, verification docs, build output, temporary files
 """
 
 IMPLEMENT_TEMPLATE = """\
@@ -110,6 +148,10 @@ Skill context:
 
 Prior knowledge (from memory):
 {memory_context}
+
+IMPORTANT CONTEXT NOTE: All required context (Jira ticket, design spec, repository) \
+has already been fetched by Team Lead and provided above. Do NOT re-fetch Jira tickets, \
+re-download design files, or re-clone the repository. Work directly with what is provided.
 
 Implement the changes described above. Follow the CRITICAL SPEED RULES in your \
 system prompt — start writing files within the first 3 turns.
@@ -178,15 +220,22 @@ PR_DESCRIPTION_TEMPLATE = """\
 Task: {user_request}
 Branch: {branch_name}
 Jira ticket: {jira_key}
+Jira URL: {jira_url}
 Implementation summary: {implementation_summary}
 Files changed: {changed_files}
+Test status: {test_status}
+Test results: {test_results}
+Self-assessment score: {assessment_score}
+Self-assessment verdict: {assessment_verdict}
+Self-assessment gaps: {assessment_gaps}
+Screenshots in workspace: {screenshot_paths}
 
 Write a pull request title and description.
 Return JSON with:
 - "title": short PR title (≤72 chars, imperative mood, prefixed with Jira key)
 - "description": Markdown description following this template:
 
-## {{jira_key}}: {{summary}}
+## {jira_key}: {{summary}}
 
 ### Changes
 {{implementation_summary}}
@@ -195,15 +244,17 @@ Return JSON with:
 {{files_changed_list}}
 
 ### Test Results
-- Passed: {{test_passed}}
-- Failed: {{test_failed}}
+{{test_summary}}
 
 ### Self-Assessment
-- Score: {{assessment_score}}
+- Score: {{assessment_score}} ({{assessment_verdict}})
 - Remaining gaps: {{gaps_list}}
 
+### Screenshots
+{{screenshots_note}}
+
 ### Jira Ticket
-[{{jira_key}}]({{jira_url}})
+[{jira_key}]({jira_url})
 """
 
 # ---------------------------------------------------------------------------
