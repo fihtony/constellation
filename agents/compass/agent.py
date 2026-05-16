@@ -113,8 +113,10 @@ class CompassAgent(BaseAgent):
     """Compass Agent -- routes requests via heuristic + LLM classification."""
 
     async def handle_message(self, message: dict) -> dict:
+        import os as _os
+
         from framework.a2a.protocol import Artifact
-        from framework.devlog import WorkspaceLogger
+        from framework.devlog import AgentLogger
         from framework.instructions import load_instructions
         from framework.runtime.adapter import get_runtime
         from framework.tools.registry import get_registry
@@ -126,7 +128,7 @@ class CompassAgent(BaseAgent):
         user_text = next((p.get("text", "") for p in parts if p.get("text")), "")
         meta = msg.get("metadata") or {}
 
-        # Create task via TaskStore
+        # Create task via TaskStore — task.id IS the master task_id for this workflow
         task_store = self.services.task_store
         task = task_store.create_task(agent_id=self.definition.agent_id)
 
@@ -135,53 +137,54 @@ class CompassAgent(BaseAgent):
 
         # --- Classify ---
         task_type = _classify_request(user_text, runtime)
-        print(f"[compass] task_type={task_type!r} request={user_text[:120]!r}")
+        _aid = self.definition.agent_id
+        print(f"[{_aid}] task_type={task_type!r} request={user_text[:120]!r}")
 
-        # --- Workspace logging ---
-        # For development tasks the workspace is created by Team Lead.
-        # Compass writes a pre-dispatch log to its own compass/ folder inside
-        # the Team Lead workspace (if workspacePath is in metadata), or in a
-        # temporary compass-only workspace otherwise.
-        workspace_path = meta.get("workspacePath", "") or meta.get("workspace_path", "")
-        if not workspace_path and task_type == "development":
-            import os as _os
-            artifact_root = _os.environ.get("ARTIFACT_ROOT", "artifacts/")
-            workspace_path = _os.path.join(artifact_root, f"compass-{task.id[:8]}")
-        compass_log = WorkspaceLogger(workspace_path, "compass")
-        compass_log.step("handle_message",
-                         task_type=task_type,
-                         task_id=task.id,
-                         request=user_text[:200])
+        # --- Workspace path: {ARTIFACT_ROOT}/{task_id}/
+        # All agents in this workflow share the same task_id as the workspace root.
+        artifact_root = _os.environ.get("ARTIFACT_ROOT", "artifacts/")
+        workspace_path = _os.path.join(artifact_root, task.id)
+
+        # --- Compass logger — writes only to its own directory ---
+        log = AgentLogger(task_id=task.id, agent_name=_aid)
+        log.node("handle_message", task_type=task_type, task_id=task.id,
+                 request=user_text[:200])
 
         # --- Dispatch ---
         if task_type == "development":
             jira_key = _extract_jira_key(user_text)
-            compass_log.info("dispatching development task", jira_key=jira_key)
-            print(f"[compass] dispatching development task: jira_key={jira_key!r}")
+            log.info("dispatching development task", jira_key=jira_key)
+            log.a2a("→", "team-lead", capability="dispatch_development_task", jira_key=jira_key)
+            print(f"[{_aid}] dispatching development task: jira_key={jira_key!r}")
             try:
                 dispatch_result_str = registry.execute_sync(
                     "dispatch_development_task",
-                    {"task_description": user_text, "jira_key": jira_key},
+                    {
+                        "task_description": user_text,
+                        "jira_key": jira_key,
+                        "orchestratorTaskId": task.id,
+                        "workspacePath": workspace_path,
+                    },
                 )
                 dispatch_data = json.loads(dispatch_result_str) if dispatch_result_str else {}
             except Exception as exc:
                 dispatch_data = {"status": "error", "message": str(exc)}
-                compass_log.error("dispatch_development_task failed", error=str(exc))
-                print(f"[compass] dispatch_development_task error: {exc}")
+                log.error("dispatch_development_task failed", error=str(exc))
+                print(f"[{_aid}] dispatch_development_task error: {exc}")
 
             status = dispatch_data.get("status", "unknown")
             task_id_tl = dispatch_data.get("taskId", "N/A")
-            compass_log.info("dispatch complete",
-                             status=status, tl_task_id=task_id_tl,
-                             pr_url=dispatch_data.get("prUrl", ""))
+            log.info("dispatch complete", status=status, tl_task_id=task_id_tl,
+                     pr_url=dispatch_data.get("prUrl", ""))
+            log.a2a("←", "team-lead", status=status, tl_task_id=task_id_tl)
             response_text = (
                 f"Development task dispatched to Team Lead.\n"
                 f"Jira: {jira_key or 'N/A'}  Status: {status}  TL task: {task_id_tl}"
             )
-            print(f"[compass] dispatch result: status={status} taskId={task_id_tl}")
+            print(f"[{_aid}] dispatch result: status={status} taskId={task_id_tl}")
 
         elif task_type == "office":
-            compass_log.info("dispatching office task")
+            log.info("dispatching office task")
             try:
                 dispatch_result_str = registry.execute_sync(
                     "dispatch_office_task",
@@ -190,15 +193,14 @@ class CompassAgent(BaseAgent):
                 dispatch_data = json.loads(dispatch_result_str) if dispatch_result_str else {}
             except Exception as exc:
                 dispatch_data = {"status": "error", "message": str(exc)}
-                compass_log.error("dispatch_office_task failed", error=str(exc))
-                print(f"[compass] dispatch_office_task error: {exc}")
-            compass_log.info("office dispatch complete",
-                             status=dispatch_data.get("status", "unknown"))
+                log.error("dispatch_office_task failed", error=str(exc))
+                print(f"[{_aid}] dispatch_office_task error: {exc}")
+            log.info("office dispatch complete", status=dispatch_data.get("status", "unknown"))
             response_text = f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
 
         else:
             # General conversational task — use LLM for a direct answer
-            compass_log.info("handling as general query")
+            log.info("handling as general query")
             system_prompt = load_instructions("compass")
             agentic_result = runtime.run_agentic(
                 task=user_text,
@@ -209,11 +211,12 @@ class CompassAgent(BaseAgent):
             )
             response_text = agentic_result.summary or "I can help you with that."
 
+        log.info("task complete", response_len=len(response_text))
         artifacts = [Artifact(
             name="compass-response",
             artifact_type="text/plain",
             parts=[{"text": response_text}],
-            metadata={"agentId": "compass"},
+            metadata={"agentId": _aid},
         )]
         task_store.complete_task(task.id, artifacts=artifacts)
         return task_store.get_task_dict(task.id)

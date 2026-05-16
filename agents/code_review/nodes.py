@@ -12,7 +12,21 @@ import json
 import os
 import re
 import time
+from pathlib import Path as _Path
 from typing import Any
+
+from framework.config import load_agent_config as _load_agent_cfg
+
+# Load own agent_id from config.yaml — single source of truth
+_AGENT_ID: str = _load_agent_cfg(
+    _Path(__file__).parent.name.replace("_", "-")
+).get("agent_id", _Path(__file__).parent.name.replace("_", "-"))
+
+# Cross-agent workspace dir reference — loaded from the corresponding config
+_TEAM_LEAD_AGENT_ID: str = _load_agent_cfg("team-lead").get("agent_id", "team-lead")
+
+# Cross-agent workspace dir reference — loaded from the corresponding config
+_WEB_DEV_AGENT_ID: str = _load_agent_cfg("web-dev").get("agent_id", "web-dev")
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +282,11 @@ async def generate_report(state: dict) -> dict:
         },
         "checked_artifacts": [
             p for p in [
-                "team_lead/jira-ticket.json" if state.get("jira_context") else "",
-                "team_lead/design-spec.json" if state.get("design_context") else "",
+                f"{_TEAM_LEAD_AGENT_ID}/jira-ticket.json" if state.get("jira_context") else "",
+                f"{_TEAM_LEAD_AGENT_ID}/design-spec.json" if state.get("design_context") else "",
                 state.get("context_manifest_path", ""),
-                "web-agent/self-assessment.json",
-                "web-agent/pr-evidence.json",
+                f"{_WEB_DEV_AGENT_ID}/self-assessment.json",
+                f"{_WEB_DEV_AGENT_ID}/pr-evidence.json",
             ] if p
         ],
     }

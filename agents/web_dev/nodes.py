@@ -14,19 +14,29 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path as _Path
 from typing import Any
 
-from framework.devlog import WorkspaceLogger
+from framework.config import load_agent_config as _load_agent_cfg
+from framework.devlog import AgentLogger
+
+# Load agent_id from config.yaml — single source of truth for identity
+_AGENT_ID: str = _load_agent_cfg(
+    _Path(__file__).parent.name.replace("_", "-")
+).get("agent_id", _Path(__file__).parent.name.replace("_", "-"))
 
 
-def _logger(state: dict) -> WorkspaceLogger:
-    """Return a WorkspaceLogger for web-dev using state workspace_path."""
-    return WorkspaceLogger(state.get("workspace_path", ""), "web-agent")
+def _logger(state: dict) -> AgentLogger:
+    """Return an AgentLogger for this agent using the task_id stored in state."""
+    return AgentLogger(state.get("_task_id", ""), _AGENT_ID)
 
 
 def _boundary_log(state: dict, agent_id: str, message: str, **kwargs: Any) -> None:
-    """Write a proxy log entry on behalf of a boundary agent."""
-    WorkspaceLogger(state.get("workspace_path", ""), agent_id).info(message, **kwargs)
+    """Deprecated proxy log — kept only to avoid breaking call sites in this file.
+
+    web_dev/nodes.py should pass task_id to boundary tool args instead.
+    This function is a no-op: each boundary agent logs to its own directory.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +109,7 @@ def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
         result_str = registry.execute_sync(tool_name, args)
         return json.loads(result_str) if result_str else {}
     except Exception as exc:
-        print(f"[web-dev] Tool {tool_name} failed: {exc}")
+        print(f"[{_AGENT_ID}] Tool {tool_name} failed: {exc}")
         return {"error": str(exc)}
 
 
@@ -140,9 +150,9 @@ def _git_commit_all_pending(repo_path: str, jira_key: str) -> list[str]:
                 capture_output=True, text=True, timeout=30,
             )
             if r.returncode == 0:
-                print(f"[web-dev] committed {len(staged_files)} pending file(s): {staged_files[:8]}")
+                print(f"[{_AGENT_ID}] committed {len(staged_files)} pending file(s): {staged_files[:8]}")
             else:
-                print(f"[web-dev] commit failed: {r.stderr.strip()[:200]}")
+                print(f"[{_AGENT_ID}] commit failed: {r.stderr.strip()[:200]}")
             return staged_files
         else:
             # Confirm there is at least one commit on the branch, and list its changed files
@@ -151,7 +161,7 @@ def _git_commit_all_pending(repo_path: str, jira_key: str) -> list[str]:
                 cwd=repo_path, env=git_env,
                 capture_output=True, text=True, timeout=10,
             )
-            print(f"[web-dev] no pending changes; last commit: {log_result.stdout.strip()[:120]!r}")
+            print(f"[{_AGENT_ID}] no pending changes; last commit: {log_result.stdout.strip()[:120]!r}")
             # Get files from HEAD commit (agent already committed during run_agentic)
             diff_result = subprocess.run(
                 ["git", "diff", "--name-only", "HEAD~1..HEAD"],
@@ -162,7 +172,7 @@ def _git_commit_all_pending(repo_path: str, jira_key: str) -> list[str]:
                 return [f for f in diff_result.stdout.strip().splitlines() if f]
             return []
     except Exception as exc:
-        print(f"[web-dev] _git_commit_all_pending error (non-fatal): {exc}")
+        print(f"[{_AGENT_ID}] _git_commit_all_pending error (non-fatal): {exc}")
         return []
 
 
@@ -171,29 +181,20 @@ def _git_commit_all_pending(repo_path: str, jira_key: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 async def prepare_jira(state: dict) -> dict:
-    """Update Jira before implementation starts.
-
-    Actions:
-    1. Discover Jira Agent through Registry (via boundary tools).
-    2. Resolve the token user identity.
-    3. List available transitions.
-    4. Transition the ticket to "In Progress" when reachable.
-    5. Set assignee to the token user by default.
-    6. Add a pickup comment.
-
-    Idempotency:
-    - Skip the transition if the ticket is already in "In Progress".
-    - Skip the assignee update if the assignee already matches the token user.
-    """
+    """Update Jira before implementation starts."""
+    log = _logger(state)
+    log.node("prepare_jira")
     jira_context = state.get("jira_context", {})
     jira_key = (
         jira_context.get("key")
         or jira_context.get("ticket_key")
         or state.get("jira_key", "")
     )
-    print(f"[web-dev] prepare_jira: jira_key={jira_key!r}")
+    log.debug("prepare_jira", jira_key=jira_key)
+    print(f"[{_AGENT_ID}] prepare_jira: jira_key={jira_key!r}")
 
     if not jira_key:
+        log.info("prepare_jira skipped — no jira_key")
         return {"jira_prepared": False, "jira_prepare_skipped": "no_jira_key"}
 
     # Resolve original status for rollback
@@ -215,7 +216,8 @@ async def prepare_jira(state: dict) -> dict:
 
     # Resolve token user
     token_user = ""
-    token_user_result = _call_boundary_tool(state, "jira_get_token_user", {})
+    task_id = state.get("_task_id", "")
+    token_user_result = _call_boundary_tool(state, "jira_get_token_user", {"task_id": task_id})
     if not token_user_result.get("error"):
         user_data = token_user_result.get("user", {})
         token_user = user_data.get("emailAddress", user_data.get("displayName", ""))
@@ -223,7 +225,7 @@ async def prepare_jira(state: dict) -> dict:
     # Transition to "In Progress" if not already
     if original_status.lower() not in ("in progress", "in development", "in dev"):
         transitions_result = _call_boundary_tool(
-            state, "jira_list_transitions", {"ticket_key": jira_key}
+            state, "jira_list_transitions", {"ticket_key": jira_key, "task_id": task_id}
         )
         transitions = transitions_result.get("transitions", [])
         _IN_PROGRESS_NAMES = {
@@ -238,17 +240,19 @@ async def prepare_jira(state: dict) -> dict:
         if in_progress_match:
             _call_boundary_tool(
                 state, "jira_transition",
-                {"ticket_key": jira_key, "transition_name": in_progress_match["name"]},
+                {"ticket_key": jira_key, "transition_name": in_progress_match["name"],
+                 "task_id": task_id},
             )
         else:
             avail = [t.get("name") for t in transitions if isinstance(t, dict)]
-            print(f"[web-dev] Cannot transition {jira_key} to In Progress; available: {avail}")
+            print(f"[{_AGENT_ID}] Cannot transition {jira_key} to In Progress; available: {avail}")
 
     # Update assignee to token user
     if token_user and token_user != original_assignee:
         _call_boundary_tool(
             state, "jira_update",
-            {"ticket_key": jira_key, "fields": {"assignee": {"emailAddress": token_user}}},
+            {"ticket_key": jira_key, "fields": {"assignee": {"emailAddress": token_user}},
+             "task_id": task_id},
         )
 
     # Add pickup comment with task_id
@@ -263,14 +267,16 @@ async def prepare_jira(state: dict) -> dict:
                 f"Assignee: {token_user or 'unknown'}\n"
                 f"Status: In Progress"
             ),
+            "task_id": task_id,
         },
     )
+    log.info("prepare_jira complete", jira_key=jira_key, token_user=token_user)
 
     # Write jira-prepare-log.json
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
         import time as _time
-        agent_dir = os.path.join(workspace_path, "web-agent")
+        agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
             log_file = os.path.join(agent_dir, "jira-prepare-log.json")
@@ -300,25 +306,17 @@ async def prepare_jira(state: dict) -> dict:
     }
 
 async def setup_workspace(state: dict) -> dict:
-    """Create a working branch in the cloned repository.
-
-    The repo is already cloned by Team Lead (via SCM Agent) into repo_path.
-    This node verifies the repo exists and creates or checks out a local
-    development branch.
-
-    Uses runtime.run() to derive a deterministic branch name from the task
-    description and Jira context.  Falls back to metadata values when no
-    runtime is available.
-    """
+    """Create a working branch in the cloned repository."""
     runtime = state.get("_runtime")
+    log = _logger(state)
+    log.node("setup_workspace")
     repo_url = state.get("repo_url", "")
     repo_path = state.get("repo_path", "")
     workspace_path = state.get("workspace_path", "")
     branch_name = state.get("branch_name", "")
     task_id = state.get("_task_id", "unknown")
-    log = _logger(state)
-    log.step("setup_workspace", repo_path=repo_path)
-    print(f"[web-dev] setup_workspace: repo_path={repo_path!r} workspace_path={workspace_path!r}")
+    log.debug("setup_workspace", repo_path=repo_path)
+    print(f"[{_AGENT_ID}] setup_workspace: repo_path={repo_path!r} workspace_path={workspace_path!r}")
 
     # Use workspace_path from Team Lead; only fall back to artifacts/ if missing
     if not workspace_path:
@@ -333,7 +331,7 @@ async def setup_workspace(state: dict) -> dict:
     # Fail fast if repo does not exist — Team Lead must have cloned it first
     if not os.path.isdir(repo_path):
         raise RuntimeError(
-            f"[web-dev] Repo not found at {repo_path!r}. "
+            f"[{_AGENT_ID}] Repo not found at {repo_path!r}. "
             "Team Lead must clone the repo before dispatching to Web Dev."
         )
 
@@ -376,7 +374,7 @@ async def setup_workspace(state: dict) -> dict:
                 n += 1
             new_name = f"{branch_name}_{n}"
             print(
-                f"[web-dev] setup_workspace: branch {branch_name!r} exists on remote, "
+                f"[{_AGENT_ID}] setup_workspace: branch {branch_name!r} exists on remote, "
                 f"using {new_name!r} to avoid conflict"
             )
             branch_name = new_name
@@ -394,7 +392,7 @@ async def setup_workspace(state: dict) -> dict:
         )
         if r.returncode == 0:
             branch_created = True
-            print(f"[web-dev] setup_workspace: created branch {branch_name!r}")
+            print(f"[{_AGENT_ID}] setup_workspace: created branch {branch_name!r}")
         else:
             # Branch might already exist — try switching to it
             r2 = subprocess.run(
@@ -404,16 +402,16 @@ async def setup_workspace(state: dict) -> dict:
             )
             if r2.returncode == 0:
                 branch_created = True
-                print(f"[web-dev] setup_workspace: switched to existing branch {branch_name!r}")
+                print(f"[{_AGENT_ID}] setup_workspace: switched to existing branch {branch_name!r}")
             else:
-                print(f"[web-dev] setup_workspace: git checkout failed: {r2.stderr.strip()[:200]}")
+                print(f"[{_AGENT_ID}] setup_workspace: git checkout failed: {r2.stderr.strip()[:200]}")
                 raise RuntimeError(
-                    f"[web-dev] Failed to create/switch branch {branch_name!r}: {r2.stderr.strip()[:200]}"
+                    f"[{_AGENT_ID}] Failed to create/switch branch {branch_name!r}: {r2.stderr.strip()[:200]}"
                 )
 
     # Write git setup log
     if workspace_path:
-        agent_dir = os.path.join(workspace_path, "web-agent")
+        agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
             import time as _time
@@ -444,14 +442,11 @@ async def setup_workspace(state: dict) -> dict:
 
 
 async def analyze_task(state: dict) -> dict:
-    """Understand requirements and produce an implementation plan.
-
-    Loads delivery-plan.json from the workspace (written by Team Lead) when
-    available, and merges it with the analysis already passed in state.
-    Falls back to a simple echo of the user request when nothing is provided.
-    """
+    """Understand requirements and produce an implementation plan."""
     import time as _time
-    print("[web-dev] analyze_task: building implementation plan")
+    log = _logger(state)
+    log.node("analyze_task")
+    print("[{_AGENT_ID}] analyze_task: building implementation plan")
 
     workspace_path = state.get("workspace_path", "")
     analysis = state.get("analysis") or state.get("user_request", "")
@@ -459,12 +454,12 @@ async def analyze_task(state: dict) -> dict:
     # Try to load Team Lead's delivery-plan.json for structured plan data
     delivery_plan: dict = {}
     if workspace_path:
-        plan_path = os.path.join(workspace_path, "team_lead", "delivery-plan.json")
+        plan_path = os.path.join(workspace_path, "team-lead", "delivery-plan.json")
         try:
             with open(plan_path, encoding="utf-8") as fh:
                 doc = json.load(fh)
                 delivery_plan = doc.get("data", doc)
-                print(f"[web-dev] Loaded delivery-plan.json from {plan_path}")
+                print(f"[{_AGENT_ID}] Loaded delivery-plan.json from {plan_path}")
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -477,7 +472,7 @@ async def analyze_task(state: dict) -> dict:
 
     # Also load Jira ticket for acceptance criteria
     if workspace_path:
-        jira_path = os.path.join(workspace_path, "team_lead", "jira-ticket.json")
+        jira_path = os.path.join(workspace_path, "team-lead", "jira-ticket.json")
         try:
             with open(jira_path, encoding="utf-8") as fh:
                 doc = json.load(fh)
@@ -492,7 +487,7 @@ async def analyze_task(state: dict) -> dict:
 
     # Write implementation-plan.json to workspace for auditability
     if workspace_path:
-        agent_dir = os.path.join(workspace_path, "web-agent")
+        agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
             plan_file = os.path.join(agent_dir, "implementation-plan.json")
@@ -517,17 +512,11 @@ async def analyze_task(state: dict) -> dict:
 
 
 async def implement_changes(state: dict) -> dict:
-    """Write code based on the implementation plan.
-
-    Uses runtime.run_agentic() for open-ended code generation and file editing.
-    The agentic loop has access to read_file, write_file, edit_file, search_code,
-    and run_command tools registered in the global ToolRegistry.
-    """
+    """Write code based on the implementation plan."""
     runtime = state.get("_runtime")
-    _logger(state).step("implement_changes",
-                        repo_path=state.get("repo_path", ""),
-                        branch=state.get("branch_name", ""))
-
+    log = _logger(state)
+    log.node("implement_changes", repo_path=state.get("repo_path", ""),
+             branch=state.get("branch_name", ""))
     if not runtime:
         # Unit-test / no-runtime path
         return {
@@ -551,7 +540,7 @@ async def implement_changes(state: dict) -> dict:
     _design_code_path = state.get("design_code_path", "")
     _workspace_path = state.get("workspace_path", "")
     if not _design_code_path and _workspace_path:
-        _design_code_path = os.path.join(_workspace_path, "team_lead", "design-code.html")
+        _design_code_path = os.path.join(_workspace_path, "team-lead", "design-code.html")
     if _design_code_path and os.path.isfile(_design_code_path):
         try:
             with open(_design_code_path, encoding="utf-8") as _f:
@@ -596,7 +585,7 @@ async def implement_changes(state: dict) -> dict:
 
     # Use Claude Code native tools (Bash, Read, Write, Glob, Grep) — no constellation
     # MCP bridge needed.  With cwd=repo_path, all relative paths resolve correctly.
-    print(f"[web-dev] implement_changes: repo_path={state.get('repo_path', '')!r} (native tools)")
+    print(f"[{_AGENT_ID}] implement_changes: repo_path={state.get('repo_path', '')!r} (native tools)")
     result = runtime.run_agentic(
         task=prompt,
         system_prompt=IMPLEMENT_SYSTEM,
@@ -606,7 +595,7 @@ async def implement_changes(state: dict) -> dict:
         timeout=1800,
         plugin_manager=state.get("_plugin_manager"),
     )
-    print(f"[web-dev] implement_changes done: success={result.success} turns={result.turns_used} summary={result.summary[:300]!r}")
+    print(f"[{_AGENT_ID}] implement_changes done: success={result.success} turns={result.turns_used} summary={result.summary[:300]!r}")
 
     if not result.success:
         raise RuntimeError(
@@ -623,24 +612,18 @@ async def implement_changes(state: dict) -> dict:
 
 
 async def run_tests(state: dict) -> dict:
-    """Run project tests and evaluate results.
-
-    Sets state["route"] to "pass" or "fail" for conditional routing.
-    Uses runtime.run_agentic() to execute test commands and parse results.
-
-    Max cycles: reads WEB_DEV_MAX_TEST_CYCLES env var (default 3 for production,
-    override to 1-2 for faster CI runs). A minimum of 1 cycle always runs.
-    """
+    """Run project tests and evaluate results."""
+    log = _logger(state)
+    log.node("run_tests")
     runtime = state.get("_runtime")
     test_cycles = state.get("test_cycles", 0) + 1
-    # Allow override via state (set at agent start) or env var.
-    # Default: 3 cycles (run → fix → re-run × 2) for production-quality coverage.
     max_test_cycles = state.get("max_test_cycles") or int(
         os.environ.get("WEB_DEV_MAX_TEST_CYCLES", "3")
     )
+    log.info("run_tests started", cycle=test_cycles, max_cycles=max_test_cycles)
 
     if not runtime:
-        # Unit-test path: always pass
+        log.info("run_tests skipped — no runtime (test mode)")
         return {
             "test_results": {"passed": 1, "failed": 0, "output": ""},
             "test_cycles": test_cycles,
@@ -649,7 +632,8 @@ async def run_tests(state: dict) -> dict:
         }
 
     repo_path = state.get("repo_path", "")
-    print(f"[web-dev] run_tests: cycle={test_cycles}/{max_test_cycles} repo_path={repo_path!r}")
+    log.debug("run_tests running build+test", repo_path=repo_path)
+    print(f"[{_AGENT_ID}] run_tests: cycle={test_cycles}/{max_test_cycles} repo_path={repo_path!r}")
 
     result = runtime.run_agentic(
         task=(
@@ -681,12 +665,14 @@ async def run_tests(state: dict) -> dict:
     failed = data.get("failed", 0)
     build_ok = data.get("build_ok", True)
     test_passed = int(failed) == 0 and build_ok and result.success
+    log.info("run_tests result", passed=data.get("passed", 0), failed=failed,
+             build_ok=build_ok, test_passed=test_passed, cycle=test_cycles)
 
     # Write per-cycle test results for auditability
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
         import time as _time
-        results_dir = os.path.join(workspace_path, "web-agent", "test-results")
+        results_dir = os.path.join(workspace_path, _AGENT_ID, "test-results")
         os.makedirs(results_dir, exist_ok=True)
         try:
             cycle_file = os.path.join(results_dir, f"test-run-{test_cycles}.json")
@@ -716,7 +702,7 @@ async def run_tests(state: dict) -> dict:
         # Exhausted fix cycles — proceed to PR; Team Lead will review.
         # Record accurate status (not "skip").
         final_status = "pass" if int(failed) == 0 else "fail_max_cycles"
-        print(f"[web-dev] run_tests: max cycles reached ({test_cycles}/{max_test_cycles}), "
+        print(f"[{_AGENT_ID}] run_tests: max cycles reached ({test_cycles}/{max_test_cycles}), "
               f"proceeding with status={final_status}")
         return {
             "test_results": data,
@@ -736,13 +722,13 @@ async def run_tests(state: dict) -> dict:
 
 
 async def fix_tests(state: dict) -> dict:
-    """Fix failing tests based on test output.
-
-    Uses runtime.run_agentic() to analyse failures and apply minimal fixes.
-    """
+    """Fix failing tests based on test output."""
+    log = _logger(state)
+    log.node("fix_tests")
     runtime = state.get("_runtime")
 
     if not runtime:
+        log.info("fix_tests skipped — no runtime")
         return {"fix_attempted": True}
 
     from agents.web_dev.prompts import FIX_SYSTEM, FIX_TEMPLATE
@@ -772,17 +758,9 @@ async def fix_tests(state: dict) -> dict:
 
 
 async def self_assess(state: dict) -> dict:
-    """Run requirement-aware and design-aware self assessment.
-
-    Evaluation dimensions:
-    1. Acceptance criteria coverage.
-    2. Component-by-component UI design alignment for UI tasks.
-    3. Build status.
-    4. Test status and newly added test coverage.
-    5. Code quality and obvious risk review.
-
-    Pass threshold: score >= 0.9.
-    """
+    """Run requirement-aware and design-aware self assessment."""
+    log = _logger(state)
+    log.node("self_assess")
     runtime = state.get("_runtime")
     assess_cycles = state.get("assess_cycles", 0) + 1
     max_assess_cycles = 3
@@ -808,7 +786,7 @@ async def self_assess(state: dict) -> dict:
 
     # Try to load full design context from workspace file (more complete than state copy)
     if workspace_path:
-        design_spec_path = os.path.join(workspace_path, "team_lead", "design-spec.json")
+        design_spec_path = os.path.join(workspace_path, "team-lead", "design-spec.json")
         if os.path.isfile(design_spec_path):
             try:
                 with open(design_spec_path, encoding="utf-8") as _f:
@@ -821,7 +799,7 @@ async def self_assess(state: dict) -> dict:
     design_code_snippet = ""
     design_code_path = state.get("design_code_path", "")
     if not design_code_path and workspace_path:
-        design_code_path = os.path.join(workspace_path, "team_lead", "design-code.html")
+        design_code_path = os.path.join(workspace_path, "team-lead", "design-code.html")
     if design_code_path and os.path.isfile(design_code_path):
         try:
             with open(design_code_path, encoding="utf-8") as _f:
@@ -889,7 +867,7 @@ async def self_assess(state: dict) -> dict:
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
         import time as _time
-        agent_dir = os.path.join(workspace_path, "web-agent")
+        agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
             sa_file = os.path.join(agent_dir, "self-assessment.json")
@@ -983,7 +961,7 @@ async def capture_screenshot(state: dict) -> dict:
 
     repo_path = state.get("repo_path", "")
     workspace_path = state.get("workspace_path", "")
-    screenshot_dir = os.path.join(workspace_path, "web-agent", "screenshots")
+    screenshot_dir = os.path.join(workspace_path, _AGENT_ID, "screenshots")
 
     try:
         os.makedirs(screenshot_dir, exist_ok=True)
@@ -1047,17 +1025,9 @@ async def capture_screenshot(state: dict) -> dict:
 
 
 async def update_jira(state: dict) -> dict:
-    """Update Jira after development is complete.
-
-    Actions:
-    1. Add a completion comment with PR URL, test results, self-assessment score.
-    2. Transition ticket to "In Review".
-
-    Idempotency:
-    - Check if a comment with the PR URL already exists before adding.
-    """
+    """Update Jira after development is complete."""
     log = _logger(state)
-    log.step("update_jira")
+    log.node("update_jira")
     jira_context = state.get("jira_context", {})
     jira_key = (
         jira_context.get("key")
@@ -1109,9 +1079,10 @@ async def update_jira(state: dict) -> dict:
     )
 
     # Idempotency: check if comment with PR URL already exists
-    _boundary_log(state, "jira", "jira_list_comments called", jira_key=jira_key)
+    task_id = state.get("_task_id", "")
+    log.debug("checking existing comments for idempotency", jira_key=jira_key)
     existing = _call_boundary_tool(
-        state, "jira_list_comments", {"ticket_key": jira_key}
+        state, "jira_list_comments", {"ticket_key": jira_key, "task_id": task_id}
     )
     already_commented = False
     for c in existing.get("comments", []):
@@ -1125,20 +1096,19 @@ async def update_jira(state: dict) -> dict:
             break
 
     if not already_commented:
-        _boundary_log(state, "jira", "jira_comment called", jira_key=jira_key, pr_url=pr_url)
+        log.info("adding jira completion comment", jira_key=jira_key, pr_url=pr_url)
         _call_boundary_tool(
             state, "jira_comment",
-            {"ticket_key": jira_key, "comment": comment_text},
+            {"ticket_key": jira_key, "comment": comment_text, "task_id": task_id},
         )
-        _boundary_log(state, "jira", "jira_comment done")
-        log.info("jira comment added", jira_key=jira_key)
+        log.debug("jira comment added", jira_key=jira_key)
     else:
         log.info("jira comment already exists, skipped")
 
     # Transition to "In Review"
-    _boundary_log(state, "jira", "jira_list_transitions called", jira_key=jira_key)
+    log.debug("listing jira transitions for in-review", jira_key=jira_key)
     transitions_result = _call_boundary_tool(
-        state, "jira_list_transitions", {"ticket_key": jira_key}
+        state, "jira_list_transitions", {"ticket_key": jira_key, "task_id": task_id}
     )
     transitions = transitions_result.get("transitions", [])
     _IN_REVIEW_NAMES = {
@@ -1152,14 +1122,11 @@ async def update_jira(state: dict) -> dict:
     )
     can_review = bool(in_review_match)
     if can_review:
-        _boundary_log(state, "jira", "jira_transition called",
-                      transition=in_review_match["name"], jira_key=jira_key)
         _call_boundary_tool(
             state, "jira_transition",
-            {"ticket_key": jira_key, "transition_name": in_review_match["name"]},
+            {"ticket_key": jira_key, "transition_name": in_review_match["name"],
+             "task_id": task_id},
         )
-        _boundary_log(state, "jira", "jira_transition done",
-                      transition=in_review_match["name"])
         log.info("jira transitioned to in review", jira_key=jira_key)
     else:
         log.warn("no in-review transition available", jira_key=jira_key)
@@ -1168,7 +1135,7 @@ async def update_jira(state: dict) -> dict:
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
         import time as _time
-        agent_dir = os.path.join(workspace_path, "web-agent")
+        agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
             log_file = os.path.join(agent_dir, "jira-update-log.json")
@@ -1193,14 +1160,10 @@ async def update_jira(state: dict) -> dict:
 
 
 async def create_pr(state: dict) -> dict:
-    """Generate a PR description and create the pull request via SCM tools.
-
-    Uses runtime.run() for the PR description and runtime.run_agentic() to
-    push the branch and open the PR through available SCM tools.
-    """
+    """Generate a PR description and create the pull request via SCM tools."""
     runtime = state.get("_runtime")
     log = _logger(state)
-    log.step("create_pr", branch=state.get("branch_name", ""))
+    log.node("create_pr", branch=state.get("branch_name", ""))
 
     if not runtime:
         return {
@@ -1229,7 +1192,7 @@ async def create_pr(state: dict) -> dict:
 
     if not all_changes:
         raise RuntimeError(
-            f"[web-dev] create_pr: No file changes detected on branch {branch_name!r}. "
+            f"[{_AGENT_ID}] create_pr: No file changes detected on branch {branch_name!r}. "
             "implement_changes produced 0 commits — cannot create a PR against main."
         )
 
@@ -1263,19 +1226,19 @@ async def create_pr(state: dict) -> dict:
     pr_description = pr_meta.get("description", state.get("implementation_summary", ""))
 
     # Step 3: Push branch then create PR via SCM boundary tools (not open agentic).
-    _boundary_log(state, "scm", "scm_push called", branch=branch_name)
+    task_id = state.get("_task_id", "")
+    log.info("pushing branch to remote", branch=branch_name)
     push_payload = _call_boundary_tool(
-        state, "scm_push", {"repo_path": repo_path, "branch": branch_name}
+        state, "scm_push", {"repo_path": repo_path, "branch": branch_name, "task_id": task_id}
     )
     if push_payload.get("error"):
-        _boundary_log(state, "scm", "scm_push failed", error=push_payload["error"])
-        print(f"[web-dev] scm_push failed: {push_payload['error']}")
+        log.error("scm_push failed", error=push_payload["error"])
+        print(f"[{_AGENT_ID}] scm_push failed: {push_payload['error']}")
     else:
-        _boundary_log(state, "scm", "scm_push ok", branch=branch_name)
-        print(f"[web-dev] scm_push OK: branch={branch_name!r}")
+        log.debug("scm_push ok", branch=branch_name)
+        print(f"[{_AGENT_ID}] scm_push OK: branch={branch_name!r}")
 
-    _boundary_log(state, "scm", "scm_create_pr called",
-                  source=branch_name, target="main", title=pr_title)
+    log.info("creating PR", source_branch=branch_name, target="main", title=pr_title[:80])
     pr_payload = _call_boundary_tool(
         state, "scm_create_pr",
         {
@@ -1284,6 +1247,7 @@ async def create_pr(state: dict) -> dict:
             "target_branch": "main",
             "title": pr_title,
             "description": pr_description,
+            "task_id": task_id,
         },
     )
     pr_url = pr_payload.get("prUrl") or pr_payload.get("pr_url", "")
@@ -1292,20 +1256,17 @@ async def create_pr(state: dict) -> dict:
     pr_status = pr_payload.get("status", "")
     pr_error = pr_payload.get("error", "")
     if not pr_url and (pr_error or (pr_status and pr_status != "ok")):
-        _boundary_log(state, "scm", "scm_create_pr failed",
-                      status=pr_status, error=pr_error)
-        _logger(state).error("PR creation failed", status=pr_status, error=pr_error)
-        print(f"[web-dev] create_pr FAILED: status={pr_status!r} error={pr_error!r} payload={pr_payload}")
+        log.error("PR creation failed", status=pr_status, error=pr_error)
+        print(f"[{_AGENT_ID}] create_pr FAILED: status={pr_status!r} error={pr_error!r} payload={pr_payload}")
     else:
-        _boundary_log(state, "scm", "scm_create_pr ok", pr_url=pr_url)
-        _logger(state).info("PR created", pr_url=pr_url, branch=branch_name)
-        print(f"[web-dev] create_pr done: prUrl={pr_url!r} prNumber={pr_number} status={pr_status!r}")
+        log.info("PR created", pr_url=pr_url, branch=branch_name)
+        print(f"[{_AGENT_ID}] create_pr done: prUrl={pr_url!r} prNumber={pr_number} status={pr_status!r}")
 
     # Write pr-evidence.json to workspace
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
         import time as _time
-        agent_dir = os.path.join(workspace_path, "web-agent")
+        agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
             evidence_file = os.path.join(agent_dir, "pr-evidence.json")
@@ -1344,12 +1305,16 @@ async def create_pr(state: dict) -> dict:
 
 async def report_result(state: dict) -> dict:
     """Return final result summary."""
+    log = _logger(state)
+    log.node("report_result")
     pr_url = state.get("pr_url", "N/A")
     branch_name = state.get("branch_name", "N/A")
     changes = state.get("changes_made", [])
     pr_title = state.get("pr_title", "")
     test_status = state.get("test_status", "unknown")
-    print(f"[web-dev] report_result: prUrl={pr_url!r} branch={branch_name!r} test_status={test_status!r} changes={len(changes)}")
+    log.info("report_result", pr_url=pr_url, branch=branch_name,
+             test_status=test_status, files_changed=len(changes))
+    print(f"[{_AGENT_ID}] report_result: prUrl={pr_url!r} branch={branch_name!r} test_status={test_status!r} changes={len(changes)}")
 
     summary_parts = [
         f"Implementation complete.",

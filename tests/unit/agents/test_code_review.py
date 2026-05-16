@@ -118,7 +118,7 @@ class TestLoadPrContext:
             "metadata": {
                 "prUrl": "https://example.com/pr/1",
                 "workspacePath": str(tmp_path),
-                "contextManifestPath": "team_lead/context-manifest.json",
+                "contextManifestPath": "team-lead/context-manifest.json",
                 "jiraContext": {"key": "PROJ-123"},
             }
         }
@@ -306,7 +306,7 @@ class TestGenerateReport:
             "test_issues": [],
             "requirement_gaps": [],
             "workspace_path": str(tmp_path),
-            "context_manifest_path": "team_lead/context-manifest.json",
+            "context_manifest_path": "team-lead/context-manifest.json",
             "jira_context": {"key": "PROJ-123"},
             "design_context": {"screen": "Login"},
         }
@@ -315,8 +315,8 @@ class TestGenerateReport:
 
         checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-summary.json"
         assert checkpoint_file.exists()
-        assert "team_lead/jira-ticket.json" in result["checked_artifacts"]
-        assert "team_lead/design-spec.json" in result["checked_artifacts"]
+        assert "team-lead/jira-ticket.json" in result["checked_artifacts"]
+        assert "team-lead/design-spec.json" in result["checked_artifacts"]
 
 
 class TestCodeReviewWorkflowExecution:

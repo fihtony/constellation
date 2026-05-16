@@ -134,26 +134,29 @@ class TeamLeadAgent(BaseAgent):
         user_text = next((p.get("text", "") for p in parts if p.get("text")), "")
         meta = msg.get("metadata") or {}
 
-        # Create task in task store
         task_store = self.services.task_store
 
-        # Build workspace_path before task creation so it can be saved in metadata
+        # Build workspace_path: {ARTIFACT_ROOT}/{orchestratorTaskId}/
+        # Compass passes its task.id as orchestratorTaskId — this is the master task_id
+        # that all agents in the workflow share for logging purposes.
         workspace_path = meta.get("workspacePath", "") or meta.get("workspace_path", "")
-        if not workspace_path:
-            artifact_root = os.environ.get("ARTIFACT_ROOT", "artifacts/")
-            workspace_path = os.path.join(
-                artifact_root,
-                f"compass-{meta.get('orchestratorTaskId', 'default')[:8]}",
-            )
+        orchestrator_task_id = meta.get("orchestratorTaskId", "")
 
+        # Create team-lead task (its ID is a fallback when there's no orchestrator)
         task = task_store.create_task(
             agent_id=self.definition.agent_id,
             metadata={
-                "orchestratorTaskId": meta.get("orchestratorTaskId", ""),
+                "orchestratorTaskId": orchestrator_task_id,
                 "orchestratorCallbackUrl": meta.get("orchestratorCallbackUrl", ""),
-                "workspacePath": workspace_path,
             },
         )
+
+        if not workspace_path:
+            artifact_root = os.environ.get("ARTIFACT_ROOT", "artifacts/")
+            if orchestrator_task_id:
+                workspace_path = os.path.join(artifact_root, orchestrator_task_id)
+            else:
+                workspace_path = os.path.join(artifact_root, f"tl-{task.id[:8]}")
 
         state = {
             "user_request": user_text,
@@ -166,7 +169,9 @@ class TeamLeadAgent(BaseAgent):
             "design_context": meta.get("designContext"),
             "workspace_path": workspace_path,
             "metadata": meta,
-            "_task_id": task.id,
+            # _task_id: use Compass task ID as the master task ID for logging.
+            # All agents in this workflow log under {ARTIFACT_ROOT}/{_task_id}/
+            "_task_id": orchestrator_task_id or task.id,
             "_agent_id": self.definition.agent_id,
             "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,

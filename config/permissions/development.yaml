@@ -13,6 +13,7 @@ allowed_tools:
   - scm_commit
   - scm_push
   - scm_create_pr
+  - scm_list_branches
   - dispatch_agent
   - query_registry
   # Jira boundary tools (called by workflow nodes, not LLM directly)

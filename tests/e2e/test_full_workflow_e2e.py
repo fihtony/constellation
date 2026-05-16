@@ -580,21 +580,21 @@ def _validate_workspace_artifacts(workspace_path: str, jira_key: str) -> None:
     print("[workspace] CP-4: Analysis + delivery plan ✓")
 
     # Checkpoint 5: Web Dev git setup
-    git_log = _check("web-agent/git-setup-log.json")
+    git_log = _check("web-dev/git-setup-log.json")
     assert git_log.get("data", {}).get("repo_exists", False), (
-        f"[workspace] web-agent git-setup-log: repo_exists=False. "
+        f"[workspace] web-dev git-setup-log: repo_exists=False. "
         f"data={json.dumps(git_log.get('data', {}))}"
     )
     branch = git_log.get("data", {}).get("branch_name", "")
     print(f"[workspace] CP-5: Git setup ✓ branch={branch}")
 
     # Checkpoint 6: Web Dev implementation plan + Jira prepare
-    _check("web-agent/implementation-plan.json")
-    _check("web-agent/jira-prepare-log.json", ["jira_key"])
+    _check("web-dev/implementation-plan.json")
+    _check("web-dev/jira-prepare-log.json", ["jira_key"])
     print("[workspace] CP-6: Web Dev impl plan + Jira prepare ✓")
 
     # Checkpoint 8: PR created
-    pr_ev = _check("web-agent/pr-evidence.json")
+    pr_ev = _check("web-dev/pr-evidence.json")
     pr_url = pr_ev.get("data", {}).get("pr_url", "")
     assert pr_url, (
         f"[workspace] pr-evidence.json: pr_url empty. "
@@ -603,7 +603,7 @@ def _validate_workspace_artifacts(workspace_path: str, jira_key: str) -> None:
     print(f"[workspace] CP-8: PR evidence ✓ pr_url={pr_url}")
 
     # Checkpoint 8b: Jira updated
-    jira_upd = _check("web-agent/jira-update-log.json")
+    jira_upd = _check("web-dev/jira-update-log.json")
     jira_upd_data = jira_upd.get("data", {})
     print(
         f"[workspace] CP-8b: Jira update "
@@ -626,11 +626,11 @@ def _print_workspace_progress(workspace_path: str) -> None:
         "CP-3 Context manifest": "team_lead/context-manifest.json",
         "CP-4a Analysis": "team_lead/analysis.json",
         "CP-4b Delivery plan": "team_lead/delivery-plan.json",
-        "CP-5 Git setup": "web-agent/git-setup-log.json",
-        "CP-6a Impl plan": "web-agent/implementation-plan.json",
-        "CP-6b Jira prepare": "web-agent/jira-prepare-log.json",
-        "CP-8 PR evidence": "web-agent/pr-evidence.json",
-        "CP-8b Jira update": "web-agent/jira-update-log.json",
+        "CP-5 Git setup": "web-dev/git-setup-log.json",
+        "CP-6a Impl plan": "web-dev/implementation-plan.json",
+        "CP-6b Jira prepare": "web-dev/jira-prepare-log.json",
+        "CP-8 PR evidence": "web-dev/pr-evidence.json",
+        "CP-8b Jira update": "web-dev/jira-update-log.json",
         "CP-9 Review report": "code-review/review-report.json",
     }
     present = []

@@ -8,8 +8,21 @@ from __future__ import annotations
 import json
 import os
 
+from pathlib import Path as _Path
+
+from framework.config import load_agent_config as _load_agent_cfg
+from framework.devlog import AgentLogger
 from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
+
+# Load agent_id from config.yaml — single source of truth for identity
+_AGENT_ID: str = _load_agent_cfg(
+    _Path(__file__).parent.name.replace("_", "-")
+).get("agent_id", _Path(__file__).parent.name.replace("_", "-"))
+
+
+def _log(task_id: str) -> AgentLogger:
+    return AgentLogger(task_id=task_id, agent_name=_AGENT_ID)
 
 
 def _get_adapter():
@@ -51,6 +64,7 @@ class FetchDesign(BaseTool):
             "stitch_project_id": {"type": "string", "description": "Google Stitch project ID."},
             "stitch_screen_id": {"type": "string", "description": "Stitch screen ID (optional)."},
             "screen_name": {"type": "string", "description": "Screen name for Stitch (optional)."},
+            "task_id": {"type": "string", "description": "Caller task ID for log correlation (optional)."},
         },
         "required": [],
     }
@@ -61,10 +75,13 @@ class FetchDesign(BaseTool):
         stitch_project_id: str = "",
         stitch_screen_id: str = "",
         screen_name: str = "",
+        task_id: str = "",
         **kw,
     ) -> ToolResult:
+        log = _log(task_id)
         adapter = _get_adapter()
         if figma_url:
+            log.info("fetch_design called", source="figma", figma_url=figma_url)
             result = adapter._dispatch(
                 "figma.file.fetch", figma_url,
                 {"metadata": {"figmaUrl": figma_url}},
@@ -74,6 +91,8 @@ class FetchDesign(BaseTool):
                 capability = "stitch.screen.fetch"
             else:
                 capability = "stitch.screens.list"
+            log.info("fetch_design called", source="stitch",
+                     stitch_project_id=stitch_project_id, capability=capability)
             result = adapter._dispatch(
                 capability, stitch_project_id,
                 {
@@ -93,12 +112,18 @@ class FetchDesign(BaseTool):
                 return self.execute_sync(
                     stitch_project_id=eff_project_id,
                     stitch_screen_id=eff_screen_id,
+                    task_id=task_id,
                 )
             if eff_figma_url:
-                return self.execute_sync(figma_url=eff_figma_url)
+                return self.execute_sync(figma_url=eff_figma_url, task_id=task_id)
+            log.warn("fetch_design: no design source configured")
             print("[ui-design-tools] No design source configured, returning empty context")
             return ToolResult(output=json.dumps({"design": {}, "status": "no_source"}))
 
+        if result.get("error"):
+            log.error("fetch_design failed", error=result["error"])
+        else:
+            log.debug("fetch_design ok")
         return ToolResult(output=json.dumps(result))
 
 

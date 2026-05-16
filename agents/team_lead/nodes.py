@@ -12,24 +12,21 @@ import json
 import os
 import re
 import time
+from pathlib import Path as _Path
 from typing import Any
 
-from framework.devlog import WorkspaceLogger
+from framework.config import load_agent_config as _load_agent_cfg
+from framework.devlog import AgentLogger
+
+# Load agent_id from config.yaml — single source of truth for identity
+_AGENT_ID: str = _load_agent_cfg(
+    _Path(__file__).parent.name.replace("_", "-")
+).get("agent_id", _Path(__file__).parent.name.replace("_", "-"))
 
 
-def _logger(state: dict, agent_id: str = "team-lead") -> WorkspaceLogger:
-    """Return a WorkspaceLogger for the given agent_id using state workspace_path."""
-    return WorkspaceLogger(state.get("workspace_path", ""), agent_id)
-
-
-def _boundary_log(state: dict, boundary_agent: str, message: str, **kwargs: Any) -> None:
-    """Write a log entry to a boundary agent's workspace folder (proxy logging).
-
-    This ensures agents like jira, scm, and ui-design have workspace folders
-    and log files even though they are called as in-process tools rather than
-    standalone services.
-    """
-    WorkspaceLogger(state.get("workspace_path", ""), boundary_agent).info(message, **kwargs)
+def _logger(state: dict) -> AgentLogger:
+    """Return an AgentLogger for this agent using the task_id stored in state."""
+    return AgentLogger(state.get("_task_id", ""), _AGENT_ID)
 
 
 async def receive_task(state: dict) -> dict:
@@ -48,20 +45,16 @@ async def receive_task(state: dict) -> dict:
         if url_match:
             jira_ticket_url = jira_ticket_url or url_match.group(1)
             jira_key = url_match.group(2)
-            print(f"[team-lead] Extracted jira_key={jira_key} from URL in user_request")
+            print(f"[{_AGENT_ID}] Extracted jira_key={jira_key} from URL in user_request")
         else:
             key_match = _re.search(r"\b([A-Z][A-Z0-9]+-\d+)\b", user_request)
             if key_match:
                 jira_key = key_match.group(1)
-                print(f"[team-lead] Extracted jira_key={jira_key} from user_request text")
+                print(f"[{_AGENT_ID}] Extracted jira_key={jira_key} from user_request text")
 
-    # Initialize workspace log and create boundary-agent placeholder folders
+    # Initialize workspace log
     log = _logger(state)
-    log.step("receive_task", jira_key=jira_key, request=user_request[:200])
-    # Create folders for boundary agents that will be called during this task
-    # so they always appear in the workspace tree even before their first call.
-    for boundary_agent in ("jira", "scm", "ui-design"):
-        _boundary_log(state, boundary_agent, "task started", jira_key=jira_key)
+    log.node("receive_task", jira_key=jira_key, request=user_request[:200])
 
     return {
         "task_received": True,
@@ -83,7 +76,7 @@ async def analyze_requirements(state: dict) -> dict:
     runtime = state.get("_runtime")
     user_request = state.get("user_request", "")
     log = _logger(state)
-    log.step("analyze_requirements")
+    log.node("analyze_requirements")
 
     if not runtime:
         analysis = {
@@ -124,7 +117,7 @@ async def analyze_requirements(state: dict) -> dict:
     # Write analysis.json to workspace
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
-        tl_dir = os.path.join(workspace_path, "team_lead")
+        tl_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(tl_dir, exist_ok=True)
         try:
             analysis_file = os.path.join(tl_dir, "analysis.json")
@@ -138,7 +131,7 @@ async def analyze_requirements(state: dict) -> dict:
                     "data": analysis,
                 }, fh, ensure_ascii=False, indent=2)
         except OSError as exc:
-            print(f"[team-lead] Failed to write analysis.json: {exc}")
+            print(f"[{_AGENT_ID}] Failed to write analysis.json: {exc}")
 
     return {
         "task_type": analysis.get("task_type", "general"),
@@ -165,7 +158,7 @@ async def gather_context(state: dict) -> dict:
     workspace_path = state.get("workspace_path", "")
 
     log = _logger(state)
-    log.step("gather_context")
+    log.node("gather_context")
 
     jira_files = []
     design_files = []
@@ -173,25 +166,24 @@ async def gather_context(state: dict) -> dict:
 
     # Fetch Jira ticket if key provided and not already present
     jira_key = state.get("jira_key", "")
+    task_id = state.get("_task_id", "")
     if jira_key and not jira_context:
         log.info("fetching jira ticket", jira_key=jira_key)
-        _boundary_log(state, "jira", "fetch_ticket called", jira_key=jira_key)
+        log.a2a("→", "jira", capability="fetch_jira_ticket", jira_key=jira_key)
         try:
             result_str = registry.execute_sync(
-                "fetch_jira_ticket", {"ticket_key": jira_key}
+                "fetch_jira_ticket", {"ticket_key": jira_key, "task_id": task_id}
             )
             payload = json.loads(result_str) if result_str else {}
             if payload.get("error"):
                 log.warn("jira fetch warning", error=payload["error"])
-                _boundary_log(state, "jira", "fetch_ticket warning", error=payload["error"])
-                print(f"[team-lead] Jira fetch warning: {payload['error']} (continuing without Jira context)")
+                print(f"[{_AGENT_ID}] Jira fetch warning: {payload['error']} (continuing without Jira context)")
             else:
                 jira_context = payload.get("ticket", payload)
-                _boundary_log(state, "jira", "fetch_ticket ok", jira_key=jira_key)
+                log.debug("jira fetch ok", jira_key=jira_key)
         except Exception as exc:
             log.error("jira fetch failed", error=str(exc))
-            _boundary_log(state, "jira", "fetch_ticket failed", error=str(exc))
-            print(f"[team-lead] Jira fetch failed: {exc} (continuing without Jira context)")
+            print(f"[{_AGENT_ID}] Jira fetch failed: {exc} (continuing without Jira context)")
 
     # Extract embedded URLs / IDs from Jira ticket content using LLM, falling back to regex.
     figma_url = state.get("figma_url", "")
@@ -207,26 +199,26 @@ async def gather_context(state: dict) -> dict:
         extracted_context = extracted
         if not repo_url and extracted.get("repo_url"):
             repo_url = extracted["repo_url"]
-            print(f"[team-lead] Extracted repo_url from Jira ticket: {repo_url}")
+            print(f"[{_AGENT_ID}] Extracted repo_url from Jira ticket: {repo_url}")
         if not figma_url and extracted.get("figma_url"):
             figma_url = extracted["figma_url"]
-            print(f"[team-lead] Extracted figma_url from Jira ticket: {figma_url}")
+            print(f"[{_AGENT_ID}] Extracted figma_url from Jira ticket: {figma_url}")
         if not stitch_id and extracted.get("stitch_project_id"):
             stitch_id = extracted["stitch_project_id"]
-            print(f"[team-lead] Extracted stitch_project_id from Jira ticket: {stitch_id}")
+            print(f"[{_AGENT_ID}] Extracted stitch_project_id from Jira ticket: {stitch_id}")
         if not stitch_screen_id and extracted.get("stitch_screen_id"):
             stitch_screen_id = extracted["stitch_screen_id"]
-            print(f"[team-lead] Extracted stitch_screen_id from Jira ticket: {stitch_screen_id}")
+            print(f"[{_AGENT_ID}] Extracted stitch_screen_id from Jira ticket: {stitch_screen_id}")
         if not stitch_screen_name and extracted.get("stitch_screen_name"):
             stitch_screen_name = extracted["stitch_screen_name"]
-            print(f"[team-lead] Extracted stitch_screen_name from Jira ticket: {stitch_screen_name}")
+            print(f"[{_AGENT_ID}] Extracted stitch_screen_name from Jira ticket: {stitch_screen_name}")
         if not tech_stack and extracted.get("tech_stack"):
             tech_stack = extracted["tech_stack"]
-            print(f"[team-lead] Extracted tech_stack from Jira ticket: {tech_stack}")
+            print(f"[{_AGENT_ID}] Extracted tech_stack from Jira ticket: {tech_stack}")
 
     # Save LLM-extracted context to workspace for traceability
     if extracted_context and workspace_path:
-        tl_dir = os.path.join(workspace_path, "team_lead")
+        tl_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(tl_dir, exist_ok=True)
         extraction_file = os.path.join(tl_dir, "jira-context-extracted.json")
         try:
@@ -239,9 +231,9 @@ async def gather_context(state: dict) -> dict:
                     },
                     "data": extracted_context,
                 }, fh, ensure_ascii=False, indent=2)
-            print(f"[team-lead] Saved jira-context-extracted.json to {extraction_file}")
+            print(f"[{_AGENT_ID}] Saved jira-context-extracted.json to {extraction_file}")
         except OSError as exc:
-            print(f"[team-lead] Failed to write jira-context-extracted.json: {exc}")
+            print(f"[{_AGENT_ID}] Failed to write jira-context-extracted.json: {exc}")
 
     # Env var fallbacks (applied after extraction, before design fetch)
     if not repo_url:
@@ -255,7 +247,7 @@ async def gather_context(state: dict) -> dict:
 
     # Write Jira ticket to workspace
     if jira_context and workspace_path:
-        tl_dir = os.path.join(workspace_path, "team_lead")
+        tl_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(tl_dir, exist_ok=True)
         jira_file = os.path.join(tl_dir, "jira-ticket.json")
         try:
@@ -268,18 +260,18 @@ async def gather_context(state: dict) -> dict:
                     },
                     "data": jira_context,
                 }, fh, ensure_ascii=False, indent=2)
-            jira_files.append("team_lead/jira-ticket.json")
+            jira_files.append("team-lead/jira-ticket.json")
         except OSError as exc:
-            print(f"[team-lead] Failed to write jira-ticket.json: {exc}")
+            print(f"[{_AGENT_ID}] Failed to write jira-ticket.json: {exc}")
 
     # Fetch design context if URL provided and not already present
     if (figma_url or stitch_id) and not design_context:
         log.info("fetching design context",
                  figma_url=figma_url, stitch_id=stitch_id, screen_id=stitch_screen_id)
-        _boundary_log(state, "ui-design", "fetch_design called",
-                      stitch_id=stitch_id, screen_id=stitch_screen_id)
+        log.a2a("→", "ui-design", capability="fetch_design",
+                stitch_id=stitch_id, screen_id=stitch_screen_id)
         try:
-            args: dict[str, str] = {}
+            args: dict[str, str] = {"task_id": task_id}
             if figma_url:
                 args["figma_url"] = figma_url
             elif stitch_id:
@@ -290,20 +282,18 @@ async def gather_context(state: dict) -> dict:
             payload = json.loads(result_str) if result_str else {}
             if payload.get("error"):
                 log.warn("design fetch warning", error=payload["error"])
-                _boundary_log(state, "ui-design", "fetch_design warning", error=payload["error"])
-                print(f"[team-lead] Design fetch warning: {payload['error']} (continuing without design context)")
+                print(f"[{_AGENT_ID}] Design fetch warning: {payload['error']} (continuing without design context)")
             else:
                 design_context = payload
-                _boundary_log(state, "ui-design", "fetch_design ok")
+                log.debug("design fetch ok")
         except Exception as exc:
             log.error("design fetch failed", error=str(exc))
-            _boundary_log(state, "ui-design", "fetch_design failed", error=str(exc))
-            print(f"[team-lead] Design fetch failed: {exc} (continuing without design context)")
+            print(f"[{_AGENT_ID}] Design fetch failed: {exc} (continuing without design context)")
 
 
     # Write design context to workspace
     if design_context and workspace_path:
-        tl_dir = os.path.join(workspace_path, "team_lead")
+        tl_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(tl_dir, exist_ok=True)
         design_file = os.path.join(tl_dir, "design-spec.json")
         try:
@@ -316,9 +306,9 @@ async def gather_context(state: dict) -> dict:
                     },
                     "data": design_context,
                 }, fh, ensure_ascii=False, indent=2)
-            design_files.append("team_lead/design-spec.json")
+            design_files.append("team-lead/design-spec.json")
         except OSError as exc:
-            print(f"[team-lead] Failed to write design-spec.json: {exc}")
+            print(f"[{_AGENT_ID}] Failed to write design-spec.json: {exc}")
 
         # Download design HTML source code when available (Stitch htmlCode.downloadUrl).
         # This gives the Web Dev agent the exact component structure from the design tool.
@@ -336,16 +326,16 @@ async def gather_context(state: dict) -> dict:
                 code_file = os.path.join(tl_dir, "design-code.html")
                 with open(code_file, "w", encoding="utf-8") as fh:
                     fh.write(html_content)
-                design_files.append("team_lead/design-code.html")
+                design_files.append("team-lead/design-code.html")
                 design_code_path = code_file
-                print(f"[team-lead] Design HTML downloaded: {len(html_content)} chars → {code_file}")
+                print(f"[{_AGENT_ID}] Design HTML downloaded: {len(html_content)} chars → {code_file}")
         except Exception as exc:
-            print(f"[team-lead] Design HTML download failed (non-fatal): {exc}")
+            print(f"[{_AGENT_ID}] Design HTML download failed (non-fatal): {exc}")
 
     # Derive repo name from URL — validate it's a real SCM URL first
     _scm_hosts = ("github.com", "bitbucket.org", "gitlab.com", "dev.azure.com")
     if repo_url and not any(h in repo_url for h in _scm_hosts):
-        print(f"[team-lead] Ignoring non-SCM repo_url: {repo_url!r}; falling back to SCM_REPO_URL env var")
+        print(f"[{_AGENT_ID}] Ignoring non-SCM repo_url: {repo_url!r}; falling back to SCM_REPO_URL env var")
         repo_url = os.environ.get("SCM_REPO_URL", "")
     repo_name = ""
     if repo_url:
@@ -360,18 +350,16 @@ async def gather_context(state: dict) -> dict:
     repo_cloned = False
     if repo_url and repo_path:
         log.info("cloning repository", repo_url=repo_url, target=repo_path)
-        _boundary_log(state, "scm", "clone_repo called", repo_url=repo_url, target=repo_path)
+        log.a2a("→", "scm", capability="clone_repo", repo_url=repo_url)
         try:
             clone_result_str = registry.execute_sync(
                 "clone_repo",
-                {"repo_url": repo_url, "target_path": repo_path},
+                {"repo_url": repo_url, "target_path": repo_path, "task_id": task_id},
             )
             clone_payload = json.loads(clone_result_str) if clone_result_str else {}
             if clone_payload.get("error"):
                 detail = clone_payload.get("detail", "")
                 detail_msg = f" | git: {detail}" if detail else ""
-                _boundary_log(state, "scm", "clone_repo failed",
-                               error=clone_payload["error"], detail=detail)
                 log.error("repo clone failed", error=clone_payload["error"])
                 raise RuntimeError(
                     f"Repo clone FAILED for {repo_url!r}: "
@@ -385,9 +373,9 @@ async def gather_context(state: dict) -> dict:
                         f"Repo clone reported success but path is missing or empty: {repo_path!r}"
                     )
                 repo_cloned = True
-                _boundary_log(state, "scm", "clone_repo ok", repo_path=repo_path)
+                log.debug("repo clone ok", repo_path=repo_path)
                 log.info("repo cloned ok", repo_name=repo_name)
-                print(f"[team-lead] Repo cloned: {repo_name} → {repo_path}")
+                print(f"[{_AGENT_ID}] Repo cloned: {repo_name} → {repo_path}")
         except RuntimeError:
             raise  # propagate clone failures — they are fatal for the workflow
         except Exception as exc:
@@ -398,7 +386,7 @@ async def gather_context(state: dict) -> dict:
     # Write context manifest
     context_manifest_path = ""
     if workspace_path:
-        tl_dir = os.path.join(workspace_path, "team_lead")
+        tl_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(tl_dir, exist_ok=True)
         manifest = {
             "metadata": {
@@ -420,9 +408,9 @@ async def gather_context(state: dict) -> dict:
         try:
             with open(manifest_file, "w", encoding="utf-8") as fh:
                 json.dump(manifest, fh, ensure_ascii=False, indent=2)
-            context_manifest_path = "team_lead/context-manifest.json"
+            context_manifest_path = "team-lead/context-manifest.json"
         except OSError as exc:
-            print(f"[team-lead] Failed to write context-manifest.json: {exc}")
+            print(f"[{_AGENT_ID}] Failed to write context-manifest.json: {exc}")
 
     return {
         "jira_context": jira_context,
@@ -494,7 +482,7 @@ async def create_plan(state: dict) -> dict:
     # Write delivery-plan.json to workspace
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
-        tl_dir = os.path.join(workspace_path, "team_lead")
+        tl_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(tl_dir, exist_ok=True)
         try:
             plan_file = os.path.join(tl_dir, "delivery-plan.json")
@@ -508,7 +496,7 @@ async def create_plan(state: dict) -> dict:
                     "data": plan,
                 }, fh, ensure_ascii=False, indent=2)
         except OSError as exc:
-            print(f"[team-lead] Failed to write delivery-plan.json: {exc}")
+            print(f"[{_AGENT_ID}] Failed to write delivery-plan.json: {exc}")
 
     return {
         "plan": plan,
@@ -526,7 +514,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
 
     registry = get_registry()
     log = _logger(state)
-    log.step("dispatch_dev_agent")
+    log.node("dispatch_dev_agent")
     revision_feedback = state.get("revision_feedback", "")
     task_description = _build_dev_brief(state)
 
@@ -560,7 +548,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
         payload = json.loads(result_str) if result_str else {}
     except Exception as exc:
         log.error("dev dispatch failed", error=str(exc))
-        print(f"[team-lead] Dev dispatch failed: {exc}")
+        print(f"[{_AGENT_ID}] Dev dispatch failed: {exc}")
         payload = {"status": "error", "message": str(exc)}
 
     pr_url = payload.get("prUrl", "")
@@ -569,12 +557,13 @@ async def dispatch_dev_agent(state: dict) -> dict:
     log.info("dev dispatch result",
              status=payload.get("status", "?"), pr_url=pr_url,
              branch=branch_name, jira_in_review=jira_in_review)
+    log.a2a("←", "web-dev", status=payload.get("status", "?"), pr_url=pr_url)
     print(
-        f"[team-lead] Dev dispatch result: status={payload.get('status','?')} "
+        f"[{_AGENT_ID}] Dev dispatch result: status={payload.get('status','?')} "
         f"prUrl={pr_url!r} branch={branch_name!r} jiraInReview={jira_in_review}"
     )
     if payload.get("error"):
-        print(f"[team-lead] Dev dispatch error detail: {payload['error']}")
+        print(f"[{_AGENT_ID}] Dev dispatch error detail: {payload['error']}")
 
     return {
         "dev_dispatched": True,
@@ -617,7 +606,7 @@ async def review_result(state: dict) -> dict:
         )
         payload = json.loads(result_str) if result_str else {}
     except Exception as exc:
-        print(f"[team-lead] Code review dispatch failed: {exc}")
+        print(f"[{_AGENT_ID}] Code review dispatch failed: {exc}")
         payload = {"verdict": "error", "message": str(exc)}
 
     verdict = payload.get("verdict", "rejected")
@@ -675,7 +664,7 @@ async def report_success(state: dict) -> dict:
     # Write final-report.json to workspace
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
-        tl_dir = os.path.join(workspace_path, "team_lead")
+        tl_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(tl_dir, exist_ok=True)
         try:
             report_file = os.path.join(tl_dir, "final-report.json")
@@ -695,7 +684,7 @@ async def report_success(state: dict) -> dict:
                     },
                 }, fh, ensure_ascii=False, indent=2)
         except OSError as exc:
-            print(f"[team-lead] Failed to write final-report.json: {exc}")
+            print(f"[{_AGENT_ID}] Failed to write final-report.json: {exc}")
 
     return {
         "report_summary": report_summary,
@@ -902,7 +891,7 @@ def _extract_context_with_llm(jira_context: dict, runtime) -> dict:
     Falls back to regex extraction if runtime is unavailable or LLM call fails.
     """
     if not runtime:
-        print("[team-lead] No runtime available for LLM extraction — using regex fallback")
+        print("[{_AGENT_ID}] No runtime available for LLM extraction — using regex fallback")
         return _extract_urls_from_ticket(jira_context)
 
     from agents.team_lead.prompts.extraction import EXTRACTION_SYSTEM, EXTRACTION_TEMPLATE
@@ -932,10 +921,10 @@ def _extract_context_with_llm(jira_context: dict, runtime) -> dict:
             "tech_stack": extracted.get("tech_stack") or [],
             "feature_description": extracted.get("feature_description") or "",
         }
-        print(f"[team-lead] LLM extraction result: {json.dumps(cleaned, ensure_ascii=False)}")
+        print(f"[{_AGENT_ID}] LLM extraction result: {json.dumps(cleaned, ensure_ascii=False)}")
         return cleaned
     except Exception as exc:
-        print(f"[team-lead] LLM extraction failed ({exc}) — falling back to regex")
+        print(f"[{_AGENT_ID}] LLM extraction failed ({exc}) — falling back to regex")
         return _extract_urls_from_ticket(jira_context)
 
 

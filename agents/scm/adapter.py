@@ -137,6 +137,9 @@ class SCMAgentAdapter(BaseAgent):
                 links = data.get("links", {}).get("self", [])
                 if links:
                     pr_url = links[0].get("href", "")
+                # Fallback: normalized PR dict uses htmlUrl (e.g. when PR already exists)
+                if not pr_url:
+                    pr_url = data.get("htmlUrl", "")
             return {"pr": data, "status": status, "prUrl": pr_url}
 
         if capability == "scm.pr.get":
@@ -319,7 +322,7 @@ class SCMAgentAdapter(BaseAgent):
             ca_bundle = os.environ.get("SCM_CA_BUNDLE", "")
             if ca_bundle and os.path.isfile(ca_bundle):
                 cmd += ["-c", f"http.sslCAInfo={ca_bundle}"]
-            cmd += ["push", "-u", "origin", branch]
+            cmd += ["push", "--force-with-lease", "-u", "origin", branch]
 
             # build_isolated_git_env sets isolated HOME, GIT_CONFIG_GLOBAL, and
             # GIT_CONFIG_NOSYSTEM=1 so macOS Keychain / host ~/.gitconfig are never used.

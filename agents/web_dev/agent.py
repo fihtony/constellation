@@ -11,6 +11,7 @@ ReAct via the runtime for open-ended code generation and repair.
 from __future__ import annotations
 
 import json
+import os
 import threading
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode

@@ -9,8 +9,21 @@ import json
 import os
 from urllib.parse import urlparse
 
+from pathlib import Path as _Path
+
+from framework.config import load_agent_config as _load_agent_cfg
+from framework.devlog import AgentLogger
 from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
+
+# Load agent_id from config.yaml — single source of truth for identity
+_AGENT_ID: str = _load_agent_cfg(
+    _Path(__file__).parent.name.replace("_", "-")
+).get("agent_id", _Path(__file__).parent.name.replace("_", "-"))
+
+
+def _log(task_id: str) -> AgentLogger:
+    return AgentLogger(task_id=task_id, agent_name=_AGENT_ID)
 
 
 def _get_adapter():
@@ -56,16 +69,23 @@ class CloneRepo(BaseTool):
         "properties": {
             "repo_url": {"type": "string", "description": "Git repository URL to clone."},
             "target_path": {"type": "string", "description": "Local filesystem path to clone into."},
+            "task_id": {"type": "string", "description": "Caller task ID for log correlation (optional)."},
         },
         "required": ["repo_url", "target_path"],
     }
 
-    def execute_sync(self, repo_url: str = "", target_path: str = "") -> ToolResult:
+    def execute_sync(self, repo_url: str = "", target_path: str = "", task_id: str = "") -> ToolResult:
+        log = _log(task_id)
+        log.info("clone_repo called", repo_url=repo_url, target_path=target_path)
         adapter = _get_adapter()
         result = adapter._dispatch(
             "scm.repo.clone", "",
             {"metadata": {"repoUrl": repo_url, "targetPath": target_path}},
         )
+        if result.get("error"):
+            log.error("clone_repo failed", error=result["error"])
+        else:
+            log.info("clone_repo ok", target_path=target_path)
         return ToolResult(output=json.dumps(result))
 
 
@@ -74,17 +94,23 @@ class SCMListBranches(BaseTool):
     description = "List remote branches in a repository."
     parameters_schema = {
         "type": "object",
-        "properties": {"repo_url": {"type": "string"}},
+        "properties": {
+            "repo_url": {"type": "string"},
+            "task_id": {"type": "string"},
+        },
         "required": ["repo_url"],
     }
 
-    def execute_sync(self, repo_url: str = "") -> ToolResult:
+    def execute_sync(self, repo_url: str = "", task_id: str = "") -> ToolResult:
+        log = _log(task_id)
+        log.debug("scm_list_branches called", repo_url=repo_url)
         adapter = _get_adapter()
         project, repo = _parse_repo_coordinates(repo_url)
         result = adapter._dispatch(
             "scm.branch.list", f"{project}/{repo}",
             {"metadata": {"project": project, "repo": repo}},
         )
+        log.debug("scm_list_branches result", count=len(result.get("branches", [])))
         return ToolResult(output=json.dumps(result))
 
 
@@ -96,16 +122,23 @@ class SCMPush(BaseTool):
         "properties": {
             "repo_path": {"type": "string", "description": "Local repo directory."},
             "branch": {"type": "string", "description": "Branch name to push."},
+            "task_id": {"type": "string"},
         },
         "required": ["repo_path", "branch"],
     }
 
-    def execute_sync(self, repo_path: str = "", branch: str = "") -> ToolResult:
+    def execute_sync(self, repo_path: str = "", branch: str = "", task_id: str = "") -> ToolResult:
+        log = _log(task_id)
+        log.info("scm_push called", repo_path=repo_path, branch=branch)
         adapter = _get_adapter()
         result = adapter._dispatch(
             "scm.branch.push", "",
             {"metadata": {"repoPath": repo_path, "branch": branch}},
         )
+        if result.get("error"):
+            log.error("scm_push failed", error=result["error"])
+        else:
+            log.info("scm_push ok", branch=branch)
         return ToolResult(output=json.dumps(result))
 
 
@@ -120,6 +153,7 @@ class SCMCreatePR(BaseTool):
             "target_branch": {"type": "string"},
             "title": {"type": "string"},
             "description": {"type": "string"},
+            "task_id": {"type": "string"},
         },
         "required": ["repo_url", "source_branch", "title", "description"],
     }
@@ -131,7 +165,12 @@ class SCMCreatePR(BaseTool):
         target_branch: str = "main",
         title: str = "",
         description: str = "",
+        task_id: str = "",
     ) -> ToolResult:
+        log = _log(task_id)
+        log.info("scm_create_pr called",
+                 repo_url=repo_url, source_branch=source_branch, target_branch=target_branch,
+                 title=title[:80])
         adapter = _get_adapter()
         project, repo = _parse_repo_coordinates(repo_url)
         result = adapter._dispatch(
@@ -147,6 +186,11 @@ class SCMCreatePR(BaseTool):
                 }
             },
         )
+        pr_url = result.get("prUrl", result.get("url", ""))
+        if result.get("error"):
+            log.error("scm_create_pr failed", error=result["error"])
+        else:
+            log.info("scm_create_pr ok", pr_url=pr_url)
         return ToolResult(output=json.dumps(result))
 
 

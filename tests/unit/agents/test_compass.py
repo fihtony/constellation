@@ -188,10 +188,14 @@ class TestCompassAgent:
         assert any("dispatched" in a["parts"][0]["text"].lower() for a in artifacts)
         # Direct dispatch should NOT call run_agentic
         runtime.run_agentic.assert_not_called()
-        mock_reg.execute_sync.assert_called_once_with(
-            "dispatch_development_task",
-            {"task_description": "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2", "jira_key": "CSTL-2"},
-        )
+        mock_reg.execute_sync.assert_called_once()
+        call_args = mock_reg.execute_sync.call_args
+        assert call_args[0][0] == "dispatch_development_task"
+        payload = call_args[0][1]
+        assert payload["task_description"] == "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2"
+        assert payload["jira_key"] == "CSTL-2"
+        assert "orchestratorTaskId" in payload
+        assert "workspacePath" in payload
 
     async def test_handles_office_task(self):
         """Office tasks are dispatched directly via registry (not run_agentic)."""
