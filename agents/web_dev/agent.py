@@ -152,6 +152,8 @@ class WebDevAgent(BaseAgent):
             "context_manifest_path": metadata.get("contextManifestPath", ""),
             "jira_files": metadata.get("jiraFiles", []),
             "design_files": metadata.get("designFiles", []),
+            "tech_stack": metadata.get("techStack", []),
+            "stitch_screen_name": metadata.get("stitchScreenName", ""),
             "task_type": metadata.get("taskType", "general"),
             "analysis": metadata.get("analysis", ""),
             "revision_feedback": metadata.get("revisionFeedback", ""),

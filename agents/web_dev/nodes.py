@@ -432,17 +432,52 @@ async def setup_workspace(state: dict) -> dict:
 async def analyze_task(state: dict) -> dict:
     """Understand requirements and produce an implementation plan.
 
-    Reuses the analysis already provided by Team Lead (via state["analysis"]).
+    Loads delivery-plan.json from the workspace (written by Team Lead) when
+    available, and merges it with the analysis already passed in state.
     Falls back to a simple echo of the user request when nothing is provided.
     """
-    print("[web-dev] analyze_task: reusing Team Lead analysis")
-    # Team Lead already performed deep analysis — reuse it
-    plan = state.get("analysis") or state.get("user_request", "")
+    import time as _time
+    print("[web-dev] analyze_task: building implementation plan")
+
+    workspace_path = state.get("workspace_path", "")
+    analysis = state.get("analysis") or state.get("user_request", "")
+
+    # Try to load Team Lead's delivery-plan.json for structured plan data
+    delivery_plan: dict = {}
+    if workspace_path:
+        plan_path = os.path.join(workspace_path, "team_lead", "delivery-plan.json")
+        try:
+            with open(plan_path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+                delivery_plan = doc.get("data", doc)
+                print(f"[web-dev] Loaded delivery-plan.json from {plan_path}")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Build rich plan string
+    plan_parts = []
+    if analysis:
+        plan_parts.append(analysis)
+    if delivery_plan:
+        plan_parts.append(f"\nDelivery plan:\n{json.dumps(delivery_plan, indent=2, ensure_ascii=False)}")
+
+    # Also load Jira ticket for acceptance criteria
+    if workspace_path:
+        jira_path = os.path.join(workspace_path, "team_lead", "jira-ticket.json")
+        try:
+            with open(jira_path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+                jira_data = doc.get("data", doc)
+                summary = jira_data.get("summary", "") or (jira_data.get("fields") or {}).get("summary", "")
+                if summary:
+                    plan_parts.append(f"\nJira ticket summary: {summary}")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    plan = "\n".join(plan_parts) if plan_parts else analysis
 
     # Write implementation-plan.json to workspace for auditability
-    workspace_path = state.get("workspace_path", "")
     if workspace_path:
-        import time as _time
         agent_dir = os.path.join(workspace_path, "web-agent")
         os.makedirs(agent_dir, exist_ok=True)
         try:
@@ -454,7 +489,10 @@ async def analyze_task(state: dict) -> dict:
                         "step": "analyze_task",
                         "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     },
-                    "data": {"implementation_plan": plan},
+                    "data": {
+                        "implementation_plan": plan,
+                        "delivery_plan_loaded": bool(delivery_plan),
+                    },
                 }, fh, ensure_ascii=False, indent=2)
         except OSError:
             pass
@@ -528,6 +566,8 @@ async def implement_changes(state: dict) -> dict:
         user_request=state.get("user_request", ""),
         repo_path=state.get("repo_path", ""),
         branch_name=state.get("branch_name", "feature/task"),
+        tech_stack=", ".join(state.get("tech_stack") or []) or "not specified",
+        stitch_screen_name=state.get("stitch_screen_name", "not specified"),
         repo_files=_repo_files_section,
         implementation_plan=impl_plan,
         jira_context=jira_for_prompt,
@@ -537,35 +577,31 @@ async def implement_changes(state: dict) -> dict:
         memory_context=state.get("memory_context", ""),
     )
 
-    # Restrict to code I/O tools only — Jira/SCM-PR tools cause distraction
-    _IMPLEMENT_TOOLS = [
-        "read_file", "write_file", "edit_file", "run_command",
-        "glob", "grep", "search_code",
-    ]
-    print(f"[web-dev] implement_changes: repo_path={state.get('repo_path', '')!r} tools={_IMPLEMENT_TOOLS}")
+    # Use Claude Code native tools (Bash, Read, Write, Glob, Grep) — no constellation
+    # MCP bridge needed.  With cwd=repo_path, all relative paths resolve correctly.
+    print(f"[web-dev] implement_changes: repo_path={state.get('repo_path', '')!r} (native tools)")
     result = runtime.run_agentic(
         task=prompt,
         system_prompt=IMPLEMENT_SYSTEM,
         cwd=state.get("repo_path") or None,
-        tools=_IMPLEMENT_TOOLS,
-        max_turns=40,
-        timeout=900,
+        tools=None,
+        max_turns=50,
+        timeout=1800,
         plugin_manager=state.get("_plugin_manager"),
     )
-    print(f"[web-dev] implement_changes done: success={result.success} turns={result.turns_used} changes={len(result.tool_calls)} summary={result.summary[:300]!r}")
+    print(f"[web-dev] implement_changes done: success={result.success} turns={result.turns_used} summary={result.summary[:300]!r}")
 
-    # Extract changed file names from tool_calls log
-    changes_made = sorted({
-        tc["arguments"] if isinstance(tc["arguments"], str)
-        else json.dumps(tc.get("arguments", {}))
-        for tc in result.tool_calls
-        if tc.get("tool") in {"write_file", "edit_file", "write_local_file", "edit_local_file"}
-    })
+    if not result.success:
+        raise RuntimeError(
+            f"implement_changes failed — claude-code returned error: {result.summary[:500]}"
+        )
 
+    # With native tools, we can't track individual file writes from tool_calls.
+    # changes_made is populated from git diff in create_pr via _git_commit_all_pending.
     return {
-        "changes_made": changes_made,
+        "changes_made": [],
         "implementation_summary": result.summary,
-        "agentic_success": result.success,
+        "agentic_success": True,
     }
 
 
@@ -606,23 +642,21 @@ async def run_tests(state: dict) -> dict:
         task=(
             "Run the project's test suite and report results.\n"
             "MANDATORY pre-flight steps (in order):\n"
-            "1. Check if package.json exists in the repo root.\n"
-            "   If yes: run_command('npm install', cwd=<repo_path>) to install dependencies.\n"
+            f"1. Change into the repo directory: {repo_path}\n"
+            "2. If package.json exists: run `npm install` to install dependencies.\n"
             "   If npm install fails (e.g. package not found), read the error,\n"
             "   remove the invalid package from package.json, and re-run npm install.\n"
-            "2. Run build to verify no compilation errors:\n"
-            "   run_command('npm run build', cwd=<repo_path>)\n"
+            "3. Run build to verify no compilation errors: `npm run build`\n"
             "   If build fails, fix the error first.\n"
-            "3. Detect the test runner (vitest, jest, pytest, mvn test, gradle test, etc.).\n"
-            "4. Run tests with verbose output.\n"
-            "5. Return a JSON summary: "
+            "4. Detect the test runner (vitest, jest, pytest, mvn test, gradle test, etc.).\n"
+            "5. Run tests with verbose output.\n"
+            "6. Return a JSON summary: "
             '{"passed": N, "failed": N, "errors": [...], "output": "...last 50 lines..."}'
         ),
         cwd=repo_path or None,
-        # Only expose shell/file tools — no Jira/SCM schemas to keep payload small
-        tools=["run_command", "read_file", "write_file", "edit_file", "glob"],
-        max_turns=12,
-        timeout=240,
+        tools=None,
+        max_turns=15,
+        timeout=600,
         plugin_manager=state.get("_plugin_manager"),
     )
 
@@ -701,10 +735,9 @@ async def fix_tests(state: dict) -> dict:
         task=prompt,
         system_prompt=FIX_SYSTEM,
         cwd=state.get("repo_path") or None,
-        # Only code editing tools — keep payload small
-        tools=["run_command", "read_file", "write_file", "edit_file", "glob", "grep", "search_code"],
-        max_turns=15,
-        timeout=300,
+        tools=None,
+        max_turns=20,
+        timeout=600,
         plugin_manager=state.get("_plugin_manager"),
     )
 
@@ -1099,7 +1132,24 @@ async def create_pr(state: dict) -> dict:
         if isinstance(jira_ctx, dict) else ""
     )
 
-    # Step 1: Generate PR description (single-shot LLM)
+    # Step 1: Commit any pending files and resolve the full changeset FIRST.
+    # This must happen before PR description generation (which needs changed_files)
+    # and before push (which needs commits to exist).
+    repo_path = state.get("repo_path", "")
+    repo_url = state.get("repo_url", "")
+    branch_name = state.get("branch_name", "feature/task")
+
+    committed_files = _git_commit_all_pending(repo_path, jira_key or "task")
+    existing_changes = state.get("changes_made", [])
+    all_changes = sorted(set(existing_changes) | set(committed_files))
+
+    if not all_changes:
+        raise RuntimeError(
+            f"[web-dev] create_pr: No file changes detected on branch {branch_name!r}. "
+            "implement_changes produced 0 commits — cannot create a PR against main."
+        )
+
+    # Step 2: Generate PR description (single-shot LLM)
     _assessment = state.get("self_assessment", {})
     _test_results = state.get("test_results", {})
     _screenshots = state.get("screenshots", [])
@@ -1110,7 +1160,7 @@ async def create_pr(state: dict) -> dict:
             _jira_url = _jira_ctx.get("url", "") or f"https://tarch.atlassian.net/browse/{jira_key}"
     desc_prompt = PR_DESCRIPTION_TEMPLATE.format(
         user_request=state.get("user_request", ""),
-        branch_name=state.get("branch_name", "feature/task"),
+        branch_name=branch_name,
         jira_key=jira_key or "N/A",
         jira_url=_jira_url or "N/A",
         implementation_summary=state.get("implementation_summary", ""),
@@ -1128,19 +1178,9 @@ async def create_pr(state: dict) -> dict:
     pr_title = pr_meta.get("title", "Implement task changes")
     pr_description = pr_meta.get("description", state.get("implementation_summary", ""))
 
-    # Step 2: Push branch then create PR via SCM boundary tools (not open agentic).
+    # Step 3: Push branch then create PR via SCM boundary tools (not open agentic).
     # Design doc §4.3: Dev Agent must use scm.branch.push + scm.pr.create
     # through the SCM Agent boundary; never direct git push or GitHub API.
-    repo_path = state.get("repo_path", "")
-    repo_url = state.get("repo_url", "")
-    branch_name = state.get("branch_name", "feature/task")
-
-    # Deterministic commit: stage ALL pending changes before push so files
-    # written by the agentic implement_changes loop are not left untracked.
-    committed_files = _git_commit_all_pending(repo_path, jira_key or "task")
-    # Merge with changes tracked from tool_calls (union of both sources)
-    existing_changes = state.get("changes_made", [])
-    all_changes = sorted(set(existing_changes) | set(committed_files))
 
     push_payload = _call_boundary_tool(
         state, "scm_push", {"repo_path": repo_path, "branch": branch_name}

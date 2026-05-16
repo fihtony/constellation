@@ -285,6 +285,14 @@ class DispatchWebDev(BaseTool):
                 "type": "array",
                 "description": "Design context file paths. Optional.",
             },
+            "tech_stack": {
+                "type": "array",
+                "description": "List of technologies extracted from Jira ticket (e.g. ['react', 'typescript']). Optional.",
+            },
+            "stitch_screen_name": {
+                "type": "string",
+                "description": "Target Stitch screen name to implement (e.g. 'Lesson Library'). Optional.",
+            },
             "revision_feedback": {
                 "type": "string",
                 "description": "Code review rejection reason for revision. Optional.",
@@ -308,6 +316,8 @@ class DispatchWebDev(BaseTool):
         context_manifest_path: str = "",
         jira_files: list | None = None,
         design_files: list | None = None,
+        tech_stack: list | None = None,
+        stitch_screen_name: str = "",
         revision_feedback: str = "",
         definition_of_done: dict | None = None,
     ) -> ToolResult:
@@ -329,6 +339,10 @@ class DispatchWebDev(BaseTool):
             meta["jiraFiles"] = jira_files
         if design_files:
             meta["designFiles"] = design_files
+        if tech_stack:
+            meta["techStack"] = tech_stack
+        if stitch_screen_name:
+            meta["stitchScreenName"] = stitch_screen_name
         if revision_feedback:
             meta["revisionFeedback"] = revision_feedback
         if definition_of_done:

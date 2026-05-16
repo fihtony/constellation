@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -46,6 +47,9 @@ async def receive_task(state: dict) -> dict:
         "repo_url": state.get("repo_url", ""),
         "figma_url": state.get("figma_url", ""),
         "stitch_project_id": state.get("stitch_project_id", ""),
+        "stitch_screen_id": state.get("stitch_screen_id", ""),
+        "stitch_screen_name": state.get("stitch_screen_name", ""),
+        "tech_stack": state.get("tech_stack") or [],
         "revision_count": 0,
         "max_revisions": 3,
     }
@@ -152,6 +156,66 @@ async def gather_context(state: dict) -> dict:
         except Exception as exc:
             print(f"[team-lead] Jira fetch failed: {exc} (continuing without Jira context)")
 
+    # Extract embedded URLs / IDs from Jira ticket content using LLM, falling back to regex.
+    figma_url = state.get("figma_url", "")
+    stitch_id = state.get("stitch_project_id", "")
+    stitch_screen_id = state.get("stitch_screen_id", "")
+    stitch_screen_name = state.get("stitch_screen_name", "")
+    tech_stack: list = state.get("tech_stack") or []
+    repo_url = state.get("repo_url", "")
+    extracted_context: dict = {}
+    if jira_context:
+        runtime = state.get("_runtime")
+        extracted = _extract_context_with_llm(jira_context, runtime)
+        extracted_context = extracted
+        if not repo_url and extracted.get("repo_url"):
+            repo_url = extracted["repo_url"]
+            print(f"[team-lead] Extracted repo_url from Jira ticket: {repo_url}")
+        if not figma_url and extracted.get("figma_url"):
+            figma_url = extracted["figma_url"]
+            print(f"[team-lead] Extracted figma_url from Jira ticket: {figma_url}")
+        if not stitch_id and extracted.get("stitch_project_id"):
+            stitch_id = extracted["stitch_project_id"]
+            print(f"[team-lead] Extracted stitch_project_id from Jira ticket: {stitch_id}")
+        if not stitch_screen_id and extracted.get("stitch_screen_id"):
+            stitch_screen_id = extracted["stitch_screen_id"]
+            print(f"[team-lead] Extracted stitch_screen_id from Jira ticket: {stitch_screen_id}")
+        if not stitch_screen_name and extracted.get("stitch_screen_name"):
+            stitch_screen_name = extracted["stitch_screen_name"]
+            print(f"[team-lead] Extracted stitch_screen_name from Jira ticket: {stitch_screen_name}")
+        if not tech_stack and extracted.get("tech_stack"):
+            tech_stack = extracted["tech_stack"]
+            print(f"[team-lead] Extracted tech_stack from Jira ticket: {tech_stack}")
+
+    # Save LLM-extracted context to workspace for traceability
+    if extracted_context and workspace_path:
+        tl_dir = os.path.join(workspace_path, "team_lead")
+        os.makedirs(tl_dir, exist_ok=True)
+        extraction_file = os.path.join(tl_dir, "jira-context-extracted.json")
+        try:
+            with open(extraction_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": "team-lead",
+                        "step": "gather_context_extraction",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    },
+                    "data": extracted_context,
+                }, fh, ensure_ascii=False, indent=2)
+            print(f"[team-lead] Saved jira-context-extracted.json to {extraction_file}")
+        except OSError as exc:
+            print(f"[team-lead] Failed to write jira-context-extracted.json: {exc}")
+
+    # Env var fallbacks (applied after extraction, before design fetch)
+    if not repo_url:
+        repo_url = os.environ.get("SCM_REPO_URL", "")
+    if not stitch_id:
+        stitch_id = os.environ.get("STITCH_PROJECT_ID", "")
+    if not stitch_screen_id:
+        stitch_screen_id = os.environ.get("STITCH_SCREEN_ID", "")
+    if not figma_url:
+        figma_url = os.environ.get("FIGMA_FILE_URL", "")
+
     # Write Jira ticket to workspace
     if jira_context and workspace_path:
         tl_dir = os.path.join(workspace_path, "team_lead")
@@ -172,9 +236,6 @@ async def gather_context(state: dict) -> dict:
             print(f"[team-lead] Failed to write jira-ticket.json: {exc}")
 
     # Fetch design context if URL provided and not already present
-    figma_url = state.get("figma_url", "")
-    stitch_id = state.get("stitch_project_id", "")
-    stitch_screen_id = state.get("stitch_screen_id", "")
     if (figma_url or stitch_id) and not design_context:
         try:
             args: dict[str, str] = {}
@@ -234,8 +295,11 @@ async def gather_context(state: dict) -> dict:
         except Exception as exc:
             print(f"[team-lead] Design HTML download failed (non-fatal): {exc}")
 
-    # Derive repo name from URL
-    repo_url = state.get("repo_url", "")
+    # Derive repo name from URL — validate it's a real SCM URL first
+    _scm_hosts = ("github.com", "bitbucket.org", "gitlab.com", "dev.azure.com")
+    if repo_url and not any(h in repo_url for h in _scm_hosts):
+        print(f"[team-lead] Ignoring non-SCM repo_url: {repo_url!r}; falling back to SCM_REPO_URL env var")
+        repo_url = os.environ.get("SCM_REPO_URL", "")
     repo_name = ""
     if repo_url:
         parts = [p for p in repo_url.rstrip("/").split("/") if p]
@@ -307,6 +371,12 @@ async def gather_context(state: dict) -> dict:
     return {
         "jira_context": jira_context,
         "design_context": design_context,
+        "repo_url": repo_url,
+        "figma_url": figma_url,
+        "stitch_project_id": stitch_id,
+        "stitch_screen_id": stitch_screen_id,
+        "stitch_screen_name": stitch_screen_name,
+        "tech_stack": tech_stack,
         "repo_name": repo_name,
         "repo_path": repo_path,
         "repo_cloned": repo_cloned,
@@ -416,6 +486,8 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "context_manifest_path": state.get("context_manifest_path", ""),
                 "jira_files": state.get("jira_files", []),
                 "design_files": state.get("design_files", []),
+                "tech_stack": state.get("tech_stack") or [],
+                "stitch_screen_name": state.get("stitch_screen_name", ""),
                 "revision_feedback": revision_feedback,
                 "definition_of_done": state.get("plan", {}).get("definition_of_done", {
                     "build_must_pass": True,
@@ -631,6 +703,14 @@ def _build_dev_brief(state: dict) -> str:
     if analysis:
         parts.append(f"\nAnalysis:\n{analysis}")
 
+    # Extracted context summary (tech stack, screen name)
+    tech_stack = state.get("tech_stack") or []
+    stitch_screen_name = state.get("stitch_screen_name", "")
+    if tech_stack:
+        parts.append(f"\nTech stack: {', '.join(tech_stack)}")
+    if stitch_screen_name:
+        parts.append(f"\nTarget screen name: {stitch_screen_name}")
+
     plan = state.get("plan", {})
     if plan:
         parts.append(f"\nPlan:\n{json.dumps(plan, indent=2, ensure_ascii=False)}")
@@ -679,5 +759,121 @@ async def handle_question(state: dict) -> dict:
     # MVP: always escalate
     return {"route": "user_needed", "escalation_reason": "Clarification needed from user."}
 
+
+# ---------------------------------------------------------------------------
+# URL extraction helpers
+# ---------------------------------------------------------------------------
+
+def _jira_to_text(jira_context: dict) -> str:
+    """Flatten Jira ticket dict into a single searchable text blob."""
+    parts = []
+    for key in ("key", "summary", "url"):
+        if jira_context.get(key):
+            parts.append(str(jira_context[key]))
+    fields = jira_context.get("fields", jira_context)
+    for _k, val in fields.items():
+        if isinstance(val, str):
+            parts.append(val)
+        elif isinstance(val, dict):
+            parts.append(json.dumps(val))
+        elif isinstance(val, list):
+            parts.append(" ".join(str(v) for v in val))
+    return "\n".join(parts)
+
+
+def _extract_urls_from_ticket(jira_context: dict) -> dict:
+    """Extract GitHub, Stitch, and Figma URLs from a Jira ticket dict (regex fallback)."""
+    text = _jira_to_text(jira_context)
+    result: dict = {}
+
+    # GitHub repo URL (stop before /issues, /pulls, /tree, /blob, /commit paths)
+    repo_match = re.search(
+        r'https?://github\.com/([\w.-]+/[\w.-]+?)(?:/(?:issues|pulls|tree|blob|commit|compare|releases)|\s|$)',
+        text,
+    )
+    if repo_match:
+        result["repo_url"] = f"https://github.com/{repo_match.group(1)}".rstrip("/")
+
+    # Figma file/design URL
+    figma_match = re.search(
+        r'https?://(?:www\.)?figma\.com/(?:file|design)/([\w-]+[^\s]*)',
+        text,
+    )
+    if figma_match:
+        result["figma_url"] = figma_match.group(0).rstrip("/")
+
+    # Google Stitch: prefer full URL, fall back to bare project ID in text
+    stitch_match = re.search(
+        r'https?://stitch\.withgoogle\.com/projects/(\d+)',
+        text,
+    )
+    if stitch_match:
+        result["stitch_project_id"] = stitch_match.group(1)
+        # Screen ID: 32-char hex string that appears after the project URL
+        after_stitch = text[stitch_match.end():]
+        screen_match = re.search(r'\b([a-f0-9]{32})\b', after_stitch)
+        if screen_match:
+            result["stitch_screen_id"] = screen_match.group(1)
+    else:
+        # Fallback: bare project ID in ticket text (e.g. "ID: 13629074018280446337")
+        bare_id_match = re.search(
+            r'(?:stitch|project)[^:]*ID[:\s]+(\d{15,20})',
+            text, re.IGNORECASE,
+        )
+        if bare_id_match:
+            result["stitch_project_id"] = bare_id_match.group(1)
+        # Screen ID: 32-char hex anywhere in the text
+        if "stitch_project_id" in result:
+            screen_match = re.search(r'\b([a-f0-9]{32})\b', text)
+            if screen_match:
+                result["stitch_screen_id"] = screen_match.group(1)
+
+    return result
+
+
+def _extract_context_with_llm(jira_context: dict, runtime) -> dict:
+    """Use LLM to extract structured context from a Jira ticket.
+
+    Returns a dict with keys: repo_url, stitch_project_id, stitch_screen_id,
+    stitch_screen_name, figma_url, tech_stack, feature_description.
+
+    Falls back to regex extraction if runtime is unavailable or LLM call fails.
+    """
+    if not runtime:
+        print("[team-lead] No runtime available for LLM extraction — using regex fallback")
+        return _extract_urls_from_ticket(jira_context)
+
+    from agents.team_lead.prompts.extraction import EXTRACTION_SYSTEM, EXTRACTION_TEMPLATE
+
+    jira_text = _jira_to_text(jira_context)
+    prompt = EXTRACTION_TEMPLATE.format(jira_text=jira_text[:4000])
+
+    try:
+        result = runtime.run(
+            prompt=prompt,
+            system_prompt=EXTRACTION_SYSTEM,
+            max_tokens=512,
+        )
+        raw = (result.get("raw_response") or "").strip()
+        # Strip markdown code fences if present
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        extracted = json.loads(raw)
+
+        # Normalize: convert null / None to empty defaults
+        cleaned = {
+            "repo_url": extracted.get("repo_url") or "",
+            "stitch_project_id": str(extracted.get("stitch_project_id") or ""),
+            "stitch_screen_id": str(extracted.get("stitch_screen_id") or ""),
+            "stitch_screen_name": extracted.get("stitch_screen_name") or "",
+            "figma_url": extracted.get("figma_url") or "",
+            "tech_stack": extracted.get("tech_stack") or [],
+            "feature_description": extracted.get("feature_description") or "",
+        }
+        print(f"[team-lead] LLM extraction result: {json.dumps(cleaned, ensure_ascii=False)}")
+        return cleaned
+    except Exception as exc:
+        print(f"[team-lead] LLM extraction failed ({exc}) — falling back to regex")
+        return _extract_urls_from_ticket(jira_context)
 
 
