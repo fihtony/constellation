@@ -234,9 +234,9 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
     ) -> dict:
         cli = _find_claude_cli()
         if not cli:
-            return self.build_failure_result(
-                "claude-code: 'claude' CLI not found in PATH",
-                backend_used="claude-code",
+            raise RuntimeError(
+                "claude-code: 'claude' CLI not found in PATH. "
+                "Install Claude Code CLI and authenticate with 'claude' before running."
             )
 
         full_prompt = self.build_prompt(
@@ -295,10 +295,9 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
         """
         cli = _find_claude_cli()
         if not cli:
-            return AgenticResult(
-                success=False,
-                summary="claude-code: 'claude' CLI not found in PATH",
-                backend_used="claude-code",
+            raise RuntimeError(
+                "claude-code: 'claude' CLI not found in PATH. "
+                "Install Claude Code CLI and authenticate with 'claude' before running."
             )
 
         model_id = _effective_model(None)

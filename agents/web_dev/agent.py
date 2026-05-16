@@ -159,6 +159,12 @@ class WebDevAgent(BaseAgent):
             "revision_feedback": metadata.get("revisionFeedback", ""),
             "definition_of_done": metadata.get("definitionOfDone", {}),
             "test_cycles": 0,
+            # max_test_cycles: can be set by caller via metadata, else uses env default.
+            # WEB_DEV_MAX_TEST_CYCLES env var (default 3) controls production cycles.
+            # Set to 2 in tests/.env for faster E2E runs.
+            "max_test_cycles": metadata.get("maxTestCycles") or int(
+                os.environ.get("WEB_DEV_MAX_TEST_CYCLES", "3")
+            ),
             "metadata": metadata,
             # Populate _allowed_tools from the permission engine so run_agentic
             # only exposes the development-profile tool list to the LLM, rather
@@ -184,8 +190,8 @@ class WebDevAgent(BaseAgent):
 
                 config = self._build_run_config(
                     task.id,
-                    max_steps=30,
-                    timeout_seconds=600,
+                    max_steps=50,
+                    timeout_seconds=int(os.environ.get("WEB_DEV_WORKFLOW_TIMEOUT", "7200")),
                 )
                 result = loop.run_until_complete(
                     self._compiled_workflow.invoke(state, config)

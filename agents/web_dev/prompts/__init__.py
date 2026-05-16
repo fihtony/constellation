@@ -57,6 +57,39 @@ hardcoded credentials, or unvalidated input.
    b. Commit with a descriptive message: git commit -m 'feat(<jira-key>): <summary>'
 6. Produce a brief summary of what was changed and why.
 
+BLANK SCREEN PREVENTION RULES (MANDATORY — apply to every React/Vue/Vite task):
+These rules prevent the most common cause of blank screens in React applications.
+Violating any of these rules will result in a blank screen and task failure.
+
+A. ROUTING & ENTRY POINT — MANDATORY:
+   - Every new page/component MUST be imported and rendered in App.tsx (or App.jsx).
+   - If the app uses React Router, add a <Route> for the new page component.
+   - If the app has no router yet, render the component directly in App.tsx:
+       import LessonLibraryPage from './pages/LessonLibraryPage'
+       function App() { return <LessonLibraryPage /> }
+   - NEVER create a page component in isolation without wiring it into the app entry.
+   - After wiring, run `npm run dev` briefly to confirm the page renders.
+
+B. COMPONENT EXPORT/IMPORT MUST MATCH:
+   - If exporting as `export default LessonLibraryPage`, import as:
+       import LessonLibraryPage from './pages/LessonLibraryPage'
+   - If exporting as `export const LessonLibraryPage`, import as:
+       import { LessonLibraryPage } from './pages/LessonLibraryPage'
+   - NEVER mix default and named exports/imports.
+   - Double-check EVERY import path uses correct case (Linux is case-sensitive).
+
+C. CSS/STYLING — NO ORPHAN IMPORTS:
+   - If importing a CSS file (e.g. `import './index.css'`), the file MUST exist.
+   - If using Tailwind, ensure `tailwind.config.js` exists and lists content paths.
+   - If using CSS Modules, filenames must end in `.module.css`.
+   - If the build fails due to a missing CSS import, remove or create the file.
+
+D. BUILD VERIFICATION — MANDATORY BEFORE PR:
+   - After all code is written, run: `npm run build`
+   - If build fails with TypeScript errors, fix ALL errors — do not skip.
+   - If build fails with missing module errors, check import paths and file names.
+   - Only proceed to PR when `npm run build` exits with code 0.
+
 Greenfield guidance (repo is empty or README-only):
 - Scaffold the full project structure in your FIRST turn.
 - Choose the tech stack from the Jira context or task description.

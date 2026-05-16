@@ -49,30 +49,120 @@ class TestCompassDefinition:
 class TestCompassClassification:
     """Unit tests for the heuristic + LLM classification helper."""
 
+    # ---------------------------------------------------------------
+    # Development tasks
+    # ---------------------------------------------------------------
     def test_jira_url_with_implement(self):
         assert _classify_request(
             "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2", None
         ) == "development"
 
-    def test_jira_key_with_fix(self):
+    def test_jira_key_with_fix_bug(self):
         assert _classify_request("Fix bug in ABC-123", None) == "development"
 
-    def test_jira_key_alone(self):
-        # Has a Jira key but no action keyword — falls back to LLM (runtime=None → general)
-        result = _classify_request("CSTL-2", None)
-        # Without runtime, should still try LLM (fails gracefully) → general
+    def test_jira_key_with_create_pr(self):
+        assert _classify_request("please create pr for PROJ-99", None) == "development"
+
+    def test_jira_url_with_code_review(self):
+        assert _classify_request(
+            "do a code review for https://jira.company.com/browse/ENG-42", None
+        ) == "development"
+
+    def test_jira_url_with_refactor(self):
+        assert _classify_request(
+            "refactor the auth module https://company.atlassian.net/browse/AUTH-5", None
+        ) == "development"
+
+    def test_implement_ticket_phrase(self):
+        assert _classify_request(
+            "implement the jira ticket https://tarch.atlassian.net/browse/CSTL-3", None
+        ) == "development"
+
+    def test_write_unit_tests(self):
+        # Has strong dev action without Jira key — goes to LLM (runtime=None → general),
+        # but the heuristic covers "write tests" only with a Jira key. Accepted.
+        result = _classify_request("write unit tests for payment service", None)
         assert result in ("development", "general")
 
-    def test_office_signal(self):
-        assert _classify_request("Summarize the PDF", None) == "office"
+    def test_jira_key_alone(self):
+        # Has a Jira key but no action keyword — falls through to LLM (runtime=None → general)
+        result = _classify_request("CSTL-2", None)
+        assert result in ("development", "general")
 
+    def test_lllm_fallback_returns_development(self):
+        """When LLM returns 'development', classification follows."""
+        mock_runtime = MagicMock()
+        mock_runtime.run.return_value = {"raw_response": "development"}
+        result = _classify_request("write unit tests for the user service", mock_runtime)
+        assert result == "development"
+
+    def test_llm_fallback_returns_development_with_noise(self):
+        """LLM may include extra whitespace/punctuation — still parsed correctly."""
+        mock_runtime = MagicMock()
+        mock_runtime.run.return_value = {"raw_response": "  development\n"}
+        result = _classify_request("help me set up docker compose", mock_runtime)
+        assert result == "development"
+
+    def test_llm_fallback_returns_office(self):
+        mock_runtime = MagicMock()
+        mock_runtime.run.return_value = {"raw_response": "office"}
+        result = _classify_request("please process my documents", mock_runtime)
+        assert result == "office"
+
+    # ---------------------------------------------------------------
+    # Office tasks
+    # ---------------------------------------------------------------
+    def test_office_summarize_pdf(self):
+        assert _classify_request("summarize the pdf in my downloads folder", None) == "office"
+
+    def test_office_organize_files(self):
+        assert _classify_request("organize files in /home/user/docs", None) == "office"
+
+    def test_office_analyze_spreadsheet(self):
+        assert _classify_request("analyze the spreadsheet /data/sales.xlsx", None) == "office"
+
+    # ---------------------------------------------------------------
+    # General tasks
+    # ---------------------------------------------------------------
     def test_general_question(self):
         assert _classify_request("What is Python?", None) == "general"
 
+    def test_general_greeting(self):
+        assert _classify_request("Hello, what can you do?", None) == "general"
+
+    def test_general_explanation(self):
+        assert _classify_request("explain how JWT authentication works", None) == "general"
+
+    def test_general_empty(self):
+        assert _classify_request("", None) == "general"
+
+    # ---------------------------------------------------------------
+    # LLM failure graceful degradation
+    # ---------------------------------------------------------------
+    def test_llm_failure_falls_back_to_general(self):
+        mock_runtime = MagicMock()
+        mock_runtime.run.side_effect = RuntimeError("LLM offline")
+        result = _classify_request("what should I do today?", mock_runtime)
+        assert result == "general"
+
+    def test_llm_unexpected_output_falls_back_to_general(self):
+        mock_runtime = MagicMock()
+        mock_runtime.run.return_value = {"raw_response": "UNKNOWN_CATEGORY"}
+        result = _classify_request("some ambiguous request", mock_runtime)
+        assert result == "general"
+
+    # ---------------------------------------------------------------
+    # Jira key extraction
+    # ---------------------------------------------------------------
     def test_extract_jira_key(self):
         assert _extract_jira_key("implement https://jira.example.com/browse/PROJ-42") == "PROJ-42"
         assert _extract_jira_key("Fix ABC-123 please") == "ABC-123"
         assert _extract_jira_key("no jira here") == ""
+
+    def test_extract_jira_key_from_url(self):
+        assert _extract_jira_key(
+            "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2"
+        ) == "CSTL-2"
 
 
 class TestCompassAgent:

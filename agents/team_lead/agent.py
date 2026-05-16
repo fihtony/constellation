@@ -184,7 +184,7 @@ class TeamLeadAgent(BaseAgent):
                 config = self._build_run_config(
                     task.id,
                     max_steps=50,
-                    timeout_seconds=900,
+                    timeout_seconds=3600,
                 )
                 result = loop.run_until_complete(
                     self._compiled_workflow.invoke(state, config)
@@ -256,7 +256,7 @@ class TeamLeadAgent(BaseAgent):
         task_store.resume_task(task_id)
 
         if self._compiled_workflow and self.checkpoint_service:
-            config = self._build_run_config(task_id, max_steps=50, timeout_seconds=900)
+            config = self._build_run_config(task_id, max_steps=50, timeout_seconds=3600)
             try:
                 result = await self._compiled_workflow.resume(config, resume_value)
                 summary = (
@@ -410,6 +410,11 @@ def _register_team_lead_dispatch(team_lead_agent: "TeamLeadAgent") -> None:
                 if m:
                     jira_key = m.group(0)
 
+            # Validate repo_url is a real SCM host, not a Jira URL
+            _scm_hosts = ("github.com", "bitbucket.org", "gitlab.com", "dev.azure.com")
+            if repo_url and not any(h in repo_url for h in _scm_hosts):
+                print(f"[tl-dispatch] Ignoring non-SCM repo_url: {repo_url!r}")
+                repo_url = ""
             effective_repo_url = repo_url or os.environ.get("SCM_REPO_URL", "")
             effective_workspace = os.environ.get("TL_WORKSPACE_PATH", "")
             print(f"[tl-dispatch] Dispatching: jira={jira_key} repo={effective_repo_url}")

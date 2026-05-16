@@ -16,6 +16,18 @@ import os
 import re
 from typing import Any
 
+from framework.devlog import WorkspaceLogger
+
+
+def _logger(state: dict) -> WorkspaceLogger:
+    """Return a WorkspaceLogger for web-dev using state workspace_path."""
+    return WorkspaceLogger(state.get("workspace_path", ""), "web-agent")
+
+
+def _boundary_log(state: dict, agent_id: str, message: str, **kwargs: Any) -> None:
+    """Write a proxy log entry on behalf of a boundary agent."""
+    WorkspaceLogger(state.get("workspace_path", ""), agent_id).info(message, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -304,6 +316,8 @@ async def setup_workspace(state: dict) -> dict:
     workspace_path = state.get("workspace_path", "")
     branch_name = state.get("branch_name", "")
     task_id = state.get("_task_id", "unknown")
+    log = _logger(state)
+    log.step("setup_workspace", repo_path=repo_path)
     print(f"[web-dev] setup_workspace: repo_path={repo_path!r} workspace_path={workspace_path!r}")
 
     # Use workspace_path from Team Lead; only fall back to artifacts/ if missing
@@ -510,6 +524,9 @@ async def implement_changes(state: dict) -> dict:
     and run_command tools registered in the global ToolRegistry.
     """
     runtime = state.get("_runtime")
+    _logger(state).step("implement_changes",
+                        repo_path=state.get("repo_path", ""),
+                        branch=state.get("branch_name", ""))
 
     if not runtime:
         # Unit-test / no-runtime path
@@ -610,10 +627,17 @@ async def run_tests(state: dict) -> dict:
 
     Sets state["route"] to "pass" or "fail" for conditional routing.
     Uses runtime.run_agentic() to execute test commands and parse results.
+
+    Max cycles: reads WEB_DEV_MAX_TEST_CYCLES env var (default 3 for production,
+    override to 1-2 for faster CI runs). A minimum of 1 cycle always runs.
     """
     runtime = state.get("_runtime")
     test_cycles = state.get("test_cycles", 0) + 1
-    max_test_cycles = 1
+    # Allow override via state (set at agent start) or env var.
+    # Default: 3 cycles (run → fix → re-run × 2) for production-quality coverage.
+    max_test_cycles = state.get("max_test_cycles") or int(
+        os.environ.get("WEB_DEV_MAX_TEST_CYCLES", "3")
+    )
 
     if not runtime:
         # Unit-test path: always pass
@@ -625,44 +649,38 @@ async def run_tests(state: dict) -> dict:
         }
 
     repo_path = state.get("repo_path", "")
-    print(f"[web-dev] run_tests: cycle={test_cycles} repo_path={repo_path!r}")
-
-    # Fast-path: if we've already hit the max test cycles, skip the LLM entirely
-    if test_cycles >= max_test_cycles:
-        print(f"[web-dev] run_tests: max cycles reached ({test_cycles}/{max_test_cycles}), force-pass")
-        return {
-            "test_results": {},
-            "test_output": "Skipped: max test cycles reached.",
-            "test_cycles": test_cycles,
-            "test_status": "skip",
-            "route": "pass",
-        }
+    print(f"[web-dev] run_tests: cycle={test_cycles}/{max_test_cycles} repo_path={repo_path!r}")
 
     result = runtime.run_agentic(
         task=(
-            "Run the project's test suite and report results.\n"
-            "MANDATORY pre-flight steps (in order):\n"
+            "Run the project's build and test suite. Report all results.\n"
+            "MANDATORY steps (execute in order — do NOT skip any step):\n"
             f"1. Change into the repo directory: {repo_path}\n"
-            "2. If package.json exists: run `npm install` to install dependencies.\n"
-            "   If npm install fails (e.g. package not found), read the error,\n"
-            "   remove the invalid package from package.json, and re-run npm install.\n"
-            "3. Run build to verify no compilation errors: `npm run build`\n"
-            "   If build fails, fix the error first.\n"
-            "4. Detect the test runner (vitest, jest, pytest, mvn test, gradle test, etc.).\n"
-            "5. Run tests with verbose output.\n"
-            "6. Return a JSON summary: "
-            '{"passed": N, "failed": N, "errors": [...], "output": "...last 50 lines..."}'
+            "2. Run `npm install` to install/update dependencies.\n"
+            "   If npm install fails (missing package), read the error,\n"
+            "   remove the invalid package from package.json, and re-run.\n"
+            "3. Run `npm run build` to check for TypeScript / compilation errors.\n"
+            "   If build fails, fix ALL errors before continuing.\n"
+            "   Common issues: missing imports, wrong export names, \n"
+            "   undefined variables, TypeScript type errors.\n"
+            "4. Detect the test runner (vitest, jest, pytest, etc.).\n"
+            "5. Run tests with verbose output: `npm test -- --run` (vitest) or equivalent.\n"
+            "   If no test command is configured, run `npx vitest --run` directly.\n"
+            "6. Return a JSON summary:\n"
+            '   {"passed": N, "failed": N, "build_ok": true/false, '
+            '"errors": ["error msg..."], "output": "...last 100 lines..."}'
         ),
         cwd=repo_path or None,
         tools=None,
-        max_turns=15,
-        timeout=600,
+        max_turns=20,
+        timeout=1800,
         plugin_manager=state.get("_plugin_manager"),
     )
 
     data = _safe_json(result.summary, fallback={})
     failed = data.get("failed", 0)
-    test_passed = int(failed) == 0 and result.success
+    build_ok = data.get("build_ok", True)
+    test_passed = int(failed) == 0 and build_ok and result.success
 
     # Write per-cycle test results for auditability
     workspace_path = state.get("workspace_path", "")
@@ -695,11 +713,16 @@ async def run_tests(state: dict) -> dict:
         }
 
     if test_cycles >= max_test_cycles:
+        # Exhausted fix cycles — proceed to PR; Team Lead will review.
+        # Record accurate status (not "skip").
+        final_status = "pass" if int(failed) == 0 else "fail_max_cycles"
+        print(f"[web-dev] run_tests: max cycles reached ({test_cycles}/{max_test_cycles}), "
+              f"proceeding with status={final_status}")
         return {
             "test_results": data,
             "test_output": data.get("output", result.summary),
             "test_cycles": test_cycles,
-            "test_status": "fail",
+            "test_status": final_status,
             "route": "pass",  # proceed to PR despite failures; Team Lead will review
         }
 
@@ -948,8 +971,10 @@ async def capture_screenshot(state: dict) -> dict:
     """
     definition_of_done = state.get("definition_of_done", {})
     screenshot_required = definition_of_done.get("screenshot_required", True)
+    log = _logger(state)
 
     if not screenshot_required:
+        log.info("screenshot skipped", reason="not_required")
         return {"screenshot_captured": False, "screenshots": []}
 
     runtime = state.get("_runtime")
@@ -965,33 +990,55 @@ async def capture_screenshot(state: dict) -> dict:
     except OSError:
         pass
 
-    # Best-effort screenshot via agentic runtime
-    # CRITICAL: screenshots MUST be saved to workspace screenshot_dir, NOT inside the git repo
+    log.step("capture_screenshot", screenshot_dir=screenshot_dir)
+
+    # Best-effort screenshot via agentic runtime with explicit playwright steps
     result = runtime.run_agentic(
         task=(
-            "Take a screenshot of the implemented UI.\n"
-            f"1. Make sure dependencies are installed: run_command('npm install', cwd='{repo_path}').\n"
-            f"2. Start the dev server: run_command('npm run dev -- --port 5179 &', cwd='{repo_path}').\n"
-            "   Wait 3 seconds for startup.\n"
-            "3. Use playwright or a headless browser to capture a screenshot at http://localhost:5179.\n"
-            f"   Save desktop screenshot to: {screenshot_dir}/landing-desktop.png\n"
-            "   (Optional) If you can resize viewport, also save mobile at 375px width: "
-            f"{screenshot_dir}/landing-mobile.png\n"
-            f"4. IMPORTANT: Save screenshots ONLY to {screenshot_dir}/ — do NOT save inside "
+            "Take a screenshot of the implemented web application.\n"
+            "\n"
+            "STEP 1 — Install dependencies (if not already installed):\n"
+            f"  cd {repo_path}\n"
+            "  npm install\n"
+            "\n"
+            "STEP 2 — Start the dev server in the background:\n"
+            f"  cd {repo_path}\n"
+            "  npm run dev -- --port 5179 --host 0.0.0.0 &\n"
+            "  sleep 5\n"
+            "  (Wait for the server to be ready before continuing.)\n"
+            "\n"
+            "STEP 3 — Check if playwright is available:\n"
+            "  npx playwright --version 2>/dev/null || npm install --save-dev playwright\n"
+            "\n"
+            "STEP 4 — Capture desktop screenshot at http://localhost:5179:\n"
+            "  Use playwright or a headless browser. Save desktop screenshot to:\n"
+            f"    {screenshot_dir}/landing-desktop.png\n"
+            "  If playwright is unavailable, use `curl -s http://localhost:5179 > /tmp/page.html`\n"
+            "  and note the HTML response — at least confirm the server responds.\n"
+            "\n"
+            "STEP 5 — Optionally capture mobile viewport (375px width):\n"
+            f"    {screenshot_dir}/landing-mobile.png\n"
+            "\n"
+            "STEP 6 — Stop the dev server:\n"
+            "  kill %1 2>/dev/null || pkill -f 'vite' || true\n"
+            "\n"
+            f"CRITICAL: Save screenshots ONLY to {screenshot_dir}/ — do NOT save inside "
             f"the git repo at {repo_path}.\n"
-            "5. Stop the dev server after capturing.\n"
-            "Return JSON: {\"screenshots\": [\"path1.png\", ...], \"captured\": true}\n"
-            "If screenshot fails, return {\"screenshots\": [], \"captured\": false}"
+            "\n"
+            'Return JSON: {"screenshots": ["<absolute_path>", ...], "captured": true}\n'
+            'If screenshot fails, return: {"screenshots": [], "captured": false, "reason": "<why>"}'
         ),
         cwd=repo_path or None,
-        max_turns=12,
-        timeout=180,
+        max_turns=15,
+        timeout=300,
         plugin_manager=state.get("_plugin_manager"),
     )
 
     data = _safe_json(result.summary, fallback={})
     screenshots = data.get("screenshots", [])
     captured = data.get("captured", bool(screenshots))
+
+    log.info("screenshot result", captured=captured, count=len(screenshots))
 
     return {
         "screenshot_captured": captured,
@@ -1009,6 +1056,8 @@ async def update_jira(state: dict) -> dict:
     Idempotency:
     - Check if a comment with the PR URL already exists before adding.
     """
+    log = _logger(state)
+    log.step("update_jira")
     jira_context = state.get("jira_context", {})
     jira_key = (
         jira_context.get("key")
@@ -1043,11 +1092,14 @@ async def update_jira(state: dict) -> dict:
     verdict = assessment.get("verdict", "N/A")
     score_str = f"{score:.2f}" if isinstance(score, float) else str(score)
 
-    # Build hyperlink PR reference
-    pr_link = f"[{pr_url}]({pr_url})" if pr_url and pr_url != "N/A" else "N/A"
+    # Build the comment using inline-markdown syntax.
+    # The Jira client converts this to proper ADF (bold, code, hyperlinks)
+    # so it renders visually in Jira Cloud — no raw asterisks or brackets shown.
+    pr_link = f"[PR: {pr_url}]({pr_url})" if pr_url and pr_url != "N/A" else "N/A"
 
     comment_text = (
-        f"✅ Development completed by web-dev agent.\n\n"
+        f"✅ Development completed by web-dev agent.\n"
+        f"\n"
         f"**Task ID:** {_task_id}\n"
         f"**PR:** {pr_link}\n"
         f"**Branch:** `{branch}`\n"
@@ -1057,6 +1109,7 @@ async def update_jira(state: dict) -> dict:
     )
 
     # Idempotency: check if comment with PR URL already exists
+    _boundary_log(state, "jira", "jira_list_comments called", jira_key=jira_key)
     existing = _call_boundary_tool(
         state, "jira_list_comments", {"ticket_key": jira_key}
     )
@@ -1066,19 +1119,24 @@ async def update_jira(state: dict) -> dict:
         if isinstance(c, dict):
             body = c.get("body", "")
             if isinstance(body, dict):
-                # ADF body — check rendered text
                 body = json.dumps(body)
         if pr_url and pr_url != "N/A" and pr_url in str(body):
             already_commented = True
             break
 
     if not already_commented:
+        _boundary_log(state, "jira", "jira_comment called", jira_key=jira_key, pr_url=pr_url)
         _call_boundary_tool(
             state, "jira_comment",
             {"ticket_key": jira_key, "comment": comment_text},
         )
+        _boundary_log(state, "jira", "jira_comment done")
+        log.info("jira comment added", jira_key=jira_key)
+    else:
+        log.info("jira comment already exists, skipped")
 
     # Transition to "In Review"
+    _boundary_log(state, "jira", "jira_list_transitions called", jira_key=jira_key)
     transitions_result = _call_boundary_tool(
         state, "jira_list_transitions", {"ticket_key": jira_key}
     )
@@ -1094,10 +1152,17 @@ async def update_jira(state: dict) -> dict:
     )
     can_review = bool(in_review_match)
     if can_review:
+        _boundary_log(state, "jira", "jira_transition called",
+                      transition=in_review_match["name"], jira_key=jira_key)
         _call_boundary_tool(
             state, "jira_transition",
             {"ticket_key": jira_key, "transition_name": in_review_match["name"]},
         )
+        _boundary_log(state, "jira", "jira_transition done",
+                      transition=in_review_match["name"])
+        log.info("jira transitioned to in review", jira_key=jira_key)
+    else:
+        log.warn("no in-review transition available", jira_key=jira_key)
 
     # Write jira-update-log.json to workspace
     workspace_path = state.get("workspace_path", "")
@@ -1134,6 +1199,8 @@ async def create_pr(state: dict) -> dict:
     push the branch and open the PR through available SCM tools.
     """
     runtime = state.get("_runtime")
+    log = _logger(state)
+    log.step("create_pr", branch=state.get("branch_name", ""))
 
     if not runtime:
         return {
@@ -1152,8 +1219,6 @@ async def create_pr(state: dict) -> dict:
     )
 
     # Step 1: Commit any pending files and resolve the full changeset FIRST.
-    # This must happen before PR description generation (which needs changed_files)
-    # and before push (which needs commits to exist).
     repo_path = state.get("repo_path", "")
     repo_url = state.get("repo_url", "")
     branch_name = state.get("branch_name", "feature/task")
@@ -1198,17 +1263,19 @@ async def create_pr(state: dict) -> dict:
     pr_description = pr_meta.get("description", state.get("implementation_summary", ""))
 
     # Step 3: Push branch then create PR via SCM boundary tools (not open agentic).
-    # Design doc §4.3: Dev Agent must use scm.branch.push + scm.pr.create
-    # through the SCM Agent boundary; never direct git push or GitHub API.
-
+    _boundary_log(state, "scm", "scm_push called", branch=branch_name)
     push_payload = _call_boundary_tool(
         state, "scm_push", {"repo_path": repo_path, "branch": branch_name}
     )
     if push_payload.get("error"):
+        _boundary_log(state, "scm", "scm_push failed", error=push_payload["error"])
         print(f"[web-dev] scm_push failed: {push_payload['error']}")
     else:
+        _boundary_log(state, "scm", "scm_push ok", branch=branch_name)
         print(f"[web-dev] scm_push OK: branch={branch_name!r}")
 
+    _boundary_log(state, "scm", "scm_create_pr called",
+                  source=branch_name, target="main", title=pr_title)
     pr_payload = _call_boundary_tool(
         state, "scm_create_pr",
         {
@@ -1219,15 +1286,19 @@ async def create_pr(state: dict) -> dict:
             "description": pr_description,
         },
     )
-    # SCM adapter returns camelCase prUrl; snake_case pr_url is a fallback
     pr_url = pr_payload.get("prUrl") or pr_payload.get("pr_url", "")
     pr_number = pr_payload.get("prNumber") or pr_payload.get("pr_number", 0)
     commit_hash = pr_payload.get("commitHash") or pr_payload.get("commit_hash", "")
     pr_status = pr_payload.get("status", "")
     pr_error = pr_payload.get("error", "")
     if not pr_url and (pr_error or (pr_status and pr_status != "ok")):
+        _boundary_log(state, "scm", "scm_create_pr failed",
+                      status=pr_status, error=pr_error)
+        _logger(state).error("PR creation failed", status=pr_status, error=pr_error)
         print(f"[web-dev] create_pr FAILED: status={pr_status!r} error={pr_error!r} payload={pr_payload}")
     else:
+        _boundary_log(state, "scm", "scm_create_pr ok", pr_url=pr_url)
+        _logger(state).info("PR created", pr_url=pr_url, branch=branch_name)
         print(f"[web-dev] create_pr done: prUrl={pr_url!r} prNumber={pr_number} status={pr_status!r}")
 
     # Write pr-evidence.json to workspace

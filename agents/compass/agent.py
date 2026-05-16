@@ -37,44 +37,66 @@ compass_definition = AgentDefinition(
 def _classify_request(user_text: str, runtime) -> str:
     """Classify request as 'development', 'office', or 'general'.
 
-    Uses heuristics first for speed and reliability, falls back to LLM for
-    ambiguous cases.
+    Strategy:
+    1. Strong heuristics catch unambiguous cases quickly (no LLM call).
+    2. Heuristic signals are passed as context hints to the LLM for
+       everything else, making the LLM the primary decision maker.
+    3. Falls back to 'general' when runtime is unavailable.
     """
     lower = user_text.lower()
 
-    # Strong development signals: Jira key/URL present + action keyword
+    # --- Heuristic pre-screening (high-confidence shortcuts only) ---
     has_jira_url = bool(re.search(
-        r"https?://[^\s]+/browse/[A-Z][A-Z0-9]+-\d+|jira[^\s]*/browse/", user_text
+        r"https?://[^\s]+/browse/[A-Z][A-Z0-9]+-\d+", user_text
     ))
     has_jira_key = bool(re.search(r"\b[A-Z][A-Z0-9]+-\d+\b", user_text))
     has_dev_action = any(kw in lower for kw in [
-        "implement", "implement the", "implement jira", "fix bug", "create pr",
-        "create a pr", "feature", "develop", "code review", "pull request",
+        "implement", "fix bug", "fix the bug", "create pr", "create a pr",
+        "open pr", "pull request", "code review", "refactor", "develop",
+        "write tests", "add tests", "write unit tests", "set up ci",
+        "set up docker", "migrate database", "database migration",
     ])
-    if (has_jira_url or has_jira_key) and has_dev_action:
+
+    # Obvious development: Jira URL + development verb
+    if has_jira_url and has_dev_action:
         return "development"
-    if has_jira_url or "implement the jira ticket" in lower:
+    # Obvious development: explicit implementation request for a Jira ticket
+    if has_jira_url and any(kw in lower for kw in ["implement", "implement the", "implement jira"]):
+        return "development"
+    # Jira key alone is strong enough → development
+    if has_jira_key and has_dev_action:
         return "development"
 
-    # Office signals
-    if any(kw in lower for kw in [
-        "summarize", "pdf", "docx", "spreadsheet", "document", "folder", "organize files",
-    ]):
+    # Obvious office: document operation verbs
+    if any(kw in lower for kw in ["summarize the pdf", "analyze the spreadsheet", "organize files"]):
         return "office"
 
-    # Fallback: single-shot LLM classification (fast, no tool calling needed)
+    # --- LLM-primary classification for everything else ---
+    if runtime is None:
+        # Unit-test path without runtime: apply minimal fallback heuristics
+        if has_jira_url or (has_jira_key and has_dev_action):
+            return "development"
+        if any(kw in lower for kw in ["summarize", "pdf", "docx", "spreadsheet", "document", "organize files"]):
+            return "office"
+        return "general"
+
     try:
         from agents.compass.prompts.triage import TRIAGE_SYSTEM, TRIAGE_TEMPLATE
         result = runtime.run(
             prompt=TRIAGE_TEMPLATE.format(user_request=user_text),
             system_prompt=TRIAGE_SYSTEM,
-            max_tokens=256,
+            max_tokens=16,
         )
         raw = (result.get("raw_response") or "").strip().lower()
+        # Accept partial matches — LLM may output "development\n" or "development."
         if "development" in raw:
             return "development"
         if "office" in raw:
             return "office"
+        if "general" in raw:
+            return "general"
+        # Unexpected output: log and fall back
+        print(f"[compass] LLM triage unexpected response: {raw!r} — defaulting to general")
     except Exception as exc:
         print(f"[compass] LLM classification failed: {exc} — defaulting to general")
 
@@ -92,6 +114,7 @@ class CompassAgent(BaseAgent):
 
     async def handle_message(self, message: dict) -> dict:
         from framework.a2a.protocol import Artifact
+        from framework.devlog import WorkspaceLogger
         from framework.instructions import load_instructions
         from framework.runtime.adapter import get_runtime
         from framework.tools.registry import get_registry
@@ -101,6 +124,7 @@ class CompassAgent(BaseAgent):
         msg = message.get("message", message)
         parts = msg.get("parts") or []
         user_text = next((p.get("text", "") for p in parts if p.get("text")), "")
+        meta = msg.get("metadata") or {}
 
         # Create task via TaskStore
         task_store = self.services.task_store
@@ -113,9 +137,26 @@ class CompassAgent(BaseAgent):
         task_type = _classify_request(user_text, runtime)
         print(f"[compass] task_type={task_type!r} request={user_text[:120]!r}")
 
+        # --- Workspace logging ---
+        # For development tasks the workspace is created by Team Lead.
+        # Compass writes a pre-dispatch log to its own compass/ folder inside
+        # the Team Lead workspace (if workspacePath is in metadata), or in a
+        # temporary compass-only workspace otherwise.
+        workspace_path = meta.get("workspacePath", "") or meta.get("workspace_path", "")
+        if not workspace_path and task_type == "development":
+            import os as _os
+            artifact_root = _os.environ.get("ARTIFACT_ROOT", "artifacts/")
+            workspace_path = _os.path.join(artifact_root, f"compass-{task.id[:8]}")
+        compass_log = WorkspaceLogger(workspace_path, "compass")
+        compass_log.step("handle_message",
+                         task_type=task_type,
+                         task_id=task.id,
+                         request=user_text[:200])
+
         # --- Dispatch ---
         if task_type == "development":
             jira_key = _extract_jira_key(user_text)
+            compass_log.info("dispatching development task", jira_key=jira_key)
             print(f"[compass] dispatching development task: jira_key={jira_key!r}")
             try:
                 dispatch_result_str = registry.execute_sync(
@@ -125,10 +166,14 @@ class CompassAgent(BaseAgent):
                 dispatch_data = json.loads(dispatch_result_str) if dispatch_result_str else {}
             except Exception as exc:
                 dispatch_data = {"status": "error", "message": str(exc)}
+                compass_log.error("dispatch_development_task failed", error=str(exc))
                 print(f"[compass] dispatch_development_task error: {exc}")
 
             status = dispatch_data.get("status", "unknown")
             task_id_tl = dispatch_data.get("taskId", "N/A")
+            compass_log.info("dispatch complete",
+                             status=status, tl_task_id=task_id_tl,
+                             pr_url=dispatch_data.get("prUrl", ""))
             response_text = (
                 f"Development task dispatched to Team Lead.\n"
                 f"Jira: {jira_key or 'N/A'}  Status: {status}  TL task: {task_id_tl}"
@@ -136,6 +181,7 @@ class CompassAgent(BaseAgent):
             print(f"[compass] dispatch result: status={status} taskId={task_id_tl}")
 
         elif task_type == "office":
+            compass_log.info("dispatching office task")
             try:
                 dispatch_result_str = registry.execute_sync(
                     "dispatch_office_task",
@@ -144,11 +190,15 @@ class CompassAgent(BaseAgent):
                 dispatch_data = json.loads(dispatch_result_str) if dispatch_result_str else {}
             except Exception as exc:
                 dispatch_data = {"status": "error", "message": str(exc)}
+                compass_log.error("dispatch_office_task failed", error=str(exc))
                 print(f"[compass] dispatch_office_task error: {exc}")
+            compass_log.info("office dispatch complete",
+                             status=dispatch_data.get("status", "unknown"))
             response_text = f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
 
         else:
             # General conversational task — use LLM for a direct answer
+            compass_log.info("handling as general query")
             system_prompt = load_instructions("compass")
             agentic_result = runtime.run_agentic(
                 task=user_text,

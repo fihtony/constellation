@@ -13,6 +13,19 @@ from pathlib import Path
 import pytest
 
 
+def pytest_addoption(parser: "pytest.Parser") -> None:
+    """Register E2E-specific CLI options."""
+    parser.addoption(
+        "--task",
+        action="store",
+        default="",
+        help=(
+            "Development task to send to Compass. "
+            "Example: --task \"implement the jira ticket: https://jira.example.com/browse/PROJ-123\""
+        ),
+    )
+
+
 def _load_test_env() -> dict[str, str]:
     env_file = Path(__file__).parent.parent / ".env"
     env: dict[str, str] = {}

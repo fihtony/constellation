@@ -27,6 +27,100 @@ _TICKET_URL_RE = re.compile(
     r"(https?://[^\s]+/browse/([A-Z][A-Z0-9]+-\d+))", re.IGNORECASE
 )
 
+# Inline markdown patterns for ADF conversion
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_MD_CODE_RE = re.compile(r"`([^`]+)`")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\)]+)\)")
+_MD_URL_RE = re.compile(r"(?<!\()https?://\S+")
+
+
+def _parse_inline_markdown(text: str) -> list:
+    """Parse a single line of text with inline markdown into ADF inline nodes.
+
+    Handles: **bold**, `code`, [text](url), and bare URLs.
+    Returns a list of ADF inline content nodes.
+    """
+    nodes: list = []
+    pos = 0
+
+    # Merge all patterns with their priorities
+    pattern = re.compile(
+        r"(\*\*(.+?)\*\*)"          # bold
+        r"|(`([^`]+)`)"              # code
+        r"|(\[([^\]]+)\]\((https?://[^\)]+)\))"  # link
+        r"|(https?://\S+)"           # bare URL
+    )
+
+    for m in pattern.finditer(text):
+        start, end = m.start(), m.end()
+        # Flush plain text before this match
+        if start > pos:
+            nodes.append({"type": "text", "text": text[pos:start]})
+        pos = end
+
+        if m.group(1):  # **bold**
+            nodes.append({
+                "type": "text",
+                "text": m.group(2),
+                "marks": [{"type": "strong"}],
+            })
+        elif m.group(3):  # `code`
+            nodes.append({
+                "type": "text",
+                "text": m.group(4),
+                "marks": [{"type": "code"}],
+            })
+        elif m.group(5):  # [text](url)
+            nodes.append({
+                "type": "text",
+                "text": m.group(6),
+                "marks": [{"type": "link", "attrs": {"href": m.group(7)}}],
+            })
+        elif m.group(8):  # bare URL
+            url = m.group(8)
+            nodes.append({
+                "type": "text",
+                "text": url,
+                "marks": [{"type": "link", "attrs": {"href": url}}],
+            })
+
+    # Flush remaining plain text
+    if pos < len(text):
+        nodes.append({"type": "text", "text": text[pos:]})
+
+    return nodes or [{"type": "text", "text": text}]
+
+
+def _md_to_adf(text: str) -> dict:
+    """Convert a plain-text comment with inline markdown to Atlassian Document Format.
+
+    Supports:
+    - Paragraph breaks (blank lines → separate ADF paragraph nodes)
+    - **bold** → strong marks
+    - ``code`` → code marks
+    - [link text](url) → link marks
+    - Bare URLs → link marks
+    - Lines that are only whitespace → empty paragraph (visual spacing)
+
+    Returns a valid ADF document dict ready for the Jira REST API body field.
+    """
+    paragraphs = text.split("\n")
+    content: list = []
+
+    for line in paragraphs:
+        stripped = line.strip()
+        if not stripped:
+            # Blank line = paragraph break (visual spacing)
+            content.append({"type": "paragraph", "content": []})
+            continue
+        inline = _parse_inline_markdown(stripped)
+        content.append({"type": "paragraph", "content": inline})
+
+    if not content:
+        content = [{"type": "paragraph", "content": [{"type": "text", "text": ""}]}]
+
+    return {"version": 1, "type": "doc", "content": content}
+
 
 def _parse_base_url_and_key(ticket_url: str) -> tuple[str, str]:
     """Parse Jira base URL and ticket key from a full browse URL.
@@ -189,20 +283,13 @@ class JiraClient:
         return {}, self._status_message(status, data)
 
     def add_comment(self, key: str, text: str) -> tuple[dict, str]:
-        """Add a plain-text comment to a ticket.
+        """Add a rich-text comment to a ticket using Atlassian Document Format (ADF).
 
-        Uses Atlassian Document Format (ADF) so the comment renders on cloud.
+        Converts simple inline-markdown patterns (**bold**, `code`, [text](url))
+        and paragraph breaks to proper ADF nodes so comments render visually in
+        Jira Cloud instead of showing raw markdown syntax.
         """
-        adf_body = {
-            "version": 1,
-            "type": "doc",
-            "content": [
-                {
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": text}],
-                }
-            ],
-        }
+        adf_body = _md_to_adf(text)
         status, data = self.request("POST", f"issue/{key}/comment", {"body": adf_body})
         if status in (200, 201):
             return data, "ok"

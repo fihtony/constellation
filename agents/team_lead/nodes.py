@@ -14,6 +14,23 @@ import re
 import time
 from typing import Any
 
+from framework.devlog import WorkspaceLogger
+
+
+def _logger(state: dict, agent_id: str = "team-lead") -> WorkspaceLogger:
+    """Return a WorkspaceLogger for the given agent_id using state workspace_path."""
+    return WorkspaceLogger(state.get("workspace_path", ""), agent_id)
+
+
+def _boundary_log(state: dict, boundary_agent: str, message: str, **kwargs: Any) -> None:
+    """Write a log entry to a boundary agent's workspace folder (proxy logging).
+
+    This ensures agents like jira, scm, and ui-design have workspace folders
+    and log files even though they are called as in-process tools rather than
+    standalone services.
+    """
+    WorkspaceLogger(state.get("workspace_path", ""), boundary_agent).info(message, **kwargs)
+
 
 async def receive_task(state: dict) -> dict:
     """Parse and validate the incoming task request."""
@@ -24,8 +41,6 @@ async def receive_task(state: dict) -> dict:
     jira_ticket_url = state.get("jira_ticket_url", "")
 
     # If jira_key not in metadata, extract it from the user_request text.
-    # Supports both bare key ("PROJ-123") and full URL forms
-    # ("https://company.atlassian.net/browse/PROJ-123").
     if not jira_key:
         url_match = _re.search(
             r"(https?://[^\s]+/browse/([A-Z][A-Z0-9]+-\d+))", user_request
@@ -39,6 +54,14 @@ async def receive_task(state: dict) -> dict:
             if key_match:
                 jira_key = key_match.group(1)
                 print(f"[team-lead] Extracted jira_key={jira_key} from user_request text")
+
+    # Initialize workspace log and create boundary-agent placeholder folders
+    log = _logger(state)
+    log.step("receive_task", jira_key=jira_key, request=user_request[:200])
+    # Create folders for boundary agents that will be called during this task
+    # so they always appear in the workspace tree even before their first call.
+    for boundary_agent in ("jira", "scm", "ui-design"):
+        _boundary_log(state, boundary_agent, "task started", jira_key=jira_key)
 
     return {
         "task_received": True,
@@ -59,6 +82,8 @@ async def analyze_requirements(state: dict) -> dict:
     """Analyze the incoming task using LLM (single-shot ReAct-inside-node)."""
     runtime = state.get("_runtime")
     user_request = state.get("user_request", "")
+    log = _logger(state)
+    log.step("analyze_requirements")
 
     if not runtime:
         analysis = {
@@ -91,6 +116,10 @@ async def analyze_requirements(state: dict) -> dict:
                 "skills": [],
                 "summary": raw or user_request,
             }
+
+    log.info("analysis complete",
+             task_type=analysis.get("task_type"),
+             complexity=analysis.get("complexity"))
 
     # Write analysis.json to workspace
     workspace_path = state.get("workspace_path", "")
@@ -135,6 +164,9 @@ async def gather_context(state: dict) -> dict:
     design_context = state.get("design_context")
     workspace_path = state.get("workspace_path", "")
 
+    log = _logger(state)
+    log.step("gather_context")
+
     jira_files = []
     design_files = []
     design_code_path = ""
@@ -142,18 +174,23 @@ async def gather_context(state: dict) -> dict:
     # Fetch Jira ticket if key provided and not already present
     jira_key = state.get("jira_key", "")
     if jira_key and not jira_context:
+        log.info("fetching jira ticket", jira_key=jira_key)
+        _boundary_log(state, "jira", "fetch_ticket called", jira_key=jira_key)
         try:
             result_str = registry.execute_sync(
                 "fetch_jira_ticket", {"ticket_key": jira_key}
             )
             payload = json.loads(result_str) if result_str else {}
             if payload.get("error"):
+                log.warn("jira fetch warning", error=payload["error"])
+                _boundary_log(state, "jira", "fetch_ticket warning", error=payload["error"])
                 print(f"[team-lead] Jira fetch warning: {payload['error']} (continuing without Jira context)")
             else:
-                # Normalize: Jira adapter returns {"ticket": {...}, "status": 200}.
-                # Downstream consumers expect a flat ticket object with top-level "key".
                 jira_context = payload.get("ticket", payload)
+                _boundary_log(state, "jira", "fetch_ticket ok", jira_key=jira_key)
         except Exception as exc:
+            log.error("jira fetch failed", error=str(exc))
+            _boundary_log(state, "jira", "fetch_ticket failed", error=str(exc))
             print(f"[team-lead] Jira fetch failed: {exc} (continuing without Jira context)")
 
     # Extract embedded URLs / IDs from Jira ticket content using LLM, falling back to regex.
@@ -237,6 +274,10 @@ async def gather_context(state: dict) -> dict:
 
     # Fetch design context if URL provided and not already present
     if (figma_url or stitch_id) and not design_context:
+        log.info("fetching design context",
+                 figma_url=figma_url, stitch_id=stitch_id, screen_id=stitch_screen_id)
+        _boundary_log(state, "ui-design", "fetch_design called",
+                      stitch_id=stitch_id, screen_id=stitch_screen_id)
         try:
             args: dict[str, str] = {}
             if figma_url:
@@ -248,11 +289,17 @@ async def gather_context(state: dict) -> dict:
             result_str = registry.execute_sync("fetch_design", args)
             payload = json.loads(result_str) if result_str else {}
             if payload.get("error"):
+                log.warn("design fetch warning", error=payload["error"])
+                _boundary_log(state, "ui-design", "fetch_design warning", error=payload["error"])
                 print(f"[team-lead] Design fetch warning: {payload['error']} (continuing without design context)")
             else:
                 design_context = payload
+                _boundary_log(state, "ui-design", "fetch_design ok")
         except Exception as exc:
+            log.error("design fetch failed", error=str(exc))
+            _boundary_log(state, "ui-design", "fetch_design failed", error=str(exc))
             print(f"[team-lead] Design fetch failed: {exc} (continuing without design context)")
+
 
     # Write design context to workspace
     if design_context and workspace_path:
@@ -312,6 +359,8 @@ async def gather_context(state: dict) -> dict:
     # Clone repo via SCM Agent (A2A)
     repo_cloned = False
     if repo_url and repo_path:
+        log.info("cloning repository", repo_url=repo_url, target=repo_path)
+        _boundary_log(state, "scm", "clone_repo called", repo_url=repo_url, target=repo_path)
         try:
             clone_result_str = registry.execute_sync(
                 "clone_repo",
@@ -321,6 +370,9 @@ async def gather_context(state: dict) -> dict:
             if clone_payload.get("error"):
                 detail = clone_payload.get("detail", "")
                 detail_msg = f" | git: {detail}" if detail else ""
+                _boundary_log(state, "scm", "clone_repo failed",
+                               error=clone_payload["error"], detail=detail)
+                log.error("repo clone failed", error=clone_payload["error"])
                 raise RuntimeError(
                     f"Repo clone FAILED for {repo_url!r}: "
                     f"{clone_payload['error']}{detail_msg}"
@@ -333,11 +385,15 @@ async def gather_context(state: dict) -> dict:
                         f"Repo clone reported success but path is missing or empty: {repo_path!r}"
                     )
                 repo_cloned = True
+                _boundary_log(state, "scm", "clone_repo ok", repo_path=repo_path)
+                log.info("repo cloned ok", repo_name=repo_name)
                 print(f"[team-lead] Repo cloned: {repo_name} → {repo_path}")
         except RuntimeError:
             raise  # propagate clone failures — they are fatal for the workflow
         except Exception as exc:
+            log.error("repo clone unexpected error", error=str(exc))
             raise RuntimeError(f"Repo clone raised unexpected error for {repo_url!r}: {exc}") from exc
+
 
     # Write context manifest
     context_manifest_path = ""
@@ -469,6 +525,8 @@ async def dispatch_dev_agent(state: dict) -> dict:
     from framework.tools.registry import get_registry
 
     registry = get_registry()
+    log = _logger(state)
+    log.step("dispatch_dev_agent")
     revision_feedback = state.get("revision_feedback", "")
     task_description = _build_dev_brief(state)
 
@@ -501,12 +559,16 @@ async def dispatch_dev_agent(state: dict) -> dict:
         )
         payload = json.loads(result_str) if result_str else {}
     except Exception as exc:
+        log.error("dev dispatch failed", error=str(exc))
         print(f"[team-lead] Dev dispatch failed: {exc}")
         payload = {"status": "error", "message": str(exc)}
 
     pr_url = payload.get("prUrl", "")
     branch_name = payload.get("branch", "")
     jira_in_review = payload.get("jiraInReview", False)
+    log.info("dev dispatch result",
+             status=payload.get("status", "?"), pr_url=pr_url,
+             branch=branch_name, jira_in_review=jira_in_review)
     print(
         f"[team-lead] Dev dispatch result: status={payload.get('status','?')} "
         f"prUrl={pr_url!r} branch={branch_name!r} jiraInReview={jira_in_review}"
