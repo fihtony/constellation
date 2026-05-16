@@ -328,8 +328,15 @@ class SCMCreatePR(BaseTool):
 # ---------------------------------------------------------------------------
 
 def register_web_dev_tools():
-    """Register all Web Dev boundary tools in the global ToolRegistry."""
+    """Register all Web Dev boundary tools in the global ToolRegistry.
+
+    SCM tools (scm_push, scm_create_pr, scm_list_branches) are only registered
+    when they are NOT already present — the in-process SCM adapter registers
+    direct-dispatch variants first during E2E/test setup, which must not be
+    overridden by the HTTP-proxy versions here.
+    """
     registry = get_registry()
+    existing = {s["function"]["name"] for s in registry.list_schemas()}
     for tool_cls in (
         JiraTransition,
         JiraComment,
@@ -341,4 +348,6 @@ def register_web_dev_tools():
         SCMPush,
         SCMCreatePR,
     ):
-        registry.register(tool_cls())
+        tool = tool_cls()
+        if tool.name not in existing:
+            registry.register(tool)

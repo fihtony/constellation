@@ -823,13 +823,32 @@ async def self_assess(state: dict) -> dict:
     if len(ac_str) > 3000:
         ac_str = ac_str[:3000] + "...]"
 
+    # Derive changed files from the actual cloned repo's git status when
+    # changes_made is empty (native tool runs don't track individual writes).
+    changed_files_list = state.get("changes_made", [])
+    if not changed_files_list:
+        repo_path = state.get("repo_path", "")
+        if repo_path and os.path.isdir(repo_path):
+            try:
+                import subprocess as _sp
+                _st = _sp.run(
+                    ["git", "status", "--short"],
+                    capture_output=True, text=True, cwd=repo_path, timeout=10,
+                )
+                for _line in _st.stdout.splitlines():
+                    _name = _line[3:].strip()
+                    if _name:
+                        changed_files_list.append(_name)
+            except Exception:
+                pass
+
     prompt = SELF_ASSESS_TEMPLATE.format(
         acceptance_criteria=ac_str,
         design_context=json.dumps(design_ctx, ensure_ascii=False)[:800] if design_ctx else "N/A (not a UI task)",
         design_code_snippet=design_code_snippet or "N/A (no design HTML available)",
         implementation_summary=str(state.get("implementation_summary", ""))[:1000],
         test_results=json.dumps(state.get("test_results", {}), ensure_ascii=False)[:500],
-        changed_files="\n".join(state.get("changes_made", [])) or "unknown",
+        changed_files="\n".join(changed_files_list) or "unknown",
     )
 
     result = runtime.run(
