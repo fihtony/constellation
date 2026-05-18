@@ -216,11 +216,13 @@ async def prepare_jira(state: dict) -> dict:
 
     # Resolve token user
     token_user = ""
+    token_user_account_id = ""
     task_id = state.get("_task_id", "")
     token_user_result = _call_boundary_tool(state, "jira_get_token_user", {"task_id": task_id})
     if not token_user_result.get("error"):
         user_data = token_user_result.get("user", {})
         token_user = user_data.get("emailAddress", user_data.get("displayName", ""))
+        token_user_account_id = user_data.get("accountId", "")
 
     # Transition to "In Progress" if not already
     if original_status.lower() not in ("in progress", "in development", "in dev"):
@@ -247,8 +249,18 @@ async def prepare_jira(state: dict) -> dict:
             avail = [t.get("name") for t in transitions if isinstance(t, dict)]
             print(f"[{_AGENT_ID}] Cannot transition {jira_key} to In Progress; available: {avail}")
 
-    # Update assignee to token user
-    if token_user and token_user != original_assignee:
+    # Update assignee to token user (use accountId for Jira Cloud)
+    if token_user_account_id:
+        log.info("assigning jira ticket to token user in prepare", jira_key=jira_key,
+                 account_id=token_user_account_id)
+        _call_boundary_tool(
+            state, "jira_update",
+            {"ticket_key": jira_key,
+             "fields": {"assignee": {"accountId": token_user_account_id}},
+             "task_id": task_id},
+        )
+    elif token_user and token_user != original_assignee:
+        # Fallback for Jira Server (uses emailAddress)
         _call_boundary_tool(
             state, "jira_update",
             {"ticket_key": jira_key, "fields": {"assignee": {"emailAddress": token_user}},
@@ -982,19 +994,19 @@ async def fix_gaps(state: dict) -> dict:
 
 
 async def capture_screenshot(state: dict) -> dict:
-    """Capture implementation screenshots using subprocess-based approach.
+    """Capture implementation screenshots using Chrome headless.
 
     Uses Python subprocess to:
-    1. Start the vite dev server
-    2. Write and run a playwright script
-    3. Kill the server
+    1. Find Chrome/Chromium binary on the system
+    2. Start the vite/Next.js dev server
+    3. Take screenshots with Chrome --headless=new
+    4. Kill the server
 
-    Much more reliable than asking the LLM to do it via run_agentic.
+    Falls back to an HTML snapshot if Chrome is not available.
     Skips if screenshot_required is False in definition_of_done.
     """
     import subprocess
-    import tempfile
-    import textwrap
+    import shutil
 
     definition_of_done = state.get("definition_of_done", {})
     screenshot_required = definition_of_done.get("screenshot_required", True)
@@ -1023,6 +1035,28 @@ async def capture_screenshot(state: dict) -> dict:
     log.step("capture_screenshot", screenshot_dir=screenshot_dir)
     print(f"[{_AGENT_ID}] capture_screenshot: repo_path={repo_path!r} screenshot_dir={screenshot_dir!r}")
 
+    # --- Find Chrome binary ---
+    _CHROME_CANDIDATES = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]
+    chrome_bin = None
+    for candidate in _CHROME_CANDIDATES:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            chrome_bin = candidate
+            break
+        if "/" not in candidate and shutil.which(candidate):
+            chrome_bin = shutil.which(candidate)
+            break
+    print(f"[{_AGENT_ID}] Chrome binary: {chrome_bin!r}")
+
     PORT = 5179
     dev_proc = None
 
@@ -1033,29 +1067,33 @@ async def capture_screenshot(state: dict) -> dict:
             timeout=5, capture_output=True,
         )
 
-        # --- Step 2: Ensure dependencies installed ---
-        subprocess.run(
-            ["npm", "install", "--prefer-offline"],
-            cwd=repo_path, timeout=120, capture_output=True,
-        )
+        # --- Step 2: Install deps only if node_modules is missing ---
+        node_modules = os.path.join(repo_path, "node_modules")
+        if not os.path.isdir(node_modules):
+            print(f"[{_AGENT_ID}] node_modules missing — running npm install")
+            subprocess.run(
+                ["npm", "install", "--prefer-offline"],
+                cwd=repo_path, timeout=120, capture_output=True,
+            )
+        else:
+            print(f"[{_AGENT_ID}] node_modules exists — skipping npm install")
 
-        # --- Step 3: Start vite dev server ---
+        # --- Step 3: Start vite dev server (output to /dev/null to avoid pipe blocking) ---
         dev_proc = subprocess.Popen(
             ["npm", "run", "dev", "--", "--port", str(PORT), "--host", "0.0.0.0"],
             cwd=repo_path,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         print(f"[{_AGENT_ID}] Dev server started (pid={dev_proc.pid}) on port {PORT}")
 
-        # --- Step 4: Wait for server ready (up to 30s) ---
+        # --- Step 4: Wait for server ready (up to 60s) ---
         import time as _time
+        import urllib.request
         server_ready = False
-        for _ in range(15):
+        for _ in range(30):
             _time.sleep(2)
             try:
-                import urllib.request
                 with urllib.request.urlopen(f"http://localhost:{PORT}", timeout=3) as r:
                     if r.status < 500:
                         server_ready = True
@@ -1065,68 +1103,52 @@ async def capture_screenshot(state: dict) -> dict:
         print(f"[{_AGENT_ID}] Server ready={server_ready}")
 
         if not server_ready:
-            print(f"[{_AGENT_ID}] Dev server not ready in time — skipping screenshot")
-            return {"screenshot_captured": False, "screenshots": []}
-
-        # --- Step 5: Write playwright script to a temp file ---
-        script_content = textwrap.dedent(f"""\
-            import {{ chromium }} from 'playwright';
-            (async () => {{
-              const browser = await chromium.launch({{ headless: true }});
-              try {{
-                const page = await browser.newPage();
-                // Desktop
-                await page.setViewportSize({{ width: 1280, height: 900 }});
-                await page.goto('http://localhost:{PORT}', {{ waitUntil: 'networkidle', timeout: 15000 }});
-                await page.screenshot({{ path: '{desktop_png}', fullPage: true }});
-                console.log('Desktop screenshot saved');
-                // Mobile
-                await page.setViewportSize({{ width: 375, height: 812 }});
-                await page.goto('http://localhost:{PORT}', {{ waitUntil: 'networkidle', timeout: 15000 }});
-                await page.screenshot({{ path: '{mobile_png}', fullPage: true }});
-                console.log('Mobile screenshot saved');
-              }} finally {{
-                await browser.close();
-              }}
-            }})();
-        """)
-
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".mjs", delete=False, prefix="screenshot_"
-        ) as tf:
-            tf.write(script_content)
-            script_path = tf.name
-
-        # --- Step 6: Ensure playwright chromium is installed ---
-        pw_check = subprocess.run(
-            ["npx", "playwright", "--version"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if pw_check.returncode != 0:
-            subprocess.run(
-                ["npx", "playwright", "install", "chromium"],
-                capture_output=True, timeout=120,
+            print(f"[{_AGENT_ID}] Dev server not ready in 60s — skipping screenshot")
+        elif chrome_bin:
+            # --- Step 5: Take desktop screenshot ---
+            chrome_result = subprocess.run(
+                [
+                    chrome_bin,
+                    "--headless=new",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    f"--screenshot={desktop_png}",
+                    "--window-size=1280,900",
+                    f"http://localhost:{PORT}",
+                ],
+                capture_output=True,
+                timeout=30,
             )
+            if os.path.isfile(desktop_png) and os.path.getsize(desktop_png) > 0:
+                screenshots.append(desktop_png)
+                print(f"[{_AGENT_ID}] Desktop screenshot saved: {os.path.getsize(desktop_png)} bytes")
+            else:
+                print(f"[{_AGENT_ID}] Desktop screenshot failed (rc={chrome_result.returncode})")
 
-        # --- Step 7: Run the script ---
-        pw_result = subprocess.run(
-            ["node", script_path],
-            capture_output=True, text=True, timeout=60,
-        )
-        print(f"[{_AGENT_ID}] Playwright stdout: {pw_result.stdout[:300]}")
-        if pw_result.returncode != 0:
-            print(f"[{_AGENT_ID}] Playwright stderr: {pw_result.stderr[:300]}")
+            # --- Step 6: Take mobile screenshot ---
+            chrome_mobile = subprocess.run(
+                [
+                    chrome_bin,
+                    "--headless=new",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    f"--screenshot={mobile_png}",
+                    "--window-size=375,812",
+                    f"http://localhost:{PORT}",
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            if os.path.isfile(mobile_png) and os.path.getsize(mobile_png) > 0:
+                screenshots.append(mobile_png)
+                print(f"[{_AGENT_ID}] Mobile screenshot saved: {os.path.getsize(mobile_png)} bytes")
+        else:
+            print(f"[{_AGENT_ID}] No Chrome/Chromium found — falling back to HTML snapshot")
 
-        # --- Step 8: Check if screenshots exist ---
-        if os.path.isfile(desktop_png) and os.path.getsize(desktop_png) > 0:
-            screenshots.append(desktop_png)
-            print(f"[{_AGENT_ID}] Desktop screenshot saved: {os.path.getsize(desktop_png)} bytes")
-        if os.path.isfile(mobile_png) and os.path.getsize(mobile_png) > 0:
-            screenshots.append(mobile_png)
-            print(f"[{_AGENT_ID}] Mobile screenshot saved: {os.path.getsize(mobile_png)} bytes")
-
-        # --- Step 9: HTML fallback if screenshots failed ---
-        if not screenshots:
+        # --- HTML fallback if screenshots failed (Chrome not found or failed) ---
+        if not screenshots and server_ready:
             try:
                 import urllib.request
                 with urllib.request.urlopen(f"http://localhost:{PORT}", timeout=5) as r:
@@ -1185,6 +1207,30 @@ async def update_jira(state: dict) -> dict:
     changes = state.get("changes_made", [])
     _task_id = state.get("_task_id", "unknown")
 
+    # --- Assign the ticket to the token owner ---
+    task_id = state.get("_task_id", "")
+    try:
+        user_result = _call_boundary_tool(
+            state, "jira_get_token_user", {"task_id": task_id}
+        )
+        user = user_result.get("user", {})
+        account_id = user.get("accountId", "") or user.get("account_id", "")
+        if account_id:
+            log.info("assigning jira ticket to token user", jira_key=jira_key, account_id=account_id)
+            _call_boundary_tool(
+                state, "jira_update",
+                {
+                    "ticket_key": jira_key,
+                    "fields": {"assignee": {"accountId": account_id}},
+                    "task_id": task_id,
+                },
+            )
+            log.info("jira assignee updated", jira_key=jira_key)
+        else:
+            log.warn("jira_get_token_user returned no accountId", user=user)
+    except Exception as exc:
+        log.warn("jira assignee update skipped", error=str(exc))
+
     # Build test summary (accurate from actual results or test_status)
     if test_status == "skip":
         test_summary = "Skipped (max cycles reached)"
@@ -1218,7 +1264,6 @@ async def update_jira(state: dict) -> dict:
     )
 
     # Idempotency: check if comment with PR URL already exists
-    task_id = state.get("_task_id", "")
     log.debug("checking existing comments for idempotency", jira_key=jira_key)
     existing = _call_boundary_tool(
         state, "jira_list_comments", {"ticket_key": jira_key, "task_id": task_id}

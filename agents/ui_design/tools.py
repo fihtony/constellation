@@ -298,14 +298,24 @@ def _save_stitch_files(
 def _build_design_md(project_result: dict, screen_meta: dict, project_id: str, screen_id: str) -> str:
     """Build a DESIGN.md from Stitch project metadata and screen metadata.
 
-    If the project text contains YAML/markdown design tokens, use them directly.
-    Otherwise, build a basic spec from the available metadata.
+    Priority:
+    1. project.designTheme.designMd  — pre-rendered Markdown/YAML from Stitch API
+    2. project.text / project.raw    — free-form text content
+    3. Fallback: basic spec from screen metadata only
     """
-    # Extract project text — may already contain YAML/markdown design spec
     project_data = project_result.get("project", project_result)
+
+    # --- Priority 1: designTheme.designMd (Stitch API v2+) ---
+    if isinstance(project_data, dict):
+        design_md = (
+            project_data.get("designTheme", {}) or {}
+        ).get("designMd", "")
+        if design_md and ("---" in design_md or "colors:" in design_md or "typography:" in design_md):
+            return design_md.strip()
+
+    # --- Priority 2: text content blocks ---
     project_text = ""
     if isinstance(project_data, dict):
-        # Check for text content blocks in the project response
         content = project_data.get("content", [])
         if isinstance(content, list):
             for block in content:
@@ -313,7 +323,6 @@ def _build_design_md(project_result: dict, screen_meta: dict, project_id: str, s
                     t = block.get("text", "")
                     if t:
                         project_text += t + "\n"
-        # Also check raw text field
         if not project_text:
             project_text = project_data.get("text", "") or project_data.get("raw", "")
 
