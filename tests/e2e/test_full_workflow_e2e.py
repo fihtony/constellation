@@ -572,16 +572,22 @@ def _validate_workspace_artifacts(workspace_path: str, jira_key: str) -> None:
     else:
         print("[workspace] CP-2: Design spec SKIPPED (not a UI task or no design URL)")
 
-    # Checkpoint 2b: Stitch design HTML file download
-    design_html_path = os.path.join(workspace_path, "team-lead", "design-code.html")
+    # Checkpoint 2b: Stitch design HTML file download (new path: ui-design/stitch/code.html)
+    design_html_path = os.path.join(workspace_path, "ui-design", "stitch", "code.html")
+    if not os.path.isfile(design_html_path):
+        # fallback to legacy path
+        design_html_path = os.path.join(workspace_path, "team-lead", "design-code.html")
     if os.path.isfile(design_html_path):
         size = os.path.getsize(design_html_path)
         print(f"[workspace] CP-2b: Design HTML downloaded ✓ ({size} bytes)")
     else:
         print("[workspace] CP-2b: Design HTML NOT found (Stitch content download may have failed)")
 
-    # Checkpoint 2c: Design spec markdown
-    design_spec_md_path = os.path.join(workspace_path, "team-lead", "design-spec.md")
+    # Checkpoint 2c: Design spec markdown (new path: ui-design/stitch/DESIGN.md)
+    design_spec_md_path = os.path.join(workspace_path, "ui-design", "stitch", "DESIGN.md")
+    if not os.path.isfile(design_spec_md_path):
+        # fallback to legacy path
+        design_spec_md_path = os.path.join(workspace_path, "team-lead", "design-spec.md")
     if os.path.isfile(design_spec_md_path):
         size = os.path.getsize(design_spec_md_path)
         print(f"[workspace] CP-2c: Design spec (markdown) ✓ ({size} bytes)")
@@ -662,8 +668,8 @@ def _print_workspace_progress(workspace_path: str) -> None:
     checkpoints = {
         "CP-1 Jira ticket": "team-lead/jira-ticket.json",
         "CP-2 Design spec": "team-lead/design-spec.json",
-        "CP-2b Design HTML": "team-lead/design-code.html",
-        "CP-2c Design MD": "team-lead/design-spec.md",
+        "CP-2b Design HTML": "ui-design/stitch/code.html",
+        "CP-2c Design MD": "ui-design/stitch/DESIGN.md",
         "CP-3 Context manifest": "team-lead/context-manifest.json",
         "CP-4a Analysis": "team-lead/analysis.json",
         "CP-4b Delivery plan": "team-lead/delivery-plan.json",
