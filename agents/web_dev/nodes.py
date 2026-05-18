@@ -994,16 +994,19 @@ async def fix_gaps(state: dict) -> dict:
 
 
 async def capture_screenshot(state: dict) -> dict:
-    """Capture implementation screenshots using Chrome headless.
+    """Capture implementation screenshots using Playwright (primary) or Chrome (fallback).
 
-    Uses Python subprocess to:
-    1. Find Chrome/Chromium binary on the system
-    2. Start the vite/Next.js dev server
-    3. Take screenshots with Chrome --headless=new
-    4. Kill the server
+    Screenshot strategy:
+    - Primary:  playwright async API with Chromium (bundled, works in containers)
+    - Fallback: Chrome/Chromium system binary via subprocess
+    - Last resort: HTML page snapshot
 
-    Falls back to an HTML snapshot if Chrome is not available.
-    Skips if screenshot_required is False in definition_of_done.
+    Playwright waits for the ``networkidle`` event and an additional JS-idle
+    delay so React has finished hydrating before the screenshot is taken.
+    Screenshots are saved to the agent workspace directory only — they are NOT
+    committed to the repository.  ``create_pr`` uploads them to GitHub via the
+    issue-assets upload API and posts a PR comment, so they appear in the PR
+    without polluting the repository history.
     """
     import subprocess
     import shutil
@@ -1035,28 +1038,6 @@ async def capture_screenshot(state: dict) -> dict:
     log.step("capture_screenshot", screenshot_dir=screenshot_dir)
     print(f"[{_AGENT_ID}] capture_screenshot: repo_path={repo_path!r} screenshot_dir={screenshot_dir!r}")
 
-    # --- Find Chrome binary ---
-    _CHROME_CANDIDATES = [
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        "google-chrome",
-        "google-chrome-stable",
-        "chromium",
-        "chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-    ]
-    chrome_bin = None
-    for candidate in _CHROME_CANDIDATES:
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            chrome_bin = candidate
-            break
-        if "/" not in candidate and shutil.which(candidate):
-            chrome_bin = shutil.which(candidate)
-            break
-    print(f"[{_AGENT_ID}] Chrome binary: {chrome_bin!r}")
-
     PORT = 5179
     dev_proc = None
 
@@ -1078,7 +1059,7 @@ async def capture_screenshot(state: dict) -> dict:
         else:
             print(f"[{_AGENT_ID}] node_modules exists — skipping npm install")
 
-        # --- Step 3: Start vite dev server (output to /dev/null to avoid pipe blocking) ---
+        # --- Step 3: Start vite dev server ---
         dev_proc = subprocess.Popen(
             ["npm", "run", "dev", "--", "--port", str(PORT), "--host", "0.0.0.0"],
             cwd=repo_path,
@@ -1104,53 +1085,112 @@ async def capture_screenshot(state: dict) -> dict:
 
         if not server_ready:
             print(f"[{_AGENT_ID}] Dev server not ready in 60s — skipping screenshot")
-        elif chrome_bin:
-            # --- Step 5: Take desktop screenshot ---
-            chrome_result = subprocess.run(
-                [
-                    chrome_bin,
-                    "--headless=new",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-dev-shm-usage",
-                    f"--screenshot={desktop_png}",
-                    "--window-size=1280,900",
-                    f"http://localhost:{PORT}",
-                ],
-                capture_output=True,
-                timeout=30,
-            )
-            if os.path.isfile(desktop_png) and os.path.getsize(desktop_png) > 0:
-                screenshots.append(desktop_png)
-                print(f"[{_AGENT_ID}] Desktop screenshot saved: {os.path.getsize(desktop_png)} bytes")
-            else:
-                print(f"[{_AGENT_ID}] Desktop screenshot failed (rc={chrome_result.returncode})")
-
-            # --- Step 6: Take mobile screenshot ---
-            chrome_mobile = subprocess.run(
-                [
-                    chrome_bin,
-                    "--headless=new",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-dev-shm-usage",
-                    f"--screenshot={mobile_png}",
-                    "--window-size=375,812",
-                    f"http://localhost:{PORT}",
-                ],
-                capture_output=True,
-                timeout=30,
-            )
-            if os.path.isfile(mobile_png) and os.path.getsize(mobile_png) > 0:
-                screenshots.append(mobile_png)
-                print(f"[{_AGENT_ID}] Mobile screenshot saved: {os.path.getsize(mobile_png)} bytes")
         else:
-            print(f"[{_AGENT_ID}] No Chrome/Chromium found — falling back to HTML snapshot")
+            # --- Step 5: Take screenshots (playwright primary, Chrome fallback) ---
+            playwright_ok = False
+            try:
+                from playwright.async_api import async_playwright
+                print(f"[{_AGENT_ID}] Taking screenshots with playwright...")
+                async with async_playwright() as pw:
+                    browser = await pw.chromium.launch(args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                    ])
+                    # Desktop screenshot
+                    ctx_desktop = await browser.new_context(
+                        viewport={"width": 1280, "height": 900},
+                    )
+                    page = await ctx_desktop.new_page()
+                    await page.goto(f"http://localhost:{PORT}", wait_until="networkidle", timeout=30000)
+                    # Extra wait for React lazy rendering / animations to settle
+                    await page.wait_for_timeout(3000)
+                    await page.screenshot(path=desktop_png, full_page=False)
+                    await ctx_desktop.close()
 
-        # --- HTML fallback if screenshots failed (Chrome not found or failed) ---
+                    # Mobile screenshot
+                    ctx_mobile = await browser.new_context(
+                        viewport={"width": 375, "height": 812},
+                        is_mobile=True,
+                    )
+                    page_mobile = await ctx_mobile.new_page()
+                    await page_mobile.goto(f"http://localhost:{PORT}", wait_until="networkidle", timeout=30000)
+                    await page_mobile.wait_for_timeout(2000)
+                    await page_mobile.screenshot(path=mobile_png, full_page=False)
+                    await ctx_mobile.close()
+
+                    await browser.close()
+
+                if os.path.isfile(desktop_png) and os.path.getsize(desktop_png) > 0:
+                    screenshots.append(desktop_png)
+                    print(f"[{_AGENT_ID}] Playwright desktop screenshot: {os.path.getsize(desktop_png)} bytes")
+                    playwright_ok = True
+                if os.path.isfile(mobile_png) and os.path.getsize(mobile_png) > 0:
+                    screenshots.append(mobile_png)
+                    print(f"[{_AGENT_ID}] Playwright mobile screenshot: {os.path.getsize(mobile_png)} bytes")
+            except ImportError:
+                print(f"[{_AGENT_ID}] playwright not available — trying system Chrome")
+            except Exception as pw_exc:
+                print(f"[{_AGENT_ID}] playwright failed: {pw_exc} — trying system Chrome")
+
+            # --- Chrome fallback (host machine only — not available in all containers) ---
+            if not playwright_ok:
+                _CHROME_CANDIDATES = [
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                    "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+                    "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser",
+                ]
+                chrome_bin = None
+                for candidate in _CHROME_CANDIDATES:
+                    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                        chrome_bin = candidate
+                        break
+                    if "/" not in candidate and shutil.which(candidate):
+                        chrome_bin = shutil.which(candidate)
+                        break
+                print(f"[{_AGENT_ID}] Chrome binary: {chrome_bin!r}")
+
+                if chrome_bin:
+                    # Pre-warm Vite + wait for React render
+                    import re as _re
+                    try:
+                        with urllib.request.urlopen(f"http://localhost:{PORT}", timeout=10) as _r:
+                            _html = _r.read().decode("utf-8", errors="replace")
+                        for _src in _re.findall(r'src="(/[^"]+)"', _html)[:10]:
+                            try:
+                                urllib.request.urlopen(f"http://localhost:{PORT}{_src}", timeout=5)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    print(f"[{_AGENT_ID}] Waiting 8s for React to fully render (Chrome path)...")
+                    _time.sleep(8)
+
+                    _chrome_flags = [
+                        "--headless=new", "--no-sandbox", "--disable-gpu",
+                        "--disable-dev-shm-usage", "--run-all-compositor-stages-before-draw",
+                    ]
+                    for _out_path, _size in [(desktop_png, "1280,900"), (mobile_png, "375,812")]:
+                        chrome_result = subprocess.run(
+                            [chrome_bin] + _chrome_flags + [
+                                f"--screenshot={_out_path}",
+                                f"--window-size={_size}",
+                                f"http://localhost:{PORT}",
+                            ],
+                            capture_output=True, timeout=45,
+                        )
+                        if os.path.isfile(_out_path) and os.path.getsize(_out_path) > 0:
+                            screenshots.append(_out_path)
+                            print(f"[{_AGENT_ID}] Chrome screenshot saved ({_size}): {os.path.getsize(_out_path)} bytes")
+                        else:
+                            print(f"[{_AGENT_ID}] Chrome screenshot failed (rc={chrome_result.returncode})")
+                else:
+                    print(f"[{_AGENT_ID}] No Chrome/Chromium found — falling back to HTML snapshot")
+
+        # --- HTML fallback if no screenshots and server is up ---
         if not screenshots and server_ready:
             try:
-                import urllib.request
                 with urllib.request.urlopen(f"http://localhost:{PORT}", timeout=5) as r:
                     html_bytes = r.read()
                 html_fallback = os.path.join(screenshot_dir, "landing-page.html")
@@ -1178,7 +1218,6 @@ async def capture_screenshot(state: dict) -> dict:
 
     captured = bool(screenshots) and any(s.endswith(".png") for s in screenshots)
     log.info("screenshot result", captured=captured, count=len(screenshots))
-
     return {
         "screenshot_captured": captured,
         "screenshots": screenshots,
@@ -1411,6 +1450,7 @@ async def create_pr(state: dict) -> dict:
 
     # Step 3: Push branch then create PR via SCM boundary tools (not open agentic).
     task_id = state.get("_task_id", "")
+
     log.info("pushing branch to remote", branch=branch_name)
     push_payload = _call_boundary_tool(
         state, "scm_push", {"repo_path": repo_path, "branch": branch_name, "task_id": task_id}
@@ -1445,6 +1485,51 @@ async def create_pr(state: dict) -> dict:
     else:
         log.info("PR created", pr_url=pr_url, branch=branch_name)
         print(f"[{_AGENT_ID}] create_pr done: prUrl={pr_url!r} prNumber={pr_number} status={pr_status!r}")
+
+    # Step 4: Upload screenshots to GitHub and post PR comment (no repo commit needed).
+    # Screenshots are stored in the agent workspace only; they are uploaded to GitHub's
+    # CDN via the issue-assets API so they appear in the PR without being part of the
+    # committed codebase.
+    _screenshots = state.get("screenshots", [])
+    if pr_number and pr_url and _screenshots:
+        _png_screenshots = [s for s in _screenshots if s.endswith(".png") and os.path.isfile(s)]
+        if _png_screenshots:
+            _screenshot_comment_parts = []
+            for _png in _png_screenshots:
+                _label = "Desktop (1280×900)" if "desktop" in _png.lower() else "Mobile (375×812)"
+                _upload_result = _call_boundary_tool(
+                    state, "scm_upload_pr_image",
+                    {
+                        "repo_url": repo_url,
+                        "pr_number": pr_number,
+                        "image_path": _png,
+                        "task_id": task_id,
+                    },
+                )
+                _image_url = _upload_result.get("image_url", "")
+                if _image_url:
+                    _screenshot_comment_parts.append(
+                        f"**{_label}**\n![]({_image_url})\n"
+                    )
+                    print(f"[{_AGENT_ID}] Screenshot uploaded to GitHub CDN: {_image_url[:80]}")
+                else:
+                    print(f"[{_AGENT_ID}] Screenshot upload failed for {_png}: {_upload_result.get('error','')}")
+
+            if _screenshot_comment_parts:
+                _comment_body = "### Screenshots\n\n" + "\n".join(_screenshot_comment_parts)
+                _comment_result = _call_boundary_tool(
+                    state, "scm_add_pr_comment",
+                    {
+                        "repo_url": repo_url,
+                        "pr_number": pr_number,
+                        "comment": _comment_body,
+                        "task_id": task_id,
+                    },
+                )
+                if _comment_result.get("ok"):
+                    print(f"[{_AGENT_ID}] Screenshot comment posted on PR #{pr_number}")
+                else:
+                    print(f"[{_AGENT_ID}] Screenshot comment failed: {_comment_result.get('error','')}")
 
     # Write pr-evidence.json to workspace
     workspace_path = state.get("workspace_path", "")

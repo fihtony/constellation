@@ -928,20 +928,127 @@ async def handle_question(state: dict) -> dict:
 # URL extraction helpers
 # ---------------------------------------------------------------------------
 
+def _adf_extract_all(node, lines: list) -> None:
+    """Recursively extract plain text and inlineCard/blockCard URLs from an ADF node.
+
+    Jira stores embedded URLs (GitHub, Stitch, Figma, etc.) as inlineCard nodes
+    rather than plain text.  This walker surfaces those URLs so the LLM can see them.
+    """
+    if isinstance(node, dict):
+        node_type = node.get("type", "")
+        if node_type in ("inlineCard", "blockCard", "embedCard"):
+            url = node.get("attrs", {}).get("url", "")
+            if url:
+                lines.append(url)
+            return
+        if node_type == "text":
+            text = node.get("text", "")
+            if text.strip():
+                lines.append(text.strip())
+            return
+        if node_type == "hardBreak":
+            return
+        for child in node.get("content", []):
+            _adf_extract_all(child, lines)
+    elif isinstance(node, list):
+        for item in node:
+            _adf_extract_all(item, lines)
+
+
+def _adf_to_text(adf) -> str:
+    """Convert an ADF document (dict or str) to plain readable text with URLs preserved."""
+    if isinstance(adf, str):
+        return adf
+    if not isinstance(adf, dict):
+        return ""
+    lines: list = []
+    _adf_extract_all(adf, lines)
+    return " ".join(lines)
+
+
+# Fields that carry important content for context extraction (checked first)
+_IMPORTANT_JIRA_FIELDS = (
+    "summary", "description", "acceptance_criteria",
+    "customfield_10016",  # Acceptance Criteria (common Jira Cloud field ID)
+    "customfield_10014",  # Story Points / Epic Link — often contains references
+    "customfield_10058",  # varies by project — sometimes acceptance criteria
+)
+
+# Noisy system/metadata fields to skip (they inflate token count with no value)
+_SKIP_JIRA_FIELDS = {
+    "issuetype", "project", "avatarUrls", "iconUrl", "subtask",
+    "statuscategory", "statusCategory", "statusCategoryChangeDate",
+    "issuerestriction", "watches", "workratio", "aggregatetimespent",
+    "timeestimate", "aggregatetimeoriginalestimate", "timespent",
+    "aggregatetimeestimate", "timetracking", "resolutiondate", "lastViewed",
+    "created", "updated", "priority", "fixVersions", "versions", "labels",
+    "customfield_10019", "customfield_10021", "customfield_10033",
+    "customfield_10035", "expand",
+}
+
+
 def _jira_to_text(jira_context: dict) -> str:
-    """Flatten Jira ticket dict into a single searchable text blob."""
-    parts = []
+    """Flatten Jira ticket dict into a searchable text blob.
+
+    Important fields (key, summary, description, acceptance criteria) are emitted
+    FIRST so they fall within the LLM prompt window even when the ticket is large.
+    ADF inlineCard/blockCard nodes are unwrapped to expose their embedded URLs.
+    Noisy system metadata fields are skipped to reduce token count.
+    """
+    parts: list[str] = []
+
+    # 1. Top-level identifiers
     for key in ("key", "summary", "url"):
-        if jira_context.get(key):
-            parts.append(str(jira_context[key]))
+        val = jira_context.get(key)
+        if val and isinstance(val, str):
+            parts.append(f"{key}: {val}")
+
     fields = jira_context.get("fields", jira_context)
+
+    # 2. Important fields first — description, acceptance criteria
+    for field_name in _IMPORTANT_JIRA_FIELDS:
+        val = fields.get(field_name)
+        if val is None:
+            continue
+        if isinstance(val, dict):
+            text = _adf_to_text(val)
+            if text:
+                parts.append(f"{field_name}: {text}")
+        elif isinstance(val, str) and val.strip():
+            parts.append(f"{field_name}: {val.strip()}")
+
+    # 3. All remaining string / dict / list fields (skip noisy metadata)
     for _k, val in fields.items():
-        if isinstance(val, str):
-            parts.append(val)
+        if _k in _SKIP_JIRA_FIELDS or _k in _IMPORTANT_JIRA_FIELDS:
+            continue
+        if isinstance(val, str) and val.strip():
+            parts.append(val.strip())
         elif isinstance(val, dict):
-            parts.append(json.dumps(val))
+            # Unwrap ADF if it looks like a doc node, otherwise compact JSON
+            if val.get("type") == "doc":
+                text = _adf_to_text(val)
+                if text:
+                    parts.append(text)
+            else:
+                # Compact JSON but still extract any inlineCard URLs
+                url_lines: list = []
+                _adf_extract_all(val, url_lines)
+                if url_lines:
+                    parts.extend(url_lines)
+                else:
+                    compact = json.dumps(val, ensure_ascii=False)
+                    if len(compact) < 300:
+                        parts.append(compact)
         elif isinstance(val, list):
-            parts.append(" ".join(str(v) for v in val))
+            url_lines = []
+            _adf_extract_all(val, url_lines)
+            if url_lines:
+                parts.extend(url_lines)
+            else:
+                flat = " ".join(str(v) for v in val if v)
+                if flat.strip():
+                    parts.append(flat)
+
     return "\n".join(parts)
 
 
@@ -1010,7 +1117,7 @@ def _extract_context_with_llm(jira_context: dict, runtime) -> dict:
     from agents.team_lead.prompts.extraction import EXTRACTION_SYSTEM, EXTRACTION_TEMPLATE
 
     jira_text = _jira_to_text(jira_context)
-    prompt = EXTRACTION_TEMPLATE.format(jira_text=jira_text[:4000])
+    prompt = EXTRACTION_TEMPLATE.format(jira_text=jira_text[:8000])
 
     try:
         result = runtime.run(

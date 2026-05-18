@@ -196,7 +196,112 @@ class SCMCreatePR(BaseTool):
         return ToolResult(output=json.dumps(result))
 
 
-_TOOLS = [CloneRepo(), SCMListBranches(), SCMPush(), SCMCreatePR()]
+class SCMAddPRComment(BaseTool):
+    """Post a Markdown comment to an existing pull request."""
+
+    name = "scm_add_pr_comment"
+    description = "Post a Markdown comment to an existing pull request."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string", "description": "Full GitHub repo URL."},
+            "pr_number": {"type": "integer", "description": "Pull request number."},
+            "comment": {"type": "string", "description": "Markdown comment body."},
+            "task_id": {"type": "string"},
+        },
+        "required": ["repo_url", "pr_number", "comment"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        pr_number: int = 0,
+        comment: str = "",
+        task_id: str = "",
+    ) -> ToolResult:
+        log = _log(task_id)
+        log.info("scm_add_pr_comment called", repo_url=repo_url, pr_number=pr_number)
+        owner, repo = _parse_repo_coordinates(repo_url)
+        # Use GitHub client directly for the comment API
+        from agents.scm.client import create_scm_client
+        import os as _os
+        client = create_scm_client(
+            base_url=repo_url,
+            token=_os.environ.get("SCM_TOKEN", ""),
+            backend="github-rest",
+        )
+        result, status = client.add_pr_comment(owner, repo, pr_number, comment)
+        if status != "ok":
+            log.error("scm_add_pr_comment failed", status=status, pr_number=pr_number)
+            return ToolResult(output=json.dumps({"error": f"status={status}", "detail": result}))
+        log.info("scm_add_pr_comment ok", pr_number=pr_number, comment_id=result.get("id"))
+        return ToolResult(output=json.dumps({"ok": True, "comment_id": result.get("id")}))
+
+
+class SCMUploadPRImage(BaseTool):
+    """Upload a local image file to a GitHub PR and return the CDN URL.
+
+    The image is uploaded via GitHub's issue-assets upload endpoint (same
+    mechanism used by drag-and-drop in the GitHub web UI).  The returned
+    ``image_url`` is a ``user-images.githubusercontent.com`` CDN link that
+    can be embedded in PR descriptions or comments without committing any
+    binary file to the repository.
+    """
+
+    name = "scm_upload_pr_image"
+    description = (
+        "Upload a local image file to a GitHub PR via GitHub's asset upload "
+        "endpoint and return the CDN URL for embedding in Markdown."
+    )
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string", "description": "Full GitHub repo URL."},
+            "pr_number": {"type": "integer", "description": "Pull request number."},
+            "image_path": {"type": "string", "description": "Absolute path to the local image file."},
+            "filename": {"type": "string", "description": "Override filename used in the upload (optional)."},
+            "task_id": {"type": "string"},
+        },
+        "required": ["repo_url", "pr_number", "image_path"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        pr_number: int = 0,
+        image_path: str = "",
+        filename: str = "",
+        task_id: str = "",
+    ) -> ToolResult:
+        from agents.scm.tools import _parse_repo_coordinates
+        import os as _os
+        log = _log(task_id)
+        log.info("scm_upload_pr_image called", repo_url=repo_url, pr_number=pr_number,
+                 image_path=image_path)
+        if not _os.path.isfile(image_path):
+            return ToolResult(output=json.dumps({"error": f"image_path not found: {image_path}"}))
+        owner, repo = _parse_repo_coordinates(repo_url)
+        from agents.scm.client import create_scm_client  # noqa: PLC0415 (local import OK)
+        client = create_scm_client(
+            base_url=repo_url,
+            token=_os.environ.get("SCM_TOKEN", ""),
+            backend="github-rest",
+        )
+        result, status = client.upload_issue_image(
+            owner, repo, pr_number, image_path, filename=filename
+        )
+        if status != "ok":
+            log.error("scm_upload_pr_image failed", status=status, error=str(result)[:200])
+            return ToolResult(output=json.dumps({
+                "error": f"upload failed: status={status}",
+                "detail": str(result)[:200],
+            }))
+        image_url = result.get("href", "")
+        log.info("scm_upload_pr_image ok", image_url=image_url[:80] if image_url else "")
+        return ToolResult(output=json.dumps({"ok": True, "image_url": image_url}))
+
+
+_TOOLS = [CloneRepo(), SCMListBranches(), SCMPush(), SCMCreatePR(), SCMAddPRComment(), SCMUploadPRImage()]
 
 
 def register_scm_tools() -> None:

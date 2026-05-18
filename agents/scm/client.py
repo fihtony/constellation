@@ -532,6 +532,89 @@ class GitHubClient:
         except Exception as exc:
             return {}, str(exc)
 
+    def update_pr(
+        self,
+        owner: str,
+        repo: str,
+        pr_id: str | int,
+        body: str | None = None,
+        title: str | None = None,
+        timeout: int = 15,
+    ) -> tuple[dict, str]:
+        """Update a pull request (title and/or body)."""
+        payload: dict = {}
+        if body is not None:
+            payload["body"] = body
+        if title is not None:
+            payload["title"] = title
+        if not payload:
+            return {}, "no_changes"
+        try:
+            status, resp = self._request(
+                "PATCH", f"repos/{owner}/{repo}/pulls/{pr_id}", payload, timeout=timeout
+            )
+            if status in (200, 201):
+                return {
+                    "id": resp.get("number"),
+                    "url": resp.get("html_url", ""),
+                }, "ok"
+            return resp, f"http_{status}"
+        except Exception as exc:
+            return {}, str(exc)
+
+    def upload_issue_image(
+        self,
+        owner: str,
+        repo: str,
+        issue_number: int,
+        image_path: str,
+        filename: str = "",
+        timeout: int = 30,
+    ) -> tuple[dict, str]:
+        """Upload a binary image to a GitHub issue/PR for embedding in comments.
+
+        Uses GitHub's uploads API (the same endpoint that the web UI uses when
+        you drag-and-drop an image into a comment box).  The returned ``href``
+        is a ``user-images.githubusercontent.com`` CDN URL that can be embedded
+        directly in Markdown: ``![label]({href})``.
+
+        The Authorization header is set but never logged per security policy.
+        """
+        import os as _os
+        fname = filename or _os.path.basename(image_path)
+        uploads_url = (
+            f"https://uploads.github.com/repos/{owner}/{repo}"
+            f"/issues/{issue_number}/assets?name={quote(fname)}"
+        )
+        try:
+            with open(image_path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            return {"error": str(exc)}, f"read_error: {exc}"
+
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Accept": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        auth = self._auth_header()
+        if auth:
+            headers["Authorization"] = auth  # NOT logged (security policy §4)
+        req = Request(uploads_url, data=data, headers=headers, method="POST")
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                result = json.loads(raw) if raw.strip() else {}
+                return result, "ok"
+        except HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                return json.loads(raw), f"http_{exc.code}"
+            except Exception:
+                return {"error": raw[:300]}, f"http_{exc.code}"
+        except Exception as exc:
+            return {"error": str(exc)}, str(exc)
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

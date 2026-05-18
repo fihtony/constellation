@@ -90,6 +90,36 @@ D. BUILD VERIFICATION — MANDATORY BEFORE PR:
    - If build fails with missing module errors, check import paths and file names.
    - Only proceed to PR when `npm run build` exits with code 0.
 
+STRICT DESIGN FIDELITY (MANDATORY for all UI tasks when a Design HTML Reference is provided):
+When Design HTML Reference is provided (not "N/A"), it is the ABSOLUTE SOURCE OF TRUTH for the UI.
+
+1. NEVER add any UI element, section, component, or content that is not present in the Design HTML Reference.
+
+2. FORBIDDEN ADDITIONS (unless explicitly visible in the reference HTML):
+   - Search bars, filter inputs, dropdown selects, or any filtering/sorting UI
+   - Tags, badges, categories, labels, chips
+   - Duration/time metadata ("5 min", "2 hrs", "45 minutes")
+   - Date fields, "last updated", author fields, "by Author" text
+   - Rating stars, likes, view counts, progress bars
+   - Pagination controls, "load more" buttons
+   - Skeleton/loading states, spinners
+   - Extra navigation links not shown in the design
+   - Social sharing buttons, bookmarks, favorites
+   - Breadcrumbs, back buttons
+   - Promotional banners, CTA sections not in the design
+   - Any additional cards, items, or list entries beyond what the design shows
+
+3. MATCH EXACT QUANTITY: If the design shows N items (e.g., 5 lesson rows), implement EXACTLY N items.
+   Do NOT add extra items, dynamic generation, or pagination for more items.
+
+4. MATCH EXACT TEXT: Use the same text content from the design reference (lesson titles, nav labels, footer text, etc.)
+
+5. COMPONENT AUDIT (do this BEFORE committing):
+   - List every visible component in the Design HTML Reference.
+   - List every component in your implementation.
+   - Remove any component in your implementation that is NOT in the design reference.
+   - This audit MUST be completed — do not skip it.
+
 Greenfield guidance (repo is empty or README-only):
 - Scaffold the full project structure in your FIRST turn.
 - Choose the tech stack from the Jira context or task description.
@@ -123,16 +153,15 @@ Always create a comprehensive .gitignore BEFORE writing any other files. It MUST
   *.local
   coverage/
   __pycache__/
-  *.png
-  *.jpg
-  *.jpeg
-  *.gif
   screenshots/
   e2e/evidence/
   FINAL_VERIFICATION.md
   IMPLEMENTATION_EVIDENCE.md
   VERIFICATION_SUMMARY.txt
   *.log
+
+NOTE: Do NOT add *.png globally to .gitignore — evidence screenshots in docs/evidence/
+must be committable for PR description embeds.
 
 Test organization rules (MANDATORY — follow framework best practices):
 - Vite+React: ALL tests (unit + integration) go in src/ alongside the components:
@@ -206,24 +235,29 @@ For UI tasks — MANDATORY steps (in order):
    - Border radius values (sm, DEFAULT, md, lg, xl)
    Write these values into your CSS/config — do NOT use generic defaults like "Inter" or "Roboto".
 
-2. If Design HTML Reference is available (not N/A):
-   Parse it completely to list EVERY component: navigation bar, header, lesson cards,
-   search/filter bar, sidebar, hero section, CTA sections, footer, pagination, etc.
-   Use the same HTML structure, CSS class names, and layout approach.
-   Extract color tokens (CSS custom properties or Tailwind config) from the HTML.
+2. COMPONENT INVENTORY — MANDATORY when Design HTML Reference is available (not N/A):
+   Parse the Design HTML Reference and list EVERY visible component you see.
+   This list is your implementation contract — you MUST implement exactly these components
+   and NO OTHERS. For example, if you see:
+     - Top navigation bar with logo, nav links, sign-in button → implement it
+     - Hero/header section with title → implement it
+     - 5 lesson list items (each with unit label, lesson title, arrow icon) → implement exactly 5
+     - Footer with copyright and policy links → implement it
+   If a component is NOT in this list, do NOT implement it.
+   FORBIDDEN: search bars, filter controls, tags, badges, duration metadata, author fields,
+   rating stars, pagination, loading states, extra CTA sections, breadcrumbs — unless
+   explicitly present in the Design HTML Reference.
 
-3. If Design HTML Reference is N/A, use the Design Specification colors and typography
-   directly. Build components from the Design Specification alone.
+3. IMPLEMENT EACH COMPONENT faithfully — match fonts, colors, spacing, and layout.
+   Use the Design HTML Reference structure, CSS class names/patterns, and design tokens.
 
-4. Implement each component faithfully — match fonts, colors, spacing, and layout.
+4. Verify npm packages before adding them (see npm rules in system prompt).
 
-5. Verify npm packages before adding them (see npm rules in system prompt).
+5. Run: npm install  (fix any install errors before continuing)
 
-6. Run: npm install  (fix any install errors before continuing)
+6. Run: npm run build  (fix ALL build/TypeScript errors before continuing)
 
-7. Run: npm run build  (fix ALL build/TypeScript errors before continuing)
-
-8. VERIFY ROUTING — MANDATORY (prevents blank screen):
+7. VERIFY ROUTING — MANDATORY (prevents blank screen):
    - Open App.tsx and confirm the new page component is imported and rendered.
    - If app uses React Router, confirm a <Route> for the new page exists.
    - If the page is NOT wired in App.tsx, add the import and route NOW.
@@ -233,6 +267,16 @@ For UI tasks — MANDATORY steps (in order):
        curl -s http://localhost:5179 | head -50   # should show HTML, not blank
        kill %1 2>/dev/null || true
    - If the server responds with blank HTML or errors, fix App.tsx routing before continuing.
+
+8. DESIGN FIDELITY AUDIT — MANDATORY before committing (for UI tasks):
+   Compare your implementation against the Design HTML Reference:
+   a. List EVERY visible component in the Design HTML Reference (make a checklist).
+   b. Verify each design component is present in your implementation with correct content.
+   c. List EVERY component in your implementation.
+   d. For each implementation component NOT found in the design reference → REMOVE IT.
+   e. Common violations to check: search bar, filter UI, tags, duration/time text,
+      author names, extra cards, extra navigation items, rating stars, pagination.
+   This audit step is NOT optional — skipping it causes self-assessment failure.
 
 9. Stage and commit ALL changes:
    git add -A
@@ -360,21 +404,54 @@ Changed files:
 {changed_files}
 
 Instructions:
-1. For each acceptance criterion, check whether it is satisfied by the changed files.
-2. Parse the Design spec and Design HTML reference to identify EVERY major component
-   (e.g. navigation bar, search/filter bar, lesson cards grid, sidebar, hero section,
-   CTA button, footer, pagination, etc.).
-   For each component:
-   a. Check whether it is present in the implementation (look in changed_files).
-   b. Check that design tokens are applied correctly: colors match Design spec, font
-      families match (Work Sans / Newsreader), spacing matches the spacing scale.
-   c. If the component exists but uses wrong colors or fonts, mark as "incomplete".
-3. Check routing: confirm the new page is wired into App.tsx and will NOT produce
-   a blank screen. If no route exists, mark as gap "Blank screen: page not routed".
-4. Score 0.9+ ONLY if ALL acceptance criteria are met AND all identified design
-   components are present and correct. List specific gaps for anything missing.
-5. In "gaps", be precise: name the missing component or failing criterion
-   so it can be fixed directly.
+
+STEP 1 — ACCEPTANCE CRITERIA:
+For each acceptance criterion, check whether it is satisfied by the changed files.
+
+STEP 2 — DESIGN COMPONENT INVENTORY:
+Parse the Design HTML reference and extract ALL visible components/elements. For example:
+  - Navigation bar items, logo text, CTA button labels
+  - Page header text, section labels
+  - List items (note the exact COUNT and CONTENT of each)
+  - Footer content
+  - Any other visible UI element
+For each design component, check whether it is present in the implementation with correct
+content, fonts, and colors. Produce a "component_checks" list entry for each.
+
+STEP 3 — EXTRA ELEMENTS CHECK (critical for UI fidelity):
+Scan the implementation (changed files) for UI elements NOT present in the design reference.
+This is the MOST COMMON failure mode. Look specifically for:
+  - Search bars or search input fields
+  - Filter dropdowns, select inputs, or sorting controls
+  - Tags, badges, category chips
+  - Duration or time labels ("5 min", "2 hours", reading time)
+  - Author names, "by Author" text, date fields
+  - Rating stars, like counts, view counts
+  - Progress bars or completion percentages
+  - Pagination controls or "Load more" buttons
+  - Skeleton loading states, spinners
+  - Extra navigation links not in the design
+  - Social share buttons, bookmark icons
+  - Breadcrumbs, back navigation
+  - Additional CTAs, promotional banners
+  - Extra list items beyond what the design shows
+
+For EACH extra element found:
+  - Add a component_check entry with status "extra"
+  - Add to "gaps" with message: "Extra element not in design: <element name>"
+  - Reduce score by at least 0.2 per extra element
+
+STEP 4 — DESIGN TOKEN CHECK:
+Verify font families, primary colors, and spacing match the design spec.
+
+STEP 5 — ROUTING CHECK:
+Confirm the new page is wired into App.tsx. If not, add gap: "Blank screen: page not routed".
+
+SCORING RULES:
+- Score 0.9+ ONLY if ALL criteria are met AND all design components are present AND zero extra elements.
+- Any extra element (search bar, tags, duration, etc.) → score must be < 0.9, verdict="fail".
+- Missing design component → score reduced proportionally.
+- Wrong design tokens (wrong font, wrong color) → score reduced.
 
 Return only valid JSON, no markdown fences:
 {{
@@ -384,13 +461,14 @@ Return only valid JSON, no markdown fences:
     {{"criterion": "...", "status": "pass" or "fail", "notes": "..."}}
   ],
   "component_checks": [
-    {{"component": "<component from design HTML>", "status": "present" or "missing" or "incomplete", "notes": "..."}}
+    {{"component": "<component name>", "status": "present" or "missing" or "incomplete" or "extra", "notes": "..."}}
   ],
-  "gaps": ["specific gap 1", "specific gap 2"],
+  "gaps": ["specific gap 1 — name the element or criterion", "specific gap 2"],
   "summary": "brief overall assessment"
 }}
 
 Pass threshold: score >= 0.9.
+Fail immediately if any extra element is found (not in design reference).
 """
 
 # ---------------------------------------------------------------------------
