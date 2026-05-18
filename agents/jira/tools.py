@@ -40,16 +40,47 @@ class FetchJiraTicket(BaseTool):
         "properties": {
             "ticket_key": {"type": "string", "description": "Jira ticket key, e.g. PROJ-123."},
             "task_id": {"type": "string", "description": "Caller task ID for log correlation (optional)."},
+            "workspace_path": {"type": "string", "description": "Workspace root path. When provided, ticket is saved to <workspace>/jira/<ticket_key>/ folder."},
         },
         "required": ["ticket_key"],
     }
 
-    def execute_sync(self, ticket_key: str = "", task_id: str = "") -> ToolResult:
+    def execute_sync(self, ticket_key: str = "", task_id: str = "", workspace_path: str = "") -> ToolResult:
+        import time as _time
         log = _log(task_id)
-        log.info("fetch_jira_ticket called", ticket_key=ticket_key)
+        log.info("fetch_jira_ticket called", ticket_key=ticket_key, workspace_path=workspace_path or "(not set)")
         data, status = _get_provider().fetch_issue(ticket_key)
-        log.debug("fetch_jira_ticket result", status=status)
-        return ToolResult(output=json.dumps({"ticket": data, "status": status}))
+        log.info("fetch_jira_ticket result", status=status, ticket_key=ticket_key)
+
+        local_folder = ""
+        files = []
+        if workspace_path and data:
+            try:
+                local_folder = os.path.join(workspace_path, _AGENT_ID, ticket_key)
+                os.makedirs(local_folder, exist_ok=True)
+                ticket_file = os.path.join(local_folder, "ticket.json")
+                with open(ticket_file, "w", encoding="utf-8") as fh:
+                    json.dump({
+                        "metadata": {
+                            "agent_id": _AGENT_ID,
+                            "step": "fetch_jira_ticket",
+                            "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                            "ticket_key": ticket_key,
+                        },
+                        "data": data,
+                    }, fh, ensure_ascii=False, indent=2)
+                files.append(f"jira/{ticket_key}/ticket.json")
+                log.info("jira ticket saved", local_folder=local_folder, file="ticket.json")
+                print(f"[{_AGENT_ID}] Jira ticket {ticket_key} saved to {local_folder}")
+            except OSError as exc:
+                log.warn("jira ticket save failed", error=str(exc))
+
+        return ToolResult(output=json.dumps({
+            "ticket": data,
+            "status": status,
+            "local_folder": local_folder,
+            "files": files,
+        }))
 
 
 class JiraTransition(BaseTool):
@@ -88,9 +119,12 @@ class JiraComment(BaseTool):
 
     def execute_sync(self, ticket_key: str = "", comment: str = "", task_id: str = "") -> ToolResult:
         log = _log(task_id)
+        comment_preview = (comment[:200] + "...") if len(comment) > 200 else comment
         log.info("jira_comment called", ticket_key=ticket_key, comment_len=len(comment))
+        log.info("jira_comment content", ticket_key=ticket_key, preview=comment_preview)
+        print(f"[{_AGENT_ID}] Adding comment to {ticket_key}: {comment_preview!r}")
         data, status = _get_provider().add_comment(ticket_key, comment)
-        log.debug("jira_comment result", status=status)
+        log.info("jira_comment result", status=status, ticket_key=ticket_key)
         return ToolResult(output=json.dumps({"comment": data, "status": status}))
 
 

@@ -174,14 +174,15 @@ class CompassAgent(BaseAgent):
 
             status = dispatch_data.get("status", "unknown")
             task_id_tl = dispatch_data.get("taskId", "N/A")
-            log.info("dispatch complete", status=status, tl_task_id=task_id_tl,
+            display_status = "dispatched" if status not in ("error", "failed", "unknown") else status
+            log.info("dispatch complete", status=display_status, tl_task_id=task_id_tl,
                      pr_url=dispatch_data.get("prUrl", ""))
-            log.a2a("←", "team-lead", status=status, tl_task_id=task_id_tl)
+            log.a2a("←", "team-lead", status=display_status, tl_task_id=task_id_tl)
             response_text = (
                 f"Development task dispatched to Team Lead.\n"
-                f"Jira: {jira_key or 'N/A'}  Status: {status}  TL task: {task_id_tl}"
+                f"Jira: {jira_key or 'N/A'}  Status: {display_status}  TL task: {task_id_tl}"
             )
-            print(f"[{_aid}] dispatch result: status={status} taskId={task_id_tl}")
+            print(f"[{_aid}] dispatch result: status={display_status} taskId={task_id_tl}")
 
         elif task_type == "office":
             log.info("dispatching office task")

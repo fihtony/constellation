@@ -446,7 +446,7 @@ async def analyze_task(state: dict) -> dict:
     import time as _time
     log = _logger(state)
     log.node("analyze_task")
-    print("[{_AGENT_ID}] analyze_task: building implementation plan")
+    print(f"[{_AGENT_ID}] analyze_task: building implementation plan")
 
     workspace_path = state.get("workspace_path", "")
     analysis = state.get("analysis") or state.get("user_request", "")
@@ -539,8 +539,11 @@ async def implement_changes(state: dict) -> dict:
     _design_code_ref = "N/A"
     _design_code_path = state.get("design_code_path", "")
     _workspace_path = state.get("workspace_path", "")
+    # Prefer ui-design/stitch/code.html, fallback to team-lead/design-code.html
     if not _design_code_path and _workspace_path:
-        _design_code_path = os.path.join(_workspace_path, "team-lead", "design-code.html")
+        _stitch_code = os.path.join(_workspace_path, "ui-design", "stitch", "code.html")
+        _legacy_code = os.path.join(_workspace_path, "team-lead", "design-code.html")
+        _design_code_path = _stitch_code if os.path.isfile(_stitch_code) else _legacy_code
     if _design_code_path and os.path.isfile(_design_code_path):
         try:
             with open(_design_code_path, encoding="utf-8") as _f:
@@ -551,7 +554,11 @@ async def implement_changes(state: dict) -> dict:
     # Load design spec markdown (typography/colors/spacing) for reference
     _design_spec_md = "N/A"
     if _workspace_path:
-        _design_spec_md_path = os.path.join(_workspace_path, "team-lead", "design-spec.md")
+        _stitch_md_path = os.path.join(_workspace_path, "ui-design", "stitch", "DESIGN.md")
+        _legacy_md_path = os.path.join(_workspace_path, "team-lead", "design-spec.md")
+        _design_spec_md_path = state.get("design_md_path", "") or (
+            _stitch_md_path if os.path.isfile(_stitch_md_path) else _legacy_md_path
+        )
         if os.path.isfile(_design_spec_md_path):
             try:
                 with open(_design_spec_md_path, encoding="utf-8") as _f:
@@ -810,8 +817,11 @@ async def self_assess(state: dict) -> dict:
     # Load design HTML code for component-by-component comparison
     design_code_snippet = ""
     design_code_path = state.get("design_code_path", "")
+    # Prefer ui-design/stitch/code.html, fallback to team-lead/design-code.html
     if not design_code_path and workspace_path:
-        design_code_path = os.path.join(workspace_path, "team-lead", "design-code.html")
+        _stitch_code = os.path.join(workspace_path, "ui-design", "stitch", "code.html")
+        _legacy_code = os.path.join(workspace_path, "team-lead", "design-code.html")
+        design_code_path = _stitch_code if os.path.isfile(_stitch_code) else _legacy_code
     if design_code_path and os.path.isfile(design_code_path):
         try:
             with open(design_code_path, encoding="utf-8") as _f:
@@ -823,7 +833,11 @@ async def self_assess(state: dict) -> dict:
     # Load design spec markdown (typography/colors/spacing) for component comparison
     design_spec_markdown = ""
     if workspace_path:
-        design_spec_md_path = os.path.join(workspace_path, "team-lead", "design-spec.md")
+        _stitch_md = os.path.join(workspace_path, "ui-design", "stitch", "DESIGN.md")
+        _legacy_md = os.path.join(workspace_path, "team-lead", "design-spec.md")
+        design_spec_md_path = state.get("design_md_path", "") or (
+            _stitch_md if os.path.isfile(_stitch_md) else _legacy_md
+        )
         if os.path.isfile(design_spec_md_path):
             try:
                 with open(design_spec_md_path, encoding="utf-8") as _f:
@@ -886,6 +900,8 @@ async def self_assess(state: dict) -> dict:
     score = float(data.get("score", 0))
     verdict = data.get("verdict", "fail")
     gaps = data.get("gaps", [])
+
+    print(f"[{_AGENT_ID}] self_assess result: score={score} verdict={verdict} gaps={len(gaps)}")
 
     # Write self-assessment.json to workspace
     workspace_path = state.get("workspace_path", "")

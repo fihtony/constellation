@@ -83,9 +83,11 @@ class CloneRepo(BaseTool):
             {"metadata": {"repoUrl": repo_url, "targetPath": target_path}},
         )
         if result.get("error"):
-            log.error("clone_repo failed", error=result["error"])
+            log.error("clone_repo failed", error=result["error"], repo_url=repo_url)
         else:
-            log.info("clone_repo ok", target_path=target_path)
+            log.info("clone_repo ok", local_path=target_path, repo_url=repo_url)
+            print(f"[{_AGENT_ID}] Repo cloned: {repo_url} → {target_path}")
+            result["localPath"] = target_path
         return ToolResult(output=json.dumps(result))
 
 

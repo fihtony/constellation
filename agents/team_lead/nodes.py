@@ -29,6 +29,34 @@ def _logger(state: dict) -> AgentLogger:
     return AgentLogger(state.get("_task_id", ""), _AGENT_ID)
 
 
+def _safe_json(text: str, fallback: Any = None) -> Any:
+    """Extract and parse the first JSON object/array from *text*.
+
+    Handles LLM responses wrapped in markdown code fences (```json...```).
+    Returns *fallback* when *text* is None/empty or no valid JSON is found.
+    """
+    if not text:
+        return fallback
+    # Strip markdown code fences if present
+    stripped = re.sub(r"^```(?:json)?\s*\n?", "", text.strip(), flags=re.IGNORECASE)
+    stripped = re.sub(r"\n?```$", "", stripped.strip())
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Try extracting a JSON object or array
+    match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return fallback
+
+
 async def receive_task(state: dict) -> dict:
     """Parse and validate the incoming task request."""
     import re as _re
@@ -100,9 +128,8 @@ async def analyze_requirements(state: dict) -> dict:
         )
 
         raw = result.get("raw_response", "")
-        try:
-            analysis = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
+        analysis = _safe_json(raw, fallback=None)
+        if not isinstance(analysis, dict):
             analysis = {
                 "task_type": "general",
                 "complexity": "medium",
@@ -167,12 +194,15 @@ async def gather_context(state: dict) -> dict:
     # Fetch Jira ticket if key provided and not already present
     jira_key = state.get("jira_key", "")
     task_id = state.get("_task_id", "")
+    jira_local_folder = ""
     if jira_key and not jira_context:
         log.info("fetching jira ticket", jira_key=jira_key)
-        log.a2a("→", "jira", capability="fetch_jira_ticket", jira_key=jira_key)
+        log.a2a("→", "jira", capability="fetch_jira_ticket", jira_key=jira_key,
+                workspace_path=workspace_path or "(not set)")
         try:
             result_str = registry.execute_sync(
-                "fetch_jira_ticket", {"ticket_key": jira_key, "task_id": task_id}
+                "fetch_jira_ticket",
+                {"ticket_key": jira_key, "task_id": task_id, "workspace_path": workspace_path}
             )
             payload = json.loads(result_str) if result_str else {}
             if payload.get("error"):
@@ -180,7 +210,14 @@ async def gather_context(state: dict) -> dict:
                 print(f"[{_AGENT_ID}] Jira fetch warning: {payload['error']} (continuing without Jira context)")
             else:
                 jira_context = payload.get("ticket", payload)
-                log.debug("jira fetch ok", jira_key=jira_key)
+                jira_local_folder = payload.get("local_folder", "")
+                returned_files = payload.get("files", [])
+                if returned_files:
+                    jira_files.extend(returned_files)
+                log.info("jira fetch ok", jira_key=jira_key, local_folder=jira_local_folder,
+                         files=returned_files)
+                log.a2a("←", "jira", capability="fetch_jira_ticket", jira_key=jira_key,
+                        local_folder=jira_local_folder, files_count=len(returned_files))
         except Exception as exc:
             log.error("jira fetch failed", error=str(exc))
             print(f"[{_AGENT_ID}] Jira fetch failed: {exc} (continuing without Jira context)")
@@ -265,13 +302,19 @@ async def gather_context(state: dict) -> dict:
             print(f"[{_AGENT_ID}] Failed to write jira-ticket.json: {exc}")
 
     # Fetch design context if URL provided and not already present
+    design_local_folder = ""
+    design_code_path_from_agent = ""
+    design_md_path_from_agent = ""
+    design_screen_path_from_agent = ""
     if (figma_url or stitch_id) and not design_context:
         log.info("fetching design context",
-                 figma_url=figma_url, stitch_id=stitch_id, screen_id=stitch_screen_id)
+                 figma_url=figma_url, stitch_id=stitch_id, screen_id=stitch_screen_id,
+                 workspace_path=workspace_path or "(not set)")
         log.a2a("→", "ui-design", capability="fetch_design",
-                stitch_id=stitch_id, screen_id=stitch_screen_id)
+                stitch_id=stitch_id, screen_id=stitch_screen_id,
+                workspace_path=workspace_path or "(not set)")
         try:
-            args: dict[str, str] = {"task_id": task_id}
+            args: dict[str, str] = {"task_id": task_id, "workspace_path": workspace_path}
             if figma_url:
                 args["figma_url"] = figma_url
             elif stitch_id:
@@ -285,13 +328,28 @@ async def gather_context(state: dict) -> dict:
                 print(f"[{_AGENT_ID}] Design fetch warning: {payload['error']} (continuing without design context)")
             else:
                 design_context = payload
-                log.debug("design fetch ok")
+                design_local_folder = payload.get("local_folder", "")
+                design_code_path_from_agent = payload.get("design_code_path", "")
+                design_md_path_from_agent = payload.get("design_md_path", "")
+                design_screen_path_from_agent = payload.get("design_screen_path", "")
+                returned_design_files = payload.get("files", [])
+                if returned_design_files:
+                    design_files.extend(returned_design_files)
+                log.info("design fetch ok", local_folder=design_local_folder,
+                         files=returned_design_files,
+                         code_path=design_code_path_from_agent,
+                         md_path=design_md_path_from_agent)
+                log.a2a("←", "ui-design", capability="fetch_design",
+                        local_folder=design_local_folder,
+                        files_count=len(returned_design_files),
+                        code_path=design_code_path_from_agent)
+                print(f"[{_AGENT_ID}] Design fetch ok: folder={design_local_folder!r} files={returned_design_files}")
         except Exception as exc:
             log.error("design fetch failed", error=str(exc))
             print(f"[{_AGENT_ID}] Design fetch failed: {exc} (continuing without design context)")
 
 
-    # Write design context to workspace
+    # Write design context JSON to team-lead workspace (for audit/fallback)
     if design_context and workspace_path:
         tl_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(tl_dir, exist_ok=True)
@@ -306,112 +364,73 @@ async def gather_context(state: dict) -> dict:
                     },
                     "data": design_context,
                 }, fh, ensure_ascii=False, indent=2)
-            design_files.append("team-lead/design-spec.json")
+            if "team-lead/design-spec.json" not in design_files:
+                design_files.append("team-lead/design-spec.json")
         except OSError as exc:
             print(f"[{_AGENT_ID}] Failed to write design-spec.json: {exc}")
 
-        # Extract and save Stitch design content (HTML code + design spec markdown).
-        # The v2 stitch_mcp.get_screen() now concatenates ALL content blocks into
-        # the 'text' field: HTML code block followed by design YAML/markdown block.
+    # Use design file paths from the UI Design agent when available.
+    # Fall back to team-lead/ copies when the agent didn't save files.
+    design_code_path = design_code_path_from_agent
+    design_md_path = design_md_path_from_agent
+    design_screen_path = design_screen_path_from_agent
+
+    if not design_code_path and design_context and workspace_path:
+        # Legacy fallback: extract and save to team-lead/ directory
+        tl_dir = os.path.join(workspace_path, _AGENT_ID)
+        os.makedirs(tl_dir, exist_ok=True)
         try:
             html_content = ""
             design_md_content = ""
 
-            # Path 1: Stitch screen fetch — text field contains HTML + design markdown.
             stitch_screen_data = design_context.get("screen", {}) if isinstance(design_context, dict) else {}
             stitch_text = stitch_screen_data.get("text", "")
 
-            if stitch_text:
-                # Split: HTML starts with <!DOCTYPE or <html; design YAML starts with ---
-                html_marker = "<!DOCTYPE html"
-                alt_html_marker = "<html"
-                if html_marker in stitch_text or alt_html_marker in stitch_text:
-                    # Find where HTML starts
-                    idx_html = stitch_text.find(html_marker)
-                    if idx_html < 0:
-                        idx_html = stitch_text.find(alt_html_marker)
-                    # Content before HTML (if any) might be design markdown
-                    pre_html = stitch_text[:idx_html].strip()
-                    html_and_after = stitch_text[idx_html:]
-                    # Find where HTML ends
-                    html_end_idx = html_and_after.rfind("</html>")
-                    if html_end_idx >= 0:
-                        html_content = html_and_after[:html_end_idx + 7]
-                        post_html = html_and_after[html_end_idx + 7:].strip()
-                    else:
-                        html_content = html_and_after
-                        post_html = ""
-                    # Combine pre-HTML and post-HTML text as design markdown
-                    parts = [p for p in (pre_html, post_html) if p]
-                    design_md_content = "\n".join(parts)
-                else:
-                    # Only design markdown / YAML — no HTML block
-                    design_md_content = stitch_text
-
-            # Path 2: Legacy htmlCode.downloadUrl fallback
-            if not html_content:
+            if stitch_text and stitch_text.strip().startswith("{"):
                 from urllib.request import Request as _Req, urlopen as _urlopen
-                design_data = design_context.get("design") or design_context
-                html_download_url = (design_data.get("htmlCode") or {}).get("downloadUrl", "")
+                screen_meta = json.loads(stitch_text)
+                html_download_url = (screen_meta.get("htmlCode") or {}).get("downloadUrl", "")
                 if html_download_url:
                     req = _Req(html_download_url, headers={"User-Agent": "constellation-team-lead/1.0"})
                     with _urlopen(req, timeout=30) as resp:
                         html_content = resp.read().decode("utf-8", errors="replace")
+                    print(f"[{_AGENT_ID}] Fallback: Downloaded HTML from htmlCode.downloadUrl: {len(html_content)} chars")
+                title = screen_meta.get("title", "Design Screen")
+                width = screen_meta.get("width", "")
+                height = screen_meta.get("height", "")
+                device = screen_meta.get("deviceType", "")
+                design_md_content = (
+                    f"# {title}\n\nScreen: {width}x{height} ({device})\n"
+                    f"Project: {stitch_screen_data.get('projectId', '')} "
+                    f"Screen: {stitch_screen_data.get('screenId', '')}\n"
+                )
+            elif stitch_text:
+                html_marker = "<!DOCTYPE html"
+                if html_marker in stitch_text or "<html" in stitch_text:
+                    idx_html = stitch_text.find(html_marker)
+                    if idx_html < 0:
+                        idx_html = stitch_text.find("<html")
+                    html_and_after = stitch_text[idx_html:]
+                    html_end_idx = html_and_after.rfind("</html>")
+                    html_content = html_and_after[:html_end_idx + 7] if html_end_idx >= 0 else html_and_after
+                    design_md_content = stitch_text[:idx_html].strip()
+                else:
+                    design_md_content = stitch_text
 
-            # Save HTML code
             if html_content:
                 code_file = os.path.join(tl_dir, "design-code.html")
                 with open(code_file, "w", encoding="utf-8") as fh:
                     fh.write(html_content)
                 design_files.append(f"{_AGENT_ID}/design-code.html")
                 design_code_path = code_file
-                print(f"[{_AGENT_ID}] Design HTML saved: {len(html_content)} chars → {code_file}")
-
-            # Save design spec markdown / YAML
             if design_md_content:
                 md_file = os.path.join(tl_dir, "design-spec.md")
                 with open(md_file, "w", encoding="utf-8") as fh:
                     fh.write(design_md_content)
                 design_files.append(f"{_AGENT_ID}/design-spec.md")
-                print(f"[{_AGENT_ID}] Design spec saved: {len(design_md_content)} chars → {md_file}")
-
+                design_md_path = md_file
         except Exception as exc:
-            print(f"[{_AGENT_ID}] Design content extraction failed (non-fatal): {exc}")
-
-    # Fetch and save Stitch screen image (design reference screenshot)
-    design_screen_path = ""
-    if stitch_id and stitch_screen_id and workspace_path:
-        try:
-            log.info("fetching stitch screen image", stitch_id=stitch_id, screen_id=stitch_screen_id)
-            log.a2a("→", "ui-design", capability="stitch.screen.image",
-                    stitch_id=stitch_id, screen_id=stitch_screen_id)
-            img_result_str = registry.execute_sync(
-                "fetch_design",
-                {
-                    "task_id": task_id,
-                    "stitch_project_id": stitch_id,
-                    "stitch_screen_id": stitch_screen_id,
-                    "capability": "stitch.screen.image",
-                },
-            )
-            img_payload = json.loads(img_result_str) if img_result_str else {}
-            image_data = img_payload.get("image", {})
-            img_url = image_data.get("imageUrl", "") or image_data.get("url", "")
-            if img_url and workspace_path:
-                tl_dir = os.path.join(workspace_path, _AGENT_ID)
-                os.makedirs(tl_dir, exist_ok=True)
-                from urllib.request import Request as _ImgReq, urlopen as _img_urlopen
-                img_req = _ImgReq(img_url, headers={"User-Agent": "constellation-team-lead/1.0"})
-                with _img_urlopen(img_req, timeout=30) as img_resp:
-                    img_bytes = img_resp.read()
-                screen_png = os.path.join(tl_dir, "screen.png")
-                with open(screen_png, "wb") as fh:
-                    fh.write(img_bytes)
-                design_files.append(f"{_AGENT_ID}/screen.png")
-                design_screen_path = screen_png
-                print(f"[{_AGENT_ID}] Design screen image saved: {len(img_bytes)} bytes → {screen_png}")
-        except Exception as exc:
-            print(f"[{_AGENT_ID}] Design screen image fetch failed (non-fatal): {exc}")
+            print(f"[{_AGENT_ID}] Design content extraction fallback failed (non-fatal): {exc}")
 
     # Derive repo name from URL — validate it's a real SCM URL first
     _scm_hosts = ("github.com", "bitbucket.org", "gitlab.com", "dev.azure.com")
@@ -425,13 +444,14 @@ async def gather_context(state: dict) -> dict:
         if parts and parts[-1] == "browse":
             parts.pop()
         repo_name = parts[-1] if parts else "repo"
-    repo_path = os.path.join(workspace_path, repo_name) if repo_name else ""
+    # Clone repo under scm/<repo_name>/ — the SCM agent owns its folder
+    repo_path = os.path.join(workspace_path, "scm", repo_name) if repo_name else ""
 
     # Clone repo via SCM Agent (A2A)
     repo_cloned = False
     if repo_url and repo_path:
         log.info("cloning repository", repo_url=repo_url, target=repo_path)
-        log.a2a("→", "scm", capability="clone_repo", repo_url=repo_url)
+        log.a2a("→", "scm", capability="clone_repo", repo_url=repo_url, local_target=repo_path)
         try:
             clone_result_str = registry.execute_sync(
                 "clone_repo",
@@ -454,8 +474,8 @@ async def gather_context(state: dict) -> dict:
                         f"Repo clone reported success but path is missing or empty: {repo_path!r}"
                     )
                 repo_cloned = True
-                log.debug("repo clone ok", repo_path=repo_path)
-                log.info("repo cloned ok", repo_name=repo_name)
+                log.info("repo clone ok", repo_name=repo_name, local_path=repo_path)
+                log.a2a("←", "scm", capability="clone_repo", local_path=repo_path, repo_name=repo_name)
                 print(f"[{_AGENT_ID}] Repo cloned: {repo_name} → {repo_path}")
         except RuntimeError:
             raise  # propagate clone failures — they are fatal for the workflow
@@ -478,8 +498,12 @@ async def gather_context(state: dict) -> dict:
             "data": {
                 "workspace_root": workspace_path,
                 "jira_files": jira_files,
+                "jira_local_folder": jira_local_folder,
                 "design_files": design_files,
+                "design_local_folder": design_local_folder,
                 "design_code_path": design_code_path,
+                "design_md_path": design_md_path,
+                "design_screen_path": design_screen_path,
                 "repo_path": repo_path,
                 "repo_name": repo_name,
                 "repo_cloned": repo_cloned,
@@ -506,8 +530,11 @@ async def gather_context(state: dict) -> dict:
         "repo_path": repo_path,
         "repo_cloned": repo_cloned,
         "jira_files": jira_files,
+        "jira_local_folder": jira_local_folder,
         "design_files": design_files,
+        "design_local_folder": design_local_folder,
         "design_code_path": design_code_path,
+        "design_md_path": design_md_path if "design_md_path" in dir() else "",
         "context_manifest_path": context_manifest_path,
     }
 
@@ -548,9 +575,8 @@ async def create_plan(state: dict) -> dict:
     )
 
     raw = result.get("raw_response", "")
-    try:
-        plan = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    plan = _safe_json(raw, fallback=None)
+    if not isinstance(plan, dict):
         plan = {"steps": [{"step": 1, "action": raw or "Execute task"}]}
 
     # Build skill context
@@ -612,7 +638,10 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "workspace_path": state.get("workspace_path", ""),
                 "context_manifest_path": state.get("context_manifest_path", ""),
                 "jira_files": state.get("jira_files", []),
+                "jira_local_folder": state.get("jira_local_folder", ""),
                 "design_files": state.get("design_files", []),
+                "design_local_folder": state.get("design_local_folder", ""),
+                "design_md_path": state.get("design_md_path", ""),
                 "tech_stack": state.get("tech_stack") or [],
                 "stitch_screen_name": state.get("stitch_screen_name", ""),
                 "orchestrator_task_id": state.get("_task_id", ""),
@@ -623,7 +652,9 @@ async def dispatch_dev_agent(state: dict) -> dict:
                     "self_assessment_required": True,
                     "jira_state_management": True,
                     "pr_required": True,
-                    "screenshot_required": state.get("task_type", "") in ("feature", "ui", "frontend"),
+                    "screenshot_required": state.get("task_type", "") in (
+                        "feature", "ui", "frontend", "frontend_feature", "ui_feature",
+                    ) or bool(state.get("design_context") or state.get("stitch_screen_id")),
                 }),
             },
         )

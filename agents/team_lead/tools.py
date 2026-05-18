@@ -261,6 +261,22 @@ class DispatchWebDev(BaseTool):
                 "type": "object",
                 "description": "Design spec data (from fetch_design). Optional.",
             },
+            "design_code_path": {
+                "type": "string",
+                "description": "Local path to design code HTML file (ui-design/stitch/code.html). Optional.",
+            },
+            "design_md_path": {
+                "type": "string",
+                "description": "Local path to DESIGN.md spec file (ui-design/stitch/DESIGN.md). Optional.",
+            },
+            "design_local_folder": {
+                "type": "string",
+                "description": "Local folder where design files were saved by the UI design agent. Optional.",
+            },
+            "jira_local_folder": {
+                "type": "string",
+                "description": "Local folder where Jira ticket files were saved by the jira agent. Optional.",
+            },
             "repo_url": {
                 "type": "string",
                 "description": "Git repository URL. Optional.",
@@ -310,6 +326,10 @@ class DispatchWebDev(BaseTool):
         task_description: str = "",
         jira_context: dict | None = None,
         design_context: dict | None = None,
+        design_code_path: str = "",
+        design_md_path: str = "",
+        design_local_folder: str = "",
+        jira_local_folder: str = "",
         repo_url: str = "",
         repo_path: str = "",
         workspace_path: str = "",
@@ -337,8 +357,16 @@ class DispatchWebDev(BaseTool):
             meta["contextManifestPath"] = context_manifest_path
         if jira_files:
             meta["jiraFiles"] = jira_files
+        if jira_local_folder:
+            meta["jiraLocalFolder"] = jira_local_folder
         if design_files:
             meta["designFiles"] = design_files
+        if design_local_folder:
+            meta["designLocalFolder"] = design_local_folder
+        if design_code_path:
+            meta["designCodePath"] = design_code_path
+        if design_md_path:
+            meta["designMdPath"] = design_md_path
         if tech_stack:
             meta["techStack"] = tech_stack
         if stitch_screen_name:

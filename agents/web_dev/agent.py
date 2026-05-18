@@ -53,7 +53,7 @@ web_dev_workflow = Workflow(
             "fail": fix_gaps,
             "need_user_input": pause_for_user_input,
         }),
-        (fix_gaps, run_tests),
+        (fix_gaps, self_assess),  # design gaps fixed — re-assess without re-running all tests
         (capture_screenshot, create_pr),
         (create_pr, update_jira),
         (update_jira, report_result),
@@ -155,6 +155,9 @@ class WebDevAgent(BaseAgent):
             ),
             "design_context": metadata.get("designContext"),
             "design_code_path": metadata.get("designCodePath", ""),
+            "design_md_path": metadata.get("designMdPath", ""),
+            "design_local_folder": metadata.get("designLocalFolder", ""),
+            "jira_local_folder": metadata.get("jiraLocalFolder", ""),
             "skill_context": metadata.get("skillContext", ""),
             "context_manifest_path": metadata.get("contextManifestPath", ""),
             "jira_files": metadata.get("jiraFiles", []),
