@@ -353,31 +353,31 @@ async def test_implement_jira_ticket_full_workflow(request):
     cfg = _load_live_config(task_arg)
     _set_env_from_config(cfg)
 
-    artifact_root = os.path.abspath(os.environ.get("ARTIFACT_ROOT", "artifacts"))
-    workspace_path = os.path.join(artifact_root, "live-e2e")
-    os.makedirs(workspace_path, exist_ok=True)
-
-    # Tell Team Lead's in-process dispatch where to put artifacts
-    os.environ["TL_WORKSPACE_PATH"] = workspace_path
+    # Set ARTIFACT_ROOT to artifacts/live-e2e/ so Compass creates
+    # workspace at artifacts/live-e2e/<compass_task_id>/
+    # All agents share that same task ID as workspace root.
+    live_e2e_root = os.path.abspath(os.path.join("artifacts", "live-e2e"))
+    os.makedirs(live_e2e_root, exist_ok=True)
+    os.environ["ARTIFACT_ROOT"] = live_e2e_root
 
     # Log setup
-    log_file = os.path.join(artifact_root, "live-e2e-run.log")
+    log_file = os.path.join(live_e2e_root, "live-e2e-run.log")
     file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     logging.getLogger().addHandler(file_handler)
     sys.stdout.reconfigure(line_buffering=True)
 
     print("\n" + "=" * 70)
-    print(f"[e2e] TASK      : {task_arg}")
-    print(f"[e2e] WORKSPACE : {workspace_path}")
-    print(f"[e2e] LOG       : {log_file}")
-    print(f"[e2e] Jira key  : {cfg['jira_key']}")
-    print(f"[e2e] SCM repo  : {cfg.get('scm_repo_url', '(to be discovered from Jira ticket)')}")
-    print(f"[e2e] Model     : {cfg['openai_model']}")
+    print(f"[e2e] TASK        : {task_arg}")
+    print(f"[e2e] ARTIFACT ROOT: {live_e2e_root}")
+    print(f"[e2e] LOG          : {log_file}")
+    print(f"[e2e] Jira key    : {cfg['jira_key']}")
+    print(f"[e2e] SCM repo    : {cfg.get('scm_repo_url', '(to be discovered from Jira ticket)')}")
+    print(f"[e2e] Model       : {cfg['openai_model']}")
     print("=" * 70)
 
-    # ---- Pre-run cleanup ----
-    _cleanup_for_fresh_run(cfg, workspace_path)
+    # ---- Pre-run cleanup (clean live-e2e root for fresh run) ----
+    _cleanup_for_fresh_run(cfg, live_e2e_root)
 
     # ---- Preflight: Jira credentials ----
     _preflight_check_jira(cfg)
@@ -454,11 +454,16 @@ async def test_implement_jira_ticket_full_workflow(request):
             "messageId": "e2e-full-workflow",
             "role": "ROLE_USER",
             "parts": [{"text": task_arg}],
-            "metadata": {"workspacePath": workspace_path},
+            "metadata": {},
         }
     })
+    compass_task_id = compass_result["task"]["id"]
     compass_state = compass_result["task"]["status"]["state"]
+    # Workspace is at ARTIFACT_ROOT/<compass_task_id>/
+    workspace_path = os.path.join(live_e2e_root, compass_task_id)
     print(f"[e2e] Compass task state: {compass_state}")
+    print(f"[e2e] Compass task ID  : {compass_task_id}")
+    print(f"[e2e] Workspace path   : {workspace_path}")
 
     # ---- Monitor Team Lead (constellation drives the workflow) ----
     print("\n[e2e] Monitoring Team Lead workflow (constellation drives all agents)...")
@@ -487,7 +492,10 @@ async def test_implement_jira_ticket_full_workflow(request):
             if tasks_all:
                 state = tasks_all[0].status.state.value
                 print(f"[e2e] Team Lead still running... ({elapsed}s) state={state}")
-                _print_workspace_progress(workspace_path)
+                # Print progress for all task subdirs in the live-e2e root
+                for entry in sorted(os.scandir(live_e2e_root), key=lambda e: e.name):
+                    if entry.is_dir():
+                        _print_workspace_progress(entry.path)
             else:
                 print(f"[e2e] Waiting for Team Lead task to be created... ({elapsed}s)")
         await asyncio.sleep(5.0)
@@ -554,18 +562,34 @@ def _validate_workspace_artifacts(workspace_path: str, jira_key: str) -> None:
     print("\n[e2e] === Workspace Artifact Validation ===")
 
     # Checkpoint 1: Team Lead gathered Jira ticket
-    _check("team_lead/jira-ticket.json")
+    _check("team-lead/jira-ticket.json")
     print("[workspace] CP-1: Jira ticket ✓")
 
     # Checkpoint 2: Team Lead gathered design content (optional — may not be a UI task)
-    design_spec = _check_optional("team_lead/design-spec.json")
+    design_spec = _check_optional("team-lead/design-spec.json")
     if design_spec:
         print("[workspace] CP-2: Design spec ✓")
     else:
         print("[workspace] CP-2: Design spec SKIPPED (not a UI task or no design URL)")
 
+    # Checkpoint 2b: Stitch design HTML file download
+    design_html_path = os.path.join(workspace_path, "team-lead", "design-code.html")
+    if os.path.isfile(design_html_path):
+        size = os.path.getsize(design_html_path)
+        print(f"[workspace] CP-2b: Design HTML downloaded ✓ ({size} bytes)")
+    else:
+        print("[workspace] CP-2b: Design HTML NOT found (Stitch content download may have failed)")
+
+    # Checkpoint 2c: Design spec markdown
+    design_spec_md_path = os.path.join(workspace_path, "team-lead", "design-spec.md")
+    if os.path.isfile(design_spec_md_path):
+        size = os.path.getsize(design_spec_md_path)
+        print(f"[workspace] CP-2c: Design spec (markdown) ✓ ({size} bytes)")
+    else:
+        print("[workspace] CP-2c: Design spec (markdown) NOT found")
+
     # Checkpoint 3: Team Lead analysis + repo clone
-    ctx = _check("team_lead/context-manifest.json")
+    ctx = _check("team-lead/context-manifest.json")
     repo_cloned = ctx.get("data", {}).get("repo_cloned", False)
     repo_path = ctx.get("data", {}).get("repo_path", "")
     if not repo_cloned:
@@ -575,8 +599,8 @@ def _validate_workspace_artifacts(workspace_path: str, jira_key: str) -> None:
     print(f"[workspace] CP-3: Repo cloned → {repo_path} ✓")
 
     # Checkpoint 4: Analysis + delivery plan
-    _check("team_lead/analysis.json", ["task_type"])
-    _check("team_lead/delivery-plan.json")
+    _check("team-lead/analysis.json", ["task_type"])
+    _check("team-lead/delivery-plan.json")
     print("[workspace] CP-4: Analysis + delivery plan ✓")
 
     # Checkpoint 5: Web Dev git setup
@@ -611,6 +635,21 @@ def _validate_workspace_artifacts(workspace_path: str, jira_key: str) -> None:
         f"transition_attempted={jira_upd_data.get('transition_attempted')}"
     )
 
+    # Checkpoint 9: Screenshots in workspace (optional — informational only)
+    screenshot_dir = os.path.join(workspace_path, "web-dev", "screenshots")
+    screenshot_desktop = os.path.join(screenshot_dir, "landing-desktop.png")
+    screenshot_mobile = os.path.join(screenshot_dir, "landing-mobile.png")
+    if os.path.isfile(screenshot_desktop):
+        size = os.path.getsize(screenshot_desktop)
+        print(f"[workspace] CP-9: Desktop screenshot ✓ ({size} bytes)")
+    else:
+        print(f"[workspace] CP-9: Desktop screenshot NOT found (looked in {screenshot_dir})")
+    if os.path.isfile(screenshot_mobile):
+        size = os.path.getsize(screenshot_mobile)
+        print(f"[workspace] CP-9b: Mobile screenshot ✓ ({size} bytes)")
+    else:
+        print(f"[workspace] CP-9b: Mobile screenshot NOT found")
+
     print("[e2e] === Workspace Validation PASSED ===\n")
 
 
@@ -621,17 +660,20 @@ def _validate_workspace_artifacts(workspace_path: str, jira_key: str) -> None:
 def _print_workspace_progress(workspace_path: str) -> None:
     """Print a brief summary of which artifacts exist so far."""
     checkpoints = {
-        "CP-1 Jira ticket": "team_lead/jira-ticket.json",
-        "CP-2 Design spec": "team_lead/design-spec.json",
-        "CP-3 Context manifest": "team_lead/context-manifest.json",
-        "CP-4a Analysis": "team_lead/analysis.json",
-        "CP-4b Delivery plan": "team_lead/delivery-plan.json",
+        "CP-1 Jira ticket": "team-lead/jira-ticket.json",
+        "CP-2 Design spec": "team-lead/design-spec.json",
+        "CP-2b Design HTML": "team-lead/design-code.html",
+        "CP-2c Design MD": "team-lead/design-spec.md",
+        "CP-3 Context manifest": "team-lead/context-manifest.json",
+        "CP-4a Analysis": "team-lead/analysis.json",
+        "CP-4b Delivery plan": "team-lead/delivery-plan.json",
         "CP-5 Git setup": "web-dev/git-setup-log.json",
         "CP-6a Impl plan": "web-dev/implementation-plan.json",
         "CP-6b Jira prepare": "web-dev/jira-prepare-log.json",
         "CP-8 PR evidence": "web-dev/pr-evidence.json",
         "CP-8b Jira update": "web-dev/jira-update-log.json",
         "CP-9 Review report": "code-review/review-report.json",
+        "CP-9 Desktop screenshot": "web-dev/screenshots/landing-desktop.png",
     }
     present = []
     missing = []

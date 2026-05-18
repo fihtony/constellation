@@ -175,9 +175,13 @@ Jira context:
 Design context (metadata):
 {design_context}
 
-Design HTML reference (actual HTML source from the design tool — use this to \
-implement the exact component structure, class names, and layout):
+━━━ DESIGN SPECIFICATION (MANDATORY — read and apply ALL values below) ━━━
+{design_spec_markdown}
+━━━ END DESIGN SPECIFICATION ━━━
+
+━━━ DESIGN HTML REFERENCE (actual generated code from design tool) ━━━
 {design_code_reference}
+━━━ END DESIGN HTML REFERENCE ━━━
 
 Skill context:
 {skill_context}
@@ -193,16 +197,44 @@ Implement the changes described above. Follow the CRITICAL SPEED RULES in your \
 system prompt — start writing files within the first 3 turns.
 
 For UI tasks — MANDATORY steps (in order):
-1. Parse the Design HTML reference above completely. Identify EVERY component: \
-navigation bar, hero section, feature cards, CTA sections, footer, etc.
-2. Extract design tokens from the HTML: color variables (CSS custom properties), \
-fonts (font-family), spacing values, and layout grid. Use them EXACTLY.
-3. Implement each component faithfully — match class names, color values, \
-typography, and layout as close as possible to the design.
-4. Verify npm packages before adding them (see npm rules in system prompt).
-5. Run: npm install  (fix any install errors before continuing)
-6. Run: npm run build  (fix any build errors before continuing)
-7. Stage and commit ALL changes:
+1. EXTRACT DESIGN TOKENS FIRST (before writing any code):
+   Read the Design Specification section above completely. Extract:
+   - Font families: typography.h1.fontFamily, typography.body-ui.fontFamily, etc.
+     → These MUST be used in CSS @import and font-family declarations (e.g. "Work Sans", "Newsreader")
+   - Primary/secondary/error colors from the colors section (hex values)
+   - Spacing: unit (8px base), container-max, gutter
+   - Border radius values (sm, DEFAULT, md, lg, xl)
+   Write these values into your CSS/config — do NOT use generic defaults like "Inter" or "Roboto".
+
+2. If Design HTML Reference is available (not N/A):
+   Parse it completely to list EVERY component: navigation bar, header, lesson cards,
+   search/filter bar, sidebar, hero section, CTA sections, footer, pagination, etc.
+   Use the same HTML structure, CSS class names, and layout approach.
+   Extract color tokens (CSS custom properties or Tailwind config) from the HTML.
+
+3. If Design HTML Reference is N/A, use the Design Specification colors and typography
+   directly. Build components from the Design Specification alone.
+
+4. Implement each component faithfully — match fonts, colors, spacing, and layout.
+
+5. Verify npm packages before adding them (see npm rules in system prompt).
+
+6. Run: npm install  (fix any install errors before continuing)
+
+7. Run: npm run build  (fix ALL build/TypeScript errors before continuing)
+
+8. VERIFY ROUTING — MANDATORY (prevents blank screen):
+   - Open App.tsx and confirm the new page component is imported and rendered.
+   - If app uses React Router, confirm a <Route> for the new page exists.
+   - If the page is NOT wired in App.tsx, add the import and route NOW.
+   - Start the dev server briefly to confirm the page renders without a blank screen:
+       cd {repo_path} && npm run dev -- --port 5179 &
+       sleep 8
+       curl -s http://localhost:5179 | head -50   # should show HTML, not blank
+       kill %1 2>/dev/null || true
+   - If the server responds with blank HTML or errors, fix App.tsx routing before continuing.
+
+9. Stage and commit ALL changes:
    git add -A
    git commit -m 'feat(<JIRA-KEY>): implement UI components'
 
@@ -312,6 +344,9 @@ Acceptance criteria:
 Design context (metadata):
 {design_context}
 
+Design spec — typography, colors, spacing (authoritative reference):
+{design_spec_markdown}
+
 Design HTML reference (full — parse to extract ALL components):
 {design_code_snippet}
 
@@ -326,13 +361,20 @@ Changed files:
 
 Instructions:
 1. For each acceptance criterion, check whether it is satisfied by the changed files.
-2. Parse the Design HTML reference to identify EVERY major component (e.g. header, \
-nav, hero section, feature cards, CTA button, footer, forms, images). \
-For each component, check whether it is present and correct in the changed files.
-3. Score 0.9+ ONLY if ALL acceptance criteria are met AND all identified design \
-components are present in the implementation. List specific gaps for anything missing.
-4. In "gaps", be precise: name the missing component or failing criterion \
-so it can be fixed directly.
+2. Parse the Design spec and Design HTML reference to identify EVERY major component
+   (e.g. navigation bar, search/filter bar, lesson cards grid, sidebar, hero section,
+   CTA button, footer, pagination, etc.).
+   For each component:
+   a. Check whether it is present in the implementation (look in changed_files).
+   b. Check that design tokens are applied correctly: colors match Design spec, font
+      families match (Work Sans / Newsreader), spacing matches the spacing scale.
+   c. If the component exists but uses wrong colors or fonts, mark as "incomplete".
+3. Check routing: confirm the new page is wired into App.tsx and will NOT produce
+   a blank screen. If no route exists, mark as gap "Blank screen: page not routed".
+4. Score 0.9+ ONLY if ALL acceptance criteria are met AND all identified design
+   components are present and correct. List specific gaps for anything missing.
+5. In "gaps", be precise: name the missing component or failing criterion
+   so it can be fixed directly.
 
 Return only valid JSON, no markdown fences:
 {{

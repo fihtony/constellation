@@ -310,27 +310,108 @@ async def gather_context(state: dict) -> dict:
         except OSError as exc:
             print(f"[{_AGENT_ID}] Failed to write design-spec.json: {exc}")
 
-        # Download design HTML source code when available (Stitch htmlCode.downloadUrl).
-        # This gives the Web Dev agent the exact component structure from the design tool.
+        # Extract and save Stitch design content (HTML code + design spec markdown).
+        # The v2 stitch_mcp.get_screen() now concatenates ALL content blocks into
+        # the 'text' field: HTML code block followed by design YAML/markdown block.
         try:
-            from urllib.request import Request as _Req, urlopen as _urlopen
-            design_data = design_context.get("design") or design_context
-            html_download_url = (design_data.get("htmlCode") or {}).get("downloadUrl", "")
-            if html_download_url:
-                req = _Req(
-                    html_download_url,
-                    headers={"User-Agent": "constellation-team-lead/1.0"},
-                )
-                with _urlopen(req, timeout=30) as resp:
-                    html_content = resp.read().decode("utf-8", errors="replace")
+            html_content = ""
+            design_md_content = ""
+
+            # Path 1: Stitch screen fetch — text field contains HTML + design markdown.
+            stitch_screen_data = design_context.get("screen", {}) if isinstance(design_context, dict) else {}
+            stitch_text = stitch_screen_data.get("text", "")
+
+            if stitch_text:
+                # Split: HTML starts with <!DOCTYPE or <html; design YAML starts with ---
+                html_marker = "<!DOCTYPE html"
+                alt_html_marker = "<html"
+                if html_marker in stitch_text or alt_html_marker in stitch_text:
+                    # Find where HTML starts
+                    idx_html = stitch_text.find(html_marker)
+                    if idx_html < 0:
+                        idx_html = stitch_text.find(alt_html_marker)
+                    # Content before HTML (if any) might be design markdown
+                    pre_html = stitch_text[:idx_html].strip()
+                    html_and_after = stitch_text[idx_html:]
+                    # Find where HTML ends
+                    html_end_idx = html_and_after.rfind("</html>")
+                    if html_end_idx >= 0:
+                        html_content = html_and_after[:html_end_idx + 7]
+                        post_html = html_and_after[html_end_idx + 7:].strip()
+                    else:
+                        html_content = html_and_after
+                        post_html = ""
+                    # Combine pre-HTML and post-HTML text as design markdown
+                    parts = [p for p in (pre_html, post_html) if p]
+                    design_md_content = "\n".join(parts)
+                else:
+                    # Only design markdown / YAML — no HTML block
+                    design_md_content = stitch_text
+
+            # Path 2: Legacy htmlCode.downloadUrl fallback
+            if not html_content:
+                from urllib.request import Request as _Req, urlopen as _urlopen
+                design_data = design_context.get("design") or design_context
+                html_download_url = (design_data.get("htmlCode") or {}).get("downloadUrl", "")
+                if html_download_url:
+                    req = _Req(html_download_url, headers={"User-Agent": "constellation-team-lead/1.0"})
+                    with _urlopen(req, timeout=30) as resp:
+                        html_content = resp.read().decode("utf-8", errors="replace")
+
+            # Save HTML code
+            if html_content:
                 code_file = os.path.join(tl_dir, "design-code.html")
                 with open(code_file, "w", encoding="utf-8") as fh:
                     fh.write(html_content)
-                design_files.append("team-lead/design-code.html")
+                design_files.append(f"{_AGENT_ID}/design-code.html")
                 design_code_path = code_file
-                print(f"[{_AGENT_ID}] Design HTML downloaded: {len(html_content)} chars → {code_file}")
+                print(f"[{_AGENT_ID}] Design HTML saved: {len(html_content)} chars → {code_file}")
+
+            # Save design spec markdown / YAML
+            if design_md_content:
+                md_file = os.path.join(tl_dir, "design-spec.md")
+                with open(md_file, "w", encoding="utf-8") as fh:
+                    fh.write(design_md_content)
+                design_files.append(f"{_AGENT_ID}/design-spec.md")
+                print(f"[{_AGENT_ID}] Design spec saved: {len(design_md_content)} chars → {md_file}")
+
         except Exception as exc:
-            print(f"[{_AGENT_ID}] Design HTML download failed (non-fatal): {exc}")
+            print(f"[{_AGENT_ID}] Design content extraction failed (non-fatal): {exc}")
+
+    # Fetch and save Stitch screen image (design reference screenshot)
+    design_screen_path = ""
+    if stitch_id and stitch_screen_id and workspace_path:
+        try:
+            log.info("fetching stitch screen image", stitch_id=stitch_id, screen_id=stitch_screen_id)
+            log.a2a("→", "ui-design", capability="stitch.screen.image",
+                    stitch_id=stitch_id, screen_id=stitch_screen_id)
+            img_result_str = registry.execute_sync(
+                "fetch_design",
+                {
+                    "task_id": task_id,
+                    "stitch_project_id": stitch_id,
+                    "stitch_screen_id": stitch_screen_id,
+                    "capability": "stitch.screen.image",
+                },
+            )
+            img_payload = json.loads(img_result_str) if img_result_str else {}
+            image_data = img_payload.get("image", {})
+            img_url = image_data.get("imageUrl", "") or image_data.get("url", "")
+            if img_url and workspace_path:
+                tl_dir = os.path.join(workspace_path, _AGENT_ID)
+                os.makedirs(tl_dir, exist_ok=True)
+                from urllib.request import Request as _ImgReq, urlopen as _img_urlopen
+                img_req = _ImgReq(img_url, headers={"User-Agent": "constellation-team-lead/1.0"})
+                with _img_urlopen(img_req, timeout=30) as img_resp:
+                    img_bytes = img_resp.read()
+                screen_png = os.path.join(tl_dir, "screen.png")
+                with open(screen_png, "wb") as fh:
+                    fh.write(img_bytes)
+                design_files.append(f"{_AGENT_ID}/screen.png")
+                design_screen_path = screen_png
+                print(f"[{_AGENT_ID}] Design screen image saved: {len(img_bytes)} bytes → {screen_png}")
+        except Exception as exc:
+            print(f"[{_AGENT_ID}] Design screen image fetch failed (non-fatal): {exc}")
 
     # Derive repo name from URL — validate it's a real SCM URL first
     _scm_hosts = ("github.com", "bitbucket.org", "gitlab.com", "dev.azure.com")
@@ -534,6 +615,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "design_files": state.get("design_files", []),
                 "tech_stack": state.get("tech_stack") or [],
                 "stitch_screen_name": state.get("stitch_screen_name", ""),
+                "orchestrator_task_id": state.get("_task_id", ""),
                 "revision_feedback": revision_feedback,
                 "definition_of_done": state.get("plan", {}).get("definition_of_done", {
                     "build_must_pass": True,

@@ -393,6 +393,8 @@ def _register_team_lead_dispatch(team_lead_agent: "TeamLeadAgent") -> None:
                 "jira_key": {"type": "string"},
                 "repo_url": {"type": "string"},
                 "design_url": {"type": "string"},
+                "orchestratorTaskId": {"type": "string", "description": "Caller (Compass) task ID — shared workspace root."},
+                "workspacePath": {"type": "string", "description": "Shared workspace path from Compass."},
             },
             "required": ["task_description"],
         }
@@ -403,6 +405,8 @@ def _register_team_lead_dispatch(team_lead_agent: "TeamLeadAgent") -> None:
             jira_key: str = "",
             repo_url: str = "",
             design_url: str = "",
+            orchestratorTaskId: str = "",
+            workspacePath: str = "",
             **kw,
         ) -> ToolResult:
             # Sanitize jira_key
@@ -421,7 +425,7 @@ def _register_team_lead_dispatch(team_lead_agent: "TeamLeadAgent") -> None:
                 print(f"[tl-dispatch] Ignoring non-SCM repo_url: {repo_url!r}")
                 repo_url = ""
             effective_repo_url = repo_url or os.environ.get("SCM_REPO_URL", "")
-            effective_workspace = os.environ.get("TL_WORKSPACE_PATH", "")
+            effective_workspace = workspacePath or os.environ.get("TL_WORKSPACE_PATH", "")
             print(f"[tl-dispatch] Dispatching: jira={jira_key} repo={effective_repo_url}")
 
             task_id_holder: dict = {}
@@ -437,6 +441,7 @@ def _register_team_lead_dispatch(team_lead_agent: "TeamLeadAgent") -> None:
                                 "repoUrl": effective_repo_url,
                                 "designUrl": design_url,
                                 "workspacePath": effective_workspace,
+                                "orchestratorTaskId": orchestratorTaskId,
                             },
                         }
                     }

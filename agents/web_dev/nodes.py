@@ -548,6 +548,17 @@ async def implement_changes(state: dict) -> dict:
         except Exception:
             pass
 
+    # Load design spec markdown (typography/colors/spacing) for reference
+    _design_spec_md = "N/A"
+    if _workspace_path:
+        _design_spec_md_path = os.path.join(_workspace_path, "team-lead", "design-spec.md")
+        if os.path.isfile(_design_spec_md_path):
+            try:
+                with open(_design_spec_md_path, encoding="utf-8") as _f:
+                    _design_spec_md = _f.read()
+            except Exception:
+                pass
+
     # Pre-scan repo so LLM doesn't waste turns on exploration
     _repo_path = state.get("repo_path", "")
     _repo_files_section: str
@@ -579,6 +590,7 @@ async def implement_changes(state: dict) -> dict:
         jira_context=jira_for_prompt,
         design_context=str(state.get("design_context", "N/A")),
         design_code_reference=_design_code_ref,
+        design_spec_markdown=_design_spec_md,
         skill_context=state.get("skill_context", ""),
         memory_context=state.get("memory_context", ""),
     )
@@ -808,6 +820,17 @@ async def self_assess(state: dict) -> dict:
         except Exception:
             pass
 
+    # Load design spec markdown (typography/colors/spacing) for component comparison
+    design_spec_markdown = ""
+    if workspace_path:
+        design_spec_md_path = os.path.join(workspace_path, "team-lead", "design-spec.md")
+        if os.path.isfile(design_spec_md_path):
+            try:
+                with open(design_spec_md_path, encoding="utf-8") as _f:
+                    design_spec_markdown = _f.read()
+            except Exception:
+                pass
+
     acceptance_criteria = []
     if isinstance(jira_ctx, dict):
         fields = jira_ctx.get("fields", jira_ctx)
@@ -847,6 +870,7 @@ async def self_assess(state: dict) -> dict:
         acceptance_criteria=ac_str,
         design_context=json.dumps(design_ctx, ensure_ascii=False)[:800] if design_ctx else "N/A (not a UI task)",
         design_code_snippet=design_code_snippet or "N/A (no design HTML available)",
+        design_spec_markdown=design_spec_markdown or "N/A (no design spec available)",
         implementation_summary=str(state.get("implementation_summary", ""))[:1000],
         test_results=json.dumps(state.get("test_results", {}), ensure_ascii=False)[:500],
         changed_files="\n".join(changed_files_list) or "unknown",
@@ -942,11 +966,20 @@ async def fix_gaps(state: dict) -> dict:
 
 
 async def capture_screenshot(state: dict) -> dict:
-    """Capture implementation screenshots for human review only.
+    """Capture implementation screenshots using subprocess-based approach.
 
-    No automatic visual diff is required in the current phase.
+    Uses Python subprocess to:
+    1. Start the vite dev server
+    2. Write and run a playwright script
+    3. Kill the server
+
+    Much more reliable than asking the LLM to do it via run_agentic.
     Skips if screenshot_required is False in definition_of_done.
     """
+    import subprocess
+    import tempfile
+    import textwrap
+
     definition_of_done = state.get("definition_of_done", {})
     screenshot_required = definition_of_done.get("screenshot_required", True)
     log = _logger(state)
@@ -955,13 +988,16 @@ async def capture_screenshot(state: dict) -> dict:
         log.info("screenshot skipped", reason="not_required")
         return {"screenshot_captured": False, "screenshots": []}
 
-    runtime = state.get("_runtime")
-    if not runtime:
-        return {"screenshot_captured": False, "screenshots": []}
-
     repo_path = state.get("repo_path", "")
     workspace_path = state.get("workspace_path", "")
     screenshot_dir = os.path.join(workspace_path, _AGENT_ID, "screenshots")
+    desktop_png = os.path.join(screenshot_dir, "landing-desktop.png")
+    mobile_png = os.path.join(screenshot_dir, "landing-mobile.png")
+    screenshots = []
+
+    if not repo_path or not os.path.isdir(repo_path):
+        log.warn("capture_screenshot skipped — repo_path missing", repo_path=repo_path)
+        return {"screenshot_captured": False, "screenshots": []}
 
     try:
         os.makedirs(screenshot_dir, exist_ok=True)
@@ -969,53 +1005,140 @@ async def capture_screenshot(state: dict) -> dict:
         pass
 
     log.step("capture_screenshot", screenshot_dir=screenshot_dir)
+    print(f"[{_AGENT_ID}] capture_screenshot: repo_path={repo_path!r} screenshot_dir={screenshot_dir!r}")
 
-    # Best-effort screenshot via agentic runtime with explicit playwright steps
-    result = runtime.run_agentic(
-        task=(
-            "Take a screenshot of the implemented web application.\n"
-            "\n"
-            "STEP 1 — Install dependencies (if not already installed):\n"
-            f"  cd {repo_path}\n"
-            "  npm install\n"
-            "\n"
-            "STEP 2 — Start the dev server in the background:\n"
-            f"  cd {repo_path}\n"
-            "  npm run dev -- --port 5179 --host 0.0.0.0 &\n"
-            "  sleep 5\n"
-            "  (Wait for the server to be ready before continuing.)\n"
-            "\n"
-            "STEP 3 — Check if playwright is available:\n"
-            "  npx playwright --version 2>/dev/null || npm install --save-dev playwright\n"
-            "\n"
-            "STEP 4 — Capture desktop screenshot at http://localhost:5179:\n"
-            "  Use playwright or a headless browser. Save desktop screenshot to:\n"
-            f"    {screenshot_dir}/landing-desktop.png\n"
-            "  If playwright is unavailable, use `curl -s http://localhost:5179 > /tmp/page.html`\n"
-            "  and note the HTML response — at least confirm the server responds.\n"
-            "\n"
-            "STEP 5 — Optionally capture mobile viewport (375px width):\n"
-            f"    {screenshot_dir}/landing-mobile.png\n"
-            "\n"
-            "STEP 6 — Stop the dev server:\n"
-            "  kill %1 2>/dev/null || pkill -f 'vite' || true\n"
-            "\n"
-            f"CRITICAL: Save screenshots ONLY to {screenshot_dir}/ — do NOT save inside "
-            f"the git repo at {repo_path}.\n"
-            "\n"
-            'Return JSON: {"screenshots": ["<absolute_path>", ...], "captured": true}\n'
-            'If screenshot fails, return: {"screenshots": [], "captured": false, "reason": "<why>"}'
-        ),
-        cwd=repo_path or None,
-        max_turns=15,
-        timeout=300,
-        plugin_manager=state.get("_plugin_manager"),
-    )
+    PORT = 5179
+    dev_proc = None
 
-    data = _safe_json(result.summary, fallback={})
-    screenshots = data.get("screenshots", [])
-    captured = data.get("captured", bool(screenshots))
+    try:
+        # --- Step 1: Kill any existing process on the port ---
+        subprocess.run(
+            ["bash", "-c", f"lsof -ti:{PORT} | xargs kill -9 2>/dev/null || true"],
+            timeout=5, capture_output=True,
+        )
 
+        # --- Step 2: Ensure dependencies installed ---
+        subprocess.run(
+            ["npm", "install", "--prefer-offline"],
+            cwd=repo_path, timeout=120, capture_output=True,
+        )
+
+        # --- Step 3: Start vite dev server ---
+        dev_proc = subprocess.Popen(
+            ["npm", "run", "dev", "--", "--port", str(PORT), "--host", "0.0.0.0"],
+            cwd=repo_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        print(f"[{_AGENT_ID}] Dev server started (pid={dev_proc.pid}) on port {PORT}")
+
+        # --- Step 4: Wait for server ready (up to 30s) ---
+        import time as _time
+        server_ready = False
+        for _ in range(15):
+            _time.sleep(2)
+            try:
+                import urllib.request
+                with urllib.request.urlopen(f"http://localhost:{PORT}", timeout=3) as r:
+                    if r.status < 500:
+                        server_ready = True
+                        break
+            except Exception:
+                pass
+        print(f"[{_AGENT_ID}] Server ready={server_ready}")
+
+        if not server_ready:
+            print(f"[{_AGENT_ID}] Dev server not ready in time — skipping screenshot")
+            return {"screenshot_captured": False, "screenshots": []}
+
+        # --- Step 5: Write playwright script to a temp file ---
+        script_content = textwrap.dedent(f"""\
+            import {{ chromium }} from 'playwright';
+            (async () => {{
+              const browser = await chromium.launch({{ headless: true }});
+              try {{
+                const page = await browser.newPage();
+                // Desktop
+                await page.setViewportSize({{ width: 1280, height: 900 }});
+                await page.goto('http://localhost:{PORT}', {{ waitUntil: 'networkidle', timeout: 15000 }});
+                await page.screenshot({{ path: '{desktop_png}', fullPage: true }});
+                console.log('Desktop screenshot saved');
+                // Mobile
+                await page.setViewportSize({{ width: 375, height: 812 }});
+                await page.goto('http://localhost:{PORT}', {{ waitUntil: 'networkidle', timeout: 15000 }});
+                await page.screenshot({{ path: '{mobile_png}', fullPage: true }});
+                console.log('Mobile screenshot saved');
+              }} finally {{
+                await browser.close();
+              }}
+            }})();
+        """)
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".mjs", delete=False, prefix="screenshot_"
+        ) as tf:
+            tf.write(script_content)
+            script_path = tf.name
+
+        # --- Step 6: Ensure playwright chromium is installed ---
+        pw_check = subprocess.run(
+            ["npx", "playwright", "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if pw_check.returncode != 0:
+            subprocess.run(
+                ["npx", "playwright", "install", "chromium"],
+                capture_output=True, timeout=120,
+            )
+
+        # --- Step 7: Run the script ---
+        pw_result = subprocess.run(
+            ["node", script_path],
+            capture_output=True, text=True, timeout=60,
+        )
+        print(f"[{_AGENT_ID}] Playwright stdout: {pw_result.stdout[:300]}")
+        if pw_result.returncode != 0:
+            print(f"[{_AGENT_ID}] Playwright stderr: {pw_result.stderr[:300]}")
+
+        # --- Step 8: Check if screenshots exist ---
+        if os.path.isfile(desktop_png) and os.path.getsize(desktop_png) > 0:
+            screenshots.append(desktop_png)
+            print(f"[{_AGENT_ID}] Desktop screenshot saved: {os.path.getsize(desktop_png)} bytes")
+        if os.path.isfile(mobile_png) and os.path.getsize(mobile_png) > 0:
+            screenshots.append(mobile_png)
+            print(f"[{_AGENT_ID}] Mobile screenshot saved: {os.path.getsize(mobile_png)} bytes")
+
+        # --- Step 9: HTML fallback if screenshots failed ---
+        if not screenshots:
+            try:
+                import urllib.request
+                with urllib.request.urlopen(f"http://localhost:{PORT}", timeout=5) as r:
+                    html_bytes = r.read()
+                html_fallback = os.path.join(screenshot_dir, "landing-page.html")
+                with open(html_fallback, "wb") as fh:
+                    fh.write(html_bytes)
+                screenshots.append(html_fallback)
+                print(f"[{_AGENT_ID}] HTML fallback saved: {len(html_bytes)} bytes")
+            except Exception as exc:
+                print(f"[{_AGENT_ID}] HTML fallback also failed: {exc}")
+
+    except Exception as exc:
+        print(f"[{_AGENT_ID}] capture_screenshot error (non-fatal): {exc}")
+    finally:
+        # Always stop the dev server
+        if dev_proc and dev_proc.poll() is None:
+            dev_proc.terminate()
+            try:
+                dev_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                dev_proc.kill()
+        subprocess.run(
+            ["bash", "-c", f"lsof -ti:{PORT} | xargs kill -9 2>/dev/null || true"],
+            timeout=5, capture_output=True,
+        )
+
+    captured = bool(screenshots) and any(s.endswith(".png") for s in screenshots)
     log.info("screenshot result", captured=captured, count=len(screenshots))
 
     return {

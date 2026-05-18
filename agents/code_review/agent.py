@@ -109,8 +109,12 @@ class CodeReviewAgent(BaseAgent):
             },
         )
 
+        # Use the Compass orchestrator task ID as canonical _task_id for AgentLogger
+        orchestrator_task_id = metadata.get("orchestratorTaskId", "")
+        canonical_task_id = orchestrator_task_id or task.id
+
         state = {
-            "_task_id": task.id,
+            "_task_id": canonical_task_id,
             "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,
             "_plugin_manager": self.plugin_manager,

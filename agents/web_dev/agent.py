@@ -131,8 +131,14 @@ class WebDevAgent(BaseAgent):
             },
         )
 
+        # Use the Compass orchestrator task ID as the canonical _task_id so
+        # AgentLogger writes to {ARTIFACT_ROOT}/{compass_task_id}/web-dev/agent.log
+        # which is the same directory as the shared workspace files.
+        orchestrator_task_id = metadata.get("orchestratorTaskId", "")
+        canonical_task_id = orchestrator_task_id or task.id
+
         state = {
-            "_task_id": task.id,
+            "_task_id": canonical_task_id,
             "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,
             "_plugin_manager": self.plugin_manager,
@@ -306,6 +312,9 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                 "context_manifest_path": {"type": "string"},
                 "jira_files": {"type": "array", "items": {"type": "string"}},
                 "design_files": {"type": "array", "items": {"type": "string"}},
+                "tech_stack": {"type": "array", "items": {"type": "string"}},
+                "stitch_screen_name": {"type": "string"},
+                "orchestrator_task_id": {"type": "string"},
                 "revision_feedback": {"type": "string"},
                 "definition_of_done": {"type": "object"},
             },
@@ -324,6 +333,9 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
             context_manifest_path: str = "",
             jira_files=None,
             design_files=None,
+            tech_stack=None,
+            stitch_screen_name: str = "",
+            orchestrator_task_id: str = "",
             revision_feedback: str = "",
             definition_of_done=None,
             **kw,
@@ -346,6 +358,9 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                                 "contextManifestPath": context_manifest_path,
                                 "jiraFiles": jira_files or [],
                                 "designFiles": design_files or [],
+                                "techStack": tech_stack or [],
+                                "stitchScreenName": stitch_screen_name,
+                                "orchestratorTaskId": orchestrator_task_id,
                                 "revisionFeedback": revision_feedback,
                                 "definitionOfDone": definition_of_done or {},
                             },

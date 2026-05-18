@@ -108,12 +108,69 @@ class StitchMcpClient:
         screen_id: str,
         timeout: int = 60,
     ) -> tuple[dict, str]:
-        """Fetch screen design specification and generated code."""
-        return self._call_tool(
-            "get_screen",
-            {"project_id": project_id, "screen_id": screen_id},
-            timeout,
+        """Fetch screen design specification and generated code.
+
+        Returns a dict with keys:
+          - ``text``: concatenated text of ALL content blocks (HTML code + design
+            markdown/YAML joined by newline). Team Lead writes this to workspace.
+          - ``content``: raw content array from the MCP response.
+          - ``projectId``, ``screenId``: echo of inputs for traceability.
+          - ``imageUrls``: list of image URLs found in content blocks.
+        """
+        resp = self._post(
+            "tools/call",
+            {"name": "get_screen", "arguments": {"project_id": project_id, "screen_id": screen_id}},
+            timeout=timeout,
         )
+        if "error" in resp:
+            return {}, _error_status(resp)
+        result = resp.get("result", {})
+        if result.get("isError"):
+            return {}, "tool_error"
+        content = result.get("content", [])
+        if isinstance(content, list):
+            # Collect ALL text/resource blocks:
+            # - text blocks: HTML code and/or design YAML/markdown
+            # - resource blocks: may contain embedded HTML or image data
+            # - image blocks: direct image URLs
+            text_parts = []
+            image_urls = []
+            embedded_html = ""
+            for block in content:
+                btype = block.get("type", "")
+                if btype == "text" and block.get("text"):
+                    text_parts.append(block["text"])
+                elif btype == "resource":
+                    # Resource blocks may have embedded data (HTML) or a URL
+                    resource = block.get("resource", {})
+                    blob = block.get("blob", "") or resource.get("blob", "")
+                    res_text = block.get("text", "") or resource.get("text", "")
+                    uri = block.get("uri", "") or resource.get("uri", "")
+                    mime = block.get("mimeType", "") or resource.get("mimeType", "")
+                    if res_text and "html" in mime.lower():
+                        embedded_html = res_text
+                    elif res_text:
+                        text_parts.append(res_text)
+                    if blob and "html" in mime.lower():
+                        embedded_html = blob
+                    if uri:
+                        image_urls.append(uri)
+                elif btype == "image":
+                    url = block.get("url", "") or block.get("source", {}).get("url", "")
+                    if url:
+                        image_urls.append(url)
+            text = "\n".join(text_parts)
+            # If HTML was embedded in a resource block, prepend it to text
+            if embedded_html and "<!DOCTYPE" in embedded_html or (embedded_html and "<html" in embedded_html):
+                text = embedded_html + "\n" + text if text else embedded_html
+            return {
+                "projectId": project_id,
+                "screenId": screen_id,
+                "content": content,
+                "text": text,
+                "imageUrls": image_urls,
+            }, "ok"
+        return result, "ok"
 
     def get_screen_image(
         self,

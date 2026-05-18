@@ -55,7 +55,8 @@ class FetchDesign(BaseTool):
     name = "fetch_design"
     description = (
         "Fetch design specification from a Figma URL or a Google Stitch project. "
-        "Provide either figma_url or stitch_project_id."
+        "Provide either figma_url or stitch_project_id. "
+        "Use capability='stitch.screen.image' to fetch screen image URL instead."
     )
     parameters_schema = {
         "type": "object",
@@ -64,6 +65,7 @@ class FetchDesign(BaseTool):
             "stitch_project_id": {"type": "string", "description": "Google Stitch project ID."},
             "stitch_screen_id": {"type": "string", "description": "Stitch screen ID (optional)."},
             "screen_name": {"type": "string", "description": "Screen name for Stitch (optional)."},
+            "capability": {"type": "string", "description": "Override capability (e.g. stitch.screen.image)."},
             "task_id": {"type": "string", "description": "Caller task ID for log correlation (optional)."},
         },
         "required": [],
@@ -75,6 +77,7 @@ class FetchDesign(BaseTool):
         stitch_project_id: str = "",
         stitch_screen_id: str = "",
         screen_name: str = "",
+        capability: str = "",
         task_id: str = "",
         **kw,
     ) -> ToolResult:
@@ -87,14 +90,16 @@ class FetchDesign(BaseTool):
                 {"metadata": {"figmaUrl": figma_url}},
             )
         elif stitch_project_id:
-            if stitch_screen_id or screen_name:
-                capability = "stitch.screen.fetch"
+            if capability:
+                effective_capability = capability
+            elif stitch_screen_id or screen_name:
+                effective_capability = "stitch.screen.fetch"
             else:
-                capability = "stitch.screens.list"
+                effective_capability = "stitch.screens.list"
             log.info("fetch_design called", source="stitch",
-                     stitch_project_id=stitch_project_id, capability=capability)
+                     stitch_project_id=stitch_project_id, capability=effective_capability)
             result = adapter._dispatch(
-                capability, stitch_project_id,
+                effective_capability, stitch_project_id,
                 {
                     "metadata": {
                         "stitchProjectId": stitch_project_id,
