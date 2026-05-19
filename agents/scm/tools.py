@@ -189,10 +189,23 @@ class SCMCreatePR(BaseTool):
             },
         )
         pr_url = result.get("prUrl", result.get("url", ""))
+        # Extract the PR number from the nested pr.id field so callers
+        # can access prNumber directly without navigating the pr dict.
+        pr_data = result.get("pr", {})
+        pr_number = 0
+        if isinstance(pr_data, dict):
+            pr_number = pr_data.get("id") or pr_data.get("number") or 0
+        if not isinstance(pr_number, int):
+            try:
+                pr_number = int(pr_number)
+            except (TypeError, ValueError):
+                pr_number = 0
         if result.get("error"):
             log.error("scm_create_pr failed", error=result["error"])
         else:
-            log.info("scm_create_pr ok", pr_url=pr_url)
+            log.info("scm_create_pr ok", pr_url=pr_url, pr_number=pr_number)
+        # Merge prNumber into the top-level result so web_dev/nodes.py can read it
+        result["prNumber"] = pr_number
         return ToolResult(output=json.dumps(result))
 
 
@@ -301,7 +314,64 @@ class SCMUploadPRImage(BaseTool):
         return ToolResult(output=json.dumps({"ok": True, "image_url": image_url}))
 
 
-_TOOLS = [CloneRepo(), SCMListBranches(), SCMPush(), SCMCreatePR(), SCMAddPRComment(), SCMUploadPRImage()]
+class SCMUpdatePR(BaseTool):
+    """Update an existing pull request's title and/or description body."""
+
+    name = "scm_update_pr"
+    description = (
+        "Update the title and/or description body of an existing pull request. "
+        "Use this to append screenshot CDN URLs or review feedback to the PR description."
+    )
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string", "description": "Full GitHub repo URL."},
+            "pr_number": {"type": "integer", "description": "Pull request number."},
+            "description": {"type": "string", "description": "New Markdown body for the PR description."},
+            "title": {"type": "string", "description": "New PR title (optional)."},
+            "task_id": {"type": "string"},
+        },
+        "required": ["repo_url", "pr_number", "description"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        pr_number: int = 0,
+        description: str = "",
+        title: str = "",
+        task_id: str = "",
+    ) -> ToolResult:
+        log = _log(task_id)
+        log.info("scm_update_pr called", repo_url=repo_url, pr_number=pr_number)
+        owner, repo = _parse_repo_coordinates(repo_url)
+        from agents.scm.client import create_scm_client
+        import os as _os
+        client = create_scm_client(
+            base_url=repo_url,
+            token=_os.environ.get("SCM_TOKEN", ""),
+            backend="github-rest",
+        )
+        kwargs: dict = {"body": description or None}
+        if title:
+            kwargs["title"] = title
+        result, status = client.update_pr(owner, repo, pr_number, **kwargs)
+        if status not in ("ok", "no_changes"):
+            log.error("scm_update_pr failed", status=status, pr_number=pr_number)
+            return ToolResult(output=json.dumps({"error": f"status={status}", "detail": result}))
+        log.info("scm_update_pr ok", pr_number=pr_number, status=status)
+        return ToolResult(output=json.dumps({"ok": True, "status": status}))
+
+
+_TOOLS = [
+    CloneRepo(),
+    SCMListBranches(),
+    SCMPush(),
+    SCMCreatePR(),
+    SCMAddPRComment(),
+    SCMUploadPRImage(),
+    SCMUpdatePR(),
+]
 
 
 def register_scm_tools() -> None:

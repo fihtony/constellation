@@ -243,6 +243,78 @@ async def review_requirements(state: dict) -> dict:
     return {"requirement_gaps": issues}
 
 
+async def review_ui_design(state: dict) -> dict:
+    """Check UI implementation for design fidelity: icons, typography, colors, layout, spacing.
+
+    This phase is triggered for any task that modifies UI source files (tsx, jsx, css, scss,
+    html) or whose PR description mentions UI/design/screen/Stitch.  It is a no-op when
+    neither condition is true, so it is safe to run for every review.
+    """
+    runtime = state.get("_runtime")
+
+    if not runtime or not state.get("pr_diff"):
+        return {"ui_issues": []}
+
+    # Determine whether this is a UI task — check file extensions and PR description
+    changed_files = state.get("changed_files", [])
+    pr_description = state.get("pr_description", "")
+    _ui_extensions = {".tsx", ".jsx", ".css", ".scss", ".sass", ".html", ".vue", ".svelte"}
+    _ui_keywords = ("ui", "design", "screen", "stitch", "figma", "page", "component",
+                    "layout", "style", "frontend", "landing")
+
+    is_ui_task = any(
+        any(f.lower().endswith(ext) for ext in _ui_extensions)
+        for f in changed_files
+    ) or any(kw in pr_description.lower() for kw in _ui_keywords)
+
+    if not is_ui_task:
+        return {"ui_issues": []}
+
+    from agents.code_review.prompts import UI_DESIGN_SYSTEM, UI_DESIGN_TEMPLATE
+
+    # Extract design context if available
+    design_context = state.get("design_context", {})
+    design_spec = ""
+    design_html = ""
+    if isinstance(design_context, dict):
+        design_spec = design_context.get("spec_markdown", "") or design_context.get("design_spec", "")
+        design_html = design_context.get("code_reference", "") or design_context.get("design_html", "")
+
+    # If not in state, try loading from workspace
+    if not design_spec and state.get("workspace_path"):
+        import os as _os
+        tl_dir = _os.path.join(state["workspace_path"], _TEAM_LEAD_AGENT_ID)
+        for candidate in ("design-spec.md", "design-code.html", "design-code.xml"):
+            path = _os.path.join(tl_dir, candidate)
+            if _os.path.isfile(path):
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        content = fh.read()
+                    if candidate.endswith(".md"):
+                        design_spec = content[:8000]
+                    else:
+                        design_html = content[:8000]
+                except OSError:
+                    pass
+
+    if not design_spec and not design_html:
+        # No design reference available — skip UI review silently
+        return {"ui_issues": []}
+
+    prompt = UI_DESIGN_TEMPLATE.format(
+        pr_description=pr_description or "N/A",
+        changed_files=", ".join(changed_files) or "N/A",
+        design_spec=design_spec[:4000] if design_spec else "N/A",
+        design_html=design_html[:4000] if design_html else "N/A",
+        pr_diff=state.get("pr_diff", ""),
+    )
+    result = runtime.run(prompt, system_prompt=UI_DESIGN_SYSTEM, max_tokens=2048,
+                         plugin_manager=state.get("_plugin_manager"))
+    issues = _parse_issue_list(result.get("raw_response", ""))
+
+    return {"ui_issues": issues}
+
+
 async def generate_report(state: dict) -> dict:
     """Aggregate all review phases and produce a final verdict.
 
@@ -254,8 +326,9 @@ async def generate_report(state: dict) -> dict:
     security = state.get("security_issues", [])
     tests = state.get("test_issues", [])
     requirements = state.get("requirement_gaps", [])
+    ui_issues = state.get("ui_issues", [])
 
-    all_comments = quality + security + tests + requirements
+    all_comments = quality + security + tests + requirements + ui_issues
 
     # Count by severity
     critical = sum(1 for c in all_comments if c.get("severity") == "critical")
@@ -266,7 +339,7 @@ async def generate_report(state: dict) -> dict:
     verdict = "approved" if (critical == 0 and high == 0) else "rejected"
 
     summary_parts = [
-        f"Review complete: {len(all_comments)} issue(s) found.",
+        f"Review complete: {len(all_comments)} issue(s) found ({len(ui_issues)} UI design).",
         f"Critical: {critical}, High: {high}, Medium: {medium}, Low: {low}.",
         f"Verdict: {verdict}.",
     ]

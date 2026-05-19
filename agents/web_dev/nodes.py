@@ -1448,6 +1448,58 @@ async def create_pr(state: dict) -> dict:
     pr_title = pr_meta.get("title", "Implement task changes")
     pr_description = pr_meta.get("description", state.get("implementation_summary", ""))
 
+    # Step 2.5: Commit screenshots to the branch so they can be referenced in the PR.
+    # Raw githubusercontent.com URLs are stable, require no external upload API, and
+    # render correctly in GitHub PR descriptions.
+    _screenshots = state.get("screenshots", [])
+    _screenshot_section = ""
+    if _screenshots:
+        import shutil as _shutil
+        import subprocess as _subprocess
+        from urllib.parse import urlparse as _urlparse
+
+        _png_screenshots = [s for s in _screenshots if s.endswith(".png") and os.path.isfile(s)]
+        if _png_screenshots:
+            _screen_repo_dir = os.path.join(repo_path, "docs", "screenshots")
+            os.makedirs(_screen_repo_dir, exist_ok=True)
+            _screenshot_entries: list[tuple[str, str]] = []
+            _parsed_url = _urlparse(repo_url)
+            _url_parts = _parsed_url.path.strip("/").split("/")
+            _gh_owner = _url_parts[0] if len(_url_parts) > 0 else ""
+            _gh_repo = _url_parts[1].replace(".git", "") if len(_url_parts) > 1 else ""
+            for _png in _png_screenshots:
+                _fname = os.path.basename(_png)
+                _label = "Desktop (1280×900)" if "desktop" in _png.lower() else "Mobile (375×812)"
+                try:
+                    _shutil.copy2(_png, os.path.join(_screen_repo_dir, _fname))
+                    _raw_url = (
+                        f"https://raw.githubusercontent.com/{_gh_owner}/{_gh_repo}"
+                        f"/{branch_name}/docs/screenshots/{_fname}"
+                    )
+                    _screenshot_entries.append((_label, _raw_url))
+                except Exception as _copy_err:
+                    print(f"[{_AGENT_ID}] Screenshot copy failed for {_png}: {_copy_err}")
+            if _screenshot_entries:
+                _subprocess.run(
+                    ["git", "add", "-f", "docs/screenshots/"],  # -f to override gitignore
+                    cwd=repo_path, capture_output=True, text=True,
+                )
+                _commit_res = _subprocess.run(
+                    ["git", "commit", "-m", "docs: add implementation screenshots"],
+                    cwd=repo_path, capture_output=True, text=True,
+                )
+                if _commit_res.returncode == 0:
+                    _section_parts = [
+                        f"**{_lbl}**\n\n![]({_url})" for _lbl, _url in _screenshot_entries
+                    ]
+                    _screenshot_section = "\n\n## Screenshots\n\n" + "\n\n".join(_section_parts)
+                    print(f"[{_AGENT_ID}] Screenshots committed to branch and embedded in PR description")
+                else:
+                    print(f"[{_AGENT_ID}] Screenshot commit failed: {_commit_res.stderr[:200]}")
+
+    if _screenshot_section:
+        pr_description = pr_description.rstrip() + _screenshot_section
+
     # Step 3: Push branch then create PR via SCM boundary tools (not open agentic).
     task_id = state.get("_task_id", "")
 
@@ -1486,50 +1538,12 @@ async def create_pr(state: dict) -> dict:
         log.info("PR created", pr_url=pr_url, branch=branch_name)
         print(f"[{_AGENT_ID}] create_pr done: prUrl={pr_url!r} prNumber={pr_number} status={pr_status!r}")
 
-    # Step 4: Upload screenshots to GitHub and post PR comment (no repo commit needed).
-    # Screenshots are stored in the agent workspace only; they are uploaded to GitHub's
-    # CDN via the issue-assets API so they appear in the PR without being part of the
-    # committed codebase.
+    # Step 4: Screenshots are already committed to the branch in Step 2.5 and
+    # embedded in the PR description via raw GitHub URLs.  No separate CDN upload
+    # is needed.  Retain a short summary log for auditability.
     _screenshots = state.get("screenshots", [])
-    if pr_number and pr_url and _screenshots:
-        _png_screenshots = [s for s in _screenshots if s.endswith(".png") and os.path.isfile(s)]
-        if _png_screenshots:
-            _screenshot_comment_parts = []
-            for _png in _png_screenshots:
-                _label = "Desktop (1280×900)" if "desktop" in _png.lower() else "Mobile (375×812)"
-                _upload_result = _call_boundary_tool(
-                    state, "scm_upload_pr_image",
-                    {
-                        "repo_url": repo_url,
-                        "pr_number": pr_number,
-                        "image_path": _png,
-                        "task_id": task_id,
-                    },
-                )
-                _image_url = _upload_result.get("image_url", "")
-                if _image_url:
-                    _screenshot_comment_parts.append(
-                        f"**{_label}**\n![]({_image_url})\n"
-                    )
-                    print(f"[{_AGENT_ID}] Screenshot uploaded to GitHub CDN: {_image_url[:80]}")
-                else:
-                    print(f"[{_AGENT_ID}] Screenshot upload failed for {_png}: {_upload_result.get('error','')}")
-
-            if _screenshot_comment_parts:
-                _comment_body = "### Screenshots\n\n" + "\n".join(_screenshot_comment_parts)
-                _comment_result = _call_boundary_tool(
-                    state, "scm_add_pr_comment",
-                    {
-                        "repo_url": repo_url,
-                        "pr_number": pr_number,
-                        "comment": _comment_body,
-                        "task_id": task_id,
-                    },
-                )
-                if _comment_result.get("ok"):
-                    print(f"[{_AGENT_ID}] Screenshot comment posted on PR #{pr_number}")
-                else:
-                    print(f"[{_AGENT_ID}] Screenshot comment failed: {_comment_result.get('error','')}")
+    if _screenshots:
+        print(f"[{_AGENT_ID}] {len(_screenshots)} screenshot(s) embedded in PR description via branch commit")
 
     # Write pr-evidence.json to workspace
     workspace_path = state.get("workspace_path", "")

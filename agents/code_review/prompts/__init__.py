@@ -136,3 +136,76 @@ Add a "requirement" field to each issue naming the specific AC that is not met.
 
 """ + _ISSUE_SCHEMA
 
+# ---------------------------------------------------------------------------
+# review_ui_design — UI/UX fidelity review
+# ---------------------------------------------------------------------------
+
+UI_DESIGN_SYSTEM = (
+    "You are a senior frontend engineer reviewing a UI implementation for design fidelity, "
+    "accessibility, and visual quality. You have access to the original design specification "
+    "and the implemented code diff. Evaluate whether the implementation faithfully reproduces "
+    "the design — checking icons, typography, colors, layout, spacing, and component structure. "
+    "Be specific: cite file names and exact CSS property values where possible."
+)
+
+UI_DESIGN_TEMPLATE = """\
+Review the following UI implementation for design fidelity issues.
+
+PR Description:
+{pr_description}
+
+Changed files: {changed_files}
+
+Design Specification (typography, colors, spacing — the source of truth):
+{design_spec}
+
+Original Design HTML Reference:
+{design_html}
+
+Diff:
+{pr_diff}
+
+Check all of the following categories and report any issue found:
+
+1. ICON RENDERING:
+   - Are icon names (e.g. "arrow_forward", "chevron_right") rendered as plain text instead of icon glyphs?
+   - Is @mui/icons-material installed and imported when Material icons are used?
+   - Are Material Icons CSS font linked in index.html when using <span class="material-icons">?
+   - Is every icon rendered via a component or CSS class — never as a text node?
+
+2. FOOTER POSITIONING:
+   - Does the root layout use flex-direction: column with min-height: 100vh/100dvh?
+   - Does the main content area have flex: 1 so the footer is always at the bottom of the viewport?
+   - Is the footer visible even when the page content is short?
+
+3. TYPOGRAPHY:
+   - Do the font-family declarations match the design spec exactly (e.g. "Work Sans", "Newsreader")?
+   - Are custom fonts imported via Google Fonts or @import in CSS?
+   - Do font sizes, weights, and colors match the design spec's typography scale?
+   - Are heading styles (h1, h2, etc.) correctly applied?
+
+4. COLORS:
+   - Do background colors match the exact hex values in the design spec?
+   - Do text colors match the spec?
+   - Do primary/secondary/accent colors match?
+   - Are CSS custom properties (variables) or Tailwind config used for consistent theming?
+
+5. SPACING AND LAYOUT:
+   - Do section paddings and margins match the design spec values?
+   - Is the container max-width correct?
+   - Are component gaps and internal paddings consistent with the spec?
+   - Does the layout match the design reference at both desktop and mobile widths?
+
+6. COMPONENT STRUCTURE:
+   - Is every component from the design reference present in the implementation?
+   - Are there extra components not in the design (search bars, tags, badges, duration labels, etc.)?
+   - Does the navigation structure match the design?
+   - Do list items, cards, and rows match the design quantity and content?
+
+Only report issues if the diff actually introduces or fails to fix the problem.
+Add a "category" field to each issue indicating which category above applies
+(e.g. "icon_rendering", "footer_positioning", "typography", "colors", "spacing", "components").
+
+""" + _ISSUE_SCHEMA
+
+

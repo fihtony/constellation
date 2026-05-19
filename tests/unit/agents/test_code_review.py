@@ -40,7 +40,7 @@ class TestCodeReviewWorkflowCompile:
         compiled = code_review_workflow.compile()
         expected_nodes = {
             "load_pr_context", "review_quality", "review_security",
-            "review_tests", "review_requirements", "generate_report",
+            "review_tests", "review_requirements", "review_ui_design", "generate_report",
         }
         assert expected_nodes == set(compiled.nodes.keys())
 

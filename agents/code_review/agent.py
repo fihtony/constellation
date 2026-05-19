@@ -20,6 +20,7 @@ from agents.code_review.nodes import (
     review_security,
     review_tests,
     review_requirements,
+    review_ui_design,
     generate_report,
 )
 
@@ -32,6 +33,7 @@ _code_review_state_schema = {
     "security_issues": Channel(reducer=append_reducer),
     "test_issues": Channel(reducer=append_reducer),
     "requirement_gaps": Channel(reducer=append_reducer),
+    "ui_issues": Channel(reducer=append_reducer),
 }
 
 # ---------------------------------------------------------------------------
@@ -45,7 +47,8 @@ code_review_workflow = Workflow(
         (review_quality, review_security),
         (review_security, review_tests),
         (review_tests, review_requirements),
-        (review_requirements, generate_report),
+        (review_requirements, review_ui_design),
+        (review_ui_design, generate_report),
         (generate_report, END),
     ],
     state_schema=_code_review_state_schema,

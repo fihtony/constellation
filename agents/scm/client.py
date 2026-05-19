@@ -581,6 +581,7 @@ class GitHubClient:
         The Authorization header is set but never logged per security policy.
         """
         import os as _os
+        import mimetypes as _mt
         fname = filename or _os.path.basename(image_path)
         uploads_url = (
             f"https://uploads.github.com/repos/{owner}/{repo}"
@@ -588,19 +589,33 @@ class GitHubClient:
         )
         try:
             with open(image_path, "rb") as fh:
-                data = fh.read()
+                file_data = fh.read()
         except OSError as exc:
             return {"error": str(exc)}, f"read_error: {exc}"
 
+        # GitHub uploads API requires multipart/form-data
+        mime_type = _mt.guess_type(fname)[0] or "image/png"
+        boundary = "----GitHubUploadBoundary"
+        body_parts = [
+            f"--{boundary}\r\n",
+            f'Content-Disposition: form-data; name="file"; filename="{fname}"\r\n',
+            f"Content-Type: {mime_type}\r\n",
+            "\r\n",
+        ]
+        body = (
+            "".join(body_parts).encode("utf-8")
+            + file_data
+            + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        )
         headers = {
-            "Content-Type": "application/octet-stream",
-            "Accept": "application/json",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
         auth = self._auth_header()
         if auth:
             headers["Authorization"] = auth  # NOT logged (security policy §4)
-        req = Request(uploads_url, data=data, headers=headers, method="POST")
+        req = Request(uploads_url, data=body, headers=headers, method="POST")
         try:
             with urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8")

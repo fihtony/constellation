@@ -163,6 +163,76 @@ Always create a comprehensive .gitignore BEFORE writing any other files. It MUST
 NOTE: Do NOT add *.png globally to .gitignore — evidence screenshots in docs/evidence/
 must be committable for PR description embeds.
 
+UI COMPONENT QUALITY RULES (MANDATORY for all React/Vue/Vite UI tasks):
+Apply these rules whenever the task involves building or modifying a user interface.
+
+A. ICON RENDERING — NEVER SHOW ICON NAMES AS TEXT:
+   A common failure mode is icons displaying their text name (e.g. "arrow_forward",
+   "chevron_right") instead of the actual icon glyph. Prevent this by:
+   - For Material UI (MUI): ALWAYS install @mui/icons-material and import icon components:
+       npm install @mui/icons-material @mui/material @emotion/react @emotion/styled
+       import ArrowForwardIcon from '@mui/icons-material/ArrowForward';
+       import ChevronRightIcon from '@mui/icons-material/ChevronRight';
+     Then render: <ChevronRightIcon />  NOT the text "chevron_right".
+   - For Google Material Icons (CSS class approach):
+       Link the font: <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+       Then render: <span className="material-icons">chevron_right</span>
+     WITHOUT the font link, "chevron_right" will render as plain text.
+   - Before committing, grep for any raw icon name strings not inside a component:
+       grep -rn "arrow_forward\\|chevron_right\\|close\\|search\\|menu" src/ --include="*.tsx"
+     If found as JSX text content (not as import or CSS class), fix to use the icon component.
+   - If the design uses SVG icons, include the SVG inline or as a React component.
+   - NEVER render an icon name as a plain text node.
+
+B. FOOTER POSITIONING — ALWAYS STICKY TO BOTTOM OF VIEWPORT:
+   The footer MUST always appear at the bottom of the visible viewport — never floating
+   in the middle of the page when content is short. Apply this CSS layout pattern:
+   - Root container:
+       display: flex;
+       flex-direction: column;
+       min-height: 100vh;  /* or 100dvh for mobile */
+   - Main content area (between header and footer):
+       flex: 1;  /* grows to push footer down */
+   - Footer: no special positioning needed — it naturally sits at the bottom.
+   Example (React/JSX):
+       <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
+         <Header />
+         <main style={{ flex: 1 }}>...</main>
+         <Footer />
+       </div>
+   - VERIFY before committing: if the page has little content, the footer must still be
+     at the bottom of the viewport, not halfway up the page.
+
+C. SPACING, PADDING AND MARGIN — FOLLOW DESIGN SPEC EXACTLY:
+   - Extract spacing values from the Design Specification section in your task prompt.
+   - NEVER use arbitrary spacing like mt-4, p-6, gap-8 without checking the design spec.
+   - Use the design spec's spacing unit (usually 8px base grid) consistently.
+   - Section padding should match the design: if the spec says "section-padding: 64px 80px",
+     use padding: 64px 80px (not 40px or 32px).
+   - Component gaps: if the spec shows 16px gap between lesson rows, use gap: 16px.
+   - Container max-width: if the spec says "container-max: 1200px", use max-width: 1200px.
+   - After implementing, do a SPACING AUDIT:
+       For each major section, compare your padding/margin values against the design spec.
+       If they don't match, fix them before committing.
+
+D. TYPOGRAPHY — MATCH EXACT FONT FAMILIES AND SIZES FROM DESIGN SPEC:
+   - Extract font-family names from design spec (e.g. "Work Sans", "Newsreader").
+   - Import those fonts from Google Fonts in index.html or via @import in CSS.
+   - NEVER use default browser fonts or substitute fonts (Arial, Helvetica, sans-serif)
+     when the design spec specifies a custom font.
+   - Font sizes must match the spec hierarchy: h1, h2, body, caption, etc.
+   - Font colors must use the exact hex values from the design spec colors section.
+   - Bold/italic/weight must match the spec (e.g. font-weight: 600 for semi-bold).
+   - After implementing, do a TYPOGRAPHY AUDIT:
+       Check that all text elements use the correct font-family, size, weight, and color.
+
+E. COLOR — USE EXACT HEX VALUES FROM DESIGN SPEC:
+   - Extract primary, secondary, background, text colors from the design spec.
+   - Use CSS custom properties (variables) for colors:
+       :root { --primary: #3D5AFE; --background: #FAFAFA; --text: #1A1A2E; }
+   - NEVER guess colors — if a color is not in the spec, use the closest spec color.
+   - Background colors for sections, cards, headers, footers must match the spec exactly.
+
 Test organization rules (MANDATORY — follow framework best practices):
 - Vite+React: ALL tests (unit + integration) go in src/ alongside the components:
     src/components/__tests__/ComponentName.test.jsx
