@@ -70,6 +70,23 @@ A. ROUTING & ENTRY POINT — MANDATORY:
    - NEVER create a page component in isolation without wiring it into the app entry.
    - After wiring, run `npm run dev` briefly to confirm the page renders.
 
+E. ROOT ROUTE REDIRECT — MANDATORY for single-feature apps:
+   - If the app uses React Router AND the ONLY route is a named path like "/lessons",
+     ALWAYS add a root redirect so that "/" also shows the feature:
+       import { Navigate } from 'react-router-dom'
+       <Route path="/" element={<Navigate to="/lessons" replace />} />
+     Complete example:
+       <Routes>
+         <Route path="/" element={<Navigate to="/lessons" replace />} />
+         <Route path="/lessons" element={<LessonLibraryPage />} />
+       </Routes>
+   - This prevents a blank screen when the app is opened at the root URL and also
+     ensures screenshots taken from "/" show the implemented feature correctly.
+   - EXCEPTION: If the app already has a home/landing page at "/", leave it as-is and
+     only add the new route — do NOT change the existing root route.
+   - EXCEPTION: If the task explicitly asks for the page to be at a specific route only
+     (e.g. "add a /settings page to the existing app"), leave root as-is.
+
 B. COMPONENT EXPORT/IMPORT MUST MATCH:
    - If exporting as `export default LessonLibraryPage`, import as:
        import LessonLibraryPage from './pages/LessonLibraryPage'

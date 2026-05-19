@@ -994,22 +994,29 @@ async def fix_gaps(state: dict) -> dict:
 
 
 async def capture_screenshot(state: dict) -> dict:
-    """Capture implementation screenshots using Playwright (primary) or Chrome (fallback).
+    """Capture implementation screenshots from the production build.
 
     Screenshot strategy:
-    - Primary:  playwright async API with Chromium (bundled, works in containers)
-    - Fallback: Chrome/Chromium system binary via subprocess
-    - Last resort: HTML page snapshot
+    - Server:   ``vite preview`` serving the production ``dist/`` build (primary).
+                Falls back to ``vite dev`` when no ``dist/`` exists.
+    - Browser:  Playwright Chromium (bundled, works in containers).
+                Falls back to system Chrome/Chromium binary.
+    - Last resort: HTML page snapshot.
 
-    Playwright waits for the ``networkidle`` event and an additional JS-idle
-    delay so React has finished hydrating before the screenshot is taken.
+    Using the production build ensures screenshots reflect the *final committed
+    state* of the implementation — the same artefacts that will be deployed.
+    External font requests (Google Fonts, etc.) are intercepted and aborted so
+    that Playwright's ``load`` event fires quickly; React falls back to the
+    system font stack for the screenshot while all layout / colour / spacing
+    from Tailwind/CSS is fully applied.
+
     Screenshots are saved to the agent workspace directory only — they are NOT
     committed to the repository.  ``create_pr`` uploads them to GitHub via the
-    issue-assets upload API and posts a PR comment, so they appear in the PR
-    without polluting the repository history.
+    release-assets CDN and embeds them in the PR description.
     """
     import subprocess
     import shutil
+    import socket
 
     definition_of_done = state.get("definition_of_done", {})
     screenshot_required = definition_of_done.get("screenshot_required", True)
@@ -1022,8 +1029,6 @@ async def capture_screenshot(state: dict) -> dict:
     repo_path = state.get("repo_path", "")
     workspace_path = state.get("workspace_path", "")
     screenshot_dir = os.path.join(workspace_path, _AGENT_ID, "screenshots")
-    desktop_png = os.path.join(screenshot_dir, "landing-desktop.png")
-    mobile_png = os.path.join(screenshot_dir, "landing-mobile.png")
     screenshots = []
 
     if not repo_path or not os.path.isdir(repo_path):
@@ -1038,96 +1043,305 @@ async def capture_screenshot(state: dict) -> dict:
     log.step("capture_screenshot", screenshot_dir=screenshot_dir)
     print(f"[{_AGENT_ID}] capture_screenshot: repo_path={repo_path!r} screenshot_dir={screenshot_dir!r}")
 
-    PORT = 5179
+    # --- Detect the correct URL path(s) to screenshot ---
+    # Parse the app's router file to find implemented routes. This is needed
+    # because a feature page is often served at a non-root path (e.g. /lessons),
+    # and navigating to "/" would show a blank screen for SPA apps that define
+    # only feature routes.
+    def _detect_app_routes(repo_root: str, task_hint: str = "") -> list[tuple[str, str]]:
+        """Return [(url_path, slug)] for the most relevant screenshot targets.
+
+        Reads the app's main router file, extracts all non-root path definitions,
+        and returns the best match(es) for the current task.  Falls back to
+        [("/", "home")] when no routes can be detected.
+
+        Args:
+            repo_root: Absolute path to the repository root.
+            task_hint: Jira summary / task description used to score routes.
+        Returns:
+            List of (url_path, slug) tuples, e.g. [("/lessons", "lessons")].
+            slug is used as the filename prefix, e.g. "lessons-desktop.png".
+        """
+        import re as _re
+
+        router_candidates = [
+            "src/App.tsx", "src/App.jsx", "src/App.ts", "src/App.js",
+            "src/app.tsx", "src/app.jsx",
+            "src/router.tsx", "src/router.jsx", "src/Router.tsx", "src/Router.jsx",
+            "src/routes.tsx", "src/routes.jsx", "src/Routes.tsx",
+            "src/routing.tsx", "src/routing.jsx",
+            "src/main.tsx", "src/main.jsx",
+            "app/layout.tsx",       # Next.js App Router root
+            "app/page.tsx",         # Next.js App Router index
+            "pages/index.tsx",      # Next.js Pages Router
+        ]
+
+        found_routes: list[str] = []
+        for candidate in router_candidates:
+            fpath = os.path.join(repo_root, candidate)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                content = open(fpath, encoding="utf-8").read()
+                # Extract path="..." / path='...' from Route JSX (<Route path="...">)
+                paths_jsx = _re.findall(r'path=["\']([^"\'*?{}]+)["\']', content)
+                # Extract string literals in router config objects: { path: "..." }
+                paths_obj = _re.findall(r'path:\s*["\']([^"\'*?{}]+)["\']', content)
+                for p in paths_jsx + paths_obj:
+                    p = p.strip()
+                    if p and p != "/" and not p.startswith("*") and p not in found_routes:
+                        if not p.startswith("/"):
+                            p = "/" + p
+                        found_routes.append(p)
+            except Exception:
+                continue
+
+        # Next.js App Router: infer routes from directory structure
+        if not found_routes:
+            app_dir = os.path.join(repo_root, "app")
+            if os.path.isdir(app_dir):
+                for entry in os.listdir(app_dir):
+                    entry_path = os.path.join(app_dir, entry)
+                    if os.path.isdir(entry_path) and not entry.startswith("(") and not entry.startswith("_"):
+                        page_file = os.path.join(entry_path, "page.tsx")
+                        if not os.path.isfile(page_file):
+                            page_file = os.path.join(entry_path, "page.jsx")
+                        if os.path.isfile(page_file):
+                            found_routes.append("/" + entry)
+
+        if not found_routes:
+            # No feature routes detected — use root with generic "app" slug
+            return [("/", "app")]
+
+        # Score routes against task_hint to find best match
+        task_lower = (task_hint or "").lower()
+        if task_lower and len(found_routes) > 1:
+            def _score(route: str) -> int:
+                slug = route.strip("/").lower().replace("-", " ").replace("_", " ")
+                if not slug:
+                    return 0
+                # Award 1 point per matching word
+                return sum(1 for word in slug.split() if word and word in task_lower)
+
+            scored = sorted(found_routes, key=_score, reverse=True)
+            best_score = _score(scored[0])
+            if best_score > 0:
+                found_routes = [r for r in scored if _score(r) == best_score]
+                if not found_routes:
+                    found_routes = scored[:1]
+
+        # Build (url_path, slug) tuples — at most 2 routes to keep PR concise
+        result: list[tuple[str, str]] = []
+        for route in found_routes[:2]:
+            slug = route.strip("/").replace("/", "-") or "app"
+            # Sanitize slug: keep alphanumeric, hyphens, underscores
+            slug = _re.sub(r"[^a-z0-9\-_]", "-", slug.lower())
+            result.append((route, slug))
+        return result
+
+    # Gather task context to help route scoring
+    _jira_ctx = state.get("jira_context", {})
+    _jira_summary = (
+        _jira_ctx.get("summary")
+        or (_jira_ctx.get("fields") or {}).get("summary", "")
+        or state.get("stitch_screen_name", "")
+        or state.get("user_request", "")
+    )
+    _detected_routes = _detect_app_routes(repo_path, _jira_summary)
+    print(f"[{_AGENT_ID}] detected screenshot routes: {_detected_routes!r} (hint={_jira_summary[:60]!r})")
+
+    # Use first detected route for desktop/mobile pair
+    _primary_route, _feature_slug = _detected_routes[0] if _detected_routes else ("/", "app")
+    desktop_png = os.path.join(screenshot_dir, f"{_feature_slug}-desktop.png")
+    mobile_png = os.path.join(screenshot_dir, f"{_feature_slug}-mobile.png")
+
+    # Pick an ephemeral port to avoid conflicts with any server started by run_tests.
+    def _free_port(preferred: int = 5179) -> int:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                return s.getsockname()[1]
+        except Exception:
+            return preferred
+
+    PORT = _free_port()
     dev_proc = None
 
     try:
-        # --- Step 1: Kill any existing process on the port ---
+        import time as _time
+        import urllib.request
+
+        # --- Step 1: Kill any leftover process on chosen port (safety net) ---
         subprocess.run(
             ["bash", "-c", f"lsof -ti:{PORT} | xargs kill -9 2>/dev/null || true"],
             timeout=5, capture_output=True,
         )
 
-        # --- Step 2: Install deps only if node_modules is missing ---
-        node_modules = os.path.join(repo_path, "node_modules")
-        if not os.path.isdir(node_modules):
-            print(f"[{_AGENT_ID}] node_modules missing — running npm install")
-            subprocess.run(
-                ["npm", "install", "--prefer-offline"],
-                cwd=repo_path, timeout=120, capture_output=True,
-            )
-        else:
-            print(f"[{_AGENT_ID}] node_modules exists — skipping npm install")
+        # --- Step 2: Decide server mode: vite preview (prod build) or vite dev ---
+        dist_dir = os.path.join(repo_path, "dist")
+        use_preview = os.path.isdir(dist_dir)
 
-        # --- Step 3: Start vite dev server ---
+        if not use_preview:
+            # run_tests should have built dist/; if missing, try to build now.
+            print(f"[{_AGENT_ID}] dist/ not found — running npm run build before screenshot")
+            node_modules = os.path.join(repo_path, "node_modules")
+            if not os.path.isdir(node_modules):
+                subprocess.run(
+                    ["npm", "install", "--prefer-offline"],
+                    cwd=repo_path, timeout=120, capture_output=True,
+                )
+            build_result = subprocess.run(
+                ["npm", "run", "build"],
+                cwd=repo_path, timeout=300, capture_output=True, text=True,
+            )
+            use_preview = build_result.returncode == 0 and os.path.isdir(dist_dir)
+            if not use_preview:
+                print(f"[{_AGENT_ID}] build failed (rc={build_result.returncode}) — "
+                      f"falling back to vite dev")
+                # Ensure deps are present for dev server
+                node_modules = os.path.join(repo_path, "node_modules")
+                if not os.path.isdir(node_modules):
+                    subprocess.run(
+                        ["npm", "install", "--prefer-offline"],
+                        cwd=repo_path, timeout=120, capture_output=True,
+                    )
+        else:
+            print(f"[{_AGENT_ID}] dist/ found — using vite preview for production-accurate screenshot")
+
+        # --- Step 3: Start server (preview preferred, dev fallback) ---
+        if use_preview:
+            # vite preview serves the production dist/ build
+            server_cmd = ["npx", "vite", "preview", "--port", str(PORT), "--host", "0.0.0.0"]
+        else:
+            server_cmd = ["npm", "run", "dev", "--", "--port", str(PORT), "--host", "0.0.0.0"]
+
         dev_proc = subprocess.Popen(
-            ["npm", "run", "dev", "--", "--port", str(PORT), "--host", "0.0.0.0"],
+            server_cmd,
             cwd=repo_path,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        print(f"[{_AGENT_ID}] Dev server started (pid={dev_proc.pid}) on port {PORT}")
+        server_type = "preview" if use_preview else "dev"
+        print(f"[{_AGENT_ID}] {server_type} server started (pid={dev_proc.pid}) on port {PORT}")
 
         # --- Step 4: Wait for server ready (up to 60s) ---
-        import time as _time
-        import urllib.request
         server_ready = False
         for _ in range(30):
             _time.sleep(2)
             try:
-                with urllib.request.urlopen(f"http://localhost:{PORT}", timeout=3) as r:
-                    if r.status < 500:
-                        server_ready = True
-                        break
+                conn = urllib.request.urlopen(f"http://localhost:{PORT}", timeout=3)
+                if conn.status < 500:
+                    server_ready = True
+                    conn.close()
+                    break
+                conn.close()
             except Exception:
                 pass
-        print(f"[{_AGENT_ID}] Server ready={server_ready}")
+        print(f"[{_AGENT_ID}] Server ready={server_ready} (type={server_type})")
 
         if not server_ready:
-            print(f"[{_AGENT_ID}] Dev server not ready in 60s — skipping screenshot")
+            print(f"[{_AGENT_ID}] Server not ready in 60s — skipping screenshot")
         else:
             # --- Step 5: Take screenshots (playwright primary, Chrome fallback) ---
             playwright_ok = False
             try:
                 from playwright.async_api import async_playwright
-                print(f"[{_AGENT_ID}] Taking screenshots with playwright...")
+                print(f"[{_AGENT_ID}] Taking screenshots with playwright "
+                      f"(wait_until=load, fonts with timeout)...")
                 async with async_playwright() as pw:
                     browser = await pw.chromium.launch(args=[
                         "--no-sandbox",
                         "--disable-dev-shm-usage",
                         "--disable-gpu",
                     ])
-                    # Desktop screenshot
-                    ctx_desktop = await browser.new_context(
-                        viewport={"width": 1280, "height": 900},
-                    )
-                    page = await ctx_desktop.new_page()
-                    await page.goto(f"http://localhost:{PORT}", wait_until="networkidle", timeout=30000)
-                    # Extra wait for React lazy rendering / animations to settle
-                    await page.wait_for_timeout(3000)
-                    await page.screenshot(path=desktop_png, full_page=False)
-                    await ctx_desktop.close()
 
-                    # Mobile screenshot
-                    ctx_mobile = await browser.new_context(
-                        viewport={"width": 375, "height": 812},
+                    async def _take_page_screenshot(
+                        browser_inst,
+                        viewport: dict,
+                        out_path: str,
+                        url_path: str = "/",
+                        is_mobile: bool = False,
+                    ) -> bool:
+                        """Navigate to url_path, wait for render, screenshot; return True on success."""
+                        ctx = await browser_inst.new_context(
+                            viewport=viewport,
+                            is_mobile=is_mobile,
+                        )
+                        pg = await ctx.new_page()
+                        try:
+                            # Block external font CDNs so 'load' fires quickly.
+                            # The page renders with system font fallbacks; all
+                            # layout / colour / spacing from CSS is fully applied.
+                            async def _block_fonts(route, request):  # noqa: ANN001
+                                host = request.url.split("/")[2] if "/" in request.url else ""
+                                if any(h in host for h in (
+                                    "fonts.googleapis.com",
+                                    "fonts.gstatic.com",
+                                    "use.typekit.net",
+                                    "kit.fontawesome.com",
+                                )):
+                                    await route.abort()
+                                else:
+                                    await route.continue_()
+
+                            await pg.route("**/*", _block_fonts)
+
+                            # Navigate to the detected feature URL (not just root).
+                            # For React Router SPAs, vite preview serves all routes
+                            # via the same index.html; the client-side router handles
+                            # the path.  For vite dev server, --host already enables this.
+                            target_url = f"http://localhost:{PORT}{url_path}"
+                            print(f"[{_AGENT_ID}] Playwright navigating to {target_url!r}")
+                            # Use 'load' (not 'networkidle') — safe with blocked CDNs.
+                            await pg.goto(
+                                target_url,
+                                wait_until="load",
+                                timeout=30000,
+                            )
+                            # Wait for React to hydrate and CSS animations to settle.
+                            await pg.wait_for_timeout(3000)
+                            # Best-effort: verify the React root has rendered content.
+                            try:
+                                await pg.wait_for_selector(
+                                    "#root > *",
+                                    state="visible",
+                                    timeout=5000,
+                                )
+                            except Exception:
+                                pass  # proceed even if selector not found
+                            await pg.screenshot(path=out_path, full_page=False)
+                        finally:
+                            await ctx.close()
+                        return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+
+                    # Desktop
+                    d_ok = await _take_page_screenshot(
+                        browser,
+                        {"width": 1280, "height": 900},
+                        desktop_png,
+                        url_path=_primary_route,
+                    )
+                    if d_ok:
+                        screenshots.append(desktop_png)
+                        print(f"[{_AGENT_ID}] Playwright desktop: "
+                              f"{os.path.getsize(desktop_png)} bytes")
+                        playwright_ok = True
+
+                    # Mobile
+                    m_ok = await _take_page_screenshot(
+                        browser,
+                        {"width": 375, "height": 812},
+                        mobile_png,
+                        url_path=_primary_route,
                         is_mobile=True,
                     )
-                    page_mobile = await ctx_mobile.new_page()
-                    await page_mobile.goto(f"http://localhost:{PORT}", wait_until="networkidle", timeout=30000)
-                    await page_mobile.wait_for_timeout(2000)
-                    await page_mobile.screenshot(path=mobile_png, full_page=False)
-                    await ctx_mobile.close()
+                    if m_ok:
+                        screenshots.append(mobile_png)
+                        print(f"[{_AGENT_ID}] Playwright mobile: "
+                              f"{os.path.getsize(mobile_png)} bytes")
 
                     await browser.close()
 
-                if os.path.isfile(desktop_png) and os.path.getsize(desktop_png) > 0:
-                    screenshots.append(desktop_png)
-                    print(f"[{_AGENT_ID}] Playwright desktop screenshot: {os.path.getsize(desktop_png)} bytes")
-                    playwright_ok = True
-                if os.path.isfile(mobile_png) and os.path.getsize(mobile_png) > 0:
-                    screenshots.append(mobile_png)
-                    print(f"[{_AGENT_ID}] Playwright mobile screenshot: {os.path.getsize(mobile_png)} bytes")
             except ImportError:
                 print(f"[{_AGENT_ID}] playwright not available — trying system Chrome")
             except Exception as pw_exc:
@@ -1152,48 +1366,47 @@ async def capture_screenshot(state: dict) -> dict:
                 print(f"[{_AGENT_ID}] Chrome binary: {chrome_bin!r}")
 
                 if chrome_bin:
-                    # Pre-warm Vite + wait for React render
-                    import re as _re
-                    try:
-                        with urllib.request.urlopen(f"http://localhost:{PORT}", timeout=10) as _r:
-                            _html = _r.read().decode("utf-8", errors="replace")
-                        for _src in _re.findall(r'src="(/[^"]+)"', _html)[:10]:
-                            try:
-                                urllib.request.urlopen(f"http://localhost:{PORT}{_src}", timeout=5)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    print(f"[{_AGENT_ID}] Waiting 8s for React to fully render (Chrome path)...")
-                    _time.sleep(8)
+                    # Give more time for the production build to fully render.
+                    # The vite preview server is faster to render than dev, so 12s
+                    # is sufficient for React hydration + Tailwind CSS application.
+                    print(f"[{_AGENT_ID}] Waiting 12s for full render (Chrome fallback, "
+                          f"{server_type} server)...")
+                    _time.sleep(12)
 
                     _chrome_flags = [
                         "--headless=new", "--no-sandbox", "--disable-gpu",
-                        "--disable-dev-shm-usage", "--run-all-compositor-stages-before-draw",
+                        "--disable-dev-shm-usage",
+                        "--run-all-compositor-stages-before-draw",
+                        # Block external font CDNs so Chrome doesn't wait on them.
+                        "--host-rules=MAP fonts.googleapis.com 127.0.0.1,"
+                        "MAP fonts.gstatic.com 127.0.0.1,"
+                        "MAP use.typekit.net 127.0.0.1",
                     ]
                     for _out_path, _size in [(desktop_png, "1280,900"), (mobile_png, "375,812")]:
                         chrome_result = subprocess.run(
                             [chrome_bin] + _chrome_flags + [
                                 f"--screenshot={_out_path}",
                                 f"--window-size={_size}",
-                                f"http://localhost:{PORT}",
+                                f"http://localhost:{PORT}{_primary_route}",
                             ],
-                            capture_output=True, timeout=45,
+                            capture_output=True, timeout=60,
                         )
                         if os.path.isfile(_out_path) and os.path.getsize(_out_path) > 0:
                             screenshots.append(_out_path)
-                            print(f"[{_AGENT_ID}] Chrome screenshot saved ({_size}): {os.path.getsize(_out_path)} bytes")
+                            print(f"[{_AGENT_ID}] Chrome screenshot saved ({_size}): "
+                                  f"{os.path.getsize(_out_path)} bytes")
                         else:
-                            print(f"[{_AGENT_ID}] Chrome screenshot failed (rc={chrome_result.returncode})")
+                            print(f"[{_AGENT_ID}] Chrome screenshot failed "
+                                  f"(rc={chrome_result.returncode})")
                 else:
                     print(f"[{_AGENT_ID}] No Chrome/Chromium found — falling back to HTML snapshot")
 
         # --- HTML fallback if no screenshots and server is up ---
         if not screenshots and server_ready:
             try:
-                with urllib.request.urlopen(f"http://localhost:{PORT}", timeout=5) as r:
+                with urllib.request.urlopen(f"http://localhost:{PORT}{_primary_route}", timeout=5) as r:
                     html_bytes = r.read()
-                html_fallback = os.path.join(screenshot_dir, "landing-page.html")
+                html_fallback = os.path.join(screenshot_dir, f"{_feature_slug}-page.html")
                 with open(html_fallback, "wb") as fh:
                     fh.write(html_bytes)
                 screenshots.append(html_fallback)
@@ -1204,7 +1417,7 @@ async def capture_screenshot(state: dict) -> dict:
     except Exception as exc:
         print(f"[{_AGENT_ID}] capture_screenshot error (non-fatal): {exc}")
     finally:
-        # Always stop the dev server
+        # Always stop the server
         if dev_proc and dev_proc.poll() is None:
             dev_proc.terminate()
             try:
@@ -1217,7 +1430,8 @@ async def capture_screenshot(state: dict) -> dict:
         )
 
     captured = bool(screenshots) and any(s.endswith(".png") for s in screenshots)
-    log.info("screenshot result", captured=captured, count=len(screenshots))
+    log.info("screenshot result", captured=captured, count=len(screenshots),
+             server_type=locals().get("server_type", "unknown"))
     return {
         "screenshot_captured": captured,
         "screenshots": screenshots,
