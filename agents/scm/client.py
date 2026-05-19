@@ -532,6 +532,173 @@ class GitHubClient:
         except Exception as exc:
             return {}, str(exc)
 
+    def update_pr(
+        self,
+        owner: str,
+        repo: str,
+        pr_id: str | int,
+        body: str | None = None,
+        title: str | None = None,
+        timeout: int = 15,
+    ) -> tuple[dict, str]:
+        """Update a pull request (title and/or body)."""
+        payload: dict = {}
+        if body is not None:
+            payload["body"] = body
+        if title is not None:
+            payload["title"] = title
+        if not payload:
+            return {}, "no_changes"
+        try:
+            status, resp = self._request(
+                "PATCH", f"repos/{owner}/{repo}/pulls/{pr_id}", payload, timeout=timeout
+            )
+            if status in (200, 201):
+                return {
+                    "id": resp.get("number"),
+                    "url": resp.get("html_url", ""),
+                }, "ok"
+            return resp, f"http_{status}"
+        except Exception as exc:
+            return {}, str(exc)
+
+    # SCREENSHOT_RELEASE_TAG is the release used as a permanent image CDN.
+    # Fine-grained PATs cannot use the issue-assets upload endpoint (HTTP 422
+    # "Bad Size"), but the Release Assets upload endpoint works correctly with
+    # raw application/octet-stream content.
+    SCREENSHOT_RELEASE_TAG = "screenshot-assets"
+
+    def _find_or_create_screenshot_release(
+        self, owner: str, repo: str, timeout: int = 20
+    ) -> tuple[int, str]:
+        """Return (release_id, status) for the screenshot-assets release.
+
+        Creates the release if it does not exist yet.
+        """
+        status, body = self._request(
+            "GET", f"repos/{owner}/{repo}/releases/tags/{self.SCREENSHOT_RELEASE_TAG}",
+            timeout=timeout
+        )
+        if status == 200 and isinstance(body, dict):
+            return body.get("id", 0), "found"
+
+        # Create the release (prerelease so it does not appear prominently)
+        create_status, create_body = self._request(
+            "POST", f"repos/{owner}/{repo}/releases", {
+                "tag_name": self.SCREENSHOT_RELEASE_TAG,
+                "name": "Screenshot Assets",
+                "body": "Auto-generated release for hosting PR screenshots. Do not delete.",
+                "draft": False,
+                "prerelease": True,
+            }, timeout=timeout
+        )
+        if create_status in (200, 201) and isinstance(create_body, dict):
+            return create_body.get("id", 0), "created"
+        return 0, f"http_{create_status}"
+
+    def upload_issue_image(
+        self,
+        owner: str,
+        repo: str,
+        issue_number: int,
+        image_path: str,
+        filename: str = "",
+        timeout: int = 60,
+    ) -> tuple[dict, str]:
+        """Upload a screenshot image as a GitHub release asset for CDN hosting.
+
+        Uses the Release Assets upload API (``uploads.github.com/repos/{owner}/
+        {repo}/releases/{id}/assets``) with ``Content-Type: application/octet-stream``.
+        This approach works with fine-grained PATs and does NOT require committing
+        image files to the PR branch.
+
+        The returned ``href`` is a ``github.com/{owner}/{repo}/releases/download/
+        screenshot-assets/{filename}`` URL that can be embedded in Markdown.
+
+        The Authorization header is set but never logged per security policy §4.
+        """
+        import os as _os
+        fname = filename or _os.path.basename(image_path)
+
+        # Include PR/issue number as prefix to allow same-named files across PRs
+        if issue_number:
+            unique_fname = f"pr{issue_number}-{fname}"
+        else:
+            unique_fname = fname
+
+        try:
+            with open(image_path, "rb") as fh:
+                file_data = fh.read()
+        except OSError as exc:
+            return {"error": str(exc)}, f"read_error: {exc}"
+
+        # Step 1: Find or create the screenshot release
+        release_id, rel_status = self._find_or_create_screenshot_release(
+            owner, repo, timeout=20
+        )
+        if not release_id:
+            return {"error": f"Could not find/create screenshot release: {rel_status}"}, rel_status
+
+        # Step 2: Upload as release asset (octet-stream, no multipart)
+        upload_url = (
+            f"https://uploads.github.com/repos/{owner}/{repo}"
+            f"/releases/{release_id}/assets?name={quote(unique_fname)}"
+        )
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Length": str(len(file_data)),
+        }
+        auth = self._auth_header()
+        if auth:
+            headers["Authorization"] = auth  # NOT logged (security policy §4)
+        req = Request(upload_url, data=file_data, headers=headers, method="POST")
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                result = json.loads(raw) if raw.strip() else {}
+                cdn_url = result.get("browser_download_url", "")
+                return {"href": cdn_url, "asset_id": result.get("id", 0)}, "ok"
+        except HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                err_body = json.loads(raw)
+            except Exception:
+                err_body = {"error": raw[:300]}
+            # Handle "already_exists" — the asset was uploaded in a previous run.
+            # Fetch the existing asset URL instead of failing.
+            errors = err_body.get("errors", [])
+            if exc.code == 422 and any(
+                e.get("code") == "already_exists" for e in errors
+            ):
+                existing_url = self._get_existing_release_asset_url(
+                    owner, repo, release_id, unique_fname, timeout=20
+                )
+                if existing_url:
+                    return {"href": existing_url, "asset_id": 0, "reused": True}, "ok"
+            return err_body, f"http_{exc.code}"
+        except Exception as exc:
+            return {"error": str(exc)}, str(exc)
+
+    def _get_existing_release_asset_url(
+        self,
+        owner: str,
+        repo: str,
+        release_id: int,
+        filename: str,
+        timeout: int = 15,
+    ) -> str:
+        """Return the browser_download_url for an existing release asset by name."""
+        status, body = self._request(
+            "GET", f"repos/{owner}/{repo}/releases/{release_id}/assets", timeout=timeout
+        )
+        if status == 200 and isinstance(body, list):
+            for asset in body:
+                if asset.get("name") == filename:
+                    return asset.get("browser_download_url", "")
+        return ""
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

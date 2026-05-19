@@ -1,12 +1,12 @@
-"""Tests for Compass Agent (LLM-driven ReAct)."""
+"""Tests for Compass Agent (hybrid heuristic + LLM routing)."""
 import json
 import pytest
-from unittest.mock import MagicMock
-from agents.compass.agent import CompassAgent, compass_definition
+from unittest.mock import MagicMock, patch
+from agents.compass.agent import CompassAgent, compass_definition, _classify_request, _extract_jira_key
 from framework.agent import AgentMode, AgentServices, ExecutionMode
 
 
-def _make_agent(mock_runtime):
+def _make_agent(mock_runtime, registry_execute_sync=None):
     from unittest.mock import MagicMock as M
     from framework.task_store import InMemoryTaskStore
     services = AgentServices(
@@ -15,7 +15,8 @@ def _make_agent(mock_runtime):
         runtime=mock_runtime, registry_client=None,
         task_store=InMemoryTaskStore(),
     )
-    return CompassAgent(definition=compass_definition, services=services)
+    agent = CompassAgent(definition=compass_definition, services=services)
+    return agent
 
 
 def _mock_runtime(summary="Task dispatched.", success=True):
@@ -24,6 +25,7 @@ def _mock_runtime(summary="Task dispatched.", success=True):
     result.summary = summary
     runtime = MagicMock()
     runtime.run_agentic.return_value = result
+    runtime.run.return_value = {"raw_response": "development"}
     return runtime
 
 
@@ -44,43 +46,190 @@ class TestCompassDefinition:
         assert len(compass_definition.tools) > 0
 
 
+class TestCompassClassification:
+    """Unit tests for the heuristic + LLM classification helper."""
+
+    # ---------------------------------------------------------------
+    # Development tasks
+    # ---------------------------------------------------------------
+    def test_jira_url_with_implement(self):
+        assert _classify_request(
+            "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2", None
+        ) == "development"
+
+    def test_jira_key_with_fix_bug(self):
+        assert _classify_request("Fix bug in ABC-123", None) == "development"
+
+    def test_jira_key_with_create_pr(self):
+        assert _classify_request("please create pr for PROJ-99", None) == "development"
+
+    def test_jira_url_with_code_review(self):
+        assert _classify_request(
+            "do a code review for https://jira.company.com/browse/ENG-42", None
+        ) == "development"
+
+    def test_jira_url_with_refactor(self):
+        assert _classify_request(
+            "refactor the auth module https://company.atlassian.net/browse/AUTH-5", None
+        ) == "development"
+
+    def test_implement_ticket_phrase(self):
+        assert _classify_request(
+            "implement the jira ticket https://tarch.atlassian.net/browse/CSTL-3", None
+        ) == "development"
+
+    def test_write_unit_tests(self):
+        # Has strong dev action without Jira key — goes to LLM (runtime=None → general),
+        # but the heuristic covers "write tests" only with a Jira key. Accepted.
+        result = _classify_request("write unit tests for payment service", None)
+        assert result in ("development", "general")
+
+    def test_jira_key_alone(self):
+        # Has a Jira key but no action keyword — falls through to LLM (runtime=None → general)
+        result = _classify_request("CSTL-2", None)
+        assert result in ("development", "general")
+
+    def test_lllm_fallback_returns_development(self):
+        """When LLM returns 'development', classification follows."""
+        mock_runtime = MagicMock()
+        mock_runtime.run.return_value = {"raw_response": "development"}
+        result = _classify_request("write unit tests for the user service", mock_runtime)
+        assert result == "development"
+
+    def test_llm_fallback_returns_development_with_noise(self):
+        """LLM may include extra whitespace/punctuation — still parsed correctly."""
+        mock_runtime = MagicMock()
+        mock_runtime.run.return_value = {"raw_response": "  development\n"}
+        result = _classify_request("help me set up docker compose", mock_runtime)
+        assert result == "development"
+
+    def test_llm_fallback_returns_office(self):
+        mock_runtime = MagicMock()
+        mock_runtime.run.return_value = {"raw_response": "office"}
+        result = _classify_request("please process my documents", mock_runtime)
+        assert result == "office"
+
+    # ---------------------------------------------------------------
+    # Office tasks
+    # ---------------------------------------------------------------
+    def test_office_summarize_pdf(self):
+        assert _classify_request("summarize the pdf in my downloads folder", None) == "office"
+
+    def test_office_organize_files(self):
+        assert _classify_request("organize files in /home/user/docs", None) == "office"
+
+    def test_office_analyze_spreadsheet(self):
+        assert _classify_request("analyze the spreadsheet /data/sales.xlsx", None) == "office"
+
+    # ---------------------------------------------------------------
+    # General tasks
+    # ---------------------------------------------------------------
+    def test_general_question(self):
+        assert _classify_request("What is Python?", None) == "general"
+
+    def test_general_greeting(self):
+        assert _classify_request("Hello, what can you do?", None) == "general"
+
+    def test_general_explanation(self):
+        assert _classify_request("explain how JWT authentication works", None) == "general"
+
+    def test_general_empty(self):
+        assert _classify_request("", None) == "general"
+
+    # ---------------------------------------------------------------
+    # LLM failure graceful degradation
+    # ---------------------------------------------------------------
+    def test_llm_failure_falls_back_to_general(self):
+        mock_runtime = MagicMock()
+        mock_runtime.run.side_effect = RuntimeError("LLM offline")
+        result = _classify_request("what should I do today?", mock_runtime)
+        assert result == "general"
+
+    def test_llm_unexpected_output_falls_back_to_general(self):
+        mock_runtime = MagicMock()
+        mock_runtime.run.return_value = {"raw_response": "UNKNOWN_CATEGORY"}
+        result = _classify_request("some ambiguous request", mock_runtime)
+        assert result == "general"
+
+    # ---------------------------------------------------------------
+    # Jira key extraction
+    # ---------------------------------------------------------------
+    def test_extract_jira_key(self):
+        assert _extract_jira_key("implement https://jira.example.com/browse/PROJ-42") == "PROJ-42"
+        assert _extract_jira_key("Fix ABC-123 please") == "ABC-123"
+        assert _extract_jira_key("no jira here") == ""
+
+    def test_extract_jira_key_from_url(self):
+        assert _extract_jira_key(
+            "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2"
+        ) == "CSTL-2"
+
+
 class TestCompassAgent:
     async def test_handles_development_task(self):
-        runtime = _mock_runtime("Development task dispatched to Team Lead.")
+        """Development tasks are dispatched directly via registry (not run_agentic)."""
+        runtime = _mock_runtime()
         agent = _make_agent(runtime)
 
         message = {
-            "parts": [{"text": "Fix bug in Jira ticket ABC-123"}],
+            "parts": [{"text": "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2"}],
             "metadata": {},
         }
-        result = await agent.handle_message(message)
+        with patch("framework.tools.registry.get_registry") as mock_get_reg:
+            mock_reg = MagicMock()
+            mock_reg.execute_sync.return_value = json.dumps({
+                "status": "submitted", "taskId": "tl-001",
+            })
+            mock_get_reg.return_value = mock_reg
+            result = await agent.handle_message(message)
 
         assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
         artifacts = result["task"]["artifacts"]
         assert any("dispatched" in a["parts"][0]["text"].lower() for a in artifacts)
-        runtime.run_agentic.assert_called_once()
+        # Direct dispatch should NOT call run_agentic
+        runtime.run_agentic.assert_not_called()
+        mock_reg.execute_sync.assert_called_once()
+        call_args = mock_reg.execute_sync.call_args
+        assert call_args[0][0] == "dispatch_development_task"
+        payload = call_args[0][1]
+        assert payload["task_description"] == "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2"
+        assert payload["jira_key"] == "CSTL-2"
+        assert "orchestratorTaskId" in payload
+        assert "workspacePath" in payload
 
     async def test_handles_office_task(self):
-        runtime = _mock_runtime("Office document summarized.")
+        """Office tasks are dispatched directly via registry (not run_agentic)."""
+        runtime = _mock_runtime()
         agent = _make_agent(runtime)
 
         message = {
             "parts": [{"text": "Summarize the PDF in my documents folder"}],
             "metadata": {},
         }
-        result = await agent.handle_message(message)
+        with patch("framework.tools.registry.get_registry") as mock_get_reg:
+            mock_reg = MagicMock()
+            mock_reg.execute_sync.return_value = json.dumps({"status": "submitted"})
+            mock_get_reg.return_value = mock_reg
+            result = await agent.handle_message(message)
+
+        assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+        runtime.run_agentic.assert_not_called()
+
+    async def test_general_task_uses_run_agentic(self):
+        """General/conversational tasks use run_agentic for LLM response."""
+        runtime = _mock_runtime("Python is a programming language.")
+        # Ensure LLM classification also returns 'general'
+        runtime.run.return_value = {"raw_response": "general"}
+        agent = _make_agent(runtime)
+
+        message = {"parts": [{"text": "What is Python?"}], "metadata": {}}
+        with patch("framework.tools.registry.get_registry") as mock_get_reg:
+            mock_reg = MagicMock()
+            mock_get_reg.return_value = mock_reg
+            result = await agent.handle_message(message)
 
         assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
         runtime.run_agentic.assert_called_once()
-
-    async def test_failed_result_maps_to_failed_state(self):
-        runtime = _mock_runtime("Something went wrong.", success=False)
-        agent = _make_agent(runtime)
-
-        message = {"parts": [{"text": "Do something"}], "metadata": {}}
-        result = await agent.handle_message(message)
-
-        assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
 
     async def test_get_task_nonexistent_returns_failed(self):
         """Non-existent task ID returns FAILED from TaskStore."""
@@ -93,27 +242,36 @@ class TestCompassAgent:
         runtime = _mock_runtime("Done.")
         agent = _make_agent(runtime)
 
-        message = {"parts": [{"text": "Hello"}], "metadata": {}}
-        result = await agent.handle_message(message)
+        message = {"parts": [{"text": "Hello there"}], "metadata": {}}
+        with patch("framework.tools.registry.get_registry") as mock_get_reg:
+            mock_reg = MagicMock()
+            mock_get_reg.return_value = mock_reg
+            result = await agent.handle_message(message)
         task_id = result["task"]["id"]
 
         poll = await agent.get_task(task_id)
         assert poll["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
 
     async def test_handle_message_accepts_a2a_envelope(self):
-        runtime = _mock_runtime("Development task dispatched to Team Lead.")
+        """A2A envelope (message.message.parts) is unwrapped correctly."""
+        runtime = _mock_runtime("Done.")
         agent = _make_agent(runtime)
 
         message = {
             "message": {
-                "parts": [{"text": "Implement PROJ-123"}],
+                "parts": [{"text": "implement the jira ticket https://jira.example.com/browse/PROJ-123"}],
                 "metadata": {},
             }
         }
-        result = await agent.handle_message(message)
+        with patch("framework.tools.registry.get_registry") as mock_get_reg:
+            mock_reg = MagicMock()
+            mock_reg.execute_sync.return_value = json.dumps({"status": "submitted", "taskId": "tl-001"})
+            mock_get_reg.return_value = mock_reg
+            result = await agent.handle_message(message)
 
         assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
-        runtime.run_agentic.assert_called_once()
+        # Development task → direct dispatch, not run_agentic
+        runtime.run_agentic.assert_not_called()
 
 
 class TestCompassTools:

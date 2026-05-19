@@ -231,6 +231,32 @@ class JiraListComments(BaseTool):
         return ToolResult(output=json.dumps(result))
 
 
+class SCMListBranches(BaseTool):
+    """List remote branches for a repository via SCM Agent."""
+
+    name = "scm_list_branches"
+    description = "List remote branches for a repository through the SCM Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string", "description": "Repository URL"},
+        },
+        "required": ["repo_url"],
+    }
+
+    def execute_sync(self, repo_url: str = "") -> ToolResult:
+        project, repo = _parse_repo_coordinates(repo_url)
+        if not project or not repo:
+            return ToolResult(output=json.dumps({"branches": [], "error": "Cannot infer project/repo from repo_url"}))
+        result = _dispatch_scm(
+            "scm.branch.list",
+            text=f"{project}/{repo}",
+            project=project,
+            repo=repo,
+        )
+        return ToolResult(output=json.dumps(result))
+
+
 class SCMPush(BaseTool):
     """Push a local branch to the remote via SCM Agent."""
 
@@ -302,8 +328,15 @@ class SCMCreatePR(BaseTool):
 # ---------------------------------------------------------------------------
 
 def register_web_dev_tools():
-    """Register all Web Dev boundary tools in the global ToolRegistry."""
+    """Register all Web Dev boundary tools in the global ToolRegistry.
+
+    SCM tools (scm_push, scm_create_pr, scm_list_branches) are only registered
+    when they are NOT already present — the in-process SCM adapter registers
+    direct-dispatch variants first during E2E/test setup, which must not be
+    overridden by the HTTP-proxy versions here.
+    """
     registry = get_registry()
+    existing = {s["function"]["name"] for s in registry.list_schemas()}
     for tool_cls in (
         JiraTransition,
         JiraComment,
@@ -311,7 +344,10 @@ def register_web_dev_tools():
         JiraListTransitions,
         JiraGetTokenUser,
         JiraListComments,
+        SCMListBranches,
         SCMPush,
         SCMCreatePR,
     ):
-        registry.register(tool_cls())
+        tool = tool_cls()
+        if tool.name not in existing:
+            registry.register(tool)

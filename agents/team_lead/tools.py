@@ -261,6 +261,22 @@ class DispatchWebDev(BaseTool):
                 "type": "object",
                 "description": "Design spec data (from fetch_design). Optional.",
             },
+            "design_code_path": {
+                "type": "string",
+                "description": "Local path to design code HTML file (ui-design/stitch/code.html). Optional.",
+            },
+            "design_md_path": {
+                "type": "string",
+                "description": "Local path to DESIGN.md spec file (ui-design/stitch/DESIGN.md). Optional.",
+            },
+            "design_local_folder": {
+                "type": "string",
+                "description": "Local folder where design files were saved by the UI design agent. Optional.",
+            },
+            "jira_local_folder": {
+                "type": "string",
+                "description": "Local folder where Jira ticket files were saved by the jira agent. Optional.",
+            },
             "repo_url": {
                 "type": "string",
                 "description": "Git repository URL. Optional.",
@@ -285,6 +301,14 @@ class DispatchWebDev(BaseTool):
                 "type": "array",
                 "description": "Design context file paths. Optional.",
             },
+            "tech_stack": {
+                "type": "array",
+                "description": "List of technologies extracted from Jira ticket (e.g. ['react', 'typescript']). Optional.",
+            },
+            "stitch_screen_name": {
+                "type": "string",
+                "description": "Target Stitch screen name to implement (e.g. 'Lesson Library'). Optional.",
+            },
             "revision_feedback": {
                 "type": "string",
                 "description": "Code review rejection reason for revision. Optional.",
@@ -302,12 +326,18 @@ class DispatchWebDev(BaseTool):
         task_description: str = "",
         jira_context: dict | None = None,
         design_context: dict | None = None,
+        design_code_path: str = "",
+        design_md_path: str = "",
+        design_local_folder: str = "",
+        jira_local_folder: str = "",
         repo_url: str = "",
         repo_path: str = "",
         workspace_path: str = "",
         context_manifest_path: str = "",
         jira_files: list | None = None,
         design_files: list | None = None,
+        tech_stack: list | None = None,
+        stitch_screen_name: str = "",
         revision_feedback: str = "",
         definition_of_done: dict | None = None,
     ) -> ToolResult:
@@ -327,8 +357,20 @@ class DispatchWebDev(BaseTool):
             meta["contextManifestPath"] = context_manifest_path
         if jira_files:
             meta["jiraFiles"] = jira_files
+        if jira_local_folder:
+            meta["jiraLocalFolder"] = jira_local_folder
         if design_files:
             meta["designFiles"] = design_files
+        if design_local_folder:
+            meta["designLocalFolder"] = design_local_folder
+        if design_code_path:
+            meta["designCodePath"] = design_code_path
+        if design_md_path:
+            meta["designMdPath"] = design_md_path
+        if tech_stack:
+            meta["techStack"] = tech_stack
+        if stitch_screen_name:
+            meta["stitchScreenName"] = stitch_screen_name
         if revision_feedback:
             meta["revisionFeedback"] = revision_feedback
         if definition_of_done:

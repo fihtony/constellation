@@ -1,5 +1,6 @@
 """Tests for Web Dev Agent workflow."""
 import json
+import os
 import pytest
 from framework.workflow import START, END
 from agents.web_dev.agent import web_dev_workflow, web_dev_definition
@@ -65,22 +66,68 @@ class TestSafeJson:
 
 class TestWebDevNodes:
 
-    async def test_setup_workspace_no_runtime(self):
-        state = {"_task_id": "t-123", "repo_url": "https://github.com/org/repo", "branch_name": "fix/test"}
-        result = await setup_workspace(state)
+    async def test_setup_workspace_no_runtime(self, tmp_path):
+        # Team Lead pre-clones the repo; setup_workspace verifies it exists.
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        # Minimal git init so branch operations work
+        import subprocess
+        subprocess.run(["git", "init", repo_path], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.email", "test@test.com"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.name", "Test"],
+                       check=True, capture_output=True)
+        # Create an initial commit so checkout -b works
+        (tmp_path / "repo" / "README.md").write_text("hi")
+        subprocess.run(["git", "-C", repo_path, "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "commit", "-m", "init"],
+                       check=True, capture_output=True)
+
+        state = {
+            "_task_id": "t-123",
+            "repo_url": "https://github.com/org/repo",
+            "repo_path": repo_path,
+            "workspace_path": str(tmp_path),
+            "branch_name": "fix/test",
+        }
+        from unittest.mock import patch, MagicMock
+        with patch("agents.web_dev.nodes._call_boundary_tool", return_value={"branches": []}):
+            result = await setup_workspace(state)
         assert "workspace_path" in result
         assert "repo_path" in result
         assert result["branch_created"] is True
         assert result["branch_name"] == "fix/test"
 
-    async def test_setup_workspace_derives_branch_from_runtime(self):
+    async def test_setup_workspace_derives_branch_from_runtime(self, tmp_path):
         """When no branch_name is preset, runtime.run() is called for it."""
+        import subprocess
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        subprocess.run(["git", "init", repo_path], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.email", "test@test.com"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.name", "Test"],
+                       check=True, capture_output=True)
+        (tmp_path / "repo" / "README.md").write_text("hi")
+        subprocess.run(["git", "-C", repo_path, "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "commit", "-m", "init"],
+                       check=True, capture_output=True)
+
         class _MockRuntime:
             def run(self, prompt, **kw):
                 return {"raw_response": '{"branch_name": "feature/ABC-1-login", "workspace_notes": "x"}'}
 
-        state = {"_task_id": "t-1", "_runtime": _MockRuntime(), "repo_url": "http://repo", "user_request": "Add login"}
-        result = await setup_workspace(state)
+        from unittest.mock import patch
+        state = {
+            "_task_id": "t-1",
+            "_runtime": _MockRuntime(),
+            "repo_url": "http://repo",
+            "repo_path": repo_path,
+            "workspace_path": str(tmp_path),
+            "user_request": "Add login",
+        }
+        with patch("agents.web_dev.nodes._call_boundary_tool", return_value={"branches": []}):
+            result = await setup_workspace(state)
         assert result["branch_name"] == "feature/ABC-1-login"
 
     async def test_analyze_task_uses_analysis(self):
@@ -256,24 +303,61 @@ class TestWebDevNodes:
 
 class TestWebDevWorkflowExecution:
 
-    async def test_happy_path_no_runtime(self):
+    async def test_happy_path_no_runtime(self, tmp_path):
+        import subprocess
+        from unittest.mock import patch
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        subprocess.run(["git", "init", repo_path], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.email", "t@t.com"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.name", "T"],
+                       check=True, capture_output=True)
+        (tmp_path / "repo" / "README.md").write_text("hi")
+        subprocess.run(["git", "-C", repo_path, "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "commit", "-m", "init"],
+                       check=True, capture_output=True)
+
         compiled = web_dev_workflow.compile()
         state = {
             "_task_id": "test-123",
             "repo_url": "https://github.com/test",
+            "repo_path": repo_path,
+            "workspace_path": str(tmp_path),
             "branch_name": "fix/ABC-123",
             "analysis": "Fix the login button",
             "user_request": "Fix login",
             "test_cycles": 0,
         }
-        result = await compiled.invoke(state)
+        with patch("agents.web_dev.nodes._call_boundary_tool", return_value={"branches": []}):
+            result = await compiled.invoke(state)
         assert result["success"] is True
         assert result["state"] == "TASK_STATE_COMPLETED"
 
-    async def test_workflow_state_keys_populated(self):
+    async def test_workflow_state_keys_populated(self, tmp_path):
+        import subprocess
+        from unittest.mock import patch
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        subprocess.run(["git", "init", repo_path], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.email", "t@t.com"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.name", "T"],
+                       check=True, capture_output=True)
+        (tmp_path / "repo" / "README.md").write_text("hi")
+        subprocess.run(["git", "-C", repo_path, "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "commit", "-m", "init"],
+                       check=True, capture_output=True)
+
         compiled = web_dev_workflow.compile()
-        state = {"_task_id": "t-1", "user_request": "Add feature"}
-        result = await compiled.invoke(state)
+        state = {
+            "_task_id": "t-1",
+            "repo_path": repo_path,
+            "workspace_path": str(tmp_path),
+            "user_request": "Add feature",
+        }
+        with patch("agents.web_dev.nodes._call_boundary_tool", return_value={"branches": []}):
+            result = await compiled.invoke(state)
         assert "workspace_path" in result
         assert "implementation_plan" in result
         assert "test_results" in result

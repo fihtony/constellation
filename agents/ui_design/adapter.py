@@ -46,6 +46,11 @@ class UIDesignAgentAdapter(BaseAgent):
         self._figma_client = figma_client
         self._stitch_client = stitch_client
 
+    async def start(self) -> None:
+        await super().start()
+        from agents.ui_design.tools import register_ui_design_tools
+        register_ui_design_tools()
+
     async def handle_message(self, message: dict) -> dict:
         from framework.a2a.protocol import Artifact, TaskState, TaskStatus
 

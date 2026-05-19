@@ -16,6 +16,13 @@ COPY pyproject.toml /app/
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
+# Install playwright and Chromium browser for headless screenshot support.
+# This runs as root before USER appuser so the browser can be installed system-wide.
+# playwright install-deps installs the OS packages Chromium needs (libnss3, etc.).
+RUN pip install --no-cache-dir playwright \
+    && playwright install chromium \
+    && playwright install-deps chromium
+
 LABEL constellation.agent_id="web-dev"
 LABEL constellation.agent_name="Web Dev Agent"
 LABEL constellation.agent_role="execution"

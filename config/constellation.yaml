@@ -7,8 +7,8 @@ project:
 
 # Default runtime backend for all agents
 runtime:
-  backend: connect-agent
-  model: gpt-5-mini
+  backend: claude-code
+  model: claude-haiku-4-5-20251001
 
 # Skills directory
 skills:

@@ -14,7 +14,29 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path as _Path
 from typing import Any
+
+from framework.config import load_agent_config as _load_agent_cfg
+from framework.devlog import AgentLogger
+
+# Load agent_id from config.yaml — single source of truth for identity
+_AGENT_ID: str = _load_agent_cfg(
+    _Path(__file__).parent.name.replace("_", "-")
+).get("agent_id", _Path(__file__).parent.name.replace("_", "-"))
+
+
+def _logger(state: dict) -> AgentLogger:
+    """Return an AgentLogger for this agent using the task_id stored in state."""
+    return AgentLogger(state.get("_task_id", ""), _AGENT_ID)
+
+
+def _boundary_log(state: dict, agent_id: str, message: str, **kwargs: Any) -> None:
+    """Deprecated proxy log — kept only to avoid breaking call sites in this file.
+
+    web_dev/nodes.py should pass task_id to boundary tool args instead.
+    This function is a no-op: each boundary agent logs to its own directory.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +109,11 @@ def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
         result_str = registry.execute_sync(tool_name, args)
         return json.loads(result_str) if result_str else {}
     except Exception as exc:
-        print(f"[web-dev] Tool {tool_name} failed: {exc}")
+        print(f"[{_AGENT_ID}] Tool {tool_name} failed: {exc}")
         return {"error": str(exc)}
 
 
-def _git_commit_all_pending(repo_path: str, jira_key: str) -> None:
+def _git_commit_all_pending(repo_path: str, jira_key: str) -> list[str]:
     """Stage all pending changes and commit if anything is staged.
 
     Called inside create_pr before scm_push to ensure every file written by
@@ -99,7 +121,7 @@ def _git_commit_all_pending(repo_path: str, jira_key: str) -> None:
     ran 'git commit <specific-file>' instead of 'git add -A && git commit'.
     """
     if not repo_path or not os.path.isdir(repo_path):
-        return
+        return []
     try:
         import subprocess
         from framework.env_utils import build_isolated_git_env
@@ -128,19 +150,30 @@ def _git_commit_all_pending(repo_path: str, jira_key: str) -> None:
                 capture_output=True, text=True, timeout=30,
             )
             if r.returncode == 0:
-                print(f"[web-dev] committed {len(staged_files)} pending file(s): {staged_files[:8]}")
+                print(f"[{_AGENT_ID}] committed {len(staged_files)} pending file(s): {staged_files[:8]}")
             else:
-                print(f"[web-dev] commit failed: {r.stderr.strip()[:200]}")
+                print(f"[{_AGENT_ID}] commit failed: {r.stderr.strip()[:200]}")
+            return staged_files
         else:
-            # Confirm there is at least one commit on the branch
+            # Confirm there is at least one commit on the branch, and list its changed files
             log_result = subprocess.run(
                 ["git", "log", "--oneline", "-1"],
                 cwd=repo_path, env=git_env,
                 capture_output=True, text=True, timeout=10,
             )
-            print(f"[web-dev] no pending changes; last commit: {log_result.stdout.strip()[:120]!r}")
+            print(f"[{_AGENT_ID}] no pending changes; last commit: {log_result.stdout.strip()[:120]!r}")
+            # Get files from HEAD commit (agent already committed during run_agentic)
+            diff_result = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD~1..HEAD"],
+                cwd=repo_path, env=git_env,
+                capture_output=True, text=True, timeout=10,
+            )
+            if diff_result.returncode == 0:
+                return [f for f in diff_result.stdout.strip().splitlines() if f]
+            return []
     except Exception as exc:
-        print(f"[web-dev] _git_commit_all_pending error (non-fatal): {exc}")
+        print(f"[{_AGENT_ID}] _git_commit_all_pending error (non-fatal): {exc}")
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -148,29 +181,20 @@ def _git_commit_all_pending(repo_path: str, jira_key: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def prepare_jira(state: dict) -> dict:
-    """Update Jira before implementation starts.
-
-    Actions:
-    1. Discover Jira Agent through Registry (via boundary tools).
-    2. Resolve the token user identity.
-    3. List available transitions.
-    4. Transition the ticket to "In Progress" when reachable.
-    5. Set assignee to the token user by default.
-    6. Add a pickup comment.
-
-    Idempotency:
-    - Skip the transition if the ticket is already in "In Progress".
-    - Skip the assignee update if the assignee already matches the token user.
-    """
+    """Update Jira before implementation starts."""
+    log = _logger(state)
+    log.node("prepare_jira")
     jira_context = state.get("jira_context", {})
     jira_key = (
         jira_context.get("key")
         or jira_context.get("ticket_key")
         or state.get("jira_key", "")
     )
-    print(f"[web-dev] prepare_jira: jira_key={jira_key!r}")
+    log.debug("prepare_jira", jira_key=jira_key)
+    print(f"[{_AGENT_ID}] prepare_jira: jira_key={jira_key!r}")
 
     if not jira_key:
+        log.info("prepare_jira skipped — no jira_key")
         return {"jira_prepared": False, "jira_prepare_skipped": "no_jira_key"}
 
     # Resolve original status for rollback
@@ -192,15 +216,18 @@ async def prepare_jira(state: dict) -> dict:
 
     # Resolve token user
     token_user = ""
-    token_user_result = _call_boundary_tool(state, "jira_get_token_user", {})
+    token_user_account_id = ""
+    task_id = state.get("_task_id", "")
+    token_user_result = _call_boundary_tool(state, "jira_get_token_user", {"task_id": task_id})
     if not token_user_result.get("error"):
         user_data = token_user_result.get("user", {})
         token_user = user_data.get("emailAddress", user_data.get("displayName", ""))
+        token_user_account_id = user_data.get("accountId", "")
 
     # Transition to "In Progress" if not already
     if original_status.lower() not in ("in progress", "in development", "in dev"):
         transitions_result = _call_boundary_tool(
-            state, "jira_list_transitions", {"ticket_key": jira_key}
+            state, "jira_list_transitions", {"ticket_key": jira_key, "task_id": task_id}
         )
         transitions = transitions_result.get("transitions", [])
         _IN_PROGRESS_NAMES = {
@@ -215,33 +242,53 @@ async def prepare_jira(state: dict) -> dict:
         if in_progress_match:
             _call_boundary_tool(
                 state, "jira_transition",
-                {"ticket_key": jira_key, "transition_name": in_progress_match["name"]},
+                {"ticket_key": jira_key, "transition_name": in_progress_match["name"],
+                 "task_id": task_id},
             )
         else:
             avail = [t.get("name") for t in transitions if isinstance(t, dict)]
-            print(f"[web-dev] Cannot transition {jira_key} to In Progress; available: {avail}")
+            print(f"[{_AGENT_ID}] Cannot transition {jira_key} to In Progress; available: {avail}")
 
-    # Update assignee to token user
-    if token_user and token_user != original_assignee:
+    # Update assignee to token user (use accountId for Jira Cloud)
+    if token_user_account_id:
+        log.info("assigning jira ticket to token user in prepare", jira_key=jira_key,
+                 account_id=token_user_account_id)
         _call_boundary_tool(
             state, "jira_update",
-            {"ticket_key": jira_key, "fields": {"assignee": {"emailAddress": token_user}}},
+            {"ticket_key": jira_key,
+             "fields": {"assignee": {"accountId": token_user_account_id}},
+             "task_id": task_id},
+        )
+    elif token_user and token_user != original_assignee:
+        # Fallback for Jira Server (uses emailAddress)
+        _call_boundary_tool(
+            state, "jira_update",
+            {"ticket_key": jira_key, "fields": {"assignee": {"emailAddress": token_user}},
+             "task_id": task_id},
         )
 
-    # Add pickup comment
+    # Add pickup comment with task_id
+    _task_id = state.get("_task_id", "unknown")
     _call_boundary_tool(
         state, "jira_comment",
         {
             "ticket_key": jira_key,
-            "comment": f"Development agent (web-dev) has picked up this ticket.",
+            "comment": (
+                f"🤖 Development agent (web-dev) has picked up this ticket.\n"
+                f"Task ID: {_task_id}\n"
+                f"Assignee: {token_user or 'unknown'}\n"
+                f"Status: In Progress"
+            ),
+            "task_id": task_id,
         },
     )
+    log.info("prepare_jira complete", jira_key=jira_key, token_user=token_user)
 
     # Write jira-prepare-log.json
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
         import time as _time
-        agent_dir = os.path.join(workspace_path, "web-agent")
+        agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
             log_file = os.path.join(agent_dir, "jira-prepare-log.json")
@@ -271,23 +318,17 @@ async def prepare_jira(state: dict) -> dict:
     }
 
 async def setup_workspace(state: dict) -> dict:
-    """Create a working branch in the cloned repository.
-
-    The repo is already cloned by Team Lead (via SCM Agent) into repo_path.
-    This node verifies the repo exists and creates or checks out a local
-    development branch.
-
-    Uses runtime.run() to derive a deterministic branch name from the task
-    description and Jira context.  Falls back to metadata values when no
-    runtime is available.
-    """
+    """Create a working branch in the cloned repository."""
     runtime = state.get("_runtime")
+    log = _logger(state)
+    log.node("setup_workspace")
     repo_url = state.get("repo_url", "")
     repo_path = state.get("repo_path", "")
     workspace_path = state.get("workspace_path", "")
     branch_name = state.get("branch_name", "")
     task_id = state.get("_task_id", "unknown")
-    print(f"[web-dev] setup_workspace: repo_path={repo_path!r} workspace_path={workspace_path!r}")
+    log.debug("setup_workspace", repo_path=repo_path)
+    print(f"[{_AGENT_ID}] setup_workspace: repo_path={repo_path!r} workspace_path={workspace_path!r}")
 
     # Use workspace_path from Team Lead; only fall back to artifacts/ if missing
     if not workspace_path:
@@ -302,7 +343,7 @@ async def setup_workspace(state: dict) -> dict:
     # Fail fast if repo does not exist — Team Lead must have cloned it first
     if not os.path.isdir(repo_path):
         raise RuntimeError(
-            f"[web-dev] Repo not found at {repo_path!r}. "
+            f"[{_AGENT_ID}] Repo not found at {repo_path!r}. "
             "Team Lead must clone the repo before dispatching to Web Dev."
         )
 
@@ -332,6 +373,24 @@ async def setup_workspace(state: dict) -> dict:
         else:
             branch_name = f"feature/{task_suffix}"
 
+    # -- Check remote for branch name conflicts; add _<n> suffix when taken --
+    # Must not delete or alter existing remote branches or PRs.
+    if branch_name and repo_url:
+        remote_result = _call_boundary_tool(state, "scm_list_branches", {"repo_url": repo_url})
+        remote_branch_names = {
+            b.get("displayId", "") for b in remote_result.get("branches", [])
+        }
+        if branch_name in remote_branch_names:
+            n = 2
+            while f"{branch_name}_{n}" in remote_branch_names:
+                n += 1
+            new_name = f"{branch_name}_{n}"
+            print(
+                f"[{_AGENT_ID}] setup_workspace: branch {branch_name!r} exists on remote, "
+                f"using {new_name!r} to avoid conflict"
+            )
+            branch_name = new_name
+
     # Actually create / checkout the branch in the cloned repo
     branch_created = False
     if repo_path and os.path.isdir(repo_path) and branch_name:
@@ -345,7 +404,7 @@ async def setup_workspace(state: dict) -> dict:
         )
         if r.returncode == 0:
             branch_created = True
-            print(f"[web-dev] setup_workspace: created branch {branch_name!r}")
+            print(f"[{_AGENT_ID}] setup_workspace: created branch {branch_name!r}")
         else:
             # Branch might already exist — try switching to it
             r2 = subprocess.run(
@@ -355,16 +414,16 @@ async def setup_workspace(state: dict) -> dict:
             )
             if r2.returncode == 0:
                 branch_created = True
-                print(f"[web-dev] setup_workspace: switched to existing branch {branch_name!r}")
+                print(f"[{_AGENT_ID}] setup_workspace: switched to existing branch {branch_name!r}")
             else:
-                print(f"[web-dev] setup_workspace: git checkout failed: {r2.stderr.strip()[:200]}")
+                print(f"[{_AGENT_ID}] setup_workspace: git checkout failed: {r2.stderr.strip()[:200]}")
                 raise RuntimeError(
-                    f"[web-dev] Failed to create/switch branch {branch_name!r}: {r2.stderr.strip()[:200]}"
+                    f"[{_AGENT_ID}] Failed to create/switch branch {branch_name!r}: {r2.stderr.strip()[:200]}"
                 )
 
     # Write git setup log
     if workspace_path:
-        agent_dir = os.path.join(workspace_path, "web-agent")
+        agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
             import time as _time
@@ -395,20 +454,52 @@ async def setup_workspace(state: dict) -> dict:
 
 
 async def analyze_task(state: dict) -> dict:
-    """Understand requirements and produce an implementation plan.
+    """Understand requirements and produce an implementation plan."""
+    import time as _time
+    log = _logger(state)
+    log.node("analyze_task")
+    print(f"[{_AGENT_ID}] analyze_task: building implementation plan")
 
-    Reuses the analysis already provided by Team Lead (via state["analysis"]).
-    Falls back to a simple echo of the user request when nothing is provided.
-    """
-    print("[web-dev] analyze_task: reusing Team Lead analysis")
-    # Team Lead already performed deep analysis — reuse it
-    plan = state.get("analysis") or state.get("user_request", "")
+    workspace_path = state.get("workspace_path", "")
+    analysis = state.get("analysis") or state.get("user_request", "")
+
+    # Try to load Team Lead's delivery-plan.json for structured plan data
+    delivery_plan: dict = {}
+    if workspace_path:
+        plan_path = os.path.join(workspace_path, "team-lead", "delivery-plan.json")
+        try:
+            with open(plan_path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+                delivery_plan = doc.get("data", doc)
+                print(f"[{_AGENT_ID}] Loaded delivery-plan.json from {plan_path}")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Build rich plan string
+    plan_parts = []
+    if analysis:
+        plan_parts.append(analysis)
+    if delivery_plan:
+        plan_parts.append(f"\nDelivery plan:\n{json.dumps(delivery_plan, indent=2, ensure_ascii=False)}")
+
+    # Also load Jira ticket for acceptance criteria
+    if workspace_path:
+        jira_path = os.path.join(workspace_path, "team-lead", "jira-ticket.json")
+        try:
+            with open(jira_path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+                jira_data = doc.get("data", doc)
+                summary = jira_data.get("summary", "") or (jira_data.get("fields") or {}).get("summary", "")
+                if summary:
+                    plan_parts.append(f"\nJira ticket summary: {summary}")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    plan = "\n".join(plan_parts) if plan_parts else analysis
 
     # Write implementation-plan.json to workspace for auditability
-    workspace_path = state.get("workspace_path", "")
     if workspace_path:
-        import time as _time
-        agent_dir = os.path.join(workspace_path, "web-agent")
+        agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
             plan_file = os.path.join(agent_dir, "implementation-plan.json")
@@ -419,7 +510,10 @@ async def analyze_task(state: dict) -> dict:
                         "step": "analyze_task",
                         "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     },
-                    "data": {"implementation_plan": plan},
+                    "data": {
+                        "implementation_plan": plan,
+                        "delivery_plan_loaded": bool(delivery_plan),
+                    },
                 }, fh, ensure_ascii=False, indent=2)
         except OSError:
             pass
@@ -430,14 +524,11 @@ async def analyze_task(state: dict) -> dict:
 
 
 async def implement_changes(state: dict) -> dict:
-    """Write code based on the implementation plan.
-
-    Uses runtime.run_agentic() for open-ended code generation and file editing.
-    The agentic loop has access to read_file, write_file, edit_file, search_code,
-    and run_command tools registered in the global ToolRegistry.
-    """
+    """Write code based on the implementation plan."""
     runtime = state.get("_runtime")
-
+    log = _logger(state)
+    log.node("implement_changes", repo_path=state.get("repo_path", ""),
+             branch=state.get("branch_name", ""))
     if not runtime:
         # Unit-test / no-runtime path
         return {
@@ -460,14 +551,32 @@ async def implement_changes(state: dict) -> dict:
     _design_code_ref = "N/A"
     _design_code_path = state.get("design_code_path", "")
     _workspace_path = state.get("workspace_path", "")
+    # Prefer ui-design/stitch/code.html, fallback to team-lead/design-code.html
     if not _design_code_path and _workspace_path:
-        _design_code_path = os.path.join(_workspace_path, "team_lead", "design-code.html")
+        _stitch_code = os.path.join(_workspace_path, "ui-design", "stitch", "code.html")
+        _legacy_code = os.path.join(_workspace_path, "team-lead", "design-code.html")
+        _design_code_path = _stitch_code if os.path.isfile(_stitch_code) else _legacy_code
     if _design_code_path and os.path.isfile(_design_code_path):
         try:
             with open(_design_code_path, encoding="utf-8") as _f:
-                _design_code_ref = _f.read()[:5000]
+                _design_code_ref = _f.read()
         except Exception:
             pass
+
+    # Load design spec markdown (typography/colors/spacing) for reference
+    _design_spec_md = "N/A"
+    if _workspace_path:
+        _stitch_md_path = os.path.join(_workspace_path, "ui-design", "stitch", "DESIGN.md")
+        _legacy_md_path = os.path.join(_workspace_path, "team-lead", "design-spec.md")
+        _design_spec_md_path = state.get("design_md_path", "") or (
+            _stitch_md_path if os.path.isfile(_stitch_md_path) else _legacy_md_path
+        )
+        if os.path.isfile(_design_spec_md_path):
+            try:
+                with open(_design_spec_md_path, encoding="utf-8") as _f:
+                    _design_spec_md = _f.read()
+            except Exception:
+                pass
 
     # Pre-scan repo so LLM doesn't waste turns on exploration
     _repo_path = state.get("repo_path", "")
@@ -493,59 +602,59 @@ async def implement_changes(state: dict) -> dict:
         user_request=state.get("user_request", ""),
         repo_path=state.get("repo_path", ""),
         branch_name=state.get("branch_name", "feature/task"),
+        tech_stack=", ".join(state.get("tech_stack") or []) or "not specified",
+        stitch_screen_name=state.get("stitch_screen_name", "not specified"),
         repo_files=_repo_files_section,
         implementation_plan=impl_plan,
         jira_context=jira_for_prompt,
         design_context=str(state.get("design_context", "N/A")),
         design_code_reference=_design_code_ref,
+        design_spec_markdown=_design_spec_md,
         skill_context=state.get("skill_context", ""),
         memory_context=state.get("memory_context", ""),
     )
 
-    # Restrict to code I/O tools only — Jira/SCM-PR tools cause distraction
-    _IMPLEMENT_TOOLS = [
-        "read_file", "write_file", "edit_file", "run_command",
-        "glob", "grep", "search_code",
-    ]
-    print(f"[web-dev] implement_changes: repo_path={state.get('repo_path', '')!r} tools={_IMPLEMENT_TOOLS}")
+    # Use Claude Code native tools (Bash, Read, Write, Glob, Grep) — no constellation
+    # MCP bridge needed.  With cwd=repo_path, all relative paths resolve correctly.
+    print(f"[{_AGENT_ID}] implement_changes: repo_path={state.get('repo_path', '')!r} (native tools)")
     result = runtime.run_agentic(
         task=prompt,
         system_prompt=IMPLEMENT_SYSTEM,
         cwd=state.get("repo_path") or None,
-        tools=_IMPLEMENT_TOOLS,
-        max_turns=40,
-        timeout=900,
+        tools=None,
+        max_turns=50,
+        timeout=1800,
         plugin_manager=state.get("_plugin_manager"),
     )
-    print(f"[web-dev] implement_changes done: success={result.success} turns={result.turns_used} changes={len(result.tool_calls)} summary={result.summary[:300]!r}")
+    print(f"[{_AGENT_ID}] implement_changes done: success={result.success} turns={result.turns_used} summary={result.summary[:300]!r}")
 
-    # Extract changed file names from tool_calls log
-    changes_made = sorted({
-        tc["arguments"] if isinstance(tc["arguments"], str)
-        else json.dumps(tc.get("arguments", {}))
-        for tc in result.tool_calls
-        if tc.get("tool") in {"write_file", "edit_file", "write_local_file", "edit_local_file"}
-    })
+    if not result.success:
+        raise RuntimeError(
+            f"implement_changes failed — claude-code returned error: {result.summary[:500]}"
+        )
 
+    # With native tools, we can't track individual file writes from tool_calls.
+    # changes_made is populated from git diff in create_pr via _git_commit_all_pending.
     return {
-        "changes_made": changes_made,
+        "changes_made": [],
         "implementation_summary": result.summary,
-        "agentic_success": result.success,
+        "agentic_success": True,
     }
 
 
 async def run_tests(state: dict) -> dict:
-    """Run project tests and evaluate results.
-
-    Sets state["route"] to "pass" or "fail" for conditional routing.
-    Uses runtime.run_agentic() to execute test commands and parse results.
-    """
+    """Run project tests and evaluate results."""
+    log = _logger(state)
+    log.node("run_tests")
     runtime = state.get("_runtime")
     test_cycles = state.get("test_cycles", 0) + 1
-    max_test_cycles = 1
+    max_test_cycles = state.get("max_test_cycles") or int(
+        os.environ.get("WEB_DEV_MAX_TEST_CYCLES", "3")
+    )
+    log.info("run_tests started", cycle=test_cycles, max_cycles=max_test_cycles)
 
     if not runtime:
-        # Unit-test path: always pass
+        log.info("run_tests skipped — no runtime (test mode)")
         return {
             "test_results": {"passed": 1, "failed": 0, "output": ""},
             "test_cycles": test_cycles,
@@ -554,44 +663,47 @@ async def run_tests(state: dict) -> dict:
         }
 
     repo_path = state.get("repo_path", "")
-    print(f"[web-dev] run_tests: cycle={test_cycles} repo_path={repo_path!r}")
-
-    # Fast-path: if we've already hit the max test cycles, skip the LLM entirely
-    if test_cycles >= max_test_cycles:
-        print(f"[web-dev] run_tests: max cycles reached ({test_cycles}/{max_test_cycles}), force-pass")
-        return {
-            "test_results": {},
-            "test_output": "Skipped: max test cycles reached.",
-            "test_cycles": test_cycles,
-            "test_status": "skip",
-            "route": "pass",
-        }
+    log.debug("run_tests running build+test", repo_path=repo_path)
+    print(f"[{_AGENT_ID}] run_tests: cycle={test_cycles}/{max_test_cycles} repo_path={repo_path!r}")
 
     result = runtime.run_agentic(
         task=(
-            "Run the project's test suite and report results.\n"
-            "1. Detect the test runner (pytest, jest, mvn test, gradle test, etc.).\n"
-            "2. Run tests with verbose output.\n"
-            "3. Return a JSON summary: "
-            '{"passed": N, "failed": N, "errors": [...], "output": "...last 50 lines..."}'
+            "Run the project's build and test suite. Report all results.\n"
+            "MANDATORY steps (execute in order — do NOT skip any step):\n"
+            f"1. Change into the repo directory: {repo_path}\n"
+            "2. Run `npm install` to install/update dependencies.\n"
+            "   If npm install fails (missing package), read the error,\n"
+            "   remove the invalid package from package.json, and re-run.\n"
+            "3. Run `npm run build` to check for TypeScript / compilation errors.\n"
+            "   If build fails, fix ALL errors before continuing.\n"
+            "   Common issues: missing imports, wrong export names, \n"
+            "   undefined variables, TypeScript type errors.\n"
+            "4. Detect the test runner (vitest, jest, pytest, etc.).\n"
+            "5. Run tests with verbose output: `npm test -- --run` (vitest) or equivalent.\n"
+            "   If no test command is configured, run `npx vitest --run` directly.\n"
+            "6. Return a JSON summary:\n"
+            '   {"passed": N, "failed": N, "build_ok": true/false, '
+            '"errors": ["error msg..."], "output": "...last 100 lines..."}'
         ),
         cwd=repo_path or None,
-        # Only expose shell/file tools — no Jira/SCM schemas to keep payload small
-        tools=["run_command", "read_file", "glob"],
-        max_turns=5,
-        timeout=120,
+        tools=None,
+        max_turns=20,
+        timeout=1800,
         plugin_manager=state.get("_plugin_manager"),
     )
 
     data = _safe_json(result.summary, fallback={})
     failed = data.get("failed", 0)
-    test_passed = int(failed) == 0 and result.success
+    build_ok = data.get("build_ok", True)
+    test_passed = int(failed) == 0 and build_ok and result.success
+    log.info("run_tests result", passed=data.get("passed", 0), failed=failed,
+             build_ok=build_ok, test_passed=test_passed, cycle=test_cycles)
 
     # Write per-cycle test results for auditability
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
         import time as _time
-        results_dir = os.path.join(workspace_path, "web-agent", "test-results")
+        results_dir = os.path.join(workspace_path, _AGENT_ID, "test-results")
         os.makedirs(results_dir, exist_ok=True)
         try:
             cycle_file = os.path.join(results_dir, f"test-run-{test_cycles}.json")
@@ -618,11 +730,16 @@ async def run_tests(state: dict) -> dict:
         }
 
     if test_cycles >= max_test_cycles:
+        # Exhausted fix cycles — proceed to PR; Team Lead will review.
+        # Record accurate status (not "skip").
+        final_status = "pass" if int(failed) == 0 else "fail_max_cycles"
+        print(f"[{_AGENT_ID}] run_tests: max cycles reached ({test_cycles}/{max_test_cycles}), "
+              f"proceeding with status={final_status}")
         return {
             "test_results": data,
             "test_output": data.get("output", result.summary),
             "test_cycles": test_cycles,
-            "test_status": "fail",
+            "test_status": final_status,
             "route": "pass",  # proceed to PR despite failures; Team Lead will review
         }
 
@@ -636,13 +753,13 @@ async def run_tests(state: dict) -> dict:
 
 
 async def fix_tests(state: dict) -> dict:
-    """Fix failing tests based on test output.
-
-    Uses runtime.run_agentic() to analyse failures and apply minimal fixes.
-    """
+    """Fix failing tests based on test output."""
+    log = _logger(state)
+    log.node("fix_tests")
     runtime = state.get("_runtime")
 
     if not runtime:
+        log.info("fix_tests skipped — no runtime")
         return {"fix_attempted": True}
 
     from agents.web_dev.prompts import FIX_SYSTEM, FIX_TEMPLATE
@@ -658,10 +775,9 @@ async def fix_tests(state: dict) -> dict:
         task=prompt,
         system_prompt=FIX_SYSTEM,
         cwd=state.get("repo_path") or None,
-        # Only code editing tools — keep payload small
-        tools=["run_command", "read_file", "write_file", "edit_file", "glob", "grep", "search_code"],
-        max_turns=15,
-        timeout=300,
+        tools=None,
+        max_turns=20,
+        timeout=600,
         plugin_manager=state.get("_plugin_manager"),
     )
 
@@ -673,17 +789,9 @@ async def fix_tests(state: dict) -> dict:
 
 
 async def self_assess(state: dict) -> dict:
-    """Run requirement-aware and design-aware self assessment.
-
-    Evaluation dimensions:
-    1. Acceptance criteria coverage.
-    2. Component-by-component UI design alignment for UI tasks.
-    3. Build status.
-    4. Test status and newly added test coverage.
-    5. Code quality and obvious risk review.
-
-    Pass threshold: score >= 0.9.
-    """
+    """Run requirement-aware and design-aware self assessment."""
+    log = _logger(state)
+    log.node("self_assess")
     runtime = state.get("_runtime")
     assess_cycles = state.get("assess_cycles", 0) + 1
     max_assess_cycles = 3
@@ -709,7 +817,7 @@ async def self_assess(state: dict) -> dict:
 
     # Try to load full design context from workspace file (more complete than state copy)
     if workspace_path:
-        design_spec_path = os.path.join(workspace_path, "team_lead", "design-spec.json")
+        design_spec_path = os.path.join(workspace_path, "team-lead", "design-spec.json")
         if os.path.isfile(design_spec_path):
             try:
                 with open(design_spec_path, encoding="utf-8") as _f:
@@ -721,16 +829,33 @@ async def self_assess(state: dict) -> dict:
     # Load design HTML code for component-by-component comparison
     design_code_snippet = ""
     design_code_path = state.get("design_code_path", "")
+    # Prefer ui-design/stitch/code.html, fallback to team-lead/design-code.html
     if not design_code_path and workspace_path:
-        design_code_path = os.path.join(workspace_path, "team_lead", "design-code.html")
+        _stitch_code = os.path.join(workspace_path, "ui-design", "stitch", "code.html")
+        _legacy_code = os.path.join(workspace_path, "team-lead", "design-code.html")
+        design_code_path = _stitch_code if os.path.isfile(_stitch_code) else _legacy_code
     if design_code_path and os.path.isfile(design_code_path):
         try:
             with open(design_code_path, encoding="utf-8") as _f:
                 design_html = _f.read()
-            # Keep first 4000 chars — enough to extract component structure
-            design_code_snippet = design_html[:4000]
+            design_code_snippet = design_html
         except Exception:
             pass
+
+    # Load design spec markdown (typography/colors/spacing) for component comparison
+    design_spec_markdown = ""
+    if workspace_path:
+        _stitch_md = os.path.join(workspace_path, "ui-design", "stitch", "DESIGN.md")
+        _legacy_md = os.path.join(workspace_path, "team-lead", "design-spec.md")
+        design_spec_md_path = state.get("design_md_path", "") or (
+            _stitch_md if os.path.isfile(_stitch_md) else _legacy_md
+        )
+        if os.path.isfile(design_spec_md_path):
+            try:
+                with open(design_spec_md_path, encoding="utf-8") as _f:
+                    design_spec_markdown = _f.read()
+            except Exception:
+                pass
 
     acceptance_criteria = []
     if isinstance(jira_ctx, dict):
@@ -748,13 +873,33 @@ async def self_assess(state: dict) -> dict:
     if len(ac_str) > 3000:
         ac_str = ac_str[:3000] + "...]"
 
+    # Derive changed files from the actual cloned repo's git status when
+    # changes_made is empty (native tool runs don't track individual writes).
+    changed_files_list = state.get("changes_made", [])
+    if not changed_files_list:
+        repo_path = state.get("repo_path", "")
+        if repo_path and os.path.isdir(repo_path):
+            try:
+                import subprocess as _sp
+                _st = _sp.run(
+                    ["git", "status", "--short"],
+                    capture_output=True, text=True, cwd=repo_path, timeout=10,
+                )
+                for _line in _st.stdout.splitlines():
+                    _name = _line[3:].strip()
+                    if _name:
+                        changed_files_list.append(_name)
+            except Exception:
+                pass
+
     prompt = SELF_ASSESS_TEMPLATE.format(
         acceptance_criteria=ac_str,
         design_context=json.dumps(design_ctx, ensure_ascii=False)[:800] if design_ctx else "N/A (not a UI task)",
         design_code_snippet=design_code_snippet or "N/A (no design HTML available)",
+        design_spec_markdown=design_spec_markdown or "N/A (no design spec available)",
         implementation_summary=str(state.get("implementation_summary", ""))[:1000],
         test_results=json.dumps(state.get("test_results", {}), ensure_ascii=False)[:500],
-        changed_files="\n".join(state.get("changes_made", [])) or "unknown",
+        changed_files="\n".join(changed_files_list) or "unknown",
     )
 
     result = runtime.run(
@@ -768,11 +913,13 @@ async def self_assess(state: dict) -> dict:
     verdict = data.get("verdict", "fail")
     gaps = data.get("gaps", [])
 
+    print(f"[{_AGENT_ID}] self_assess result: score={score} verdict={verdict} gaps={len(gaps)}")
+
     # Write self-assessment.json to workspace
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
         import time as _time
-        agent_dir = os.path.join(workspace_path, "web-agent")
+        agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
             sa_file = os.path.join(agent_dir, "self-assessment.json")
@@ -847,51 +994,230 @@ async def fix_gaps(state: dict) -> dict:
 
 
 async def capture_screenshot(state: dict) -> dict:
-    """Capture implementation screenshots for human review only.
+    """Capture implementation screenshots using Playwright (primary) or Chrome (fallback).
 
-    No automatic visual diff is required in the current phase.
-    Skips if screenshot_required is False in definition_of_done.
+    Screenshot strategy:
+    - Primary:  playwright async API with Chromium (bundled, works in containers)
+    - Fallback: Chrome/Chromium system binary via subprocess
+    - Last resort: HTML page snapshot
+
+    Playwright waits for the ``networkidle`` event and an additional JS-idle
+    delay so React has finished hydrating before the screenshot is taken.
+    Screenshots are saved to the agent workspace directory only — they are NOT
+    committed to the repository.  ``create_pr`` uploads them to GitHub via the
+    issue-assets upload API and posts a PR comment, so they appear in the PR
+    without polluting the repository history.
     """
+    import subprocess
+    import shutil
+
     definition_of_done = state.get("definition_of_done", {})
     screenshot_required = definition_of_done.get("screenshot_required", True)
+    log = _logger(state)
 
     if not screenshot_required:
-        return {"screenshot_captured": False, "screenshots": []}
-
-    runtime = state.get("_runtime")
-    if not runtime:
+        log.info("screenshot skipped", reason="not_required")
         return {"screenshot_captured": False, "screenshots": []}
 
     repo_path = state.get("repo_path", "")
     workspace_path = state.get("workspace_path", "")
-    screenshot_dir = os.path.join(workspace_path, "web-agent", "screenshots")
+    screenshot_dir = os.path.join(workspace_path, _AGENT_ID, "screenshots")
+    desktop_png = os.path.join(screenshot_dir, "landing-desktop.png")
+    mobile_png = os.path.join(screenshot_dir, "landing-mobile.png")
+    screenshots = []
+
+    if not repo_path or not os.path.isdir(repo_path):
+        log.warn("capture_screenshot skipped — repo_path missing", repo_path=repo_path)
+        return {"screenshot_captured": False, "screenshots": []}
 
     try:
         os.makedirs(screenshot_dir, exist_ok=True)
     except OSError:
         pass
 
-    # Best-effort screenshot via agentic runtime
-    result = runtime.run_agentic(
-        task=(
-            "Take a screenshot of the implemented UI.\n"
-            f"1. Start the dev server in {repo_path} (npm run dev or similar).\n"
-            "2. Wait for it to be ready.\n"
-            "3. Use a headless browser to capture a screenshot.\n"
-            f"4. Save screenshots to {screenshot_dir}/\n"
-            "Return JSON: {\"screenshots\": [\"path1.png\", ...], \"captured\": true}\n"
-            "If screenshot fails, return {\"screenshots\": [], \"captured\": false}"
-        ),
-        cwd=repo_path or None,
-        max_turns=10,
-        timeout=120,
-        plugin_manager=state.get("_plugin_manager"),
-    )
+    log.step("capture_screenshot", screenshot_dir=screenshot_dir)
+    print(f"[{_AGENT_ID}] capture_screenshot: repo_path={repo_path!r} screenshot_dir={screenshot_dir!r}")
 
-    data = _safe_json(result.summary, fallback={})
-    screenshots = data.get("screenshots", [])
-    captured = data.get("captured", bool(screenshots))
+    PORT = 5179
+    dev_proc = None
 
+    try:
+        # --- Step 1: Kill any existing process on the port ---
+        subprocess.run(
+            ["bash", "-c", f"lsof -ti:{PORT} | xargs kill -9 2>/dev/null || true"],
+            timeout=5, capture_output=True,
+        )
+
+        # --- Step 2: Install deps only if node_modules is missing ---
+        node_modules = os.path.join(repo_path, "node_modules")
+        if not os.path.isdir(node_modules):
+            print(f"[{_AGENT_ID}] node_modules missing — running npm install")
+            subprocess.run(
+                ["npm", "install", "--prefer-offline"],
+                cwd=repo_path, timeout=120, capture_output=True,
+            )
+        else:
+            print(f"[{_AGENT_ID}] node_modules exists — skipping npm install")
+
+        # --- Step 3: Start vite dev server ---
+        dev_proc = subprocess.Popen(
+            ["npm", "run", "dev", "--", "--port", str(PORT), "--host", "0.0.0.0"],
+            cwd=repo_path,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"[{_AGENT_ID}] Dev server started (pid={dev_proc.pid}) on port {PORT}")
+
+        # --- Step 4: Wait for server ready (up to 60s) ---
+        import time as _time
+        import urllib.request
+        server_ready = False
+        for _ in range(30):
+            _time.sleep(2)
+            try:
+                with urllib.request.urlopen(f"http://localhost:{PORT}", timeout=3) as r:
+                    if r.status < 500:
+                        server_ready = True
+                        break
+            except Exception:
+                pass
+        print(f"[{_AGENT_ID}] Server ready={server_ready}")
+
+        if not server_ready:
+            print(f"[{_AGENT_ID}] Dev server not ready in 60s — skipping screenshot")
+        else:
+            # --- Step 5: Take screenshots (playwright primary, Chrome fallback) ---
+            playwright_ok = False
+            try:
+                from playwright.async_api import async_playwright
+                print(f"[{_AGENT_ID}] Taking screenshots with playwright...")
+                async with async_playwright() as pw:
+                    browser = await pw.chromium.launch(args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                    ])
+                    # Desktop screenshot
+                    ctx_desktop = await browser.new_context(
+                        viewport={"width": 1280, "height": 900},
+                    )
+                    page = await ctx_desktop.new_page()
+                    await page.goto(f"http://localhost:{PORT}", wait_until="networkidle", timeout=30000)
+                    # Extra wait for React lazy rendering / animations to settle
+                    await page.wait_for_timeout(3000)
+                    await page.screenshot(path=desktop_png, full_page=False)
+                    await ctx_desktop.close()
+
+                    # Mobile screenshot
+                    ctx_mobile = await browser.new_context(
+                        viewport={"width": 375, "height": 812},
+                        is_mobile=True,
+                    )
+                    page_mobile = await ctx_mobile.new_page()
+                    await page_mobile.goto(f"http://localhost:{PORT}", wait_until="networkidle", timeout=30000)
+                    await page_mobile.wait_for_timeout(2000)
+                    await page_mobile.screenshot(path=mobile_png, full_page=False)
+                    await ctx_mobile.close()
+
+                    await browser.close()
+
+                if os.path.isfile(desktop_png) and os.path.getsize(desktop_png) > 0:
+                    screenshots.append(desktop_png)
+                    print(f"[{_AGENT_ID}] Playwright desktop screenshot: {os.path.getsize(desktop_png)} bytes")
+                    playwright_ok = True
+                if os.path.isfile(mobile_png) and os.path.getsize(mobile_png) > 0:
+                    screenshots.append(mobile_png)
+                    print(f"[{_AGENT_ID}] Playwright mobile screenshot: {os.path.getsize(mobile_png)} bytes")
+            except ImportError:
+                print(f"[{_AGENT_ID}] playwright not available — trying system Chrome")
+            except Exception as pw_exc:
+                print(f"[{_AGENT_ID}] playwright failed: {pw_exc} — trying system Chrome")
+
+            # --- Chrome fallback (host machine only — not available in all containers) ---
+            if not playwright_ok:
+                _CHROME_CANDIDATES = [
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                    "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+                    "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser",
+                ]
+                chrome_bin = None
+                for candidate in _CHROME_CANDIDATES:
+                    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                        chrome_bin = candidate
+                        break
+                    if "/" not in candidate and shutil.which(candidate):
+                        chrome_bin = shutil.which(candidate)
+                        break
+                print(f"[{_AGENT_ID}] Chrome binary: {chrome_bin!r}")
+
+                if chrome_bin:
+                    # Pre-warm Vite + wait for React render
+                    import re as _re
+                    try:
+                        with urllib.request.urlopen(f"http://localhost:{PORT}", timeout=10) as _r:
+                            _html = _r.read().decode("utf-8", errors="replace")
+                        for _src in _re.findall(r'src="(/[^"]+)"', _html)[:10]:
+                            try:
+                                urllib.request.urlopen(f"http://localhost:{PORT}{_src}", timeout=5)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    print(f"[{_AGENT_ID}] Waiting 8s for React to fully render (Chrome path)...")
+                    _time.sleep(8)
+
+                    _chrome_flags = [
+                        "--headless=new", "--no-sandbox", "--disable-gpu",
+                        "--disable-dev-shm-usage", "--run-all-compositor-stages-before-draw",
+                    ]
+                    for _out_path, _size in [(desktop_png, "1280,900"), (mobile_png, "375,812")]:
+                        chrome_result = subprocess.run(
+                            [chrome_bin] + _chrome_flags + [
+                                f"--screenshot={_out_path}",
+                                f"--window-size={_size}",
+                                f"http://localhost:{PORT}",
+                            ],
+                            capture_output=True, timeout=45,
+                        )
+                        if os.path.isfile(_out_path) and os.path.getsize(_out_path) > 0:
+                            screenshots.append(_out_path)
+                            print(f"[{_AGENT_ID}] Chrome screenshot saved ({_size}): {os.path.getsize(_out_path)} bytes")
+                        else:
+                            print(f"[{_AGENT_ID}] Chrome screenshot failed (rc={chrome_result.returncode})")
+                else:
+                    print(f"[{_AGENT_ID}] No Chrome/Chromium found — falling back to HTML snapshot")
+
+        # --- HTML fallback if no screenshots and server is up ---
+        if not screenshots and server_ready:
+            try:
+                with urllib.request.urlopen(f"http://localhost:{PORT}", timeout=5) as r:
+                    html_bytes = r.read()
+                html_fallback = os.path.join(screenshot_dir, "landing-page.html")
+                with open(html_fallback, "wb") as fh:
+                    fh.write(html_bytes)
+                screenshots.append(html_fallback)
+                print(f"[{_AGENT_ID}] HTML fallback saved: {len(html_bytes)} bytes")
+            except Exception as exc:
+                print(f"[{_AGENT_ID}] HTML fallback also failed: {exc}")
+
+    except Exception as exc:
+        print(f"[{_AGENT_ID}] capture_screenshot error (non-fatal): {exc}")
+    finally:
+        # Always stop the dev server
+        if dev_proc and dev_proc.poll() is None:
+            dev_proc.terminate()
+            try:
+                dev_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                dev_proc.kill()
+        subprocess.run(
+            ["bash", "-c", f"lsof -ti:{PORT} | xargs kill -9 2>/dev/null || true"],
+            timeout=5, capture_output=True,
+        )
+
+    captured = bool(screenshots) and any(s.endswith(".png") for s in screenshots)
+    log.info("screenshot result", captured=captured, count=len(screenshots))
     return {
         "screenshot_captured": captured,
         "screenshots": screenshots,
@@ -899,15 +1225,9 @@ async def capture_screenshot(state: dict) -> dict:
 
 
 async def update_jira(state: dict) -> dict:
-    """Update Jira after development is complete.
-
-    Actions:
-    1. Add a completion comment with PR URL, test results, self-assessment score.
-    2. Transition ticket to "In Review".
-
-    Idempotency:
-    - Check if a comment with the PR URL already exists before adding.
-    """
+    """Update Jira after development is complete."""
+    log = _logger(state)
+    log.node("update_jira")
     jira_context = state.get("jira_context", {})
     jira_key = (
         jira_context.get("key")
@@ -921,23 +1241,71 @@ async def update_jira(state: dict) -> dict:
     pr_url = state.get("pr_url", "N/A")
     branch = state.get("branch_name", "N/A")
     test_results = state.get("test_results", {})
+    test_status = state.get("test_status", "unknown")
     assessment = state.get("self_assessment", {})
     changes = state.get("changes_made", [])
+    _task_id = state.get("_task_id", "unknown")
 
-    # Build completion comment
+    # --- Assign the ticket to the token owner ---
+    task_id = state.get("_task_id", "")
+    try:
+        user_result = _call_boundary_tool(
+            state, "jira_get_token_user", {"task_id": task_id}
+        )
+        user = user_result.get("user", {})
+        account_id = user.get("accountId", "") or user.get("account_id", "")
+        if account_id:
+            log.info("assigning jira ticket to token user", jira_key=jira_key, account_id=account_id)
+            _call_boundary_tool(
+                state, "jira_update",
+                {
+                    "ticket_key": jira_key,
+                    "fields": {"assignee": {"accountId": account_id}},
+                    "task_id": task_id,
+                },
+            )
+            log.info("jira assignee updated", jira_key=jira_key)
+        else:
+            log.warn("jira_get_token_user returned no accountId", user=user)
+    except Exception as exc:
+        log.warn("jira assignee update skipped", error=str(exc))
+
+    # Build test summary (accurate from actual results or test_status)
+    if test_status == "skip":
+        test_summary = "Skipped (max cycles reached)"
+    elif test_status == "pass":
+        passed = test_results.get("passed", "?")
+        failed = test_results.get("failed", 0)
+        test_summary = f"{passed} passed, {failed} failed"
+    else:
+        passed = test_results.get("passed", 0)
+        failed = test_results.get("failed", "?")
+        test_summary = f"{passed} passed, {failed} failed"
+
+    score = assessment.get("score", "N/A")
+    verdict = assessment.get("verdict", "N/A")
+    score_str = f"{score:.2f}" if isinstance(score, float) else str(score)
+
+    # Build the comment using inline-markdown syntax.
+    # The Jira client converts this to proper ADF (bold, code, hyperlinks)
+    # so it renders visually in Jira Cloud — no raw asterisks or brackets shown.
+    pr_link = f"[PR: {pr_url}]({pr_url})" if pr_url and pr_url != "N/A" else "N/A"
+
     comment_text = (
-        f"Development completed by web-dev agent.\n"
-        f"PR: {pr_url}\n"
-        f"Branch: {branch}\n"
-        f"Test results: {test_results.get('passed', 0)} passed, "
-        f"{test_results.get('failed', 0)} failed\n"
-        f"Self-assessment score: {assessment.get('score', 'N/A')}\n"
-        f"Changes: {len(changes)} files modified"
+        f"✅ Development completed by web-dev agent.\n"
+        f"\n"
+        f"**Task ID:** {_task_id}\n"
+        f"**PR:** {pr_link}\n"
+        f"**Branch:** `{branch}`\n"
+        f"**Test results:** {test_summary}\n"
+        f"**Self-assessment:** {score_str} ({verdict})\n"
+        f"**Files changed:** {len(changes)}"
     )
 
     # Idempotency: check if comment with PR URL already exists
+    log.debug("checking existing comments for idempotency", jira_key=jira_key)
     existing = _call_boundary_tool(
-        state, "jira_list_comments", {"ticket_key": jira_key}
+        state, "jira_list_comments", {"ticket_key": jira_key, "task_id": task_id}
     )
     already_commented = False
     for c in existing.get("comments", []):
@@ -945,21 +1313,25 @@ async def update_jira(state: dict) -> dict:
         if isinstance(c, dict):
             body = c.get("body", "")
             if isinstance(body, dict):
-                # ADF body — check rendered text
                 body = json.dumps(body)
         if pr_url and pr_url != "N/A" and pr_url in str(body):
             already_commented = True
             break
 
     if not already_commented:
+        log.info("adding jira completion comment", jira_key=jira_key, pr_url=pr_url)
         _call_boundary_tool(
             state, "jira_comment",
-            {"ticket_key": jira_key, "comment": comment_text},
+            {"ticket_key": jira_key, "comment": comment_text, "task_id": task_id},
         )
+        log.debug("jira comment added", jira_key=jira_key)
+    else:
+        log.info("jira comment already exists, skipped")
 
     # Transition to "In Review"
+    log.debug("listing jira transitions for in-review", jira_key=jira_key)
     transitions_result = _call_boundary_tool(
-        state, "jira_list_transitions", {"ticket_key": jira_key}
+        state, "jira_list_transitions", {"ticket_key": jira_key, "task_id": task_id}
     )
     transitions = transitions_result.get("transitions", [])
     _IN_REVIEW_NAMES = {
@@ -975,14 +1347,18 @@ async def update_jira(state: dict) -> dict:
     if can_review:
         _call_boundary_tool(
             state, "jira_transition",
-            {"ticket_key": jira_key, "transition_name": in_review_match["name"]},
+            {"ticket_key": jira_key, "transition_name": in_review_match["name"],
+             "task_id": task_id},
         )
+        log.info("jira transitioned to in review", jira_key=jira_key)
+    else:
+        log.warn("no in-review transition available", jira_key=jira_key)
 
     # Write jira-update-log.json to workspace
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
         import time as _time
-        agent_dir = os.path.join(workspace_path, "web-agent")
+        agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
             log_file = os.path.join(agent_dir, "jira-update-log.json")
@@ -1007,12 +1383,10 @@ async def update_jira(state: dict) -> dict:
 
 
 async def create_pr(state: dict) -> dict:
-    """Generate a PR description and create the pull request via SCM tools.
-
-    Uses runtime.run() for the PR description and runtime.run_agentic() to
-    push the branch and open the PR through available SCM tools.
-    """
+    """Generate a PR description and create the pull request via SCM tools."""
     runtime = state.get("_runtime")
+    log = _logger(state)
+    log.node("create_pr", branch=state.get("branch_name", ""))
 
     if not runtime:
         return {
@@ -1029,14 +1403,45 @@ async def create_pr(state: dict) -> dict:
         jira_ctx.get("key") or jira_ctx.get("ticket_key") or ""
         if isinstance(jira_ctx, dict) else ""
     )
+    task_id = state.get("_task_id", "")
 
-    # Step 1: Generate PR description (single-shot LLM)
+    # Step 1: Commit any pending files and resolve the full changeset FIRST.
+    repo_path = state.get("repo_path", "")
+    repo_url = state.get("repo_url", "")
+    branch_name = state.get("branch_name", "feature/task")
+
+    committed_files = _git_commit_all_pending(repo_path, jira_key or "task")
+    existing_changes = state.get("changes_made", [])
+    all_changes = sorted(set(existing_changes) | set(committed_files))
+
+    if not all_changes:
+        raise RuntimeError(
+            f"[{_AGENT_ID}] create_pr: No file changes detected on branch {branch_name!r}. "
+            "implement_changes produced 0 commits — cannot create a PR against main."
+        )
+
+    # Step 2: Generate PR description (single-shot LLM)
+    _assessment = state.get("self_assessment", {})
+    _test_results = state.get("test_results", {})
+    _screenshots = state.get("screenshots", [])
+    _jira_url = ""
+    if jira_key:
+        _jira_ctx = state.get("jira_context", {})
+        if isinstance(_jira_ctx, dict):
+            _jira_url = _jira_ctx.get("url", "") or f"https://tarch.atlassian.net/browse/{jira_key}"
     desc_prompt = PR_DESCRIPTION_TEMPLATE.format(
         user_request=state.get("user_request", ""),
-        branch_name=state.get("branch_name", "feature/task"),
+        branch_name=branch_name,
         jira_key=jira_key or "N/A",
+        jira_url=_jira_url or "N/A",
         implementation_summary=state.get("implementation_summary", ""),
-        changed_files=", ".join(state.get("changes_made", [])) or "various files",
+        changed_files=", ".join(all_changes[:20]) or "various files",
+        test_status=state.get("test_status", "unknown"),
+        test_results=json.dumps(_test_results),
+        assessment_score=_assessment.get("score", "N/A"),
+        assessment_verdict=_assessment.get("verdict", "N/A"),
+        assessment_gaps=", ".join(_assessment.get("gaps", [])) or "none",
+        screenshot_paths=", ".join(_screenshots) or "none captured",
     )
     desc_result = runtime.run(desc_prompt, system_prompt=PR_DESCRIPTION_SYSTEM,
                               plugin_manager=state.get("_plugin_manager"))
@@ -1044,25 +1449,108 @@ async def create_pr(state: dict) -> dict:
     pr_title = pr_meta.get("title", "Implement task changes")
     pr_description = pr_meta.get("description", state.get("implementation_summary", ""))
 
-    # Step 2: Push branch then create PR via SCM boundary tools (not open agentic).
-    # Design doc §4.3: Dev Agent must use scm.branch.push + scm.pr.create
-    # through the SCM Agent boundary; never direct git push or GitHub API.
-    repo_path = state.get("repo_path", "")
-    repo_url = state.get("repo_url", "")
-    branch_name = state.get("branch_name", "feature/task")
+    # Step 2.5: Upload screenshots to GitHub CDN via Release Assets API.
+    # This avoids committing image files to the PR branch — screenshots are hosted
+    # in the repo's 'screenshot-assets' pre-release, giving stable CDN URLs like:
+    #   https://github.com/{owner}/{repo}/releases/download/screenshot-assets/{file}
+    # Falls back to the branch-commit approach if CDN upload fails.
+    _screenshots = state.get("screenshots", [])
+    _screenshot_section = ""
+    if _screenshots:
+        import shutil as _shutil
+        import subprocess as _subprocess
+        from urllib.parse import urlparse as _urlparse
 
-    # Deterministic commit: stage ALL pending changes before push so files
-    # written by the agentic implement_changes loop are not left untracked.
-    _git_commit_all_pending(repo_path, jira_key or "task")
+        _png_screenshots = [s for s in _screenshots if s.endswith(".png") and os.path.isfile(s)]
+        if _png_screenshots:
+            _screenshot_entries: list[tuple[str, str]] = []
+            _cdn_upload_ok = True
 
+            # Try CDN upload first (GitHub Release Assets)
+            for _png in _png_screenshots:
+                _fname = os.path.basename(_png)
+                _label = "Desktop (1280×900)" if "desktop" in _png.lower() else "Mobile (375×812)"
+                _upload_result = _call_boundary_tool(
+                    state, "scm_upload_pr_image",
+                    {"repo_url": repo_url, "pr_number": 0,
+                     "image_path": _png, "task_id": task_id},
+                )
+                _cdn_url = _upload_result.get("image_url", "")
+                if _cdn_url:
+                    _screenshot_entries.append((_label, _cdn_url))
+                else:
+                    _cdn_upload_ok = False
+                    print(f"[{_AGENT_ID}] CDN upload failed for {_fname}: "
+                          f"{_upload_result.get('error', '(no error detail)')}")
+
+            if _screenshot_entries:
+                _section_parts = [
+                    f"**{_lbl}**\n\n![]({_url})" for _lbl, _url in _screenshot_entries
+                ]
+                _screenshot_section = "\n\n## Screenshots\n\n" + "\n\n".join(_section_parts)
+                print(f"[{_AGENT_ID}] Screenshots uploaded to GitHub CDN — "
+                      f"{len(_screenshot_entries)} image(s) embedded in PR description")
+            elif not _cdn_upload_ok:
+                # Fallback: commit screenshots to the branch so raw.githubusercontent.com works.
+                # This path is taken when SCM backend is not GitHub or CDN upload is unsupported.
+                print(f"[{_AGENT_ID}] CDN upload unavailable, falling back to branch commit")
+                _parsed_url = _urlparse(repo_url)
+                _url_parts = _parsed_url.path.strip("/").split("/")
+                _gh_owner = _url_parts[0] if len(_url_parts) > 0 else ""
+                _gh_repo = _url_parts[1].replace(".git", "") if len(_url_parts) > 1 else ""
+                _screen_repo_dir = os.path.join(repo_path, "docs", "screenshots")
+                os.makedirs(_screen_repo_dir, exist_ok=True)
+                _fallback_entries: list[tuple[str, str]] = []
+                for _png in _png_screenshots:
+                    _fname = os.path.basename(_png)
+                    _label = "Desktop (1280×900)" if "desktop" in _png.lower() else "Mobile (375×812)"
+                    try:
+                        _shutil.copy2(_png, os.path.join(_screen_repo_dir, _fname))
+                        _raw_url = (
+                            f"https://raw.githubusercontent.com/{_gh_owner}/{_gh_repo}"
+                            f"/{branch_name}/docs/screenshots/{_fname}"
+                        )
+                        _fallback_entries.append((_label, _raw_url))
+                    except Exception as _copy_err:
+                        print(f"[{_AGENT_ID}] Screenshot copy failed for {_png}: {_copy_err}")
+                if _fallback_entries:
+                    _subprocess.run(
+                        ["git", "add", "-f", "docs/screenshots/"],  # -f to override gitignore
+                        cwd=repo_path, capture_output=True, text=True,
+                    )
+                    _commit_res = _subprocess.run(
+                        ["git", "commit", "-m", "docs: add implementation screenshots"],
+                        cwd=repo_path, capture_output=True, text=True,
+                    )
+                    if _commit_res.returncode == 0:
+                        _section_parts = [
+                            f"**{_lbl}**\n\n![]({_url})" for _lbl, _url in _fallback_entries
+                        ]
+                        _screenshot_section = "\n\n## Screenshots\n\n" + "\n\n".join(_section_parts)
+                        print(f"[{_AGENT_ID}] Screenshots committed to branch (fallback) "
+                              f"and embedded in PR description")
+                    else:
+                        print(f"[{_AGENT_ID}] Screenshot fallback commit failed: "
+                              f"{_commit_res.stderr[:200]}")
+
+    if _screenshot_section:
+        pr_description = pr_description.rstrip() + _screenshot_section
+
+    # Step 3: Push branch then create PR via SCM boundary tools (not open agentic).
+    task_id = state.get("_task_id", "")
+
+    log.info("pushing branch to remote", branch=branch_name)
     push_payload = _call_boundary_tool(
-        state, "scm_push", {"repo_path": repo_path, "branch": branch_name}
+        state, "scm_push", {"repo_path": repo_path, "branch": branch_name, "task_id": task_id}
     )
     if push_payload.get("error"):
-        print(f"[web-dev] scm_push failed: {push_payload['error']}")
+        log.error("scm_push failed", error=push_payload["error"])
+        print(f"[{_AGENT_ID}] scm_push failed: {push_payload['error']}")
     else:
-        print(f"[web-dev] scm_push OK: branch={branch_name!r}")
+        log.debug("scm_push ok", branch=branch_name)
+        print(f"[{_AGENT_ID}] scm_push OK: branch={branch_name!r}")
 
+    log.info("creating PR", source_branch=branch_name, target="main", title=pr_title[:80])
     pr_payload = _call_boundary_tool(
         state, "scm_create_pr",
         {
@@ -1071,24 +1559,31 @@ async def create_pr(state: dict) -> dict:
             "target_branch": "main",
             "title": pr_title,
             "description": pr_description,
+            "task_id": task_id,
         },
     )
-    # SCM adapter returns camelCase prUrl; snake_case pr_url is a fallback
     pr_url = pr_payload.get("prUrl") or pr_payload.get("pr_url", "")
     pr_number = pr_payload.get("prNumber") or pr_payload.get("pr_number", 0)
     commit_hash = pr_payload.get("commitHash") or pr_payload.get("commit_hash", "")
     pr_status = pr_payload.get("status", "")
     pr_error = pr_payload.get("error", "")
     if not pr_url and (pr_error or (pr_status and pr_status != "ok")):
-        print(f"[web-dev] create_pr FAILED: status={pr_status!r} error={pr_error!r} payload={pr_payload}")
+        log.error("PR creation failed", status=pr_status, error=pr_error)
+        print(f"[{_AGENT_ID}] create_pr FAILED: status={pr_status!r} error={pr_error!r} payload={pr_payload}")
     else:
-        print(f"[web-dev] create_pr done: prUrl={pr_url!r} prNumber={pr_number} status={pr_status!r}")
+        log.info("PR created", pr_url=pr_url, branch=branch_name)
+        print(f"[{_AGENT_ID}] create_pr done: prUrl={pr_url!r} prNumber={pr_number} status={pr_status!r}")
+
+    # Step 4: Screenshots were handled in Step 2.5 (CDN upload or fallback branch commit).
+    _screenshots = state.get("screenshots", [])
+    if _screenshots:
+        print(f"[{_AGENT_ID}] {len(_screenshots)} screenshot(s) processed for PR description")
 
     # Write pr-evidence.json to workspace
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
         import time as _time
-        agent_dir = os.path.join(workspace_path, "web-agent")
+        agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
             evidence_file = os.path.join(agent_dir, "pr-evidence.json")
@@ -1105,7 +1600,8 @@ async def create_pr(state: dict) -> dict:
                         "branch": branch_name,
                         "title": pr_title,
                         "commit_hash": commit_hash,
-                        "files_changed": len(state.get("changes_made", [])),
+                        "files_changed": len(all_changes),
+                        "changed_files": all_changes[:30],
                         "test_status": state.get("test_status", "unknown"),
                         "self_assessment_score": state.get("self_assessment", {}).get("score", "N/A"),
                         "screenshot_included": state.get("screenshot_captured", False),
@@ -1120,17 +1616,22 @@ async def create_pr(state: dict) -> dict:
         "pr_title": pr_title,
         "pr_description": pr_description,
         "commit_hash": commit_hash,
+        "changes_made": all_changes,
     }
 
 
 async def report_result(state: dict) -> dict:
     """Return final result summary."""
+    log = _logger(state)
+    log.node("report_result")
     pr_url = state.get("pr_url", "N/A")
     branch_name = state.get("branch_name", "N/A")
     changes = state.get("changes_made", [])
     pr_title = state.get("pr_title", "")
     test_status = state.get("test_status", "unknown")
-    print(f"[web-dev] report_result: prUrl={pr_url!r} branch={branch_name!r} test_status={test_status!r} changes={len(changes)}")
+    log.info("report_result", pr_url=pr_url, branch=branch_name,
+             test_status=test_status, files_changed=len(changes))
+    print(f"[{_AGENT_ID}] report_result: prUrl={pr_url!r} branch={branch_name!r} test_status={test_status!r} changes={len(changes)}")
 
     summary_parts = [
         f"Implementation complete.",

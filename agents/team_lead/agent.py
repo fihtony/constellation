@@ -118,6 +118,10 @@ team_lead_definition = _build_team_lead_definition()
 class TeamLeadAgent(BaseAgent):
     """Team Lead Agent — graph-first with ReAct-inside-nodes."""
 
+    async def start(self) -> None:
+        await super().start()
+        _register_team_lead_dispatch(self)
+
     async def handle_message(self, message: dict) -> dict:
         from framework.a2a.protocol import Artifact, TaskState
         from framework.workflow import RunConfig
@@ -130,27 +134,29 @@ class TeamLeadAgent(BaseAgent):
         user_text = next((p.get("text", "") for p in parts if p.get("text")), "")
         meta = msg.get("metadata") or {}
 
-        # Create task in task store
         task_store = self.services.task_store
+
+        # Build workspace_path: {ARTIFACT_ROOT}/{orchestratorTaskId}/
+        # Compass passes its task.id as orchestratorTaskId — this is the master task_id
+        # that all agents in the workflow share for logging purposes.
+        workspace_path = meta.get("workspacePath", "") or meta.get("workspace_path", "")
+        orchestrator_task_id = meta.get("orchestratorTaskId", "")
+
+        # Create team-lead task (its ID is a fallback when there's no orchestrator)
         task = task_store.create_task(
             agent_id=self.definition.agent_id,
             metadata={
-                "orchestratorTaskId": meta.get("orchestratorTaskId", ""),
+                "orchestratorTaskId": orchestrator_task_id,
                 "orchestratorCallbackUrl": meta.get("orchestratorCallbackUrl", ""),
             },
         )
 
-        # Build initial workflow state
-        # Honour workspacePath from orchestrator metadata (Compass / E2E test);
-        # only construct a default path when none is provided.
-        workspace_path = meta.get("workspacePath", "") or meta.get("workspace_path", "")
         if not workspace_path:
             artifact_root = os.environ.get("ARTIFACT_ROOT", "artifacts/")
-            workspace_path = os.path.join(
-                artifact_root,
-                f"compass-{meta.get('orchestratorTaskId', 'default')[:8]}",
-                task.id,
-            )
+            if orchestrator_task_id:
+                workspace_path = os.path.join(artifact_root, orchestrator_task_id)
+            else:
+                workspace_path = os.path.join(artifact_root, f"tl-{task.id[:8]}")
 
         state = {
             "user_request": user_text,
@@ -163,7 +169,9 @@ class TeamLeadAgent(BaseAgent):
             "design_context": meta.get("designContext"),
             "workspace_path": workspace_path,
             "metadata": meta,
-            "_task_id": task.id,
+            # _task_id: use Compass task ID as the master task ID for logging.
+            # All agents in this workflow log under {ARTIFACT_ROOT}/{_task_id}/
+            "_task_id": orchestrator_task_id or task.id,
             "_agent_id": self.definition.agent_id,
             "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,
@@ -181,7 +189,7 @@ class TeamLeadAgent(BaseAgent):
                 config = self._build_run_config(
                     task.id,
                     max_steps=50,
-                    timeout_seconds=900,
+                    timeout_seconds=3600,
                 )
                 result = loop.run_until_complete(
                     self._compiled_workflow.invoke(state, config)
@@ -253,7 +261,7 @@ class TeamLeadAgent(BaseAgent):
         task_store.resume_task(task_id)
 
         if self._compiled_workflow and self.checkpoint_service:
-            config = self._build_run_config(task_id, max_steps=50, timeout_seconds=900)
+            config = self._build_run_config(task_id, max_steps=50, timeout_seconds=3600)
             try:
                 result = await self._compiled_workflow.resume(config, resume_value)
                 summary = (
@@ -362,3 +370,113 @@ def _send_input_required_callback(
             pass
     except Exception as exc:
         print(f"[team-lead] INPUT_REQUIRED callback failed: {exc}")
+
+
+def _register_team_lead_dispatch(team_lead_agent: "TeamLeadAgent") -> None:
+    """Register in-process dispatch_development_task (overrides Compass's HTTP version)."""
+    import asyncio
+    import re as _re
+    from framework.tools.base import BaseTool, ToolResult
+    from framework.tools.registry import get_registry
+
+    class InProcessDispatchDevelopmentTask(BaseTool):
+        name = "dispatch_development_task"
+        description = (
+            "Dispatch a software development task (implement feature, fix bug, "
+            "create PR, review code) to the Team Lead Agent.  Returns immediately "
+            "after the task is submitted."
+        )
+        parameters_schema = {
+            "type": "object",
+            "properties": {
+                "task_description": {"type": "string"},
+                "jira_key": {"type": "string"},
+                "repo_url": {"type": "string"},
+                "design_url": {"type": "string"},
+                "orchestratorTaskId": {"type": "string", "description": "Caller (Compass) task ID — shared workspace root."},
+                "workspacePath": {"type": "string", "description": "Shared workspace path from Compass."},
+            },
+            "required": ["task_description"],
+        }
+
+        def execute_sync(
+            self,
+            task_description: str = "",
+            jira_key: str = "",
+            repo_url: str = "",
+            design_url: str = "",
+            orchestratorTaskId: str = "",
+            workspacePath: str = "",
+            **kw,
+        ) -> ToolResult:
+            # Sanitize jira_key
+            if jira_key:
+                m = _re.search(r"[A-Z][A-Z0-9]+-\d+", jira_key)
+                jira_key = m.group(0) if m else ""
+            # Also try to extract from task_description
+            if not jira_key:
+                m = _re.search(r"[A-Z][A-Z0-9]+-\d+", task_description)
+                if m:
+                    jira_key = m.group(0)
+
+            # Validate repo_url is a real SCM host, not a Jira URL
+            _scm_hosts = ("github.com", "bitbucket.org", "gitlab.com", "dev.azure.com")
+            if repo_url and not any(h in repo_url for h in _scm_hosts):
+                print(f"[tl-dispatch] Ignoring non-SCM repo_url: {repo_url!r}")
+                repo_url = ""
+            effective_repo_url = repo_url or os.environ.get("SCM_REPO_URL", "")
+            effective_workspace = workspacePath or os.environ.get("TL_WORKSPACE_PATH", "")
+            print(f"[tl-dispatch] Dispatching: jira={jira_key} repo={effective_repo_url}")
+
+            task_id_holder: dict = {}
+
+            def _run() -> None:
+                loop = asyncio.new_event_loop()
+                try:
+                    msg = {
+                        "message": {
+                            "parts": [{"text": task_description}],
+                            "metadata": {
+                                "jiraKey": jira_key,
+                                "repoUrl": effective_repo_url,
+                                "designUrl": design_url,
+                                "workspacePath": effective_workspace,
+                                "orchestratorTaskId": orchestratorTaskId,
+                            },
+                        }
+                    }
+                    result = loop.run_until_complete(team_lead_agent.handle_message(msg))
+                    task_id_holder["task_id"] = result["task"]["id"]
+                    print(f"[tl-dispatch] Team Lead task started: {task_id_holder['task_id']}")
+                except Exception as exc:
+                    task_id_holder["error"] = str(exc)
+                    print(f"[tl-dispatch] Team Lead start error: {exc}")
+                finally:
+                    loop.close()
+
+            t = threading.Thread(target=_run, daemon=True, name="tl-dispatch")
+            t.start()
+            # Wait briefly to capture task_id
+            t.join(timeout=5.0)
+
+            task_id = task_id_holder.get("task_id", "")
+            if task_id_holder.get("error"):
+                return ToolResult(output=json.dumps({
+                    "status": "error",
+                    "message": task_id_holder["error"],
+                }))
+
+            return ToolResult(output=json.dumps({
+                "status": "submitted",
+                "taskId": task_id,
+                "message": f"Development task dispatched to Team Lead (jira={jira_key}).",
+            }))
+
+    registry = get_registry()
+    # Force-register (unregister Compass's HTTP version first if present)
+    try:
+        registry.unregister("dispatch_development_task")
+    except Exception:
+        pass
+    registry.register(InProcessDispatchDevelopmentTask())
+    print("[team-lead] Registered in-process dispatch_development_task")

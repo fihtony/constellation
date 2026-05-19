@@ -13,6 +13,19 @@ from pathlib import Path
 import pytest
 
 
+def pytest_addoption(parser: "pytest.Parser") -> None:
+    """Register E2E-specific CLI options."""
+    parser.addoption(
+        "--task",
+        action="store",
+        default="",
+        help=(
+            "Development task to send to Compass. "
+            "Example: --task \"implement the jira ticket: https://jira.example.com/browse/PROJ-123\""
+        ),
+    )
+
+
 def _load_test_env() -> dict[str, str]:
     env_file = Path(__file__).parent.parent / ".env"
     env: dict[str, str] = {}
@@ -67,7 +80,7 @@ def llm_base_url() -> str:
 
 @pytest.fixture(scope="session")
 def llm_model() -> str:
-    return _env("OPENAI_MODEL", "gpt-5-mini")
+    return _env("OPENAI_MODEL", "claude-haiku-4-5-20251001")
 
 
 @pytest.fixture(scope="session")

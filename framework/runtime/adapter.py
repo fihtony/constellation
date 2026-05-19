@@ -56,8 +56,8 @@ class AgenticCheckpoint:
 # Abstract base
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "gpt-5-mini"
-DEFAULT_BACKEND = "connect-agent"
+DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_BACKEND = "claude-code"
 
 
 class AgentRuntimeAdapter(ABC):

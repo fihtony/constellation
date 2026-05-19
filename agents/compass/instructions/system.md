@@ -32,6 +32,10 @@ Thought: Is the task complete?  Do I need to check status?
 1. Always reason before acting — express your Thought before each tool call.
 2. When dispatching to Team Lead, include all context you have: Jira key, repo URL,
    design URL, ambiguous requirement details.
+   IMPORTANT: The `repo_url` parameter must be a Git SCM URL (e.g. github.com,
+   bitbucket.org, gitlab.com).  NEVER pass a Jira ticket URL as `repo_url` — if
+   the user only provides a Jira URL, leave `repo_url` empty; the system will
+   look it up from the Jira ticket or use a configured default.
 3. If the user request is ambiguous and critical info is missing (e.g. no Jira key
    for a development task that requires one), ask a clarifying question instead of
    guessing.

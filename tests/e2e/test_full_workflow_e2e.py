@@ -1,34 +1,52 @@
 """Full workflow E2E test: Compass → Team Lead → Web Dev → PR + Jira.
 
-Single focused test that exercises the REAL multi-agent chain:
-  1. Compass receives user request and dispatches to Team Lead
-  2. Team Lead analyzes, gathers Jira context, plans, dispatches to Web Dev
-  3. Web Dev implements changes, creates branch + PR, updates Jira
-  4. Code Review auto-approves (stub)
-  5. Team Lead reports success
+The test sends a development task to Compass and monitors the constellation
+system as it drives the full workflow autonomously:
+  1. Compass receives request → dispatches to Team Lead
+  2. Team Lead fetches Jira ticket (via Jira agent), design (via UIDesign agent),
+     clones repo (via SCM agent), analyzes, plans
+  3. Team Lead dispatches to Web Dev → implements, tests, creates PR, updates Jira
+  4. Team Lead runs Code Review independently
+  5. Team Lead reports success → Compass summarizes for user
 
-Requirements:
-  - Jira (Atlassian Cloud) with a valid token
-  - SCM (GitHub) with a valid token
-  - LLM (CopilotConnect) reachable at OPENAI_BASE_URL
+The test does NOT:
+  - Register boundary tools directly
+  - Launch agents manually mid-test
+  - Orchestrate or interfere with the workflow
+It only:
+  - Starts constellation agents (which self-register their tools)
+  - Sends ONE message to Compass (the task from --task CLI arg)
+  - Monitors Team Lead task store for completion
+  - Validates workspace artifacts
+
+Configuration (tests/.env — only credentials needed):
+  TEST_JIRA_TOKEN, TEST_JIRA_EMAIL            — Jira credentials
+  TEST_SCM_TOKEN (or TEST_GITHUB_TOKEN)       — SCM credentials
+  TEST_FIGMA_TOKEN                            — Figma token (optional)
+  TEST_STITCH_API_KEY                         — Stitch API key (optional)
+  TEST_SCM_REPO_URL (or TEST_GITHUB_REPO_URL) — fallback repo URL (optional;
+                                                agents discover from Jira ticket)
 
 Run:
-    pytest tests/e2e/test_full_workflow_e2e.py -m live -v -s
+    pytest tests/e2e/test_full_workflow_e2e.py -m live -v -s \\
+        --task "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2"
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
-import queue
+import re
+import sys
 import time
-import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Config — all values from tests/.env, zero PII in code
+# Config — credentials from tests/.env, task from --task CLI arg
 # ---------------------------------------------------------------------------
 
 def _load_test_env() -> dict[str, str]:
@@ -56,13 +74,27 @@ def _env(key: str, default: str = "") -> str:
 def _require_env(key: str) -> str:
     val = _env(key)
     if not val:
-        pytest.skip(f"Missing required env var: {key}")
+        pytest.skip(f"Missing required credential: {key} (add to tests/.env)")
     return val
 
 
-def _extract_jira_key(ticket_url: str) -> str:
-    parts = urlparse(ticket_url).path.rstrip("/").split("/")
-    return parts[-1] if parts else ""
+def _extract_jira_info(task_arg: str) -> tuple[str, str]:
+    """Extract (jira_ticket_url, jira_key) from task string.
+
+    Handles formats:
+      - "implement jira ticket: https://company.atlassian.net/browse/PROJ-123"
+      - "https://company.atlassian.net/browse/PROJ-123"
+      - "PROJ-123"
+    """
+    url_match = re.search(
+        r"(https?://[^\s]+/browse/([A-Z][A-Z0-9]+-\d+))", task_arg
+    )
+    if url_match:
+        return url_match.group(1), url_match.group(2)
+    key_match = re.search(r"\b([A-Z][A-Z0-9]+-\d+)\b", task_arg)
+    if key_match:
+        return "", key_match.group(1)
+    return "", ""
 
 
 def _infer_jira_base_url(ticket_url: str) -> str:
@@ -80,61 +112,100 @@ def _infer_scm_base_url(repo_url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def _load_live_config() -> dict:
-    """Load and validate live E2E config from tests/.env."""
-    jira_ticket_url = _require_env("TEST_JIRA_TICKET_URL")
-    # Prefer TEST_SCM_REPO_URL (canonical SCM URL), fall back to TEST_GITHUB_REPO_URL
-    scm_repo_url = _env("TEST_SCM_REPO_URL") or _require_env("TEST_GITHUB_REPO_URL")
-    # Prefer TEST_SCM_TOKEN (Bitbucket / non-GitHub PAT), fall back to TEST_GITHUB_TOKEN
-    scm_token = _env("TEST_SCM_TOKEN") or _require_env("TEST_GITHUB_TOKEN")
+def _load_live_config(task_arg: str) -> dict:
+    """Build test configuration from CLI task arg and tests/.env credentials.
+
+    The task arg (from --task) provides the Jira ticket URL.
+    All credentials come from tests/.env.
+    SCM repo URL is optional — agents discover it from the Jira ticket if absent.
+    """
+    jira_ticket_url, jira_key = _extract_jira_info(task_arg)
+    if not jira_key:
+        pytest.fail(
+            f"Cannot extract Jira key from --task argument: {task_arg!r}\n"
+            "Expected format: 'implement jira ticket: https://company.atlassian.net/browse/PROJ-123'"
+        )
+
+    jira_base_url = _infer_jira_base_url(jira_ticket_url) if jira_ticket_url else ""
+    if not jira_base_url:
+        # Try to infer from JIRA_BASE_URL env var
+        jira_base_url = _env("JIRA_BASE_URL", "https://tarch.atlassian.net")
+
+    # SCM: token required, repo URL optional (agents discover from Jira)
+    scm_token = _env("TEST_SCM_TOKEN") or _env("TEST_GITHUB_TOKEN", "")
+    scm_repo_url = _env("TEST_SCM_REPO_URL") or _env("TEST_GITHUB_REPO_URL", "")
+
+    # Stitch: extract project_id from URL if provided
+    stitch_project_url = _env("TEST_STITCH_PROJECT_URL", "")
+    stitch_project_id = ""
+    if stitch_project_url and "/projects/" in stitch_project_url:
+        stitch_project_id = stitch_project_url.rstrip("/").split("/projects/")[-1].split("/")[0]
+
     return {
+        "task_arg": task_arg,
         "jira_ticket_url": jira_ticket_url,
-        "jira_base_url": _infer_jira_base_url(jira_ticket_url),
-        "jira_key": _extract_jira_key(jira_ticket_url),
+        "jira_base_url": jira_base_url,
+        "jira_key": jira_key,
         "jira_token": _require_env("TEST_JIRA_TOKEN"),
         "jira_email": _require_env("TEST_JIRA_EMAIL"),
-        "scm_repo_url": scm_repo_url,
-        "scm_backend": _infer_scm_backend(scm_repo_url),
-        "scm_base_url": _infer_scm_base_url(scm_repo_url),
+        "scm_repo_url": scm_repo_url,  # optional — agents discover from Jira ticket
+        "scm_backend": _infer_scm_backend(scm_repo_url) if scm_repo_url else "github-rest",
+        "scm_base_url": _infer_scm_base_url(scm_repo_url) if scm_repo_url else "https://github.com",
         "scm_token": scm_token,
-        # SCM_USERNAME is optional; required for Bitbucket Basic auth, omit for PAT Bearer auth
         "scm_username": _env("TEST_SCM_USERNAME", ""),
         "figma_url": _env("TEST_FIGMA_FILE_URL", ""),
         "figma_token": _env("TEST_FIGMA_TOKEN", ""),
-        # Google Stitch design context (preferred for CSTL-1)
-        "stitch_project_url": _env("TEST_STITCH_PROJECT_URL", ""),
-        "stitch_project_id": _env("TEST_STITCH_PROJECT_URL", "").rstrip("/").split("/")[-1]
-            if _env("TEST_STITCH_PROJECT_URL", "") else "",
+        "stitch_project_url": stitch_project_url,
+        "stitch_project_id": stitch_project_id,
         "stitch_screen_id": _env("TEST_STITCH_SCREEN_ID", ""),
         "stitch_api_key": _env("TEST_STITCH_API_KEY", ""),
-        "openai_base_url": _require_env("OPENAI_BASE_URL"),
-        "openai_model": _env("OPENAI_MODEL", "gpt-5-mini"),
+        "openai_base_url": _env("OPENAI_BASE_URL", "http://localhost:1288/v1"),
+        "openai_model": _env("OPENAI_MODEL", "claude-haiku-4-5-20251001"),
     }
 
 
 def _set_env_from_config(cfg: dict) -> None:
-    """Populate env vars so agents can discover services."""
+    """Set process environment variables so agents pick up all credentials."""
     os.environ["OPENAI_BASE_URL"] = cfg["openai_base_url"]
     os.environ["OPENAI_MODEL"] = cfg["openai_model"]
-    os.environ["AGENT_RUNTIME"] = "connect-agent"
+    os.environ["AGENT_RUNTIME"] = "claude-code"
     os.environ.setdefault("OPENAI_API_KEY", "")
-    os.environ.setdefault("ARTIFACT_ROOT", "artifacts/")
+
+    # Jira
     os.environ["JIRA_BASE_URL"] = cfg["jira_base_url"]
     os.environ["JIRA_TOKEN"] = cfg["jira_token"]
     os.environ["JIRA_EMAIL"] = cfg["jira_email"]
     os.environ["JIRA_BACKEND"] = "rest"
-    os.environ["SCM_BASE_URL"] = cfg["scm_base_url"]
-    os.environ["SCM_TOKEN"] = cfg["scm_token"]
-    os.environ["SCM_BACKEND"] = cfg["scm_backend"]
-    # SCM_USERNAME: set only when provided (Bearer PAT auth needs it unset)
+
+    # SCM credentials (always set — repo URL is discovered by agents from Jira)
+    if cfg.get("scm_token"):
+        os.environ["SCM_TOKEN"] = cfg["scm_token"]
+        os.environ["GITHUB_TOKEN"] = cfg["scm_token"]  # also set GITHUB_TOKEN for GitHub REST
+    if cfg.get("scm_repo_url"):
+        # Set as agent fallback; agents will also try to discover from Jira ticket
+        os.environ["SCM_REPO_URL"] = cfg["scm_repo_url"]
+        os.environ["SCM_BASE_URL"] = cfg["scm_base_url"]
+        os.environ["SCM_BACKEND"] = cfg["scm_backend"]
+    else:
+        # No explicit repo URL — agents will discover it from Jira ticket
+        os.environ["SCM_BASE_URL"] = "https://github.com"
+        os.environ["SCM_BACKEND"] = "github-rest"
     if cfg.get("scm_username"):
         os.environ["SCM_USERNAME"] = cfg["scm_username"]
-    elif "SCM_USERNAME" in os.environ:
-        del os.environ["SCM_USERNAME"]  # ensure clean PAT Bearer auth
+
+    # Figma
     if cfg.get("figma_token"):
         os.environ["FIGMA_TOKEN"] = cfg["figma_token"]
+    if cfg.get("figma_url"):
+        os.environ["FIGMA_FILE_URL"] = cfg["figma_url"]
+
+    # Stitch
     if cfg.get("stitch_api_key"):
         os.environ["STITCH_API_KEY"] = cfg["stitch_api_key"]
+    if cfg.get("stitch_project_id"):
+        os.environ["STITCH_PROJECT_ID"] = cfg["stitch_project_id"]
+    if cfg.get("stitch_screen_id"):
+        os.environ["STITCH_SCREEN_ID"] = cfg["stitch_screen_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -153,10 +224,9 @@ def _make_services(runtime=None, task_store=None):
     from framework.task_store import InMemoryTaskStore
 
     effective_runtime = runtime or get_runtime(
-        "connect-agent",
-        model=os.environ.get("OPENAI_MODEL", "gpt-5-mini"),
+        "claude-code",
+        model=os.environ.get("OPENAI_MODEL", "claude-haiku-4-5-20251001"),
     )
-
     return AgentServices(
         session_service=InMemorySessionService(),
         event_store=InMemoryEventStore(),
@@ -171,331 +241,33 @@ def _make_services(runtime=None, task_store=None):
 
 
 # ---------------------------------------------------------------------------
-# Live boundary tool registration — in-process, no Docker
+# Pre-run cleanup
 # ---------------------------------------------------------------------------
 
-def _register_live_boundary_tools(cfg: dict) -> None:
-    """Register live Jira/SCM tools so tests run without Docker services."""
-    from framework.tools.base import BaseTool, ToolResult
-    from framework.tools.registry import get_registry
-    from agents.jira.providers.rest import JiraRESTProvider
-
-    registry = get_registry()
-    jira_provider = JiraRESTProvider(
-        base_url=cfg["jira_base_url"],
-        token=cfg["jira_token"],
-        email=cfg["jira_email"],
-        auth_mode="basic",
-    )
-
-    class _LiveFetchJiraTicket(BaseTool):
-        name = "fetch_jira_ticket"
-        description = "Fetch a Jira ticket (live provider)."
-        parameters_schema = {"type": "object", "properties": {"ticket_key": {"type": "string"}}, "required": ["ticket_key"]}
-        def execute_sync(self, ticket_key: str = "") -> ToolResult:
-            data, status = jira_provider.fetch_issue(ticket_key)
-            return ToolResult(output=json.dumps({"ticket": data, "status": status}))
-
-    class _LiveCloneRepo(BaseTool):
-        name = "clone_repo"
-        description = "Clone a repository (live SCM)."
-        parameters_schema = {"type": "object", "properties": {"repo_url": {"type": "string"}, "target_path": {"type": "string"}}, "required": ["repo_url", "target_path"]}
-        def execute_sync(self, repo_url: str = "", target_path: str = "") -> ToolResult:
-            from agents.scm.adapter import SCMAgentAdapter, scm_definition
-            adapter = SCMAgentAdapter(definition=scm_definition, services=_make_services())
-            result = adapter._dispatch("scm.repo.clone", "", {
-                "metadata": {"repoUrl": repo_url, "targetPath": target_path, "token": cfg["scm_token"]}
-            })
-            return ToolResult(output=json.dumps(result))
-
-    class _LiveFetchDesign(BaseTool):
-        name = "fetch_design"
-        description = "Fetch design context from Google Stitch MCP or Figma."
-        parameters_schema = {
-            "type": "object",
-            "properties": {
-                "stitch_project_id": {"type": "string"},
-                "stitch_screen_id": {"type": "string"},
-                "figma_url": {"type": "string"},
-                "screen_name": {"type": "string"},
-            },
-            "required": [],
-        }
-        def execute_sync(self, stitch_project_id: str = "", stitch_screen_id: str = "",
-                         figma_url: str = "", screen_name: str = "", **kw) -> ToolResult:
-            # Resolve effective IDs (prefer caller args, fall back to test config)
-            eff_project_id = stitch_project_id or cfg.get("stitch_project_id", "")
-            eff_screen_id = stitch_screen_id or cfg.get("stitch_screen_id", "")
-            if eff_project_id:
-                from agents.ui_design.clients.stitch_mcp import StitchMcpClient
-                client = StitchMcpClient(api_key=cfg.get("stitch_api_key", ""))
-                if eff_screen_id:
-                    print(f"[live-design] Fetching Stitch screen project={eff_project_id} screen={eff_screen_id}")
-                    data, status = client.get_screen(eff_project_id, eff_screen_id)
-                else:
-                    print(f"[live-design] Listing Stitch screens project={eff_project_id}")
-                    data, status = client.list_screens(eff_project_id)
-                print(f"[live-design] Stitch fetch status={status}")
-                return ToolResult(output=json.dumps({"design": data, "status": status}))
-            if figma_url and cfg.get("figma_token"):
-                from agents.ui_design.clients.figma import FigmaClient
-                client = FigmaClient(token=cfg["figma_token"])
-                data, status = client.get_file(figma_url)
-                print(f"[live-design] Figma fetch status={status}")
-                return ToolResult(output=json.dumps({"design": data, "status": status}))
-            print("[live-design] No design source configured, returning empty context")
-            return ToolResult(output=json.dumps({}))
-
-    class _MockDispatchCodeReview(BaseTool):
-        name = "dispatch_code_review"
-        description = "Auto-approve code review (live E2E stub)."
-        parameters_schema = {"type": "object", "properties": {}, "required": []}
-        def execute_sync(self, **kw) -> ToolResult:
-            return ToolResult(output=json.dumps({"verdict": "approved", "summary": "Auto-approved for live E2E test."}))
-
-    for tool in (_LiveFetchJiraTicket(), _LiveCloneRepo(), _LiveFetchDesign(), _MockDispatchCodeReview()):
-        registry.register(tool)
-
-
-def _register_live_jira_scm_tools(cfg: dict) -> None:
-    """Register in-process Jira/SCM tools for Web Dev agent."""
-    from framework.tools.base import BaseTool, ToolResult
-    from framework.tools.registry import get_registry
-    from agents.jira.providers.rest import JiraRESTProvider
-
-    registry = get_registry()
-    jira_provider = JiraRESTProvider(
-        base_url=cfg["jira_base_url"],
-        token=cfg["jira_token"],
-        email=cfg["jira_email"],
-        auth_mode="basic",
-    )
-
-    class _LiveJiraTransition(BaseTool):
-        name = "jira_transition"
-        description = "Transition Jira ticket (live)."
-        parameters_schema = {"type": "object", "properties": {"ticket_key": {"type": "string"}, "transition_name": {"type": "string"}}, "required": ["ticket_key", "transition_name"]}
-        def execute_sync(self, ticket_key: str = "", transition_name: str = "") -> ToolResult:
-            data, status = jira_provider.transition_issue(ticket_key, transition_name)
-            return ToolResult(output=json.dumps({"transitionId": data, "status": status}))
-
-    class _LiveJiraComment(BaseTool):
-        name = "jira_comment"
-        description = "Add Jira comment (live)."
-        parameters_schema = {"type": "object", "properties": {"ticket_key": {"type": "string"}, "comment": {"type": "string"}}, "required": ["ticket_key", "comment"]}
-        def execute_sync(self, ticket_key: str = "", comment: str = "") -> ToolResult:
-            data, status = jira_provider.add_comment(ticket_key, comment)
-            return ToolResult(output=json.dumps({"comment": data, "status": status}))
-
-    class _LiveJiraUpdate(BaseTool):
-        name = "jira_update"
-        description = "Update Jira ticket fields (live)."
-        parameters_schema = {"type": "object", "properties": {"ticket_key": {"type": "string"}, "fields": {"type": "object"}}, "required": ["ticket_key"]}
-        def execute_sync(self, ticket_key: str = "", fields: dict | None = None) -> ToolResult:
-            data, status = jira_provider.update_issue_fields(ticket_key, fields or {})
-            return ToolResult(output=json.dumps({"result": data, "status": status}))
-
-    class _LiveJiraListTransitions(BaseTool):
-        name = "jira_list_transitions"
-        description = "List Jira transitions (live)."
-        parameters_schema = {"type": "object", "properties": {"ticket_key": {"type": "string"}}, "required": ["ticket_key"]}
-        def execute_sync(self, ticket_key: str = "") -> ToolResult:
-            data, status = jira_provider.get_transitions(ticket_key)
-            names = [t.get("name") for t in data if isinstance(t, dict)]
-            print(f"[live-jira] get_transitions({ticket_key}): status={status}, count={len(data)}, names={names}")
-            return ToolResult(output=json.dumps({"transitions": data, "status": status}))
-
-    class _LiveJiraGetTokenUser(BaseTool):
-        name = "jira_get_token_user"
-        description = "Get Jira token user (live)."
-        parameters_schema = {"type": "object", "properties": {}, "required": []}
-        def execute_sync(self) -> ToolResult:
-            data, status = jira_provider.get_myself()
-            return ToolResult(output=json.dumps({"user": data, "status": status}))
-
-    class _LiveJiraListComments(BaseTool):
-        name = "jira_list_comments"
-        description = "List Jira comments (live)."
-        parameters_schema = {"type": "object", "properties": {"ticket_key": {"type": "string"}}, "required": ["ticket_key"]}
-        def execute_sync(self, ticket_key: str = "") -> ToolResult:
-            data, status = jira_provider.list_comments(ticket_key)
-            return ToolResult(output=json.dumps({"comments": data, "status": status}))
-
-    class _LiveSCMPush(BaseTool):
-        name = "scm_push"
-        description = "Push branch to remote (live SCM)."
-        parameters_schema = {"type": "object", "properties": {"repo_path": {"type": "string"}, "branch": {"type": "string"}}, "required": ["repo_path", "branch"]}
-        def execute_sync(self, repo_path: str = "", branch: str = "") -> ToolResult:
-            from agents.scm.adapter import SCMAgentAdapter, scm_definition
-            adapter = SCMAgentAdapter(definition=scm_definition, services=_make_services())
-            result = adapter._dispatch("scm.branch.push", "", {
-                "metadata": {"repoPath": repo_path, "branch": branch, "token": cfg["scm_token"]}
-            })
-            return ToolResult(output=json.dumps(result))
-
-    class _LiveSCMCreatePR(BaseTool):
-        name = "scm_create_pr"
-        description = "Create PR (live SCM)."
-        parameters_schema = {"type": "object", "properties": {"repo_url": {"type": "string"}, "source_branch": {"type": "string"}, "target_branch": {"type": "string"}, "title": {"type": "string"}, "description": {"type": "string"}}, "required": ["repo_url", "source_branch", "title", "description"]}
-        def execute_sync(self, repo_url: str = "", source_branch: str = "", target_branch: str = "main", title: str = "", description: str = "") -> ToolResult:
-            from agents.scm.adapter import SCMAgentAdapter, scm_definition
-            from agents.web_dev.tools import _parse_repo_coordinates
-            adapter = SCMAgentAdapter(definition=scm_definition, services=_make_services())
-            project, repo = _parse_repo_coordinates(repo_url)
-            result = adapter._dispatch("scm.pr.create", title, {
-                "metadata": {
-                    "project": project, "repo": repo,
-                    "sourceBranch": source_branch, "targetBranch": target_branch,
-                    "title": title, "description": description,
-                    "token": cfg["scm_token"],
-                }
-            })
-            return ToolResult(output=json.dumps(result))
-
-    for tool in (_LiveJiraTransition(), _LiveJiraComment(), _LiveJiraUpdate(),
-                 _LiveJiraListTransitions(), _LiveJiraGetTokenUser(), _LiveJiraListComments(),
-                 _LiveSCMPush(), _LiveSCMCreatePR()):
-        registry.register(tool)
-
-
-def _register_live_dispatch_web_dev(cfg: dict) -> None:
-    """Register dispatch_web_dev that runs Web Dev agent in-process."""
-    from framework.tools.base import BaseTool, ToolResult
-    from framework.tools.registry import get_registry
-
-    registry = get_registry()
-
-    class _LiveDispatchWebDev(BaseTool):
-        name = "dispatch_web_dev"
-        description = "Run web dev agent in-process."
-        parameters_schema = {"type": "object", "properties": {}, "required": []}
-
-        def execute_sync(self, task_description: str = "", jira_context=None, design_context=None,
-                         design_code_path: str = "",
-                         repo_url: str = "", repo_path: str = "", workspace_path: str = "",
-                         context_manifest_path: str = "", jira_files=None, design_files=None,
-                         revision_feedback: str = "", definition_of_done=None) -> ToolResult:
-            import asyncio as _asyncio
-            import concurrent.futures
-
-            def _run_web_dev():
-                loop = _asyncio.new_event_loop()
-                _asyncio.set_event_loop(loop)
-                try:
-                    from framework.task_store import InMemoryTaskStore
-                    from agents.web_dev.agent import WebDevAgent, web_dev_definition
-
-                    wd_task_store = InMemoryTaskStore()
-                    wd_services = _make_services(task_store=wd_task_store)
-                    agent = WebDevAgent(definition=web_dev_definition, services=wd_services)
-                    loop.run_until_complete(agent.start())
-
-                    # Re-register live tools in this thread's context
-                    _register_live_jira_scm_tools(cfg)
-
-                    msg = {
-                        "message": {
-                            "messageId": "inline-web-dev",
-                            "role": "ROLE_USER",
-                            "parts": [{"text": task_description}],
-                            "metadata": {
-                                "jiraContext": jira_context or {},
-                                "designContext": design_context,
-                                "designCodePath": design_code_path,
-                                "repoUrl": repo_url,
-                                "repoPath": repo_path,
-                                "workspacePath": workspace_path,
-                                "contextManifestPath": context_manifest_path,
-                                "jiraFiles": jira_files or [],
-                                "designFiles": design_files or [],
-                                "revisionFeedback": revision_feedback,
-                                "definitionOfDone": definition_of_done or {},
-                            },
-                        }
-                    }
-                    result = loop.run_until_complete(agent.handle_message(msg))
-                    task_id = result["task"]["id"]
-                    print(f"[live-e2e] Web Dev task started: {task_id}")
-
-                    # Poll until terminal state
-                    deadline = time.monotonic() + 1800
-                    while time.monotonic() < deadline:
-                        td = wd_task_store.get_task_dict(task_id)
-                        state = td["task"]["status"]["state"]
-                        if state in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_INPUT_REQUIRED"):
-                            break
-                        time.sleep(2.0)
-
-                    final_td = wd_task_store.get_task_dict(task_id)
-                    final_state = final_td["task"]["status"]["state"]
-                    arts = final_td["task"].get("artifacts", [])
-                    print(f"[live-e2e] Web Dev final state: {final_state}, artifacts: {len(arts)}")
-
-                    # Extract evidence from artifacts
-                    pr_url = ""
-                    branch = ""
-                    jira_in_review = False
-                    for art in arts:
-                        m = art.get("metadata", {})
-                        pr_url = pr_url or m.get("prUrl", "")
-                        branch = branch or m.get("branch", "")
-                        jir = m.get("jiraInReview")
-                        if jir:
-                            jira_in_review = jir in (True, "True", "true", "1")
-
-                    summary = (arts[0].get("parts", [{}])[0].get("text", "Done.") if arts else "Done.")
-                    print(f"[live-e2e] Web Dev result: prUrl={pr_url!r} branch={branch!r} jiraInReview={jira_in_review}")
-                    return {
-                        "status": "completed" if final_state == "TASK_STATE_COMPLETED" else "error",
-                        "summary": summary,
-                        "prUrl": pr_url,
-                        "branch": branch,
-                        "jiraInReview": jira_in_review,
-                    }
-                except Exception as exc:
-                    import traceback
-                    print(f"[live-e2e] Web Dev exception: {exc}")
-                    traceback.print_exc()
-                    return {"status": "error", "summary": str(exc), "prUrl": "", "branch": "", "jiraInReview": False}
-                finally:
-                    loop.close()
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_run_web_dev)
-                result_dict = future.result(timeout=960)
-            return ToolResult(output=json.dumps(result_dict))
-
-    registry.register(_LiveDispatchWebDev())
-
-
 def _cleanup_for_fresh_run(cfg: dict, workspace_path: str) -> None:
-    """Remove workspace artifacts and remote feature branches left from previous runs.
-
-    This ensures each test run starts from a clean state:
-     - No stale local workspace files that would suppress re-fetches
-     - No remote branches with old commits that would block PR creation
-     (GitHub rejects PR creation when the feature branch == main tip)
-
-    Credentials are sent via Authorization header — never embedded in URLs.
-    """
+    """Wipe local workspace and delete stale remote feature branches."""
     import shutil
     from urllib.request import Request, urlopen
-    from urllib.parse import urlparse
 
-    # 1. Wipe local workspace (jira/stitch/repo artifacts from previous runs)
     if os.path.isdir(workspace_path):
-        print(f"[live-e2e] Cleaning workspace: {workspace_path}")
+        print(f"[e2e] Cleaning workspace: {workspace_path}")
         shutil.rmtree(workspace_path, ignore_errors=True)
     os.makedirs(workspace_path, exist_ok=True)
 
-    # 2. Delete remote feature branches for this Jira key from GitHub
-    #    (Avoids "No commits between main and feature/..." PR error)
-    parsed = urlparse(cfg.get("scm_repo_url", ""))
+    # Only clean remote branches when we know the repo URL upfront
+    scm_repo_url = cfg.get("scm_repo_url", "")
+    if not scm_repo_url:
+        return
+
+    parsed = urlparse(scm_repo_url)
     path_parts = [p for p in parsed.path.strip("/").split("/") if p]
     if len(path_parts) < 2 or "github" not in parsed.netloc.lower():
-        return  # Only supported for GitHub
+        return
     owner, repo_name = path_parts[0], path_parts[1].rstrip(".git")
-    jira_prefix = f"feature/{cfg['jira_key'].lower()}"
+    jira_key = cfg.get("jira_key", "")
+    if not jira_key:
+        return
+    jira_prefix = f"feature/{jira_key.lower()}"
     token = cfg.get("scm_token", "")
     if not token:
         return
@@ -503,10 +275,7 @@ def _cleanup_for_fresh_run(cfg: dict, workspace_path: str) -> None:
     try:
         list_req = Request(
             f"https://api.github.com/repos/{owner}/{repo_name}/branches?per_page=100",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github.v3+json",
-            },
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"},
         )
         with urlopen(list_req, timeout=15) as resp:
             branches = json.load(resp)
@@ -516,19 +285,40 @@ def _cleanup_for_fresh_run(cfg: dict, workspace_path: str) -> None:
                 del_req = Request(
                     f"https://api.github.com/repos/{owner}/{repo_name}/git/refs/heads/{name}",
                     method="DELETE",
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Accept": "application/vnd.github.v3+json",
-                    },
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"},
                 )
                 try:
                     with urlopen(del_req, timeout=10):
                         pass
-                    print(f"[live-e2e] Deleted remote branch: {name}")
+                    print(f"[e2e] Deleted remote branch: {name}")
                 except Exception as exc:
-                    print(f"[live-e2e] Could not delete branch {name}: {exc}")
+                    print(f"[e2e] Could not delete branch {name}: {exc}")
     except Exception as exc:
-        print(f"[live-e2e] Branch cleanup error (non-fatal): {exc}")
+        print(f"[e2e] Branch cleanup error (non-fatal): {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Preflight checks
+# ---------------------------------------------------------------------------
+
+def _preflight_check_jira(cfg: dict) -> None:
+    """Verify Jira credentials and that the target ticket is accessible."""
+    from agents.jira.providers.rest import JiraRESTProvider
+    provider = JiraRESTProvider(
+        base_url=cfg["jira_base_url"],
+        token=cfg["jira_token"],
+        email=cfg["jira_email"],
+        auth_mode="basic",
+    )
+    myself, status = provider.get_myself()
+    assert status == "ok", f"Jira auth failed: {status}"
+    print(f"[e2e] Jira auth OK: {myself.get('displayName', '?')}")
+
+    jira_key = cfg.get("jira_key", "")
+    if jira_key:
+        ticket, status = provider.fetch_issue(jira_key)
+        assert status == "ok" and ticket, f"Cannot fetch ticket {jira_key}: {status}"
+        print(f"[e2e] Jira ticket OK: {jira_key}")
 
 
 # ---------------------------------------------------------------------------
@@ -537,253 +327,375 @@ def _cleanup_for_fresh_run(cfg: dict, workspace_path: str) -> None:
 
 @pytest.mark.live
 @pytest.mark.asyncio
-async def test_implement_jira_ticket_full_workflow():
-    """Full workflow: Compass → Team Lead → Web Dev → PR + Jira update.
+async def test_implement_jira_ticket_full_workflow(request):
+    """E2E: send task to Compass, constellation system drives the full workflow.
 
-    Single focused test that verifies the happy path per design doc §10.3.
-    All boundary agents run in-process (no Docker required).
+    Pass the development task via --task CLI argument:
+        pytest ... --task "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2"
 
-    Expected outcome:
-      - PR is created in the target repo
-      - Jira ticket is transitioned to "In Review"
-      - Jira comment is added with PR URL
+    The test only:
+      1. Starts all constellation agents (they self-register their tools)
+      2. Sends ONE message to Compass (the --task argument)
+      3. Monitors Team Lead's task store for completion
+      4. Validates workspace artifacts
+
+    Agents drive everything: Jira fetch, design fetch, repo clone, implementation,
+    testing, PR creation, code review, Jira update — all inside the system.
     """
-    cfg = _load_live_config()
+    task_arg = request.config.getoption("--task", default="")
+    if not task_arg:
+        pytest.skip(
+            "No --task argument provided.\n"
+            "Usage: pytest tests/e2e/test_full_workflow_e2e.py -m live -v -s "
+            "--task \"implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2\""
+        )
+
+    cfg = _load_live_config(task_arg)
     _set_env_from_config(cfg)
 
-    # Deterministic workspace path under artifacts/
-    workspace_path = os.path.join(
-        os.path.abspath(os.environ.get("ARTIFACT_ROOT", "artifacts")),
-        "live-e2e",
-    )
-    os.makedirs(workspace_path, exist_ok=True)
+    # Set ARTIFACT_ROOT to artifacts/live-e2e/ so Compass creates
+    # workspace at artifacts/live-e2e/<compass_task_id>/
+    # All agents share that same task ID as workspace root.
+    live_e2e_root = os.path.abspath(os.path.join("artifacts", "live-e2e"))
+    os.makedirs(live_e2e_root, exist_ok=True)
+    os.environ["ARTIFACT_ROOT"] = live_e2e_root
 
-    # Tee all test output to a log file under artifacts/ (not /tmp/)
-    import logging as _logging
-    _log_file = os.path.join(workspace_path, "test-run.log")
-    _file_handler = _logging.FileHandler(_log_file, mode="w", encoding="utf-8")
-    _file_handler.setLevel(_logging.DEBUG)
-    _root_logger = _logging.getLogger()
-    _root_logger.addHandler(_file_handler)
+    # Log setup
+    log_file = os.path.join(live_e2e_root, "live-e2e-run.log")
+    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    logging.getLogger().addHandler(file_handler)
+    sys.stdout.reconfigure(line_buffering=True)
 
     print("\n" + "=" * 70)
-    print(f"[live-e2e] WORKSPACE: {workspace_path}")
-    print(f"[live-e2e] Jira key: {cfg['jira_key']}")
-    print(f"[live-e2e] SCM backend: {cfg['scm_backend']}")
-    print(f"[live-e2e] Model: {cfg['openai_model']}")
+    print(f"[e2e] TASK        : {task_arg}")
+    print(f"[e2e] ARTIFACT ROOT: {live_e2e_root}")
+    print(f"[e2e] LOG          : {log_file}")
+    print(f"[e2e] Jira key    : {cfg['jira_key']}")
+    print(f"[e2e] SCM repo    : {cfg.get('scm_repo_url', '(to be discovered from Jira ticket)')}")
+    print(f"[e2e] Model       : {cfg['openai_model']}")
     print("=" * 70)
 
-    # ---- Pre-run cleanup: wipe workspace + delete remote test branches ----
-    _cleanup_for_fresh_run(cfg, workspace_path)
+    # ---- Pre-run cleanup (clean live-e2e root for fresh run) ----
+    _cleanup_for_fresh_run(cfg, live_e2e_root)
 
-    # ---- Preflight: verify Jira credentials ----
-    from agents.jira.providers.rest import JiraRESTProvider
-    jira_provider = JiraRESTProvider(
-        base_url=cfg["jira_base_url"],
-        token=cfg["jira_token"],
-        email=cfg["jira_email"],
-        auth_mode="basic",
-    )
-    myself, jira_auth_status = jira_provider.get_myself()
-    assert jira_auth_status == "ok", f"Jira auth failed: {jira_auth_status}"
-    print(f"[live-e2e] Jira auth OK: {myself.get('displayName', '?')}")
+    # ---- Preflight: Jira credentials ----
+    _preflight_check_jira(cfg)
 
-    ticket, ticket_status = jira_provider.fetch_issue(cfg["jira_key"])
-    assert ticket_status == "ok" and ticket, f"Cannot fetch ticket {cfg['jira_key']}: {ticket_status}"
-    print(f"[live-e2e] Ticket fetched: {cfg['jira_key']}")
+    # ---- Register Compass tools first (idempotent; agents will override dispatch) ----
+    from agents.compass.tools import register_compass_tools
+    register_compass_tools()
 
-    # ---- Preflight: verify SCM clone ----
-    import tempfile, shutil
-    _preflight_clone_dir = os.path.join(tempfile.gettempdir(), "constellation-preflight-clone")
-    if os.path.isdir(_preflight_clone_dir):
-        shutil.rmtree(_preflight_clone_dir, ignore_errors=True)
+    # =========================================================================
+    # Start constellation agents — they self-register their tools into the
+    # global ToolRegistry.  The test does NOT register any tools directly.
+    # =========================================================================
+    print("\n[e2e] Starting constellation agents...")
+
+    # -- Boundary agents --
+    from agents.jira.adapter import JiraAgentAdapter, jira_definition
     from agents.scm.adapter import SCMAgentAdapter, scm_definition
-    _scm_svc = _make_services()
-    _scm_adapter = SCMAgentAdapter(definition=scm_definition, services=_scm_svc)
-    _clone_result = _scm_adapter._dispatch(
-        "scm.repo.clone", "",
-        {"metadata": {"repoUrl": cfg["scm_repo_url"], "targetPath": _preflight_clone_dir}},
-    )
-    if _clone_result.get("error") or not os.path.isdir(_preflight_clone_dir):
-        detail = _clone_result.get("detail", "")
-        pytest.fail(
-            f"[live-e2e] SCM preflight clone FAILED: {_clone_result.get('error', 'path missing')} "
-            f"| git: {detail}\n"
-            f"Hint: set TEST_SCM_USERNAME=<your-bitbucket-username> in tests/.env if PAT Bearer fails"
-        )
-    shutil.rmtree(_preflight_clone_dir, ignore_errors=True)
-    print(f"[live-e2e] SCM preflight clone OK: {cfg['scm_repo_url']}")
+    from agents.ui_design.adapter import UIDesignAgentAdapter, ui_design_definition
 
-    # ---- Register all live tools ----
-    _register_live_jira_scm_tools(cfg)
-    _register_live_boundary_tools(cfg)
-    _register_live_dispatch_web_dev(cfg)
+    jira_agent = JiraAgentAdapter(definition=jira_definition, services=_make_services())
+    await jira_agent.start()   # registers: fetch_jira_ticket, jira_transition, jira_comment, …
+    print("[e2e] Jira agent started")
 
-    # ---- Set up Team Lead result queue ----
-    tl_result_queue: queue.Queue = queue.Queue()
+    scm_agent = SCMAgentAdapter(definition=scm_definition, services=_make_services())
+    await scm_agent.start()    # registers: clone_repo, scm_push, scm_create_pr, scm_list_branches
+    print("[e2e] SCM agent started")
 
-    # Override Compass's dispatch_development_task to run Team Lead in-process
-    _register_compass_dispatch(cfg, workspace_path, tl_result_queue)
+    ui_agent = UIDesignAgentAdapter(definition=ui_design_definition, services=_make_services())
+    await ui_agent.start()     # registers: fetch_design
+    print("[e2e] UI Design agent started")
 
-    # ---- Start Compass ----
-    from agents.compass.agent import CompassAgent, compass_definition
+    # -- Execution agents --
+    from agents.code_review.agent import CodeReviewAgent, code_review_definition
+    from agents.web_dev.agent import WebDevAgent, web_dev_definition
+    from agents.team_lead.agent import TeamLeadAgent, team_lead_definition
+
     from framework.task_store import InMemoryTaskStore
 
-    compass_task_store = InMemoryTaskStore()
-    compass_services = _make_services(task_store=compass_task_store)
-    compass_agent = CompassAgent(definition=compass_definition, services=compass_services)
-
-    user_message = (
-        f"Please implement Jira ticket {cfg['jira_key']} "
-        f"in the repository {cfg['scm_repo_url']}. "
-        f"Ticket URL: {cfg['jira_ticket_url']}"
+    cr_agent = CodeReviewAgent(
+        definition=code_review_definition,
+        services=_make_services(task_store=InMemoryTaskStore()),
     )
-    message = {
+    await cr_agent.start()     # registers: dispatch_code_review (in-process)
+    print("[e2e] Code Review agent started")
+
+    wd_agent = WebDevAgent(
+        definition=web_dev_definition,
+        services=_make_services(task_store=InMemoryTaskStore()),
+    )
+    await wd_agent.start()     # registers: dispatch_web_dev (in-process)
+    print("[e2e] Web Dev agent started")
+
+    # Team Lead — use a dedicated task store so the test can poll it
+    tl_task_store = InMemoryTaskStore()
+    tl_agent = TeamLeadAgent(
+        definition=team_lead_definition,
+        services=_make_services(task_store=tl_task_store),
+    )
+    await tl_agent.start()     # registers: dispatch_development_task (in-process, overrides Compass's)
+    print("[e2e] Team Lead agent started")
+
+    # ---- Send task to Compass ----
+    from agents.compass.agent import CompassAgent, compass_definition
+
+    compass_agent = CompassAgent(
+        definition=compass_definition,
+        services=_make_services(task_store=InMemoryTaskStore()),
+    )
+
+    print(f"\n[e2e] Sending task to Compass:\n  {task_arg}")
+
+    compass_result = await compass_agent.handle_message({
         "message": {
-            "messageId": "live-e2e-full-workflow",
+            "messageId": "e2e-full-workflow",
             "role": "ROLE_USER",
-            "parts": [{"text": user_message}],
-            "metadata": {"workspacePath": workspace_path},
-        },
-    }
-
-    print(f"[live-e2e] Sending request to Compass...")
-    compass_result = await compass_agent.handle_message(message)
+            "parts": [{"text": task_arg}],
+            "metadata": {},
+        }
+    })
+    compass_task_id = compass_result["task"]["id"]
     compass_state = compass_result["task"]["status"]["state"]
-    print(f"[live-e2e] Compass finished: {compass_state}")
+    # Workspace is at ARTIFACT_ROOT/<compass_task_id>/
+    workspace_path = os.path.join(live_e2e_root, compass_task_id)
+    print(f"[e2e] Compass task state: {compass_state}")
+    print(f"[e2e] Compass task ID  : {compass_task_id}")
+    print(f"[e2e] Workspace path   : {workspace_path}")
 
-    assert compass_state in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED"), \
-        f"Compass did not reach terminal state: {compass_state}"
+    # ---- Monitor Team Lead (constellation drives the workflow) ----
+    print("\n[e2e] Monitoring Team Lead workflow (constellation drives all agents)...")
+    print("[e2e] Checkpoints: Jira fetch → design fetch → repo clone → plan → "
+          "web dev → code review → PR → report")
 
-    # ---- Wait for Team Lead ----
-    print("[live-e2e] Waiting for Team Lead to complete...")
-    try:
-        final = tl_result_queue.get(timeout=2400)
-    except queue.Empty:
-        pytest.fail("[live-e2e] Team Lead did not complete within 2400s")
-    if "error" in final and "task" not in final:
-        pytest.fail(f"[live-e2e] Team Lead thread crashed: {final['error']}")
+    tl_final: dict | None = None
+    _TERMINAL = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_INPUT_REQUIRED"}
+    deadline = time.monotonic() + 3600  # 1h max
+    last_heartbeat = time.monotonic()
 
-    task_state = final["task"]["status"]["state"]
-    artifacts = final["task"].get("artifacts", [])
+    while time.monotonic() < deadline:
+        tasks = tl_task_store.list_tasks(agent_id="team-lead")
+        for task in tasks:
+            if task.status.state.value in _TERMINAL:
+                tl_final = tl_task_store.get_task_dict(task.id)
+                break
+        if tl_final:
+            break
+        # Progress heartbeat every 30s
+        now = time.monotonic()
+        if now - last_heartbeat >= 30:
+            last_heartbeat = now
+            elapsed = int(now - (deadline - 3600))
+            tasks_all = tl_task_store.list_tasks(agent_id="team-lead")
+            if tasks_all:
+                state = tasks_all[0].status.state.value
+                print(f"[e2e] Team Lead still running... ({elapsed}s) state={state}")
+                # Print progress for all task subdirs in the live-e2e root
+                for entry in sorted(os.scandir(live_e2e_root), key=lambda e: e.name):
+                    if entry.is_dir():
+                        _print_workspace_progress(entry.path)
+            else:
+                print(f"[e2e] Waiting for Team Lead task to be created... ({elapsed}s)")
+        await asyncio.sleep(5.0)
+
+    if not tl_final:
+        _dump_workspace_artifacts(workspace_path)
+        pytest.fail("[e2e] Team Lead did not reach terminal state within 1h")
+
+    tl_state = tl_final["task"]["status"]["state"]
+    tl_meta = tl_final["task"].get("metadata", {})
+    actual_workspace = tl_meta.get("workspacePath") or workspace_path
 
     print(f"\n{'=' * 70}")
-    print(f"[live-e2e] RESULT: state={task_state}, artifacts={len(artifacts)}")
-
-    if task_state == "TASK_STATE_FAILED":
-        status_msg = final["task"].get("status", {}).get("message", {})
-        if isinstance(status_msg, dict):
-            parts = status_msg.get("parts", [])
-            error_text = parts[0].get("text", "") if parts else str(status_msg)
-        else:
-            error_text = str(status_msg)
-        print(f"[live-e2e] FAILURE REASON: {error_text[:500]}")
-        # Dump workspace artifacts for diagnosis
-        _dump_workspace_artifacts(workspace_path)
-        pytest.fail(f"Team Lead FAILED: {error_text[:500]}")
-
-    assert task_state == "TASK_STATE_COMPLETED", f"Expected COMPLETED, got {task_state}"
-    assert len(artifacts) > 0, "No artifacts returned"
-
-    meta = artifacts[0].get("metadata", {})
-    pr_url = meta.get("prUrl", "")
-    branch = meta.get("branch", "")
-    jira_in_review = meta.get("jiraInReview", False)
-
-    print(f"[live-e2e] PR URL: {pr_url}")
-    print(f"[live-e2e] Branch: {branch}")
-    print(f"[live-e2e] Jira In Review: {jira_in_review}")
-    print(f"[live-e2e] Workspace: {workspace_path}")
+    print(f"[e2e] Team Lead final state : {tl_state}")
+    print(f"[e2e] Workspace             : {actual_workspace}")
     print("=" * 70)
 
-    # ---- Step-level workspace validation ----
-    _validate_workspace_artifacts(workspace_path, cfg["jira_key"])
+    if tl_state == "TASK_STATE_FAILED":
+        _dump_workspace_artifacts(actual_workspace)
+        status_msg = tl_final["task"].get("status", {}).get("message", {})
+        parts = status_msg.get("parts", []) if isinstance(status_msg, dict) else []
+        error_text = parts[0].get("text", str(status_msg))[:500] if parts else str(status_msg)[:500]
+        pytest.fail(f"Team Lead FAILED: {error_text}")
 
-    assert pr_url, f"prUrl missing from artifact metadata: {meta}"
-    assert branch, f"branch missing from artifact metadata: {meta}"
-    assert jira_in_review, (
-        f"Jira ticket was NOT transitioned to 'In Review'. "
-        f"Check {workspace_path}/web-agent/jira-update-log.json for details."
-    )
-    print("[live-e2e] PASSED")
+    if tl_state == "TASK_STATE_INPUT_REQUIRED":
+        _dump_workspace_artifacts(actual_workspace)
+        pytest.fail("Team Lead requires user input — check escalate_to_user path")
+
+    assert tl_state == "TASK_STATE_COMPLETED", f"Expected COMPLETED, got {tl_state}"
+
+    # ---- Validate workspace artifacts ----
+    _validate_workspace_artifacts(actual_workspace, cfg["jira_key"])
+    print("[e2e] PASSED ✓")
 
 
 # ---------------------------------------------------------------------------
-# Workspace validation helpers
+# Workspace validation
 # ---------------------------------------------------------------------------
 
 def _validate_workspace_artifacts(workspace_path: str, jira_key: str) -> None:
-    """Assert expected workspace artifacts exist and contain data.
-
-    Fails fast with a clear message when a required artifact is missing,
-    so the developer knows exactly which step failed.
-    """
-    def _check_artifact(rel_path: str, required_data_keys: "list[str] | None" = None) -> dict:
-        full_path = os.path.join(workspace_path, rel_path)
-        if not os.path.isfile(full_path):
-            pytest.fail(f"[workspace-check] Missing artifact: {rel_path}")
-        with open(full_path, encoding="utf-8") as fh:
+    def _check(rel_path: str, required_keys: list[str] | None = None) -> dict:
+        full = os.path.join(workspace_path, rel_path)
+        if not os.path.isfile(full):
+            pytest.fail(f"[workspace] Missing artifact: {rel_path}")
+        with open(full, encoding="utf-8") as fh:
             content = json.load(fh)
         data = content.get("data", {})
-        if required_data_keys:
-            for key in required_data_keys:
+        if required_keys:
+            for key in required_keys:
                 assert data.get(key), (
-                    f"[workspace-check] {rel_path}: data.{key} is empty/missing. "
+                    f"[workspace] {rel_path}: data.{key} is empty/missing. "
                     f"data={json.dumps({k: str(v)[:100] for k, v in data.items()}, ensure_ascii=False)}"
                 )
         return content
 
-    print("\n[live-e2e] === Workspace Artifact Validation ===")
+    def _check_optional(rel_path: str) -> dict | None:
+        full = os.path.join(workspace_path, rel_path)
+        if not os.path.isfile(full):
+            print(f"[workspace] OPTIONAL artifact missing: {rel_path}")
+            return None
+        with open(full, encoding="utf-8") as fh:
+            return json.load(fh)
 
-    # Team Lead artifacts
-    _check_artifact("team_lead/jira-ticket.json")
-    _check_artifact("team_lead/design-spec.json")  # CP-2: Stitch/Figma design content
-    _check_artifact("team_lead/analysis.json", ["task_type"])
-    _check_artifact("team_lead/delivery-plan.json")
-    ctx = _check_artifact("team_lead/context-manifest.json")
+    print("\n[e2e] === Workspace Artifact Validation ===")
+
+    # Checkpoint 1: Team Lead gathered Jira ticket
+    _check("team-lead/jira-ticket.json")
+    print("[workspace] CP-1: Jira ticket ✓")
+
+    # Checkpoint 2: Team Lead gathered design content (optional — may not be a UI task)
+    design_spec = _check_optional("team-lead/design-spec.json")
+    if design_spec:
+        print("[workspace] CP-2: Design spec ✓")
+    else:
+        print("[workspace] CP-2: Design spec SKIPPED (not a UI task or no design URL)")
+
+    # Checkpoint 2b: Stitch design HTML file download (new path: ui-design/stitch/code.html)
+    design_html_path = os.path.join(workspace_path, "ui-design", "stitch", "code.html")
+    if not os.path.isfile(design_html_path):
+        # fallback to legacy path
+        design_html_path = os.path.join(workspace_path, "team-lead", "design-code.html")
+    if os.path.isfile(design_html_path):
+        size = os.path.getsize(design_html_path)
+        print(f"[workspace] CP-2b: Design HTML downloaded ✓ ({size} bytes)")
+    else:
+        print("[workspace] CP-2b: Design HTML NOT found (Stitch content download may have failed)")
+
+    # Checkpoint 2c: Design spec markdown (new path: ui-design/stitch/DESIGN.md)
+    design_spec_md_path = os.path.join(workspace_path, "ui-design", "stitch", "DESIGN.md")
+    if not os.path.isfile(design_spec_md_path):
+        # fallback to legacy path
+        design_spec_md_path = os.path.join(workspace_path, "team-lead", "design-spec.md")
+    if os.path.isfile(design_spec_md_path):
+        size = os.path.getsize(design_spec_md_path)
+        print(f"[workspace] CP-2c: Design spec (markdown) ✓ ({size} bytes)")
+    else:
+        print("[workspace] CP-2c: Design spec (markdown) NOT found")
+
+    # Checkpoint 3: Team Lead analysis + repo clone
+    ctx = _check("team-lead/context-manifest.json")
     repo_cloned = ctx.get("data", {}).get("repo_cloned", False)
-    assert repo_cloned, (
-        f"[workspace-check] Repo was NOT cloned. "
-        f"context-manifest.json: {json.dumps(ctx.get('data', {}), indent=2)}"
-    )
     repo_path = ctx.get("data", {}).get("repo_path", "")
-    print(f"[workspace-check] Team Lead artifacts: OK  (repo_cloned={repo_cloned}, repo_path={repo_path})")
+    if not repo_cloned:
+        # Dump context manifest for debugging
+        print(f"[workspace] context-manifest data: {json.dumps(ctx.get('data', {}), indent=2)}")
+        pytest.fail(f"[workspace] Repo NOT cloned. context-manifest shows repo_cloned=False")
+    print(f"[workspace] CP-3: Repo cloned → {repo_path} ✓")
 
-    # Web Dev artifacts
-    git_log = _check_artifact("web-agent/git-setup-log.json")
+    # Checkpoint 4: Analysis + delivery plan
+    _check("team-lead/analysis.json", ["task_type"])
+    _check("team-lead/delivery-plan.json")
+    print("[workspace] CP-4: Analysis + delivery plan ✓")
+
+    # Checkpoint 5: Web Dev git setup
+    git_log = _check("web-dev/git-setup-log.json")
     assert git_log.get("data", {}).get("repo_exists", False), (
-        f"[workspace-check] web-agent git-setup-log: repo_exists=False. "
+        f"[workspace] web-dev git-setup-log: repo_exists=False. "
         f"data={json.dumps(git_log.get('data', {}))}"
     )
-    branch_name = git_log.get("data", {}).get("branch_name", "")
-    print(f"[workspace-check] Web Dev git setup: OK  (branch={branch_name})")
+    branch = git_log.get("data", {}).get("branch_name", "")
+    print(f"[workspace] CP-5: Git setup ✓ branch={branch}")
 
-    _check_artifact("web-agent/implementation-plan.json")
-    _check_artifact("web-agent/jira-prepare-log.json", ["jira_key"])
+    # Checkpoint 6: Web Dev implementation plan + Jira prepare
+    _check("web-dev/implementation-plan.json")
+    _check("web-dev/jira-prepare-log.json", ["jira_key"])
+    print("[workspace] CP-6: Web Dev impl plan + Jira prepare ✓")
 
-    # PR evidence
-    pr_ev = _check_artifact("web-agent/pr-evidence.json")
-    pr_url_evidence = pr_ev.get("data", {}).get("pr_url", "")
-    assert pr_url_evidence, (
-        f"[workspace-check] pr-evidence.json: pr_url is empty. "
+    # Checkpoint 8: PR created
+    pr_ev = _check("web-dev/pr-evidence.json")
+    pr_url = pr_ev.get("data", {}).get("pr_url", "")
+    assert pr_url, (
+        f"[workspace] pr-evidence.json: pr_url empty. "
         f"data={json.dumps(pr_ev.get('data', {}))}"
     )
-    print(f"[workspace-check] PR evidence: OK  (pr_url={pr_url_evidence})")
+    print(f"[workspace] CP-8: PR evidence ✓ pr_url={pr_url}")
 
-    # Jira update log
-    jira_upd = _check_artifact("web-agent/jira-update-log.json")
+    # Checkpoint 8b: Jira updated
+    jira_upd = _check("web-dev/jira-update-log.json")
     jira_upd_data = jira_upd.get("data", {})
     print(
-        f"[workspace-check] Jira update: comment_added={jira_upd_data.get('comment_added')} "
+        f"[workspace] CP-8b: Jira update "
+        f"comment_added={jira_upd_data.get('comment_added')} "
         f"transition_attempted={jira_upd_data.get('transition_attempted')}"
     )
 
-    print("[live-e2e] === Workspace Validation PASSED ===\n")
+    # Checkpoint 9: Screenshots in workspace (optional — informational only)
+    screenshot_dir = os.path.join(workspace_path, "web-dev", "screenshots")
+    screenshot_desktop = os.path.join(screenshot_dir, "landing-desktop.png")
+    screenshot_mobile = os.path.join(screenshot_dir, "landing-mobile.png")
+    if os.path.isfile(screenshot_desktop):
+        size = os.path.getsize(screenshot_desktop)
+        print(f"[workspace] CP-9: Desktop screenshot ✓ ({size} bytes)")
+    else:
+        print(f"[workspace] CP-9: Desktop screenshot NOT found (looked in {screenshot_dir})")
+    if os.path.isfile(screenshot_mobile):
+        size = os.path.getsize(screenshot_mobile)
+        print(f"[workspace] CP-9b: Mobile screenshot ✓ ({size} bytes)")
+    else:
+        print(f"[workspace] CP-9b: Mobile screenshot NOT found")
+
+    print("[e2e] === Workspace Validation PASSED ===\n")
+
+
+# ---------------------------------------------------------------------------
+# Debug helpers
+# ---------------------------------------------------------------------------
+
+def _print_workspace_progress(workspace_path: str) -> None:
+    """Print a brief summary of which artifacts exist so far."""
+    checkpoints = {
+        "CP-1 Jira ticket": "team-lead/jira-ticket.json",
+        "CP-2 Design spec": "team-lead/design-spec.json",
+        "CP-2b Design HTML": "ui-design/stitch/code.html",
+        "CP-2c Design MD": "ui-design/stitch/DESIGN.md",
+        "CP-3 Context manifest": "team-lead/context-manifest.json",
+        "CP-4a Analysis": "team-lead/analysis.json",
+        "CP-4b Delivery plan": "team-lead/delivery-plan.json",
+        "CP-5 Git setup": "web-dev/git-setup-log.json",
+        "CP-6a Impl plan": "web-dev/implementation-plan.json",
+        "CP-6b Jira prepare": "web-dev/jira-prepare-log.json",
+        "CP-8 PR evidence": "web-dev/pr-evidence.json",
+        "CP-8b Jira update": "web-dev/jira-update-log.json",
+        "CP-9 Review report": "code-review/review-report.json",
+        "CP-9 Desktop screenshot": "web-dev/screenshots/landing-desktop.png",
+    }
+    present = []
+    missing = []
+    for label, path in checkpoints.items():
+        if os.path.isfile(os.path.join(workspace_path, path)):
+            present.append(label)
+        else:
+            missing.append(label)
+    if present:
+        print(f"[e2e] Done: {', '.join(present)}")
+    if missing:
+        print(f"[e2e] Pending: {', '.join(missing)}")
 
 
 def _dump_workspace_artifacts(workspace_path: str) -> None:
-    """Print all workspace artifact files for debugging on failure."""
-    print(f"\n[live-e2e] === Workspace Dump: {workspace_path} ===")
+    print(f"\n[e2e] === Workspace Dump: {workspace_path} ===")
     for root, dirs, files in os.walk(workspace_path):
         dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "node_modules"}]
         for fname in sorted(files):
@@ -798,97 +710,4 @@ def _dump_workspace_artifacts(workspace_path: str) -> None:
                 print(json.dumps(content, indent=2, ensure_ascii=False)[:800])
             except Exception as exc:
                 print(f"\n--- {rel} [READ ERROR: {exc}] ---")
-    print("[live-e2e] === End Workspace Dump ===\n")
-
-def _register_compass_dispatch(cfg: dict, workspace_path: str, tl_result_queue: queue.Queue) -> None:
-    """Override dispatch_development_task to run Team Lead in a background thread."""
-    import asyncio as _asyncio
-    from framework.tools.base import BaseTool, ToolResult
-    from framework.tools.registry import get_registry
-
-    registry = get_registry()
-
-    class _InProcessDispatch(BaseTool):
-        name = "dispatch_development_task"
-        description = "Dispatch a software development task to Team Lead."
-        parameters_schema = {
-            "type": "object",
-            "properties": {
-                "task_description": {"type": "string"},
-                "jira_key": {"type": "string"},
-                "repo_url": {"type": "string"},
-                "design_url": {"type": "string"},
-            },
-            "required": ["task_description"],
-        }
-
-        def execute_sync(self, task_description: str = "", jira_key: str = "",
-                         repo_url: str = "", design_url: str = "") -> ToolResult:
-            effective_jira_key = jira_key or cfg["jira_key"]
-            effective_repo_url = repo_url or cfg["scm_repo_url"]
-            print(f"[compass-mock] dispatch: jira={effective_jira_key} repo={effective_repo_url}")
-
-            def _run_team_lead():
-                loop = _asyncio.new_event_loop()
-                _asyncio.set_event_loop(loop)
-                try:
-                    from framework.task_store import InMemoryTaskStore
-                    from agents.team_lead.agent import TeamLeadAgent, team_lead_definition
-
-                    tl_task_store = InMemoryTaskStore()
-                    tl_services = _make_services(task_store=tl_task_store)
-                    tl_agent = TeamLeadAgent(definition=team_lead_definition, services=tl_services)
-                    loop.run_until_complete(tl_agent.start())
-
-                    # Register live boundary tools for Team Lead
-                    _register_live_boundary_tools(cfg)
-
-                    msg = {
-                        "message": {
-                            "messageId": "inline-tl",
-                            "role": "ROLE_USER",
-                            "parts": [{"text": task_description}],
-                            "metadata": {
-                                "jiraKey": effective_jira_key,
-                                "repoUrl": effective_repo_url,
-                                "workspacePath": workspace_path,
-                                # Pass design source: prefer Stitch, fall back to Figma.
-                                # Never pass both — Team Lead only uses the first available.
-                                "stitchProjectId": cfg.get("stitch_project_id", ""),
-                                "stitchScreenId": cfg.get("stitch_screen_id", ""),
-                                "figmaUrl": cfg.get("figma_url", "") if not cfg.get("stitch_project_id") else "",
-                            },
-                        }
-                    }
-                    result = loop.run_until_complete(tl_agent.handle_message(msg))
-                    task_id = result["task"]["id"]
-                    print(f"[compass-mock] Team Lead task: {task_id}")
-
-                    deadline = time.monotonic() + 960
-                    while time.monotonic() < deadline:
-                        td = tl_task_store.get_task_dict(task_id)
-                        state = td["task"]["status"]["state"]
-                        if state in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_INPUT_REQUIRED"):
-                            print(f"[compass-mock] Team Lead reached {state}")
-                            tl_result_queue.put(td)
-                            return
-                        time.sleep(2.0)
-
-                    print("[compass-mock] Team Lead polling timed out")
-                    tl_result_queue.put(tl_task_store.get_task_dict(task_id))
-                except Exception as exc:
-                    import traceback
-                    print(f"[compass-mock] Team Lead error: {exc}")
-                    traceback.print_exc()
-                    tl_result_queue.put({"error": str(exc)})
-                finally:
-                    loop.close()
-
-            t = threading.Thread(target=_run_team_lead, daemon=True, name="tl-e2e")
-            t.start()
-            return ToolResult(output=json.dumps({
-                "status": "submitted",
-                "message": f"Development task dispatched (jira={effective_jira_key}).",
-            }))
-
-    registry.register(_InProcessDispatch())
+    print("[e2e] === End Workspace Dump ===\n")

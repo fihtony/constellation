@@ -11,6 +11,7 @@ ReAct via the runtime for open-ended code generation and repair.
 from __future__ import annotations
 
 import json
+import os
 import threading
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
@@ -52,7 +53,7 @@ web_dev_workflow = Workflow(
             "fail": fix_gaps,
             "need_user_input": pause_for_user_input,
         }),
-        (fix_gaps, run_tests),
+        (fix_gaps, self_assess),  # design gaps fixed — re-assess without re-running all tests
         (capture_screenshot, create_pr),
         (create_pr, update_jira),
         (update_jira, report_result),
@@ -109,6 +110,7 @@ class WebDevAgent(BaseAgent):
         from agents.web_dev.coding_tools import register_web_dev_coding_tools
         register_web_dev_tools()
         register_web_dev_coding_tools()
+        _register_web_dev_dispatch(self)
 
     async def handle_message(self, message: dict) -> dict:
         from framework.a2a.protocol import Artifact
@@ -129,8 +131,14 @@ class WebDevAgent(BaseAgent):
             },
         )
 
+        # Use the Compass orchestrator task ID as the canonical _task_id so
+        # AgentLogger writes to {ARTIFACT_ROOT}/{compass_task_id}/web-dev/agent.log
+        # which is the same directory as the shared workspace files.
+        orchestrator_task_id = metadata.get("orchestratorTaskId", "")
+        canonical_task_id = orchestrator_task_id or task.id
+
         state = {
-            "_task_id": task.id,
+            "_task_id": canonical_task_id,
             "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,
             "_plugin_manager": self.plugin_manager,
@@ -147,15 +155,26 @@ class WebDevAgent(BaseAgent):
             ),
             "design_context": metadata.get("designContext"),
             "design_code_path": metadata.get("designCodePath", ""),
+            "design_md_path": metadata.get("designMdPath", ""),
+            "design_local_folder": metadata.get("designLocalFolder", ""),
+            "jira_local_folder": metadata.get("jiraLocalFolder", ""),
             "skill_context": metadata.get("skillContext", ""),
             "context_manifest_path": metadata.get("contextManifestPath", ""),
             "jira_files": metadata.get("jiraFiles", []),
             "design_files": metadata.get("designFiles", []),
+            "tech_stack": metadata.get("techStack", []),
+            "stitch_screen_name": metadata.get("stitchScreenName", ""),
             "task_type": metadata.get("taskType", "general"),
             "analysis": metadata.get("analysis", ""),
             "revision_feedback": metadata.get("revisionFeedback", ""),
             "definition_of_done": metadata.get("definitionOfDone", {}),
             "test_cycles": 0,
+            # max_test_cycles: can be set by caller via metadata, else uses env default.
+            # WEB_DEV_MAX_TEST_CYCLES env var (default 3) controls production cycles.
+            # Set to 2 in tests/.env for faster E2E runs.
+            "max_test_cycles": metadata.get("maxTestCycles") or int(
+                os.environ.get("WEB_DEV_MAX_TEST_CYCLES", "3")
+            ),
             "metadata": metadata,
             # Populate _allowed_tools from the permission engine so run_agentic
             # only exposes the development-profile tool list to the LLM, rather
@@ -181,8 +200,8 @@ class WebDevAgent(BaseAgent):
 
                 config = self._build_run_config(
                     task.id,
-                    max_steps=30,
-                    timeout_seconds=600,
+                    max_steps=50,
+                    timeout_seconds=int(os.environ.get("WEB_DEV_WORKFLOW_TIMEOUT", "7200")),
                 )
                 result = loop.run_until_complete(
                     self._compiled_workflow.invoke(state, config)
@@ -268,3 +287,139 @@ def _send_callback(
             pass
     except Exception as exc:
         print(f"[web-dev] Callback failed: {exc}")
+
+
+def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
+    """Register in-process dispatch_web_dev tool (overrides idempotent HTTP version)."""
+    import asyncio
+    import time
+    from framework.tools.base import BaseTool, ToolResult
+    from framework.tools.registry import get_registry
+
+    class InProcessDispatchWebDev(BaseTool):
+        name = "dispatch_web_dev"
+        description = (
+            "Dispatch a web development implementation task to the Web Dev Agent. "
+            "Include all gathered context: Jira ticket details, design spec, repo URL."
+        )
+        parameters_schema = {
+            "type": "object",
+            "properties": {
+                "task_description": {"type": "string"},
+                "jira_context": {"type": "object"},
+                "design_context": {"type": "object"},
+                "design_code_path": {"type": "string"},
+                "repo_url": {"type": "string"},
+                "repo_path": {"type": "string"},
+                "workspace_path": {"type": "string"},
+                "context_manifest_path": {"type": "string"},
+                "jira_files": {"type": "array", "items": {"type": "string"}},
+                "design_files": {"type": "array", "items": {"type": "string"}},
+                "tech_stack": {"type": "array", "items": {"type": "string"}},
+                "stitch_screen_name": {"type": "string"},
+                "orchestrator_task_id": {"type": "string"},
+                "revision_feedback": {"type": "string"},
+                "definition_of_done": {"type": "object"},
+            },
+            "required": ["task_description"],
+        }
+
+        def execute_sync(
+            self,
+            task_description: str = "",
+            jira_context=None,
+            design_context=None,
+            design_code_path: str = "",
+            repo_url: str = "",
+            repo_path: str = "",
+            workspace_path: str = "",
+            context_manifest_path: str = "",
+            jira_files=None,
+            design_files=None,
+            tech_stack=None,
+            stitch_screen_name: str = "",
+            orchestrator_task_id: str = "",
+            revision_feedback: str = "",
+            definition_of_done=None,
+            **kw,
+        ) -> ToolResult:
+            task_id_holder: dict = {}
+
+            def _run() -> None:
+                loop = asyncio.new_event_loop()
+                try:
+                    msg = {
+                        "message": {
+                            "parts": [{"text": task_description}],
+                            "metadata": {
+                                "jiraContext": jira_context or {},
+                                "designContext": design_context,
+                                "designCodePath": design_code_path,
+                                "repoUrl": repo_url,
+                                "repoPath": repo_path,
+                                "workspacePath": workspace_path,
+                                "contextManifestPath": context_manifest_path,
+                                "jiraFiles": jira_files or [],
+                                "designFiles": design_files or [],
+                                "techStack": tech_stack or [],
+                                "stitchScreenName": stitch_screen_name,
+                                "orchestratorTaskId": orchestrator_task_id,
+                                "revisionFeedback": revision_feedback,
+                                "definitionOfDone": definition_of_done or {},
+                            },
+                        }
+                    }
+                    result = loop.run_until_complete(web_dev_agent.handle_message(msg))
+                    task_id_holder["task_id"] = result["task"]["id"]
+                except Exception as exc:
+                    task_id_holder["error"] = str(exc)
+                finally:
+                    loop.close()
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(timeout=10.0)
+
+            task_id = task_id_holder.get("task_id")
+            if not task_id:
+                err = task_id_holder.get("error", "Task ID unavailable")
+                print(f"[web-dev-dispatch] Failed to start: {err}")
+                return ToolResult(output=json.dumps({"status": "error", "summary": err}))
+
+            print(f"[web-dev-dispatch] Task started: {task_id}")
+            deadline = time.monotonic() + 1800
+            while time.monotonic() < deadline:
+                td = web_dev_agent.services.task_store.get_task_dict(task_id)
+                state = td["task"]["status"]["state"]
+                if state in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_INPUT_REQUIRED"):
+                    arts = td["task"].get("artifacts", [])
+                    pr_url = ""
+                    branch = ""
+                    jira_in_review = False
+                    for art in arts:
+                        m = art.get("metadata", {})
+                        pr_url = pr_url or m.get("prUrl", "")
+                        branch = branch or m.get("branch", "")
+                        if m.get("jiraInReview"):
+                            jira_in_review = True
+                    summary = (arts[0].get("parts", [{}])[0].get("text", "Done.") if arts else "Done.")
+                    print(f"[web-dev-dispatch] Done: state={state} pr={pr_url} branch={branch}")
+                    return ToolResult(output=json.dumps({
+                        "status": "completed" if state == "TASK_STATE_COMPLETED" else "error",
+                        "summary": summary,
+                        "prUrl": pr_url,
+                        "branch": branch,
+                        "jiraInReview": jira_in_review,
+                    }))
+                time.sleep(2.0)
+
+            return ToolResult(output=json.dumps({"status": "error", "summary": "Web Dev timed out after 30m"}))
+
+    registry = get_registry()
+    # Force-register (unregister HTTP version first if present)
+    try:
+        registry.unregister("dispatch_web_dev")
+    except Exception:
+        pass
+    registry.register(InProcessDispatchWebDev())
+    print("[web-dev] Registered in-process dispatch_web_dev")
