@@ -104,7 +104,7 @@ def _infer_jira_base_url(ticket_url: str) -> str:
 
 def _infer_scm_backend(repo_url: str) -> str:
     host = urlparse(repo_url).netloc.lower()
-    return "github-rest" if "github.com" in host else "bitbucket"
+    return "github-mcp" if "github.com" in host else "bitbucket"
 
 
 def _infer_scm_base_url(repo_url: str) -> str:
@@ -171,16 +171,16 @@ def _set_env_from_config(cfg: dict) -> None:
     os.environ["AGENT_RUNTIME"] = "claude-code"
     os.environ.setdefault("OPENAI_API_KEY", "")
 
-    # Jira
+    # Jira — use MCP backend by default per system design requirements
     os.environ["JIRA_BASE_URL"] = cfg["jira_base_url"]
     os.environ["JIRA_TOKEN"] = cfg["jira_token"]
     os.environ["JIRA_EMAIL"] = cfg["jira_email"]
-    os.environ["JIRA_BACKEND"] = "rest"
+    os.environ["JIRA_BACKEND"] = "mcp"
 
-    # SCM credentials (always set — repo URL is discovered by agents from Jira)
+    # SCM credentials — only set SCM_TOKEN, never GITHUB_TOKEN (credential isolation)
+    # GITHUB_TOKEN would expose credentials to claude subprocess env
     if cfg.get("scm_token"):
         os.environ["SCM_TOKEN"] = cfg["scm_token"]
-        os.environ["GITHUB_TOKEN"] = cfg["scm_token"]  # also set GITHUB_TOKEN for GitHub REST
     if cfg.get("scm_repo_url"):
         # Set as agent fallback; agents will also try to discover from Jira ticket
         os.environ["SCM_REPO_URL"] = cfg["scm_repo_url"]
@@ -189,7 +189,7 @@ def _set_env_from_config(cfg: dict) -> None:
     else:
         # No explicit repo URL — agents will discover it from Jira ticket
         os.environ["SCM_BASE_URL"] = "https://github.com"
-        os.environ["SCM_BACKEND"] = "github-rest"
+        os.environ["SCM_BACKEND"] = "github-mcp"
     if cfg.get("scm_username"):
         os.environ["SCM_USERNAME"] = cfg["scm_username"]
 
@@ -642,17 +642,24 @@ def _validate_workspace_artifacts(workspace_path: str, jira_key: str) -> None:
     )
 
     # Checkpoint 9: Screenshots in workspace (optional — informational only)
+    # Filenames are feature-based (e.g., lessons-desktop.png), not fixed names.
     screenshot_dir = os.path.join(workspace_path, "web-dev", "screenshots")
-    screenshot_desktop = os.path.join(screenshot_dir, "landing-desktop.png")
-    screenshot_mobile = os.path.join(screenshot_dir, "landing-mobile.png")
-    if os.path.isfile(screenshot_desktop):
-        size = os.path.getsize(screenshot_desktop)
-        print(f"[workspace] CP-9: Desktop screenshot ✓ ({size} bytes)")
+    desktop_pngs = [
+        f for f in (os.listdir(screenshot_dir) if os.path.isdir(screenshot_dir) else [])
+        if f.endswith(".png") and "desktop" in f
+    ]
+    mobile_pngs = [
+        f for f in (os.listdir(screenshot_dir) if os.path.isdir(screenshot_dir) else [])
+        if f.endswith(".png") and "mobile" in f
+    ]
+    if desktop_pngs:
+        size = os.path.getsize(os.path.join(screenshot_dir, desktop_pngs[0]))
+        print(f"[workspace] CP-9: Desktop screenshot ✓ {desktop_pngs[0]} ({size} bytes)")
     else:
         print(f"[workspace] CP-9: Desktop screenshot NOT found (looked in {screenshot_dir})")
-    if os.path.isfile(screenshot_mobile):
-        size = os.path.getsize(screenshot_mobile)
-        print(f"[workspace] CP-9b: Mobile screenshot ✓ ({size} bytes)")
+    if mobile_pngs:
+        size = os.path.getsize(os.path.join(screenshot_dir, mobile_pngs[0]))
+        print(f"[workspace] CP-9b: Mobile screenshot ✓ {mobile_pngs[0]} ({size} bytes)")
     else:
         print(f"[workspace] CP-9b: Mobile screenshot NOT found")
 
@@ -679,7 +686,9 @@ def _print_workspace_progress(workspace_path: str) -> None:
         "CP-8 PR evidence": "web-dev/pr-evidence.json",
         "CP-8b Jira update": "web-dev/jira-update-log.json",
         "CP-9 Review report": "code-review/review-report.json",
-        "CP-9 Desktop screenshot": "web-dev/screenshots/landing-desktop.png",
+        # Screenshots are named by feature route (e.g., lessons-desktop.png), so just
+        # check that the screenshots directory exists and has at least one PNG.
+        # (The missing check below will test the directory, not a fixed filename.)
     }
     present = []
     missing = []

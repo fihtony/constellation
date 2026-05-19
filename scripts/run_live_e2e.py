@@ -60,9 +60,32 @@ def _env(key: str, default: str = "") -> str:
 
 # Set LLM env
 os.environ.setdefault("OPENAI_BASE_URL", _env("OPENAI_BASE_URL", "http://localhost:1288/v1"))
-os.environ.setdefault("OPENAI_MODEL", _env("OPENAI_MODEL", "gpt-5-mini"))
+os.environ.setdefault("OPENAI_MODEL", _env("OPENAI_MODEL", "claude-haiku-4-5-20251001"))
 os.environ.setdefault("OPENAI_API_KEY", _env("OPENAI_API_KEY", ""))
-os.environ.setdefault("AGENT_RUNTIME", "connect-agent")
+os.environ.setdefault("AGENT_RUNTIME", "claude-code")
+
+# Set credentials from tests/.env — ONLY SCM_TOKEN (not GITHUB_TOKEN, per credential isolation policy)
+if _env("TEST_JIRA_TOKEN"):
+    os.environ.setdefault("JIRA_TOKEN", _env("TEST_JIRA_TOKEN"))
+if _env("TEST_JIRA_EMAIL"):
+    os.environ.setdefault("JIRA_EMAIL", _env("TEST_JIRA_EMAIL"))
+if _env("TEST_SCM_TOKEN"):
+    os.environ.setdefault("SCM_TOKEN", _env("TEST_SCM_TOKEN"))
+if _env("TEST_SCM_REPO_URL"):
+    os.environ.setdefault("SCM_REPO_URL", _env("TEST_SCM_REPO_URL"))
+    os.environ.setdefault("SCM_BASE_URL", "https://github.com")
+    os.environ.setdefault("SCM_BACKEND", "github-mcp")
+if _env("TEST_STITCH_API_KEY"):
+    os.environ.setdefault("STITCH_API_KEY", _env("TEST_STITCH_API_KEY"))
+if _env("TEST_STITCH_PROJECT_URL"):
+    stitch_url = _env("TEST_STITCH_PROJECT_URL")
+    if "/projects/" in stitch_url:
+        _stitch_id = stitch_url.rstrip("/").split("/projects/")[-1].split("/")[0]
+        os.environ.setdefault("STITCH_PROJECT_ID", _stitch_id)
+if _env("TEST_STITCH_SCREEN_ID"):
+    os.environ.setdefault("STITCH_SCREEN_ID", _env("TEST_STITCH_SCREEN_ID"))
+os.environ.setdefault("JIRA_BACKEND", "mcp")
+os.environ.setdefault("JIRA_BASE_URL", "https://tarch.atlassian.net")
 
 
 # ---------------------------------------------------------------------------
@@ -565,10 +588,10 @@ async def main():
         print("\n[FATAL] Cannot proceed without LLM. Ensure Copilot Connect is running.")
         sys.exit(1)
 
-    # Step 2: Get runtime
+    # Step 2: Get runtime (claude-code uses Anthropic API directly — no URL check needed)
     from framework.runtime.adapter import get_runtime
     runtime = get_runtime()
-    print(f"[OK] Runtime: connect-agent")
+    print(f"[OK] Runtime: {os.environ.get('AGENT_RUNTIME', 'claude-code')}")
 
     # Step 3: Quick LLM smoke test
     print("\n[step] LLM smoke test...")

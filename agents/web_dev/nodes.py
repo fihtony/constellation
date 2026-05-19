@@ -629,16 +629,39 @@ async def implement_changes(state: dict) -> dict:
     print(f"[{_AGENT_ID}] implement_changes done: success={result.success} turns={result.turns_used} summary={result.summary[:300]!r}")
 
     if not result.success:
-        raise RuntimeError(
-            f"implement_changes failed — claude-code returned error: {result.summary[:500]}"
-        )
+        # Before failing, check if claude committed code despite the error/timeout.
+        # Claude often commits changes then continues with build/test verification which
+        # may fail or time out — we should not discard committed work in that case.
+        _commits_exist = False
+        try:
+            import subprocess as _sp
+            from framework.env_utils import build_isolated_git_env as _bge
+            _ge = _bge(scope="web-dev-impl-check")
+            _diff = _sp.run(
+                ["git", "diff", "--name-only", "main..HEAD"],
+                cwd=state.get("repo_path", ""), capture_output=True, text=True,
+                timeout=10, env=_ge,
+            )
+            _commits_exist = _diff.returncode == 0 and bool(_diff.stdout.strip())
+        except Exception:
+            pass
+        if _commits_exist:
+            print(f"[{_AGENT_ID}] implement_changes: agentic error ({result.summary[:200]!r}) "
+                  f"but commits found on branch — proceeding with partial implementation")
+            impl_summary = f"Partial implementation (stopped early). Commits present. Error: {result.summary[:200]}"
+        else:
+            raise RuntimeError(
+                f"implement_changes failed — claude-code returned error: {result.summary[:500]}"
+            )
+    else:
+        impl_summary = result.summary
 
     # With native tools, we can't track individual file writes from tool_calls.
     # changes_made is populated from git diff in create_pr via _git_commit_all_pending.
     return {
         "changes_made": [],
-        "implementation_summary": result.summary,
-        "agentic_success": True,
+        "implementation_summary": impl_summary,
+        "agentic_success": result.success,
     }
 
 

@@ -31,6 +31,86 @@ _SINGLE_SHOT_SYSTEM = (
 # Reads CONSTELLATION_TOOLS_URL from env and proxies JSON-RPC tool calls to
 # the local HTTP ToolsHTTPServer running in the parent process.
 # ---------------------------------------------------------------------------
+# Credential env vars that must NEVER be passed to the claude subprocess.
+# Claude accesses external services only through the MCP tool bridge (which
+# calls Python tools in the parent process where credentials live). Passing
+# these directly would allow claude to use raw git/gh commands with real creds.
+_CLAUDE_ENV_STRIP = frozenset({
+    "GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN",
+    "SCM_TOKEN", "SCM_USERNAME", "SCM_PASSWORD",
+    "JIRA_TOKEN", "JIRA_EMAIL",
+    "FIGMA_TOKEN",
+    "STITCH_API_KEY",
+    "OPENAI_API_KEY",
+    "GCM_CREDENTIAL_STORE", "CREDENTIAL_HELPER",
+    "GCM_INTERACTIVE",
+    # Test-prefixed variants
+    "TEST_JIRA_TOKEN", "TEST_SCM_TOKEN", "TEST_FIGMA_TOKEN", "TEST_STITCH_API_KEY",
+    "TEST_GITHUB_TOKEN",
+})
+
+
+def _build_claude_env(extra: dict | None = None) -> dict:
+    """Build subprocess env for the claude CLI.
+
+    Strips all service credential vars so claude cannot use raw git/gh
+    commands to reach external services. Claude's own Anthropic auth
+    (~/.claude/) is preserved because HOME is unchanged.
+
+    Also sets git/gh isolation flags to prevent credential fallback:
+      - GIT_TERMINAL_PROMPT=0: no interactive password prompt
+      - GIT_CONFIG_NOSYSTEM=1: ignore /etc/gitconfig
+      - GH_CONFIG_DIR: isolated empty dir (blocks 'gh auth' fallback)
+    """
+    env = {k: v for k, v in os.environ.items() if k not in _CLAUDE_ENV_STRIP}
+
+    # Create an isolated temporary git config that disables credential helpers.
+    # This is written lazily — reuse it across calls within the same process.
+    global _isolated_gitconfig_path
+    if _isolated_gitconfig_path is None or not os.path.exists(_isolated_gitconfig_path):
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".gitconfig-isolated", delete=False, prefix="cc_gitcfg_"
+        )
+        tmp.write(
+            "[credential]\n\thelper =\n"
+            "[safe]\n\tdirectory = *\n"
+            "[user]\n\tname = constellation-agent\n"
+            "\temail = constellation@noreply.local\n"
+        )
+        tmp.close()
+        _isolated_gitconfig_path = tmp.name
+
+    # Isolated GH_CONFIG_DIR: empty dir so gh CLI cannot use host 'gh auth' creds
+    if _isolated_gh_config_dir is None:
+        _init_isolated_gh_config()
+
+    env.update({
+        "GIT_CONFIG_GLOBAL": _isolated_gitconfig_path,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS": "",
+        "GCM_INTERACTIVE": "never",
+        "GH_CONFIG_DIR": _isolated_gh_config_dir or "",
+    })
+    if extra:
+        env.update(extra)
+    return env
+
+
+# Module-level cache for isolated git/gh config paths (created once per process)
+_isolated_gitconfig_path: str | None = None
+_isolated_gh_config_dir: str | None = None
+
+
+def _init_isolated_gh_config() -> None:
+    global _isolated_gh_config_dir
+    gh_dir = os.path.join(tempfile.gettempdir(), "constellation-claude-gh-isolated")
+    os.makedirs(gh_dir, exist_ok=True)
+    _isolated_gh_config_dir = gh_dir
+
+
 _MCP_BRIDGE_SCRIPT = textwrap.dedent("""\
     #!/usr/bin/env python3
     \"\"\"Constellation MCP stdio bridge — proxies tool calls to a local HTTP server.\"\"\"
@@ -254,7 +334,7 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                env={**os.environ},
+                env=_build_claude_env(),
             )
             if proc.returncode != 0:
                 return self.build_failure_result(
@@ -340,6 +420,13 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
             cmd += ["--mcp-config", mcp_config_path]
 
         # --- Run claude -------------------------------------------------
+        # Build credential-stripped env; inject MCP bridge URL when bridge is active
+        _extra_env: dict = {}
+        if tools and http_srv:
+            # CONSTELLATION_TOOLS_URL is passed to the MCP bridge script via
+            # its own env entry in mcp_servers config, not here.  But keep it
+            # available as a fallback in case the bridge script reads os.environ.
+            pass
         try:
             proc = subprocess.run(
                 cmd,
@@ -348,7 +435,7 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
                 text=True,
                 cwd=cwd,
                 timeout=timeout,
-                env={**os.environ},
+                env=_build_claude_env(_extra_env or None),
             )
             stdout = proc.stdout.strip()
             stderr = proc.stderr.strip()
