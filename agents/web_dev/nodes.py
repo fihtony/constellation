@@ -945,7 +945,7 @@ async def self_assess(state: dict) -> dict:
         agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
-            sa_file = os.path.join(agent_dir, "self-assessment.json")
+            sa_file = os.path.join(agent_dir, f"self-assessment-{assess_cycles}.json")
             with open(sa_file, "w", encoding="utf-8") as fh:
                 json.dump({
                     "metadata": {
