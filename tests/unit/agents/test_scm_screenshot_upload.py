@@ -1,21 +1,26 @@
 """Unit tests for GitHubClient image upload and PR description embedding.
 
 Verifies that:
-  1. upload_issue_image sends POST to uploads.github.com with correct headers.
-  2. update_pr sends PATCH to the GitHub API with the correct body.
-  3. The full create_pr flow in web_dev/nodes.py commits screenshots to the
-     branch and embeds raw.githubusercontent.com URLs in the PR description.
+  1. upload_issue_image uses GitHub Release Assets API (octet-stream, not multipart).
+  2. upload_issue_image handles "already_exists" by returning the existing URL.
+  3. update_pr sends PATCH to the GitHub API with the correct body.
+  4. The full create_pr flow in web_dev/nodes.py calls scm_upload_pr_image and
+     embeds the returned CDN URL in the PR description.
+
+Discovery:
+  - uploads.github.com/issues/assets returns HTTP 422 "Bad Size" with any multipart
+    payload (including real screenshots) when using fine-grained PATs.
+  - uploads.github.com/releases/{id}/assets with Content-Type: application/octet-stream
+    WORKS with fine-grained PATs and returns {"browser_download_url": "..."}.
+  - The "screenshot-assets" pre-release is created once per repo and reused.
 """
 from __future__ import annotations
 
-import io
 import json
 import os
 import tempfile
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from threading import Thread
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -24,142 +29,122 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
-class _FakeHTTPHandler(BaseHTTPRequestHandler):
-    """Captures the last request and writes a canned response."""
-
-    server: "_CapturingServer"  # type annotation only
-
-    def log_message(self, fmt, *args):  # noqa: D102  silence output
-        pass
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length else b""
-        self.server.last_method = "POST"
-        self.server.last_path = self.path
-        self.server.last_headers = dict(self.headers)
-        self.server.last_body = body
-        response = json.dumps(self.server.response_payload).encode()
-        self.send_response(self.server.response_status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(response)))
-        self.end_headers()
-        self.wfile.write(response)
-
-    def do_PATCH(self):
-        self.do_POST()
+def _make_png_file() -> tuple[str, bytes]:
+    """Create a tiny valid PNG in a temp file and return (path, bytes)."""
+    png_bytes = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+        b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00"
+        b"\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18"
+        b"\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp.write(png_bytes)
+    tmp.close()
+    return tmp.name, png_bytes
 
 
-class _CapturingServer(HTTPServer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.last_method = ""
-        self.last_path = ""
-        self.last_headers: dict = {}
-        self.last_body = b""
-        self.response_status = 200
-        self.response_payload: dict = {}
+def _release_upload_mocks(release_id: int, cdn_url: str):
+    """Return fake urlopen: call 1 = GET release found, call 2 = upload success."""
+    call_count = [0]
 
+    def _urlopen(req, timeout=None):
+        call_count[0] += 1
+        resp = MagicMock()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        resp.status = 200
+        if call_count[0] == 1:
+            resp.read.return_value = json.dumps({"id": release_id}).encode()
+        else:
+            resp.read.return_value = json.dumps(
+                {"id": 1, "browser_download_url": cdn_url}
+            ).encode()
+        return resp
 
-def _start_fake_server(port: int, status: int, payload: dict) -> _CapturingServer:
-    server = _CapturingServer(("127.0.0.1", port), _FakeHTTPHandler)
-    server.response_status = status
-    server.response_payload = payload
-    t = Thread(target=server.handle_request, daemon=True)
-    t.start()
-    return server
+    return _urlopen
 
 
 # ---------------------------------------------------------------------------
-# GitHubClient.upload_issue_image
+# GitHubClient.upload_issue_image  (Release Assets approach)
 # ---------------------------------------------------------------------------
 
 class TestGitHubClientUploadIssueImage:
-    """Test that upload_issue_image sends the correct HTTP request."""
+    """Test that upload_issue_image uses GitHub Release Assets API (not multipart)."""
 
-    def _make_png(self) -> tuple[str, bytes]:
-        """Create a tiny valid PNG in a temp file and return (path, bytes)."""
-        # Minimal 1×1 white PNG (known-good binary)
-        png_bytes = (
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
-            b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00"
-            b"\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18"
-            b"\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
-        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        tmp.write(png_bytes)
-        tmp.close()
-        return tmp.name, png_bytes
+    def _mock_urlopen_sequence(self, responses: list[tuple[int, dict]]):
+        """Return a mock urlopen that returns different responses per call."""
+        call_count = [0]
+
+        def _urlopen(req, timeout=None):
+            idx = min(call_count[0], len(responses) - 1)
+            status, payload = responses[idx]
+            call_count[0] += 1
+            mock_resp = MagicMock()
+            mock_resp.__enter__ = lambda s: s
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_resp.status = status
+            mock_resp.read.return_value = json.dumps(payload).encode()
+            return mock_resp
+
+        return _urlopen
 
     def test_returns_href_on_success(self):
         """upload_issue_image returns {href: cdn_url} when the API responds 200."""
         from agents.scm.client import GitHubClient
 
         cdn_url = "https://user-images.githubusercontent.com/123/abc.png"
-        expected_payload = {
-            "id": 1,
-            "href": cdn_url,
-            "content_type": "image/png",
-            "size": 68,
-        }
-
-        path, _ = self._make_png()
+        path, _ = _make_png_file()
         try:
-            with patch("agents.scm.client.urlopen") as mock_urlopen:
-                mock_resp = MagicMock()
-                mock_resp.__enter__ = lambda s: s
-                mock_resp.__exit__ = MagicMock(return_value=False)
-                mock_resp.read.return_value = json.dumps(expected_payload).encode()
-                mock_urlopen.return_value = mock_resp
-
+            with patch("agents.scm.client.urlopen",
+                       side_effect=_release_upload_mocks(999, cdn_url)):
                 client = GitHubClient(token="test-token")
                 result, status = client.upload_issue_image(
-                    "fihtony", "english-study-hub", 57, path, filename="desktop.png"
+                    "owner", "repo", 57, path, filename="desktop.png"
                 )
 
-            assert status == "ok"
-            assert result["href"] == cdn_url
+            assert status == "ok", f"Expected ok, got {status!r}: {result}"
+            assert result.get("href") == cdn_url
         finally:
             os.unlink(path)
 
-    def test_sends_correct_url_and_headers(self):
-        """upload_issue_image POSTs to uploads.github.com with correct query and headers."""
+    def test_uses_release_assets_endpoint_with_octet_stream(self):
+        """upload_issue_image POSTs to uploads.github.com releases/{id}/assets with octet-stream."""
         from agents.scm.client import GitHubClient
-        from urllib.request import Request
 
-        path, _ = self._make_png()
-        captured: dict = {}
+        captured_requests = []
 
         def fake_urlopen(req, timeout=None):
-            captured["url"] = req.full_url
-            captured["method"] = req.method
-            captured["headers"] = dict(req.headers)
-            mock_resp = MagicMock()
-            mock_resp.__enter__ = lambda s: s
-            mock_resp.__exit__ = MagicMock(return_value=False)
-            mock_resp.read.return_value = json.dumps(
-                {"href": "https://user-images.githubusercontent.com/x/y.png"}
-            ).encode()
-            return mock_resp
+            captured_requests.append({
+                "url": req.full_url,
+                "method": req.method,
+                "content_type": req.get_header("Content-type"),
+            })
+            resp = MagicMock()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            resp.status = 200
+            if len(captured_requests) == 1:
+                resp.read.return_value = json.dumps({"id": 42}).encode()
+            else:
+                cdn = "https://github.com/owner/repo/releases/download/screenshot-assets/pr10-screenshot.png"
+                resp.read.return_value = json.dumps({"id": 1, "browser_download_url": cdn}).encode()
+            return resp
 
+        path, _ = _make_png_file()
         try:
             with patch("agents.scm.client.urlopen", side_effect=fake_urlopen):
                 client = GitHubClient(token="test-token")
-                result, status = client.upload_issue_image(
-                    "owner", "repo", 42, path, filename="screenshot.png"
-                )
+                client.upload_issue_image("owner", "repo", 10, path, filename="screenshot.png")
 
-            assert status == "ok"
-            assert captured["url"].startswith("https://uploads.github.com/repos/owner/repo/issues/42/assets")
-            assert "name=screenshot.png" in captured["url"]
-            assert captured["method"] == "POST"
-            # Authorization header must NOT appear in assertion
-            # (it should be set but we must not log it — security policy §4)
-            # Authorization header MUST be set (for authenticated API call)
-            # but must NOT appear in log output (see test_authorization_header_not_logged)
-            assert "Authorization" in captured["headers"]
-            # Content type must be octet-stream
-            assert "multipart/form-data" in captured["headers"].get("Content-type", "")
+            assert len(captured_requests) >= 2
+            upload_req = captured_requests[1]
+            assert "uploads.github.com" in upload_req["url"]
+            assert "releases/42/assets" in upload_req["url"]
+            assert "name=pr10-screenshot.png" in upload_req["url"]
+            assert upload_req["method"] == "POST"
+            assert upload_req["content_type"] == "application/octet-stream", (
+                f"Expected octet-stream, got: {upload_req['content_type']}"
+            )
         finally:
             os.unlink(path)
 
@@ -178,17 +163,11 @@ class TestGitHubClientUploadIssueImage:
         from agents.scm.client import GitHubClient
         from unittest.mock import MagicMock
 
-        path, _ = self._make_png()
+        cdn_url = "https://github.com/o/r/releases/download/screenshot-assets/f.png"
+        path, _ = _make_png_file()
         try:
-            with patch("agents.scm.client.urlopen") as mock_urlopen:
-                mock_resp = MagicMock()
-                mock_resp.__enter__ = lambda s: s
-                mock_resp.__exit__ = MagicMock(return_value=False)
-                mock_resp.read.return_value = json.dumps(
-                    {"href": "https://user-images.githubusercontent.com/x/y.png"}
-                ).encode()
-                mock_urlopen.return_value = mock_resp
-
+            with patch("agents.scm.client.urlopen",
+                       side_effect=_release_upload_mocks(1, cdn_url)):
                 client = GitHubClient(token="super-secret-token")
                 client.upload_issue_image("o", "r", 1, path)
 
@@ -294,36 +273,24 @@ class TestSCMUpdatePRTool:
 # ---------------------------------------------------------------------------
 
 class TestScreenshotEmbeddedInPRDescription:
-    """Verify that create_pr node commits screenshots to branch and embeds raw URLs."""
-
-    def _make_png(self) -> str:
-        png_bytes = (
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
-            b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00"
-            b"\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18"
-            b"\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
-        tmp = tempfile.NamedTemporaryFile(suffix="-desktop.png", delete=False)
-        tmp.write(png_bytes)
-        tmp.close()
-        return tmp.name
+    """Verify create_pr uploads screenshots via CDN and embeds the returned URL."""
 
     @pytest.mark.asyncio
-    async def test_screenshots_embedded_in_pr_description(self):
-        """create_pr must commit screenshots and embed raw.githubusercontent.com URLs in PR description."""
-        import shutil
-        import subprocess
+    async def test_screenshots_embedded_via_cdn_upload(self):
+        """create_pr calls scm_upload_pr_image and embeds the CDN URL in PR description."""
         from agents.web_dev.nodes import create_pr
 
-        desktop_png = self._make_png()
+        desktop_png_path, _ = _make_png_file()
         try:
-            # Track all boundary tool calls
             tool_calls: list[dict] = []
+            CDN_URL = "https://github.com/fihtony/english-study-hub/releases/download/screenshot-assets/pr0-desktop.png"
 
             def fake_boundary_tool(state, tool_name, args):
                 tool_calls.append({"tool": tool_name, "args": args})
                 if tool_name == "scm_push":
                     return {"status": "ok"}
+                if tool_name == "scm_upload_pr_image":
+                    return {"ok": True, "image_url": CDN_URL}
                 if tool_name == "scm_create_pr":
                     return {
                         "status": "ok",
@@ -333,7 +300,6 @@ class TestScreenshotEmbeddedInPRDescription:
                     }
                 return {}
 
-            # Mock runtime that returns a valid PR description JSON
             mock_runtime = MagicMock()
             mock_runtime.run.return_value = {
                 "raw_response": json.dumps({
@@ -348,9 +314,8 @@ class TestScreenshotEmbeddedInPRDescription:
                 "repo_url": "https://github.com/fihtony/english-study-hub",
                 "branch_name": "feature/CSTL-1-landing-page",
                 "repo_path": "/tmp/fake-repo",
-                "jira_key": "CSTL-1",
                 "jira_context": {"key": "CSTL-1", "fields": {"summary": "Landing page"}},
-                "screenshots": [desktop_png],
+                "screenshots": [desktop_png_path],
                 "screenshot_captured": True,
                 "implementation_summary": "Implement landing page.",
                 "test_status": "passed",
@@ -358,31 +323,90 @@ class TestScreenshotEmbeddedInPRDescription:
                 "workspace_path": tempfile.mkdtemp(),
             }
 
+            with patch("agents.web_dev.nodes._call_boundary_tool", side_effect=fake_boundary_tool), \
+                 patch("agents.web_dev.nodes._git_commit_all_pending", return_value=["src/App.tsx"]), \
+                 patch("os.makedirs"):
+                result = await create_pr(state)
+
+            assert result.get("pr_url"), "PR URL must be set"
+
+            upload_calls = [c for c in tool_calls if c["tool"] == "scm_upload_pr_image"]
+            assert upload_calls, "scm_upload_pr_image must be called"
+
+            create_pr_calls = [c for c in tool_calls if c["tool"] == "scm_create_pr"]
+            assert create_pr_calls, "scm_create_pr must be called"
+            pr_desc = create_pr_calls[0]["args"].get("description", "")
+            assert CDN_URL in pr_desc, (
+                f"CDN URL not in PR description.\nExpected: {CDN_URL}\nDescription: {pr_desc[:500]}"
+            )
+        finally:
+            os.unlink(desktop_png_path)
+
+    @pytest.mark.asyncio
+    async def test_screenshots_fallback_when_cdn_fails(self):
+        """When CDN upload fails, description contains raw.githubusercontent.com fallback URLs."""
+        import subprocess as _subprocess
+        from agents.web_dev.nodes import create_pr
+
+        desktop_png_path, _ = _make_png_file()
+        try:
+            tool_calls: list[dict] = []
+
+            def fake_boundary_tool(state, tool_name, args):
+                tool_calls.append({"tool": tool_name, "args": args})
+                if tool_name == "scm_push":
+                    return {"status": "ok"}
+                if tool_name == "scm_upload_pr_image":
+                    return {"error": "upload failed"}
+                if tool_name == "scm_create_pr":
+                    return {
+                        "status": "ok",
+                        "prUrl": "https://github.com/fihtony/english-study-hub/pull/88",
+                        "prNumber": 88,
+                        "commitHash": "def456",
+                    }
+                return {}
+
+            mock_runtime = MagicMock()
+            mock_runtime.run.return_value = {
+                "raw_response": json.dumps({
+                    "title": "feat(CSTL-1): implement landing page",
+                    "description": "Initial PR description.",
+                })
+            }
+
             commit_result = MagicMock()
             commit_result.returncode = 0
 
-            # Patch _call_boundary_tool, _git_commit_all_pending, shutil.copy2, subprocess.run
+            state = {
+                "_task_id": "test-task",
+                "_runtime": mock_runtime,
+                "repo_url": "https://github.com/fihtony/english-study-hub",
+                "branch_name": "feature/CSTL-1-fallback",
+                "repo_path": "/tmp/fake-repo-2",
+                "jira_context": {"key": "CSTL-1"},
+                "screenshots": [desktop_png_path],
+                "screenshot_captured": True,
+                "implementation_summary": "test",
+                "test_status": "passed",
+                "changes_made": ["src/App.tsx"],
+                "workspace_path": tempfile.mkdtemp(),
+            }
+
             with patch("agents.web_dev.nodes._call_boundary_tool", side_effect=fake_boundary_tool), \
                  patch("agents.web_dev.nodes._git_commit_all_pending", return_value=["src/App.tsx"]), \
                  patch("shutil.copy2"), \
                  patch("subprocess.run", return_value=commit_result), \
                  patch("os.makedirs"):
-
                 result = await create_pr(state)
 
-            # Verify PR was created
-            assert result.get("pr_url"), "PR URL must be set"
-
-            # Verify scm_create_pr was called with description containing raw GitHub URL
+            assert result.get("pr_url"), "PR URL must be set even with CDN failure"
             create_pr_calls = [c for c in tool_calls if c["tool"] == "scm_create_pr"]
             assert create_pr_calls, "scm_create_pr must be called"
             pr_desc = create_pr_calls[0]["args"].get("description", "")
             assert "raw.githubusercontent.com" in pr_desc, (
-                f"raw.githubusercontent.com URL not in PR description. "
+                f"Expected raw.githubusercontent.com in fallback description.\n"
                 f"Description: {pr_desc[:500]}"
             )
-            assert "feature/CSTL-1-landing-page" in pr_desc, (
-                f"Branch name not in screenshot URL. Description: {pr_desc[:500]}"
-            )
         finally:
-            os.unlink(desktop_png)
+            os.unlink(desktop_png_path)

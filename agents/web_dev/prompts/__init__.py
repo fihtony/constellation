@@ -154,63 +154,101 @@ Always create a comprehensive .gitignore BEFORE writing any other files. It MUST
   coverage/
   __pycache__/
   screenshots/
+  docs/screenshots/
   e2e/evidence/
   FINAL_VERIFICATION.md
   IMPLEMENTATION_EVIDENCE.md
   VERIFICATION_SUMMARY.txt
   *.log
 
-NOTE: Do NOT add *.png globally to .gitignore — evidence screenshots in docs/evidence/
-must be committable for PR description embeds.
+NOTE: Do NOT add *.png globally to .gitignore (it would exclude app icons and assets).
+Screenshots are uploaded to GitHub CDN automatically — do NOT commit them to the branch.
+Only keep source assets (icons, logos) tracked in git.
 
 UI COMPONENT QUALITY RULES (MANDATORY for all React/Vue/Vite UI tasks):
 Apply these rules whenever the task involves building or modifying a user interface.
 
 A. ICON RENDERING — NEVER SHOW ICON NAMES AS TEXT:
    A common failure mode is icons displaying their text name (e.g. "arrow_forward",
-   "chevron_right") instead of the actual icon glyph. Prevent this by:
-   - For Material UI (MUI): ALWAYS install @mui/icons-material and import icon components:
-       npm install @mui/icons-material @mui/material @emotion/react @emotion/styled
-       import ArrowForwardIcon from '@mui/icons-material/ArrowForward';
-       import ChevronRightIcon from '@mui/icons-material/ChevronRight';
-     Then render: <ChevronRightIcon />  NOT the text "chevron_right".
-   - For Google Material Icons (CSS class approach):
-       Link the font: <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-       Then render: <span className="material-icons">chevron_right</span>
-     WITHOUT the font link, "chevron_right" will render as plain text.
-   - Before committing, grep for any raw icon name strings not inside a component:
-       grep -rn "arrow_forward\\|chevron_right\\|close\\|search\\|menu" src/ --include="*.tsx"
-     If found as JSX text content (not as import or CSS class), fix to use the icon component.
-   - If the design uses SVG icons, include the SVG inline or as a React component.
-   - NEVER render an icon name as a plain text node.
+   "chevron_right") instead of the actual icon glyph. ALWAYS identify which icon
+   system the Design HTML Reference uses BEFORE writing any icon code.
+
+   DETECT THE ICON SYSTEM FROM THE DESIGN HTML REFERENCE:
+   - If the HTML has `<link ... "Material+Symbols+Outlined"...>` AND
+     `<span class="material-symbols-outlined">icon_name</span>`:
+     → Use Material Symbols Outlined (variable icon font, see below)
+   - If the HTML has `<link ... "Material+Icons"...>` AND
+     `<span class="material-icons">icon_name</span>`:
+     → Use Material Icons (classic fixed font, same CSS class approach)
+   - If the HTML imports from "@mui/icons-material":
+     → Use MUI React icon components
+
+   OPTION 1 — MATERIAL SYMBOLS OUTLINED (used by Google Stitch designs):
+   This is the MOST COMMON icon approach in Google Stitch-generated designs.
+   The key requirement is loading the VARIABLE FONT and setting CSS properties.
+   a. In index.html, load the variable-weight font (MUST include wght,FILL range):
+      <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
+   b. In index.css (or a global CSS file), add the class definition:
+      .material-symbols-outlined {
+        font-family: 'Material Symbols Outlined';
+        font-weight: normal;
+        font-style: normal;
+        font-size: 24px;
+        line-height: 1;
+        letter-spacing: normal;
+        text-transform: none;
+        display: inline-block;
+        white-space: nowrap;
+        word-wrap: normal;
+        direction: ltr;
+        font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        -webkit-font-smoothing: antialiased;
+      }
+   c. In JSX, render icons as: <span className="material-symbols-outlined">arrow_forward</span>
+      The text content BECOMES the icon when the font and CSS are loaded correctly.
+      NEVER use <span>arrow_forward</span> without the class — it shows as text.
+   d. Verify after implementation:
+      - Build succeeds (npm run build)
+      - No JSX with icon text inside <span> without "material-symbols-outlined" class
+      - Run: grep -rn 'arrow_forward|chevron|close|search|menu' src/ | grep -v 'material-symbols'
+        → If results found outside the class, fix them.
+
+   OPTION 2 — MUI React Icons (if project uses Material UI):
+   Only use this if the project already has @mui/material as a dependency.
+   Install: npm install @mui/icons-material
+   Import: import ArrowForwardIcon from '@mui/icons-material/ArrowForward';
+   Render: <ArrowForwardIcon fontSize="small" />  NOT the text "arrow_forward".
+
+   OPTION 3 — Material Icons classic (if design uses material-icons class):
+   In index.html: <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+   In JSX: <span className="material-icons">chevron_right</span>
+
+   RULE: NEVER render an icon name as a plain text node. If unsure which option to use,
+   choose OPTION 1 (Material Symbols Outlined) as it is the default for Stitch designs.
 
 B. FOOTER POSITIONING — ALWAYS STICKY TO BOTTOM OF VIEWPORT:
    The footer MUST always appear at the bottom of the visible viewport — never floating
    in the middle of the page when content is short. Apply this CSS layout pattern:
-   - Root container:
-       display: flex;
-       flex-direction: column;
-       min-height: 100vh;  /* or 100dvh for mobile */
+   - Root container (App or page wrapper):
+       display: flex; flex-direction: column; min-height: 100vh;
    - Main content area (between header and footer):
        flex: 1;  /* grows to push footer down */
    - Footer: no special positioning needed — it naturally sits at the bottom.
-   Example (React/JSX):
-       <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
+   Example (React/JSX with Tailwind):
+       <div className="flex flex-col min-h-screen">
          <Header />
-         <main style={{ flex: 1 }}>...</main>
+         <main className="flex-1">...</main>
          <Footer />
        </div>
-   - VERIFY before committing: if the page has little content, the footer must still be
-     at the bottom of the viewport, not halfway up the page.
+   VERIFY before committing: open the page with little content — footer must be at bottom.
 
 C. SPACING, PADDING AND MARGIN — FOLLOW DESIGN SPEC EXACTLY:
    - Extract spacing values from the Design Specification section in your task prompt.
    - NEVER use arbitrary spacing like mt-4, p-6, gap-8 without checking the design spec.
    - Use the design spec's spacing unit (usually 8px base grid) consistently.
-   - Section padding should match the design: if the spec says "section-padding: 64px 80px",
-     use padding: 64px 80px (not 40px or 32px).
-   - Component gaps: if the spec shows 16px gap between lesson rows, use gap: 16px.
-   - Container max-width: if the spec says "container-max: 1200px", use max-width: 1200px.
+   - Section padding should match the design: if the spec says "section-padding: 80px",
+     use py-section-padding (if token is in tailwind.config) or padding: 80px.
+   - Container max-width: if the spec says "container-max: 1120px", use max-width: 1120px.
    - After implementing, do a SPACING AUDIT:
        For each major section, compare your padding/margin values against the design spec.
        If they don't match, fix them before committing.
@@ -229,9 +267,99 @@ D. TYPOGRAPHY — MATCH EXACT FONT FAMILIES AND SIZES FROM DESIGN SPEC:
 E. COLOR — USE EXACT HEX VALUES FROM DESIGN SPEC:
    - Extract primary, secondary, background, text colors from the design spec.
    - Use CSS custom properties (variables) for colors:
-       :root { --primary: #3D5AFE; --background: #FAFAFA; --text: #1A1A2E; }
+       :root { --primary: #002045; --background: #f9f9ff; }
    - NEVER guess colors — if a color is not in the spec, use the closest spec color.
    - Background colors for sections, cards, headers, footers must match the spec exactly.
+
+F. TAILWIND CSS SETUP (MANDATORY when Design HTML Reference uses Tailwind classes):
+   Google Stitch and many design tools generate HTML using Tailwind CSS classes for
+   layout and design tokens (e.g. text-primary, bg-on-tertiary-container, font-h1).
+   If the Design HTML Reference uses these classes, you MUST install and configure
+   Tailwind CSS for them to work. WITHOUT Tailwind, ALL these classes are ignored and
+   the page will be completely unstyled.
+
+   DETECT: If the Design HTML Reference has any of these → Tailwind is required:
+     - <script src="https://cdn.tailwindcss.com...">
+     - CSS classes like: flex, items-center, text-primary, max-w-[...], space-x-*, etc.
+     - A tailwind.config object in a <script> tag
+
+   INSTALL STEPS (for Vite+React):
+   1. Install packages (verify they exist first):
+      npm info tailwindcss version && npm info postcss version && npm info autoprefixer version
+      npm install -D tailwindcss postcss autoprefixer
+      npx tailwindcss init -p
+
+   2. In tailwind.config.js, COPY the COMPLETE design token configuration from the
+      Design HTML Reference's tailwind.config object. This includes:
+      - theme.extend.colors: ALL custom color tokens (primary, secondary, surface-*, etc.)
+      - theme.extend.fontFamily: ALL custom font families (h1, h2, body-ui, button, etc.)
+      - theme.extend.fontSize: ALL custom font sizes with lineHeight/letterSpacing
+      - theme.extend.spacing: ALL custom spacing tokens (stack-sm, gutter, section-padding, etc.)
+      - theme.extend.borderRadius: ALL custom radius tokens
+      Example tailwind.config.js structure:
+        /** @type {import('tailwindcss').Config} */
+        export default {
+          content: ['./index.html', './src/**/*.{js,jsx,ts,tsx}'],
+          theme: {
+            extend: {
+              colors: {
+                "primary": "#002045",
+                "secondary": "#13696a",
+                "on-primary": "#ffffff",
+                /* ... ALL other tokens from design ... */
+              },
+              fontFamily: {
+                "h1": ["Work Sans", "sans-serif"],
+                "body-ui": ["Work Sans", "sans-serif"],
+                "body-reading": ["Newsreader", "serif"],
+                /* ... ALL other font families ... */
+              },
+              fontSize: {
+                "h1": ["48px", { lineHeight: "1.2", letterSpacing: "-0.02em", fontWeight: "700" }],
+                /* ... ALL other font sizes ... */
+              },
+              spacing: {
+                "stack-sm": "8px",
+                "stack-md": "24px",
+                "stack-lg": "48px",
+                "gutter": "24px",
+                "section-padding": "80px",
+                "margin-mobile": "16px",
+                /* ... ALL other spacing tokens ... */
+              },
+            },
+          },
+          plugins: [],
+        };
+
+   3. In index.css (at the TOP, before any custom CSS):
+      @tailwind base;
+      @tailwind components;
+      @tailwind utilities;
+
+   4. Verify Tailwind works: run `npm run build` — if it fails with Tailwind errors, fix them.
+      Also check that design token classes resolve: `npx tailwindcss --content 'src/**/*.jsx' --minify | grep 'text-primary'`
+      → Should output CSS for text-primary; if empty, check tailwind.config.js.
+
+   5. IMPORTANT: When design tokens use hyphenated names like "on-tertiary-container",
+      Tailwind requires them to be quoted in the config AND the HTML/JSX must use the
+      full class name: `bg-on-tertiary-container` (not `bg-on_tertiary_container`).
+
+G. RENDERED PAGE VERIFICATION (MANDATORY before committing UI tasks):
+   After implementation, verify the rendered page matches the design:
+   1. Start dev server: npm run dev -- --port 5179 &
+      sleep 10
+   2. Check the page renders: curl -s http://localhost:5179 | grep -c "DOCTYPE|<div"
+      → If count > 0, page is rendering HTML
+   3. Check for icon issues: curl -s http://localhost:5179 | grep -o 'arrow_forward|chevron_right'
+      → If found in non-font context, icons may not be rendering
+   4. Check Tailwind is processing: look for style attribute or class in rendered HTML
+   5. Stop server: kill %1 2>/dev/null || pkill -f "vite.*5179"
+   6. Compare key design elements with the Design HTML Reference:
+      - Header: correct logo, nav links, sign-in button
+      - Main: correct heading text, CTA button (correct color), category links
+      - Footer: positioned at bottom, correct copyright text and links
+   7. If ANY element is missing or wrong → fix it BEFORE committing.
 
 Test organization rules (MANDATORY — follow framework best practices):
 - Vite+React: ALL tests (unit + integration) go in src/ alongside the components:
@@ -305,7 +433,22 @@ For UI tasks — MANDATORY steps (in order):
    - Border radius values (sm, DEFAULT, md, lg, xl)
    Write these values into your CSS/config — do NOT use generic defaults like "Inter" or "Roboto".
 
-2. COMPONENT INVENTORY — MANDATORY when Design HTML Reference is available (not N/A):
+2. TAILWIND CSS SETUP — MANDATORY if Design HTML Reference uses Tailwind:
+   DETECT: If the Design HTML Reference contains `cdn.tailwindcss.com` or a tailwind.config
+   script block → Tailwind is used. YOU MUST install and configure it.
+   a. Install packages: npm install -D tailwindcss postcss autoprefixer
+   b. Init: npx tailwindcss init -p
+   c. In tailwind.config.js — set content paths AND copy ALL design tokens from the
+      Design HTML Reference's tailwind.config object (colors, fontFamily, fontSize, spacing,
+      borderRadius). The content path must be: ['./index.html', './src/**/*.{{js,jsx,ts,tsx}}']
+   d. In index.css (FIRST THREE LINES — before any custom CSS):
+      @tailwind base;
+      @tailwind components;
+      @tailwind utilities;
+   e. Verify: npm run build — must succeed. If Tailwind errors, fix config.
+   WITHOUT this setup, ALL Tailwind classes (flex, text-primary, font-h1, etc.) are ignored.
+
+3. COMPONENT INVENTORY — MANDATORY when Design HTML Reference is available (not N/A):
    Parse the Design HTML Reference and list EVERY visible component you see.
    This list is your implementation contract — you MUST implement exactly these components
    and NO OTHERS. For example, if you see:
@@ -318,39 +461,60 @@ For UI tasks — MANDATORY steps (in order):
    rating stars, pagination, loading states, extra CTA sections, breadcrumbs — unless
    explicitly present in the Design HTML Reference.
 
-3. IMPLEMENT EACH COMPONENT faithfully — match fonts, colors, spacing, and layout.
+4. IMPLEMENT EACH COMPONENT faithfully — match fonts, colors, spacing, and layout.
    Use the Design HTML Reference structure, CSS class names/patterns, and design tokens.
+   KEY: If the design uses Tailwind classes, your React JSX MUST use the same class names.
+   The Tailwind config (step 2) translates those class names to CSS.
 
-4. Verify npm packages before adding them (see npm rules in system prompt).
+5. Verify npm packages before adding them (see npm rules in system prompt).
 
-5. Run: npm install  (fix any install errors before continuing)
+6. Run: npm install  (fix any install errors before continuing)
 
-6. Run: npm run build  (fix ALL build/TypeScript errors before continuing)
+7. Run: npm run build  (fix ALL build/TypeScript errors before continuing)
 
-7. VERIFY ROUTING — MANDATORY (prevents blank screen):
+8. VERIFY ROUTING — MANDATORY (prevents blank screen):
    - Open App.tsx and confirm the new page component is imported and rendered.
    - If app uses React Router, confirm a <Route> for the new page exists.
    - If the page is NOT wired in App.tsx, add the import and route NOW.
    - Start the dev server briefly to confirm the page renders without a blank screen:
        cd {repo_path} && npm run dev -- --port 5179 &
-       sleep 8
+       sleep 10
        curl -s http://localhost:5179 | head -50   # should show HTML, not blank
        kill %1 2>/dev/null || true
    - If the server responds with blank HTML or errors, fix App.tsx routing before continuing.
 
-8. DESIGN FIDELITY AUDIT — MANDATORY before committing (for UI tasks):
-   Compare your implementation against the Design HTML Reference:
-   a. List EVERY visible component in the Design HTML Reference (make a checklist).
-   b. Verify each design component is present in your implementation with correct content.
-   c. List EVERY component in your implementation.
-   d. For each implementation component NOT found in the design reference → REMOVE IT.
-   e. Common violations to check: search bar, filter UI, tags, duration/time text,
-      author names, extra cards, extra navigation items, rating stars, pagination.
-   This audit step is NOT optional — skipping it causes self-assessment failure.
+9. RENDERED PAGE COMPARISON — MANDATORY before committing (for UI tasks with design reference):
+   Compare your implementation against the Design HTML Reference by running the app:
+   a. Start dev server: cd {repo_path} && npm run dev -- --port 5179 &
+      sleep 10
+   b. Fetch rendered HTML: curl -s http://localhost:5179 > /tmp/rendered.html
+   c. Compare component by component:
+      - Check header: grep -o 'Linguist Library|Sign In' /tmp/rendered.html
+      - Check main content: grep -o 'Master Academic|Start Learning' /tmp/rendered.html
+      - Check icons: grep -o 'material-symbols-outlined' /tmp/rendered.html
+        → Should find the CSS class, not raw icon names outside a class
+      - Check footer: grep -o 'Terms of Service|Privacy Policy' /tmp/rendered.html
+   d. Common issues to check:
+      - If page shows plain text "arrow_forward" → Material Symbols CSS class missing
+      - If footer is floating midpage → missing flex-col min-h-screen on root wrapper
+      - If design colors are wrong → Tailwind config not set up with tokens
+      - If fonts are wrong → Google Fonts link missing or font-family not applied
+   e. Stop server: kill %1 2>/dev/null || pkill -f "vite.*5179" || true
+   f. Fix ALL issues found before committing.
 
-9. Stage and commit ALL changes:
-   git add -A
-   git commit -m 'feat(<JIRA-KEY>): implement UI components'
+10. DESIGN FIDELITY AUDIT — MANDATORY before committing (for UI tasks):
+    Compare your implementation against the Design HTML Reference:
+    a. List EVERY visible component in the Design HTML Reference (make a checklist).
+    b. Verify each design component is present in your implementation with correct content.
+    c. List EVERY component in your implementation.
+    d. For each implementation component NOT found in the design reference → REMOVE IT.
+    e. Common violations to check: search bar, filter UI, tags, duration/time text,
+       author names, extra cards, extra navigation items, rating stars, pagination.
+    This audit step is NOT optional — skipping it causes self-assessment failure.
+
+11. Stage and commit ALL changes:
+    git add -A
+    git commit -m 'feat(<JIRA-KEY>): implement UI components'
 
 For non-UI tasks:
 After implementation, stage and commit ALL changes:
