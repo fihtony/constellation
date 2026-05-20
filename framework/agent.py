@@ -60,7 +60,7 @@ class AgentDefinition:
     model: str = "gpt-5-mini"
     workflow: Any = None  # Workflow instance or None
     config: dict = field(default_factory=dict)
-    launch_spec: LaunchSpec = None              # Container launch specification
+    launch_spec: LaunchSpec | None = None              # Container launch specification
 
 
 @dataclass
