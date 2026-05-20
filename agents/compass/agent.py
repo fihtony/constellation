@@ -21,6 +21,7 @@ import json
 import re
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
+from agents.compass.ui.routes import handle_ui_request
 from agents.compass.tools import TOOL_NAMES, register_compass_tools
 
 compass_definition = AgentDefinition(
@@ -151,6 +152,7 @@ class CompassAgent(BaseAgent):
                  request=user_text[:200])
 
         # --- Dispatch ---
+        dispatch_data = {}
         if task_type == "development":
             jira_key = _extract_jira_key(user_text)
             log.info("dispatching development task", jira_key=jira_key)
@@ -220,8 +222,26 @@ class CompassAgent(BaseAgent):
             metadata={"agentId": _aid},
         )]
         task_store.complete_task(task.id, artifacts=artifacts)
-        return task_store.get_task_dict(task.id)
+
+        # Build UI-friendly response with ui_update for frontend rendering
+        display_status = dispatch_data.get("status", "unknown") if task_type == "development" else (
+            dispatch_data.get("status", "unknown") if task_type == "office" else "completed"
+        )
+        ui_update = {
+            "task_id": task.id,
+            "task_status": task.status.state.value,
+            "chat_message": {
+                "role": "COMPASS",
+                "text": response_text,
+                "style": "failed" if display_status in ("error", "failed", "unknown") else "normal",
+            }
+        }
+        return {**task_store.get_task_dict(task.id), "ui_update": ui_update}
 
     async def get_task(self, task_id: str) -> dict:
         """Return real task state from TaskStore."""
         return self.services.task_store.get_task_dict(task_id)
+
+    def serve_ui(self, path: str) -> dict:
+        """Handle UI-related requests."""
+        return handle_ui_request("GET", path, self.services.task_store)
