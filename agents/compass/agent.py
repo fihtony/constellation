@@ -21,6 +21,7 @@ import json
 import re
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
+from agents.compass.ui.routes import handle_ui_request
 from agents.compass.tools import TOOL_NAMES, register_compass_tools
 
 compass_definition = AgentDefinition(
@@ -225,3 +226,7 @@ class CompassAgent(BaseAgent):
     async def get_task(self, task_id: str) -> dict:
         """Return real task state from TaskStore."""
         return self.services.task_store.get_task_dict(task_id)
+
+    def serve_ui(self, path: str) -> dict:
+        """Handle UI-related requests."""
+        return handle_ui_request("GET", path, self.services.task_store)
