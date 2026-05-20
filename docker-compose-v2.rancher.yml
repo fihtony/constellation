@@ -1,11 +1,7 @@
-# Constellation v2 — Docker Compose
-# Orchestrates all agents in the new framework architecture.
+# Constellation v2 — Docker Compose for Rancher Desktop
+version: "3.8"
 
 services:
-
-  # -----------------------------------------------------------------------
-  # Compass Agent — control plane entry point (port 8000)
-  # -----------------------------------------------------------------------
   compass:
     image: constellation-v2-compass:latest
     build:
@@ -15,19 +11,19 @@ services:
       team-lead:
         condition: service_healthy
     environment:
-      AGENT_ID: "compass"
-      HOST: "0.0.0.0"
-      PORT: "8000"
-      AGENT_RUNTIME: "claude-code"
+      AGENT_ID: compass
+      HOST: 0.0.0.0
+      PORT: 8000
+      AGENT_RUNTIME: claude-code
       ARTIFACT_ROOT: /app/artifacts
-      CONTAINER_RUNTIME: docker
+      CONTAINER_RUNTIME: rancher
+    labels:
+      constellation.agent_id: compass
+      constellation.agent_role: fundamental
     volumes:
       - ./artifacts:/app/artifacts
       - ./config/.env:/app/config/.env:ro
-    labels:
-      constellation.agent_id: "compass"
-      constellation.agent_name: "Compass Agent"
-      constellation.agent_role: "fundamental"
+      - ~/.rd/docker.sock:/var/run/docker.sock
     ports:
       - "8000:8000"
     healthcheck:
@@ -39,28 +35,25 @@ services:
     networks:
       - constellation-v2
 
-  # -----------------------------------------------------------------------
-  # Team Lead Agent — intelligence layer (port 8030)
-  # -----------------------------------------------------------------------
   team-lead:
     image: constellation-v2-team-lead:latest
     build:
       context: .
       dockerfile: agents/team_lead/Dockerfile
     environment:
-      AGENT_ID: "team-lead"
-      HOST: "0.0.0.0"
-      PORT: "8030"
-      AGENT_RUNTIME: "claude-code"
+      AGENT_ID: team-lead
+      HOST: 0.0.0.0
+      PORT: 8030
+      AGENT_RUNTIME: claude-code
       ARTIFACT_ROOT: /app/artifacts
-      CONTAINER_RUNTIME: docker
+      CONTAINER_RUNTIME: rancher
+    labels:
+      constellation.agent_id: team-lead
+      constellation.agent_role: fundamental
     volumes:
       - ./artifacts:/app/artifacts
       - ./config/.env:/app/config/.env:ro
-    labels:
-      constellation.agent_id: "team-lead"
-      constellation.agent_name: "Team Lead Agent"
-      constellation.agent_role: "fundamental"
+      - ~/.rd/docker.sock:/var/run/docker.sock
     ports:
       - "8030:8030"
     healthcheck:

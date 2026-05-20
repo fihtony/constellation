@@ -10,6 +10,17 @@ runtime:
   backend: claude-code
   model: claude-haiku-4-5-20251001
 
+# Agent launch specifications
+agents:
+  compass:
+    launch_spec:
+      runtime: docker
+      network: constellation-network
+  team-lead:
+    launch_spec:
+      runtime: docker
+      network: constellation-network
+
 # Skills directory
 skills:
   directory: skills

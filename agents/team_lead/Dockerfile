@@ -7,14 +7,16 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY framework/     /app/framework/
-COPY agents/        /app/agents/
-COPY skills/        /app/skills/
-COPY config/        /app/config/
-COPY scripts/       /app/scripts/
+COPY agents/       /app/agents/
+COPY skills/       /app/skills/
+COPY config/       /app/config/
+COPY scripts/      /app/scripts/
 COPY pyproject.toml /app/
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    ARTIFACT_ROOT=/app/artifacts \
+    AGENT_RUNTIME=claude-code
 
 LABEL constellation.agent_id="team-lead"
 LABEL constellation.agent_name="Team Lead Agent"
