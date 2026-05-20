@@ -1117,7 +1117,7 @@ def _extract_context_with_llm(jira_context: dict, runtime) -> dict:
     Falls back to regex extraction if runtime is unavailable or LLM call fails.
     """
     if not runtime:
-        print("[{_AGENT_ID}] No runtime available for LLM extraction — using regex fallback")
+        print(f"[{_AGENT_ID}] No runtime available for LLM extraction — using regex fallback")
         return _extract_urls_from_ticket(jira_context)
 
     from agents.team_lead.prompts.extraction import EXTRACTION_SYSTEM, EXTRACTION_TEMPLATE
