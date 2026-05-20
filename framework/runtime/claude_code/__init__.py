@@ -311,6 +311,7 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
         timeout: int = 120,
         max_tokens: int = 4096,
         plugin_manager=None,
+        cwd: str | None = None,
     ) -> dict:
         cli = _find_claude_cli()
         if not cli:
@@ -335,6 +336,7 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
                 text=True,
                 timeout=timeout,
                 env=_build_claude_env(),
+                cwd=cwd,
             )
             if proc.returncode != 0:
                 return self.build_failure_result(

@@ -29,6 +29,8 @@ class PermissionSet:
     scm: str = "read"
     filesystem: str = "workspace-only"
     custom: dict[str, Any] = field(default_factory=dict)
+    agent_launching: bool = False              # Whether this agent can launch other agents
+    allowed_agents: list[str] = field(default_factory=list)  # List of agent_ids that can be launched
 
 
 class PermissionEngine:
@@ -62,6 +64,22 @@ class PermissionEngine:
         if not self.check_scm_write():
             raise PermissionDeniedError("SCM write operations are not permitted")
 
+    def check_agent_launching(self, target_agent_id: str) -> bool:
+        """Return True if this agent can launch target_agent_id."""
+        if not self._permissions.agent_launching:
+            return False
+        allowed = self._permissions.allowed_agents
+        if not allowed:
+            return True  # No restriction list = can launch any
+        return target_agent_id in allowed
+
+    def require_agent_launching(self, target_agent_id: str) -> None:
+        """Raise PermissionDeniedError if agent launching not permitted."""
+        if not self.check_agent_launching(target_agent_id):
+            raise PermissionDeniedError(
+                f"Agent launching '{target_agent_id}' is not permitted"
+            )
+
     @classmethod
     def from_dict(cls, data: dict) -> PermissionEngine:
         """Build a PermissionEngine from a raw config dict."""
@@ -71,6 +89,8 @@ class PermissionEngine:
             scm=data.get("scm", "read"),
             filesystem=data.get("filesystem", "workspace-only"),
             custom=data.get("custom", {}),
+            agent_launching=data.get("agent_launching", False),
+            allowed_agents=data.get("allowed_agents", []),
         )
         return cls(ps)
     @classmethod
@@ -85,6 +105,8 @@ class PermissionEngine:
             denied_tools: []
             scm: read-write
             filesystem: workspace-only
+            agent_launching: true
+            allowed_agents: [web_dev, code_review]
             custom:
               protected_branch_patterns: ["^main$", "^master$"]
         """

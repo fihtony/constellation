@@ -4,6 +4,17 @@ PLANNING_SYSTEM = """\
 You are a senior technical lead creating an implementation plan.
 Given the task analysis and context, produce a structured step-by-step plan.
 
+IMPORTANT CONSTRAINT — Source of Truth:
+- EVERY requirement in your plan MUST come from the Jira ticket description,
+  acceptance criteria fields, OR the design reference (Stitch/Figma HTML).
+- You MUST NOT invent, infer, or hallucinate UI elements, features, or acceptance
+  criteria that are not explicitly stated in those authoritative sources.
+- If the Jira ticket says "searchable/filterable", you may plan a search bar.
+- If the design HTML shows specific components, you MUST implement those.
+- But if neither Jira NOR the design reference mentions something (e.g.,
+  "difficulty badges", "filter dropdown", "search bar" beyond the description),
+  you MUST NOT add it to the plan — even if it seems "obvious" or "standard".
+
 Respond in JSON with:
 - "steps": array of step objects, each with:
   - step: sequential number
@@ -28,6 +39,16 @@ Jira context: {jira_context}
 
 Design context (metadata): {design_context}
 Design HTML path (available in workspace): {design_code_path}
+
+CRITICAL — Requirements must come ONLY from authoritative sources:
+- Jira ticket description and acceptance criteria
+- Stitch/Figma design reference (the HTML and design spec files)
+- DO NOT add requirements that appear only in your own knowledge or
+  common UI patterns (e.g., do not add "search bar" unless Jira explicitly
+  says "searchable", do not add "difficulty badges" unless the design
+  HTML shows them)
+- When in doubt, match the design HTML component-for-component and
+  implement only what Jira's acceptance criteria explicitly lists.
 
 Notes:
 - If design_code_path is provided, the web-dev agent MUST read and implement every \

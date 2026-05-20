@@ -56,6 +56,8 @@ class CopilotCLIAdapter(AgentRuntimeAdapter):
         model: str | None = None,
         timeout: int = 120,
         max_tokens: int = 4096,
+        plugin_manager=None,
+        cwd: str | None = None,
     ) -> dict:
         return run_single_shot(
             prompt,

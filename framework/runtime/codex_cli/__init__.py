@@ -38,6 +38,8 @@ class CodexCLIAdapter(AgentRuntimeAdapter):
         model: str | None = None,
         timeout: int = 120,
         max_tokens: int = 4096,
+        plugin_manager=None,
+        cwd: str | None = None,
     ) -> dict:
         return run_single_shot(
             prompt,
@@ -48,6 +50,7 @@ class CodexCLIAdapter(AgentRuntimeAdapter):
             max_tokens=max_tokens,
             default_system=_SINGLE_SHOT_SYSTEM,
             backend_used="codex-cli",
+            cwd=cwd,
         )
 
     def run_agentic(
