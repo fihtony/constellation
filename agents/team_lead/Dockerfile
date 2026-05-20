@@ -2,16 +2,19 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+COPY pyproject.toml /app/
+
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -e . \
+    && apt-get clean
 
 COPY framework/     /app/framework/
 COPY agents/       /app/agents/
 COPY skills/       /app/skills/
 COPY config/       /app/config/
 COPY scripts/      /app/scripts/
-COPY pyproject.toml /app/
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
