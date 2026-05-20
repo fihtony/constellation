@@ -301,7 +301,7 @@ class SCMUploadPRImage(BaseTool):
             backend="github-rest",
         )
         result, status = client.upload_issue_image(
-            owner, repo, pr_number, image_path, filename=filename
+            owner, repo, pr_number, image_path, filename=filename, task_id=task_id
         )
         if status != "ok":
             log.error("scm_upload_pr_image failed", status=status, error=str(result)[:200])
