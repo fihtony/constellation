@@ -95,3 +95,37 @@ tests/
 ```
 
 The `asyncio_mode = "auto"` pytest setting means all async test functions run automatically without `@pytest.mark.asyncio`.
+
+## Working Guidelines
+
+### Core Principle (Most Important)
+**You must never do work that constellation agents should do themselves.** When fixing issues:
+- **NEVER** directly complete tasks (manually edit code, write code snippets, submit PRs)
+- **MUST** improve the constellation system (agent code, skills, tools, instructions, prompts, etc.)
+- Constellation agents must complete tasks through their own workflow
+
+### Credentials & Sensitive Data
+1. **NEVER** hard-code PII (personally identifiable information) in code or test scripts — always use values from `.env`
+2. **NEVER** store credentials in the local machine keychain — always read from `.env`
+3. **NEVER** put credentials in URLs — always use headers; **NEVER** log credential headers in log files
+
+### Documentation & Language
+- Create/update documentation in English
+- Explain in English
+- Generate code, scripts, test cases, skills, instructions, and prompts in English
+
+### Development Environment
+- Use Python 3.12 virtual environment
+- All test output or workspace files must be in the `artifacts/` folder
+
+### Boundary Agent Reference
+When encountering issues related to boundary agents (scm, ui_design, jira, etc.), reference the `v1/` folder for implementation patterns
+
+### Testing Principles
+- **NEVER** hard-code any step for a test Jira ticket
+- Constellation agents are built to complete **any** development task, not just one specific task
+- Tests must run successfully on both local machine and in containers
+
+### Workflow
+- Improve agent code, skills, tools, instructions, and prompts — do not directly complete development tasks
+- Drive task completion through the system's workflow

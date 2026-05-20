@@ -53,7 +53,7 @@ web_dev_workflow = Workflow(
             "fail": fix_gaps,
             "need_user_input": pause_for_user_input,
         }),
-        (fix_gaps, self_assess),  # design gaps fixed — re-assess without re-running all tests
+        (fix_gaps, run_tests),  # fix gaps, then re-run build+test before reassessing
         (capture_screenshot, create_pr),
         (create_pr, update_jira),
         (update_jira, report_result),

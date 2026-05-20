@@ -658,6 +658,10 @@ Instructions:
 
 STEP 1 — ACCEPTANCE CRITERIA:
 For each acceptance criterion, check whether it is satisfied by the changed files.
+NOTE: Requirements from Jira acceptance criteria (e.g. "searchable/filterable list",
+"difficulty level and duration") are AUTHORITATIVE — they are NOT extra elements.
+If Jira explicitly requires something that the design HTML does not show, implement
+it but note it as a "Jira-required extension" in component_checks (status=present).
 
 STEP 2 — DESIGN COMPONENT INVENTORY:
 Parse the Design HTML reference and extract ALL visible components/elements. For example:
@@ -669,28 +673,16 @@ Parse the Design HTML reference and extract ALL visible components/elements. For
 For each design component, check whether it is present in the implementation with correct
 content, fonts, and colors. Produce a "component_checks" list entry for each.
 
-STEP 3 — EXTRA ELEMENTS CHECK (critical for UI fidelity):
-Scan the implementation (changed files) for UI elements NOT present in the design reference.
-This is the MOST COMMON failure mode. Look specifically for:
-  - Search bars or search input fields
-  - Filter dropdowns, select inputs, or sorting controls
-  - Tags, badges, category chips
-  - Duration or time labels ("5 min", "2 hours", reading time)
-  - Author names, "by Author" text, date fields
-  - Rating stars, like counts, view counts
-  - Progress bars or completion percentages
-  - Pagination controls or "Load more" buttons
-  - Skeleton loading states, spinners
-  - Extra navigation links not in the design
-  - Social share buttons, bookmark icons
-  - Breadcrumbs, back navigation
-  - Additional CTAs, promotional banners
-  - Extra list items beyond what the design shows
+STEP 3 — EXTRA ELEMENTS CHECK (only for non-Jira elements):
+This step ONLY flags elements NOT mentioned in BOTH Jira acceptance criteria AND the
+design HTML. Look for things that NEITHER source mentions, for example:
+  - Extra navigation links not in design and not in Jira
+  - Social share buttons, bookmark icons not in either source
+  - Pagination controls or "Load more" buttons beyond what design shows
+  - Promotional banners or additional CTAs not in any source
 
-For EACH extra element found:
-  - Add a component_check entry with status "extra"
-  - Add to "gaps" with message: "Extra element not in design: <element name>"
-  - Reduce score by at least 0.2 per extra element
+Do NOT flag as "extra" any element that appears in Jira acceptance criteria,
+even if absent from the design HTML reference.
 
 STEP 4 — DESIGN TOKEN CHECK:
 Verify font families, primary colors, and spacing match the design spec.
@@ -699,8 +691,10 @@ STEP 5 — ROUTING CHECK:
 Confirm the new page is wired into App.tsx. If not, add gap: "Blank screen: page not routed".
 
 SCORING RULES:
-- Score 0.9+ ONLY if ALL criteria are met AND all design components are present AND zero extra elements.
-- Any extra element (search bar, tags, duration, etc.) → score must be < 0.9, verdict="fail".
+- Score 0.9+ ONLY if ALL Jira acceptance criteria are met AND all design components
+  are present AND zero unauthorized extra elements exist.
+- If Jira requires search/filter (e.g. "searchable/filterable list") and design HTML
+  does not show it — add the feature (it is Jira-required), do not flag as extra.
 - Missing design component → score reduced proportionally.
 - Wrong design tokens (wrong font, wrong color) → score reduced.
 
@@ -719,7 +713,6 @@ Return only valid JSON, no markdown fences:
 }}
 
 Pass threshold: score >= 0.9.
-Fail immediately if any extra element is found (not in design reference).
 """
 
 # ---------------------------------------------------------------------------

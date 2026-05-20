@@ -1,0 +1,4 @@
+agent_id: log-store
+port: 8040
+artifact_root: /artifacts
+poll_interval_seconds: 5

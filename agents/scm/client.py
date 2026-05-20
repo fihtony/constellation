@@ -603,6 +603,7 @@ class GitHubClient:
         issue_number: int,
         image_path: str,
         filename: str = "",
+        task_id: str = "",
         timeout: int = 60,
     ) -> tuple[dict, str]:
         """Upload a screenshot image as a GitHub release asset for CDN hosting.
@@ -620,8 +621,11 @@ class GitHubClient:
         import os as _os
         fname = filename or _os.path.basename(image_path)
 
-        # Include PR/issue number as prefix to allow same-named files across PRs
-        if issue_number:
+        # Build a unique filename so screenshots from different E2E runs never
+        # reuse stale CDN assets. task_id is preferred; falls back to PR number.
+        if task_id:
+            unique_fname = f"{task_id}-{fname}"
+        elif issue_number:
             unique_fname = f"pr{issue_number}-{fname}"
         else:
             unique_fname = fname

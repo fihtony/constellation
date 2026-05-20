@@ -34,6 +34,10 @@ AGENTS = {
     "team-lead": ("agents.team_lead.agent", "TeamLeadAgent", "team_lead_definition"),
     "web-dev": ("agents.web_dev.agent", "WebDevAgent", "web_dev_definition"),
     "code-review": ("agents.code_review.agent", "CodeReviewAgent", "code_review_definition"),
+    "office": ("agents.office.agent", "OfficeAgent", "office_definition"),
+    "jira": ("agents.jira.adapter", "JiraAgentAdapter", "jira_definition"),
+    "scm": ("agents.scm.adapter", "SCMAgentAdapter", "scm_definition"),
+    "ui-design": ("agents.ui_design.adapter", "UIDesignAgentAdapter", "ui_design_definition"),
 }
 
 
@@ -46,9 +50,8 @@ def create_services(
     Permission binding is handled by BaseAgent.start() via the agent's
     permission_profile in its AgentDefinition — no manual binding here.
     """
-    skills_registry = SkillsRegistry()
-    if os.path.isdir(skills_dir):
-        skills_registry.load_directory(skills_dir)
+    skills_registry = SkillsRegistry(skills_dir)
+    skills_registry.load_all()
 
     # Load agent config to display at startup
     config = load_agent_config(agent_id)
@@ -102,8 +105,10 @@ async def main():
     )
     _adv_url = f"http://localhost:{args.port}"
 
+    _agent = agent
+
     class AgentHandler(A2ARequestHandler):
-        agent = agent  # noqa: F811
+        agent = _agent  # noqa: F811
         advertised_url = _adv_url
         agent_card_path = _card_path
 

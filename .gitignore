@@ -21,6 +21,7 @@ reference/
 certs/
 tests/data*
 teams-bot/
+.claude/worktrees/
 .connect-agent/
 
 # SQLite database files (persisted in data/ directory, not committed)
@@ -39,3 +40,4 @@ data/
 *.swo
 *~
 .DS_Store
+.worktrees/

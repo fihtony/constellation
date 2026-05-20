@@ -31,6 +31,10 @@ denied_tools: []
 
 scm: read-write
 filesystem: workspace-only
+agent_launching: true
+allowed_agents:
+  - web-dev
+  - code-review
 
 custom:
   protected_branch_patterns:

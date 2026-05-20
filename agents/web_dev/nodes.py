@@ -85,16 +85,26 @@ def _safe_json(text: str, fallback: Any = None) -> Any:
     """
     if not text:
         return fallback
+    # Try to find JSON object or array in the response first
     match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
             pass
+    # Fall back to parsing the whole text
     try:
         return json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return fallback
+        pass
+    # Last resort: try stripping markdown code fences
+    stripped = re.sub(r"```(?:json)?\s*", "", text.strip()).strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+    return fallback
 
 
 def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
@@ -629,16 +639,39 @@ async def implement_changes(state: dict) -> dict:
     print(f"[{_AGENT_ID}] implement_changes done: success={result.success} turns={result.turns_used} summary={result.summary[:300]!r}")
 
     if not result.success:
-        raise RuntimeError(
-            f"implement_changes failed — claude-code returned error: {result.summary[:500]}"
-        )
+        # Before failing, check if claude committed code despite the error/timeout.
+        # Claude often commits changes then continues with build/test verification which
+        # may fail or time out — we should not discard committed work in that case.
+        _commits_exist = False
+        try:
+            import subprocess as _sp
+            from framework.env_utils import build_isolated_git_env as _bge
+            _ge = _bge(scope="web-dev-impl-check")
+            _diff = _sp.run(
+                ["git", "diff", "--name-only", "main..HEAD"],
+                cwd=state.get("repo_path", ""), capture_output=True, text=True,
+                timeout=10, env=_ge,
+            )
+            _commits_exist = _diff.returncode == 0 and bool(_diff.stdout.strip())
+        except Exception:
+            pass
+        if _commits_exist:
+            print(f"[{_AGENT_ID}] implement_changes: agentic error ({result.summary[:200]!r}) "
+                  f"but commits found on branch — proceeding with partial implementation")
+            impl_summary = f"Partial implementation (stopped early). Commits present. Error: {result.summary[:200]}"
+        else:
+            raise RuntimeError(
+                f"implement_changes failed — claude-code returned error: {result.summary[:500]}"
+            )
+    else:
+        impl_summary = result.summary
 
     # With native tools, we can't track individual file writes from tool_calls.
     # changes_made is populated from git diff in create_pr via _git_commit_all_pending.
     return {
         "changes_made": [],
-        "implementation_summary": result.summary,
-        "agentic_success": True,
+        "implementation_summary": impl_summary,
+        "agentic_success": result.success,
     }
 
 
@@ -904,11 +937,16 @@ async def self_assess(state: dict) -> dict:
 
     result = runtime.run(
         prompt, system_prompt=SELF_ASSESS_SYSTEM,
-        max_tokens=2048,
+        max_tokens=4096,
         plugin_manager=state.get("_plugin_manager"),
+        cwd=state.get("repo_path") or None,
     )
 
-    data = _safe_json(result.get("raw_response", ""), fallback={})
+    raw_response = result.get("raw_response", "")
+    print(f"[{_AGENT_ID}] self_assess raw_response (first 500 chars): {raw_response[:500]!r}")
+    data = _safe_json(raw_response, fallback={})
+    if not data:
+        print(f"[{_AGENT_ID}] self_assess _safe_json returned empty — raw_response type={type(raw_response).__name__}, len={len(raw_response) if raw_response else 0}")
     score = float(data.get("score", 0))
     verdict = data.get("verdict", "fail")
     gaps = data.get("gaps", [])
@@ -922,7 +960,7 @@ async def self_assess(state: dict) -> dict:
         agent_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(agent_dir, exist_ok=True)
         try:
-            sa_file = os.path.join(agent_dir, "self-assessment.json")
+            sa_file = os.path.join(agent_dir, f"self-assessment-{assess_cycles}.json")
             with open(sa_file, "w", encoding="utf-8") as fh:
                 json.dump({
                     "metadata": {
@@ -1269,22 +1307,10 @@ async def capture_screenshot(state: dict) -> dict:
                         )
                         pg = await ctx.new_page()
                         try:
-                            # Block external font CDNs so 'load' fires quickly.
-                            # The page renders with system font fallbacks; all
-                            # layout / colour / spacing from CSS is fully applied.
-                            async def _block_fonts(route, request):  # noqa: ANN001
-                                host = request.url.split("/")[2] if "/" in request.url else ""
-                                if any(h in host for h in (
-                                    "fonts.googleapis.com",
-                                    "fonts.gstatic.com",
-                                    "use.typekit.net",
-                                    "kit.fontawesome.com",
-                                )):
-                                    await route.abort()
-                                else:
-                                    await route.continue_()
-
-                            await pg.route("**/*", _block_fonts)
+                            # No font blocking — allow all requests through so the browser
+                            # loads Google Fonts normally (Work Sans, Newsreader, Material
+                            # Symbols). Playwright's 'load' event fires when all resources
+                            # (including fonts) are ready, so no extra wait is needed.
 
                             # Navigate to the detected feature URL (not just root).
                             # For React Router SPAs, vite preview serves all routes
@@ -1299,16 +1325,34 @@ async def capture_screenshot(state: dict) -> dict:
                                 timeout=30000,
                             )
                             # Wait for React to hydrate and CSS animations to settle.
-                            await pg.wait_for_timeout(3000)
+                            # Use a longer wait for production builds via vite preview
+                            # since the bundled JS needs to parse + execute + render.
+                            await pg.wait_for_timeout(5000)
                             # Best-effort: verify the React root has rendered content.
+                            # IMPORTANT: wait_for_selector with state="visible" returns
+                            # immediately if the element exists but is empty. We must
+                            # actively check for non-empty content.
+                            root = pg.locator("#root")
                             try:
-                                await pg.wait_for_selector(
-                                    "#root > *",
-                                    state="visible",
-                                    timeout=5000,
-                                )
+                                # Wait for #root to have at least one child element
+                                # (React renders into this div; empty div = blank screen)
+                                await root.wait_for(state="attached", timeout=5000)
+                                child_count = await root.locator("> *").count()
+                                if child_count == 0:
+                                    # React hasn't mounted yet — wait longer
+                                    await pg.wait_for_timeout(5000)
+                                    child_count = await root.locator("> *").count()
+                                # Final check: ensure we have content before screenshot
+                                if child_count > 0:
+                                    # Verify body has rendered size (not 0x0 blank)
+                                    body_box = await pg.locator("body").bounding_box()
+                                    if body_box and body_box["width"] > 0 and body_box["height"] > 0:
+                                        pass  # content confirmed
+                                    else:
+                                        # One more wait for font/layout to settle
+                                        await pg.wait_for_timeout(3000)
                             except Exception:
-                                pass  # proceed even if selector not found
+                                pass  # proceed even if checks fail
                             await pg.screenshot(path=out_path, full_page=False)
                         finally:
                             await ctx.close()

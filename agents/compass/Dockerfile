@@ -2,20 +2,24 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy framework and agents
-COPY framework/     /app/framework/
-COPY agents/        /app/agents/
-COPY skills/        /app/skills/
-COPY config/        /app/config/
-COPY scripts/       /app/scripts/
 COPY pyproject.toml /app/
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir pyyaml>=6.0 \
+    && apt-get clean
+
+COPY framework/     /app/framework/
+COPY agents/       /app/agents/
+COPY skills/       /app/skills/
+COPY config/       /app/config/
+COPY scripts/      /app/scripts/
+
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    ARTIFACT_ROOT=/app/artifacts \
+    AGENT_RUNTIME=claude-code
 
 LABEL constellation.agent_id="compass"
 LABEL constellation.agent_name="Compass Agent"

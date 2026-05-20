@@ -1,0 +1,17 @@
+agent_id: office
+name: "Office Agent"
+description: "Document processing: summarize PDF/DOCX/TXT, analyze CSV data"
+mode: task
+execution_mode: per-task
+default_skills: []
+tools:
+  - read_pdf
+  - read_docx
+  - read_txt
+  - read_csv
+  - list_directory
+  - write_workspace
+  - write_file
+permission_profile: office_readonly
+runtime_backend: connect-agent
+model: gpt-5-mini
