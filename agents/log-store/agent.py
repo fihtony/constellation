@@ -8,7 +8,7 @@ LOGSTORE_DEFINITION = AgentDefinition(
     agent_id="log-store",
     name="Log Store Agent",
     description="Aggregates and serves logs from all agents in a task",
-    mode=AgentMode.SERVER,
+    mode=AgentMode.TASK,
     execution_mode=ExecutionMode.PERSISTENT,
     workflow=None,
     tools=[],
@@ -36,3 +36,22 @@ class LogStoreAgent:
 
     async def health(self) -> dict:
         return {"status": "ok", "service": "log-store"}
+
+    def get_logs_sync(self, task_id: str) -> list[dict]:
+        """Synchronous get logs for API."""
+        return self._logs.get(task_id, [])
+
+    def add_log_sync(self, task_id: str, log_entry: dict) -> None:
+        """Synchronous add log for API."""
+        if task_id not in self._logs:
+            self._logs[task_id] = []
+        self._logs[task_id].append(log_entry)
+
+    def health_sync(self) -> dict:
+        """Synchronous health check for API."""
+        return {"status": "ok", "service": "log-store"}
+
+    def get_api(self) -> "LogStoreAPI":
+        """Return API instance for REST endpoints."""
+        from agents.log_store.api import LogStoreAPI
+        return LogStoreAPI(self)
