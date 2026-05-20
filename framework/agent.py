@@ -60,6 +60,23 @@ class AgentDefinition:
     model: str = "gpt-5-mini"
     workflow: Any = None  # Workflow instance or None
     config: dict = field(default_factory=dict)
+    launch_spec: LaunchSpec = None              # Container launch specification
+
+
+@dataclass
+class LaunchSpec:
+    """Describes how an agent should be launched in a container."""
+
+    cli: str = "claude-code"                    # CLI backend: claude-code | copilot-cli | connect-agent
+    image: str = ""                              # Docker image (e.g. "constellation-v2-web-dev:latest")
+    mount_docker_socket: bool = False           # Mount host Docker socket for nested containers
+    mount_artifact_root: bool = True            # Mount local artifacts/ to /app/artifacts
+    env: dict = field(default_factory=dict)     # Static env vars injected into container
+    pass_through_env: list[str] = field(default_factory=list)  # Host env vars passed through
+    port: int = 0                               # Container port (0 = auto-assign)
+    memory: str = ""                             # Memory limit (e.g. "2g", "512m")
+    startup_delay_seconds: float = 1.0           # Seconds to wait before health check
+    extra_binds: list[str] = field(default_factory=list)  # Additional bind mounts
 
 
 @dataclass

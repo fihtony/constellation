@@ -29,6 +29,8 @@ class PermissionSet:
     scm: str = "read"
     filesystem: str = "workspace-only"
     custom: dict[str, Any] = field(default_factory=dict)
+    agent_launching: bool = False              # Whether this agent can launch other agents
+    allowed_agents: list[str] = field(default_factory=list)  # List of agent_ids that can be launched
 
 
 class PermissionEngine:
@@ -71,6 +73,8 @@ class PermissionEngine:
             scm=data.get("scm", "read"),
             filesystem=data.get("filesystem", "workspace-only"),
             custom=data.get("custom", {}),
+            agent_launching=data.get("agent_launching", False),
+            allowed_agents=data.get("allowed_agents", []),
         )
         return cls(ps)
     @classmethod
@@ -85,6 +89,8 @@ class PermissionEngine:
             denied_tools: []
             scm: read-write
             filesystem: workspace-only
+            agent_launching: true
+            allowed_agents: [web_dev, code_review]
             custom:
               protected_branch_patterns: ["^main$", "^master$"]
         """
