@@ -150,23 +150,31 @@ Inside container, `ARTIFACT_ROOT=/app/artifacts`. Task workspace becomes `/app/a
 
 The launcher resolves host paths for bind mounts using `_discover_host_source()` (from v1 `RancherLauncher`).
 
-### 6. Claude Code CLI Credentials
+### 6. Claude Code CLI Credentials — Project-Local Only
 
-Credentials stored in `~/.claude/settings.json`. When container starts:
+**Security requirement**: NEVER fetch credentials from outside the project workspace. All credentials must be defined in project-local `.env` files within the project directory.
 
-1. Host mount: `~/.claude/:/home/appuser/.claude:ro` (read-only)
-2. Or copy relevant settings to `.env` before container start
+Flow:
+1. Create `.env.example` in project root with all required keys (empty values)
+2. User manually sets values in `.env` in project root (never committed)
+3. `.env` is gitignored
+4. Container mounts the project `.env` file
 
-Env vars needed by Claude Code adapter:
-- `ANTHROPIC_AUTH_TOKEN`
-- `ANTHROPIC_BASE_URL`
-- `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL`
-- `API_TIMEOUT_MS`
-- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
+Env vars (all from local project `.env`, NOT from host `~/.claude/settings.json`):
+```
+ANTHROPIC_AUTH_TOKEN=        # Anthropic API token
+ANTHROPIC_BASE_URL=          # API base URL
+ANTHROPIC_MODEL=             # Default model
+ANTHROPIC_DEFAULT_HAIKU_MODEL=
+ANTHROPIC_DEFAULT_SONNET_MODEL=
+ANTHROPIC_DEFAULT_OPUS_MODEL=
+API_TIMEOUT_MS=              # API timeout in ms
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=
+```
 
 Files:
-- `.env.example`: All keys with placeholder values (committed)
-- `.env`: Actual values from host (gitignored)
+- `.env.example`: All keys with empty values (committed to git)
+- `.env`: Actual values set by user (gitignored)
 
 ### 7. Docker Compose Files
 
@@ -177,16 +185,17 @@ services:
     image: constellation-v2-compass:latest
     volumes:
       - ./artifacts:/app/artifacts
-      - ~/.claude:/home/appuser/.claude:ro
+      - ./.env:/app/.env:ro
     environment:
       CONTAINER_RUNTIME: docker
       ARTIFACT_ROOT: /app/artifacts
+      # Credentials loaded from /app/.env (project-local, gitignored)
 
   team-lead:
     image: constellation-v2-team-lead:latest
     volumes:
       - ./artifacts:/app/artifacts
-      - ~/.claude:/home/appuser/.claude:ro
+      - ./.env:/app/.env:ro
     environment:
       CONTAINER_RUNTIME: docker
       ARTIFACT_ROOT: /app/artifacts
@@ -199,6 +208,7 @@ services:
     image: constellation-v2-compass:latest
     volumes:
       - ./artifacts:/app/artifacts
+      - ./.env:/app/.env:ro
       - ~/.rd/docker.sock:/var/run/docker.sock
     environment:
       CONTAINER_RUNTIME: rancher
