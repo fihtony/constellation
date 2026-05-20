@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from framework.agent import AgentDefinition, AgentMode, ExecutionMode
+from agents.log_store.log_aggregator import LogAggregator
 
 
 LOGSTORE_DEFINITION = AgentDefinition(
@@ -18,9 +19,14 @@ LOGSTORE_DEFINITION = AgentDefinition(
 class LogStoreAgent:
     definition = LOGSTORE_DEFINITION
 
-    def __init__(self, services):
+    def __init__(self, services, artifact_root: str = "/artifacts"):
         self.services = services
-        self._logs: dict[str, list[dict]] = {}  # task_id -> logs
+        self._logs: dict[str, list[dict]] = {}
+        self._aggregator = LogAggregator(artifact_root)
+
+    def aggregate_from_filesystem(self, task_id: str) -> list[dict]:
+        """Called periodically to sync filesystem logs."""
+        return self._aggregator.aggregate_task(task_id)
 
     async def handle_message(self, message: dict) -> dict:
         """Handle incoming log messages via A2A."""
