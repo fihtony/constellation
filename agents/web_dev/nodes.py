@@ -85,16 +85,26 @@ def _safe_json(text: str, fallback: Any = None) -> Any:
     """
     if not text:
         return fallback
+    # Try to find JSON object or array in the response first
     match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
             pass
+    # Fall back to parsing the whole text
     try:
         return json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return fallback
+        pass
+    # Last resort: try stripping markdown code fences
+    stripped = re.sub(r"```(?:json)?\s*", "", text.strip()).strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+    return fallback
 
 
 def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
@@ -931,7 +941,11 @@ async def self_assess(state: dict) -> dict:
         plugin_manager=state.get("_plugin_manager"),
     )
 
-    data = _safe_json(result.get("raw_response", ""), fallback={})
+    raw_response = result.get("raw_response", "")
+    print(f"[{_AGENT_ID}] self_assess raw_response (first 500 chars): {raw_response[:500]!r}")
+    data = _safe_json(raw_response, fallback={})
+    if not data:
+        print(f"[{_AGENT_ID}] self_assess _safe_json returned empty — raw_response type={type(raw_response).__name__}, len={len(raw_response) if raw_response else 0}")
     score = float(data.get("score", 0))
     verdict = data.get("verdict", "fail")
     gaps = data.get("gaps", [])
@@ -1322,16 +1336,34 @@ async def capture_screenshot(state: dict) -> dict:
                                 timeout=30000,
                             )
                             # Wait for React to hydrate and CSS animations to settle.
-                            await pg.wait_for_timeout(3000)
+                            # Use a longer wait for production builds via vite preview
+                            # since the bundled JS needs to parse + execute + render.
+                            await pg.wait_for_timeout(5000)
                             # Best-effort: verify the React root has rendered content.
+                            # IMPORTANT: wait_for_selector with state="visible" returns
+                            # immediately if the element exists but is empty. We must
+                            # actively check for non-empty content.
+                            root = pg.locator("#root")
                             try:
-                                await pg.wait_for_selector(
-                                    "#root > *",
-                                    state="visible",
-                                    timeout=5000,
-                                )
+                                # Wait for #root to have at least one child element
+                                # (React renders into this div; empty div = blank screen)
+                                await root.wait_for(state="attached", timeout=5000)
+                                child_count = await root.locator("> *").count()
+                                if child_count == 0:
+                                    # React hasn't mounted yet — wait longer
+                                    await pg.wait_for_timeout(5000)
+                                    child_count = await root.locator("> *").count()
+                                # Final check: ensure we have content before screenshot
+                                if child_count > 0:
+                                    # Verify body has rendered size (not 0x0 blank)
+                                    body_box = await pg.locator("body").bounding_box()
+                                    if body_box and body_box["width"] > 0 and body_box["height"] > 0:
+                                        pass  # content confirmed
+                                    else:
+                                        # One more wait for font/layout to settle
+                                        await pg.wait_for_timeout(3000)
                             except Exception:
-                                pass  # proceed even if selector not found
+                                pass  # proceed even if checks fail
                             await pg.screenshot(path=out_path, full_page=False)
                         finally:
                             await ctx.close()
