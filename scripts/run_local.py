@@ -34,6 +34,7 @@ AGENTS = {
     "team-lead": ("agents.team_lead.agent", "TeamLeadAgent", "team_lead_definition"),
     "web-dev": ("agents.web_dev.agent", "WebDevAgent", "web_dev_definition"),
     "code-review": ("agents.code_review.agent", "CodeReviewAgent", "code_review_definition"),
+    "office": ("agents.office.agent", "OfficeAgent", "office_definition"),
     "jira": ("agents.jira.adapter", "JiraAgentAdapter", "jira_definition"),
     "scm": ("agents.scm.adapter", "SCMAgentAdapter", "scm_definition"),
     "ui-design": ("agents.ui_design.adapter", "UIDesignAgentAdapter", "ui_design_definition"),
