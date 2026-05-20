@@ -1,6 +1,8 @@
 """LogStore Agent - Aggregates logs from all agents via filesystem subscription."""
 from __future__ import annotations
 
+import json
+
 from framework.agent import AgentDefinition, AgentMode, ExecutionMode
 from agents.log_store.log_aggregator import LogAggregator
 
@@ -32,8 +34,19 @@ class LogStoreAgent:
         """Handle incoming log messages via A2A."""
         parts = message.get("message", {}).get("parts", [])
         text = next((p.get("text", "") for p in parts if p.get("text")), "")
-        # Parse log entry
-        # Store in self._logs[task_id]
+
+        try:
+            log_data = json.loads(text)
+            task_id = log_data.get("task_id", "unknown")
+            self.add_log_sync(task_id, {
+                "timestamp": log_data.get("timestamp", ""),
+                "level": log_data.get("level", "INFO"),
+                "agent": log_data.get("agent", "unknown"),
+                "message": log_data.get("message", ""),
+            })
+        except json.JSONDecodeError:
+            pass
+
         return {"status": "ok"}
 
     async def get_logs(self, task_id: str) -> dict:
