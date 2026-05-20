@@ -1,0 +1,71 @@
+- generic [ref=e2]:
+  - heading "Compass UI - Layout Mockup" [level=1] [ref=e3]
+  - 'heading "Left: Chat Window (50%) | Right: Task Tabs + Status (50%)" [level=2] [ref=e4]'
+  - generic [ref=e5]:
+    - generic [ref=e6]:
+      - generic [ref=e7]:
+        - generic [ref=e8]: Compass Agent
+        - generic [ref=e9]: Control Plane
+      - generic [ref=e10]:
+        - generic [ref=e11]:
+          - generic [ref=e12]: USER
+          - generic [ref=e13]: "Implement PROJ-123: Add user login feature"
+        - generic [ref=e14]:
+          - generic [ref=e15]: COMPASS
+          - generic [ref=e16]:
+            - text: Development task dispatched to Team Lead.
+            - text: "Jira: PROJ-123 | Status: dispatched | TL task: task-abc123"
+        - generic [ref=e17]:
+          - generic [ref=e18]: USER
+          - generic [ref=e19]: Create PR for authentication module
+        - generic [ref=e20]:
+          - generic [ref=e21]: COMPASS
+          - generic [ref=e22]:
+            - text: "Office task dispatched. Status: completed"
+            - text: "PR created: https://github.com/example/pull/456"
+      - generic [ref=e23]:
+        - textbox "Type your message..." [ref=e24]
+        - button "Send" [ref=e25] [cursor=pointer]
+    - generic [ref=e26]:
+      - generic [ref=e27]: Active Tasks
+      - generic [ref=e28]:
+        - generic [ref=e29] [cursor=pointer]: PROJ-123 ✗
+        - generic [ref=e30] [cursor=pointer]: PROJ-124 ●
+        - generic [ref=e31] [cursor=pointer]:
+          - generic [ref=e32]:
+            - generic [ref=e33]: PROJ-125
+            - generic [ref=e34]: ✓
+          - generic [ref=e35]: "PR #456 merged"
+      - generic [ref=e36]:
+        - generic [ref=e37]:
+          - generic [ref=e38]: PROJ-124
+          - generic [ref=e39]: IN PROGRESS
+        - generic [ref=e40]: Analyze user authentication flow and design API endpoints
+        - generic [ref=e41]:
+          - generic [ref=e42]:
+            - text: "Running Agent:"
+            - strong [ref=e43]: team-lead
+          - generic [ref=e44]:
+            - text: "Started:"
+            - strong [ref=e45]: 10:30 AM
+      - generic [ref=e46]:
+        - generic [ref=e47]: Major Steps
+        - generic [ref=e48]:
+          - generic [ref=e49]: ✓
+          - generic [ref=e50]: Analyze requirements
+        - generic [ref=e51]:
+          - generic [ref=e52]: ●
+          - generic [ref=e53]: Plan implementation
+        - generic [ref=e54]:
+          - generic [ref=e55]: "3"
+          - generic [ref=e56]: Implement feature
+        - generic [ref=e57]:
+          - generic [ref=e58]: "4"
+          - generic [ref=e59]: Create PR
+      - generic [ref=e60]:
+        - generic [ref=e61]: Logs
+        - generic [ref=e62]: "[team-lead] Task started at 10:30:15"
+        - generic [ref=e63]: "[code-review] Analyzing codebase structure..."
+        - generic [ref=e64]: "[scm] Fetching repository info"
+        - generic [ref=e65]: "[team-lead] Planning implementation..."
+        - generic [ref=e66]: "[compass] Waiting for team-lead to complete planning"
