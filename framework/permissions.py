@@ -64,6 +64,22 @@ class PermissionEngine:
         if not self.check_scm_write():
             raise PermissionDeniedError("SCM write operations are not permitted")
 
+    def check_agent_launching(self, target_agent_id: str) -> bool:
+        """Return True if this agent can launch target_agent_id."""
+        if not self._permissions.agent_launching:
+            return False
+        allowed = self._permissions.allowed_agents
+        if not allowed:
+            return True  # No restriction list = can launch any
+        return target_agent_id in allowed
+
+    def require_agent_launching(self, target_agent_id: str) -> None:
+        """Raise PermissionDeniedError if agent launching not permitted."""
+        if not self.check_agent_launching(target_agent_id):
+            raise PermissionDeniedError(
+                f"Agent launching '{target_agent_id}' is not permitted"
+            )
+
     @classmethod
     def from_dict(cls, data: dict) -> PermissionEngine:
         """Build a PermissionEngine from a raw config dict."""

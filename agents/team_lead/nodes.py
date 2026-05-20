@@ -620,6 +620,12 @@ async def dispatch_dev_agent(state: dict) -> dict:
     from framework.tools.registry import get_registry
 
     registry = get_registry()
+
+    # Enforce agent launching permission
+    perm_engine = registry._permission_engine
+    if perm_engine:
+        perm_engine.require_agent_launching("web-dev")
+
     log = _logger(state)
     log.node("dispatch_dev_agent")
     revision_feedback = state.get("revision_feedback", "")
