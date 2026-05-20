@@ -1,0 +1,1 @@
+"""LogStore Agent - Aggregates logs from all agents via filesystem subscription."""
