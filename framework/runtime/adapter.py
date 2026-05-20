@@ -77,12 +77,17 @@ class AgentRuntimeAdapter(ABC):
         timeout: int = 120,
         max_tokens: int = 4096,
         plugin_manager: Any = None,
+        cwd: str | None = None,
     ) -> dict:
         """Execute a single prompt and return the standard result dict.
 
         When *plugin_manager* is provided, implementations SHOULD fire
         ``before_llm_call`` before the request and ``after_llm_response``
         after receiving the response.
+
+        *cwd* sets the working directory for local subprocess backends
+        (e.g. claude-code). Remote API backends (copilot-cli, connect-agent)
+        ignore it.
         """
         ...
 

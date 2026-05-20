@@ -937,8 +937,9 @@ async def self_assess(state: dict) -> dict:
 
     result = runtime.run(
         prompt, system_prompt=SELF_ASSESS_SYSTEM,
-        max_tokens=2048,
+        max_tokens=4096,
         plugin_manager=state.get("_plugin_manager"),
+        cwd=state.get("repo_path") or None,
     )
 
     raw_response = result.get("raw_response", "")
@@ -1306,22 +1307,10 @@ async def capture_screenshot(state: dict) -> dict:
                         )
                         pg = await ctx.new_page()
                         try:
-                            # Block external font CDNs so 'load' fires quickly.
-                            # The page renders with system font fallbacks; all
-                            # layout / colour / spacing from CSS is fully applied.
-                            async def _block_fonts(route, request):  # noqa: ANN001
-                                host = request.url.split("/")[2] if "/" in request.url else ""
-                                if any(h in host for h in (
-                                    "fonts.googleapis.com",
-                                    "fonts.gstatic.com",
-                                    "use.typekit.net",
-                                    "kit.fontawesome.com",
-                                )):
-                                    await route.abort()
-                                else:
-                                    await route.continue_()
-
-                            await pg.route("**/*", _block_fonts)
+                            # No font blocking — allow all requests through so the browser
+                            # loads Google Fonts normally (Work Sans, Newsreader, Material
+                            # Symbols). Playwright's 'load' event fires when all resources
+                            # (including fonts) are ready, so no extra wait is needed.
 
                             # Navigate to the detected feature URL (not just root).
                             # For React Router SPAs, vite preview serves all routes

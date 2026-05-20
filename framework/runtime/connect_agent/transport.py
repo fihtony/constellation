@@ -232,11 +232,14 @@ def run_single_shot(
     default_system: str,
     backend_used: str,
     plugin_manager=None,
+    cwd: str | None = None,
 ) -> dict:
     """Single-shot prompt → response via chat-completion.
 
     When *plugin_manager* is provided, fires ``before_llm_call`` before the
     request and ``after_llm_response`` after receiving the response.
+
+    *cwd* is accepted for API compatibility but has no effect on remote calls.
     """
     effective_model = AgentRuntimeAdapter.resolve_model(
         model,
