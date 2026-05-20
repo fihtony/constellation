@@ -10,7 +10,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def handle_ui_request(method: str, path: str, task_store=None) -> dict:
+def handle_ui_request(method: str, path: str, task_store=None, log_store_url=None) -> dict:
     """Handle UI-related HTTP requests."""
     if method == "GET" and path == "/ui":
         return serve_ui()
@@ -22,6 +22,9 @@ def handle_ui_request(method: str, path: str, task_store=None) -> dict:
     if method == "GET" and path == "/poll":
         since = None  # TODO: parse from query params
         return poll_task_status(task_store, since)
+    if method == "GET" and path.startswith("/logs/"):
+        task_id = path.split("/")[-1]
+        return proxy_to_log_store(task_id, log_store_url)
 
     return {"status": 404, "body": "Not found"}
 
@@ -85,6 +88,19 @@ def get_task_detail(task_id: str, task_store) -> dict:
             ],
         },
     }
+
+
+def proxy_to_log_store(task_id: str, log_store_url: str) -> dict:
+    """Proxy log requests to LogStore."""
+    if not log_store_url:
+        return {"status": 200, "headers": {"Content-Type": "application/json"}, "body": {"task_id": task_id, "logs": []}}
+
+    import urllib.request
+    try:
+        resp = urllib.request.urlopen(f"{log_store_url}/logs/{task_id}")
+        return {"status": 200, "headers": {"Content-Type": "application/json"}, "body": resp.read()}
+    except Exception as e:
+        return {"status": 200, "headers": {"Content-Type": "application/json"}, "body": {"task_id": task_id, "logs": [], "error": str(e)}}
 
 
 def poll_task_status(task_store, since: str | None = None) -> dict:

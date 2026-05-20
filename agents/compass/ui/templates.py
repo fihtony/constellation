@@ -108,6 +108,9 @@ def render_compass_ui(messages: list[dict], tasks: list[dict], selected_task_id:
         </div>
     </div>
     <script>
+        // Global state
+        let currentTaskId = null;
+
         // Basic interactivity
         document.getElementById("send-btn").addEventListener("click", sendMessage);
         async function sendMessage() {{
@@ -116,6 +119,24 @@ def render_compass_ui(messages: list[dict], tasks: list[dict], selected_task_id:
             if (!text) return;
             // Send to Compass via fetch
             input.value = "";
+        }}
+
+        // Log polling
+        async function pollLogs() {{
+            if (!currentTaskId) return;
+            try {{
+                const resp = await fetch("/logs/" + currentTaskId);
+                const data = await resp.json();
+                updateLogsPanel(data.logs);
+            }} catch (e) {{
+                console.error("Log poll failed:", e);
+            }}
+            setTimeout(pollLogs, 5000);
+        }}
+
+        function updateLogsPanel(logs) {{
+            // Update the logs panel with new log entries
+            console.log("Updating logs:", logs);
         }}
     </script>
 </body>
