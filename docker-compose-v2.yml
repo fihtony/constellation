@@ -14,6 +14,12 @@ services:
     depends_on:
       team-lead:
         condition: service_healthy
+      jira:
+        condition: service_healthy
+      scm:
+        condition: service_healthy
+      ui-design:
+        condition: service_healthy
     environment:
       AGENT_ID: "compass"
       HOST: "0.0.0.0"
@@ -65,6 +71,109 @@ services:
       - "8030:8030"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8030/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+    networks:
+      - constellation-v2
+
+  # -----------------------------------------------------------------------
+  # Jira Agent — boundary agent (port 8010)
+  # -----------------------------------------------------------------------
+  jira:
+    image: constellation-v2-jira:latest
+    build:
+      context: .
+      dockerfile: agents/jira/Dockerfile
+    environment:
+      AGENT_ID: "jira"
+      HOST: "0.0.0.0"
+      PORT: "8010"
+      AGENT_RUNTIME: "claude-code"
+      ARTIFACT_ROOT: /app/artifacts
+      JIRA_BACKEND: ${JIRA_BACKEND:-rest}
+      JIRA_BASE_URL: ${JIRA_BASE_URL:-}
+      JIRA_TOKEN: ${JIRA_TOKEN:-}
+      JIRA_EMAIL: ${JIRA_EMAIL:-}
+      JIRA_CA_BUNDLE: ${JIRA_CA_BUNDLE:-}
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./config/.env:/app/config/.env:ro
+    labels:
+      constellation.agent_id: "jira"
+      constellation.agent_name: "Jira Agent"
+      constellation.agent_role: "boundary"
+    ports:
+      - "8010:8010"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+    networks:
+      - constellation-v2
+
+  # -----------------------------------------------------------------------
+  # SCM Agent — boundary agent (port 8020)
+  # -----------------------------------------------------------------------
+  scm:
+    image: constellation-v2-scm:latest
+    build:
+      context: .
+      dockerfile: agents/scm/Dockerfile
+    environment:
+      AGENT_ID: "scm"
+      HOST: "0.0.0.0"
+      PORT: "8020"
+      AGENT_RUNTIME: "claude-code"
+      ARTIFACT_ROOT: /app/artifacts
+      GH_TOKEN: ${GH_TOKEN:-}
+      SCM_REPO_URL: ${SCM_REPO_URL:-}
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./config/.env:/app/config/.env:ro
+    labels:
+      constellation.agent_id: "scm"
+      constellation.agent_name: "SCM Agent"
+      constellation.agent_role: "boundary"
+    ports:
+      - "8020:8020"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8020/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+    networks:
+      - constellation-v2
+
+  # -----------------------------------------------------------------------
+  # UI Design Agent — boundary agent (port 8040)
+  # -----------------------------------------------------------------------
+  ui-design:
+    image: constellation-v2-ui-design:latest
+    build:
+      context: .
+      dockerfile: agents/ui_design/Dockerfile
+    environment:
+      AGENT_ID: "ui-design"
+      HOST: "0.0.0.0"
+      PORT: "8040"
+      AGENT_RUNTIME: "claude-code"
+      ARTIFACT_ROOT: /app/artifacts
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./config/.env:/app/config/.env:ro
+    labels:
+      constellation.agent_id: "ui-design"
+      constellation.agent_name: "UI Design Agent"
+      constellation.agent_role: "boundary"
+    ports:
+      - "8040:8040"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8040/health')"]
       interval: 2s
       timeout: 2s
       retries: 20

@@ -21,12 +21,12 @@ ENV PYTHONUNBUFFERED=1 \
     ARTIFACT_ROOT=/app/artifacts \
     AGENT_RUNTIME=claude-code
 
-LABEL constellation.agent_id="compass"
-LABEL constellation.agent_name="Compass Agent"
+LABEL constellation.agent_id="ui-design"
+LABEL constellation.agent_name="UI Design Agent"
 LABEL constellation.agent_role="fundamental"
 
 RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
     && chown -R appuser:appuser /app
 USER appuser
 
-CMD ["python3", "scripts/run_local.py", "compass", "--port", "8000"]
+CMD ["python3", "scripts/run_local.py", "ui-design", "--port", "8040"]
