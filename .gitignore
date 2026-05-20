@@ -40,3 +40,4 @@ data/
 *.swo
 *~
 .DS_Store
+.worktrees/
