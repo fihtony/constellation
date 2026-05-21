@@ -28,14 +28,17 @@ AGENT_ID = "office"
 # ---------------------------------------------------------------------------
 
 def _get_workspace_root(state: dict) -> str:
-    """Get the workspace root for this task."""
+    """Get the workspace root for this task.
+
+    Workspace path: {ARTIFACT_ROOT}/{compass_task_id}/office/
+    All office tasks under the same compass task share the same workspace.
+    """
     artifact_root = os.environ.get(
         "ARTIFACT_ROOT",
         os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "artifacts")
     )
     compass_id = state.get("_compass_task_id", "default")
-    task_id = state.get("_task_id", "office")
-    return os.path.join(artifact_root, compass_id, task_id, "office")
+    return os.path.join(artifact_root, compass_id, "office")
 
 
 def _validate_source_path(path: str) -> tuple[str, str]:
@@ -69,7 +72,8 @@ def _extract_paths(text: str) -> list[str]:
     # Also match relative paths
     rel_paths = re.findall(r'(?:^|\s)([a-zA-Z0-9_./-]*(?:tests?/data[/\w.-]+)[a-zA-Z0-9_./-]*)', text)
     all_paths = paths + rel_paths
-    return [p.strip() for p in all_paths if len(p.strip()) > 3]
+    # Deduplicate while preserving order
+    return list(dict.fromkeys(p.strip() for p in all_paths if len(p.strip()) > 3))
 
 
 # ---------------------------------------------------------------------------
@@ -203,19 +207,14 @@ def execute_office_work(state: dict) -> dict:
 
     logger.info(f"execute_office_work: running {capability} with {len(validated_paths)} paths")
 
-    # Get tool schemas from registry
-    from framework.tools.registry import get_registry
-    registry = get_registry()
     tool_names = ["read_pdf", "read_docx", "read_txt", "read_csv", "read_xlsx", "read_xls",
               "read_pptx", "list_directory", "write_workspace", "write_file",
               "organize_folder", "organize_move_file"]
-    tool_schemas = registry.list_schemas(tool_names)
 
     result = runtime.run_agentic(
         prompt,
         system_prompt=_load_system_prompt(),
-        tools=tool_schemas,
-        allowed_tools=tool_names,
+        tools=tool_names,
         max_turns=30,
         timeout=1800,
     )
@@ -296,6 +295,10 @@ For each numeric column: count, min, max, average
 - Insight 1
 - Insight 2
 - Insight 3
+
+IMPORTANT: Write all analysis results in English. Do not use any other language.
+
+CRITICAL: The write_workspace tool writes to the OFFICE_WORKSPACE_ROOT folder (already set in the environment). Use the exact filename pattern: {{original_filename}}.analysis.md (e.g., sales_data.csv.analysis.md).
 """
 
 
@@ -356,8 +359,8 @@ def report_result(state: dict) -> dict:
             except OSError as exc:
                 logger.error(f"report_result: failed to write warnings: {exc}")
 
-        # Write pr-evidence.json
-        evidence_path = os.path.join(workspace_root, "pr-evidence.json")
+        # Write task-report.json (was pr-evidence.json)
+        task_report_path = os.path.join(workspace_root, "task-report.json")
         evidence = {
             "metadata": {
                 "agent_id": AGENT_ID,
@@ -375,11 +378,11 @@ def report_result(state: dict) -> dict:
             },
         }
         try:
-            with open(evidence_path, "w", encoding="utf-8") as fh:
+            with open(task_report_path, "w", encoding="utf-8") as fh:
                 json.dump(evidence, fh, ensure_ascii=False, indent=2)
-            logger.info(f"report_result: evidence written to {evidence_path}")
+            logger.info(f"report_result: task-report written to {task_report_path}")
         except OSError as exc:
-            logger.error(f"report_result: failed to write evidence: {exc}")
+            logger.error(f"report_result: failed to write task-report: {exc}")
 
     return {
         "status": "completed",

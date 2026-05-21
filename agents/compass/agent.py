@@ -18,6 +18,7 @@ Tools live in:
 from __future__ import annotations
 
 import json
+import os
 import re
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
@@ -188,15 +189,40 @@ class CompassAgent(BaseAgent):
 
         elif task_type == "office":
             log.info("dispatching office task")
+            # Step 1: Query registry for office capability
+            registry_url = ""
+            office_url = ""
+            try:
+                from framework.registry_client import RegistryClient
+                rc = RegistryClient.from_config()
+                registry_url = rc.url
+                office_url = rc.discover("office.document.summarize")
+                if not office_url:
+                    office_url = rc.discover("office.agent")
+                if not office_url:
+                    office_url = os.environ.get("OFFICE_AGENT_URL", "http://office:8060")
+                log.info("registry lookup", registry_url=registry_url, discovered_url=office_url)
+            except Exception as exc:
+                log.warn("registry lookup failed, using default", error=str(exc))
+                office_url = os.environ.get("OFFICE_AGENT_URL", "http://office:8060")
+                log.info("using fallback office URL", url=office_url)
+
+            # Step 2: Log A2A message being sent
+            log.a2a("→", "office", capability="office.document.summarize",
+                    office_url=office_url, task_id=task.id,
+                    request_preview=user_text[:100])
             try:
                 dispatch_result_str = registry.execute_sync(
                     "dispatch_office_task",
                     {"task_description": user_text},
                 )
                 dispatch_data = json.loads(dispatch_result_str) if dispatch_result_str else {}
+                log.a2a("←", "office", status=dispatch_data.get("status", "unknown"),
+                        result_preview=str(dispatch_data)[:200])
             except Exception as exc:
                 dispatch_data = {"status": "error", "message": str(exc)}
                 log.error("dispatch_office_task failed", error=str(exc))
+                log.a2a("←", "office", status="error", error=str(exc)[:100])
                 print(f"[{_aid}] dispatch_office_task error: {exc}")
             log.info("office dispatch complete", status=dispatch_data.get("status", "unknown"))
             response_text = f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"

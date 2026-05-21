@@ -86,6 +86,7 @@ class OfficeAgent(BaseAgent):
         Non-blocking: returns task dict immediately, runs workflow in background thread.
         """
         from framework.workflow import RunConfig
+        from framework.devlog import AgentLogger
 
         msg = message.get("message", message)
         parts = msg.get("parts", [])
@@ -108,6 +109,16 @@ class OfficeAgent(BaseAgent):
 
         canonical_task_id = task.id
 
+        # Setup logging - use compass_task_id if available, else own task id
+        log_task_id = compass_task_id if compass_task_id else canonical_task_id
+        log = AgentLogger(task_id=log_task_id, agent_name=self.definition.agent_id)
+        log.node("handle_message", compass_task_id=compass_task_id, office_task_id=canonical_task_id,
+                 request_preview=user_text[:200])
+        log.info("office agent started", output_mode=metadata.get("output_mode", "workspace"),
+                 has_callback=bool(callback_url))
+        log.a2a("←", "compass", event="task received",
+                compass_task_id=compass_task_id, office_task_id=canonical_task_id)
+
         # Build initial state
         state: dict[str, Any] = {
             "_task_id": canonical_task_id,
@@ -125,9 +136,13 @@ class OfficeAgent(BaseAgent):
         }
 
         # Set OFFICE_WORKSPACE_ROOT for this task
+        # Workspace path: {ARTIFACT_ROOT}/{compass_task_id}/office/
+        # All office tasks under the same compass task share the same workspace
         artifact_root = os.environ.get("ARTIFACT_ROOT", "")
-        if artifact_root and compass_task_id:
-            workspace_root = os.path.join(artifact_root, compass_task_id, canonical_task_id, "office")
+        if artifact_root:
+            # Use compass_task_id if available, otherwise use canonical_task_id for standalone operation
+            ws_id = compass_task_id if compass_task_id else canonical_task_id
+            workspace_root = os.path.join(artifact_root, ws_id, "office")
             artifacts_dir = os.path.join(workspace_root, "artifacts")
             os.makedirs(artifacts_dir, exist_ok=True)
             os.environ["OFFICE_WORKSPACE_ROOT"] = artifacts_dir
