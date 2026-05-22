@@ -23,7 +23,7 @@ def test_read_xlsx_tool_basic():
         data = json.loads(result.output)
         assert "sheets" in data
         assert "TestSheet" in data["sheets"]
-        assert data["sheets"]["TestSheet"]["row_count"] == 3
+        assert data["sheets"]["TestSheet"]["total_rows"] == 2
     finally:
         os.unlink(xlsx_path)
 
@@ -40,7 +40,7 @@ def test_read_xlsx_rejects_non_xlsx():
         tool = ReadXlsxTool()
         result = tool.execute_sync(path=csv_path)
         assert not result.success
-        assert "not an XLSX file" in result.error
+        assert "not a supported spreadsheet file" in result.error
     finally:
         os.unlink(csv_path)
 

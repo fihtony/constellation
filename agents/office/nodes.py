@@ -25,10 +25,11 @@ logger = logging.getLogger(__name__)
 
 AGENT_ID = "office"
 SUMMARY_EXTENSIONS = {
-    ".pdf", ".docx", ".docm", ".dotx", ".dotm",
+    ".pdf", ".docx", ".docm", ".dotx", ".dotm", ".odt",
     ".txt", ".md", ".markdown", ".html", ".htm", ".xml",
     ".json", ".jsonl", ".yaml", ".yml", ".log", ".ini", ".cfg", ".toml", ".rtf",
-    ".pptx", ".csv", ".tsv", ".xlsx", ".xls",
+    ".pptx", ".pptm", ".potx", ".potm", ".ppsx", ".ppsm", ".odp",
+    ".csv", ".tsv", ".xlsx", ".xlsm", ".xltx", ".xltm", ".xlsb", ".ods", ".xls",
 }
 
 
@@ -632,366 +633,6 @@ def _target_output_path(output_mode: str, source_path: str, artifacts_dir: str, 
     return _target_output_file(output_mode, source_path, artifacts_dir, f"{basename}{suffix}")
 
 
-def _maybe_float(value: str) -> float | None:
-    try:
-        cleaned = str(value).strip().replace(",", "")
-        if not cleaned:
-            return None
-        return float(cleaned)
-    except (TypeError, ValueError):
-        return None
-
-
-def _detect_numeric_columns(rows: list[dict[str, str]], headers: list[str]) -> set[str]:
-    numeric_cols: set[str] = set()
-    for h in headers:
-        non_empty = 0
-        numeric = 0
-        for row in rows:
-            val = row.get(h, "")
-            if str(val).strip() == "":
-                continue
-            non_empty += 1
-            if _maybe_float(val) is not None:
-                numeric += 1
-        if non_empty > 0 and numeric / non_empty >= 0.8:
-            numeric_cols.add(h)
-    return numeric_cols
-
-
-def _load_tabular_rows(path: str) -> tuple[list[str], list[dict[str, str]], str]:
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".csv":
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            reader = csv.DictReader(fh)
-            rows = list(reader)
-            return list(reader.fieldnames or []), rows, "csv"
-    if ext in {".xlsx", ".xlsm"}:
-        import openpyxl
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        ws = wb[wb.sheetnames[0]]
-        raw_rows = [list(r) for r in ws.iter_rows(values_only=True)]
-        if not raw_rows:
-            return [], [], "xlsx"
-        headers = [str(h).strip() if h is not None else f"column_{idx+1}" for idx, h in enumerate(raw_rows[0])]
-        rows: list[dict[str, str]] = []
-        for raw in raw_rows[1:]:
-            row = {headers[i]: ("" if i >= len(raw) or raw[i] is None else str(raw[i])) for i in range(len(headers))}
-            rows.append(row)
-        return headers, rows, "xlsx"
-    if ext == ".xls":
-        import xlrd
-        wb = xlrd.open_workbook(path)
-        ws = wb.sheet_by_index(0)
-        if ws.nrows == 0:
-            return [], [], "xls"
-        headers = [str(ws.cell_value(0, i)).strip() or f"column_{i+1}" for i in range(ws.ncols)]
-        rows: list[dict[str, str]] = []
-        for r in range(1, ws.nrows):
-            row = {headers[c]: str(ws.cell_value(r, c)) for c in range(ws.ncols)}
-            rows.append(row)
-        return headers, rows, "xls"
-    if ext in {".txt", ".tsv"}:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            sample = fh.read(4096)
-            fh.seek(0)
-            dialect = csv.excel
-            try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
-            except Exception:
-                pass
-            reader = csv.DictReader(fh, dialect=dialect)
-            rows = list(reader)
-            return list(reader.fieldnames or []), rows, "txt"
-    return [], [], "unsupported"
-
-
-def _extract_document_text(path: str, max_chars: int = 10000) -> str:
-    ext = os.path.splitext(path)[1].lower()
-    try:
-        if ext in {".txt", ".md", ".markdown", ".json", ".jsonl", ".yaml", ".yml", ".log", ".ini", ".cfg", ".toml", ".rtf"}:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                raw = fh.read(max_chars * 2)
-            from agents.office.office_tools import _extract_markup_text
-            text, _ = _extract_markup_text(raw, ext)
-            return text[:max_chars]
-        if ext in {".csv", ".tsv"}:
-            headers, rows, _ = _load_tabular_rows(path)
-            preview = {
-                "headers": headers,
-                "sample_rows": rows[:10],
-            }
-            return json.dumps(preview, ensure_ascii=False)[:max_chars]
-        if ext in {".html", ".htm", ".xml"}:
-            from agents.office.office_tools import _extract_markup_text
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                raw = fh.read(max_chars * 2)
-            text, _ = _extract_markup_text(raw, ext)
-            return text[:max_chars]
-        if ext == ".pdf":
-            import pdfplumber
-            parts = []
-            with pdfplumber.open(path) as pdf:
-                for page in pdf.pages:
-                    txt = page.extract_text() or ""
-                    if txt.strip():
-                        parts.append(txt.strip())
-                    if sum(len(p) for p in parts) >= max_chars:
-                        break
-            return "\n\n".join(parts)[:max_chars]
-        if ext in {".docx", ".docm", ".dotx", ".dotm"}:
-            from agents.office.office_tools import _extract_docx_like_text
-            lines, _ = _extract_docx_like_text(path)
-            return "\n".join(lines)[:max_chars]
-        if ext == ".xlsx":
-            headers, rows, _ = _load_tabular_rows(path)
-            preview = {
-                "headers": headers,
-                "sample_rows": rows[:10],
-            }
-            return json.dumps(preview, ensure_ascii=False)[:max_chars]
-        if ext == ".xls":
-            headers, rows, _ = _load_tabular_rows(path)
-            preview = {
-                "headers": headers,
-                "sample_rows": rows[:10],
-            }
-            return json.dumps(preview, ensure_ascii=False)[:max_chars]
-        if ext == ".pptx":
-            import pptx
-            prs = pptx.Presentation(path)
-            lines = []
-            for slide in prs.slides:
-                for shape in slide.shapes:
-                    if hasattr(shape, "text") and shape.text:
-                        txt = shape.text.strip()
-                        if txt:
-                            lines.append(txt)
-                if sum(len(x) for x in lines) >= max_chars:
-                    break
-            return "\n".join(lines)[:max_chars]
-    except Exception:
-        return ""
-    return ""
-
-
-def _make_bullet_points(text: str, max_points: int = 5) -> list[str]:
-    lines = [ln.strip(" -\t") for ln in text.splitlines() if ln.strip()]
-    bullets: list[str] = []
-    seen: set[str] = set()
-    for ln in lines:
-        key = ln.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        bullets.append(ln[:180])
-        if len(bullets) >= max_points:
-            break
-    return bullets
-
-
-def _write_text(path: str, content: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(content)
-
-
-def _fallback_analyze(paths: list[str], output_mode: str, artifacts_dir: str) -> dict:
-    table_paths = [
-        p for p in paths
-        if os.path.isfile(p) and os.path.splitext(p)[1].lower() in {".csv", ".xlsx", ".xlsm", ".xls", ".txt", ".tsv"}
-    ]
-    if not table_paths:
-        return {"success": False, "summary": "No readable tabular path provided for fallback analysis."}
-    outputs: list[str] = []
-    for table_path in table_paths:
-        headers, rows, source_type = _load_tabular_rows(table_path)
-        numeric_cols = _detect_numeric_columns(rows, headers)
-        numeric_stats: dict[str, dict[str, float]] = {}
-        for col in sorted(numeric_cols):
-            vals = [_maybe_float(r.get(col, "")) for r in rows]
-            nums = [v for v in vals if v is not None]
-            if not nums:
-                continue
-            numeric_stats[col] = {
-                "count": float(len(nums)),
-                "min": min(nums),
-                "max": max(nums),
-                "avg": sum(nums) / len(nums),
-            }
-        categorical_cols = [h for h in headers if h not in numeric_cols]
-        top_group_lines: list[str] = []
-        if categorical_cols and numeric_cols:
-            for cat_col in categorical_cols[:3]:
-                for num_col in sorted(numeric_cols)[:3]:
-                    grouped: dict[str, float] = {}
-                    for row in rows:
-                        key = (row.get(cat_col, "") or "Unknown").strip() or "Unknown"
-                        val = _maybe_float(row.get(num_col, ""))
-                        if val is None:
-                            continue
-                        grouped[key] = grouped.get(key, 0.0) + val
-                    if not grouped:
-                        continue
-                    top_items = sorted(grouped.items(), key=lambda kv: kv[1], reverse=True)[:3]
-                    preview = ", ".join(f"{k}={v:.2f}" for k, v in top_items)
-                    top_group_lines.append(f"- `{cat_col}` grouped by `{num_col}` (top 3): {preview}")
-        lines = [
-            f"# Data Analysis: {os.path.basename(table_path)}",
-            "",
-            "## File Overview",
-            f"- Source type: {source_type}",
-            f"- Rows: {len(rows)}",
-            f"- Columns: {', '.join(headers) if headers else 'N/A'}",
-            "",
-            "## Numeric Summary",
-        ]
-        if numeric_stats:
-            for col, st in numeric_stats.items():
-                lines.append(
-                    f"- `{col}`: count={int(st['count'])}, min={st['min']:.2f}, max={st['max']:.2f}, avg={st['avg']:.2f}"
-                )
-        else:
-            lines.append("- No stable numeric columns detected.")
-        lines.extend(["", "## Key Insights"])
-        if top_group_lines:
-            lines.extend(top_group_lines)
-        else:
-            lines.append("- No reliable categorical+numeric aggregation insight detected.")
-        lines.extend([
-            "- Insights were inferred from detected schema, without hardcoded column assumptions.",
-            "- Report generated by deterministic fallback after agentic runtime failure.",
-            "",
-        ])
-        out_path = _target_output_path(output_mode, table_path, artifacts_dir, ".analysis.md")
-        _write_text(out_path, "\n".join(lines))
-        outputs.append(out_path)
-    return {"success": True, "summary": f"Tabular analysis completed for {len(outputs)} file(s)."}
-
-
-def _fallback_summarize(paths: list[str], output_mode: str, artifacts_dir: str) -> dict:
-    doc_paths = [p for p in paths if os.path.isfile(p)]
-    if not doc_paths:
-        return {"success": False, "summary": "No readable document path provided for fallback summary."}
-    outputs: list[str] = []
-    for doc_path in doc_paths:
-        extracted = _extract_document_text(doc_path)
-        bullets = _make_bullet_points(extracted, max_points=5)
-        words = len(extracted.split()) if extracted else 0
-        size = os.path.getsize(doc_path) if os.path.exists(doc_path) else 0
-        lines = [
-            f"# Summary: {os.path.basename(doc_path)}",
-            "",
-            "## Document Info",
-            f"- Type: {os.path.splitext(doc_path)[1].lower() or 'unknown'}",
-            f"- Size: {size} bytes",
-            f"- Extracted words: {words}",
-            "",
-            "## Key Points",
-        ]
-        if bullets:
-            lines.extend([f"- {b}" for b in bullets])
-        else:
-            lines.append("- No text extracted; binary or unsupported format.")
-        lines.extend([
-            "",
-            "## Executive Summary",
-            "Deterministic fallback summary generated after agentic runtime failure.",
-            "",
-        ])
-        out_path = _target_output_path(output_mode, doc_path, artifacts_dir, ".summary.md")
-        _write_text(out_path, "\n".join(lines))
-        outputs.append(out_path)
-    return {"success": True, "summary": f"Document summary completed for {len(outputs)} file(s)."}
-
-
-def _fallback_organize(paths: list[str], output_mode: str, artifacts_dir: str) -> dict:
-    folders = [p for p in paths if os.path.isdir(p)]
-    if not folders:
-        return {"success": False, "summary": "No folder path provided for fallback organization."}
-    outputs: list[str] = []
-    ext_groups = {
-        "documents": {".pdf", ".doc", ".docx", ".docm", ".dotx", ".dotm"},
-        "text": {".txt", ".md", ".rtf"},
-        "data": {".csv", ".xlsx", ".xls"},
-        "images": {".png", ".jpg", ".jpeg", ".gif", ".svg"},
-        "presentations": {".ppt", ".pptx"},
-        "code": {".py", ".js", ".ts", ".java", ".c", ".cpp", ".h"},
-    }
-    for folder in folders:
-        by_category: dict[str, list[str]] = {}
-        by_date_folder: dict[str, list[str]] = {}
-        for root, dirs, files in os.walk(folder):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            rel_root = os.path.relpath(root, folder)
-            date_key = ""
-            if rel_root != ".":
-                parts = rel_root.split(os.sep)
-                for part in parts:
-                    if re.fullmatch(r"\d{8}", part) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", part):
-                        date_key = part
-                        break
-            for name in files:
-                if name.startswith("."):
-                    continue
-                ext = os.path.splitext(name)[1].lower()
-                rel = os.path.relpath(os.path.join(root, name), folder)
-                category = "other"
-                for cat, exts in ext_groups.items():
-                    if ext in exts:
-                        category = cat
-                        break
-                by_category.setdefault(category, []).append(rel)
-                if date_key:
-                    by_date_folder.setdefault(date_key, []).append(rel)
-        lines = [
-            "# Organization Plan",
-            "",
-            "## Source Folder",
-            f"- {folder}",
-            "",
-            "## Proposed Grouping by Category",
-        ]
-        for cat in sorted(by_category):
-            lines.append(f"### {cat.title()} ({len(by_category[cat])})")
-            for rel in sorted(by_category[cat])[:50]:
-                lines.append(f"- {rel}")
-            if len(by_category[cat]) > 50:
-                lines.append(f"- ... {len(by_category[cat]) - 50} more")
-            lines.append("")
-        lines.append("## Date-Based Grouping (if detected)")
-        if by_date_folder:
-            for key in sorted(by_date_folder):
-                lines.append(f"### {key} ({len(by_date_folder[key])})")
-                for rel in sorted(by_date_folder[key])[:50]:
-                    lines.append(f"- {rel}")
-                if len(by_date_folder[key]) > 50:
-                    lines.append(f"- ... {len(by_date_folder[key]) - 50} more")
-                lines.append("")
-        else:
-            lines.append("- No date-based folder structure detected.")
-        lines.append("## Notes")
-        lines.append("- Plan generated by deterministic fallback after agentic runtime failure.")
-        lines.append("- No files were moved or deleted.")
-        filename = "organization-plan.md"
-        if output_mode == "workspace" and len(folders) > 1:
-            filename = f"{os.path.basename(folder.rstrip('/'))}.organization-plan.md"
-        out_path = _target_output_file(output_mode, folder, artifacts_dir, filename)
-        _write_text(out_path, "\n".join(lines) + "\n")
-        outputs.append(out_path)
-    return {"success": True, "summary": f"Organization plan generated for {len(outputs)} folder(s)."}
-
-
-def _run_deterministic_fallback(capability: str, paths: list[str], output_mode: str, artifacts_dir: str) -> dict:
-    if capability == "analyze":
-        return _fallback_analyze(paths, output_mode, artifacts_dir)
-    if capability == "summarize":
-        return _fallback_summarize(paths, output_mode, artifacts_dir)
-    if capability == "organize":
-        return _fallback_organize(paths, output_mode, artifacts_dir)
-    return {"success": False, "summary": f"Fallback unsupported capability: {capability}"}
-
-
 def _build_summarize_prompt(paths: list[str], output_mode: str, source_root: str) -> str:
     paths_list = "\n".join(f"- {p}" for p in paths)
     has_multiple_files = len(paths) > 1
@@ -1025,11 +666,11 @@ Required output targets:
 For each file:
 1. Read the file using the appropriate tool:
    - PDF: `read_pdf`
-   - Word OpenXML (`.docx/.docm/.dotx/.dotm`): `read_docx`
-   - Plain text / Markdown / HTML / XML / TSV: `read_txt`
+   - Word-like text documents (`.docx/.docm/.dotx/.dotm/.odt`): `read_docx`
+   - Plain text / Markdown / HTML / XML / JSON / YAML / RTF / LOG / TSV: `read_txt`
    - CSV: `read_csv`
-   - Excel (`.xlsx/.xls`): `read_xlsx` or `read_xls`
-   - PowerPoint (`.pptx`): `read_pptx`
+   - Spreadsheets (`.xlsx/.xlsm/.xltx/.xltm/.xlsb/.ods/.xls`): `read_xlsx` or `read_xls`
+   - Presentations (`.pptx/.pptm/.potx/.potm/.ppsx/.ppsm/.odp`): `read_pptx`
 {write_rules}
 3. Summarize in English. For French or other foreign language documents, summarize accurately.
 4. Use only the provided MCP tools. Do not use native Write/Edit/Read tools.
@@ -1040,7 +681,7 @@ Output format for each file:
 # Summary: {{filename}}
 
 ## Document Info
-- Type: PDF/Word/TXT/Markdown/HTML/XML/PPTX/Spreadsheet
+- Type: PDF/Word-like/TXT/Markdown/HTML/XML/JSON/YAML/RTF/Presentation/Spreadsheet
 - Size: N KB
 
 ## Key Points
@@ -1084,9 +725,9 @@ Required output targets:
 Methodology (must follow):
 1. Inspect each source first to infer schema and structure:
    - CSV/TSV: read_csv or read_txt (if delimiter-based text)
-   - XLSX: read_xlsx
+   - XLSX/XLSM/XLTX/XLTM/XLSB/ODS: read_xlsx
    - XLS: read_xls
-   - Document-based tables: read_pdf/read_docx/read_txt as needed
+   - Document-based tables or semi-structured data: read_pdf/read_docx/read_txt/read_pptx as needed
 2. Explicitly state inferred schema: columns/fields, inferred data types, missing-value patterns.
 3. Produce analysis from inferred schema only (no hardcoded column-name assumptions):
    - Summary statistics for detected numeric fields

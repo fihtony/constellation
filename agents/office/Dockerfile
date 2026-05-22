@@ -15,6 +15,7 @@ RUN apt-get update \
         pypdf>=5.0.0 \
         python-docx>=1.1.2 \
         python-pptx>=1.0.2 \
+        pyxlsb>=1.0.10 \
         striprtf>=0.0.29 \
         openpyxl>=3.1.5 \
         xlrd>=2.0.1 \

@@ -112,7 +112,7 @@ def test_analyze_request_validates_paths():
 
 
 def test_report_result_writes_evidence():
-    """Test report_result writes pr-evidence.json."""
+    """Test report_result writes task-report.json."""
     from agents.office.nodes import report_result
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -124,11 +124,12 @@ def test_report_result_writes_evidence():
             "output_mode": "workspace",
             "summary": "Test summary content.",
             "validated_paths": ["/tmp/test.txt"],
+            "success": True,
         }
         result = report_result(state)
         assert result["status"] == "completed"
 
-        evidence_file = os.path.join(tmp, "pr-evidence.json")
+        evidence_file = os.path.join(tmp, "task-report.json")
         assert os.path.exists(evidence_file), f"Evidence file not written at {evidence_file}"
         with open(evidence_file) as f:
             evidence = json.load(f)
@@ -198,6 +199,7 @@ def test_report_result_writes_warnings_md(tmp_path):
         "output_mode": "workspace",
         "summary": "Test summary",
         "validated_paths": ["/tmp/test.txt"],
+        "success": True,
         "warnings": [
             "File file1.pdf could not be parsed (corrupted)",
             "File file2.doc is in legacy .doc format, needs conversion",
@@ -215,7 +217,7 @@ def test_report_result_writes_warnings_md(tmp_path):
 
 
 def test_receive_task_parses_folder_summarize():
-    """Test that receive_task identifies folder in path triggers organize capability."""
+    """Summarize requests should remain summarize even if the path contains 'folder'."""
     from agents.office.nodes import receive_task
 
     state = {
@@ -223,5 +225,4 @@ def test_receive_task_parses_folder_summarize():
         "user_request": "summarize /path/to/folder",
     }
     result = receive_task(state)
-    # "folder" in the path triggers organize capability (per _parse_capability logic)
-    assert result["capability"] == "organize"
+    assert result["capability"] == "summarize"

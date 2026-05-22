@@ -13,7 +13,7 @@ and produce a clear organization plan.
 
 - Never delete original files
 - Never overwrite existing files
-- Group by: Documents (pdf/docx/docm/dotx/dotm), Text (txt/md), Data (csv/xlsx), Images (png/jpg), Code (py/js), Folders
+- Group by: Documents (pdf/docx/docm/dotx/dotm/odt), Text-like files (txt/md/html/xml/json/yaml/log/rtf), Data (csv/tsv/xlsx/xlsm/xltx/xltm/xlsb/ods/xls), Presentations (pptx/pptm/potx/potm/ppsx/ppsm/odp), Images, Code, or other meaningful content-driven categories
 - Preserve directory structure when possible
 
 ## Output Format (organization-plan.md)

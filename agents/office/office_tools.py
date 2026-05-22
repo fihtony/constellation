@@ -251,9 +251,20 @@ READER_TOOL_BY_EXTENSION = {
     ".docm": "read_docx",
     ".dotx": "read_docx",
     ".dotm": "read_docx",
+    ".odt": "read_docx",
     ".pptx": "read_pptx",
+    ".pptm": "read_pptx",
+    ".potx": "read_pptx",
+    ".potm": "read_pptx",
+    ".ppsx": "read_pptx",
+    ".ppsm": "read_pptx",
+    ".odp": "read_pptx",
     ".xlsx": "read_xlsx",
     ".xlsm": "read_xlsx",
+    ".xltx": "read_xlsx",
+    ".xltm": "read_xlsx",
+    ".xlsb": "read_xlsx",
+    ".ods": "read_xlsx",
     ".xls": "read_xls",
 }
 IDENTITY_PREFIXES = {
@@ -318,15 +329,18 @@ def _is_under_organized_output(path: str) -> bool:
 
 
 def _categorize_extension(ext: str) -> str:
-    if ext in (".pdf", ".doc", ".docx"):
+    if ext in (".pdf", ".doc", ".docx", ".docm", ".dotx", ".dotm", ".odt"):
         return "documents"
-    if ext in (".txt", ".md", ".rtf"):
+    if ext in (
+        ".txt", ".md", ".markdown", ".rtf", ".html", ".htm", ".xml",
+        ".json", ".jsonl", ".yaml", ".yml", ".log", ".ini", ".cfg", ".toml",
+    ):
         return "text"
-    if ext in (".csv", ".xlsx", ".xls", ".xlsm", ".tsv"):
+    if ext in (".csv", ".xlsx", ".xls", ".xlsm", ".xltx", ".xltm", ".xlsb", ".ods", ".tsv"):
         return "data"
     if ext in (".png", ".jpg", ".jpeg", ".gif", ".svg"):
         return "images"
-    if ext in (".ppt", ".pptx"):
+    if ext in (".ppt", ".pptx", ".pptm", ".potx", ".potm", ".ppsx", ".ppsm", ".odp"):
         return "presentations"
     if ext in (".py", ".js", ".ts", ".java", ".cpp", ".c", ".h"):
         return "code"
@@ -519,8 +533,26 @@ def _extract_markup_text(raw_text: str, ext: str) -> tuple[str, str]:
     return raw_text, "plain-text"
 
 
+def _extract_odf_text_nodes(content_xml: bytes, tags: tuple[str, ...]) -> list[str]:
+    root = ET.fromstring(content_xml)
+    paragraphs: list[str] = []
+    for element in root.iter():
+        tag_name = element.tag.rsplit("}", 1)[-1]
+        if tag_name not in tags:
+            continue
+        joined = "".join(text.strip() for text in element.itertext() if text and text.strip()).strip()
+        if joined:
+            paragraphs.append(joined)
+    return paragraphs
+
+
 def _extract_docx_like_text(path: str) -> tuple[list[str], str]:
-    """Extract paragraph text from Word OpenXML documents with a library fallback."""
+    """Extract paragraph text from Word-like documents without OCR."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".odt":
+        with zipfile.ZipFile(path) as archive:
+            xml_bytes = archive.read("content.xml")
+        return _extract_odf_text_nodes(xml_bytes, ("h", "p")), "odt-zip-xml"
     try:
         import docx
         doc = docx.Document(path)
@@ -537,6 +569,62 @@ def _extract_docx_like_text(path: str) -> tuple[list[str], str]:
             if joined:
                 paragraphs.append(joined)
         return paragraphs, "zip-xml"
+
+
+def _extract_presentation_like_text(path: str) -> tuple[list[str], str, int]:
+    """Extract slide-like text from PowerPoint-like documents without OCR."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".odp":
+        with zipfile.ZipFile(path) as archive:
+            xml_bytes = archive.read("content.xml")
+        slides = _extract_odf_text_nodes(xml_bytes, ("h", "p"))
+        return slides, "odp-zip-xml", len(slides)
+
+    import pptx
+
+    prs = pptx.Presentation(path)
+    slides: list[str] = []
+    for i, slide in enumerate(prs.slides):
+        slide_text = []
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text.strip():
+                slide_text.append(shape.text.strip())
+        if slide_text:
+            slides.append(f"[Slide {i + 1}]\n" + "\n".join(slide_text))
+    return slides, "python-pptx", len(prs.slides)
+
+
+def _extract_ods_rows(path: str) -> tuple[dict[str, dict[str, object]], list[str]]:
+    with zipfile.ZipFile(path) as archive:
+        xml_bytes = archive.read("content.xml")
+    root = ET.fromstring(xml_bytes)
+    sheets: dict[str, dict[str, object]] = {}
+    sheet_names: list[str] = []
+    table_ns = "urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    text_ns = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+    for table in root.findall(f".//{{{table_ns}}}table"):
+        sheet_name = table.attrib.get(f"{{{table_ns}}}name", f"Sheet{len(sheet_names) + 1}")
+        sheet_names.append(sheet_name)
+        rows: list[list[str]] = []
+        for row_el in table.findall(f"./{{{table_ns}}}table-row"):
+            repeat_rows = int(row_el.attrib.get(f"{{{table_ns}}}number-rows-repeated", "1"))
+            row_values: list[str] = []
+            for cell in row_el.findall(f"./{{{table_ns}}}table-cell"):
+                repeat_cells = int(cell.attrib.get(f"{{{table_ns}}}number-columns-repeated", "1"))
+                cell_text = "\n".join(
+                    text.strip()
+                    for text in cell.itertext()
+                    if text and text.strip()
+                )
+                row_values.extend([cell_text] * repeat_cells)
+            if row_values:
+                for _ in range(min(repeat_rows, 1)):
+                    rows.append(row_values.copy())
+        if not rows:
+            sheets[sheet_name] = {"headers": [], "total_rows": 0, "sample_rows": []}
+            continue
+        sheets[sheet_name] = _summarize_tabular_rows(rows[0], rows[1:])
+    return sheets, sheet_names
 
 
 def _safe_path_segment(value: str) -> str:
@@ -860,7 +948,7 @@ class ReadPdfTool(BaseTool):
 
 class ReadDocxTool(BaseTool):
     name = "read_docx"
-    description = "Read Word OpenXML files (.docx/.docm/.dotx/.dotm) and return bounded text content including paragraph metadata. Uses a standard-library fallback when python-docx is unavailable."
+    description = "Read Word-like text documents (.docx/.docm/.dotx/.dotm/.odt) and return bounded text content including paragraph metadata. Uses non-OCR fallbacks when optional libraries are unavailable."
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -877,8 +965,8 @@ class ReadDocxTool(BaseTool):
             return ToolResult(output="", error=f"read_docx: file not found: {path}")
         if normalized.lower().endswith(".doc"):
             return ToolResult(output="", error="read_docx: .doc format is not supported. Please convert to .docx first.")
-        if not normalized.lower().endswith((".docx", ".docm", ".dotx", ".dotm")):
-            return ToolResult(output="", error=f"read_docx: not a supported Word OpenXML file: {path}")
+        if not normalized.lower().endswith((".docx", ".docm", ".dotx", ".dotm", ".odt")):
+            return ToolResult(output="", error=f"read_docx: not a supported Word-like file: {path}")
         ok, size_err = _check_file_size(normalized)
         if not ok:
             return ToolResult(output="", error=f"read_docx: {size_err}")
@@ -903,7 +991,7 @@ class ReadDocxTool(BaseTool):
 
 class ReadPptxTool(BaseTool):
     name = "read_pptx"
-    description = "Read a PPTX file and return bounded slide text for summarization."
+    description = "Read PowerPoint-like files (.pptx/.pptm/.potx/.potm/.ppsx/.ppsm/.odp) and return bounded slide text for summarization."
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -918,29 +1006,23 @@ class ReadPptxTool(BaseTool):
             return ToolResult(output="", error=f"read_pptx: {err}")
         if not os.path.isfile(normalized):
             return ToolResult(output="", error=f"read_pptx: file not found: {path}")
-        if not normalized.lower().endswith(".pptx"):
-            return ToolResult(output="", error="read_pptx: only .pptx files are supported. Please convert .ppt to .pptx first.")
+        if normalized.lower().endswith(".ppt"):
+            return ToolResult(output="", error="read_pptx: legacy .ppt files are not supported. Please convert to .pptx first.")
+        if not normalized.lower().endswith((".pptx", ".pptm", ".potx", ".potm", ".ppsx", ".ppsm", ".odp")):
+            return ToolResult(output="", error="read_pptx: not a supported presentation file.")
         ok, size_err = _check_file_size(normalized)
         if not ok:
             return ToolResult(output="", error=f"read_pptx: {size_err}")
         try:
-            import pptx
-            prs = pptx.Presentation(normalized)
-            slides = []
-            for i, slide in enumerate(prs.slides):
-                slide_text = []
-                for shape in slide.shapes:
-                    if hasattr(shape, "text") and shape.text.strip():
-                        slide_text.append(shape.text.strip())
-                if slide_text:
-                    slides.append(f"[Slide {i+1}]\n" + "\n".join(slide_text))
+            slides, extraction_method, total_slides = _extract_presentation_like_text(normalized)
             content = "\n\n".join(slides)
             content, truncated = _truncate_content(content)
             return ToolResult(output=json.dumps({
                 "content": content,
                 "path": normalized,
                 "slides": len(slides),
-                "total_slides": len(prs.slides),
+                "total_slides": total_slides,
+                "extraction_method": extraction_method,
                 "truncated": truncated,
             }))
         except Exception as exc:
@@ -1044,7 +1126,7 @@ class ReadCsvTool(BaseTool):
 
 class ReadXlsxTool(BaseTool):
     name = "read_xlsx"
-    description = "Read an Excel XLSX file and return a compact summary for each sheet."
+    description = "Read spreadsheet files (.xlsx/.xlsm/.xltx/.xltm/.xlsb/.ods) and return a compact summary for each sheet."
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -1059,26 +1141,51 @@ class ReadXlsxTool(BaseTool):
             return ToolResult(output="", error=f"read_xlsx: {err}")
         if not os.path.isfile(normalized):
             return ToolResult(output="", error=f"read_xlsx: file not found: {path}")
-        if not normalized.lower().endswith((".xlsx", ".xlsm")):
-            return ToolResult(output="", error=f"read_xlsx: not an XLSX file: {path}")
+        if not normalized.lower().endswith((".xlsx", ".xlsm", ".xltx", ".xltm", ".xlsb", ".ods")):
+            return ToolResult(output="", error=f"read_xlsx: not a supported spreadsheet file: {path}")
         ok, size_err = _check_file_size(normalized)
         if not ok:
             return ToolResult(output="", error=f"read_xlsx: {size_err}")
         try:
-            import openpyxl
-            wb = openpyxl.load_workbook(normalized, read_only=True, data_only=True)
-            sheets = {}
-            for sheet_name in wb.sheetnames:
-                ws = wb[sheet_name]
-                rows = [list(row) for row in ws.iter_rows(values_only=True)]
-                if not rows:
-                    sheets[sheet_name] = {"headers": [], "total_rows": 0, "sample_rows": []}
-                    continue
-                sheets[sheet_name] = _summarize_tabular_rows(rows[0], rows[1:])
+            ext = os.path.splitext(normalized)[1].lower()
+            extraction_method = ""
+            if ext in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+                import openpyxl
+
+                wb = openpyxl.load_workbook(normalized, read_only=True, data_only=True)
+                sheets = {}
+                for sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    rows = [list(row) for row in ws.iter_rows(values_only=True)]
+                    if not rows:
+                        sheets[sheet_name] = {"headers": [], "total_rows": 0, "sample_rows": []}
+                        continue
+                    sheets[sheet_name] = _summarize_tabular_rows(rows[0], rows[1:])
+                sheet_names = wb.sheetnames
+                extraction_method = "openpyxl"
+            elif ext == ".xlsb":
+                from pyxlsb import open_workbook
+
+                sheets = {}
+                sheet_names = []
+                with open_workbook(normalized) as wb:
+                    for sheet_name in wb.sheets:
+                        sheet_names.append(sheet_name)
+                        with wb.get_sheet(sheet_name) as ws:
+                            rows = [[cell.v for cell in row] for row in ws.rows()]
+                        if not rows:
+                            sheets[sheet_name] = {"headers": [], "total_rows": 0, "sample_rows": []}
+                            continue
+                        sheets[sheet_name] = _summarize_tabular_rows(rows[0], rows[1:])
+                extraction_method = "pyxlsb"
+            else:
+                sheets, sheet_names = _extract_ods_rows(normalized)
+                extraction_method = "ods-zip-xml"
             return ToolResult(output=json.dumps({
                 "path": normalized,
                 "sheets": sheets,
-                "sheet_names": wb.sheetnames,
+                "sheet_names": sheet_names,
+                "extraction_method": extraction_method,
             }))
         except Exception as exc:
             return ToolResult(output="", error=f"read_xlsx: failed to read: {exc}")

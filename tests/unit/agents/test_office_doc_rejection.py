@@ -56,7 +56,7 @@ class TestReadDocxToolDocRejection:
         result = tool.execute_sync(path=str(txt_file))
 
         assert result.success is False
-        assert "not a supported Word OpenXML file" in result.error or "not a DOCX" in result.error
+        assert "not a supported Word-like file" in result.error or "not a DOCX" in result.error
 
     def test_uppercase_doc_extension_rejected(self, tmp_path):
         """Uppercase .DOC extension is also rejected."""
