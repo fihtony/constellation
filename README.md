@@ -37,15 +37,18 @@ cp jira/.env.example      jira/.env
 cp scm/.env.example       scm/.env
 cp ui-design/.env.example ui-design/.env
 
-# 2. Build on-demand agent images
-./build-agents.sh
+# 2. Start the local registry and persistent services
+docker compose -f docker-compose-v2.yml up --build -d registry compass team-lead jira scm ui-design
 
-# 3. Start all persistent services
-docker compose up --build -d
+# 3. Register or refresh agent definitions in the registry
+source .venv/bin/activate
+python scripts/register_agents.py --registry-url http://localhost:9000
 
 # 4. Open the Web UI
-open http://localhost:8080
+open http://localhost:8000/ui
 ```
+
+`python scripts/register_agents.py` is a manual bootstrap / update step for registry definitions. Run it the first time you stand up a registry, and run it again only when an agent changes its capability list, launch spec, display name, or agent id. Live service instances still register themselves automatically at runtime.
 
 ## Agents
 

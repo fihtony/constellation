@@ -103,6 +103,8 @@ The `asyncio_mode = "auto"` pytest setting means all async test functions run au
 - **NEVER** directly complete tasks (manually edit code, write code snippets, submit PRs)
 - **MUST** improve the constellation system (agent code, skills, tools, instructions, prompts, etc.)
 - Constellation agents must complete tasks through their own workflow
+- Any Constellation agent code, tools, skills, prompts, instructions, or workflow assets must stay blind to test-task details. Do not embed test-only file paths, fixture names, sample column names, sample values, or any other test-case clues inside agent logic. Agents must analyze requests, gather context, and proceed through the correct runtime tools, skills, and instructions using only the real task inputs and authorized metadata.
+- All inter-agent communication must resolve the target through the Capability Registry first. If the required capability or agent is not registered, fail closed. Do not bypass the registry with hardcoded agent URLs, config URL fallbacks, or environment-variable URL overrides for agent-to-agent traffic.
 
 ### Credentials & Sensitive Data
 1. **NEVER** hard-code PII (personally identifiable information) in code or test scripts — always use values from `.env`

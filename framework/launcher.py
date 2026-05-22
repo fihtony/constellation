@@ -260,6 +260,8 @@ class Launcher:
         artifact_root_host = self.resolve_host_path(artifact_root_container)
         if artifact_root_host:
             binds.append(f"{artifact_root_host}:{artifact_root_container}")
+            env["ARTIFACT_ROOT"] = artifact_root_container
+            payload["Env"] = [f"{key}={value}" for key, value in sorted(env.items())]
 
         mount_socket = bool(_spec_value(spec, "mount_docker_socket", "mountDockerSocket", default=False))
         if mount_socket and os.path.exists(self.socket_path):

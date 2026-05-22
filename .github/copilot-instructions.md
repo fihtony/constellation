@@ -22,6 +22,13 @@ After **any** code change, always consider these three questions before closing 
 
 ---
 
+## Core Principle (Most Important)
+
+- Constellation agents must stay blind to test-task details. Do not hardcode or leak test-only paths, fixture names, column names, sample values, or any other test-case hints into agent code, tools, prompts, skills, instructions, workflows, or runtime rules. Agents must understand tasks, gather context, and execute work from the real request plus authorized metadata and tools only.
+- All agent-to-agent communication must resolve the target through the Capability Registry first. If the required capability or agent is not registered, fail closed. Hardcoded service URLs, config URL fallbacks, and environment-variable URL overrides are forbidden for agent-to-agent routing.
+
+---
+
 ## Project Overview
 
 **Constellation** is a multi-agent system built on the A2A (Agent-to-Agent) protocol.

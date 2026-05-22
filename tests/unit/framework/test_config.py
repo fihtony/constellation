@@ -124,6 +124,15 @@ class TestLoadAgentConfig:
         cfg = load_agent_config("team-lead", project_dir)
         assert cfg.get("runtime.model") == "gpt-6"
 
+    def test_claude_runtime_env_override(self, project_dir, monkeypatch):
+        from framework.config import load_agent_config
+
+        monkeypatch.setenv("AGENT_RUNTIME", "claude-code")
+        monkeypatch.setenv("ANTHROPIC_MODEL", "MiniMax-M2.7")
+        cfg = load_agent_config("team-lead", project_dir)
+        assert cfg.get("runtime.backend") == "claude-code"
+        assert cfg.get("runtime.model") == "MiniMax-M2.7"
+
     def test_constellation_prefix_beats_openai_model(self, project_dir, monkeypatch):
         """CONSTELLATION_RUNTIME_MODEL should win over OPENAI_MODEL."""
         from framework.config import load_agent_config

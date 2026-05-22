@@ -18,7 +18,13 @@ port: 8040
 capabilities:
   - figma.file.fetch
   - figma.page.fetch
-  - figma.node.get
-  - stitch.screen.list
+  - figma.design.fetch
+  - figma.pages.list
+  - figma.node.fetch
+  - figma.styles.fetch
+  - stitch.project.get
+  - stitch.screens.list
   - stitch.screen.fetch
+  - stitch.screen.image
+  - stitch.tools.list
   - design.context.fetch

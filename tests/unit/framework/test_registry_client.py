@@ -63,6 +63,25 @@ class TestRegistryClientDiscover:
             assert url2 == "http://jira:8080"
             assert mock_open.call_count == 1  # no additional call
 
+    def test_discover_reads_nested_instances(self):
+        client = RegistryClient("http://registry:9000")
+        response = json.dumps([
+            {
+                "agent_id": "jira",
+                "capabilities": ["jira.ticket.fetch"],
+                "instances": [{"service_url": "http://jira:8010", "status": "idle"}],
+            }
+        ]).encode()
+
+        with patch("urllib.request.urlopen") as mock_open:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = response
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_open.return_value = mock_resp
+
+            assert client.discover("jira.ticket.fetch") == "http://jira:8010"
+
     def test_invalidate_clears_cache(self):
         client = RegistryClient("http://registry:9000", cache_ttl_seconds=60)
         # Seed cache

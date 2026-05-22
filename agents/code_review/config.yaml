@@ -20,3 +20,5 @@ tools:
 permissions:
   scm: read
 permission_profile: read_only
+capabilities:
+  - review.code.check

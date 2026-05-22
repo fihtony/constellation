@@ -18,3 +18,5 @@ tools:
   - dispatch_agent
   - query_registry
 port: 8000
+capabilities:
+  - compass.task.route

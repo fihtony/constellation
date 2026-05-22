@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import os
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -282,14 +283,26 @@ class BaseAgent:
         )
 
     async def _register(self) -> None:
-        """Register with the Capability Registry (best-effort)."""
+        """Register the current live instance with the Capability Registry (best-effort)."""
         client = self.services.registry_client
         if client is None:
             return
         try:
-            await client.register_agent(self.definition.agent_id)
+            agent_id = os.environ.get("AGENT_ID", self.definition.agent_id).strip() or self.definition.agent_id
+            port = int(os.environ.get("PORT", "0") or 0)
+            service_url = os.environ.get("ADVERTISED_BASE_URL", "").strip()
+            if not service_url and port > 0:
+                service_url = f"http://{agent_id}:{port}"
+            if not service_url or port <= 0:
+                return
+            client.register_instance(
+                agent_id,
+                service_url=service_url,
+                port=port,
+                container_id=os.environ.get("CONTAINER_ID", "").strip(),
+            )
         except Exception as exc:  # noqa: BLE001
-            print(f"[{self.definition.agent_id}] Registry registration failed: {exc}")
+            print(f"[{self.definition.agent_id}] Registry instance registration failed: {exc}")
 
     # -- Memory helpers -------------------------------------------------------
 

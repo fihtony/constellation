@@ -6,7 +6,6 @@ These tools allow the Web Dev Agent's workflow nodes to call boundary agents
 from __future__ import annotations
 
 import json
-import os
 from urllib.parse import urlparse
 
 from framework.tools.base import BaseTool, ToolResult
@@ -14,12 +13,7 @@ from framework.tools.registry import get_registry
 
 
 def _resolve_agent_url(capability: str, env_var: str = "", default: str = "") -> str:
-    """Resolve an agent's URL via Registry discovery, env var, or default."""
-    if env_var:
-        env_val = os.environ.get(env_var)
-        if env_val:
-            return env_val
-
+    """Resolve an agent's URL via Registry discovery only."""
     try:
         from framework.registry_client import RegistryClient
         client = RegistryClient.from_config()
@@ -28,25 +22,14 @@ def _resolve_agent_url(capability: str, env_var: str = "", default: str = "") ->
             return url
     except Exception:
         pass
-
-    if not default:
-        try:
-            from framework.config import load_global_config
-            cfg = load_global_config()
-            services = cfg.get("services") or {}
-            if "jira" in capability:
-                return services.get("jira_agent_url", "http://jira:8010")
-            if "scm" in capability:
-                return services.get("scm_agent_url", "http://scm:8020")
-        except Exception:
-            pass
-
-    return default
+    return ""
 
 
 def _dispatch_jira(capability: str, ticket_key: str = "", **meta) -> dict:
     """Dispatch a Jira capability via A2A."""
     jira_url = _resolve_agent_url(capability, "JIRA_AGENT_URL", "http://jira:8010")
+    if not jira_url:
+        return {"error": "No registered Jira instance was found in the registry."}
     try:
         from framework.a2a.client import dispatch_sync
         result = dispatch_sync(
@@ -68,6 +51,8 @@ def _dispatch_jira(capability: str, ticket_key: str = "", **meta) -> dict:
 def _dispatch_scm(capability: str, text: str = "", **meta) -> dict:
     """Dispatch an SCM capability via A2A."""
     scm_url = _resolve_agent_url(capability, "SCM_AGENT_URL", "http://scm:8020")
+    if not scm_url:
+        return {"error": "No registered SCM instance was found in the registry."}
     try:
         from framework.a2a.client import dispatch_sync
 

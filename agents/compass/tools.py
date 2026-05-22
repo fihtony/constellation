@@ -18,7 +18,7 @@ from framework.tools.registry import get_registry
 
 
 def _resolve_team_lead_url() -> str:
-    """Resolve the Team Lead endpoint via Registry before falling back."""
+    """Resolve the Team Lead endpoint via Registry only."""
     try:
         from framework.registry_client import RegistryClient
 
@@ -27,12 +27,11 @@ def _resolve_team_lead_url() -> str:
             return discovered
     except Exception:
         pass
-
-    return os.environ.get("TEAM_LEAD_URL", "http://team-lead:8030")
+    return ""
 
 
 def _resolve_office_url() -> str:
-    """Resolve the Office endpoint via Registry before falling back."""
+    """Resolve the Office endpoint via Registry only."""
     try:
         from framework.registry_client import RegistryClient
 
@@ -43,8 +42,7 @@ def _resolve_office_url() -> str:
                 return discovered
     except Exception:
         pass
-
-    return os.environ.get("OFFICE_AGENT_URL", "http://office:8060")
+    return ""
 
 
 def _office_requested_capability(capability: str) -> str:
@@ -257,6 +255,11 @@ class DispatchDevelopmentTask(BaseTool):
             jira_key = _match.group(0) if _match else jira_key.strip().split()[0]
 
         team_lead_url = _resolve_team_lead_url()
+        if not team_lead_url:
+            return ToolResult(output=json.dumps({
+                "status": "error",
+                "message": "No registered Team Lead instance was found in the registry.",
+            }))
         meta: dict[str, Any] = {}
         if jira_key:
             meta["jiraKey"] = jira_key
@@ -358,6 +361,11 @@ class DispatchOfficeTask(BaseTool):
                 return ToolResult(output=json.dumps(result))
 
             office_url = _resolve_office_url()
+            if not office_url:
+                return ToolResult(output=json.dumps({
+                    "status": "error",
+                    "message": "No registered Office instance was found in the registry.",
+                }))
             meta: dict[str, Any] = {}
             if normalized_source_paths:
                 meta["source_paths"] = normalized_source_paths

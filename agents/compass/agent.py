@@ -23,7 +23,7 @@ import re
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 from agents.compass.ui.routes import handle_ui_request
-from agents.compass.tools import TOOL_NAMES, register_compass_tools
+from agents.compass.tools import TOOL_NAMES, _should_use_per_task_office_launch, register_compass_tools
 
 compass_definition = AgentDefinition(
     agent_id="compass",
@@ -200,16 +200,24 @@ def _dispatch_office_request(task_id: str, user_text: str, office_request: dict,
     office_url = ""
     discovered_from_registry = False
     requested_capability = _office_requested_capability(office_request.get("capability", "summarize"))
+    use_per_task_launch = _should_use_per_task_office_launch()
     try:
         from framework.registry_client import RegistryClient
 
         rc = RegistryClient.from_config()
         registry_url = rc.url
         log.a2a("→", "registry", capability=requested_capability, registry_url=registry_url)
-        office_url = rc.discover(requested_capability)
-        if not office_url:
-            office_url = rc.discover("office.agent")
-        discovered_from_registry = bool(office_url)
+        if use_per_task_launch:
+            definition = rc.get_capability_definition(requested_capability)
+            if not definition:
+                definition = rc.get_capability_definition("office.document.summarize")
+            discovered_from_registry = bool(definition)
+            office_url = "per-task-launch" if discovered_from_registry else ""
+        else:
+            office_url = rc.discover(requested_capability)
+            if not office_url:
+                office_url = rc.discover("office.agent")
+            discovered_from_registry = bool(office_url)
         log.info("registry lookup", registry_url=registry_url, discovered_url=office_url)
         log.a2a(
             "←",

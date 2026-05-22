@@ -21,6 +21,7 @@ import time
 import threading
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -104,24 +105,13 @@ class RegistryClient:
             if cached and time.time() < cached[0]:
                 return cached[1]
 
-        # Query registry
         try:
-            import urllib.request
-
-            url = f"{self._registry_url}/query?capability={capability}"
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-
-            instances = body if isinstance(body, list) else body.get("instances", [])
-            for inst in instances:
-                svc_url = inst.get("serviceUrl") or inst.get("service_url") or ""
+            instances = self.find_instances(capability)
+            for instance in instances:
+                svc_url = instance.get("serviceUrl") or instance.get("service_url") or ""
                 if svc_url:
                     with self._lock:
-                        self._cache[capability] = (
-                            time.time() + self._cache_ttl,
-                            svc_url,
-                        )
+                        self._cache[capability] = (time.time() + self._cache_ttl, svc_url)
                     return svc_url
         except Exception as exc:
             logger.debug("[registry-client] Discovery failed for %s: %s", capability, exc)
@@ -138,16 +128,100 @@ class RegistryClient:
             return ""
 
         try:
-            import urllib.request
-
-            url = f"{self._registry_url}/agents/{agent_id}"
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-            return body.get("serviceUrl") or body.get("service_url") or ""
+            body = self._request_json("GET", f"/agents/{quote(agent_id, safe='')}/instances")
+            instances = body if isinstance(body, list) else body.get("instances", [])
+            for instance in instances:
+                svc_url = instance.get("serviceUrl") or instance.get("service_url") or ""
+                if svc_url:
+                    return svc_url
         except Exception as exc:
             logger.debug("[registry-client] Lookup failed for %s: %s", agent_id, exc)
             return ""
+
+    def get_definition(self, agent_id: str) -> dict:
+        """Return the registered definition for *agent_id* or an empty dict."""
+        if not self._registry_url:
+            return {}
+        try:
+            body = self._request_json("GET", f"/agents/{quote(agent_id, safe='')}")
+            return body if isinstance(body, dict) else {}
+        except Exception as exc:
+            logger.debug("[registry-client] Definition lookup failed for %s: %s", agent_id, exc)
+            return {}
+
+    def query_capability(self, capability: str) -> list[dict]:
+        """Return registry definitions advertising *capability*."""
+        if not self._registry_url:
+            return []
+        try:
+            body = self._request_json("GET", f"/query?capability={quote(capability, safe='')}")
+            return body if isinstance(body, list) else body.get("instances", [])
+        except Exception as exc:
+            logger.debug("[registry-client] Capability query failed for %s: %s", capability, exc)
+            return []
+
+    def get_capability_definition(self, capability: str) -> dict:
+        """Return the first definition that advertises *capability*."""
+        definitions = self.query_capability(capability)
+        return definitions[0] if definitions else {}
+
+    def has_capability(self, capability: str) -> bool:
+        """Return whether any active definition advertises *capability*."""
+        return bool(self.query_capability(capability))
+
+    def find_instances(self, capability: str) -> list[dict]:
+        """Return flattened live instances for *capability*."""
+        definitions = self.query_capability(capability)
+        instances: list[dict] = []
+        for definition in definitions:
+            nested_instances = definition.get("instances")
+            if isinstance(nested_instances, list) and nested_instances:
+                for instance in nested_instances:
+                    merged = dict(instance)
+                    merged.setdefault("agentId", definition.get("agent_id") or definition.get("agentId", ""))
+                    merged.setdefault("capabilities", definition.get("capabilities") or [])
+                    instances.append(merged)
+                continue
+
+            svc_url = definition.get("serviceUrl") or definition.get("service_url") or ""
+            if svc_url:
+                merged = dict(definition)
+                merged.setdefault("agentId", definition.get("agent_id") or definition.get("agentId", ""))
+                instances.append(merged)
+        return instances
+
+    def upsert_agent(self, payload: dict[str, Any]) -> dict:
+        """Create or replace an agent definition in the registry."""
+        return self._request_json("POST", "/agents", payload=payload)
+
+    def register_instance(
+        self,
+        agent_id: str,
+        *,
+        service_url: str,
+        port: int,
+        container_id: str = "",
+    ) -> dict:
+        """Register or refresh a live instance for *agent_id*."""
+        payload = {
+            "serviceUrl": service_url,
+            "port": int(port or 0),
+        }
+        if container_id:
+            payload["containerId"] = container_id
+        return self._request_json(
+            "POST",
+            f"/agents/{quote(agent_id, safe='')}/instances",
+            payload=payload,
+        )
+
+    def heartbeat_instance(self, agent_id: str, instance_id: str) -> dict:
+        """Send a heartbeat update for an existing instance."""
+        return self._request_json(
+            "PUT",
+            f"/agents/{quote(agent_id, safe='')}/instances/{quote(instance_id, safe='')}",
+            payload={"heartbeat": True},
+        )
 
     def invalidate(self, capability: str | None = None) -> None:
         """Invalidate the cache for a single capability (or all)."""
@@ -156,6 +230,22 @@ class RegistryClient:
                 self._cache.pop(capability, None)
             else:
                 self._cache.clear()
+
+    def _request_json(self, method: str, path: str, payload: dict[str, Any] | None = None, timeout: int = 3) -> Any:
+        import urllib.request
+
+        if not self._registry_url:
+            raise RuntimeError("Registry URL is not configured")
+
+        request = urllib.request.Request(
+            f"{self._registry_url}{path}",
+            data=None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"} if payload is not None else {},
+            method=method,
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
 
     def __repr__(self) -> str:
         return f"RegistryClient(url={self._registry_url!r})"

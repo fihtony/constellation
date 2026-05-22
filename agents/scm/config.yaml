@@ -17,8 +17,11 @@ port: 8020
 # Capabilities exposed via A2A skill IDs
 capabilities:
   - scm.repo.inspect
+  - scm.repo.get
+  - scm.repo.clone
   - scm.branch.list
   - scm.branch.create
+  - scm.branch.push
   - scm.pr.create
   - scm.pr.get
   - scm.pr.list

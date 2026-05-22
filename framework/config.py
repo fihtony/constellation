@@ -87,6 +87,9 @@ def _find_project_root() -> Path:
 # come later (last-write-wins).
 _ENV_OVERRIDES: dict[str, str] = {
     # --- unprefixed (lower priority) ---
+    "AGENT_RUNTIME": "runtime.backend",
+    "AGENT_MODEL": "runtime.model",
+    "ANTHROPIC_MODEL": "runtime.model",
     "OPENAI_MODEL": "runtime.model",
     "REGISTRY_URL": "registry.url",
     "CONTAINER_RUNTIME": "container.runtime",

@@ -21,8 +21,12 @@ port: 8010
 # Capabilities exposed via A2A skill IDs
 capabilities:
   - jira.ticket.fetch
+  - jira.ticket.get
   - jira.ticket.search
+  - jira.comment.add
   - jira.ticket.comment
   - jira.ticket.update
   - jira.ticket.transition
   - jira.transitions.list
+  - jira.user.me
+  - jira.comment.list

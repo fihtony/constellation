@@ -6,7 +6,6 @@ workflow orchestration — intelligence comes from the LLM + instructions.
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
 from framework.tools.base import BaseTool, ToolResult
@@ -28,36 +27,12 @@ def _discover_via_registry(capability: str) -> str:
 
 
 def _resolve_agent_url(env_var: str, config_key: str, default: str, capability: str = "") -> str:
-    """Resolve an agent's URL with a defined priority order:
-
-    1. Environment variable (``env_var``) — highest priority, deployment override.
-    2. Capability Registry discovery via ``/query?capability=<capability>``.
-    3. Global config ``services.<config_key>`` from constellation.yaml.
-    4. Hardcoded ``default`` — last-resort fallback for bare-metal / test runs.
-    """
-    # Priority 1: explicit env var override
-    env_val = os.environ.get(env_var)
-    if env_val:
-        return env_val
-
-    # Priority 2: Registry capability discovery (preferred at runtime)
+    """Resolve an agent's live URL via Registry only."""
     if capability:
         discovered = _discover_via_registry(capability)
         if discovered:
             return discovered
-
-    # Priority 3: global config services section
-    try:
-        from framework.config import load_global_config
-        global_cfg = load_global_config()
-        services = global_cfg.get("services") or {}
-        cfg_url = services.get(config_key, "").strip()
-        if cfg_url:
-            return cfg_url
-    except Exception:
-        pass
-
-    return default
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +57,8 @@ class FetchJiraTicket(BaseTool):
 
     def execute_sync(self, ticket_key: str = "") -> ToolResult:
         jira_url = _resolve_agent_url("JIRA_AGENT_URL", "jira_agent_url", "http://jira:8010", "jira.ticket.fetch")
+        if not jira_url:
+            return ToolResult(output=json.dumps({"error": "No registered Jira instance was found in the registry.", "ticketKey": ticket_key}))
         try:
             from framework.a2a.client import dispatch_sync
             result = dispatch_sync(
@@ -143,6 +120,8 @@ class FetchDesign(BaseTool):
         screen_name: str = "",
     ) -> ToolResult:
         ui_url = _resolve_agent_url("UI_DESIGN_AGENT_URL", "ui_design_agent_url", "http://ui-design:8040", "figma.file.fetch")
+        if not ui_url:
+            return ToolResult(output=json.dumps({"error": "No registered UI Design instance was found in the registry."}))
         try:
             from framework.a2a.client import dispatch_sync
             if figma_url:
@@ -207,6 +186,12 @@ class CloneRepo(BaseTool):
         scm_url = _resolve_agent_url(
             "SCM_AGENT_URL", "scm_agent_url", "http://scm:8020", "scm.repo.clone"
         )
+        if not scm_url:
+            return ToolResult(output=json.dumps({
+                "error": "No registered SCM instance was found in the registry.",
+                "repoUrl": repo_url,
+                "targetPath": target_path,
+            }))
         try:
             from framework.a2a.client import dispatch_sync
             result = dispatch_sync(
@@ -342,6 +327,11 @@ class DispatchWebDev(BaseTool):
         definition_of_done: dict | None = None,
     ) -> ToolResult:
         web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", "web-dev.task.execute")
+        if not web_dev_url:
+            return ToolResult(output=json.dumps({
+                "status": "error",
+                "message": "No registered Web Dev instance was found in the registry.",
+            }))
         meta: dict[str, Any] = {}
         if jira_context:
             meta["jiraContext"] = jira_context
@@ -469,6 +459,11 @@ class DispatchCodeReview(BaseTool):
         context_manifest_path: str = "",
     ) -> ToolResult:
         review_url = _resolve_agent_url("CODE_REVIEW_AGENT_URL", "code_review_agent_url", "http://code-review:8050", "review.code.check")
+        if not review_url:
+            return ToolResult(output=json.dumps({
+                "verdict": "error",
+                "message": "No registered Code Review instance was found in the registry.",
+            }))
         meta: dict[str, Any] = {}
         if pr_url:
             meta["prUrl"] = pr_url

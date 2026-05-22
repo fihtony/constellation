@@ -351,6 +351,23 @@ class TestCompassTools:
         assert payload["state"] == "TASK_STATE_FAILED"
         assert "Jira ticket not accessible" in payload["message"]
 
+    def test_dispatch_development_task_requires_registry_registration(self, monkeypatch):
+        from agents.compass.tools import DispatchDevelopmentTask
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return ""
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+
+        result = DispatchDevelopmentTask().execute_sync(task_description="Implement PROJ-123")
+        payload = json.loads(result.output)
+        assert payload["status"] == "error"
+        assert "No registered Team Lead instance" in payload["message"]
+
     def test_dispatch_office_task_uses_per_task_launcher_for_workspace_mode(self, monkeypatch, tmp_path):
         from agents.compass.tools import DispatchOfficeTask
 
@@ -466,3 +483,48 @@ class TestCompassTools:
         assert payload["status"] == "completed"
         assert launched["overrides"]["env"]["OFFICE_ALLOW_INPLACE_WRITES"] == "true"
         assert launched["overrides"]["extra_binds"] == [f"/host{source_dir}:/app/userdata/input-0"]
+
+    def test_office_dispatch_accepts_registry_definition_for_per_task_launch(self, monkeypatch):
+        from agents.compass.agent import _dispatch_office_request
+
+        class StubRegistryClient:
+            url = "http://registry:9000"
+
+            def get_capability_definition(self, capability):
+                if capability == "office.data.analyze":
+                    return {"agent_id": "office", "execution_mode": "per-task"}
+                return {}
+
+        class StubRegistry:
+            def execute_sync(self, name, arguments):
+                assert name == "dispatch_office_task"
+                return json.dumps({"status": "completed", "summary": "Office task completed."})
+
+        class StubLog:
+            def a2a(self, *args, **kwargs):
+                return None
+
+            def info(self, *args, **kwargs):
+                return None
+
+            def warn(self, *args, **kwargs):
+                return None
+
+            def error(self, *args, **kwargs):
+                return None
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setattr("agents.compass.agent._should_use_per_task_office_launch", lambda: True)
+
+        result = _dispatch_office_request(
+            "task-123",
+            "Analyze the authorized data.",
+            {"source_paths": ["/workspace/input.csv"], "capability": "analyze", "output_mode": "workspace"},
+            StubRegistry(),
+            StubLog(),
+        )
+
+        assert result["status"] == "completed"

@@ -4,6 +4,28 @@
 services:
 
   # -----------------------------------------------------------------------
+  # Registry — capability definition and live instance tracking (port 9000)
+  # -----------------------------------------------------------------------
+  registry:
+    image: constellation-v2-registry:latest
+    build:
+      context: .
+      dockerfile: registry/Dockerfile
+    environment:
+      REGISTRY_HOST: "0.0.0.0"
+      REGISTRY_PORT: "9000"
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+    networks:
+      - constellation-v2
+
+  # -----------------------------------------------------------------------
   # Compass Agent — control plane entry point (port 8000)
   # -----------------------------------------------------------------------
   compass:
@@ -12,6 +34,8 @@ services:
       context: .
       dockerfile: agents/compass/Dockerfile
     depends_on:
+      registry:
+        condition: service_healthy
       team-lead:
         condition: service_healthy
       jira:
@@ -24,6 +48,7 @@ services:
       AGENT_ID: "compass"
       HOST: "0.0.0.0"
       PORT: "8000"
+      REGISTRY_URL: "http://registry:9000"
       AGENT_RUNTIME: "claude-code"
       ARTIFACT_ROOT: /app/artifacts
       CONTAINER_RUNTIME: docker
@@ -63,6 +88,7 @@ services:
       AGENT_ID: "team-lead"
       HOST: "0.0.0.0"
       PORT: "8030"
+      REGISTRY_URL: "http://registry:9000"
       AGENT_RUNTIME: "claude-code"
       ARTIFACT_ROOT: /app/artifacts
       CONTAINER_RUNTIME: docker
@@ -96,6 +122,7 @@ services:
       AGENT_ID: "jira"
       HOST: "0.0.0.0"
       PORT: "8010"
+      REGISTRY_URL: "http://registry:9000"
       AGENT_RUNTIME: "claude-code"
       ARTIFACT_ROOT: /app/artifacts
       JIRA_BACKEND: ${JIRA_BACKEND:-rest}
@@ -133,6 +160,7 @@ services:
       AGENT_ID: "scm"
       HOST: "0.0.0.0"
       PORT: "8020"
+      REGISTRY_URL: "http://registry:9000"
       AGENT_RUNTIME: "claude-code"
       ARTIFACT_ROOT: /app/artifacts
       GH_TOKEN: ${GH_TOKEN:-}
@@ -167,6 +195,7 @@ services:
       AGENT_ID: "ui-design"
       HOST: "0.0.0.0"
       PORT: "8040"
+      REGISTRY_URL: "http://registry:9000"
       AGENT_RUNTIME: "claude-code"
       ARTIFACT_ROOT: /app/artifacts
     volumes:
@@ -201,6 +230,7 @@ services:
       AGENT_ID: "office"
       HOST: "0.0.0.0"
       PORT: "8060"
+      REGISTRY_URL: "http://registry:9000"
       AGENT_RUNTIME: "claude-code"
       ARTIFACT_ROOT: /app/artifacts
       OFFICE_SOURCE_ROOT: ${OFFICE_SOURCE_ROOT:-/app/userdata}
