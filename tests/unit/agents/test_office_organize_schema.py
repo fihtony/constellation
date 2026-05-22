@@ -113,7 +113,7 @@ class TestOrganizeMoveFileToolSchemaEnforcement:
 
     def teardown_method(self):
         """Clean up test environment."""
-        for key in ["OFFICE_ALLOW_INPLACE_WRITES", "OFFICE_SOURCE_ROOT", "OFFICE_WORKSPACE_ROOT"]:
+        for key in ["OFFICE_ALLOW_INPLACE_WRITES", "OFFICE_SOURCE_ROOT", "OFFICE_WORKSPACE_ROOT", "OFFICE_OUTPUT_MODE"]:
             if key in os.environ:
                 del os.environ[key]
 
@@ -153,16 +153,19 @@ class TestOrganizeMoveFileToolSchemaEnforcement:
     def test_accepts_students_category_path(self, tmp_path):
         """Accepts destinations under students/ category."""
         os.environ["OFFICE_WORKSPACE_ROOT"] = str(tmp_path)
+        os.environ["OFFICE_OUTPUT_MODE"] = "workspace"
 
         result = self.tool.execute_sync(
             action="mkdir",
             dst="students/Ethan",
         )
         assert result.success, f"Should accept students category: {result.error}"
+        assert (tmp_path / "organized-output" / "files" / "students" / "Ethan").exists()
 
     def test_accepts_documents_category_path(self, tmp_path):
         """Accepts destinations under documents/ category."""
         os.environ["OFFICE_WORKSPACE_ROOT"] = str(tmp_path)
+        os.environ["OFFICE_OUTPUT_MODE"] = "workspace"
 
         result = self.tool.execute_sync(
             action="write_text",
@@ -170,10 +173,12 @@ class TestOrganizeMoveFileToolSchemaEnforcement:
             content="# Summary",
         )
         assert result.success, f"Should accept documents category: {result.error}"
+        assert (tmp_path / "organized-output" / "files" / "documents" / "report.pdf.summary.md").exists()
 
     def test_accepts_data_category_path(self, tmp_path):
         """Accepts destinations under data/ category."""
         os.environ["OFFICE_WORKSPACE_ROOT"] = str(tmp_path)
+        os.environ["OFFICE_OUTPUT_MODE"] = "workspace"
 
         result = self.tool.execute_sync(
             action="write_text",
@@ -181,6 +186,7 @@ class TestOrganizeMoveFileToolSchemaEnforcement:
             content="# Analysis",
         )
         assert result.success, f"Should accept data category: {result.error}"
+        assert (tmp_path / "organized-output" / "files" / "data" / "sales.csv.analysis.md").exists()
 
     def test_inplace_mode_uses_source_root(self, tmp_path):
         """In inplace mode, resolves path relative to source root."""

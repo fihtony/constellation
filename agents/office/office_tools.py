@@ -5,8 +5,12 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import shutil
 import time
+import zipfile
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from io import StringIO
 from pathlib import Path
 
@@ -215,6 +219,61 @@ def _truncate_content(text: str, max_chars: int = 16000) -> tuple[str, bool]:
 ORGANIZED_OUTPUT_ROOT = "organized-output/files/"
 VALID_CATEGORIES = {"students", "documents", "data", "code", "images", "presentations"}
 WRAPPER_PREFIXES = {"grouped", "by-student", "organized", "output", "originals"}
+TEXT_PREVIEW_EXTENSIONS = {
+    ".txt", ".md", ".markdown",
+    ".csv", ".tsv",
+    ".json", ".jsonl",
+    ".yaml", ".yml",
+    ".rtf", ".log",
+    ".ini", ".cfg", ".toml",
+    ".html", ".htm", ".xml",
+}
+READER_TOOL_BY_EXTENSION = {
+    ".txt": "read_txt",
+    ".md": "read_txt",
+    ".markdown": "read_txt",
+    ".html": "read_txt",
+    ".htm": "read_txt",
+    ".xml": "read_txt",
+    ".json": "read_txt",
+    ".jsonl": "read_txt",
+    ".yaml": "read_txt",
+    ".yml": "read_txt",
+    ".ini": "read_txt",
+    ".cfg": "read_txt",
+    ".toml": "read_txt",
+    ".log": "read_txt",
+    ".rtf": "read_txt",
+    ".csv": "read_csv",
+    ".tsv": "read_txt",
+    ".pdf": "read_pdf",
+    ".docx": "read_docx",
+    ".docm": "read_docx",
+    ".dotx": "read_docx",
+    ".dotm": "read_docx",
+    ".pptx": "read_pptx",
+    ".xlsx": "read_xlsx",
+    ".xlsm": "read_xlsx",
+    ".xls": "read_xls",
+}
+IDENTITY_PREFIXES = {
+    "student",
+    "author",
+    "writer",
+    "owner",
+    "employee",
+    "member",
+    "candidate",
+    "user",
+    "agent",
+    "participant",
+    "customer",
+    "client",
+    "employee name",
+    "name",
+    "created by",
+    "prepared by",
+}
 
 
 def _is_wrapper_prefixed(path: str) -> bool:
@@ -256,6 +315,292 @@ def _is_under_organized_output(path: str) -> bool:
     # Check if it's a category-relative path (students/, documents/, data/, etc.)
     first_component = normalized.split("/")[0] if normalized else ""
     return first_component in VALID_CATEGORIES
+
+
+def _categorize_extension(ext: str) -> str:
+    if ext in (".pdf", ".doc", ".docx"):
+        return "documents"
+    if ext in (".txt", ".md", ".rtf"):
+        return "text"
+    if ext in (".csv", ".xlsx", ".xls", ".xlsm", ".tsv"):
+        return "data"
+    if ext in (".png", ".jpg", ".jpeg", ".gif", ".svg"):
+        return "images"
+    if ext in (".ppt", ".pptx"):
+        return "presentations"
+    if ext in (".py", ".js", ".ts", ".java", ".cpp", ".c", ".h"):
+        return "code"
+    return "other"
+
+
+def _suggested_reader_tool(ext: str) -> str | None:
+    return READER_TOOL_BY_EXTENSION.get(ext)
+
+
+def _path_year_hint(root: str, relative_path: str) -> str | None:
+    candidates = list(Path(root).parts) + list(Path(relative_path).parts)
+    for part in candidates:
+        if re.fullmatch(r"(19|20)\d{2}", part):
+            return part
+    return None
+
+
+def _infer_date_bucket(root: str, relative_path: str, preview: str) -> str | None:
+    year_hint = _path_year_hint(root, relative_path)
+    tokens = list(Path(relative_path).parts)
+    tokens.extend(re.findall(r"\b\d{4}[-_/]?\d{2}(?:[-_/]?\d{2})?\b", preview))
+
+    for token in tokens:
+        cleaned = token.replace("_", "-").replace("/", "-")
+        full_date = re.search(r"\b((19|20)\d{2})-(\d{2})(?:-(\d{2}))?\b", cleaned)
+        if full_date:
+            return f"{full_date.group(1)}-{full_date.group(3)}"
+        compact_date = re.search(r"\b((19|20)\d{2})(\d{2})(\d{2})\b", token)
+        if compact_date:
+            return f"{compact_date.group(1)}-{compact_date.group(3)}"
+        compact_month = re.search(r"\b((19|20)\d{2})(\d{2})\b", token)
+        if compact_month:
+            return f"{compact_month.group(1)}-{compact_month.group(3)}"
+        month_day = re.fullmatch(r"(\d{2})(\d{2})", token)
+        if month_day and year_hint:
+            month = month_day.group(1)
+            if 1 <= int(month) <= 12:
+                return f"{year_hint}-{month}"
+    return None
+
+
+def _extract_prominent_headings(lines: list[str]) -> list[str]:
+    headings: list[str] = []
+    for line in lines[:20]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith((">>>", "#", "##")):
+            headings.append(stripped.lstrip("#>").strip())
+            continue
+        if len(stripped) <= 80 and stripped == stripped.title():
+            headings.append(stripped)
+        if len(headings) >= 5:
+            break
+    return headings
+
+
+def _extract_labeled_fields(lines: list[str]) -> list[dict[str, str]]:
+    fields: list[dict[str, str]] = []
+    for line in lines[:25]:
+        match = re.match(r"^\s*([A-Za-z][A-Za-z0-9 _/-]{1,40})\s*:\s*(.+?)\s*$", line)
+        if not match:
+            continue
+        label = match.group(1).strip()
+        value = match.group(2).strip()
+        if len(value) > 120:
+            continue
+        fields.append({"label": label, "value": value})
+        if len(fields) >= 8:
+            break
+    return fields
+
+
+def _clean_entity_candidate(value: str) -> str:
+    candidate = re.sub(r"^[>\-#\s]+", "", value).strip()
+    candidate = re.sub(r"\s+", " ", candidate)
+    lowered = candidate.lower()
+    for prefix in sorted(IDENTITY_PREFIXES, key=len, reverse=True):
+        if lowered.startswith(prefix + " "):
+            return candidate[len(prefix):].strip(" :-")
+    return candidate.strip(" :-")
+
+
+def _looks_like_person_name(value: str) -> bool:
+    tokens = re.findall(r"[A-Za-z][A-Za-z'._-]*", value)
+    if not tokens or len(tokens) > 4:
+        return False
+    return all(token[:1].isupper() for token in tokens if token)
+
+
+def _extract_primary_entity(lines: list[str], headings: list[str], labeled_fields: list[dict[str, str]]) -> tuple[str | None, str | None, str]:
+    for line in lines[:20]:
+        stripped = line.strip()
+        for prefix in sorted(IDENTITY_PREFIXES, key=len, reverse=True):
+            marker = prefix.title()
+            if stripped.lower().startswith((">>> " + prefix + " ", prefix + " ")):
+                candidate = _clean_entity_candidate(
+                    stripped.split(">>>", 1)[-1].strip() if stripped.startswith(">>>") else stripped
+                )
+                if candidate.lower().startswith(prefix + " "):
+                    candidate = candidate[len(prefix):].strip(" :-")
+                if candidate:
+                    return candidate, "explicit_heading", "high"
+    for field in labeled_fields:
+        candidate = _clean_entity_candidate(field["value"])
+        label = field["label"].strip().lower()
+        if label in IDENTITY_PREFIXES and candidate:
+            return candidate, "labeled_field", "high"
+    return None, None, "none"
+
+
+def _read_text_preview(path: str, max_chars: int = 1200) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in TEXT_PREVIEW_EXTENSIONS:
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(max_chars * 2)
+        text, _ = _decode_text_bytes(raw)
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
+def _extract_markup_text(raw_text: str, ext: str) -> tuple[str, str]:
+    """Convert markup-oriented formats into readable text."""
+    if ext in {".html", ".htm"}:
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(raw_text, "lxml")
+            return soup.get_text("\n"), "html-bs4"
+        except Exception:
+            try:
+                class _TextExtractor(HTMLParser):
+                    def __init__(self) -> None:
+                        super().__init__()
+                        self.chunks: list[str] = []
+
+                    def handle_data(self, data: str) -> None:
+                        if data.strip():
+                            self.chunks.append(data.strip())
+
+                parser = _TextExtractor()
+                parser.feed(raw_text)
+                return "\n".join(parser.chunks), "html-stdlib"
+            except Exception:
+                return raw_text, "html-raw"
+    if ext == ".xml":
+        try:
+            root = ET.fromstring(raw_text)
+            return "\n".join(text.strip() for text in root.itertext() if text.strip()), "xml-etree"
+        except Exception:
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(raw_text, "xml")
+                return soup.get_text("\n"), "xml-bs4"
+            except Exception:
+                return raw_text, "xml-raw"
+    if ext == ".json":
+        try:
+            parsed = json.loads(raw_text)
+            return json.dumps(parsed, ensure_ascii=False, indent=2), "json-pretty"
+        except Exception:
+            return raw_text, "json-raw"
+    if ext == ".jsonl":
+        lines = []
+        for raw_line in raw_text.splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                lines.append(json.dumps(json.loads(raw_line), ensure_ascii=False, indent=2))
+            except Exception:
+                lines.append(raw_line)
+        return "\n\n".join(lines), "jsonl-pretty"
+    if ext in {".yaml", ".yml"}:
+        try:
+            import yaml
+            parsed = yaml.safe_load(raw_text)
+            return json.dumps(parsed, ensure_ascii=False, indent=2), "yaml-json"
+        except Exception:
+            return raw_text, "yaml-raw"
+    if ext == ".rtf":
+        try:
+            from striprtf.striprtf import rtf_to_text
+            return rtf_to_text(raw_text), "rtf-striprtf"
+        except Exception:
+            return raw_text, "rtf-raw"
+    return raw_text, "plain-text"
+
+
+def _extract_docx_like_text(path: str) -> tuple[list[str], str]:
+    """Extract paragraph text from Word OpenXML documents with a library fallback."""
+    try:
+        import docx
+        doc = docx.Document(path)
+        return [p.text for p in doc.paragraphs if p.text.strip()], "python-docx"
+    except Exception:
+        with zipfile.ZipFile(path) as archive:
+            xml_bytes = archive.read("word/document.xml")
+        root = ET.fromstring(xml_bytes)
+        namespaces = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        paragraphs = []
+        for para in root.findall(".//w:p", namespaces):
+            texts = [node.text or "" for node in para.findall(".//w:t", namespaces)]
+            joined = "".join(texts).strip()
+            if joined:
+                paragraphs.append(joined)
+        return paragraphs, "zip-xml"
+
+
+def _safe_path_segment(value: str) -> str:
+    segment = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    return segment.strip("_") or "unknown"
+
+
+def _build_file_metadata(root: str, full_path: str) -> dict[str, object]:
+    rel_path = os.path.relpath(full_path, root)
+    ext = os.path.splitext(full_path)[1].lower()
+    category = _categorize_extension(ext)
+    preview = _read_text_preview(full_path)
+    lines = preview.splitlines()
+    headings = _extract_prominent_headings(lines)
+    labeled_fields = _extract_labeled_fields(lines)
+    primary_entity, primary_entity_source, primary_entity_confidence = _extract_primary_entity(
+        lines,
+        headings,
+        labeled_fields,
+    )
+    inferred_date_bucket = _infer_date_bucket(root, rel_path, preview)
+    relative_stem = rel_path.replace(os.sep, "-")
+    suggested_destination = None
+    if primary_entity and inferred_date_bucket:
+        suggested_destination = (
+            f"{_safe_path_segment(primary_entity)}/"
+            f"{inferred_date_bucket}/"
+            f"{relative_stem}"
+        )
+    return {
+        "relative_path": rel_path,
+        "name": os.path.basename(full_path),
+        "ext": ext,
+        "size": os.path.getsize(full_path),
+        "category": category,
+        "parent_dirs": list(Path(rel_path).parts[:-1]),
+        "suggested_reader_tool": _suggested_reader_tool(ext),
+        "inferred_date_bucket": inferred_date_bucket,
+        "primary_entity": primary_entity,
+        "primary_entity_source": primary_entity_source,
+        "primary_entity_confidence": primary_entity_confidence,
+        "prominent_headings": headings[:2],
+        "labeled_fields": labeled_fields[:2],
+        "suggested_destination": suggested_destination,
+    }
+
+
+def collect_organize_file_inventory(root: str) -> tuple[list[dict[str, object]], dict[str, list[str]], int]:
+    """Return recursive file inventory and category groups for organize tasks."""
+    inventory: list[dict[str, object]] = []
+    groups: dict[str, list[str]] = {}
+    total_dirs = 0
+    for walk_root, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        total_dirs += len(dirs)
+        for name in sorted(files):
+            if name.startswith("."):
+                continue
+            full_path = os.path.join(walk_root, name)
+            item = _build_file_metadata(root, full_path)
+            inventory.append(item)
+            groups.setdefault(str(item["category"]), []).append(str(item["relative_path"]))
+    inventory.sort(key=lambda item: str(item["relative_path"]))
+    return inventory, groups, total_dirs
 
 
 def _get_audit_dir() -> str:
@@ -448,7 +793,7 @@ def _check_directory_limits(path: str) -> dict | None:
 
 class ReadPdfTool(BaseTool):
     name = "read_pdf"
-    description = "Read a PDF file and return bounded text content with page metadata for summarization."
+    description = "Read a PDF file and return bounded text content with extraction metadata for summarization. If no embedded text is extractable without OCR, report that clearly."
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -471,19 +816,38 @@ class ReadPdfTool(BaseTool):
         try:
             import pdfplumber
             with pdfplumber.open(normalized) as pdf:
+                total_pages = len(pdf.pages)
                 pages = []
                 for page in pdf.pages:
                     text = page.extract_text() or ""
                     if text.strip():
                         pages.append(f"[Page {page.page_number}]\n{text}")
                 content = "\n\n".join(pages)
+            extraction_method = "pdfplumber"
+            if not content.strip():
+                try:
+                    from pypdf import PdfReader
+                    reader = PdfReader(normalized)
+                    alt_pages = []
+                    for idx, page in enumerate(reader.pages):
+                        text = page.extract_text() or ""
+                        if text.strip():
+                            alt_pages.append(f"[Page {idx + 1}]\n{text}")
+                    if alt_pages:
+                        content = "\n\n".join(alt_pages)
+                        extraction_method = "pypdf"
+                except Exception:
+                    pass
             content, truncated = _truncate_content(content)
             size_kb = os.path.getsize(normalized) // 1024
             return ToolResult(output=json.dumps({
                 "content": content,
                 "path": normalized,
-                "pages": len(pages),
+                "pages_with_text": len(pages) if extraction_method == "pdfplumber" else len([block for block in content.split("\n\n") if block.strip()]),
+                "total_pages": total_pages,
                 "size_kb": size_kb,
+                "extractable_text": bool(content.strip()),
+                "extraction_method": extraction_method if content.strip() else "none",
                 "truncated": truncated,
             }))
         except Exception as exc:
@@ -496,11 +860,11 @@ class ReadPdfTool(BaseTool):
 
 class ReadDocxTool(BaseTool):
     name = "read_docx"
-    description = "Read a DOCX file and return bounded text content including paragraph metadata."
+    description = "Read Word OpenXML files (.docx/.docm/.dotx/.dotm) and return bounded text content including paragraph metadata. Uses a standard-library fallback when python-docx is unavailable."
     parameters_schema = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Absolute path to the DOCX file"},
+            "path": {"type": "string", "description": "Absolute path to the Word OpenXML file"},
         },
         "required": ["path"],
     }
@@ -513,21 +877,20 @@ class ReadDocxTool(BaseTool):
             return ToolResult(output="", error=f"read_docx: file not found: {path}")
         if normalized.lower().endswith(".doc"):
             return ToolResult(output="", error="read_docx: .doc format is not supported. Please convert to .docx first.")
-        if not normalized.lower().endswith(".docx"):
-            return ToolResult(output="", error=f"read_docx: not a DOCX file: {path}")
+        if not normalized.lower().endswith((".docx", ".docm", ".dotx", ".dotm")):
+            return ToolResult(output="", error=f"read_docx: not a supported Word OpenXML file: {path}")
         ok, size_err = _check_file_size(normalized)
         if not ok:
             return ToolResult(output="", error=f"read_docx: {size_err}")
         try:
-            import docx
-            doc = docx.Document(normalized)
-            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            paragraphs, extraction_method = _extract_docx_like_text(normalized)
             content = "\n\n".join(paragraphs)
             content, truncated = _truncate_content(content)
             return ToolResult(output=json.dumps({
                 "content": content,
                 "path": normalized,
                 "paragraphs": len(paragraphs),
+                "extraction_method": extraction_method,
                 "truncated": truncated,
             }))
         except Exception as exc:
@@ -590,7 +953,7 @@ class ReadPptxTool(BaseTool):
 
 class ReadTxtTool(BaseTool):
     name = "read_txt"
-    description = "Read a plain text file and return bounded text content."
+    description = "Read text-like files such as TXT, Markdown, HTML, and XML, returning bounded readable text content."
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -612,12 +975,15 @@ class ReadTxtTool(BaseTool):
             with open(normalized, "rb") as fh:
                 raw = fh.read()
             content, encoding = _decode_text_bytes(raw)
+            ext = os.path.splitext(normalized)[1].lower()
+            content, extraction_method = _extract_markup_text(content, ext)
             content, truncated = _truncate_content(content)
             return ToolResult(output=json.dumps({
                 "content": content,
                 "path": normalized,
                 "chars": len(content),
                 "encoding": encoding,
+                "extraction_method": extraction_method,
                 "truncated": truncated,
             }))
         except Exception as exc:
@@ -882,9 +1248,9 @@ class WriteFileTool(BaseTool):
 
 class OrganizeFolderTool(BaseTool):
     name = "organize_folder"
-    description = """Analyze a folder and generate an organization plan that groups files by type/category.
-Outputs a structured organization-plan.md file. Use list_directory to survey the folder first.
-This tool does NOT move files — use organize_move_file to execute planned moves."""
+    description = """Survey a folder recursively and return per-file metadata for organizing.
+Returns path, recursive file inventory, category groups, and extracted signals such as headings,
+date buckets, and suggested reader tools. Use this before planning organize_move_file operations."""
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -901,62 +1267,25 @@ This tool does NOT move files — use organize_move_file to execute planned move
             return ToolResult(output="", error=f"organize_folder: not a directory: {path}")
 
         try:
-            entries = []
-            errors = []
-            for name in os.listdir(normalized):
-                full = os.path.join(normalized, name)
-                try:
-                    stat = os.stat(full)
-                    is_dir = os.path.isdir(full)
-                    entries.append({
-                        "name": name,
-                        "type": "dir" if is_dir else "file",
-                        "size": stat.st_size if not is_dir else 0,
-                        "ext": os.path.splitext(name)[1].lower(),
-                    })
-                except OSError:
-                    errors.append(name)
-
-            # Group by extension/category
-            groups = {}
-            for e in entries:
-                if e["type"] == "dir":
-                    cat = "folders"
-                else:
-                    ext = e.get("ext", "")
-                    if ext in (".pdf", ".doc", ".docx"):
-                        cat = "documents"
-                    elif ext in (".txt", ".md", ".rtf"):
-                        cat = "text"
-                    elif ext in (".csv", ".xlsx", ".xls"):
-                        cat = "data"
-                    elif ext in (".png", ".jpg", ".jpeg", ".gif", ".svg"):
-                        cat = "images"
-                    elif ext in (".py", ".js", ".ts", ".java", ".cpp", ".c", ".h"):
-                        cat = "code"
-                    else:
-                        cat = "other"
-                if cat not in groups:
-                    groups[cat] = []
-                groups[cat].append(e["name"])
-
-            # Build organization plan markdown
-            plan_lines = ["# Folder Organization Plan", "", f"**Source:** `{normalized}`", ""]
-            for cat, files in sorted(groups.items()):
-                plan_lines.append(f"## {cat.title()} ({len(files)})")
-                for f in sorted(files, key=str.lower):
-                    plan_lines.append(f"- `{f}`")
-                plan_lines.append("")
-
-            plan_content = "\n".join(plan_lines)
-
+            files, groups, total_dirs = collect_organize_file_inventory(normalized)
+            entity_counts: dict[str, int] = {}
+            date_bucket_counts: dict[str, int] = {}
+            for item in files:
+                entity = str(item.get("primary_entity") or "").strip()
+                if entity:
+                    entity_counts[entity] = entity_counts.get(entity, 0) + 1
+                date_bucket = str(item.get("inferred_date_bucket") or "").strip()
+                if date_bucket:
+                    date_bucket_counts[date_bucket] = date_bucket_counts.get(date_bucket, 0) + 1
             return ToolResult(output=json.dumps({
                 "path": normalized,
                 "groups": groups,
-                "plan_content": plan_content,
-                "total_files": len([e for e in entries if e["type"] == "file"]),
-                "total_dirs": len([e for e in entries if e["type"] == "dir"]),
-                "errors": errors,
+                "files": files,
+                "total_files": len(files),
+                "total_dirs": total_dirs,
+                "entity_counts": entity_counts,
+                "date_bucket_counts": date_bucket_counts,
+                "errors": [],
             }))
         except Exception as exc:
             return ToolResult(output="", error=f"organize_folder: failed: {exc}")
@@ -984,32 +1313,44 @@ Use organize_folder tool first to survey the folder, then organize_execute_plan 
     def execute_sync(self, action: str = "", src: str = "", dst: str = "", content: str = "") -> ToolResult:
         allow_inplace = os.environ.get("OFFICE_ALLOW_INPLACE_WRITES", "false").lower() in ("true", "1", "yes")
         workspace_root = _get_workspace_root()
+        source_root = _get_source_root()
         output_mode = os.environ.get("OFFICE_OUTPUT_MODE", "workspace").lower()
+        if output_mode != "inplace" and not workspace_root and allow_inplace and source_root:
+            output_mode = "inplace"
 
         # Validate action is in whitelist
         if action not in self.ALLOWED_ACTIONS:
             return ToolResult(output="", error=f"organize_move_file: action {action!r} not allowed. Allowed: {self.ALLOWED_ACTIONS}")
 
+        if not os.path.isabs(dst) and _is_wrapper_prefixed(dst):
+            return ToolResult(output="", error=f"organize_move_file: destination {dst!r} is outside the organized-output/files/ schema (wrapper prefix not allowed)")
+
         # Validate destination path
         if output_mode == "inplace":
             if not allow_inplace:
                 return ToolResult(output="", error="organize_move_file: inplace writes not enabled. Set OFFICE_ALLOW_INPLACE_WRITES=true")
-            dst_normalized, err = _validate_path(dst)
+            raw_dst = dst
+            if not os.path.isabs(raw_dst):
+                raw_dst = os.path.join(source_root, _normalize_organized_path(raw_dst))
+            dst_normalized, err = _validate_path(raw_dst)
             if err:
                 return ToolResult(output="", error=f"organize_move_file: destination {err}")
         else:
             if not workspace_root:
                 return ToolResult(output="", error="organize_move_file: OFFICE_WORKSPACE_ROOT is not set for workspace mode")
-            raw_dst = dst
-            if not os.path.isabs(raw_dst):
-                raw_dst = os.path.join(workspace_root, raw_dst)
+            if os.path.isabs(dst):
+                if not dst.startswith(workspace_root):
+                    return ToolResult(output="", error=f"organize_move_file: destination {dst!r} is outside OFFICE_WORKSPACE_ROOT")
+                rel_dst = os.path.relpath(dst, workspace_root)
+                raw_dst = os.path.join(workspace_root, _normalize_organized_path(rel_dst))
+            else:
+                raw_dst = os.path.join(workspace_root, _normalize_organized_path(dst))
             dst_normalized, err = _validate_workspace_path(raw_dst)
             if err:
                 return ToolResult(output="", error=f"organize_move_file: destination {err}")
 
-        # Reject wrapper prefixes (grouped/, by-student/, output/, organized/)
-        if _is_wrapper_prefixed(dst):
-            return ToolResult(output="", error=f"organize_move_file: destination {dst!r} is outside the organized-output/files/ schema (wrapper prefix not allowed)")
+        # In workspace mode, allow organizing into subdirectories under organized-output/files/
+        # The validation is just to ensure we don't escape OFFICE_WORKSPACE_ROOT
 
         # Validate source path if provided
         if src:
@@ -1019,26 +1360,80 @@ Use organize_folder tool first to survey the folder, then organize_execute_plan 
         else:
             src_normalized = ""
 
-        # Write operations-plan.json before executing
-        if workspace_root:
-            plan_path = os.path.join(workspace_root, "operations-plan.json")
-            with open(plan_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "action": action,
-                    "src": src_normalized,
-                    "dst": dst_normalized,
-                    "content_length": len(content) if content else 0,
-                }) + "\n")
+        if action == "copy_file" and src_normalized:
+            try:
+                source_metadata = _build_file_metadata(source_root, src_normalized)
+            except Exception:
+                source_metadata = {}
+            expected_entity = _safe_path_segment(str(source_metadata.get("primary_entity") or ""))
+            expected_date = str(source_metadata.get("inferred_date_bucket") or "")
+            expected_filename = str(source_metadata.get("relative_path") or "").replace(os.sep, "-")
+            confidence = str(source_metadata.get("primary_entity_confidence") or "")
+            if confidence == "high" and expected_entity and expected_date and expected_filename:
+                dst_parts = Path(dst_normalized).parts
+                tail = list(dst_parts[-3:]) if len(dst_parts) >= 3 else list(dst_parts)
+                expected_tail = [expected_entity, expected_date, expected_filename]
+                if tail != expected_tail:
+                    return ToolResult(
+                        output="",
+                        error=(
+                            "organize_move_file: destination does not match high-confidence source metadata. "
+                            f"Expected tail {'/'.join(expected_tail)!r}, got {'/'.join(tail)!r}"
+                        ),
+                    )
+
+        plan_path = os.path.join(workspace_root, "operations-plan.json") if workspace_root else ""
+        if action == "copy_file" and src_normalized and plan_path and os.path.exists(plan_path):
+            try:
+                with open(plan_path, encoding="utf-8") as existing_plan:
+                    for raw_line in existing_plan:
+                        raw_line = raw_line.strip()
+                        if not raw_line:
+                            continue
+                        record = json.loads(raw_line)
+                        if (
+                            record.get("action") == "copy_file"
+                            and record.get("status") == "succeeded"
+                            and record.get("src") == src_normalized
+                        ):
+                            return ToolResult(
+                                output="",
+                                error=(
+                                    "organize_move_file: source file already copied successfully in this task. "
+                                    f"Duplicate copy blocked for {src_normalized}"
+                                ),
+                            )
+            except Exception:
+                pass
 
         # Execute action
         try:
             if action == "mkdir":
                 os.makedirs(dst_normalized, exist_ok=True)
+                if plan_path:
+                    with open(plan_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "action": action,
+                            "src": src_normalized,
+                            "dst": dst_normalized,
+                            "content_length": len(content) if content else 0,
+                            "status": "succeeded",
+                        }) + "\n")
                 return ToolResult(output=json.dumps({"path": dst_normalized, "action": "mkdir"}))
             elif action == "copy_file":
                 if not src_normalized:
                     return ToolResult(output="", error="organize_move_file: copy_file requires src")
+                os.makedirs(os.path.dirname(dst_normalized), exist_ok=True)
                 shutil.copy2(src_normalized, dst_normalized)
+                if plan_path:
+                    with open(plan_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "action": action,
+                            "src": src_normalized,
+                            "dst": dst_normalized,
+                            "content_length": len(content) if content else 0,
+                            "status": "succeeded",
+                        }) + "\n")
                 return ToolResult(output=json.dumps({"from": src_normalized, "to": dst_normalized, "action": "copy_file"}))
             elif action == "write_text":
                 if not content:
@@ -1046,8 +1441,30 @@ Use organize_folder tool first to survey the folder, then organize_execute_plan 
                 os.makedirs(os.path.dirname(dst_normalized), exist_ok=True)
                 with open(dst_normalized, "w", encoding="utf-8") as f:
                     f.write(content)
+                if plan_path:
+                    with open(plan_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "action": action,
+                            "src": src_normalized,
+                            "dst": dst_normalized,
+                            "content_length": len(content) if content else 0,
+                            "status": "succeeded",
+                        }) + "\n")
                 return ToolResult(output=json.dumps({"path": dst_normalized, "action": "write_text", "bytes": len(content)}))
         except Exception as exc:
+            if plan_path:
+                try:
+                    with open(plan_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "action": action,
+                            "src": src_normalized,
+                            "dst": dst_normalized,
+                            "content_length": len(content) if content else 0,
+                            "status": "failed",
+                            "error": str(exc),
+                        }) + "\n")
+                except Exception:
+                    pass
             return ToolResult(output="", error=f"organize_move_file: {exc}")
 
 

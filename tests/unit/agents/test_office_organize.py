@@ -49,3 +49,64 @@ def test_organize_folder_tool_empty_dir(tmp_path):
     assert data.get("total_files") == 0
     assert data.get("total_dirs") == 0
     assert data.get("groups") == {}
+
+
+def test_organize_folder_tool_returns_recursive_file_metadata(tmp_path):
+    """OrganizeFolderTool returns recursive per-file metadata for nested content."""
+    tool = OrganizeFolderTool()
+    source_root = tmp_path / "2026"
+    essay_dir = source_root / "0103"
+    essay_dir.mkdir(parents=True)
+    essay_path = essay_dir / "1.txt"
+    essay_path.write_text(
+        "\n\n>>> Student Yan\n\nThe Most Important Discovery\n",
+        encoding="utf-8",
+    )
+
+    result = tool.execute_sync(path=str(source_root))
+
+    assert result.success, f"organize_folder failed: {result.error}"
+    data = json.loads(result.output)
+    files = data.get("files", [])
+    assert len(files) == 1
+    assert files[0]["relative_path"] == "0103/1.txt"
+    assert files[0]["suggested_reader_tool"] == "read_txt"
+    assert files[0]["inferred_date_bucket"] == "2026-01"
+    assert files[0]["primary_entity"] == "Yan"
+    assert "Student Yan" in "\n".join(files[0]["prominent_headings"])
+
+
+def test_organize_folder_tool_counts_all_nested_files(tmp_path):
+    """OrganizeFolderTool recurses through the full folder tree."""
+    tool = OrganizeFolderTool()
+    (tmp_path / "0103").mkdir()
+    (tmp_path / "0207").mkdir()
+    (tmp_path / "0103" / "1.txt").write_text(">>> Student Ethan", encoding="utf-8")
+    (tmp_path / "0207" / "2.txt").write_text(">>> Student Liam", encoding="utf-8")
+
+    result = tool.execute_sync(path=str(tmp_path))
+
+    assert result.success, f"organize_folder failed: {result.error}"
+    data = json.loads(result.output)
+    assert data.get("total_files") == 2
+    relative_paths = {item["relative_path"] for item in data.get("files", [])}
+    assert relative_paths == {"0103/1.txt", "0207/2.txt"}
+
+
+def test_organize_folder_tool_uses_explicit_identity_not_assignment_title(tmp_path):
+    """OrganizeFolderTool should prefer explicit identity markers over document titles."""
+    tool = OrganizeFolderTool()
+    essay_dir = tmp_path / "0131"
+    essay_dir.mkdir(parents=True)
+    (essay_dir / "1.txt").write_text(
+        "Formal Letter Writing\n\n>>> Student Ethan\n\nFebruary 1, 2026\n",
+        encoding="utf-8",
+    )
+
+    result = tool.execute_sync(path=str(tmp_path))
+
+    assert result.success, f"organize_folder failed: {result.error}"
+    data = json.loads(result.output)
+    file_entry = data["files"][0]
+    assert file_entry["primary_entity"] == "Ethan"
+    assert file_entry["primary_entity_confidence"] == "high"

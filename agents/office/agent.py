@@ -1,6 +1,6 @@
 """Office Agent — Graph outside, ReAct inside.
 
-Handles document summarization (PDF/DOCX/TXT) and CSV data analysis.
+Handles document summarization (PDF/Word/TXT/PPTX) and data analysis.
 """
 
 from __future__ import annotations

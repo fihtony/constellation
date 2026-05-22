@@ -18,12 +18,56 @@ from typing import Any
 
 from agents.office.office_tools import (
     _check_directory_limits,
+    collect_organize_file_inventory,
 )
 
 logger = logging.getLogger(__name__)
 
 AGENT_ID = "office"
-SUMMARY_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".pptx"}
+SUMMARY_EXTENSIONS = {
+    ".pdf", ".docx", ".docm", ".dotx", ".dotm",
+    ".txt", ".md", ".markdown", ".html", ".htm", ".xml",
+    ".json", ".jsonl", ".yaml", ".yml", ".log", ".ini", ".cfg", ".toml", ".rtf",
+    ".pptx", ".csv", ".tsv", ".xlsx", ".xls",
+}
+
+
+def _contains_cjk(text: str) -> bool:
+    return any(
+        "\u4e00" <= ch <= "\u9fff" or
+        "\u3400" <= ch <= "\u4dbf" or
+        "\u3040" <= ch <= "\u30ff" or
+        "\uac00" <= ch <= "\ud7af"
+        for ch in text
+    )
+
+
+def _english_summary_for_report(capability: str, success: bool, expected_outputs: list[str]) -> str:
+    action_map = {
+        "summarize": "document summarization",
+        "analyze": "data analysis",
+        "organize": "folder organization",
+    }
+    action = action_map.get(capability, "office work")
+    if success:
+        if expected_outputs:
+            outputs = ", ".join(os.path.basename(path) for path in expected_outputs[:5])
+            return f"Office {action} completed successfully. Primary outputs: {outputs}."
+        return f"Office {action} completed successfully."
+    return f"Office {action} did not complete successfully. Review warnings and task artifacts for details."
+
+
+def _english_agentic_output(raw_output: str, capability: str, expected_outputs: list[str]) -> str:
+    if raw_output and not _contains_cjk(raw_output):
+        return raw_output
+    lines = [
+        "The original agentic response was not persisted verbatim because it was not fully in English.",
+        _english_summary_for_report(capability, True, expected_outputs),
+    ]
+    if expected_outputs:
+        lines.append("Generated outputs:")
+        lines.extend(f"- {path}" for path in expected_outputs)
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -244,13 +288,27 @@ def _capability_tool_names(capability: str, output_mode: str) -> list[str]:
             "read_docx",
             "read_txt",
             "read_pptx",
+            "read_csv",
+            "read_xlsx",
+            "read_xls",
             "list_directory",
         ]
         tools.append("write_file" if output_mode == "inplace" else "write_workspace")
         return tools
 
     if capability == "organize":
-        tools = ["list_directory", "organize_folder", "organize_move_file"]
+        tools = [
+            "list_directory",
+            "organize_folder",
+            "organize_move_file",
+            "read_txt",
+            "read_pdf",
+            "read_docx",
+            "read_pptx",
+            "read_csv",
+            "read_xlsx",
+            "read_xls",
+        ]
         tools.append("write_file" if output_mode == "inplace" else "write_workspace")
         return tools
 
@@ -302,14 +360,128 @@ def _verify_delivery_paths(expected_paths: list[str], output_mode: str, artifact
     return (not errors), errors
 
 
+def _verify_organize_materialization(output_mode: str, artifacts_dir: str, source_paths: list[str]) -> list[str]:
+    """Ensure organize tasks created a real organized-output tree, not only a plan."""
+    if output_mode == "workspace":
+        root = os.path.join(artifacts_dir, "organized-output", "files")
+    else:
+        source_root = source_paths[0] if source_paths else ""
+        root = os.path.join(source_root, "organized-output", "files")
+    if not os.path.isdir(root):
+        return [f"Missing organized output directory: {root}"]
+    copied_files: list[str] = []
+    for walk_root, _, files in os.walk(root):
+        for name in files:
+            copied_files.append(os.path.join(walk_root, name))
+    if not copied_files:
+        return [f"No organized files were materialized under: {root}"]
+    if not source_paths:
+        return []
+
+    operations_path = os.path.join(artifacts_dir, "operations-plan.json")
+    if not os.path.exists(operations_path):
+        return [f"Missing operations log: {operations_path}"]
+
+    source_root = source_paths[0]
+    inventory, _, _ = collect_organize_file_inventory(source_root)
+    expected_sources = {
+        os.path.realpath(os.path.join(source_root, str(item["relative_path"])))
+        for item in inventory
+    }
+
+    copy_actions: list[dict[str, str]] = []
+    try:
+        with open(operations_path, encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if record.get("action") == "copy_file" and record.get("src") and record.get("dst"):
+                    if record.get("status") == "failed":
+                        continue
+                    copy_actions.append({
+                        "src": os.path.realpath(os.path.abspath(record["src"])),
+                        "dst": os.path.realpath(os.path.abspath(record["dst"])),
+                    })
+    except Exception as exc:
+        return [f"Failed to read operations log {operations_path}: {exc}"]
+
+    if not copy_actions:
+        return [f"No copy_file operations recorded in {operations_path}"]
+
+    copy_counts: dict[str, int] = {}
+    for record in copy_actions:
+        src = record["src"]
+        copy_counts[src] = copy_counts.get(src, 0) + 1
+
+    errors: list[str] = []
+    duplicated = sorted(src for src, count in copy_counts.items() if count > 1)
+    if duplicated:
+        errors.append(
+            "Source files copied more than once: "
+            + ", ".join(os.path.relpath(src, source_root) for src in duplicated[:10])
+        )
+
+    missing = sorted(src for src in expected_sources if copy_counts.get(src, 0) == 0)
+    if missing:
+        errors.append(
+            "Source files were not copied: "
+            + ", ".join(os.path.relpath(src, source_root) for src in missing[:10])
+        )
+
+    def _path_key(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+    inventory_by_src = {
+        os.path.realpath(os.path.join(source_root, str(item["relative_path"]))): item
+        for item in inventory
+    }
+    for record in copy_actions:
+        if not os.path.exists(record["dst"]):
+            continue
+        item = inventory_by_src.get(record["src"])
+        if not item:
+            continue
+        dst_relative = os.path.relpath(record["dst"], root)
+        primary_entity = str(item.get("primary_entity") or "").strip()
+        primary_entity_confidence = str(item.get("primary_entity_confidence") or "")
+        if primary_entity and primary_entity_confidence == "high" and _path_key(primary_entity) not in _path_key(dst_relative):
+            errors.append(
+                f"Destination does not reflect inferred entity for {item['relative_path']}: "
+                f"{primary_entity} -> {dst_relative}"
+            )
+        date_bucket = str(item.get("inferred_date_bucket") or "").strip()
+        if date_bucket and date_bucket not in dst_relative:
+            errors.append(
+                f"Destination does not reflect inferred date bucket for {item['relative_path']}: "
+                f"{date_bucket} -> {dst_relative}"
+            )
+
+    return errors
+
+
 def _effective_agentic_budget(capability: str, validated_paths: list[str]) -> tuple[int, int]:
     """Scale agentic budget with workload size instead of using a single flat timeout."""
-    max_turns, timeout_seconds = _effective_agentic_budget(capability, validated_paths)
+    max_turns = int(os.environ.get("OFFICE_AGENTIC_MAX_TURNS", "30"))
+    timeout_seconds = int(os.environ.get("OFFICE_AGENTIC_TIMEOUT_SECONDS", "1800"))
     if capability == "summarize":
         doc_count = len([path for path in validated_paths if os.path.isfile(path)])
         if doc_count > 1:
             timeout_seconds = max(timeout_seconds, min(900, 120 + doc_count * 45))
             max_turns = max(max_turns, min(40, 8 + doc_count * 2))
+    elif capability == "organize":
+        folder_count = len([path for path in validated_paths if os.path.isdir(path)])
+        base_timeout = 900
+        if folder_count == 1:
+            subdirs = 0
+            for p in validated_paths:
+                if os.path.isdir(p):
+                    subdirs = len([d for d in os.listdir(p) if os.path.isdir(os.path.join(p, d)) and not d.startswith('.')])
+            timeout_seconds = max(base_timeout, min(1200, base_timeout + subdirs * 25))
+            max_turns = max(max_turns, min(60, 30 + subdirs * 2))
+        else:
+            timeout_seconds = max(base_timeout, min(1200, base_timeout + folder_count * 30))
     return max_turns, timeout_seconds
 
 
@@ -348,8 +520,7 @@ def execute_office_work(state: dict) -> dict:
     if not tool_names:
         return {"error": f"No tools configured for capability {capability!r}"}
 
-    max_turns = int(os.environ.get("OFFICE_AGENTIC_MAX_TURNS", "30"))
-    timeout_seconds = int(os.environ.get("OFFICE_AGENTIC_TIMEOUT_SECONDS", "1800"))
+    max_turns, timeout_seconds = _effective_agentic_budget(capability, validated_paths)
 
     skill_context = _build_skill_context(state)
     system_prompt = _load_system_prompt()
@@ -410,6 +581,9 @@ def execute_office_work(state: dict) -> dict:
     if result.success:
         expected_outputs = _expected_output_paths(capability, validated_paths, output_mode, artifacts_dir)
         delivery_ok, delivery_errors = _verify_delivery_paths(expected_outputs, output_mode, artifacts_dir)
+        if capability == "organize":
+            delivery_errors.extend(_verify_organize_materialization(output_mode, artifacts_dir, validated_paths))
+            delivery_ok = not delivery_errors
         if not delivery_ok:
             logger.error("execute_office_work: delivery verification failed: %s", "; ".join(delivery_errors))
             return {
@@ -535,9 +709,25 @@ def _load_tabular_rows(path: str) -> tuple[list[str], list[dict[str, str]], str]
 def _extract_document_text(path: str, max_chars: int = 10000) -> str:
     ext = os.path.splitext(path)[1].lower()
     try:
-        if ext in {".txt", ".md", ".csv"}:
+        if ext in {".txt", ".md", ".markdown", ".json", ".jsonl", ".yaml", ".yml", ".log", ".ini", ".cfg", ".toml", ".rtf"}:
             with open(path, encoding="utf-8", errors="replace") as fh:
-                return fh.read(max_chars)
+                raw = fh.read(max_chars * 2)
+            from agents.office.office_tools import _extract_markup_text
+            text, _ = _extract_markup_text(raw, ext)
+            return text[:max_chars]
+        if ext in {".csv", ".tsv"}:
+            headers, rows, _ = _load_tabular_rows(path)
+            preview = {
+                "headers": headers,
+                "sample_rows": rows[:10],
+            }
+            return json.dumps(preview, ensure_ascii=False)[:max_chars]
+        if ext in {".html", ".htm", ".xml"}:
+            from agents.office.office_tools import _extract_markup_text
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                raw = fh.read(max_chars * 2)
+            text, _ = _extract_markup_text(raw, ext)
+            return text[:max_chars]
         if ext == ".pdf":
             import pdfplumber
             parts = []
@@ -549,11 +739,24 @@ def _extract_document_text(path: str, max_chars: int = 10000) -> str:
                     if sum(len(p) for p in parts) >= max_chars:
                         break
             return "\n\n".join(parts)[:max_chars]
-        if ext == ".docx":
-            import docx
-            doc = docx.Document(path)
-            lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        if ext in {".docx", ".docm", ".dotx", ".dotm"}:
+            from agents.office.office_tools import _extract_docx_like_text
+            lines, _ = _extract_docx_like_text(path)
             return "\n".join(lines)[:max_chars]
+        if ext == ".xlsx":
+            headers, rows, _ = _load_tabular_rows(path)
+            preview = {
+                "headers": headers,
+                "sample_rows": rows[:10],
+            }
+            return json.dumps(preview, ensure_ascii=False)[:max_chars]
+        if ext == ".xls":
+            headers, rows, _ = _load_tabular_rows(path)
+            preview = {
+                "headers": headers,
+                "sample_rows": rows[:10],
+            }
+            return json.dumps(preview, ensure_ascii=False)[:max_chars]
         if ext == ".pptx":
             import pptx
             prs = pptx.Presentation(path)
@@ -708,7 +911,7 @@ def _fallback_organize(paths: list[str], output_mode: str, artifacts_dir: str) -
         return {"success": False, "summary": "No folder path provided for fallback organization."}
     outputs: list[str] = []
     ext_groups = {
-        "documents": {".pdf", ".doc", ".docx"},
+        "documents": {".pdf", ".doc", ".docx", ".docm", ".dotx", ".dotm"},
         "text": {".txt", ".md", ".rtf"},
         "data": {".csv", ".xlsx", ".xls"},
         "images": {".png", ".jpg", ".jpeg", ".gif", ".svg"},
@@ -820,7 +1023,13 @@ Required output targets:
 {targets_block}
 
 For each file:
-1. Read the file using the appropriate tool (read_pdf, read_docx, read_txt, or read_pptx)
+1. Read the file using the appropriate tool:
+   - PDF: `read_pdf`
+   - Word OpenXML (`.docx/.docm/.dotx/.dotm`): `read_docx`
+   - Plain text / Markdown / HTML / XML / TSV: `read_txt`
+   - CSV: `read_csv`
+   - Excel (`.xlsx/.xls`): `read_xlsx` or `read_xls`
+   - PowerPoint (`.pptx`): `read_pptx`
 {write_rules}
 3. Summarize in English. For French or other foreign language documents, summarize accurately.
 4. Use only the provided MCP tools. Do not use native Write/Edit/Read tools.
@@ -831,7 +1040,7 @@ Output format for each file:
 # Summary: {{filename}}
 
 ## Document Info
-- Type: PDF/DOCX/TXT
+- Type: PDF/Word/TXT/Markdown/HTML/XML/PPTX/Spreadsheet
 - Size: N KB
 
 ## Key Points
@@ -841,6 +1050,8 @@ Output format for each file:
 
 ## Executive Summary
 1-paragraph summary of the document.
+
+If a PDF or document has no extractable embedded text with the provided tools, state that explicitly in English and do not invent content.
 
 If multiple files are provided, `combined-summary.md` is mandatory.
 """
@@ -915,41 +1126,56 @@ def _build_organize_prompt(paths: list[str], output_mode: str, source_root: str)
         else
         "3. Write the organization plan using write_file tool to: {source_folder}/organization-plan.md"
     )
-    return f"""Organize the following folder(s) into logical groups:
+    return f"""Analyze and organize the following folder(s):
 
 {paths_list}
 
 Source root: {source_root}
 Output mode: {output_mode}
 
-Workflow:
-1. Use organize_folder tool to survey each folder and generate an organization plan
-2. Create a meaningful grouping based on observed filenames, file types, dates, and repeated entities such as student names or project names.
-3. Materialize the organized result:
-   - In workspace mode: create an `organized-output/files/` tree under the workspace using organize_move_file with `mkdir` and `copy_file`.
-   - In inplace mode: create an `organized-output/files/` tree under the source folder using organize_move_file with `mkdir` and `copy_file`.
-{write_rules}
+TASK:
+Your goal is to discover meaningful patterns in the file content and structure, then CREATE the organized folder structure in the workspace.
 
-Rules:
-- Never delete original files
-- Never overwrite existing files
-- Use only the provided MCP tools. Do not use native Write/Edit/Read tools.
-- The organization plan must explain why the chosen grouping is useful.
-- Group by observed structure, not a fixed hardcoded taxonomy.
+WORKFLOW:
+1. Call organize_folder on each source folder first. Treat its recursive `files` inventory as the authoritative source list.
+2. Review the returned per-file metadata:
+   - Use `primary_entity`, `primary_entity_source`, `primary_entity_confidence`, `inferred_date_bucket`, `prominent_headings`, `labeled_fields`, `suggested_reader_tool`, and `suggested_destination`
+   - Use `entity_counts` and `date_bucket_counts` to sanity-check the overall distribution before copying
+   - If `primary_entity_confidence` is `high`, treat that identity as authoritative
+   - If metadata is ambiguous or missing, inspect representative files with the suggested reader tool
+   - Do NOT infer ownership from assignment titles, book titles, or topic headings
+3. Based on the discovered patterns, determine the BEST grouping strategy:
+   - Choose grouping criteria that meaningfully organizes the files
+   - Examples: by type, by date, by author, by status, by project, by topic, etc.
+4. EXECUTE the organization using organize_move_file tool:
+   - Use mkdir action to create directory structure under `organized-output/files/`
+   - Use copy_file action to copy files to their organized locations under `organized-output/files/`
+   - In workspace mode, pass category-relative destinations such as:
+     `entities/Entity_A/YYYY-MM/source-001.txt`
+     `entities/Entity_B/YYYY-MM/source-014.txt`
+     The tool will place them under `organized-output/files/`
+   - Write the organization plan using write_workspace tool with filename: organization-plan.md
 
-Output format:
+CRITICAL: You must USE the organize_move_file tool to actually create the organized folder structure. Do not just write a plan - execute it.
+CRITICAL: A plan-only answer is a failure. The task is complete only if files exist under `organized-output/files/`.
+CRITICAL: Every non-hidden source file from `organize_folder.files` must be copied exactly once. Do not duplicate a source file into multiple destinations.
+CRITICAL: When `primary_entity` or `inferred_date_bucket` is present in the organize_folder metadata, use it in the destination path unless a file inspection proves it is wrong.
+CRITICAL: Never reference or copy a source path that is not present in `organize_folder.files`.
+CRITICAL: If `suggested_destination` is present for a file, use that exact relative destination unless a direct file inspection proves it is wrong.
+CRITICAL: Your final response and the contents of `organization-plan.md` must be in English only.
+
+OUTPUT FORMAT:
+Write a summary to organization-plan.md explaining:
 # Folder Organization Plan
 
-## Proposed Structure
-- destination/path/one
-- destination/path/two
+## Discovered Patterns
+What patterns you found in the files.
 
-## Rationale
-- Why this grouping fits the observed folder
+## Organized Structure Created
+Show the actual directory structure you created under `organized-output/files/`.
 
-## Operations
-- copy source_a -> destination_a
-- copy source_b -> destination_b
+## Files Organized
+List which files were moved to which locations.
 """
 
 
@@ -970,6 +1196,7 @@ def report_result(state: dict) -> dict:
     status = "completed" if success else "failed"
     expected_outputs = state.get("expected_outputs", [])
     raw_output = state.get("raw_output", "")
+    english_summary = summary if summary and not _contains_cjk(summary) else _english_summary_for_report(capability, success, expected_outputs)
 
     if workspace_root:
         os.makedirs(workspace_root, exist_ok=True)
@@ -998,7 +1225,7 @@ def report_result(state: dict) -> dict:
                 "capability": capability,
                 "output_mode": output_mode,
                 "source_paths": validated_paths,
-                "summary": summary[:500] if summary else "",
+                "summary": english_summary[:500] if english_summary else "",
                 "success": success,
                 "artifacts_dir": state.get("artifacts_dir", ""),
                 "expected_outputs": expected_outputs,
@@ -1016,14 +1243,14 @@ def report_result(state: dict) -> dict:
             raw_output_path = os.path.join(workspace_root, "agentic-output.txt")
             try:
                 with open(raw_output_path, "w", encoding="utf-8") as fh:
-                    fh.write(raw_output)
+                    fh.write(_english_agentic_output(raw_output, capability, expected_outputs))
                 logger.info(f"report_result: agentic output written to {raw_output_path}")
             except OSError as exc:
                 logger.error(f"report_result: failed to write agentic output: {exc}")
 
     return {
         "status": status,
-        "summary": summary,
+        "summary": english_summary,
         "capability": capability,
         "output_mode": output_mode,
         "success": success,

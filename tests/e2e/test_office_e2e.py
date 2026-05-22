@@ -599,6 +599,20 @@ async def test_office_task(
         f"[{test_id}] Expected output missing: {expected_output_path}"
     )
 
+    if capability == "organize":
+        if output_mode == "workspace":
+            organized_root = os.path.join(office_workspace, "organized-output", "files")
+        else:
+            organized_root = os.path.join(source_path, "organized-output", "files")
+        assert os.path.isdir(organized_root), (
+            f"[{test_id}] Missing organized output directory: {organized_root}"
+        )
+        organized_files = [
+            path for path in Path(organized_root).rglob("*")
+            if path.is_file()
+        ]
+        assert organized_files, f"[{test_id}] No files materialized under organized output"
+
     if capability == "summarize" and len(summarize_sources) > 1:
         for doc_path in summarize_sources:
             per_doc_output = _expected_output_path(

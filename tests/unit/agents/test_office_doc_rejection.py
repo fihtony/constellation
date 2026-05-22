@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import tempfile
+import json
 from pathlib import Path
 
 import pytest
 
 from agents.office.office_tools import ReadDocxTool
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 class TestReadDocxToolDocRejection:
@@ -52,7 +56,7 @@ class TestReadDocxToolDocRejection:
         result = tool.execute_sync(path=str(txt_file))
 
         assert result.success is False
-        assert "Not a Word document" in result.error or "not a DOCX" in result.error
+        assert "not a supported Word OpenXML file" in result.error or "not a DOCX" in result.error
 
     def test_uppercase_doc_extension_rejected(self, tmp_path):
         """Uppercase .DOC extension is also rejected."""
@@ -65,3 +69,15 @@ class TestReadDocxToolDocRejection:
 
         assert result.success is False
         assert ".doc format is not supported" in result.error
+
+    def test_real_docx_file_text_is_extractable(self):
+        """A real DOCX file can be extracted even without optional third-party helpers."""
+        tool = ReadDocxTool()
+        docx_path = PROJECT_ROOT / "tests" / "data" / "stlouis" / "Code de vie.docx"
+
+        result = tool.execute_sync(path=str(docx_path))
+
+        assert result.success is True, result.error
+        payload = json.loads(result.output)
+        assert payload["paragraphs"] > 0
+        assert payload["content"].strip()

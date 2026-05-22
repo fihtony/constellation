@@ -7,7 +7,17 @@ COPY pyproject.toml /app/
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir pyyaml>=6.0 \
+    && pip install --no-cache-dir \
+        pyyaml>=6.0 \
+        beautifulsoup4>=4.12.3 \
+        lxml>=5.3.0 \
+        pdfplumber>=0.11.0 \
+        pypdf>=5.0.0 \
+        python-docx>=1.1.2 \
+        python-pptx>=1.0.2 \
+        striprtf>=0.0.29 \
+        openpyxl>=3.1.5 \
+        xlrd>=2.0.1 \
     && apt-get clean
 
 COPY framework/     /app/framework/
