@@ -21,3 +21,20 @@ tools:
 permission_profile: office_readonly
 runtime_backend: claude-code
 model: MiniMax-M2.7
+launch_spec:
+  image: constellation-v2-office:latest
+  port: 8060
+  startup_delay_seconds: 1.5
+  pass_through_env:
+    - AGENT_RUNTIME
+    - AGENT_MODEL
+    - CONSTELLATION_RUNTIME_BACKEND
+    - CONSTELLATION_RUNTIME_MODEL
+    - OPENAI_MODEL
+    - OPENAI_BASE_URL
+    - OPENAI_API_KEY
+    - ANTHROPIC_MODEL
+    - ANTHROPIC_API_KEY
+    - COPILOT_GITHUB_TOKEN
+    - LOCAL_TIMEZONE
+    - TZ

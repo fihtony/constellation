@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.request
 from typing import Any
 
+from framework.launcher import get_launcher
 from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
 
@@ -26,6 +29,182 @@ def _resolve_team_lead_url() -> str:
         pass
 
     return os.environ.get("TEAM_LEAD_URL", "http://team-lead:8030")
+
+
+def _resolve_office_url() -> str:
+    """Resolve the Office endpoint via Registry before falling back."""
+    try:
+        from framework.registry_client import RegistryClient
+
+        client = RegistryClient.from_config()
+        for capability in ("office.document.summarize", "office.agent"):
+            discovered = client.discover(capability)
+            if discovered:
+                return discovered
+    except Exception:
+        pass
+
+    return os.environ.get("OFFICE_AGENT_URL", "http://office:8060")
+
+
+def _office_requested_capability(capability: str) -> str:
+    mapping = {
+        "analyze": "office.data.analyze",
+        "organize": "office.folder.organize",
+        "summarize": "office.document.summarize",
+    }
+    return mapping.get((capability or "").strip().lower(), "office.document.summarize")
+
+
+def _is_containerized_process() -> bool:
+    return any((
+        bool(os.environ.get("CONTAINER_ID", "").strip()),
+        os.path.exists("/.dockerenv"),
+        os.path.exists("/run/.containerenv"),
+    ))
+
+
+def _should_use_per_task_office_launch() -> bool:
+    if os.environ.get("CONSTELLATION_FORCE_DIRECT_OFFICE_URL", "").strip().lower() in {"1", "true", "yes"}:
+        return False
+    if not _is_containerized_process():
+        return False
+    try:
+        from agents.office.agent import office_definition
+
+        return bool(getattr(office_definition, "launch_spec", None))
+    except Exception:
+        return False
+
+
+def _office_mount_plan(source_paths: list[str], output_mode: str, launcher) -> dict[str, Any]:
+    if not source_paths:
+        return {
+            "translated_paths": [],
+            "extra_binds": [],
+            "env": {
+                "OFFICE_SOURCE_ROOT": "/app/userdata",
+                "OFFICE_ALLOWED_BASE_PATHS": "",
+                "OFFICE_ALLOW_INPLACE_WRITES": "true" if output_mode == "inplace" else "false",
+            },
+        }
+
+    translated_paths: list[str] = []
+    allowed_paths: list[str] = []
+    extra_binds: list[str] = []
+    mount_targets: dict[tuple[str, bool], str] = {}
+    read_only = output_mode != "inplace"
+    source_root = "/app/userdata"
+
+    for raw_path in source_paths:
+        requested_path = str(raw_path or "").strip()
+        if not requested_path or not os.path.isabs(requested_path):
+            raise ValueError(f"Office source path must be absolute: {raw_path}")
+
+        container_visible_path = os.path.realpath(requested_path)
+        host_path = launcher.resolve_host_path(container_visible_path)
+        inspect_path = container_visible_path if os.path.exists(container_visible_path) else host_path
+        if not os.path.exists(inspect_path):
+            raise ValueError(f"Office source path does not exist: {requested_path}")
+
+        if os.path.isfile(inspect_path):
+            host_bind_source = os.path.dirname(host_path)
+            relative_path = os.path.basename(container_visible_path)
+        else:
+            host_bind_source = host_path
+            relative_path = ""
+
+        bind_key = (os.path.realpath(host_bind_source), read_only)
+        mount_target = mount_targets.get(bind_key)
+        if not mount_target:
+            mount_target = f"{source_root}/input-{len(mount_targets)}"
+            mount_targets[bind_key] = mount_target
+            bind_suffix = ":ro" if read_only else ""
+            extra_binds.append(f"{host_bind_source}:{mount_target}{bind_suffix}")
+
+        translated_path = mount_target if not relative_path else os.path.join(mount_target, relative_path)
+        translated_paths.append(translated_path)
+        allowed_paths.append(translated_path)
+
+    return {
+        "translated_paths": translated_paths,
+        "extra_binds": extra_binds,
+        "env": {
+            "OFFICE_SOURCE_ROOT": source_root,
+            "OFFICE_ALLOWED_BASE_PATHS": ":".join(allowed_paths),
+            "OFFICE_ALLOW_INPLACE_WRITES": "true" if output_mode == "inplace" else "false",
+        },
+    }
+
+
+def _wait_for_agent_ready(base_url: str, timeout: int = 30) -> None:
+    deadline = time.time() + timeout
+    health_url = f"{base_url.rstrip('/')}/health"
+    last_error = "agent did not become ready"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(health_url, timeout=2):
+                return
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            time.sleep(0.5)
+    raise TimeoutError(f"Timed out waiting for per-task office agent: {last_error}")
+
+
+def _dispatch_office_task_via_launcher(
+    task_description: str,
+    source_paths: list[str],
+    output_mode: str,
+    capability: str,
+    orchestrator_task_id: str,
+) -> dict:
+    from agents.office.agent import office_definition
+    from framework.a2a.client import dispatch_sync
+
+    launcher = get_launcher()
+    mount_plan = _office_mount_plan(source_paths, output_mode, launcher)
+    launch = launcher.launch_instance(
+        office_definition,
+        orchestrator_task_id or "office-task",
+        launch_overrides={
+            "env": mount_plan["env"],
+            "extra_binds": mount_plan["extra_binds"],
+        },
+    )
+
+    try:
+        _wait_for_agent_ready(launch["service_url"])
+        result = dispatch_sync(
+            url=launch["service_url"],
+            capability=_office_requested_capability(capability),
+            message_parts=[{"text": task_description}],
+            metadata={
+                "source_paths": mount_plan["translated_paths"],
+                "output_mode": output_mode,
+                "capability": capability,
+                "compassTaskId": orchestrator_task_id,
+            },
+            timeout=3600,
+        )
+    finally:
+        try:
+            launcher.destroy_instance(office_definition.agent_id, launch["container_name"])
+        except Exception:
+            pass
+
+    task = result.get("task", result)
+    task_state = task.get("status", {}).get("state", "")
+    artifacts = task.get("artifacts", [])
+    summary = _extract_text(artifacts) or _extract_status_text(task) or "Task completed."
+    status = "completed" if task_state == "TASK_STATE_COMPLETED" else (
+        "input-required" if task_state == "TASK_STATE_INPUT_REQUIRED" else "error"
+    )
+    return {
+        "status": status,
+        "state": task_state,
+        "taskId": task.get("id", ""),
+        "summary": summary,
+    }
 
 # ---------------------------------------------------------------------------
 # Tool: dispatch_development_task
@@ -128,6 +307,27 @@ class DispatchOfficeTask(BaseTool):
                 "type": "string",
                 "description": "Absolute path to the file or folder.  Optional.",
             },
+            "source_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Authorized source file or folder paths.",
+            },
+            "output_mode": {
+                "type": "string",
+                "description": "workspace or inplace",
+            },
+            "capability": {
+                "type": "string",
+                "description": "summarize, analyze, or organize",
+            },
+            "orchestrator_task_id": {
+                "type": "string",
+                "description": "The Compass task ID for workspace scoping.",
+            },
+            "callback_url": {
+                "type": "string",
+                "description": "Optional orchestrator callback URL.",
+            },
         },
         "required": ["task_description"],
     }
@@ -136,24 +336,62 @@ class DispatchOfficeTask(BaseTool):
         self,
         task_description: str = "",
         file_path: str = "",
+        source_paths: list[str] | None = None,
+        output_mode: str = "workspace",
+        capability: str = "summarize",
+        orchestrator_task_id: str = "",
+        callback_url: str = "",
     ) -> ToolResult:
-        office_url = os.environ.get("OFFICE_AGENT_URL", "http://office:8060")
-        meta: dict[str, Any] = {}
-        if file_path:
-            meta["filePath"] = file_path
+        normalized_source_paths = [str(item) for item in (source_paths or []) if item]
+        if file_path and file_path not in normalized_source_paths:
+            normalized_source_paths.append(file_path)
 
         try:
+            if _should_use_per_task_office_launch():
+                result = _dispatch_office_task_via_launcher(
+                    task_description=task_description,
+                    source_paths=normalized_source_paths,
+                    output_mode=output_mode,
+                    capability=capability,
+                    orchestrator_task_id=orchestrator_task_id,
+                )
+                return ToolResult(output=json.dumps(result))
+
+            office_url = _resolve_office_url()
+            meta: dict[str, Any] = {}
+            if normalized_source_paths:
+                meta["source_paths"] = normalized_source_paths
+            if output_mode in {"workspace", "inplace"}:
+                meta["output_mode"] = output_mode
+            if capability:
+                meta["capability"] = capability
+            if orchestrator_task_id:
+                meta["compassTaskId"] = orchestrator_task_id
+            if callback_url:
+                meta["orchestratorCallbackUrl"] = callback_url
+
             from framework.a2a.client import dispatch_sync
+
             result = dispatch_sync(
                 url=office_url,
-                capability="office.document.summarize",
+                capability=_office_requested_capability(capability),
                 message_parts=[{"text": task_description}],
                 metadata=meta,
+                timeout=3600,
             )
             task = result.get("task", result)
+            task_state = task.get("status", {}).get("state", "")
             artifacts = task.get("artifacts", [])
-            summary = _extract_text(artifacts) or "Task completed."
-            return ToolResult(output=json.dumps({"status": "completed", "summary": summary}))
+            summary = _extract_text(artifacts) or _extract_status_text(task) or "Task completed."
+            status = "completed" if task_state == "TASK_STATE_COMPLETED" else (
+                "input-required" if task_state == "TASK_STATE_INPUT_REQUIRED" else "error"
+            )
+            return ToolResult(output=json.dumps({
+                "status": status,
+                "state": task_state,
+                "taskId": task.get("id", ""),
+                "summary": summary,
+            }))
         except Exception as exc:
             return ToolResult(output=json.dumps({"status": "error", "message": str(exc)}))
 

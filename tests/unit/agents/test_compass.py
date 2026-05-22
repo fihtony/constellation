@@ -198,7 +198,7 @@ class TestCompassAgent:
         assert "workspacePath" in payload
 
     async def test_handles_office_task(self):
-        """Office tasks are dispatched directly via registry (not run_agentic)."""
+        """Office tasks without output_mode pause for clarification before dispatch."""
         runtime = _mock_runtime()
         agent = _make_agent(runtime)
 
@@ -212,7 +212,9 @@ class TestCompassAgent:
             mock_get_reg.return_value = mock_reg
             result = await agent.handle_message(message)
 
-        assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+        assert result["task"]["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+        runtime.run_agentic.assert_not_called()
+        mock_reg.execute_sync.assert_not_called()
         runtime.run_agentic.assert_not_called()
 
     async def test_general_task_uses_run_agentic(self):
@@ -348,3 +350,119 @@ class TestCompassTools:
         assert payload["status"] == "error"
         assert payload["state"] == "TASK_STATE_FAILED"
         assert "Jira ticket not accessible" in payload["message"]
+
+    def test_dispatch_office_task_uses_per_task_launcher_for_workspace_mode(self, monkeypatch, tmp_path):
+        from agents.compass.tools import DispatchOfficeTask
+
+        source_dir = tmp_path / "docs"
+        source_dir.mkdir()
+        source_file = source_dir / "report.txt"
+        source_file.write_text("hello", encoding="utf-8")
+
+        launched = {}
+        destroyed = {}
+        dispatched = {}
+
+        class StubLauncher:
+            def resolve_host_path(self, path):
+                return f"/host{path}"
+
+            def launch_instance(self, agent_definition, task_id, *, launch_overrides=None):
+                launched["agent_id"] = agent_definition.agent_id
+                launched["task_id"] = task_id
+                launched["overrides"] = launch_overrides
+                return {
+                    "container_name": "office-task-1",
+                    "service_url": "http://office-task-1:8060",
+                    "port": 8060,
+                }
+
+            def destroy_instance(self, agent_id, container_name):
+                destroyed["agent_id"] = agent_id
+                destroyed["container_name"] = container_name
+
+        def _dispatch_sync(url, capability, message_parts, metadata, **kwargs):
+            dispatched["url"] = url
+            dispatched["capability"] = capability
+            dispatched["metadata"] = metadata
+            return {
+                "task": {
+                    "id": "office-1",
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"parts": [{"text": "Done."}], "metadata": {}}],
+                }
+            }
+
+        monkeypatch.setattr("agents.compass.tools._should_use_per_task_office_launch", lambda: True)
+        monkeypatch.setattr("agents.compass.tools.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("agents.compass.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        result = DispatchOfficeTask().execute_sync(
+            task_description="Summarize the authorized file.",
+            source_paths=[str(source_file)],
+            output_mode="workspace",
+            capability="summarize",
+            orchestrator_task_id="compass-123",
+        )
+
+        payload = json.loads(result.output)
+        assert payload["status"] == "completed"
+        assert launched["agent_id"] == "office"
+        assert launched["overrides"]["env"]["OFFICE_SOURCE_ROOT"] == "/app/userdata"
+        assert launched["overrides"]["env"]["OFFICE_ALLOW_INPLACE_WRITES"] == "false"
+        assert launched["overrides"]["extra_binds"] == [f"/host{source_dir}:/app/userdata/input-0:ro"]
+        assert dispatched["url"] == "http://office-task-1:8060"
+        assert dispatched["capability"] == "office.document.summarize"
+        assert dispatched["metadata"]["source_paths"] == ["/app/userdata/input-0/report.txt"]
+        assert destroyed == {"agent_id": "office", "container_name": "office-task-1"}
+
+    def test_dispatch_office_task_uses_writable_mounts_for_inplace_mode(self, monkeypatch, tmp_path):
+        from agents.compass.tools import DispatchOfficeTask
+
+        source_dir = tmp_path / "folder"
+        source_dir.mkdir()
+
+        launched = {}
+
+        class StubLauncher:
+            def resolve_host_path(self, path):
+                return f"/host{path}"
+
+            def launch_instance(self, agent_definition, task_id, *, launch_overrides=None):
+                launched["overrides"] = launch_overrides
+                return {
+                    "container_name": "office-task-2",
+                    "service_url": "http://office-task-2:8060",
+                    "port": 8060,
+                }
+
+            def destroy_instance(self, agent_id, container_name):
+                return None
+
+        monkeypatch.setattr("agents.compass.tools._should_use_per_task_office_launch", lambda: True)
+        monkeypatch.setattr("agents.compass.tools.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("agents.compass.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            "framework.a2a.client.dispatch_sync",
+            lambda **kwargs: {
+                "task": {
+                    "id": "office-2",
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"parts": [{"text": "Done."}], "metadata": {}}],
+                }
+            },
+        )
+
+        result = DispatchOfficeTask().execute_sync(
+            task_description="Organize the authorized folder.",
+            source_paths=[str(source_dir)],
+            output_mode="inplace",
+            capability="organize",
+            orchestrator_task_id="compass-456",
+        )
+
+        payload = json.loads(result.output)
+        assert payload["status"] == "completed"
+        assert launched["overrides"]["env"]["OFFICE_ALLOW_INPLACE_WRITES"] == "true"
+        assert launched["overrides"]["extra_binds"] == [f"/host{source_dir}:/app/userdata/input-0"]

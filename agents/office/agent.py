@@ -30,6 +30,28 @@ from agents.office.office_tools import register_office_tools
 logger = logging.getLogger(__name__)
 
 
+def _normalize_source_paths(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if item]
+    return []
+
+
+def _normalize_capability(value: str) -> str:
+    capability = (value or "").strip().lower()
+    mapping = {
+        "office.document.summarize": "summarize",
+        "office.folder.summarize": "summarize",
+        "office.data.analyze": "analyze",
+        "office.folder.organize": "organize",
+    }
+    capability = mapping.get(capability, capability)
+    return capability if capability in {"summarize", "analyze", "organize"} else ""
+
+
 # ---------------------------------------------------------------------------
 # Workflow definition
 # ---------------------------------------------------------------------------
@@ -65,6 +87,7 @@ def _build_office_definition() -> AgentDefinition:
         model=cfg.get("model", "gpt-5-mini"),
         workflow=office_workflow,
         config=cfg,
+        launch_spec=cfg.get("launch_spec"),
     )
 
 
@@ -79,7 +102,6 @@ class OfficeAgent(BaseAgent):
     async def start(self) -> None:
         await super().start()
         register_office_tools()
-        _register_office_dispatch(self)
 
     async def handle_message(self, message: dict) -> dict:
         """Handle incoming A2A message.
@@ -94,6 +116,22 @@ class OfficeAgent(BaseAgent):
         user_text = parts[0].get("text", "") if parts else ""
         metadata = msg.get("metadata", {})
         callback_url = metadata.get("callbackUrl", "") or metadata.get("orchestratorCallbackUrl", "")
+        source_paths = _normalize_source_paths(
+            metadata.get("source_paths") or metadata.get("officeTargetPaths")
+        )
+        capability = _normalize_capability(
+            str(
+                metadata.get("capability")
+                or metadata.get("officeCapability")
+                or metadata.get("requestedCapability")
+                or ""
+            )
+        )
+        output_mode = str(
+            metadata.get("output_mode") or metadata.get("officeOutputMode") or "workspace"
+        ).strip().lower()
+        if output_mode not in {"workspace", "inplace"}:
+            output_mode = "workspace"
 
         # Get compass task ID for workspace scoping
         compass_task_id = metadata.get("compassTaskId", metadata.get("taskId", ""))
@@ -105,6 +143,9 @@ class OfficeAgent(BaseAgent):
             metadata={
                 "compass_task_id": compass_task_id,
                 "user_text": user_text,
+                "source_paths": source_paths,
+                "capability": capability,
+                "output_mode": output_mode,
             },
         )
 
@@ -124,6 +165,7 @@ class OfficeAgent(BaseAgent):
         state: dict[str, Any] = {
             "_task_id": canonical_task_id,
             "_compass_task_id": compass_task_id,
+            "_message_metadata": dict(metadata),
             "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,
             "_plugin_manager": self.plugin_manager,
@@ -131,9 +173,9 @@ class OfficeAgent(BaseAgent):
             "_permission_engine": getattr(self, "_permission_engine", None),
             "required_skills": list(self.definition.skills or []),
             "user_request": user_text,
-            "output_mode": metadata.get("output_mode", "workspace"),
-            "source_paths": [],
-            "capability": "summarize",
+            "output_mode": output_mode,
+            "source_paths": source_paths,
+            "capability": capability or "summarize",
             "test_cycles": 0,
         }
 
@@ -226,61 +268,3 @@ def _send_callback(callback_url: str, task_id: str, result: dict) -> None:
 # In-process dispatch (overrides HTTP dispatch)
 # ---------------------------------------------------------------------------
 
-def _register_office_dispatch(office_agent: "OfficeAgent") -> None:
-    """Register in-process dispatch_office_task tool (overrides HTTP-based dispatch)."""
-    from framework.tools.base import BaseTool, ToolResult
-    from framework.tools.registry import get_registry
-
-    class InProcessDispatchOffice(BaseTool):
-        name = "dispatch_office_task"
-        description = "Dispatch a generic office task (documents, data analysis, or folder organization) to the Office Agent."
-        parameters_schema = {
-            "type": "object",
-            "properties": {
-                "task_description": {"type": "string", "description": "Task description text"},
-                "output_mode": {"type": "string", "description": "Output mode: workspace or inplace"},
-                "source_paths": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Source file/folder paths",
-                },
-            },
-            "required": ["task_description"],
-        }
-
-        def execute_sync(
-            self,
-            task_description: str = "",
-            output_mode: str = "workspace",
-            source_paths: list = None,
-        ) -> ToolResult:
-            from framework.a2a.client import dispatch_sync
-
-            source_paths = source_paths or []
-            msg = {
-                "message": {
-                    "messageId": f"dispatch-office-{id(self)}",
-                    "role": "ROLE_USER",
-                    "parts": [{"text": task_description}],
-                    "metadata": {
-                        "output_mode": output_mode,
-                        "source_paths": source_paths,
-                    },
-                }
-            }
-            try:
-                result = dispatch_sync(
-                    agent_id="office",
-                    message=msg,
-                    timeout=3600,
-                )
-                return ToolResult(output=json.dumps(result))
-            except Exception as exc:
-                return ToolResult(output="", error=f"dispatch_office_task: {exc}")
-
-    registry = get_registry()
-    try:
-        registry.unregister("dispatch_office_task")
-    except KeyError:
-        pass
-    registry.register(InProcessDispatchOffice())

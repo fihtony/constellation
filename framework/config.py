@@ -244,4 +244,5 @@ def build_agent_definition_from_config(
         "runtime_backend": data.get("runtime_backend", cfg.get("runtime.backend", "connect-agent")),
         "model": data.get("model", cfg.get("runtime.model", "gpt-5-mini")),
         "config": data,
+        "launch_spec": data.get("launch_spec") or data.get("launchSpec"),
     }

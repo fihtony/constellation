@@ -8,6 +8,7 @@ Use this methodology for any office task. Do not assume fixed domains, fixed sch
 2. Choose tools by source type, not by task keywords.
 3. Always state assumptions, confidence limits, and data quality caveats.
 4. Keep output deterministic, auditable, and within authorized folders only.
+5. Prefer authorized task metadata for source paths, capability, and output mode when it is available; do not depend on literal test paths or dataset-specific clues in the natural-language request.
 
 ## Phase 1: Task Framing
 

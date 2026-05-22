@@ -118,22 +118,30 @@ def _parse_capability(text: str) -> str:
     return "summarize"
 
 
+def _normalize_source_paths(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        candidates = [value]
+    elif isinstance(value, (list, tuple, set)):
+        candidates = [str(item) for item in value if item]
+    else:
+        return []
+
+    normalized: list[str] = []
+    for candidate in candidates:
+        sanitized = candidate.strip().strip('"\'`').lstrip("([{").rstrip(".,;:!?)]}\"'`")
+        if sanitized and sanitized not in normalized:
+            normalized.append(sanitized)
+    return normalized
+
+
 def _extract_paths(text: str) -> list[str]:
     """Extract file/folder paths from task text."""
-    # Match absolute Unix paths
-    paths = re.findall(r'(?:^|\s)((?:/[a-zA-Z0-9_.~-]+)+)', text)
-    # Also match relative paths
-    rel_paths = re.findall(r'(?:^|\s)([a-zA-Z0-9_./-]*(?:tests?/data[/\w.-]+)[a-zA-Z0-9_./-]*)', text)
-    all_paths = paths + rel_paths
-    def _sanitize(candidate: str) -> str:
-        return candidate.strip().strip("\"'`").lstrip("([{").rstrip(".,;:!?)]}\"'`")
-    # Deduplicate while preserving order
-    normalized = []
-    for p in all_paths:
-        sp = _sanitize(p)
-        if len(sp) > 3:
-            normalized.append(sp)
-    return list(dict.fromkeys(normalized))
+    absolute_paths = re.findall(r'(?:(?<=\s)|^)(/[^\s"\'`]+)', text)
+    quoted_paths = re.findall(r'["\']([^"\']*[\\/][^"\']+)["\']', text)
+    paths = [candidate for candidate in absolute_paths + quoted_paths if not candidate.startswith("//")]
+    return _normalize_source_paths(paths)
 
 
 def _expand_summarize_sources(paths: list[str]) -> list[str]:
@@ -157,17 +165,43 @@ def _expand_summarize_sources(paths: list[str]) -> list[str]:
 def receive_task(state: dict) -> dict:
     """Parse the incoming task message to extract capability, paths, and output mode."""
     user_text = state.get("user_request", "")
+    metadata = state.get("_message_metadata", {}) or {}
 
     # Parse output mode
-    output_mode = "workspace"
-    if "inplace" in user_text.lower():
-        output_mode = "inplace"
+    output_mode = str(
+        metadata.get("output_mode")
+        or metadata.get("officeOutputMode")
+        or state.get("output_mode")
+        or ""
+    ).strip().lower()
+    if output_mode not in {"workspace", "inplace"}:
+        output_mode = "inplace" if "inplace" in user_text.lower() else "workspace"
 
     # Parse capability
-    capability = _parse_capability(user_text)
+    raw_capability = str(
+        metadata.get("capability")
+        or metadata.get("officeCapability")
+        or metadata.get("requestedCapability")
+        or state.get("capability")
+        or ""
+    ).strip().lower()
+    capability_map = {
+        "office.document.summarize": "summarize",
+        "office.folder.summarize": "summarize",
+        "office.data.analyze": "analyze",
+        "office.folder.organize": "organize",
+    }
+    capability = capability_map.get(raw_capability, raw_capability)
+    if capability not in {"summarize", "analyze", "organize"}:
+        capability = _parse_capability(user_text)
 
     # Parse source paths
-    source_paths = _extract_paths(user_text)
+    source_paths = _normalize_source_paths(
+        metadata.get("source_paths")
+        or metadata.get("officeTargetPaths")
+        or state.get("source_paths")
+        or _extract_paths(user_text)
+    )
 
     logger.info(f"receive_task: capability={capability} output_mode={output_mode} paths={source_paths}")
 

@@ -17,13 +17,18 @@ services:
       AGENT_RUNTIME: claude-code
       ARTIFACT_ROOT: /app/artifacts
       CONTAINER_RUNTIME: rancher
+      DYNAMIC_AGENT_NETWORK: constellation-v2-network
+      DOCKER_SOCKET: /var/run/docker.sock
     labels:
       constellation.agent_id: compass
       constellation.agent_role: fundamental
     volumes:
       - ./artifacts:/app/artifacts
+      - .:/workspace:ro
       - ./config/.env:/app/config/.env:ro
       - ~/.rd/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_SOCKET_GID:-0}"
     ports:
       - "8000:8000"
     healthcheck:

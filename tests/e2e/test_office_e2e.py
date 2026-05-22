@@ -1,70 +1,51 @@
-"""Office task E2E tests: Compass → Office Agent.
+"""Local Office task E2E tests: Compass UI/A2A -> Registry -> Office Agent.
 
-Tests 3 office tasks × 2 output modes (workspace / inplace) = 6 E2E runs.
-
-Each test:
-  1. Compass receives a user request → classifies as "office"
-  2. Compass dispatches via dispatch_office_task (in-process) → Office agent HTTP server
-  3. Office agent receives task → executes workflow (analyze/summarize/organize)
-  4. Office agent writes output to expected location
-  5. Compass receives completion callback → verifies delivery
-
-Output modes:
-  - workspace: source is read-only; output goes to OFFICE_WORKSPACE_ROOT / artifacts folder
-  - inplace:   source folder is R/W for Office Agent; output goes to source folder
-
-Test data:
-  - tests/data/csv/sales_data.csv        → "analyze" capability (best sales rep, totals)
-  - tests/data/stlouis/                    → "summarize" capability (summarize all school documents in folder)
-  - tests/data/2026/                      → "organize" capability (group student essays by date)
-
-Run locally (no containers):
-    source .venv/bin/activate
-    pytest tests/e2e/test_office_e2e.py -v -s
-
-Run a single test:
-    pytest tests/e2e/test_office_e2e.py -v -s -k "csv_workspace"
+This suite runs three workspace-mode office tasks against real local HTTP
+servers. The natural-language request stays generic so agents do not depend on
+test-only paths or dataset-specific clues in prompt text. Authorized source
+paths and capability hints are passed via message metadata instead.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
+import stat
 import time
+import urllib.parse
+import urllib.request
 import unicodedata
-from http.server import HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from typing import Generator
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 TESTS_DATA = PROJECT_ROOT / "tests" / "data"
 ARTIFACTS_ROOT = PROJECT_ROOT / "artifacts" / "office-e2e"
-TOOLS_DATA_CSV = TESTS_DATA / "csv"
+READONLY_INPUTS_ROOT = PROJECT_ROOT / "artifacts" / "office-e2e-inputs"
+
+TOOLS_DATA_CSV = TESTS_DATA / "csv" / "sales_data.csv"
 TOOLS_DATA_STLOUIS = TESTS_DATA / "stlouis"
 TOOLS_DATA_2026 = TESTS_DATA / "2026"
 
-# ---------------------------------------------------------------------------
-# Environment helpers
-# ---------------------------------------------------------------------------
 
 def _load_env() -> dict[str, str]:
-    env_file = PROJECT_ROOT / "config" / ".env"
-    env = {}
-    if env_file.exists():
+    env: dict[str, str] = {}
+    for env_file in (PROJECT_ROOT / "tests" / ".env", PROJECT_ROOT / "config" / ".env"):
+        if not env_file.exists():
+            continue
         with open(env_file, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
-                key, _, val = line.partition("=")
-                env[key.strip()] = val.strip()
+                key, _, value = line.partition("=")
+                env.setdefault(key.strip(), value.strip())
     return env
 
 
@@ -72,12 +53,8 @@ _TEST_ENV = _load_env()
 
 
 def _env(key: str, default: str = "") -> str:
-    return _TEST_ENV.get(key, os.environ.get(key, default))
+    return os.environ.get(key, _TEST_ENV.get(key, default))
 
-
-# ---------------------------------------------------------------------------
-# Service factory
-# ---------------------------------------------------------------------------
 
 def _make_services(task_store=None):
     from framework.agent import AgentServices
@@ -93,11 +70,7 @@ def _make_services(task_store=None):
     skills_registry = SkillsRegistry()
     skills_registry.load_all()
 
-    model = _env("ANTHROPIC_MODEL", "MiniMax-M2.7")
-    effective_runtime = get_runtime(
-        "claude-code",
-        model=model,
-    )
+    runtime = get_runtime("claude-code", model=_env("ANTHROPIC_MODEL", "MiniMax-M2.7"))
     return AgentServices(
         session_service=InMemorySessionService(),
         event_store=InMemoryEventStore(),
@@ -105,55 +78,111 @@ def _make_services(task_store=None):
         skills_registry=skills_registry,
         plugin_manager=PluginManager(),
         checkpoint_service=InMemoryCheckpointer(),
-        runtime=effective_runtime,
+        runtime=runtime,
         registry_client=None,
         task_store=task_store or InMemoryTaskStore(),
     )
 
 
-# ---------------------------------------------------------------------------
-# Office agent HTTP server in a thread
-# ---------------------------------------------------------------------------
-
-class _OfficeServer:
-    """In-process OfficeAgent wrapper for local E2E tests (no socket binding)."""
-
-    def __init__(self, office_agent, port: int = 0):
-        self._agent = office_agent
-        self._port = port
-        self._server: HTTPServer | None = None
+class _AgentServer:
+    def __init__(self, agent, card_path: str = "", port: int = 0):
+        self.agent = agent
+        self.card_path = card_path
+        self.port = port
+        self._server: ThreadingHTTPServer | None = None
         self._thread: Thread | None = None
 
     @property
-    def agent(self):
-        """The OfficeAgent instance (for accessing its task store)."""
-        return self._agent
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def start(self) -> "_AgentServer":
+        from framework.a2a.server import A2ARequestHandler
+
+        parent = self
+
+        class Handler(A2ARequestHandler):
+            agent = parent.agent
+            advertised_url = ""
+            agent_card_path = parent.card_path
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        self.port = self._server.server_address[1]
+        Handler.advertised_url = self.url
+        self._thread = Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        self._wait_for_ready()
+        return self
+
+    def _wait_for_ready(self) -> None:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"{self.url}/health", timeout=1):
+                    return
+            except Exception:
+                time.sleep(0.1)
+        raise RuntimeError(f"Server did not become ready: {self.url}")
+
+    def stop(self) -> None:
+        if self._server:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+
+class _RegistryServer:
+    def __init__(self, capability_map: dict[str, str], port: int = 0):
+        self.capability_map = capability_map
+        self.port = port
+        self.queries: list[str] = []
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: Thread | None = None
 
     @property
     def url(self) -> str:
-        return "inprocess://office"
+        return f"http://127.0.0.1:{self.port}"
 
-    def start(self) -> "_OfficeServer":
-        from framework.a2a.server import A2ARequestHandler
+    def start(self) -> "_RegistryServer":
+        parent = self
 
-        class Handler(A2ARequestHandler):
-            agent = self._agent
-            advertised_url = self.url
-            agent_card_path = ""
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == "/query":
+                    capability = urllib.parse.parse_qs(parsed.query).get("capability", [""])[0]
+                    parent.queries.append(capability)
+                    service_url = parent.capability_map.get(capability, "")
+                    body = json.dumps([{"serviceUrl": service_url}] if service_url else []).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
 
-        self._server = HTTPServer(("127.0.0.1", self._port), Handler)
-        self._port = self._server.server_address[1]
+                if parsed.path.startswith("/agents/"):
+                    agent_id = parsed.path.split("/")[-1]
+                    service_url = parent.capability_map.get(agent_id, "")
+                    payload = json.dumps({"serviceUrl": service_url}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, format: str, *args) -> None:  # noqa: A003
+                print(f"[registry] {format % args}")
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        self.port = self._server.server_address[1]
         self._thread = Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
-        # Wait until server is ready
-        for _ in range(50):
-            time.sleep(0.05)
-            try:
-                import urllib.request
-                urllib.request.urlopen(f"{self.url}/health", timeout=1)
-                break
-            except Exception:
-                pass
         return self
 
     def stop(self) -> None:
@@ -164,157 +193,238 @@ class _OfficeServer:
             self._thread.join(timeout=5)
 
 
-# ---------------------------------------------------------------------------
-# Shared fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="session")
-def office_server() -> Generator[_OfficeServer, None, None]:
-    """Start Office Agent for the test session (in-process, no HTTP binding)."""
-    from agents.office.agent import OfficeAgent, office_definition
-
-    services = _make_services()
-    office_agent = OfficeAgent(office_definition, services)
-
-    import asyncio
-    async def _start():
-        await office_agent.start()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(_start())
-    loop.close()
-
-    server = _OfficeServer(office_agent)
-    print(f"\n[office-server] started at {server.url}")
-    yield server
-    print(f"\n[office-server] stopped")
+def _http_get(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
-@pytest.fixture
-def clean_artifacts():
-    """Clean test_* folders from previous runs before each test.
-
-    Note: Office agent output goes to {ARTIFACTS_ROOT}/{compass_task_id}/office/artifacts/
-    not to this folder. This fixture just provides isolation.
-    """
-    ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
-    # Clean all test_* folders from previous runs
-    for item in ARTIFACTS_ROOT.iterdir():
-        if item.is_dir() and item.name.startswith("test_"):
-            shutil.rmtree(item, ignore_errors=True)
-    yield  # Tests run here
-    # Don't clean up — preserve for post-test inspection
+def _http_get_text(url: str) -> str:
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        return resp.read().decode("utf-8")
 
 
-# ---------------------------------------------------------------------------
-# Test cases
-# ---------------------------------------------------------------------------
-
-# Task definitions: (test_id, description, source_path, capability, output_filename)
-OFFICE_TASKS = [
-    (
-        "csv_analyze_workspace",
-        f"Analyze the CSV file at {TOOLS_DATA_CSV}/sales_data.csv and find the best sales person and total sales amount. Output should go to workspace.",
-        str(TOOLS_DATA_CSV / "sales_data.csv"),
-        "analyze",
-        "sales_data.csv.analysis.md",
-    ),
-    (
-        "csv_analyze_inplace",
-        f"Analyze the CSV file at {TOOLS_DATA_CSV}/sales_data.csv and find the best sales person and total sales amount. Output should be inplace.",
-        str(TOOLS_DATA_CSV / "sales_data.csv"),
-        "analyze",
-        "sales_data.csv.analysis.md",
-    ),
-    (
-        "stlouis_summarize_workspace",
-        f"Summarize all supported documents under folder {TOOLS_DATA_STLOUIS}. Create one summary per document and a combined summary report. Output should go to workspace.",
-        str(TOOLS_DATA_STLOUIS),
-        "summarize",
-        "combined-summary.md",
-    ),
-    (
-        "stlouis_summarize_inplace",
-        f"Summarize all supported documents under folder {TOOLS_DATA_STLOUIS}. Create one summary per document and a combined summary report. Output should be inplace.",
-        str(TOOLS_DATA_STLOUIS),
-        "summarize",
-        "combined-summary.md",
-    ),
-    (
-        "2026_organize_workspace",
-        f"Organize the student essays in {TOOLS_DATA_2026} folder by grouping same student's essays by date. Output should go to workspace.",
-        str(TOOLS_DATA_2026),
-        "organize",
-        "organization-plan.md",
-    ),
-    (
-        "2026_organize_inplace",
-        f"Organize the student essays in {TOOLS_DATA_2026} folder by grouping same student's essays by date. Output should be inplace.",
-        str(TOOLS_DATA_2026),
-        "organize",
-        "organization-plan.md",
-    ),
-]
+def _http_post(url: str, payload: dict, timeout: int = 30) -> dict:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
-def _output_mode(test_id: str) -> str:
-    return "inplace" if "inplace" in test_id else "workspace"
+def _task_state(task_dict: dict) -> str:
+    return task_dict.get("task", task_dict).get("status", {}).get("state", "")
 
 
-def _source_root_for(source_path: str) -> str:
-    p = Path(source_path)
-    if p.is_dir():
-        return str(p.resolve())
-    return str(p.parent.resolve())
+def _task_id(task_dict: dict) -> str:
+    return task_dict.get("task", task_dict).get("id", "")
 
 
-def _expected_output_path(
-    output_mode: str,
-    capability: str,
-    source_path: str,
-    output_filename: str,
-    office_workspace: str,
-) -> str:
-    if output_mode == "workspace":
-        return os.path.join(office_workspace, output_filename)
-    if capability in {"analyze", "summarize"}:
-        base_dir = source_path if os.path.isdir(source_path) else os.path.dirname(source_path)
-        return os.path.join(base_dir, output_filename)
-    return os.path.join(source_path, output_filename)
+def _poll_task(base_url: str, task_id: str, timeout_seconds: int = 600) -> dict:
+    deadline = time.time() + timeout_seconds
+    terminal = {
+        "TASK_STATE_COMPLETED",
+        "TASK_STATE_FAILED",
+        "TASK_STATE_CANCELLED",
+        "TASK_STATE_INPUT_REQUIRED",
+    }
+    while time.time() < deadline:
+        result = _http_get(f"{base_url}/tasks/{task_id}")
+        if _task_state(result) in terminal:
+            return result
+        time.sleep(2)
+    raise TimeoutError(f"Task {task_id} did not complete within {timeout_seconds}s")
 
 
-def _summarize_source_files(source_path: str) -> list[str]:
-    path = Path(source_path)
-    if path.is_dir():
-        return sorted(
-            str(item.resolve())
-            for item in path.rglob("*")
-            if item.is_file() and item.suffix.lower() in {".pdf", ".docx", ".txt", ".md", ".pptx"}
-        )
-    return [str(path.resolve())]
+def _set_readonly(path: Path) -> None:
+    if path.is_file():
+        path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        return
+
+    for child in sorted(path.rglob("*"), reverse=True):
+        if child.is_dir():
+            child.chmod(stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        else:
+            child.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    path.chmod(stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
 
 
-def _read_text(path: str) -> str:
-    if not os.path.exists(path):
+def _set_writable(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_file():
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+        return
+
+    for child in sorted(path.rglob("*")):
+        if child.is_dir():
+            child.chmod(
+                stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+                | stat.S_IRGRP | stat.S_IXGRP
+                | stat.S_IROTH | stat.S_IXOTH
+            )
+        else:
+            child.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+    path.chmod(
+        stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+        | stat.S_IRGRP | stat.S_IXGRP
+        | stat.S_IROTH | stat.S_IXOTH
+    )
+
+
+def _stage_readonly_source(test_id: str, source_path: Path) -> Path:
+    stage_root = READONLY_INPUTS_ROOT / test_id
+    if stage_root.exists():
+        _set_writable(stage_root)
+        shutil.rmtree(stage_root)
+    if source_path.is_dir():
+        target = stage_root / source_path.name
+        shutil.copytree(source_path, target)
+    else:
+        target_dir = stage_root / "source"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / source_path.name
+        shutil.copy2(source_path, target)
+    _set_readonly(stage_root)
+    return target
+
+
+def _source_root_for(source_path: Path) -> Path:
+    return source_path if source_path.is_dir() else source_path.parent
+
+
+def _snapshot_tree(path: Path) -> dict[str, tuple[int, int]]:
+    root = path if path.is_dir() else path.parent
+    snapshot: dict[str, tuple[int, int]] = {}
+    if path.is_file():
+        stat_result = path.stat()
+        snapshot[path.name] = (stat_result.st_size, int(stat_result.st_mtime))
+        return snapshot
+    for item in sorted(root.rglob("*")):
+        rel = str(item.relative_to(root))
+        stat_result = item.stat()
+        snapshot[rel] = (stat_result.st_size, int(stat_result.st_mtime))
+    return snapshot
+
+
+def _expected_output_path(output_filename: str, office_workspace: Path) -> Path:
+    return office_workspace / output_filename
+
+
+def _read_text(path: Path) -> str:
+    if not path.exists():
         return ""
-    with open(path, encoding="utf-8") as fh:
-        return fh.read()
-
-
-def _safe_mtime(path: str) -> float:
-    try:
-        return os.path.getmtime(path)
-    except OSError:
-        return -1.0
+    return path.read_text(encoding="utf-8")
 
 
 def _normalize_text(value: str) -> str:
     return unicodedata.normalize("NFC", value)
 
 
-# ---------------------------------------------------------------------------
-# Individual tests
-# ---------------------------------------------------------------------------
+def _summarize_source_files(source_path: Path) -> list[Path]:
+    if source_path.is_dir():
+        return sorted(
+            item for item in source_path.rglob("*")
+            if item.is_file() and item.suffix.lower() in {".pdf", ".docx", ".txt", ".md", ".pptx"}
+        )
+    return [source_path]
+
+
+OFFICE_TASKS = [
+    (
+        "csv_workspace",
+        "Please analyze the authorized spreadsheet in the shared folder and write the result to the task workspace.",
+        TOOLS_DATA_CSV,
+        "analyze",
+        "sales_data.csv.analysis.md",
+    ),
+    (
+        "stlouis_workspace",
+        "Please summarize the authorized documents in the shared folder and write the summaries to the task workspace.",
+        TOOLS_DATA_STLOUIS,
+        "summarize",
+        "combined-summary.md",
+    ),
+    (
+        "2026_workspace",
+        "Please organize the authorized files in the shared folder into the task workspace.",
+        TOOLS_DATA_2026,
+        "organize",
+        "organization-plan.md",
+    ),
+]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def configure_env() -> Generator[None, None, None]:
+    ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
+    READONLY_INPUTS_ROOT.mkdir(parents=True, exist_ok=True)
+
+    os.environ["ARTIFACT_ROOT"] = str(ARTIFACTS_ROOT)
+    os.environ["AGENT_RUNTIME"] = "claude-code"
+    os.environ["ANTHROPIC_AUTH_TOKEN"] = _env("ANTHROPIC_AUTH_TOKEN", "")
+    os.environ["ANTHROPIC_BASE_URL"] = _env("ANTHROPIC_BASE_URL", "https://api.minimaxi.com/anthropic")
+    os.environ["ANTHROPIC_MODEL"] = _env("ANTHROPIC_MODEL", "MiniMax-M2.7")
+    os.environ["OFFICE_AGENTIC_TIMEOUT_SECONDS"] = "300"
+    os.environ["OFFICE_AGENTIC_MAX_TURNS"] = "16"
+    os.environ["OFFICE_ALLOW_INPLACE_WRITES"] = "false"
+    yield
+
+
+@pytest.fixture(scope="session")
+def office_server() -> Generator[_AgentServer, None, None]:
+    from agents.office.agent import OfficeAgent, office_definition
+
+    agent = OfficeAgent(office_definition, _make_services())
+    asyncio.run(agent.start())
+    server = _AgentServer(agent).start()
+    print(f"\n[office-server] {server.url}")
+    yield server
+    server.stop()
+    asyncio.run(agent.stop())
+
+
+@pytest.fixture(scope="session")
+def registry_server(office_server: _AgentServer) -> Generator[_RegistryServer, None, None]:
+    capability_map = {
+        "office.document.summarize": office_server.url,
+        "office.data.analyze": office_server.url,
+        "office.folder.organize": office_server.url,
+        "office.agent": office_server.url,
+        "office": office_server.url,
+    }
+    server = _RegistryServer(capability_map).start()
+    print(f"\n[registry-server] {server.url}")
+    yield server
+    server.stop()
+
+
+@pytest.fixture(scope="session")
+def compass_server(registry_server: _RegistryServer) -> Generator[_AgentServer, None, None]:
+    from agents.compass.agent import CompassAgent, compass_definition
+    from framework.task_store import InMemoryTaskStore
+
+    os.environ["REGISTRY_URL"] = registry_server.url
+
+    agent = CompassAgent(compass_definition, _make_services(task_store=InMemoryTaskStore()))
+    asyncio.run(agent.start())
+    server = _AgentServer(agent).start()
+    os.environ["COMPASS_BASE_URL"] = server.url
+    print(f"\n[compass-server] {server.url}")
+    print(f"[compass-ui] {server.url}/ui")
+    yield server
+    server.stop()
+    asyncio.run(agent.stop())
+
+
+@pytest.fixture(autouse=True)
+def reset_registry_queries(registry_server: _RegistryServer) -> Generator[None, None, None]:
+    registry_server.queries.clear()
+    yield
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -322,354 +432,150 @@ def _normalize_text(value: str) -> str:
     OFFICE_TASKS,
     ids=[case[0] for case in OFFICE_TASKS],
 )
-async def test_office_task(
-    office_server,
-    clean_artifacts,
-    monkeypatch,
-    test_id,
-    description,
-    source_path,
-    capability,
-    output_filename,
+async def test_office_task_workspace(
+    compass_server: _AgentServer,
+    office_server: _AgentServer,
+    registry_server: _RegistryServer,
+    test_id: str,
+    description: str,
+    source_path: Path,
+    capability: str,
+    output_filename: str,
 ):
-    """Run a single office task E2E test.
+    staged_source = _stage_readonly_source(test_id, source_path)
+    source_root = _source_root_for(staged_source)
+    source_snapshot_before = _snapshot_tree(source_root)
 
-    Validates:
-      1. Compass classifies the request as "office"
-      2. Compass dispatches to Office Agent (in-process dispatch_office_task → HTTP)
-      3. Office Agent processes the task
-      4. Output appears in the expected location (workspace or inplace)
-      5. A2A callback is sent from Office Agent to Compass
-    """
-    from agents.compass.agent import CompassAgent, compass_definition
-    from framework.task_store import InMemoryTaskStore
-    from framework.tools.base import BaseTool, ToolResult
-    from framework.tools.registry import get_registry
+    os.environ["OFFICE_SOURCE_ROOT"] = str(source_root)
+    os.environ["OFFICE_ALLOWED_BASE_PATHS"] = str(source_root)
+    os.environ["OFFICE_ALLOW_INPLACE_WRITES"] = "false"
 
-    output_mode = _output_mode(test_id)
-    source_root = _source_root_for(source_path)
-    # clean_artifacts fixture just cleans up old test folders, actual output goes to compass_task_id folder
+    compass_ui_url = f"{compass_server.url}/ui"
+    ui_html = _http_get_text(compass_ui_url)
+    assert "Compass Agent" in ui_html
 
-    print(f"\n{'='*70}")
-    print(f"[{test_id}] START")
-    print(f"  source   : {source_path}")
-    print(f"  sourceRoot: {source_root}")
-    print(f"  output   : {output_mode}")
-    print(f"  office   : {office_server.url}")
-    print(f"{'='*70}")
+    print(f"\n{'=' * 70}")
+    print(f"[{test_id}] Compass UI: {compass_ui_url}")
+    print(f"[{test_id}] Source root : {source_root}")
+    print(f"[{test_id}] Source path : {staged_source}")
+    print(f"{'=' * 70}")
 
-    # ---- Set environment for this test ----
-    os.environ["OFFICE_SOURCE_ROOT"] = source_root
-    os.environ["OFFICE_ALLOWED_BASE_PATHS"] = source_root
-    os.environ["OFFICE_ALLOW_INPLACE_WRITES"] = "true" if output_mode == "inplace" else "false"
-    os.environ["ARTIFACT_ROOT"] = str(ARTIFACTS_ROOT)
-    os.environ["AGENT_RUNTIME"] = "claude-code"
-    os.environ["ANTHROPIC_AUTH_TOKEN"] = _env("ANTHROPIC_AUTH_TOKEN", "")
-    os.environ["ANTHROPIC_BASE_URL"] = _env("ANTHROPIC_BASE_URL", "https://api.minimaxi.com/anthropic")
-    os.environ["ANTHROPIC_MODEL"] = _env("ANTHROPIC_MODEL", "MiniMax-M2.7")
-    os.environ["OFFICE_AGENTIC_TIMEOUT_SECONDS"] = "180"
-    os.environ["OFFICE_AGENTIC_MAX_TURNS"] = "12"
+    assert not os.access(source_root, os.W_OK), f"[{test_id}] source root should be read-only"
 
-    # Ensure compass registry lookup can discover office capability in local E2E.
-    from framework.registry_client import RegistryClient
-    monkeypatch.setattr(
-        RegistryClient,
-        "discover",
-        lambda self, capability_name: office_server.url if capability_name in {"office.document.summarize", "office.agent"} else "",
-    )
-
-    # ---- Register compass tools ----
-    from agents.compass.tools import register_compass_tools
-    register_compass_tools()
-
-    # ---- Create Compass Agent ----
-    compass_store = InMemoryTaskStore()
-    compass_services = _make_services(task_store=compass_store)
-    compass_agent = CompassAgent(compass_definition, compass_services)
-
-    await compass_agent.start()
-
-    # Override dispatch_office_task to call the office server directly
-    registry = get_registry()
-
-    class InProcessDispatchOfficeOverride(BaseTool):
-        name = "dispatch_office_task"
-        description = "Override dispatch_office_task to call office server directly"
-        parameters_schema = {
-            "type": "object",
-            "properties": {
-                "task_description": {"type": "string"},
-                "source_paths": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["task_description"],
-        }
-
-        def execute_sync(self, task_description: str = "", source_paths: list = None) -> ToolResult:
-            import asyncio
-            import threading
-            import uuid
-
-            source_paths = source_paths or []
-
-            # Get the compass task ID at execution time (task is already created by compass.handle_message)
-            compass_tasks = compass_store.list_tasks(agent_id="compass")
-            current_compass_task_id = compass_tasks[-1].id if compass_tasks else ""
-
-            envelope = {
-                "message": {
-                    "messageId": str(uuid.uuid4()),
-                    "role": "ROLE_USER",
-                    "parts": [{"text": task_description}],
-                    "metadata": {
-                        "output_mode": output_mode,
-                        "source_paths": source_paths,
-                        "compassTaskId": current_compass_task_id,
-                        "allowed_tools": ["read_pdf", "read_docx", "read_txt", "read_csv",
-                                         "list_directory", "write_workspace", "write_file",
-                                         "organize_folder", "organize_move_file"],
-                    },
+    initial_response = _http_post(
+        f"{compass_server.url}/message:send",
+        {
+            "message": {
+                "messageId": f"office-e2e-{test_id}",
+                "role": "ROLE_USER",
+                "parts": [{"text": description}],
+                "metadata": {
+                    "capability": capability,
+                    "source_paths": [str(staged_source)],
                 },
-                "configuration": {"returnImmediately": True},
-            }
-            try:
-                response_holder: dict[str, dict] = {}
-                error_holder: dict[str, str] = {}
-
-                def _invoke_office():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        response_holder["response"] = loop.run_until_complete(
-                            office_server.agent.handle_message(envelope)
-                        )
-                    except Exception as exc:
-                        error_holder["error"] = str(exc)
-                    finally:
-                        loop.close()
-
-                t = threading.Thread(target=_invoke_office, daemon=True)
-                t.start()
-                t.join(timeout=60)
-                if t.is_alive():
-                    return ToolResult(output="", error=json.dumps({"status": "error", "message": "office handle_message timeout"}))
-                if error_holder.get("error"):
-                    return ToolResult(output="", error=json.dumps({"status": "error", "message": error_holder["error"]}))
-
-                response = response_holder.get("response", {})
-                task_data = response.get("task", response)
-                task_id = task_data.get("id", "")
-                if not task_id:
-                    return ToolResult(output=json.dumps({"status": "dispatched", "taskId": ""}))
-
-                # Poll until done
-                deadline = time.time() + 600
-                terminal = {
-                    "TASK_STATE_COMPLETED", "TASK_STATE_FAILED",
-                    "TASK_STATE_CANCELLED", "TASK_STATE_INPUT_REQUIRED",
-                }
-                while time.time() < deadline:
-                    try:
-                        result = office_server.agent.services.task_store.get_task_dict(task_id)
-                        task_obj = result.get("task", result)
-                        state = task_obj.get("status", {}).get("state", "")
-                        if state in terminal:
-                            return ToolResult(output=json.dumps({"status": "completed", "taskId": task_id}))
-                    except Exception:
-                        pass
-                    time.sleep(2)
-                return ToolResult(output=json.dumps({"status": "timeout", "taskId": task_id}))
-            except Exception as exc:
-                return ToolResult(output="", error=json.dumps({"status": "error", "message": str(exc)}))
-
-    try:
-        registry.unregister("dispatch_office_task")
-    except KeyError:
-        pass
-    registry.register(InProcessDispatchOfficeOverride())
-
-    # ---- Send task to Compass ----
-    print(f"\n[{test_id}] Sending to Compass...")
-
-    compass_result = await compass_agent.handle_message({
-        "message": {
-            "messageId": f"e2e-{test_id}",
-            "role": "ROLE_USER",
-            "parts": [{"text": description}],
-            "metadata": {},
-        }
-    })
-
-    compass_task_id = compass_result.get("task", {}).get("id", "")
-    compass_state = compass_result.get("task", {}).get("status", {}).get("state", "")
-    print(f"[{test_id}] Compass task state: {compass_state}")
-    print(f"[{test_id}] Compass task ID  : {compass_task_id}")
-    assert compass_task_id, f"[{test_id}] Compass task ID is empty"
-    assert compass_state in {"TASK_STATE_COMPLETED", "TASK_STATE_WORKING", "TASK_STATE_SUBMITTED"}, (
-        f"[{test_id}] Unexpected compass task state: {compass_state}"
+            },
+            "configuration": {"returnImmediately": True},
+        },
     )
 
-    # Track source output timestamp to ensure mode-specific delivery checks are real.
-    source_expected_output = _expected_output_path(
-        output_mode="inplace",
-        capability=capability,
-        source_path=source_path,
-        output_filename=output_filename,
-        office_workspace="",
+    compass_task_id = _task_id(initial_response)
+    assert compass_task_id, f"[{test_id}] empty Compass task id"
+    assert _task_state(initial_response) == "TASK_STATE_INPUT_REQUIRED", (
+        f"[{test_id}] expected output-mode clarification first: {initial_response}"
     )
-    source_output_mtime_before = _safe_mtime(source_expected_output)
 
-    # Poll for office task completion using the same task store as the office agent
-    print(f"\n[{test_id}] Waiting for Office Agent to complete...")
+    resumed_response = _http_post(
+        f"{compass_server.url}/tasks/{compass_task_id}/resume",
+        {"input": "workspace"},
+        timeout=600,
+    )
+    assert _task_id(resumed_response) == compass_task_id
+
+    compass_final = _poll_task(compass_server.url, compass_task_id)
+    assert _task_state(compass_final) == "TASK_STATE_COMPLETED", f"[{test_id}] compass failed: {compass_final}"
 
     office_task_store = office_server.agent.services.task_store
-    deadline = time.monotonic() + 600
-    last_heartbeat = time.monotonic()
     office_final = None
-
-    while time.monotonic() < deadline:
+    deadline = time.time() + 600
+    while time.time() < deadline:
         tasks = office_task_store.list_tasks(agent_id="office")
         for task in tasks:
             task_meta = getattr(task, "metadata", {}) or {}
             if task_meta.get("compass_task_id") != compass_task_id:
                 continue
-            state_val = task.status.state.value
-            if state_val in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED"}:
-                office_final = office_task_store.get_task_dict(task.id)
+            current = office_task_store.get_task_dict(task.id)
+            state = _task_state(current)
+            if state in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED"}:
+                office_final = current
                 break
-        if office_final:
+        if office_final is not None:
             break
-        now = time.monotonic()
-        if now - last_heartbeat >= 30:
-            last_heartbeat = now
-            elapsed = int(now - (deadline - 600))
-            print(f"[{test_id}] Office Agent still running... ({elapsed}s elapsed)")
         time.sleep(2)
 
-    assert office_final is not None, f"[{test_id}] Office Agent did not complete within 600s"
-    office_task_obj = office_final.get("task", office_final)
-    office_state = office_task_obj.get("status", {}).get("state", "")
-    print(f"[{test_id}] Office task state: {office_state}")
-    assert office_state == "TASK_STATE_COMPLETED", f"[{test_id}] Office task failed: {office_final}"
+    assert office_final is not None, f"[{test_id}] office task not found for compass task {compass_task_id}"
+    assert _task_state(office_final) == "TASK_STATE_COMPLETED", f"[{test_id}] office failed: {office_final}"
 
-    # ---- Verify output location ----
-    print(f"\n[{test_id}] Verifying output...")
+    office_base = ARTIFACTS_ROOT / compass_task_id / "office"
+    office_workspace = office_base / "artifacts"
+    task_report_path = office_base / "task-report.json"
+    expected_output_path = _expected_output_path(output_filename, office_workspace)
 
-    # The office agent writes to: {ARTIFACT_ROOT}/{compass_task_id}/office/
-    # task-report.json is in {compass_task_id}/office/
-    # output file is in {compass_task_id}/office/artifacts/{filename}
-    office_base = os.path.join(ARTIFACTS_ROOT, compass_task_id, "office")
-    office_workspace = os.path.join(office_base, "artifacts")
-    task_report_path = os.path.join(office_base, "task-report.json")
+    assert office_workspace.is_dir(), f"[{test_id}] missing office workspace: {office_workspace}"
+    assert task_report_path.exists(), f"[{test_id}] missing task-report.json"
+    assert expected_output_path.exists(), f"[{test_id}] missing expected output: {expected_output_path}"
 
-    expected_output_path = _expected_output_path(
-        output_mode=output_mode,
-        capability=capability,
-        source_path=source_path,
-        output_filename=output_filename,
-        office_workspace=office_workspace,
-    )
-    summarize_sources = _summarize_source_files(source_path) if capability == "summarize" else []
+    report = json.loads(task_report_path.read_text(encoding="utf-8"))
+    assert report.get("data", {}).get("output_mode") == "workspace"
+    assert report.get("data", {}).get("warnings_count") == 0
 
-    print(f"[{test_id}] Expected output: {expected_output_path}")
-    print(f"[{test_id}] Office workspace: {office_workspace}")
-    print(f"[{test_id}] Workspace contents: {list(Path(office_workspace).rglob('*')) if os.path.exists(office_workspace) else 'not found'}")
-
-    if output_mode == "workspace":
-        # List workspace contents for debugging
-        workspace_contents = list(Path(office_workspace).rglob("*")) if os.path.exists(office_workspace) else []
-        print(f"[{test_id}] Workspace contents: {workspace_contents}")
-
-    # Check task-report.json exists in the office working folder
-    assert os.path.exists(task_report_path), f"[{test_id}] task-report.json not found in office working folder"
-    with open(task_report_path, encoding="utf-8") as f:
-        report = json.load(f)
-    print(f"[{test_id}] task-report.json: {json.dumps(report, indent=2)}")
-    assert report.get("data", {}).get("output_mode") == output_mode, (
-        f"[{test_id}] task-report output_mode mismatch"
-    )
-    assert report.get("data", {}).get("warnings_count") == 0, (
-        f"[{test_id}] task-report warnings_count should be 0: {report}"
-    )
-    assert not os.path.exists(os.path.join(office_base, "warnings.md")), (
-        f"[{test_id}] warnings.md should not exist for successful agentic execution"
-    )
-
-    # Check output delivery in the expected location
-    assert os.path.exists(expected_output_path), (
-        f"[{test_id}] Expected output missing: {expected_output_path}"
-    )
+    if capability == "summarize":
+        combined_text = _read_text(expected_output_path)
+        for doc_path in _summarize_source_files(staged_source):
+            per_doc_output = office_workspace / f"{doc_path.name}.summary.md"
+            assert per_doc_output.exists(), f"[{test_id}] missing per-document summary: {per_doc_output}"
+            assert _normalize_text(doc_path.name) in _normalize_text(combined_text), (
+                f"[{test_id}] combined summary missing {doc_path.name}"
+            )
 
     if capability == "organize":
-        if output_mode == "workspace":
-            organized_root = os.path.join(office_workspace, "organized-output", "files")
-        else:
-            organized_root = os.path.join(source_path, "organized-output", "files")
-        assert os.path.isdir(organized_root), (
-            f"[{test_id}] Missing organized output directory: {organized_root}"
-        )
-        organized_files = [
-            path for path in Path(organized_root).rglob("*")
-            if path.is_file()
-        ]
-        assert organized_files, f"[{test_id}] No files materialized under organized output"
+        organized_root = office_workspace / "organized-output" / "files"
+        assert organized_root.is_dir(), f"[{test_id}] missing organized output root"
+        organized_files = [path for path in organized_root.rglob("*") if path.is_file()]
+        assert organized_files, f"[{test_id}] no organized files materialized"
 
-    if capability == "summarize" and len(summarize_sources) > 1:
-        for doc_path in summarize_sources:
-            per_doc_output = _expected_output_path(
-                output_mode=output_mode,
-                capability=capability,
-                source_path=doc_path,
-                output_filename=f"{Path(doc_path).name}.summary.md",
-                office_workspace=office_workspace,
-            )
-            assert os.path.exists(per_doc_output), (
-                f"[{test_id}] Missing per-document summary: {per_doc_output}"
-            )
-        combined_text = _read_text(expected_output_path)
-        for doc_path in summarize_sources:
-            assert _normalize_text(Path(doc_path).name) in _normalize_text(combined_text), (
-                f"[{test_id}] combined summary missing document section for {Path(doc_path).name}"
-            )
+    source_snapshot_after = _snapshot_tree(source_root)
+    assert source_snapshot_after == source_snapshot_before, f"[{test_id}] source tree changed in workspace mode"
+    assert not any(path.name == output_filename for path in source_root.rglob("*")), (
+        f"[{test_id}] output escaped into read-only source root"
+    )
 
-    source_output_mtime_after = _safe_mtime(source_expected_output)
-    if output_mode == "workspace":
-        if source_output_mtime_before >= 0:
-            assert source_output_mtime_after == source_output_mtime_before, (
-                f"[{test_id}] Workspace mode should not modify source output path: {source_expected_output}"
-            )
-        print(f"[{test_id}] PASS: workspace output verified")
-    else:
-        assert source_output_mtime_after >= source_output_mtime_before, (
-            f"[{test_id}] Inplace output was not updated in source folder: {source_expected_output}"
-        )
-        print(f"[{test_id}] PASS: inplace output verified")
-
-    # Step-level log checks: compass + office logs under artifacts/{task_id}/...
     from framework.devlog import get_agent_log_path
 
-    compass_log = get_agent_log_path(compass_task_id, "compass")
-    office_log = get_agent_log_path(compass_task_id, "office")
+    compass_log = Path(get_agent_log_path(compass_task_id, "compass"))
+    office_log = Path(get_agent_log_path(compass_task_id, "office"))
     compass_log_text = _read_text(compass_log)
     office_log_text = _read_text(office_log)
-    print(f"[{test_id}] Compass log: {compass_log}")
-    print(f"[{test_id}] Office log : {office_log}")
 
-    assert "[NODE] handle_message" in compass_log_text, f"[{test_id}] missing compass handle_message log"
-    assert "task_type='office'" in compass_log_text, f"[{test_id}] compass did not classify task as office"
-    assert "[A2A] → registry" in compass_log_text, f"[{test_id}] missing A2A registry query log"
-    assert "[A2A] ← registry" in compass_log_text, f"[{test_id}] missing A2A registry response log"
-    assert "[A2A] → office" in compass_log_text, f"[{test_id}] missing A2A dispatch-to-office log"
-    assert "office dispatch complete" in compass_log_text, f"[{test_id}] missing office dispatch completion log"
+    assert compass_log.exists(), f"[{test_id}] missing compass log"
+    assert office_log.exists(), f"[{test_id}] missing office log"
+
+    assert "task_type='office'" in compass_log_text, f"[{test_id}] compass did not classify as office"
+    assert "office task awaiting output mode" in compass_log_text, f"[{test_id}] missing output-mode inquiry log"
+    assert "[A2A] → registry" in compass_log_text, f"[{test_id}] missing registry send log"
+    assert "[A2A] ← registry" in compass_log_text, f"[{test_id}] missing registry receive log"
+    assert "[A2A] → office" in compass_log_text, f"[{test_id}] missing office dispatch log"
+    assert "office delivery verified" in compass_log_text, f"[{test_id}] missing office delivery verification log"
+    assert "[A2A] ← callback" in compass_log_text, f"[{test_id}] missing office callback log"
 
     assert "[NODE] handle_message" in office_log_text, f"[{test_id}] missing office handle_message log"
-    assert "[A2A] ← compass" in office_log_text, f"[{test_id}] missing office receive-from-compass log"
     assert "office agent started" in office_log_text, f"[{test_id}] missing office startup log"
+    assert "[A2A] ← compass" in office_log_text, f"[{test_id}] missing office receive-from-compass log"
 
-    print(f"\n[{test_id}] COMPLETED SUCCESSFULLY")
-    print(f"{'='*70}")
+    assert any(query in registry_server.queries for query in {"office.document.summarize", "office.data.analyze", "office.folder.organize"}), (
+        f"[{test_id}] registry was not queried for office capability"
+    )
 
-    # Clean up registry
-    try:
-        registry.unregister("dispatch_office_task")
-    except KeyError:
-        pass
+    print(f"[{test_id}] Compass log : {compass_log}")
+    print(f"[{test_id}] Office log  : {office_log}")
+    print(f"[{test_id}] Workspace   : {office_workspace}")
+    print(f"[{test_id}] Output      : {expected_output_path}")

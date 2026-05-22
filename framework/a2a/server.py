@@ -54,6 +54,16 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                 self._handle_get_task(task_id)
                 return
 
+        if self.agent and hasattr(self.agent, "serve_ui"):
+            try:
+                response = self.agent.serve_ui(path or "/")
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
+                return
+            if isinstance(response, dict):
+                self._send_response(response)
+                return
+
         self._send_json(404, {"error": "Not found"})
 
     def do_POST(self) -> None:
@@ -144,19 +154,54 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             loop.close()
 
     def _handle_callback(self, task_id: str, body: dict) -> None:
-        # Default: log and return OK.  Override for actual callback handling.
+        # Default: record callback metadata, write task-scoped logs, and return OK.
         agent_id = self.agent.definition.agent_id if self.agent else "unknown"
+        try:
+            from framework.devlog import AgentLogger
+
+            log = AgentLogger(task_id=task_id, agent_name=agent_id)
+            log.a2a(
+                "←",
+                "callback",
+                state=body.get("state", ""),
+                result_preview=str(body.get("result", ""))[:200],
+            )
+        except Exception:
+            pass
+
+        task_store = getattr(getattr(self.agent, "services", None), "task_store", None)
+        if task_store is not None:
+            try:
+                task_store.update_metadata(task_id, {"last_callback": body})
+            except Exception:
+                pass
+
         print(f"[{agent_id}] Callback received for task {task_id}")
         self._send_json(200, {"status": "ok"})
 
     def _handle_progress(self, task_id: str, body: dict) -> None:
         agent_id = self.agent.definition.agent_id if self.agent else "unknown"
         step = body.get("step", "")
+        try:
+            from framework.devlog import AgentLogger
+
+            AgentLogger(task_id=task_id, agent_name=agent_id).info(
+                "[A2A] ← progress",
+                step=step,
+            )
+        except Exception:
+            pass
         print(f"[{agent_id}] Progress for task {task_id}: {step}")
         self._send_json(200, {"status": "ok"})
 
     def _handle_ack(self, task_id: str) -> None:
         agent_id = self.agent.definition.agent_id if self.agent else "unknown"
+        try:
+            from framework.devlog import AgentLogger
+
+            AgentLogger(task_id=task_id, agent_name=agent_id).a2a("←", "ack")
+        except Exception:
+            pass
         print(f"[{agent_id}] ACK received for task {task_id}")
         self._send_json(200, {"status": "ok"})
 
@@ -200,6 +245,27 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_response(self, response: dict) -> None:
+        status = int(response.get("status", 200))
+        headers = dict(response.get("headers") or {})
+        body = response.get("body", "")
+
+        if isinstance(body, (dict, list)):
+            payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            headers.setdefault("Content-Type", "application/json; charset=utf-8")
+        elif isinstance(body, bytes):
+            payload = body
+        else:
+            payload = str(body).encode("utf-8")
+            headers.setdefault("Content-Type", "text/plain; charset=utf-8")
+
+        self.send_response(status)
+        for key, value in headers.items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def log_message(self, format: str, *args: Any) -> None:
         """Prefix HTTP logs with agent ID."""

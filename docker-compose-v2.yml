@@ -27,9 +27,15 @@ services:
       AGENT_RUNTIME: "claude-code"
       ARTIFACT_ROOT: /app/artifacts
       CONTAINER_RUNTIME: docker
+      DYNAMIC_AGENT_NETWORK: constellation-v2-network
+      DOCKER_SOCKET: /var/run/docker.sock
     volumes:
       - ./artifacts:/app/artifacts
+      - .:/workspace:ro
+      - /var/run/docker.sock:/var/run/docker.sock
       - ./config/.env:/app/config/.env:ro
+    group_add:
+      - "${DOCKER_SOCKET_GID:-0}"
     labels:
       constellation.agent_id: "compass"
       constellation.agent_name: "Compass Agent"
@@ -185,6 +191,8 @@ services:
   # Office Agent — per-task document processing (port 8060)
   # -----------------------------------------------------------------------
   office:
+    profiles:
+      - manual
     image: constellation-v2-office:latest
     build:
       context: .

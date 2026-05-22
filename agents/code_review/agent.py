@@ -78,6 +78,7 @@ def _build_code_review_definition() -> AgentDefinition:
         permissions=cfg.get("permissions", {"scm": "read"}),
         permission_profile=cfg.get("permission_profile", "read_only"),
         config=cfg.get("config", {}),
+        launch_spec=cfg.get("launch_spec"),
     )
 
 

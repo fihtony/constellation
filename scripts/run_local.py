@@ -26,6 +26,13 @@ from framework.plugin import PluginManager
 from framework.agent import AgentServices
 from framework.task_store import InMemoryTaskStore
 from framework.config import load_agent_config
+from framework.env_utils import load_dotenv
+from framework.launcher import get_launcher
+from framework.registry_client import RegistryClient
+from framework.runtime.adapter import get_runtime
+
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 # Agent registry
@@ -50,6 +57,9 @@ def create_services(
     Permission binding is handled by BaseAgent.start() via the agent's
     permission_profile in its AgentDefinition — no manual binding here.
     """
+    load_dotenv(os.path.join(PROJECT_ROOT, "config", ".env"))
+    load_dotenv(os.path.join(PROJECT_ROOT, "agents", agent_id.replace("-", "_"), ".env"))
+
     skills_registry = SkillsRegistry(skills_dir)
     skills_registry.load_all()
 
@@ -58,6 +68,11 @@ def create_services(
     print(f"[{agent_id}] Config loaded: runtime={config.get('runtime.backend')}, "
           f"model={config.get('runtime.model')}")
 
+    runtime = get_runtime(
+        backend=config.get("runtime.backend") or config.get("runtime_backend"),
+        model=config.get("runtime.model") or config.get("model"),
+    )
+
     return AgentServices(
         session_service=InMemorySessionService(),
         event_store=InMemoryEventStore(),
@@ -65,13 +80,14 @@ def create_services(
         skills_registry=skills_registry,
         plugin_manager=PluginManager(),
         checkpoint_service=InMemoryCheckpointer(),
-        runtime=None,  # No LLM in local dev by default
-        registry_client=None,
+        runtime=runtime,
+        registry_client=RegistryClient.from_config(),
         task_store=InMemoryTaskStore(),
+        launcher=get_launcher(),
     )
 
 
-async def main():
+def main():
     parser = argparse.ArgumentParser(description="Run a Constellation v2 agent locally")
     parser.add_argument("agent", choices=list(AGENTS.keys()), help="Agent to run")
     parser.add_argument("--port", type=int, default=8000, help="HTTP port (default: 8000)")
@@ -91,7 +107,7 @@ async def main():
     agent = agent_class(agent_def, services)
 
     print(f"[{args.agent}] Starting agent on port {args.port}...")
-    await agent.start()
+    asyncio.run(agent.start())
     print(f"[{args.agent}] Agent ready. Workflow compiled: {agent._compiled_workflow is not None}")
 
     # Start HTTP server
@@ -119,9 +135,9 @@ async def main():
         server.serve_forever()
     except KeyboardInterrupt:
         print(f"\n[{args.agent}] Shutting down...")
-        await agent.stop()
+        asyncio.run(agent.stop())
         server.shutdown()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

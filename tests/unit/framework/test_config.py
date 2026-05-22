@@ -53,6 +53,11 @@ def project_dir(tmp_path):
         mode: task
         execution_mode: per-task
         model: gpt-5-mini
+        launch_spec:
+          image: constellation-v2-web-dev:latest
+          port: 8050
+          extra_binds:
+            - /tmp/source:/app/source:ro
         default_skills:
           - react-nextjs
           - testing
@@ -157,6 +162,16 @@ class TestBuildAgentDefinitionFromConfig:
 
         definition = build_agent_definition_from_config("web-dev", project_dir)
         assert definition["skills"] == ["react-nextjs", "testing"]
+
+    def test_launch_spec_is_preserved(self, project_dir):
+        from framework.config import build_agent_definition_from_config
+
+        definition = build_agent_definition_from_config("web-dev", project_dir)
+        assert definition["launch_spec"] == {
+            "image": "constellation-v2-web-dev:latest",
+            "port": 8050,
+            "extra_binds": ["/tmp/source:/app/source:ro"],
+        }
 
 
 class TestDeepMerge:
