@@ -128,6 +128,7 @@ class OfficeAgent(BaseAgent):
             "_plugin_manager": self.plugin_manager,
             "_allowed_tools": metadata.get("allowed_tools"),
             "_permission_engine": getattr(self, "_permission_engine", None),
+            "required_skills": list(self.definition.skills or []),
             "user_request": user_text,
             "output_mode": metadata.get("output_mode", "workspace"),
             "source_paths": [],
@@ -167,7 +168,11 @@ class OfficeAgent(BaseAgent):
                         },
                     )
                 ]
-                task_store.complete_task(canonical_task_id, artifacts=artifacts)
+                if result.get("success", False):
+                    task_store.complete_task(canonical_task_id, artifacts=artifacts)
+                else:
+                    task_store.fail_task(canonical_task_id, result.get("summary", "Office task failed."))
+                    return
 
                 if callback_url:
                     _send_callback(callback_url, canonical_task_id, result)
@@ -182,14 +187,26 @@ class OfficeAgent(BaseAgent):
 
         return task_store.get_task_dict(canonical_task_id)
 
+    async def get_task(self, task_id: str) -> dict:
+        """Return real task state from TaskStore."""
+        return self.services.task_store.get_task_dict(task_id)
+
 
 def _send_callback(callback_url: str, task_id: str, result: dict) -> None:
     """Send completion callback to orchestrator."""
     import urllib.request
+    # Sanitize result - remove non-JSON-serializable objects
+    safe_result = {
+        "status": result.get("status", "completed"),
+        "summary": result.get("summary", ""),
+        "capability": result.get("capability", ""),
+        "output_mode": result.get("output_mode", "workspace"),
+        "warnings_count": result.get("warnings_count", 0),
+    }
     payload = json.dumps({
         "task_id": task_id,
         "state": "completed",
-        "result": result,
+        "result": safe_result,
     }).encode("utf-8")
     req = urllib.request.Request(
         callback_url,
@@ -215,7 +232,7 @@ def _register_office_dispatch(office_agent: "OfficeAgent") -> None:
 
     class InProcessDispatchOffice(BaseTool):
         name = "dispatch_office_task"
-        description = "Dispatch an office task (summarize documents, analyze CSV data) to the Office Agent."
+        description = "Dispatch a generic office task (documents, data analysis, or folder organization) to the Office Agent."
         parameters_schema = {
             "type": "object",
             "properties": {

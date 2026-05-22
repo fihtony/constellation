@@ -1,0 +1,19 @@
+id: office-generic-methodology
+name: "Office Generic Methodology"
+description: "Generic, schema-driven methodology for office document/data tasks without business-specific assumptions."
+version: "1.0.0"
+tags: ["office", "documents", "data-analysis", "methodology"]
+priority: 20
+allowed_tools:
+  - read_pdf
+  - read_docx
+  - read_txt
+  - read_csv
+  - read_xlsx
+  - read_xls
+  - read_pptx
+  - list_directory
+  - write_workspace
+  - write_file
+  - organize_folder
+  - organize_move_file

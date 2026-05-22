@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import time
+from io import StringIO
 from pathlib import Path
 
 from framework.tools.base import BaseTool, ToolResult
@@ -18,6 +19,10 @@ from framework.tools.base import BaseTool, ToolResult
 
 def _get_source_root() -> str:
     return os.environ.get("OFFICE_SOURCE_ROOT", "/")
+
+
+def _get_workspace_root() -> str:
+    return os.environ.get("OFFICE_WORKSPACE_ROOT", "")
 
 
 def _validate_path(path: str) -> tuple[str, str]:
@@ -62,6 +67,22 @@ def _validate_path(path: str) -> tuple[str, str]:
         return "", f"Path validation error: {exc}"
 
 
+def _validate_workspace_path(path: str) -> tuple[str, str]:
+    """Validate that a path is within OFFICE_WORKSPACE_ROOT."""
+    workspace_root = _get_workspace_root()
+    if not workspace_root:
+        return "", "OFFICE_WORKSPACE_ROOT is not set"
+    try:
+        real_path = os.path.realpath(os.path.abspath(path))
+        real_root = os.path.realpath(os.path.abspath(workspace_root))
+        prefix = real_root.rstrip(os.sep) + os.sep
+        if real_path != real_root and not real_path.startswith(prefix):
+            return "", f"Path {path!r} is outside OFFICE_WORKSPACE_ROOT"
+        return real_path, ""
+    except Exception as exc:
+        return "", f"Workspace path validation error: {exc}"
+
+
 # ---------------------------------------------------------------------------
 # File size limit helper
 # ---------------------------------------------------------------------------
@@ -77,6 +98,107 @@ def _check_file_size(path: str) -> tuple[bool, str]:
         return True, ""
     except OSError:
         return True, ""  # Let the file read handle the error
+
+
+def _decode_text_bytes(raw: bytes) -> tuple[str, str]:
+    """Decode bytes robustly without requiring optional third-party packages."""
+    try:
+        import chardet  # type: ignore
+    except Exception:
+        chardet = None
+
+    if chardet is not None:
+        try:
+            detected = chardet.detect(raw)
+            encoding = (detected or {}).get("encoding") or ""
+            if encoding:
+                return raw.decode(encoding, errors="replace"), encoding
+        except Exception:
+            pass
+
+    for encoding in ("utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding), encoding
+        except Exception:
+            continue
+
+    return raw.decode("utf-8", errors="replace"), "utf-8-replace"
+
+
+def _is_number(value: object) -> bool:
+    try:
+        if value is None:
+            return False
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return False
+        float(text)
+        return True
+    except Exception:
+        return False
+
+
+def _summarize_tabular_rows(headers: list[str], rows: list[list[object]], sample_limit: int = 25) -> dict:
+    """Build a compact, analysis-oriented summary for tabular data."""
+    normalized_headers = [
+        str(header).strip() if str(header).strip() else f"column_{idx + 1}"
+        for idx, header in enumerate(headers)
+    ]
+    row_dicts: list[dict[str, str]] = []
+    for row in rows:
+        row_dicts.append({
+            normalized_headers[idx]: (
+                "" if idx >= len(row) or row[idx] is None else str(row[idx])
+            )
+            for idx in range(len(normalized_headers))
+        })
+
+    schema: list[dict[str, object]] = []
+    numeric_stats: dict[str, dict[str, float | int]] = {}
+    categorical_previews: dict[str, list[dict[str, object]]] = {}
+
+    for idx, header in enumerate(normalized_headers):
+        values = [
+            row[idx] if idx < len(row) else ""
+            for row in rows
+        ]
+        non_empty = [value for value in values if str(value).strip()]
+        numeric_values = [float(str(value).strip().replace(",", "")) for value in non_empty if _is_number(value)]
+        missing_count = len(values) - len(non_empty)
+        inferred_type = "numeric" if non_empty and len(numeric_values) / len(non_empty) >= 0.8 else "text"
+        schema.append({
+            "name": header,
+            "inferred_type": inferred_type,
+            "missing_count": missing_count,
+            "non_empty_count": len(non_empty),
+        })
+
+        if inferred_type == "numeric" and numeric_values:
+            numeric_stats[header] = {
+                "count": len(numeric_values),
+                "min": min(numeric_values),
+                "max": max(numeric_values),
+                "avg": round(sum(numeric_values) / len(numeric_values), 2),
+            }
+        elif non_empty:
+            counts: dict[str, int] = {}
+            for value in non_empty:
+                key = str(value).strip()
+                counts[key] = counts.get(key, 0) + 1
+            top_values = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:5]
+            categorical_previews[header] = [
+                {"value": value, "count": count}
+                for value, count in top_values
+            ]
+
+    return {
+        "headers": normalized_headers,
+        "total_rows": len(rows),
+        "schema": schema,
+        "numeric_stats": numeric_stats,
+        "categorical_previews": categorical_previews,
+        "sample_rows": row_dicts[:sample_limit],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -474,12 +596,9 @@ class ReadTxtTool(BaseTool):
         if not ok:
             return ToolResult(output="", error=f"read_txt: {size_err}")
         try:
-            import chardet
             with open(normalized, "rb") as fh:
                 raw = fh.read()
-            detected = chardet.detect(raw)
-            encoding = detected.get("encoding", "utf-8") or "utf-8"
-            content = raw.decode(encoding, errors="replace")
+            content, encoding = _decode_text_bytes(raw)
             return ToolResult(output=json.dumps({
                 "content": content,
                 "path": normalized,
@@ -496,7 +615,7 @@ class ReadTxtTool(BaseTool):
 
 class ReadCsvTool(BaseTool):
     name = "read_csv"
-    description = "Read a CSV file and return headers and rows as structured data. Use for data analysis tasks."
+    description = "Read a CSV file and return a compact schema-first summary with sample rows and statistics."
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -517,38 +636,23 @@ class ReadCsvTool(BaseTool):
         if not ok:
             return ToolResult(output="", error=f"read_csv: {size_err}")
         try:
-            import chardet
             with open(normalized, "rb") as fh:
                 raw = fh.read()
-            detected = chardet.detect(raw)
-            encoding = detected.get("encoding", "utf-8") or "utf-8"
-            text = raw.decode(encoding, errors="replace")
-            reader = csv.reader(text.splitlines())
+            text, encoding = _decode_text_bytes(raw)
+            sample = text[:8192]
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+            except Exception:
+                dialect = csv.excel
+            reader = csv.reader(StringIO(text), dialect=dialect)
             rows = list(reader)
             if not rows:
                 return ToolResult(output="", error="read_csv: CSV file is empty")
             headers = rows[0]
             data_rows = rows[1:]
-            stats = {}
-            for col_idx, header in enumerate(headers):
-                try:
-                    vals = [float(row[col_idx]) for row in data_rows if col_idx < len(row) and row[col_idx].strip()]
-                    if vals:
-                        stats[header] = {
-                            "count": len(vals),
-                            "min": min(vals),
-                            "max": max(vals),
-                            "avg": round(sum(vals) / len(vals), 2),
-                        }
-                except (ValueError, IndexError):
-                    pass
-            return ToolResult(output=json.dumps({
-                "headers": headers,
-                "rows": data_rows[:1000],
-                "total_rows": len(data_rows),
-                "stats": stats,
-                "encoding": encoding,
-            }))
+            summary = _summarize_tabular_rows(headers, data_rows)
+            summary["encoding"] = encoding
+            return ToolResult(output=json.dumps(summary))
         except Exception as exc:
             return ToolResult(output="", error=f"read_csv: failed to read: {exc}")
 
@@ -559,7 +663,7 @@ class ReadCsvTool(BaseTool):
 
 class ReadXlsxTool(BaseTool):
     name = "read_xlsx"
-    description = "Read the full content of an Excel XLSX file. Returns structured data with sheet names, headers, and rows."
+    description = "Read an Excel XLSX file and return a compact summary for each sheet."
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -585,13 +689,11 @@ class ReadXlsxTool(BaseTool):
             sheets = {}
             for sheet_name in wb.sheetnames:
                 ws = wb[sheet_name]
-                rows = []
-                for row in ws.iter_rows(values_only=True):
-                    rows.append(list(row))
-                sheets[sheet_name] = {
-                    "rows": rows,
-                    "row_count": len(rows),
-                }
+                rows = [list(row) for row in ws.iter_rows(values_only=True)]
+                if not rows:
+                    sheets[sheet_name] = {"headers": [], "total_rows": 0, "sample_rows": []}
+                    continue
+                sheets[sheet_name] = _summarize_tabular_rows(rows[0], rows[1:])
             return ToolResult(output=json.dumps({
                 "path": normalized,
                 "sheets": sheets,
@@ -607,7 +709,7 @@ class ReadXlsxTool(BaseTool):
 
 class ReadXlsTool(BaseTool):
     name = "read_xls"
-    description = "Read the content of a legacy Excel XLS file. Best-effort support — convert to .xlsx for better results."
+    description = "Read a legacy Excel XLS file and return a compact summary for each sheet."
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -633,13 +735,11 @@ class ReadXlsTool(BaseTool):
             sheets = {}
             for i in range(wb.nsheets):
                 ws = wb.sheet_by_index(i)
-                rows = []
-                for row_idx in range(ws.nrows):
-                    rows.append(ws.row_values(row_idx))
-                sheets[ws.name] = {
-                    "rows": rows,
-                    "row_count": ws.nrows,
-                }
+                rows = [ws.row_values(row_idx) for row_idx in range(ws.nrows)]
+                if not rows:
+                    sheets[ws.name] = {"headers": [], "total_rows": 0, "sample_rows": []}
+                    continue
+                sheets[ws.name] = _summarize_tabular_rows(rows[0], rows[1:])
             return ToolResult(output=json.dumps({
                 "path": normalized,
                 "sheets": sheets,
@@ -867,19 +967,30 @@ Use organize_folder tool first to survey the folder, then organize_execute_plan 
     ALLOWED_ACTIONS = {"mkdir", "copy_file", "write_text"}
 
     def execute_sync(self, action: str = "", src: str = "", dst: str = "", content: str = "") -> ToolResult:
-        # Check if inplace writes are allowed
-        allow_inplace = os.environ.get("OFFICE_ALLOW_INPLACE_WRITES", "false").lower()
-        if allow_inplace not in ("true", "1", "yes"):
-            return ToolResult(output="", error="organize_move_file: inplace writes not enabled. Set OFFICE_ALLOW_INPLACE_WRITES=true")
+        allow_inplace = os.environ.get("OFFICE_ALLOW_INPLACE_WRITES", "false").lower() in ("true", "1", "yes")
+        workspace_root = _get_workspace_root()
+        output_mode = os.environ.get("OFFICE_OUTPUT_MODE", "workspace").lower()
 
         # Validate action is in whitelist
         if action not in self.ALLOWED_ACTIONS:
             return ToolResult(output="", error=f"organize_move_file: action {action!r} not allowed. Allowed: {self.ALLOWED_ACTIONS}")
 
         # Validate destination path
-        dst_normalized, err = _validate_path(dst)
-        if err:
-            return ToolResult(output="", error=f"organize_move_file: destination {err}")
+        if output_mode == "inplace":
+            if not allow_inplace:
+                return ToolResult(output="", error="organize_move_file: inplace writes not enabled. Set OFFICE_ALLOW_INPLACE_WRITES=true")
+            dst_normalized, err = _validate_path(dst)
+            if err:
+                return ToolResult(output="", error=f"organize_move_file: destination {err}")
+        else:
+            if not workspace_root:
+                return ToolResult(output="", error="organize_move_file: OFFICE_WORKSPACE_ROOT is not set for workspace mode")
+            raw_dst = dst
+            if not os.path.isabs(raw_dst):
+                raw_dst = os.path.join(workspace_root, raw_dst)
+            dst_normalized, err = _validate_workspace_path(raw_dst)
+            if err:
+                return ToolResult(output="", error=f"organize_move_file: destination {err}")
 
         # Reject wrapper prefixes (grouped/, by-student/, output/, organized/)
         if _is_wrapper_prefixed(dst):
@@ -894,7 +1005,6 @@ Use organize_folder tool first to survey the folder, then organize_execute_plan 
             src_normalized = ""
 
         # Write operations-plan.json before executing
-        workspace_root = os.environ.get("OFFICE_WORKSPACE_ROOT", "")
         if workspace_root:
             plan_path = os.path.join(workspace_root, "operations-plan.json")
             with open(plan_path, "a", encoding="utf-8") as f:

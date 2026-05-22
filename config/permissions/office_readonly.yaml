@@ -1,0 +1,27 @@
+# Permissions: Office task execution with controlled file access.
+# Note:
+# - Source read access is constrained by OFFICE_SOURCE_ROOT / OFFICE_ALLOWED_BASE_PATHS in tools.
+# - Write destination is controlled by output mode and tool-level checks.
+
+allowed_tools:
+  - read_pdf
+  - read_docx
+  - read_txt
+  - read_csv
+  - read_xlsx
+  - read_xls
+  - read_pptx
+  - list_directory
+  - write_workspace
+  - write_file
+  - organize_folder
+  - organize_move_file
+
+denied_tools:
+  - run_command
+  - edit_file
+  - scm_push
+  - scm_create_pr
+
+scm: none
+filesystem: workspace-only

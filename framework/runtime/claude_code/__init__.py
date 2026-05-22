@@ -113,10 +113,33 @@ def _init_isolated_gh_config() -> None:
 
 _MCP_BRIDGE_SCRIPT = textwrap.dedent("""\
     #!/usr/bin/env python3
-    \"\"\"Constellation MCP stdio bridge — proxies tool calls to a local HTTP server.\"\"\"
-    import json, os, sys, urllib.request
+    \"\"\"Constellation MCP stdio bridge.
 
-    TOOLS_URL = os.environ["CONSTELLATION_TOOLS_URL"]
+    Mode A (default): proxy tool calls to local parent HTTP bridge via CONSTELLATION_TOOLS_URL.
+    Mode B (no-socket fallback): call ToolRegistry directly in this process.
+    \"\"\"
+    import json, os, sys, urllib.request, importlib
+
+    TOOLS_URL = os.environ.get("CONSTELLATION_TOOLS_URL", "")
+    TOOL_NAMES = json.loads(os.environ.get("CONSTELLATION_TOOL_NAMES_JSON", "[]"))
+    BOOTSTRAP = json.loads(os.environ.get("CONSTELLATION_TOOL_BOOTSTRAP_JSON", "[]"))
+
+    _REGISTRY = None
+
+    def _init_registry_mode():
+        global _REGISTRY
+        from framework.tools.registry import get_registry
+        _REGISTRY = get_registry()
+        for entry in BOOTSTRAP:
+            if ":" not in entry:
+                continue
+            mod_name, fn_name = entry.split(":", 1)
+            try:
+                mod = importlib.import_module(mod_name)
+                fn = getattr(mod, fn_name)
+                fn()
+            except Exception:
+                pass
 
 
     def _get(path):
@@ -146,16 +169,31 @@ _MCP_BRIDGE_SCRIPT = textwrap.dedent("""\
         if method.startswith("notifications/"):
             return None  # notifications need no response
         if method == "tools/list":
-            return {"jsonrpc": "2.0", "id": id_,
-                    "result": {"tools": _get("/tools")}}
+            if TOOLS_URL:
+                tools = _get("/tools")
+            else:
+                schemas = _REGISTRY.list_schemas(TOOL_NAMES or None)
+                tools = [{
+                    "name": s["function"]["name"],
+                    "description": s["function"].get("description", ""),
+                    "inputSchema": s["function"].get("parameters", {"type": "object", "properties": {}}),
+                } for s in schemas]
+            return {"jsonrpc": "2.0", "id": id_, "result": {"tools": tools}}
         if method == "tools/call":
             p = req.get("params", {})
-            result = _post("/tools/call",
-                           {"name": p.get("name"), "arguments": p.get("arguments", {})})
+            if TOOLS_URL:
+                result = _post("/tools/call",
+                               {"name": p.get("name"), "arguments": p.get("arguments", {})})
+            else:
+                out = _REGISTRY.execute_sync(p.get("name", ""), p.get("arguments", {}))
+                result = {"content": [{"type": "text", "text": out}]}
             return {"jsonrpc": "2.0", "id": id_, "result": result}
         return {"jsonrpc": "2.0", "id": id_,
                 "error": {"code": -32601, "message": f"Method not found: {method}"}}
 
+
+    if not TOOLS_URL:
+        _init_registry_mode()
 
     for line in sys.stdin:
         line = line.strip()
@@ -177,6 +215,13 @@ def _find_claude_cli() -> str | None:
         if which(cmd):
             return cmd
     return None
+
+
+def _claude_mcp_tool_name(server_name: str, tool_name: str) -> str:
+    """Translate an MCP server/tool pair to Claude Code's tool id format."""
+    safe_server = str(server_name).strip().replace("-", "_")
+    safe_tool = str(tool_name).strip()
+    return f"mcp__{safe_server}__{safe_tool}"
 
 
 # Map Anthropic API model IDs → Claude Code CLI model aliases.
@@ -207,6 +252,31 @@ def _cli_model(model: str | None) -> str:
 
 def _effective_model(model: str | None) -> str:
     return _cli_model(model)
+
+
+# ---------------------------------------------------------------------------
+# Tool bootstrap inference for no-socket bridge mode
+# ---------------------------------------------------------------------------
+
+def _infer_tool_bootstrap_entries(tool_names: list[str] | None) -> list[str]:
+    names = set(tool_names or [])
+    entries: list[str] = []
+    if names & {
+        "read_pdf", "read_docx", "read_txt", "read_csv", "read_xlsx", "read_xls",
+        "read_pptx", "list_directory", "write_workspace", "write_file",
+        "organize_folder", "organize_move_file",
+    }:
+        entries.append("agents.office.office_tools:register_office_tools")
+    if names & {"dispatch_development_task", "dispatch_office_task"}:
+        entries.append("agents.compass.tools:register_compass_tools")
+    if names & {
+        "read_file", "write_file", "edit_file", "search_code", "run_command",
+        "scm_clone", "scm_branch", "scm_commit", "scm_push", "scm_create_pr",
+    }:
+        entries.append("agents.web_dev.tools:register_web_dev_tools")
+        entries.append("agents.web_dev.coding_tools:register_web_dev_coding_tools")
+    # Stable dedupe preserving order
+    return list(dict.fromkeys(entries))
 
 
 # ---------------------------------------------------------------------------
@@ -392,12 +462,25 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
         http_srv: _ToolsHTTPServer | None = None
         bridge_path: str | None = None
         mcp_config_path: str | None = None
+        no_socket_bridge_mode = False
+        bridge_env: dict[str, str] = {}
 
         if tools:
             from framework.tools.registry import get_registry
             registry = get_registry()
-            http_srv = _ToolsHTTPServer(registry, tools)
-            port = http_srv.start()
+            try:
+                http_srv = _ToolsHTTPServer(registry, tools)
+                port = http_srv.start()
+                bridge_env["CONSTELLATION_TOOLS_URL"] = f"http://127.0.0.1:{port}"
+            except Exception:
+                # Some sandboxed runtimes disallow local socket bind.
+                # Fall back to direct registry mode inside the bridge process.
+                no_socket_bridge_mode = True
+                http_srv = None
+                bridge_env["CONSTELLATION_TOOL_NAMES_JSON"] = json.dumps(tools)
+                bridge_env["CONSTELLATION_TOOL_BOOTSTRAP_JSON"] = json.dumps(
+                    _infer_tool_bootstrap_entries(tools)
+                )
 
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".py", delete=False, prefix="cc_mcp_bridge_"
@@ -408,7 +491,7 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
             merged_mcp["constellation-tools"] = {
                 "command": "python3",
                 "args": [bridge_path],
-                "env": {"CONSTELLATION_TOOLS_URL": f"http://127.0.0.1:{port}"},
+                "env": bridge_env,
             }
 
         cmd = [cli, "--print", "--dangerously-skip-permissions", "--model", model_id]
@@ -419,16 +502,33 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
             ) as tmp:
                 json.dump({"mcpServers": merged_mcp}, tmp)
                 mcp_config_path = tmp.name
-            cmd += ["--mcp-config", mcp_config_path]
+            cmd += ["--mcp-config", mcp_config_path, "--strict-mcp-config"]
+
+        effective_allowed_tools = list(allowed_tools or [])
+        if not effective_allowed_tools and tools:
+            effective_allowed_tools = [
+                _claude_mcp_tool_name("constellation-tools", tool_name)
+                for tool_name in tools
+            ]
+
+        if effective_allowed_tools:
+            cmd += ["--allowedTools", ",".join(effective_allowed_tools)]
+            if all(str(name).startswith("mcp__") for name in effective_allowed_tools):
+                # Disable Claude's built-in filesystem/shell tools when this run
+                # should operate exclusively through Constellation MCP tools.
+                cmd += ["--tools", ""]
 
         # --- Run claude -------------------------------------------------
         # Build credential-stripped env; inject MCP bridge URL when bridge is active
         _extra_env: dict = {}
-        if tools and http_srv:
-            # CONSTELLATION_TOOLS_URL is passed to the MCP bridge script via
-            # its own env entry in mcp_servers config, not here.  But keep it
-            # available as a fallback in case the bridge script reads os.environ.
-            pass
+        if no_socket_bridge_mode:
+            # Ensure bridge subprocess can import repository modules when no-socket mode
+            # needs to bootstrap and register tools directly.
+            cwd_for_path = cwd or os.getcwd()
+            existing = os.environ.get("PYTHONPATH", "")
+            _extra_env["PYTHONPATH"] = (
+                f"{cwd_for_path}{os.pathsep}{existing}" if existing else cwd_for_path
+            )
         try:
             proc = subprocess.run(
                 cmd,

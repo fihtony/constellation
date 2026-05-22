@@ -69,7 +69,14 @@ def _classify_request(user_text: str, runtime) -> str:
     if has_jira_key and has_dev_action:
         return "development"
 
-    # Obvious office: document operation verbs
+    # Obvious office: document/data operation verbs + file/folder hints
+    office_verb = any(kw in lower for kw in ["summarize", "analyze", "organize"])
+    office_target = any(kw in lower for kw in [
+        "pdf", "docx", "txt", "csv", "xlsx", "xls", "spreadsheet",
+        "document", "documents", "folder", "files", "essay", "essays",
+    ])
+    if office_verb and office_target:
+        return "office"
     if any(kw in lower for kw in ["summarize the pdf", "analyze the spreadsheet", "organize files"]):
         return "office"
 
@@ -192,38 +199,49 @@ class CompassAgent(BaseAgent):
             # Step 1: Query registry for office capability
             registry_url = ""
             office_url = ""
+            discovered_from_registry = False
             try:
                 from framework.registry_client import RegistryClient
                 rc = RegistryClient.from_config()
                 registry_url = rc.url
+                log.a2a("→", "registry", capability="office.document.summarize", registry_url=registry_url)
                 office_url = rc.discover("office.document.summarize")
                 if not office_url:
                     office_url = rc.discover("office.agent")
-                if not office_url:
-                    office_url = os.environ.get("OFFICE_AGENT_URL", "http://office:8060")
+                discovered_from_registry = bool(office_url)
                 log.info("registry lookup", registry_url=registry_url, discovered_url=office_url)
+                log.a2a("←", "registry", capability="office.document.summarize",
+                        status="found" if discovered_from_registry else "not_found",
+                        discovered_url=office_url)
             except Exception as exc:
-                log.warn("registry lookup failed, using default", error=str(exc))
-                office_url = os.environ.get("OFFICE_AGENT_URL", "http://office:8060")
-                log.info("using fallback office URL", url=office_url)
+                log.warn("registry lookup failed", error=str(exc))
+                log.a2a("←", "registry", capability="office.document.summarize",
+                        status="error", error=str(exc)[:100])
 
             # Step 2: Log A2A message being sent
-            log.a2a("→", "office", capability="office.document.summarize",
-                    office_url=office_url, task_id=task.id,
-                    request_preview=user_text[:100])
-            try:
-                dispatch_result_str = registry.execute_sync(
-                    "dispatch_office_task",
-                    {"task_description": user_text},
-                )
-                dispatch_data = json.loads(dispatch_result_str) if dispatch_result_str else {}
-                log.a2a("←", "office", status=dispatch_data.get("status", "unknown"),
-                        result_preview=str(dispatch_data)[:200])
-            except Exception as exc:
-                dispatch_data = {"status": "error", "message": str(exc)}
-                log.error("dispatch_office_task failed", error=str(exc))
-                log.a2a("←", "office", status="error", error=str(exc)[:100])
-                print(f"[{_aid}] dispatch_office_task error: {exc}")
+            if not discovered_from_registry:
+                dispatch_data = {
+                    "status": "no-capability",
+                    "message": "No Office-capable agent is currently registered in Constellation.",
+                }
+                log.warn("office capability not found in registry", registry_url=registry_url)
+            else:
+                log.a2a("→", "office", capability="office.document.summarize",
+                        office_url=office_url, task_id=task.id,
+                        request_preview=user_text[:100])
+                try:
+                    dispatch_result_str = registry.execute_sync(
+                        "dispatch_office_task",
+                        {"task_description": user_text},
+                    )
+                    dispatch_data = json.loads(dispatch_result_str) if dispatch_result_str else {}
+                    log.a2a("←", "office", status=dispatch_data.get("status", "unknown"),
+                            result_preview=str(dispatch_data)[:200])
+                except Exception as exc:
+                    dispatch_data = {"status": "error", "message": str(exc)}
+                    log.error("dispatch_office_task failed", error=str(exc))
+                    log.a2a("←", "office", status="error", error=str(exc)[:100])
+                    print(f"[{_aid}] dispatch_office_task error: {exc}")
             log.info("office dispatch complete", status=dispatch_data.get("status", "unknown"))
             response_text = f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
 

@@ -65,3 +65,32 @@ def test_read_csv_tool_has_encoding(tmp_path):
             os.environ["OFFICE_SOURCE_ROOT"] = old_root
         else:
             os.environ.pop("OFFICE_SOURCE_ROOT", None)
+
+
+def test_read_csv_tool_returns_compact_schema_summary(tmp_path):
+    """Test ReadCsvTool returns schema and a bounded sample instead of full rows."""
+    from agents.office.office_tools import ReadCsvTool
+
+    csv_file = tmp_path / "wide.csv"
+    lines = ["name,score,team"]
+    for idx in range(40):
+        lines.append(f"user-{idx},{idx},team-{idx % 3}")
+    csv_file.write_text("\n".join(lines), encoding="utf-8")
+
+    tool = ReadCsvTool()
+    old_root = os.environ.get("OFFICE_SOURCE_ROOT")
+    try:
+        os.environ["OFFICE_SOURCE_ROOT"] = str(tmp_path)
+        result = tool.execute_sync(path=str(csv_file))
+        assert result.success, f"read_csv failed: {result.error}"
+        data = json.loads(result.output)
+        assert data["total_rows"] == 40
+        assert "schema" in data
+        assert "numeric_stats" in data
+        assert len(data["sample_rows"]) <= 25
+        assert "rows" not in data
+    finally:
+        if old_root is not None:
+            os.environ["OFFICE_SOURCE_ROOT"] = old_root
+        else:
+            os.environ.pop("OFFICE_SOURCE_ROOT", None)

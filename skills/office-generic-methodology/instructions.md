@@ -1,0 +1,95 @@
+# Office Generic Methodology
+
+Use this methodology for any office task. Do not assume fixed domains, fixed schemas, or fixed field names.
+
+## Core Principles
+
+1. Infer structure from observed data; never hardcode business-specific assumptions.
+2. Choose tools by source type, not by task keywords.
+3. Always state assumptions, confidence limits, and data quality caveats.
+4. Keep output deterministic, auditable, and within authorized folders only.
+
+## Phase 1: Task Framing
+
+1. Identify requested outcome:
+- Summary
+- Analysis
+- Organization
+- Mixed output
+2. Determine source set:
+- Single file
+- Multi-file set
+- Folder tree
+3. Determine output mode:
+- `workspace`: write only with `write_workspace`
+- `inplace`: write only with `write_file` under source root
+
+## Phase 2: Source Profiling
+
+For each source, inspect before interpreting:
+
+- PDF: `read_pdf`
+- DOCX: `read_docx`
+- TXT/MD: `read_txt`
+- CSV: `read_csv`
+- XLSX: `read_xlsx`
+- XLS: `read_xls`
+- PPTX: `read_pptx`
+- Folder: `list_directory` and/or `organize_folder`
+
+Collect:
+- Parseability status
+- Detected fields/sections
+- Approximate size/volume
+- Missing/empty data signals
+
+## Phase 3: Generic Reasoning Strategy
+
+### A) For Analysis Tasks
+
+1. Build inferred schema:
+- Field names
+- Candidate types (numeric, categorical, text, date-like, unknown)
+- Missingness and parse caveats
+2. Compute baseline statistics for numeric fields:
+- Count, min, max, average
+3. Build safe aggregations:
+- Group categorical fields against numeric measures
+- Prefer top-N summaries over exhaustive dumps
+4. Report insights from observed distributions and relationships only.
+
+### B) For Summary Tasks
+
+1. Extract key sections/paragraphs/slides/pages.
+2. Produce:
+- Document info
+- 3-5 key points
+- Executive summary
+3. If extraction is partial, say so clearly.
+
+### C) For Organization Tasks
+
+1. Survey current tree and classify items by generic signals:
+- Extension/type
+- Directory/date patterns
+- Existing category folders
+2. Produce a plan first; do not delete source files.
+3. If execution is requested, only perform allowed operations.
+
+## Phase 4: Output Contract
+
+Every output should include:
+
+1. What was read (source inventory)
+2. What was inferred (schema/structure)
+3. What was computed (statistics/groupings/summary logic)
+4. Caveats and confidence boundaries
+
+## Phase 5: Validation Checklist
+
+Before finishing:
+
+1. Confirm no writes happened outside authorized folder policy.
+2. Confirm output filenames and locations match requested mode.
+3. Confirm no credentials or secrets are included in output/log text.
+4. Confirm no domain-specific field assumptions were hardcoded.
