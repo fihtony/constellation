@@ -302,6 +302,17 @@ def _verify_delivery_paths(expected_paths: list[str], output_mode: str, artifact
     return (not errors), errors
 
 
+def _effective_agentic_budget(capability: str, validated_paths: list[str]) -> tuple[int, int]:
+    """Scale agentic budget with workload size instead of using a single flat timeout."""
+    max_turns, timeout_seconds = _effective_agentic_budget(capability, validated_paths)
+    if capability == "summarize":
+        doc_count = len([path for path in validated_paths if os.path.isfile(path)])
+        if doc_count > 1:
+            timeout_seconds = max(timeout_seconds, min(900, 120 + doc_count * 45))
+            max_turns = max(max_turns, min(40, 8 + doc_count * 2))
+    return max_turns, timeout_seconds
+
+
 # ---------------------------------------------------------------------------
 # Node: execute_office_work
 # ---------------------------------------------------------------------------

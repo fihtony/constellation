@@ -31,6 +31,7 @@ import json
 import os
 import shutil
 import time
+import unicodedata
 from http.server import HTTPServer
 from pathlib import Path
 from threading import Thread
@@ -305,6 +306,10 @@ def _safe_mtime(path: str) -> float:
         return os.path.getmtime(path)
     except OSError:
         return -1.0
+
+
+def _normalize_text(value: str) -> str:
+    return unicodedata.normalize("NFC", value)
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +613,7 @@ async def test_office_task(
             )
         combined_text = _read_text(expected_output_path)
         for doc_path in summarize_sources:
-            assert Path(doc_path).name in combined_text, (
+            assert _normalize_text(Path(doc_path).name) in _normalize_text(combined_text), (
                 f"[{test_id}] combined summary missing document section for {Path(doc_path).name}"
             )
 

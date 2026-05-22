@@ -201,6 +201,13 @@ def _summarize_tabular_rows(headers: list[str], rows: list[list[object]], sample
     }
 
 
+def _truncate_content(text: str, max_chars: int = 16000) -> tuple[str, bool]:
+    """Bound tool output size so multi-document tasks stay within context/time budgets."""
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
 # ---------------------------------------------------------------------------
 # Audit file helpers
 # ---------------------------------------------------------------------------
@@ -441,7 +448,7 @@ def _check_directory_limits(path: str) -> dict | None:
 
 class ReadPdfTool(BaseTool):
     name = "read_pdf"
-    description = "Read the full text content of a PDF file. Returns the text content."
+    description = "Read a PDF file and return bounded text content with page metadata for summarization."
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -470,12 +477,14 @@ class ReadPdfTool(BaseTool):
                     if text.strip():
                         pages.append(f"[Page {page.page_number}]\n{text}")
                 content = "\n\n".join(pages)
+            content, truncated = _truncate_content(content)
             size_kb = os.path.getsize(normalized) // 1024
             return ToolResult(output=json.dumps({
                 "content": content,
                 "path": normalized,
                 "pages": len(pages),
                 "size_kb": size_kb,
+                "truncated": truncated,
             }))
         except Exception as exc:
             return ToolResult(output="", error=f"read_pdf: failed to read: {exc}")
@@ -487,7 +496,7 @@ class ReadPdfTool(BaseTool):
 
 class ReadDocxTool(BaseTool):
     name = "read_docx"
-    description = "Read the full text content of a DOCX file. Returns the text content including tables."
+    description = "Read a DOCX file and return bounded text content including paragraph metadata."
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -514,10 +523,12 @@ class ReadDocxTool(BaseTool):
             doc = docx.Document(normalized)
             paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
             content = "\n\n".join(paragraphs)
+            content, truncated = _truncate_content(content)
             return ToolResult(output=json.dumps({
                 "content": content,
                 "path": normalized,
                 "paragraphs": len(paragraphs),
+                "truncated": truncated,
             }))
         except Exception as exc:
             return ToolResult(output="", error=f"read_docx: failed to read: {exc}")
@@ -529,7 +540,7 @@ class ReadDocxTool(BaseTool):
 
 class ReadPptxTool(BaseTool):
     name = "read_pptx"
-    description = "Read the full text content of a PowerPoint PPTX file. Extracts text from all slides."
+    description = "Read a PPTX file and return bounded slide text for summarization."
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -561,11 +572,13 @@ class ReadPptxTool(BaseTool):
                 if slide_text:
                     slides.append(f"[Slide {i+1}]\n" + "\n".join(slide_text))
             content = "\n\n".join(slides)
+            content, truncated = _truncate_content(content)
             return ToolResult(output=json.dumps({
                 "content": content,
                 "path": normalized,
                 "slides": len(slides),
                 "total_slides": len(prs.slides),
+                "truncated": truncated,
             }))
         except Exception as exc:
             return ToolResult(output="", error=f"read_pptx: failed to read: {exc}")
@@ -577,7 +590,7 @@ class ReadPptxTool(BaseTool):
 
 class ReadTxtTool(BaseTool):
     name = "read_txt"
-    description = "Read the full text content of a plain text file."
+    description = "Read a plain text file and return bounded text content."
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -599,11 +612,13 @@ class ReadTxtTool(BaseTool):
             with open(normalized, "rb") as fh:
                 raw = fh.read()
             content, encoding = _decode_text_bytes(raw)
+            content, truncated = _truncate_content(content)
             return ToolResult(output=json.dumps({
                 "content": content,
                 "path": normalized,
                 "chars": len(content),
                 "encoding": encoding,
+                "truncated": truncated,
             }))
         except Exception as exc:
             return ToolResult(output="", error=f"read_txt: failed to read: {exc}")
