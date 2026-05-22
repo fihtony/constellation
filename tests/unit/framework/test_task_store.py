@@ -36,6 +36,14 @@ class TestTaskStoreLifecycle:
         assert fetched.id == task.id
         assert fetched.status.state == TaskState.WORKING
 
+    def test_create_with_explicit_task_id(self, store):
+        task = store.create_task("agent-explicit", task_id="task-parent-123")
+
+        assert task.id == "task-parent-123"
+        fetched = store.get_task("task-parent-123")
+        assert fetched is not None
+        assert fetched.id == "task-parent-123"
+
     def test_get_nonexistent(self, store):
         assert store.get_task("does-not-exist") is None
 

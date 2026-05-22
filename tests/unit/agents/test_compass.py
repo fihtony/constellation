@@ -482,7 +482,66 @@ class TestCompassTools:
         payload = json.loads(result.output)
         assert payload["status"] == "completed"
         assert launched["overrides"]["env"]["OFFICE_ALLOW_INPLACE_WRITES"] == "true"
-        assert launched["overrides"]["extra_binds"] == [f"/host{source_dir}:/app/userdata/input-0"]
+        assert launched["overrides"]["extra_binds"] == [f"/host{tmp_path}:/app/userdata/input-0"]
+
+    def test_dispatch_office_task_translates_host_paths_visible_only_via_workspace_mount(self, monkeypatch, tmp_path):
+        from agents.compass.tools import DispatchOfficeTask
+
+        workspace_root = tmp_path / "workspace"
+        source_dir = workspace_root / "tests" / "data" / "2026"
+        source_dir.mkdir(parents=True)
+        (source_dir / "1.txt").write_text("hello", encoding="utf-8")
+        requested_host_path = "/Users/test/project/tests/data/2026"
+
+        launched = {}
+
+        class StubLauncher:
+            def resolve_container_path(self, path):
+                if path == requested_host_path:
+                    return str(source_dir)
+                return path
+
+            def resolve_host_path(self, path):
+                if path == str(source_dir):
+                    return "/host-mounted/tests/data/2026"
+                return path
+
+            def launch_instance(self, agent_definition, task_id, *, launch_overrides=None):
+                launched["overrides"] = launch_overrides
+                return {
+                    "container_name": "office-task-3",
+                    "service_url": "http://office-task-3:8060",
+                    "port": 8060,
+                }
+
+            def destroy_instance(self, agent_id, container_name):
+                return None
+
+        monkeypatch.setattr("agents.compass.tools._should_use_per_task_office_launch", lambda: True)
+        monkeypatch.setattr("agents.compass.tools.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("agents.compass.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            "framework.a2a.client.dispatch_sync",
+            lambda **kwargs: {
+                "task": {
+                    "id": "office-3",
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"parts": [{"text": "Done."}], "metadata": {}}],
+                }
+            },
+        )
+
+        result = DispatchOfficeTask().execute_sync(
+            task_description="Organize the authorized folder.",
+            source_paths=[requested_host_path],
+            output_mode="workspace",
+            capability="organize",
+            orchestrator_task_id="compass-789",
+        )
+
+        payload = json.loads(result.output)
+        assert payload["status"] == "completed"
+        assert launched["overrides"]["extra_binds"] == ["/host-mounted/tests/data:/app/userdata/input-0:ro"]
 
     def test_office_dispatch_accepts_registry_definition_for_per_task_launch(self, monkeypatch):
         from agents.compass.agent import _dispatch_office_request

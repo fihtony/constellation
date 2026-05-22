@@ -25,6 +25,23 @@ services:
     networks:
       - constellation-v2
 
+  init-register:
+    image: constellation-v2-init-register:latest
+    build:
+      context: .
+      dockerfile: agents/compass/Dockerfile
+    command: ["python3", "scripts/register_agents.py", "--registered-by", "compose-init"]
+    depends_on:
+      registry:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: "http://registry:9000"
+    volumes:
+      - ./config/.env:/app/config/.env:ro
+    restart: "no"
+    networks:
+      - constellation-v2
+
   # -----------------------------------------------------------------------
   # Compass Agent — control plane entry point (port 8000)
   # -----------------------------------------------------------------------
@@ -36,6 +53,8 @@ services:
     depends_on:
       registry:
         condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
       team-lead:
         condition: service_healthy
       jira:
@@ -56,7 +75,6 @@ services:
       DOCKER_SOCKET: /var/run/docker.sock
     volumes:
       - ./artifacts:/app/artifacts
-      - .:/workspace:ro
       - /var/run/docker.sock:/var/run/docker.sock
       - ./config/.env:/app/config/.env:ro
     group_add:
@@ -84,6 +102,11 @@ services:
     build:
       context: .
       dockerfile: agents/team_lead/Dockerfile
+    depends_on:
+      registry:
+        condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
     environment:
       AGENT_ID: "team-lead"
       HOST: "0.0.0.0"
@@ -118,6 +141,11 @@ services:
     build:
       context: .
       dockerfile: agents/jira/Dockerfile
+    depends_on:
+      registry:
+        condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
     environment:
       AGENT_ID: "jira"
       HOST: "0.0.0.0"
@@ -133,6 +161,7 @@ services:
     volumes:
       - ./artifacts:/app/artifacts
       - ./config/.env:/app/config/.env:ro
+      - ./agents/jira/.env:/app/agents/jira/.env:ro
     labels:
       constellation.agent_id: "jira"
       constellation.agent_name: "Jira Agent"
@@ -156,6 +185,11 @@ services:
     build:
       context: .
       dockerfile: agents/scm/Dockerfile
+    depends_on:
+      registry:
+        condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
     environment:
       AGENT_ID: "scm"
       HOST: "0.0.0.0"
@@ -168,6 +202,7 @@ services:
     volumes:
       - ./artifacts:/app/artifacts
       - ./config/.env:/app/config/.env:ro
+      - ./agents/scm/.env:/app/agents/scm/.env:ro
     labels:
       constellation.agent_id: "scm"
       constellation.agent_name: "SCM Agent"
@@ -191,6 +226,11 @@ services:
     build:
       context: .
       dockerfile: agents/ui_design/Dockerfile
+    depends_on:
+      registry:
+        condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
     environment:
       AGENT_ID: "ui-design"
       HOST: "0.0.0.0"
@@ -201,6 +241,7 @@ services:
     volumes:
       - ./artifacts:/app/artifacts
       - ./config/.env:/app/config/.env:ro
+      - ./agents/ui_design/.env:/app/agents/ui_design/.env:ro
     labels:
       constellation.agent_id: "ui-design"
       constellation.agent_name: "UI Design Agent"
@@ -226,6 +267,11 @@ services:
     build:
       context: .
       dockerfile: agents/office/Dockerfile
+    depends_on:
+      registry:
+        condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
     environment:
       AGENT_ID: "office"
       HOST: "0.0.0.0"

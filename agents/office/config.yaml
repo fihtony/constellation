@@ -29,6 +29,7 @@ launch_spec:
   image: constellation-v2-office:latest
   port: 8060
   startup_delay_seconds: 1.5
+  env_file: /app/config/.env
   pass_through_env:
     - AGENT_RUNTIME
     - AGENT_MODEL

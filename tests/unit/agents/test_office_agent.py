@@ -50,11 +50,12 @@ def test_receive_task_parses_request():
     state = {
         "_task_id": "task-test123",
         "user_request": "summarize tests/data/2026/0103/1.txt",
+        "source_paths": ["/tmp/tests/data/2026/0103/1.txt"],
     }
     result = receive_task(state)
     assert result["capability"] == "summarize"
     assert result["output_mode"] == "workspace"
-    assert len(result["source_paths"]) > 0
+    assert result["source_paths"] == ["/tmp/tests/data/2026/0103/1.txt"]
 
 
 def test_receive_task_parses_analyze():
@@ -84,6 +85,7 @@ def test_receive_task_parses_inplace():
 def test_analyze_request_validates_paths():
     """Test analyze_request validates paths against OFFICE_SOURCE_ROOT."""
     from agents.office.nodes import analyze_request
+    from framework.devlog import AgentLogger
 
     with tempfile.TemporaryDirectory() as tmp:
         # Set OFFICE_SOURCE_ROOT to our temp dir
@@ -98,6 +100,7 @@ def test_analyze_request_validates_paths():
         state = {
             "_task_id": "task-test123",
             "_compass_task_id": "compass-test",
+            "_task_logger": AgentLogger(task_id="compass-test", agent_name="office"),
             "source_paths": [test_file],
             "capability": "summarize",
             "output_mode": "workspace",
@@ -106,6 +109,9 @@ def test_analyze_request_validates_paths():
         assert "validated_paths" in result
         assert os.path.realpath(test_file) in [os.path.realpath(p) for p in result["validated_paths"]]
         assert "artifacts_dir" in result
+        log_file = os.path.join(tmp, "compass-test", "office", "agent.log")
+        assert os.path.exists(log_file)
+        assert "validated office request" in open(log_file, encoding="utf-8").read()
 
         del os.environ["OFFICE_SOURCE_ROOT"]
         del os.environ["ARTIFACT_ROOT"]

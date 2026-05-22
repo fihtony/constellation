@@ -207,9 +207,21 @@ def test_office_task_workspace_container(
         assert organized_root.is_dir(), f"[{test_id}] missing organized output root"
         organized_files = [path for path in organized_root.rglob("*") if path.is_file()]
         assert organized_files, f"[{test_id}] no organized files materialized"
+        if test_id == "2026_workspace":
+            assert (organized_root / "Yan" / "2026-01" / "0103-1.txt").exists()
+            assert (organized_root / "Ethan" / "2026-01" / "0103-4.txt").exists()
+            assert (organized_root / "Ethan" / "2026-02" / "0221-1.txt").exists()
+            assert not (organized_root / "Ethan" / "2026-01" / "0103-1.txt").exists()
+            assert not (organized_root / "Yan" / "2026-01" / "0103-4.txt").exists()
+            assert not (organized_root / "Ethan" / "2026-02" / "input-0-0221-1.txt").exists()
 
     source_snapshot_after = _snapshot_tree(source_root)
     assert source_snapshot_after == source_snapshot_before, f"[{test_id}] source tree changed in workspace mode"
     assert not any(path.name == output_filename for path in source_root.rglob("*")), (
         f"[{test_id}] output escaped into source tree"
     )
+
+    from framework.devlog import get_agent_log_path
+
+    office_log = Path(get_agent_log_path(compass_task_id, "office"))
+    assert office_log.exists(), f"[{test_id}] missing office log"

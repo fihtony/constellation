@@ -31,7 +31,12 @@ class TaskStore(ABC):
     """Abstract task persistence interface."""
 
     @abstractmethod
-    def create_task(self, agent_id: str, metadata: dict | None = None) -> Task:
+    def create_task(
+        self,
+        agent_id: str,
+        metadata: dict | None = None,
+        task_id: str | None = None,
+    ) -> Task:
         """Create and persist a new task in SUBMITTED state."""
         ...
 
@@ -134,8 +139,13 @@ class InMemoryTaskStore(TaskStore):
         self._agent_index: dict[str, list[str]] = {}  # agent_id → [task_id]
         self._lock = threading.Lock()
 
-    def create_task(self, agent_id: str, metadata: dict | None = None) -> Task:
-        task = Task(metadata={"agentId": agent_id, **(metadata or {})})
+    def create_task(
+        self,
+        agent_id: str,
+        metadata: dict | None = None,
+        task_id: str | None = None,
+    ) -> Task:
+        task = Task(id=task_id or f"task-{uuid.uuid4().hex[:12]}", metadata={"agentId": agent_id, **(metadata or {})})
         task.status = TaskStatus(state=TaskState.WORKING)
         with self._lock:
             self._tasks[task.id] = task
@@ -234,8 +244,13 @@ class SqliteTaskStore(TaskStore):
     def _conn(self) -> sqlite3.Connection:
         return sqlite3.connect(self._db_path)
 
-    def create_task(self, agent_id: str, metadata: dict | None = None) -> Task:
-        task = Task(metadata={"agentId": agent_id, **(metadata or {})})
+    def create_task(
+        self,
+        agent_id: str,
+        metadata: dict | None = None,
+        task_id: str | None = None,
+    ) -> Task:
+        task = Task(id=task_id or f"task-{uuid.uuid4().hex[:12]}", metadata={"agentId": agent_id, **(metadata or {})})
         task.status = TaskStatus(state=TaskState.WORKING)
         now = _now_iso()
         with self._lock:

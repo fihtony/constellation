@@ -85,3 +85,23 @@ def test_launch_instance_passes_through_claude_runtime_env(monkeypatch):
     assert "ANTHROPIC_AUTH_TOKEN=token-from-config-env" in create_payload["Env"]
     assert "ANTHROPIC_BASE_URL=https://anthropic.example.test" in create_payload["Env"]
     assert "ANTHROPIC_MODEL=MiniMax-M2.7" in create_payload["Env"]
+
+
+def test_resolve_container_path_maps_host_mounts(monkeypatch):
+    """Launcher should translate host-visible paths back into the current container mount path."""
+
+    launcher = Launcher(socket_path="/tmp/fake-docker.sock")
+    monkeypatch.setattr(
+        launcher,
+        "_current_container_mounts",
+        lambda: [
+            {
+                "Source": "/Users/test/project",
+                "Destination": "/workspace",
+            }
+        ],
+    )
+
+    translated = launcher.resolve_container_path("/Users/test/project/tests/data/2026")
+
+    assert translated == "/workspace/tests/data/2026"

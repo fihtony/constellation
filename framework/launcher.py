@@ -168,6 +168,38 @@ class Launcher:
             return best_match[1]
         return target_real
 
+    def resolve_container_path(self, host_path: str) -> str:
+        if not host_path:
+            return ""
+
+        target_real = os.path.realpath(host_path)
+        mounts = self._current_container_mounts()
+        best_match: tuple[int, str] | None = None
+
+        for mount in mounts:
+            destination = str(mount.get("Destination") or "")
+            source = str(mount.get("Source") or "")
+            if not destination or not source:
+                continue
+            source_real = os.path.realpath(source)
+            prefix = source_real.rstrip(os.sep) + os.sep
+            if target_real == source_real:
+                score = len(source_real)
+                candidate = destination
+            elif target_real.startswith(prefix):
+                relative = os.path.relpath(target_real, source_real)
+                candidate = os.path.realpath(os.path.join(destination, relative))
+                score = len(source_real)
+            else:
+                continue
+
+            if best_match is None or score > best_match[0]:
+                best_match = (score, candidate)
+
+        if best_match is not None:
+            return best_match[1]
+        return target_real
+
     def launch_instance(self, agent_definition, task_id: str, *, launch_overrides: dict | None = None) -> dict:
         definition = _as_dict(agent_definition)
         base_spec = _as_dict(definition.get("launch_spec") or definition.get("launchSpec"))

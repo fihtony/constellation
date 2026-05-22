@@ -138,6 +138,7 @@ class OfficeAgent(BaseAgent):
 
         # Create task via task store
         task_store = self.services.task_store
+        canonical_task_id = compass_task_id or ""
         task = task_store.create_task(
             agent_id=self.definition.agent_id,
             metadata={
@@ -147,6 +148,7 @@ class OfficeAgent(BaseAgent):
                 "capability": capability,
                 "output_mode": output_mode,
             },
+            task_id=canonical_task_id or None,
         )
 
         canonical_task_id = task.id
@@ -165,6 +167,7 @@ class OfficeAgent(BaseAgent):
         state: dict[str, Any] = {
             "_task_id": canonical_task_id,
             "_compass_task_id": compass_task_id,
+            "_task_logger": log,
             "_message_metadata": dict(metadata),
             "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,
@@ -190,6 +193,7 @@ class OfficeAgent(BaseAgent):
             artifacts_dir = os.path.join(workspace_root, "artifacts")
             os.makedirs(artifacts_dir, exist_ok=True)
             os.environ["OFFICE_WORKSPACE_ROOT"] = artifacts_dir
+            log.info("office workspace prepared", workspace_root=workspace_root, artifacts_dir=artifacts_dir)
 
         # Run workflow in background thread
         def _run() -> None:

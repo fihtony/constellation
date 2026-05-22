@@ -99,18 +99,29 @@ def _office_mount_plan(source_paths: list[str], output_mode: str, launcher) -> d
         if not requested_path or not os.path.isabs(requested_path):
             raise ValueError(f"Office source path must be absolute: {raw_path}")
 
-        container_visible_path = os.path.realpath(requested_path)
-        host_path = launcher.resolve_host_path(container_visible_path)
-        inspect_path = container_visible_path if os.path.exists(container_visible_path) else host_path
-        if not os.path.exists(inspect_path):
-            raise ValueError(f"Office source path does not exist: {requested_path}")
-
-        if os.path.isfile(inspect_path):
-            host_bind_source = os.path.dirname(host_path)
-            relative_path = os.path.basename(container_visible_path)
+        host_path = os.path.realpath(requested_path)
+        if os.path.exists(requested_path):
+            resolved_host_path = str(launcher.resolve_host_path(requested_path) or "").strip()
+            if resolved_host_path:
+                host_path = os.path.realpath(resolved_host_path)
         else:
-            host_bind_source = host_path
-            relative_path = ""
+            resolve_container_path = getattr(launcher, "resolve_container_path", None)
+            if callable(resolve_container_path):
+                translated = str(resolve_container_path(requested_path) or "").strip()
+                if translated and os.path.exists(translated):
+                    resolved_host_path = str(launcher.resolve_host_path(translated) or "").strip()
+                    if resolved_host_path:
+                        host_path = os.path.realpath(resolved_host_path)
+
+        host_path_stripped = host_path.rstrip(os.sep)
+        if not host_path_stripped:
+            host_path_stripped = os.sep
+
+        relative_path = os.path.basename(host_path_stripped)
+        if relative_path:
+            host_bind_source = os.path.dirname(host_path_stripped) or os.sep
+        else:
+            host_bind_source = host_path_stripped
 
         bind_key = (os.path.realpath(host_bind_source), read_only)
         mount_target = mount_targets.get(bind_key)

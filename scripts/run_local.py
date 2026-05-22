@@ -112,7 +112,7 @@ def main():
 
     # Start HTTP server
     from framework.a2a.server import A2ARequestHandler
-    from http.server import HTTPServer
+    from http.server import ThreadingHTTPServer
 
     _card_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -128,7 +128,7 @@ def main():
         advertised_url = _adv_url
         agent_card_path = _card_path
 
-    server = HTTPServer(("0.0.0.0", args.port), AgentHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", args.port), AgentHandler)
     print(f"[{args.agent}] HTTP server listening on 0.0.0.0:{args.port}")
 
     try:
