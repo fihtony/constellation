@@ -26,14 +26,13 @@ from framework.plugin import PluginManager
 from framework.agent import AgentServices
 from framework.task_store import InMemoryTaskStore
 from framework.config import load_agent_config
-from framework.env_utils import load_dotenv
+from framework.env_utils import load_agent_environment
 from framework.launcher import get_launcher
 from framework.registry_client import RegistryClient
 from framework.runtime.adapter import get_runtime
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUNTIMELESS_AGENTS = {"jira", "scm", "ui-design"}
 
 
 # Agent registry
@@ -58,8 +57,10 @@ def create_services(
     Permission binding is handled by BaseAgent.start() via the agent's
     permission_profile in its AgentDefinition — no manual binding here.
     """
-    load_dotenv(os.path.join(PROJECT_ROOT, "config", ".env"))
-    load_dotenv(os.path.join(PROJECT_ROOT, "agents", agent_id.replace("-", "_"), ".env"))
+    bootstrap_config = load_agent_config(agent_id)
+    runtime_env_required = bool(bootstrap_config.get("runtime_env_required", False))
+
+    load_agent_environment(PROJECT_ROOT, agent_id, include_runtime_env=runtime_env_required)
 
     skills_registry = SkillsRegistry(skills_dir)
     skills_registry.load_all()
@@ -70,13 +71,13 @@ def create_services(
           f"model={config.get('runtime.model')}")
 
     runtime = None
-    if agent_id not in RUNTIMELESS_AGENTS:
+    if runtime_env_required:
         runtime = get_runtime(
             backend=config.get("runtime.backend") or config.get("runtime_backend"),
             model=config.get("runtime.model") or config.get("model"),
         )
     else:
-        print(f"[{agent_id}] Runtime disabled: boundary adapter does not require agentic backend")
+        print(f"[{agent_id}] Runtime disabled: shared runtime env not required for this agent")
 
     return AgentServices(
         session_service=InMemorySessionService(),

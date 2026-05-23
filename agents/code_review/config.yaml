@@ -7,6 +7,7 @@ name: "Code Review Agent"
 description: "Independent code review: quality, security, tests, requirements compliance"
 mode: task
 execution_mode: per-task
+runtime_env_required: true
 
 # runtime and model inherit from global constellation.yaml:
 #   runtime.backend: connect-agent

@@ -11,6 +11,7 @@ _CONTAINER_RUNTIME_HOSTS = {
 }
 
 _ISOLATED_RUNTIME_ROOT = os.path.join(tempfile.gettempdir(), "constellation-runtime")
+_RUNTIME_ENV_FILENAMES = (".runtime.env", ".env")
 
 
 def _parse_env_file(path: str) -> dict[str, str]:
@@ -35,6 +36,36 @@ def load_dotenv(path: str) -> None:
     """Load a .env file into ``os.environ`` (does not override existing keys)."""
     for key, value in _parse_env_file(path).items():
         os.environ.setdefault(key, value)
+
+
+def resolve_runtime_env_file(project_root: str) -> str:
+    """Resolve the shared runtime env file for runtime-enabled agents.
+
+    Resolution order:
+    1. ``CONSTELLATION_RUNTIME_ENV_FILE`` explicit override
+    2. ``config/.runtime.env`` under the project root
+    3. legacy ``config/.env`` under the project root
+    """
+    explicit = os.environ.get("CONSTELLATION_RUNTIME_ENV_FILE", "").strip()
+    if explicit:
+        return explicit
+
+    for filename in _RUNTIME_ENV_FILENAMES:
+        candidate = os.path.join(project_root, "config", filename)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(project_root, "config", _RUNTIME_ENV_FILENAMES[0])
+
+
+def load_agent_environment(project_root: str, agent_id: str, *, include_runtime_env: bool = False) -> None:
+    """Load environment files for an agent.
+
+    Runtime-enabled agents opt in to the shared runtime env file. Every agent
+    still loads its own agent-scoped ``agents/<agent>/.env`` file afterwards.
+    """
+    if include_runtime_env:
+        load_dotenv(resolve_runtime_env_file(project_root))
+    load_dotenv(os.path.join(project_root, "agents", agent_id.replace("-", "_"), ".env"))
 
 
 def resolve_container_runtime(default: str = "docker") -> str:

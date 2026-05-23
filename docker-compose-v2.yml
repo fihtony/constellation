@@ -67,6 +67,7 @@ services:
       PORT: "8000"
       REGISTRY_URL: "http://registry:9000"
       AGENT_RUNTIME: "claude-code"
+      CONSTELLATION_RUNTIME_ENV_FILE: /app/config/.runtime.env
       ARTIFACT_ROOT: /app/artifacts
       CONTAINER_RUNTIME: docker
       DYNAMIC_AGENT_NETWORK: constellation-v2-network
@@ -74,7 +75,7 @@ services:
     volumes:
       - ./artifacts:/app/artifacts
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./config/.env:/app/config/.env:ro
+      - ./config/.env:/app/config/.runtime.env:ro
     group_add:
       - "${DOCKER_SOCKET_GID:-0}"
     labels:
@@ -111,11 +112,12 @@ services:
       PORT: "8030"
       REGISTRY_URL: "http://registry:9000"
       AGENT_RUNTIME: "claude-code"
+      CONSTELLATION_RUNTIME_ENV_FILE: /app/config/.runtime.env
       ARTIFACT_ROOT: /app/artifacts
       CONTAINER_RUNTIME: docker
     volumes:
       - ./artifacts:/app/artifacts
-      - ./config/.env:/app/config/.env:ro
+      - ./config/.env:/app/config/.runtime.env:ro
     labels:
       constellation.agent_id: "team-lead"
       constellation.agent_name: "Team Lead Agent"
@@ -263,13 +265,14 @@ services:
       PORT: "8060"
       REGISTRY_URL: "http://registry:9000"
       AGENT_RUNTIME: "claude-code"
+      CONSTELLATION_RUNTIME_ENV_FILE: /app/config/.runtime.env
       ARTIFACT_ROOT: /app/artifacts
       OFFICE_SOURCE_ROOT: ${OFFICE_SOURCE_ROOT:-/app/userdata}
       OFFICE_ALLOWED_BASE_PATHS: ${OFFICE_ALLOWED_BASE_PATHS:-}
       OFFICE_BACKUP_ENABLED: ${OFFICE_BACKUP_ENABLED:-true}
     volumes:
       - ./artifacts:/app/artifacts
-      - ./config/.env:/app/config/.env:ro
+      - ./config/.env:/app/config/.runtime.env:ro
     labels:
       constellation.agent_id: "office"
       constellation.agent_name: "Office Agent"

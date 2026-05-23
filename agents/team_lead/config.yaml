@@ -7,6 +7,7 @@ name: "Team Lead Agent"
 description: "Intelligence layer: analysis, planning, dispatch, code review coordination"
 mode: task
 execution_mode: persistent
+runtime_env_required: true
 
 permission_profile: "development"
 
