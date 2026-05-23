@@ -10,6 +10,7 @@ import json
 import os
 import time
 import urllib.request
+from types import SimpleNamespace
 from typing import Any
 
 from framework.launcher import get_launcher
@@ -67,12 +68,29 @@ def _should_use_per_task_office_launch() -> bool:
         return False
     if not _is_containerized_process():
         return False
-    try:
-        from agents.office.agent import office_definition
+    return bool(_office_launch_definition("summarize"))
 
-        return bool(getattr(office_definition, "launch_spec", None))
+
+def _office_launch_definition(capability: str) -> dict[str, Any]:
+    def _as_definition_object(definition: dict[str, Any]) -> Any:
+        return SimpleNamespace(**definition)
+
+    try:
+        from framework.config import build_agent_definition_from_config
+        from framework.registry_client import RegistryClient
+
+        client = RegistryClient.from_config()
+        requested_capability = _office_requested_capability(capability)
+        for candidate in (requested_capability, "office.document.summarize"):
+            definition = client.get_capability_definition(candidate)
+            if definition and (definition.get("launch_spec") or definition.get("launchSpec")):
+                return _as_definition_object(definition)
+        fallback = build_agent_definition_from_config("office")
+        if fallback.get("launch_spec") or fallback.get("launchSpec"):
+            return _as_definition_object(fallback)
     except Exception:
-        return False
+        pass
+    return {}
 
 
 def _office_mount_plan(source_paths: list[str], output_mode: str, launcher) -> dict[str, Any]:
@@ -100,6 +118,7 @@ def _office_mount_plan(source_paths: list[str], output_mode: str, launcher) -> d
             raise ValueError(f"Office source path must be absolute: {raw_path}")
 
         host_path = os.path.realpath(requested_path)
+        visible_path = requested_path if os.path.exists(requested_path) else ""
         if os.path.exists(requested_path):
             resolved_host_path = str(launcher.resolve_host_path(requested_path) or "").strip()
             if resolved_host_path:
@@ -109,6 +128,7 @@ def _office_mount_plan(source_paths: list[str], output_mode: str, launcher) -> d
             if callable(resolve_container_path):
                 translated = str(resolve_container_path(requested_path) or "").strip()
                 if translated and os.path.exists(translated):
+                    visible_path = translated
                     resolved_host_path = str(launcher.resolve_host_path(translated) or "").strip()
                     if resolved_host_path:
                         host_path = os.path.realpath(resolved_host_path)
@@ -118,7 +138,18 @@ def _office_mount_plan(source_paths: list[str], output_mode: str, launcher) -> d
             host_path_stripped = os.sep
 
         relative_path = os.path.basename(host_path_stripped)
-        if relative_path:
+        is_directory_request = False
+        if visible_path:
+            is_directory_request = os.path.isdir(visible_path)
+        elif requested_path.endswith(os.sep):
+            is_directory_request = True
+        elif not os.path.splitext(os.path.basename(host_path_stripped))[1]:
+            is_directory_request = True
+
+        if is_directory_request:
+            host_bind_source = host_path_stripped
+            relative_path = ""
+        elif relative_path:
             host_bind_source = os.path.dirname(host_path_stripped) or os.sep
         else:
             host_bind_source = host_path_stripped
@@ -166,14 +197,18 @@ def _dispatch_office_task_via_launcher(
     output_mode: str,
     capability: str,
     orchestrator_task_id: str,
+    office_definition: dict[str, Any] | None = None,
 ) -> dict:
-    from agents.office.agent import office_definition
     from framework.a2a.client import dispatch_sync
+
+    definition = office_definition or _office_launch_definition(capability)
+    if not definition:
+        raise RuntimeError("No registered Office launch definition was found in the registry.")
 
     launcher = get_launcher()
     mount_plan = _office_mount_plan(source_paths, output_mode, launcher)
     launch = launcher.launch_instance(
-        office_definition,
+        definition,
         orchestrator_task_id or "office-task",
         launch_overrides={
             "env": mount_plan["env"],
@@ -197,7 +232,13 @@ def _dispatch_office_task_via_launcher(
         )
     finally:
         try:
-            launcher.destroy_instance(office_definition.agent_id, launch["container_name"])
+            agent_id = getattr(definition, "agent_id", None)
+            if not agent_id and isinstance(definition, dict):
+                agent_id = definition.get("agent_id") or definition.get("agentId")
+            launcher.destroy_instance(
+                str(agent_id or "office"),
+                launch["container_name"],
+            )
         except Exception:
             pass
 
@@ -362,12 +403,14 @@ class DispatchOfficeTask(BaseTool):
 
         try:
             if _should_use_per_task_office_launch():
+                office_definition = _office_launch_definition(capability)
                 result = _dispatch_office_task_via_launcher(
                     task_description=task_description,
                     source_paths=normalized_source_paths,
                     output_mode=output_mode,
                     capability=capability,
                     orchestrator_task_id=orchestrator_task_id,
+                    office_definition=office_definition,
                 )
                 return ToolResult(output=json.dumps(result))
 

@@ -29,6 +29,30 @@ def _get_workspace_root() -> str:
     return os.environ.get("OFFICE_WORKSPACE_ROOT", "")
 
 
+def _allowed_base_paths() -> list[str]:
+    allowed_bases = os.environ.get("OFFICE_ALLOWED_BASE_PATHS", "")
+    return [base.strip() for base in allowed_bases.split(":") if base.strip()]
+
+
+def _metadata_root_for_path(path: str) -> str:
+    real_path = os.path.realpath(os.path.abspath(path))
+    candidates: list[str] = []
+    for base in _allowed_base_paths():
+        base_real = os.path.realpath(os.path.abspath(base))
+        prefix = base_real.rstrip(os.sep) + os.sep
+        if real_path == base_real:
+            candidate = os.path.dirname(base_real) if os.path.isfile(base_real) else base_real
+            if candidate:
+                candidates.append(candidate)
+            continue
+        if real_path.startswith(prefix):
+            candidates.append(base_real)
+
+    if candidates:
+        return max(candidates, key=len)
+    return _get_source_root()
+
+
 def _validate_path(path: str) -> tuple[str, str]:
     """Validate that path is within OFFICE_SOURCE_ROOT and OFFICE_ALLOWED_BASE_PATHS.
 
@@ -1469,7 +1493,8 @@ Use organize_folder tool first to survey the folder, then organize_execute_plan 
 
         if action == "copy_file" and src_normalized:
             try:
-                source_metadata = _build_file_metadata(source_root, src_normalized)
+                metadata_root = _metadata_root_for_path(src_normalized)
+                source_metadata = _build_file_metadata(metadata_root, src_normalized)
             except Exception:
                 source_metadata = {}
             expected_entity = _safe_path_segment(str(source_metadata.get("primary_entity") or ""))

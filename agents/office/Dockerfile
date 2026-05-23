@@ -22,11 +22,12 @@ RUN apt-get update \
         xlrd>=2.0.1 \
     && apt-get clean
 
-COPY framework/     /app/framework/
-COPY agents/       /app/agents/
-COPY skills/       /app/skills/
-COPY config/       /app/config/
-COPY scripts/      /app/scripts/
+COPY framework/ /app/framework/
+COPY agents/__init__.py /app/agents/__init__.py
+COPY agents/office/ /app/agents/office/
+COPY skills/office-generic-methodology/ /app/skills/office-generic-methodology/
+COPY config/ /app/config/
+COPY scripts/run_local.py /app/scripts/run_local.py
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \

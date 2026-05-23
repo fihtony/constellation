@@ -11,11 +11,11 @@ RUN apt-get update \
     && pip install --no-cache-dir pyyaml>=6.0 \
     && apt-get clean
 
-COPY framework/     /app/framework/
-COPY agents/       /app/agents/
-COPY skills/       /app/skills/
-COPY config/       /app/config/
-COPY scripts/      /app/scripts/
+COPY framework/ /app/framework/
+COPY agents/__init__.py /app/agents/__init__.py
+COPY agents/jira/ /app/agents/jira/
+COPY config/ /app/config/
+COPY scripts/run_local.py /app/scripts/run_local.py
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
@@ -24,7 +24,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 LABEL constellation.agent_id="jira"
 LABEL constellation.agent_name="Jira Agent"
-LABEL constellation.agent_role="fundamental"
+LABEL constellation.agent_role="boundary"
 
 RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
     && chown -R appuser:appuser /app

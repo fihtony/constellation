@@ -16,6 +16,7 @@ import csv
 import filecmp
 import shutil
 import threading
+import time
 from typing import Any
 
 from agents.office.office_tools import (
@@ -107,13 +108,57 @@ def _task_logger(state: dict):
     return state.get("_task_logger")
 
 
+def _fallback_task_log_path(state: dict) -> str:
+    workspace_root = str(state.get("workspace_root") or "").strip()
+    if workspace_root:
+        return os.path.join(workspace_root, "agent.log")
+    task_id = str(state.get("_compass_task_id") or state.get("_task_id") or "").strip()
+    if not task_id:
+        return ""
+    artifact_root = os.environ.get("ARTIFACT_ROOT", "artifacts/")
+    return os.path.join(artifact_root, task_id, AGENT_ID, "agent.log")
+
+
+def _write_fallback_task_log(state: dict, level: str, message: str, **kwargs: Any) -> None:
+    log_path = _fallback_task_log_path(state)
+    if not log_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        extra = ""
+        if kwargs:
+            parts = []
+            for key, value in kwargs.items():
+                rendered = str(value)
+                if len(rendered) > 200:
+                    rendered = rendered[:197] + "..."
+                parts.append(f"{key}={rendered!r}")
+            extra = " " + " ".join(parts)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level}] [{AGENT_ID}] {message}{extra}\n")
+    except OSError:
+        return
+
+
 def _task_log(state: dict, level: str, message: str, **kwargs: Any) -> None:
     task_log = _task_logger(state)
+    rendered_message = message
+    rendered_level = "INFO "
+    if level == "node":
+        rendered_message = f"[NODE] {message}"
+    elif level == "warn":
+        rendered_level = "WARN "
+    elif level == "error":
+        rendered_level = "ERROR"
+    elif level == "debug":
+        rendered_level = "DEBUG"
     if task_log is None:
+        _write_fallback_task_log(state, rendered_level, rendered_message, **kwargs)
         return
     log_fn = getattr(task_log, level, None)
     if callable(log_fn):
         log_fn(message, **kwargs)
+    _write_fallback_task_log(state, rendered_level, rendered_message, **kwargs)
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,7 @@ from framework.runtime.adapter import get_runtime
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUNTIMELESS_AGENTS = {"jira", "scm", "ui-design"}
 
 
 # Agent registry
@@ -68,10 +69,14 @@ def create_services(
     print(f"[{agent_id}] Config loaded: runtime={config.get('runtime.backend')}, "
           f"model={config.get('runtime.model')}")
 
-    runtime = get_runtime(
-        backend=config.get("runtime.backend") or config.get("runtime_backend"),
-        model=config.get("runtime.model") or config.get("model"),
-    )
+    runtime = None
+    if agent_id not in RUNTIMELESS_AGENTS:
+        runtime = get_runtime(
+            backend=config.get("runtime.backend") or config.get("runtime_backend"),
+            model=config.get("runtime.model") or config.get("model"),
+        )
+    else:
+        print(f"[{agent_id}] Runtime disabled: boundary adapter does not require agentic backend")
 
     return AgentServices(
         session_service=InMemorySessionService(),

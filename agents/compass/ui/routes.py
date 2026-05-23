@@ -10,10 +10,45 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _ui_status(task) -> str:
+    raw = getattr(getattr(task, "status", None), "state", "")
+    value = getattr(raw, "value", raw)
+    mapping = {
+        "TASK_STATE_COMPLETED": "completed",
+        "TASK_STATE_FAILED": "failed",
+        "TASK_STATE_INPUT_REQUIRED": "waiting",
+        "TASK_STATE_WORKING": "active",
+        "TASK_STATE_SUBMITTED": "active",
+    }
+    return mapping.get(str(value), "active")
+
+
+def _task_summary(task) -> str:
+    metadata = getattr(task, "metadata", {}) or {}
+    if metadata.get("summary"):
+        return str(metadata["summary"])
+    message = getattr(getattr(task, "status", None), "message", None)
+    if message:
+        text = message.text().strip()
+        if text:
+            return text
+    return ""
+
+
+def _serialize_ui_task(task) -> dict:
+    return {
+        "task_id": task.id,
+        "status": _ui_status(task),
+        "summary": _task_summary(task),
+        "raw_status": getattr(getattr(task, "status", None), "state", None).value,
+        "agent": (getattr(task, "metadata", {}) or {}).get("agentId", ""),
+    }
+
+
 def handle_ui_request(method: str, path: str, task_store=None, log_store_url=None) -> dict:
     """Handle UI-related HTTP requests."""
     if method == "GET" and path == "/ui":
-        return serve_ui()
+        return serve_ui(task_store)
     if method == "GET" and path == "/tasks":
         return list_tasks(task_store)
     if method == "GET" and path.startswith("/tasks/"):
@@ -29,11 +64,13 @@ def handle_ui_request(method: str, path: str, task_store=None, log_store_url=Non
     return {"status": 404, "body": "Not found"}
 
 
-def serve_ui() -> dict:
+def serve_ui(task_store=None) -> dict:
     """Serve the main UI page."""
     # Get current state
     messages = []  # TODO: Get from session
-    tasks = []     # TODO: Get from task_store
+    tasks = []
+    if task_store is not None:
+        tasks = [_serialize_ui_task(task) for task in task_store.list_tasks()]
 
     html = render_compass_ui(messages, tasks)
     return {
@@ -53,14 +90,7 @@ def list_tasks(task_store) -> dict:
         "status": 200,
         "headers": {"Content-Type": "application/json"},
         "body": {
-            "tasks": [
-                {
-                    "task_id": t.id,
-                    "status": t.status.state.value,
-                    "summary": t.metadata.get("summary", ""),
-                }
-                for t in tasks
-            ]
+            "tasks": [_serialize_ui_task(t) for t in tasks]
         },
     }
 
@@ -115,12 +145,7 @@ def poll_task_status(task_store, since: str | None = None) -> dict:
 
     return {
         "tasks": [
-            {
-                "task_id": t.id,
-                "status": t.status.state.value,
-                "summary": t.metadata.get("summary", ""),
-                "agent": t.metadata.get("agentId", ""),
-            }
+            _serialize_ui_task(t)
             for t in tasks
         ],
         "messages": messages,

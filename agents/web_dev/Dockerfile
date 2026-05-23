@@ -11,11 +11,13 @@ RUN apt-get update \
     && pip install --no-cache-dir pyyaml>=6.0 \
     && apt-get clean
 
-COPY framework/     /app/framework/
-COPY agents/       /app/agents/
-COPY skills/       /app/skills/
-COPY config/       /app/config/
-COPY scripts/      /app/scripts/
+COPY framework/ /app/framework/
+COPY agents/__init__.py /app/agents/__init__.py
+COPY agents/web_dev/ /app/agents/web_dev/
+COPY skills/react-nextjs/ /app/skills/react-nextjs/
+COPY skills/testing/ /app/skills/testing/
+COPY config/ /app/config/
+COPY scripts/run_local.py /app/scripts/run_local.py
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \

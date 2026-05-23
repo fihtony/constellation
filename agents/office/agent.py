@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import Any
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
@@ -28,6 +29,28 @@ from agents.office.office_tools import register_office_tools
 
 
 logger = logging.getLogger(__name__)
+
+
+def _append_office_log(task_id: str, message: str, level: str = "INFO ", **kwargs: Any) -> None:
+    if not task_id:
+        return
+    artifact_root = os.environ.get("ARTIFACT_ROOT", "artifacts/")
+    log_path = os.path.join(artifact_root, task_id, "office", "agent.log")
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        extra = ""
+        if kwargs:
+            parts = []
+            for key, value in kwargs.items():
+                rendered = str(value)
+                if len(rendered) > 200:
+                    rendered = rendered[:197] + "..."
+                parts.append(f"{key}={rendered!r}")
+            extra = " " + " ".join(parts)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level}] [office] {message}{extra}\n")
+    except OSError:
+        return
 
 
 def _normalize_source_paths(value: Any) -> list[str]:
@@ -158,10 +181,30 @@ class OfficeAgent(BaseAgent):
         log = AgentLogger(task_id=log_task_id, agent_name=self.definition.agent_id)
         log.node("handle_message", compass_task_id=compass_task_id, office_task_id=canonical_task_id,
                  request_preview=user_text[:200])
+        _append_office_log(
+            log_task_id,
+            "[NODE] handle_message",
+            compass_task_id=compass_task_id,
+            office_task_id=canonical_task_id,
+            request_preview=user_text[:200],
+        )
         log.info("office agent started", output_mode=metadata.get("output_mode", "workspace"),
                  has_callback=bool(callback_url))
+        _append_office_log(
+            log_task_id,
+            "office agent started",
+            output_mode=metadata.get("output_mode", "workspace"),
+            has_callback=bool(callback_url),
+        )
         log.a2a("←", "compass", event="task received",
                 compass_task_id=compass_task_id, office_task_id=canonical_task_id)
+        _append_office_log(
+            log_task_id,
+            "[A2A] ← compass",
+            capability=capability,
+            compass_task_id=compass_task_id,
+            office_task_id=canonical_task_id,
+        )
 
         # Build initial state
         state: dict[str, Any] = {
@@ -194,6 +237,12 @@ class OfficeAgent(BaseAgent):
             os.makedirs(artifacts_dir, exist_ok=True)
             os.environ["OFFICE_WORKSPACE_ROOT"] = artifacts_dir
             log.info("office workspace prepared", workspace_root=workspace_root, artifacts_dir=artifacts_dir)
+            _append_office_log(
+                log_task_id,
+                "office workspace prepared",
+                workspace_root=workspace_root,
+                artifacts_dir=artifacts_dir,
+            )
 
         # Run workflow in background thread
         def _run() -> None:

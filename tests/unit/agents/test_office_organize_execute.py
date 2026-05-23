@@ -157,3 +157,30 @@ def test_organize_move_file_rejects_duplicate_successful_copy(tmp_path):
     os.environ.pop("OFFICE_OUTPUT_MODE", None)
     os.environ.pop("OFFICE_SOURCE_ROOT", None)
     os.environ.pop("OFFICE_WORKSPACE_ROOT", None)
+
+
+def test_organize_move_file_uses_allowed_base_for_expected_filename(tmp_path):
+    """High-confidence filename checks should use the narrowest authorized base path."""
+    from agents.office.office_tools import OrganizeMoveFileTool
+
+    source_dir = tmp_path / "mount-root" / "2026" / "0103"
+    source_dir.mkdir(parents=True)
+    src_file = source_dir / "1.txt"
+    src_file.write_text(">>> Student Yan\n", encoding="utf-8")
+
+    tool = OrganizeMoveFileTool()
+    os.environ["OFFICE_ALLOW_INPLACE_WRITES"] = "true"
+    os.environ["OFFICE_OUTPUT_MODE"] = "workspace"
+    os.environ["OFFICE_SOURCE_ROOT"] = str(tmp_path / "mount-root")
+    os.environ["OFFICE_ALLOWED_BASE_PATHS"] = str(tmp_path / "mount-root" / "2026")
+    os.environ["OFFICE_WORKSPACE_ROOT"] = str(tmp_path / "workspace")
+
+    result = tool.execute_sync(action="copy_file", src=str(src_file), dst="Yan/2026-01/0103-1.txt")
+
+    assert result.success, result.error
+
+    os.environ.pop("OFFICE_ALLOW_INPLACE_WRITES", None)
+    os.environ.pop("OFFICE_OUTPUT_MODE", None)
+    os.environ.pop("OFFICE_SOURCE_ROOT", None)
+    os.environ.pop("OFFICE_ALLOWED_BASE_PATHS", None)
+    os.environ.pop("OFFICE_WORKSPACE_ROOT", None)

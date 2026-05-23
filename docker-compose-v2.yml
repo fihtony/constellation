@@ -29,15 +29,13 @@ services:
     image: constellation-v2-init-register:latest
     build:
       context: .
-      dockerfile: agents/compass/Dockerfile
+      dockerfile: scripts/register_agents.Dockerfile
     command: ["python3", "scripts/register_agents.py", "--registered-by", "compose-init"]
     depends_on:
       registry:
         condition: service_healthy
     environment:
       REGISTRY_URL: "http://registry:9000"
-    volumes:
-      - ./config/.env:/app/config/.env:ro
     restart: "no"
     networks:
       - constellation-v2
@@ -151,16 +149,9 @@ services:
       HOST: "0.0.0.0"
       PORT: "8010"
       REGISTRY_URL: "http://registry:9000"
-      AGENT_RUNTIME: "claude-code"
       ARTIFACT_ROOT: /app/artifacts
-      JIRA_BACKEND: ${JIRA_BACKEND:-rest}
-      JIRA_BASE_URL: ${JIRA_BASE_URL:-}
-      JIRA_TOKEN: ${JIRA_TOKEN:-}
-      JIRA_EMAIL: ${JIRA_EMAIL:-}
-      JIRA_CA_BUNDLE: ${JIRA_CA_BUNDLE:-}
     volumes:
       - ./artifacts:/app/artifacts
-      - ./config/.env:/app/config/.env:ro
       - ./agents/jira/.env:/app/agents/jira/.env:ro
     labels:
       constellation.agent_id: "jira"
@@ -195,13 +186,9 @@ services:
       HOST: "0.0.0.0"
       PORT: "8020"
       REGISTRY_URL: "http://registry:9000"
-      AGENT_RUNTIME: "claude-code"
       ARTIFACT_ROOT: /app/artifacts
-      GH_TOKEN: ${GH_TOKEN:-}
-      SCM_REPO_URL: ${SCM_REPO_URL:-}
     volumes:
       - ./artifacts:/app/artifacts
-      - ./config/.env:/app/config/.env:ro
       - ./agents/scm/.env:/app/agents/scm/.env:ro
     labels:
       constellation.agent_id: "scm"
@@ -236,11 +223,9 @@ services:
       HOST: "0.0.0.0"
       PORT: "8040"
       REGISTRY_URL: "http://registry:9000"
-      AGENT_RUNTIME: "claude-code"
       ARTIFACT_ROOT: /app/artifacts
     volumes:
       - ./artifacts:/app/artifacts
-      - ./config/.env:/app/config/.env:ro
       - ./agents/ui_design/.env:/app/agents/ui_design/.env:ro
     labels:
       constellation.agent_id: "ui-design"
