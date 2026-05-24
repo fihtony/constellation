@@ -17,7 +17,7 @@ _RUNTIME_ENV_FILENAMES = (".runtime.env", ".env")
 def _parse_env_file(path: str) -> dict[str, str]:
     """Parse a simple KEY=VALUE .env file (ignoring comments)."""
     values: dict[str, str] = {}
-    if not path or not os.path.exists(path):
+    if not path or not os.path.isfile(path):
         return values
     with open(path, encoding="utf-8") as fh:
         for raw in fh:

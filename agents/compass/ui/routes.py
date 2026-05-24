@@ -20,7 +20,18 @@ def _ui_status(task) -> str:
         "TASK_STATE_WORKING": "active",
         "TASK_STATE_SUBMITTED": "active",
     }
-    return mapping.get(str(value), "active")
+    ui_status = mapping.get(str(value), "active")
+
+    # Check if the task actually failed despite being marked COMPLETED
+    # by examining the message content for error indicators
+    if ui_status == "completed":
+        message = getattr(getattr(task, "status", None), "message", None)
+        if message:
+            text = message.text().lower()
+            if "error" in text or "failed" in text or "status: error" in text:
+                return "failed"
+
+    return ui_status
 
 
 def _task_summary(task) -> str:
