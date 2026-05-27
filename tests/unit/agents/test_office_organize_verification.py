@@ -125,3 +125,28 @@ def test_repair_missing_organize_outputs_materializes_skipped_sources(tmp_path):
 
     errors = _verify_organize_materialization("workspace", str(artifacts_dir), [str(source_root)])
     assert errors == []
+
+
+def test_repair_missing_organize_outputs_removes_unknown_date_bucket(tmp_path):
+    """Canonical repair should not keep `unknown/` date buckets when no date can be inferred."""
+    source_root = tmp_path / "source"
+    essay_dir = source_root / "0103"
+    essay_dir.mkdir(parents=True)
+    essay = essay_dir / "1.txt"
+    essay.write_text(">>> Student Yan\n", encoding="utf-8")
+
+    workspace_root = tmp_path / "workspace"
+    artifacts_dir = workspace_root / "artifacts"
+    wrong_root = artifacts_dir / "organized-output" / "files" / "Yan" / "unknown"
+    wrong_root.mkdir(parents=True)
+    (wrong_root / "0103-1.txt").write_text(">>> Student Yan\n", encoding="utf-8")
+    _write_operation(artifacts_dir, "copy_file", essay, str(wrong_root / "0103-1.txt"))
+
+    repaired = _repair_missing_organize_outputs("workspace", str(artifacts_dir), [str(source_root)])
+
+    assert str(essay.resolve()) in repaired
+    assert (artifacts_dir / "organized-output" / "files" / "Yan" / "0103-1.txt").exists()
+    assert not (artifacts_dir / "organized-output" / "files" / "Yan" / "unknown" / "0103-1.txt").exists()
+
+    errors = _verify_organize_materialization("workspace", str(artifacts_dir), [str(source_root)])
+    assert errors == []

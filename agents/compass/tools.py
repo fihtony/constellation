@@ -148,16 +148,20 @@ def _office_mount_plan(source_paths: list[str], output_mode: str, launcher) -> d
 
         if is_directory_request:
             host_bind_source = host_path_stripped
+            bind_relative_path = os.path.basename(host_path_stripped)
             relative_path = ""
         elif relative_path:
             host_bind_source = os.path.dirname(host_path_stripped) or os.sep
+            bind_relative_path = ""
         else:
             host_bind_source = host_path_stripped
+            bind_relative_path = ""
 
-        bind_key = (os.path.realpath(host_bind_source), read_only)
+        bind_key = (os.path.realpath(host_bind_source), read_only, bind_relative_path)
         mount_target = mount_targets.get(bind_key)
         if not mount_target:
-            mount_target = f"{source_root}/input-{len(mount_targets)}"
+            mount_base = f"{source_root}/input-{len(mount_targets)}"
+            mount_target = os.path.join(mount_base, bind_relative_path) if bind_relative_path else mount_base
             mount_targets[bind_key] = mount_target
             bind_suffix = ":ro" if read_only else ""
             extra_binds.append(f"{host_bind_source}:{mount_target}{bind_suffix}")

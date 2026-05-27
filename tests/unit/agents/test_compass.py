@@ -518,7 +518,8 @@ class TestCompassTools:
         payload = json.loads(result.output)
         assert payload["status"] == "completed"
         assert launched["overrides"]["env"]["OFFICE_ALLOW_INPLACE_WRITES"] == "true"
-        assert launched["overrides"]["extra_binds"] == [f"/host{source_dir}:/app/userdata/input-0"]
+        assert launched["overrides"]["extra_binds"] == [f"/host{source_dir}:/app/userdata/input-0/folder"]
+        assert launched["overrides"]["env"]["OFFICE_ALLOWED_BASE_PATHS"] == "/app/userdata/input-0/folder"
 
     def test_dispatch_office_task_translates_host_paths_visible_only_via_workspace_mount(self, monkeypatch, tmp_path):
         from agents.compass.tools import DispatchOfficeTask
@@ -577,7 +578,8 @@ class TestCompassTools:
 
         payload = json.loads(result.output)
         assert payload["status"] == "completed"
-        assert launched["overrides"]["extra_binds"] == ["/host-mounted/tests/data/2026:/app/userdata/input-0:ro"]
+        assert launched["overrides"]["extra_binds"] == ["/host-mounted/tests/data/2026:/app/userdata/input-0/2026:ro"]
+        assert launched["overrides"]["env"]["OFFICE_ALLOWED_BASE_PATHS"] == "/app/userdata/input-0/2026"
 
     def test_office_dispatch_accepts_registry_definition_for_per_task_launch(self, monkeypatch):
         from agents.compass.agent import _dispatch_office_request

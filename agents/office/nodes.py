@@ -8,6 +8,7 @@ report_result   — Write pr-evidence.json, return result
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import filecmp
 import shutil
 import threading
 import time
+import unicodedata
 from typing import Any
 
 from agents.office.office_tools import (
@@ -460,6 +462,95 @@ def _verify_delivery_paths(expected_paths: list[str], output_mode: str, artifact
     return (not errors), errors
 
 
+def _summary_similarity_key(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", name)
+    stripped = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", "", stripped.casefold())
+
+
+def _select_summary_rename_candidate(expected_path: str, candidate_paths: list[str]) -> str:
+    expected_name = os.path.basename(expected_path)
+    if not expected_name.endswith(".summary.md"):
+        return ""
+
+    expected_stem = expected_name[:-len(".summary.md")]
+    expected_key = _summary_similarity_key(expected_stem)
+    scored: list[tuple[float, str]] = []
+    for candidate_path in candidate_paths:
+        candidate_name = os.path.basename(candidate_path)
+        if candidate_name == "combined-summary.md" or not candidate_name.endswith(".summary.md"):
+            continue
+        candidate_stem = candidate_name[:-len(".summary.md")]
+        candidate_key = _summary_similarity_key(candidate_stem)
+        if not candidate_key:
+            continue
+        score = 2.0 if candidate_key == expected_key else difflib.SequenceMatcher(None, expected_key, candidate_key).ratio()
+        scored.append((score, candidate_path))
+
+    if not scored:
+        return ""
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_candidate = scored[0]
+    if best_score < 0.92:
+        return ""
+    if len(scored) > 1 and best_score < 2.0 and abs(best_score - scored[1][0]) < 0.02:
+        return ""
+    return best_candidate
+
+
+def _canonicalize_summary_output_filenames(
+    validated_paths: list[str],
+    output_mode: str,
+    artifacts_dir: str,
+) -> list[str]:
+    """Rename near-miss summary filenames back to exact source basenames.
+
+    Some runtimes preserve the right count of per-document summaries but drift a
+    filename slightly (for example Unicode normalization or a minor spelling
+    rewrite). Delivery verification is contract-based and expects exact source
+    basenames, so we repair only high-confidence near-miss outputs here.
+    """
+    repaired: list[str] = []
+    file_paths = [path for path in validated_paths if os.path.isfile(path)]
+    if not file_paths:
+        return repaired
+
+    expected_by_dir: dict[str, list[str]] = {}
+    for path in file_paths:
+        expected_path = _target_output_path(output_mode, path, artifacts_dir, ".summary.md")
+        expected_by_dir.setdefault(os.path.dirname(expected_path), []).append(expected_path)
+
+    for output_dir, expected_paths in expected_by_dir.items():
+        if not os.path.isdir(output_dir):
+            continue
+        candidate_paths = [
+            os.path.join(output_dir, name)
+            for name in os.listdir(output_dir)
+            if name.endswith(".summary.md") and name != "combined-summary.md"
+        ]
+        unmatched_candidates = {path for path in candidate_paths if path not in expected_paths}
+
+        for expected_path in expected_paths:
+            if os.path.exists(expected_path):
+                unmatched_candidates.discard(expected_path)
+                continue
+
+            candidate_path = _select_summary_rename_candidate(expected_path, sorted(unmatched_candidates))
+            if not candidate_path:
+                continue
+
+            try:
+                os.replace(candidate_path, expected_path)
+            except OSError:
+                continue
+
+            unmatched_candidates.discard(candidate_path)
+            repaired.append(expected_path)
+
+    return repaired
+
+
 def _ensure_combined_summary_exact_filenames(
     validated_paths: list[str],
     output_mode: str,
@@ -518,6 +609,13 @@ def _ensure_combined_summary_exact_filenames(
         return
 
 
+def _optional_safe_path_segment(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return _safe_path_segment(text)
+
+
 def _canonical_organize_destination(output_root: str, item: dict[str, Any]) -> str:
     suggested = str(item.get("suggested_destination") or "").strip()
     if suggested:
@@ -526,9 +624,9 @@ def _canonical_organize_destination(output_root: str, item: dict[str, Any]) -> s
             return os.path.realpath(os.path.join(output_root, *segments))
 
     relative_stem = str(item.get("relative_path") or "").replace(os.sep, "-").replace("/", "-")
-    primary_entity = _safe_path_segment(str(item.get("primary_entity") or "").strip())
-    date_bucket = _safe_path_segment(str(item.get("inferred_date_bucket") or "").strip())
-    category = _safe_path_segment(str(item.get("category") or "other").strip() or "other")
+    primary_entity = _optional_safe_path_segment(item.get("primary_entity"))
+    date_bucket = _optional_safe_path_segment(item.get("inferred_date_bucket"))
+    category = _optional_safe_path_segment(str(item.get("category") or "other").strip() or "other") or "other"
 
     if primary_entity and date_bucket:
         return os.path.realpath(os.path.join(output_root, primary_entity, date_bucket, relative_stem))
@@ -779,6 +877,10 @@ def execute_office_work(state: dict) -> dict:
 
     if result.success:
         if capability == "summarize":
+            repaired_paths = _canonicalize_summary_output_filenames(validated_paths, output_mode, artifacts_dir)
+            if repaired_paths:
+                logger.info("execute_office_work: repaired %d summary filenames", len(repaired_paths))
+                _task_log(state, "info", "canonicalized summary filenames", repaired_files=len(repaired_paths))
             _ensure_combined_summary_exact_filenames(validated_paths, output_mode, artifacts_dir)
         expected_outputs = _expected_output_paths(capability, validated_paths, output_mode, artifacts_dir)
         delivery_ok, delivery_errors = _verify_delivery_paths(expected_outputs, output_mode, artifacts_dir)
