@@ -1,5 +1,7 @@
 """Unit tests for the per-task container launcher."""
 
+from pathlib import Path
+
 from framework.agent import AgentDefinition, LaunchSpec
 from framework.launcher import Launcher
 
@@ -107,3 +109,45 @@ def test_resolve_container_path_maps_host_mounts(monkeypatch):
     translated = launcher.resolve_container_path("/Users/test/project/tests/data/2026")
 
     assert translated == "/workspace/tests/data/2026"
+
+
+def test_launch_instance_creates_task_dir_via_container_path_first(monkeypatch):
+    monkeypatch.setenv("ARTIFACT_ROOT", "/app/artifacts")
+    monkeypatch.setenv("REGISTRY_URL", "http://registry:9000")
+
+    launcher = Launcher(socket_path="/tmp/fake-docker.sock")
+    requests = []
+    mkdir_calls = []
+
+    def fake_request(method, path, payload=None):
+        requests.append((method, path, payload))
+        return {}
+
+    def fake_makedirs(path, exist_ok=False):
+        mkdir_calls.append(path)
+        if str(path).startswith("/app/artifacts"):
+            return None
+        raise AssertionError(f"unexpected fallback makedirs path: {path}")
+
+    monkeypatch.setattr(launcher, "_request", fake_request)
+    monkeypatch.setattr(
+        launcher,
+        "resolve_host_path",
+        lambda path: "/host/artifacts" if path == "/app/artifacts" else "/host/artifacts/task-123",
+    )
+    monkeypatch.setattr("framework.launcher.os.makedirs", fake_makedirs)
+    monkeypatch.setattr("framework.launcher.time.sleep", lambda _: None)
+
+    agent = AgentDefinition(
+        agent_id="code-review",
+        name="Code Review Agent",
+        description="Code Review",
+        launch_spec=LaunchSpec(image="constellation-v2-code-review:latest", port=8060),
+    )
+
+    launcher.launch_instance(agent, "task-123")
+
+    assert mkdir_calls == ["/app/artifacts/task-123"]
+    create_requests = [payload for method, path, payload in requests if method == "POST" and path.startswith("/v1.43/containers/create")]
+    assert len(create_requests) == 1
+    assert "/host/artifacts/task-123:/app/artifacts/task-123" in create_requests[0]["HostConfig"]["Binds"]

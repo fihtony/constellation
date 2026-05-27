@@ -795,6 +795,8 @@ async def review_result(state: dict) -> dict:
                 "design_context": state.get("design_context"),
                 "workspace_path": state.get("workspace_path", ""),
                 "context_manifest_path": state.get("context_manifest_path", ""),
+                "orchestrator_task_id": state.get("_task_id", ""),
+                "task_id": state.get("_task_id", ""),
             },
         )
         payload = json.loads(result_str) if result_str else {}

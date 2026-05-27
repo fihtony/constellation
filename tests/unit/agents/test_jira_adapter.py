@@ -170,6 +170,31 @@ class TestJiraAdapterDispatch:
         assert data["ticket"]["key"] == "PROJ-99"
 
     @pytest.mark.asyncio
+    async def test_fetch_ticket_persists_workspace_artifact(self, tmp_path):
+        msg = {
+            "parts": [],
+            "metadata": {
+                "requestedCapability": "jira.ticket.fetch",
+                "ticketKey": "PROJ-77",
+                "taskId": "task-123",
+                "workspacePath": str(tmp_path),
+            },
+        }
+
+        result = await self.adapter.handle_message(msg)
+        task = result.get("task", result)
+        art_text = task["artifacts"][0]["parts"][0]["text"]
+        data = json.loads(art_text)
+
+        ticket_path = tmp_path / "jira" / "PROJ-77" / "ticket.json"
+        assert data["local_folder"] == str(tmp_path / "jira" / "PROJ-77")
+        assert data["files"] == ["jira/PROJ-77/ticket.json"]
+        assert ticket_path.is_file()
+        saved = json.loads(ticket_path.read_text(encoding="utf-8"))
+        assert saved["data"]["key"] == "PROJ-77"
+        assert self.provider.calls[-1] == ("fetch_issue", {"ticket_key": "PROJ-77"})
+
+    @pytest.mark.asyncio
     async def test_search(self):
         msg = {
             "parts": [{"text": "project = PROJ"}],

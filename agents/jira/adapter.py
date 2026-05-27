@@ -127,9 +127,15 @@ class JiraAgentAdapter(BaseAgent):
         provider = self._get_provider()
 
         if capability in ("jira.ticket.fetch", "jira.ticket.get"):
+            from agents.jira.tools import _fetch_jira_ticket_payload
+
             key = meta.get("ticketKey") or text.strip()
-            data, status = provider.fetch_issue(key)
-            return {"ticket": data, "status": status}
+            return _fetch_jira_ticket_payload(
+                ticket_key=key,
+                task_id=meta.get("taskId", ""),
+                workspace_path=meta.get("workspacePath", ""),
+                provider=provider,
+            )
 
         if capability == "jira.ticket.search":
             jql = meta.get("jql") or text.strip()

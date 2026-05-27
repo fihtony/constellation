@@ -93,6 +93,31 @@ def _child_path(parent: str, child: str) -> str:
     return os.path.join(parent, child)
 
 
+def _ensure_task_workspace_dir(container_path: str, host_path: str) -> None:
+    """Create the task workspace directory from the current runtime's visible path.
+
+    When Launcher runs inside a container, *host_path* points at a host-only path
+    (for example `/Users/...`) that the current process cannot write directly.
+    Creating the bind-mounted *container_path* ensures the directory materializes
+    on the host through the existing `/app/artifacts` bind mount. When Launcher
+    runs on the host, creating *container_path* usually fails, so we fall back to
+    *host_path*.
+    """
+
+    candidates: list[str] = []
+    for candidate in (container_path, host_path):
+        value = str(candidate or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    for candidate in candidates:
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            return
+        except OSError:
+            continue
+
+
 class Launcher:
     def __init__(self, socket_path: str | None = None):
         self.socket_path = socket_path or os.environ.get("DOCKER_SOCKET", _CHILD_SOCKET_PATH)
@@ -307,10 +332,7 @@ class Launcher:
             if artifact_root_host and (not task_workspace_host or task_workspace_host == task_workspace_container):
                 task_workspace_host = _child_path(artifact_root_host, task_id)
             if task_workspace_host:
-                try:
-                    os.makedirs(task_workspace_host, exist_ok=True)
-                except OSError:
-                    pass
+                _ensure_task_workspace_dir(task_workspace_container, task_workspace_host)
                 binds.append(f"{task_workspace_host}:{task_workspace_container}")
                 env["ARTIFACT_ROOT"] = artifact_root_container
                 env["CONSTELLATION_TASK_WORKSPACE"] = task_workspace_container

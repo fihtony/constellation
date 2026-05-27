@@ -147,6 +147,80 @@ def _run_mandatory_validation(repo_path: str, workspace_path: str, cycle: int) -
     return data
 
 
+def _tail_text(text: str, limit: int = 600) -> str:
+    """Return the last *limit* characters of text for compact logging."""
+    normalized = str(text or "").strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[-limit:]
+
+
+def _git_worktree_changed_files(repo_path: str) -> list[str]:
+    """Return tracked/untracked worktree files from git status."""
+    if not repo_path or not os.path.isdir(repo_path):
+        return []
+    try:
+        from framework.env_utils import build_isolated_git_env
+
+        proc = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=repo_path,
+            env=build_isolated_git_env(scope="web-dev-worktree-status"),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    files: list[str] = []
+    for line in proc.stdout.splitlines():
+        path = line[3:].strip() if len(line) > 3 else line.strip()
+        if path:
+            files.append(path)
+    return sorted(set(files))
+
+
+def _git_branch_changed_files(repo_path: str, base_ref: str = "main") -> list[str]:
+    """Return files changed on the current branch relative to *base_ref*."""
+    if not repo_path or not os.path.isdir(repo_path):
+        return []
+    try:
+        from framework.env_utils import build_isolated_git_env
+
+        proc = subprocess.run(
+            ["git", "diff", "--name-only", f"{base_ref}..HEAD"],
+            cwd=repo_path,
+            env=build_isolated_git_env(scope="web-dev-branch-status"),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
+
+
+def _summarize_validation_commands(data: dict) -> list[dict[str, Any]]:
+    """Return compact validation command summaries for agent.log."""
+    summaries: list[dict[str, Any]] = []
+    for command in data.get("commands") or []:
+        parts = command.get("command") or []
+        summaries.append(
+            {
+                "command": " ".join(str(part) for part in parts),
+                "returncode": command.get("returncode"),
+                "duration_seconds": command.get("duration_seconds"),
+            }
+        )
+    return summaries
+
+
 def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
     """Call a boundary agent tool via the global ToolRegistry.
 
@@ -698,6 +772,16 @@ async def implement_changes(state: dict) -> dict:
 
     # Use Claude Code native tools (Bash, Read, Write, Glob, Grep) — no constellation
     # MCP bridge needed.  With cwd=repo_path, all relative paths resolve correctly.
+    repo_path = state.get("repo_path", "")
+    branch_name = state.get("branch_name", "")
+    changed_before = set(_git_branch_changed_files(repo_path)) | set(_git_worktree_changed_files(repo_path))
+    log.info(
+        "implement_changes started",
+        repo_path=repo_path,
+        branch=branch_name,
+        jira_local_folder=state.get("jira_local_folder", ""),
+        design_local_folder=state.get("design_local_folder", ""),
+    )
     print(f"[{_AGENT_ID}] implement_changes: repo_path={state.get('repo_path', '')!r} (native tools)")
     result = runtime.run_agentic(
         task=prompt,
@@ -708,6 +792,21 @@ async def implement_changes(state: dict) -> dict:
         timeout=1800,
         plugin_manager=state.get("_plugin_manager"),
     )
+    changed_after = set(_git_branch_changed_files(repo_path)) | set(_git_worktree_changed_files(repo_path))
+    changed_files = sorted(changed_after)
+    new_files = sorted(changed_after - changed_before)
+    log.info(
+        "implement_changes result",
+        success=result.success,
+        turns=result.turns_used,
+        files_changed=len(changed_files),
+        new_files=len(new_files),
+        files=changed_files[:12],
+    )
+    if new_files:
+        log.debug("implement_changes new files", files=new_files[:20])
+    if result.summary:
+        log.debug("implement_changes summary", summary=result.summary[:500])
     print(f"[{_AGENT_ID}] implement_changes done: success={result.success} turns={result.turns_used} summary={result.summary[:300]!r}")
 
     if not result.success:
@@ -781,9 +880,16 @@ async def run_tests(state: dict) -> dict:
     build_ok = data.get("build_ok", False)
     test_ok = data.get("test_ok", False)
     test_passed = int(failed) == 0 and install_ok and build_ok and test_ok
+    command_summaries = _summarize_validation_commands(data)
     log.info("run_tests result", passed=data.get("passed", 0), failed=failed,
              install_ok=install_ok, build_ok=build_ok, test_ok=test_ok,
              test_passed=test_passed, cycle=test_cycles)
+    if command_summaries:
+        log.info("run_tests commands", commands=command_summaries)
+    if data.get("errors"):
+        log.warn("run_tests errors", errors=data.get("errors", []), output_tail=_tail_text(data.get("output", ""), 1200))
+    else:
+        log.debug("run_tests output tail", output_tail=_tail_text(data.get("output", ""), 500))
 
     # Write per-cycle test results for auditability
     if workspace_path:
@@ -872,6 +978,7 @@ async def self_assess(state: dict) -> dict:
     runtime = state.get("_runtime")
     assess_cycles = state.get("assess_cycles", 0) + 1
     max_assess_cycles = 3
+    log.info("self_assess started", cycle=assess_cycles, max_cycles=max_assess_cycles)
 
     if not runtime:
         return {
@@ -1019,14 +1126,24 @@ async def self_assess(state: dict) -> dict:
             pass
 
     if score >= 0.9 and verdict != "fail":
-        return {
-            "self_assessment": data,
-            "assess_cycles": assess_cycles,
-            "route": "pass",
-        }
+        route = "pass"
+    elif assess_cycles >= max_assess_cycles:
+        route = "pass"
+    else:
+        route = "fail"
 
-    if assess_cycles >= max_assess_cycles:
-        # Exhausted assess cycles — proceed to PR rather than blocking on user input
+    log.info(
+        "self_assess result",
+        score=score,
+        verdict=verdict,
+        gaps=len(gaps),
+        route=route,
+        cycle=assess_cycles,
+    )
+    if gaps:
+        log.warn("self_assess gaps", gaps=gaps[:10], summary=str(data.get("summary", ""))[:300])
+
+    if route == "pass":
         return {
             "self_assessment": data,
             "assess_cycles": assess_cycles,
@@ -1042,9 +1159,12 @@ async def self_assess(state: dict) -> dict:
 
 async def fix_gaps(state: dict) -> dict:
     """Fix self-assessment gaps before re-running tests and self-assessment."""
+    log = _logger(state)
+    log.node("fix_gaps")
     runtime = state.get("_runtime")
 
     if not runtime:
+        log.info("fix_gaps skipped — no runtime")
         return {"fix_gaps_attempted": True}
 
     from agents.web_dev.prompts import FIX_GAPS_SYSTEM, FIX_GAPS_TEMPLATE
@@ -1052,6 +1172,7 @@ async def fix_gaps(state: dict) -> dict:
     assessment = state.get("self_assessment", {})
     gaps = assessment.get("gaps", [])
     changed_files = state.get("changes_made", [])
+    log.info("fix_gaps started", gaps=len(gaps), files_changed=len(changed_files))
 
     prompt = FIX_GAPS_TEMPLATE.format(
         gaps="\n".join(f"- {g}" for g in gaps) if gaps else "No specific gaps listed.",
@@ -1067,6 +1188,7 @@ async def fix_gaps(state: dict) -> dict:
         timeout=300,
         plugin_manager=state.get("_plugin_manager"),
     )
+    log.info("fix_gaps result", success=result.success, summary=result.summary[:300])
 
     return {
         "fix_gaps_attempted": True,
@@ -1372,8 +1494,9 @@ async def capture_screenshot(state: dict) -> dict:
                         try:
                             # No font blocking — allow all requests through so the browser
                             # loads Google Fonts normally (Work Sans, Newsreader, Material
-                            # Symbols). Playwright's 'load' event fires when all resources
-                            # (including fonts) are ready, so no extra wait is needed.
+                            # Symbols). Wait for the Font Loading API as well so screenshot
+                            # evidence reflects the real rendered icon glyphs instead of the
+                            # raw icon token text.
 
                             # Navigate to the detected feature URL (not just root).
                             # For React Router SPAs, vite preview serves all routes
@@ -1387,6 +1510,16 @@ async def capture_screenshot(state: dict) -> dict:
                                 wait_until="load",
                                 timeout=30000,
                             )
+                            try:
+                                await pg.evaluate(
+                                    """async () => {
+                                        if (document.fonts && document.fonts.ready) {
+                                            await document.fonts.ready;
+                                        }
+                                    }"""
+                                )
+                            except Exception:
+                                pass
                             # Wait for React to hydrate and CSS animations to settle.
                             # Use a longer wait for production builds via vite preview
                             # since the bundled JS needs to parse + execute + render.
@@ -1514,10 +1647,10 @@ async def capture_screenshot(state: dict) -> dict:
                         "--headless=new", "--no-sandbox", "--disable-gpu",
                         "--disable-dev-shm-usage",
                         "--run-all-compositor-stages-before-draw",
-                        # Block external font CDNs so Chrome doesn't wait on them.
-                        "--host-rules=MAP fonts.googleapis.com 127.0.0.1,"
-                        "MAP fonts.gstatic.com 127.0.0.1,"
-                        "MAP use.typekit.net 127.0.0.1",
+                        # Keep Google Fonts/Material Symbols reachable so UI screenshots
+                        # reflect the same icon/font rendering that the real page uses.
+                        # Only block unrelated font CDNs that sometimes hang in CI.
+                        "--host-rules=MAP use.typekit.net 127.0.0.1",
                     ]
                     for _out_path, _size in [(desktop_png, "1280,900"), (mobile_png, "375,812")]:
                         chrome_result = subprocess.run(

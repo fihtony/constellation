@@ -85,6 +85,23 @@ def _downstream_timeout_seconds(kind: str) -> int:
         return default
 
 
+def _derive_launch_task_id(
+    orchestrator_task_id: str = "",
+    task_id: str = "",
+    workspace_path: str = "",
+) -> str:
+    explicit = (orchestrator_task_id or task_id or "").strip()
+    if explicit:
+        return explicit
+
+    workspace = (workspace_path or "").strip().rstrip("/")
+    if workspace:
+        leaf = os.path.basename(workspace)
+        if leaf:
+            return leaf
+    return ""
+
+
 def _dispatch_via_launcher(
     definition: dict[str, Any],
     *,
@@ -496,11 +513,16 @@ class DispatchWebDev(BaseTool):
         try:
             from framework.a2a.client import dispatch_sync
             timeout_seconds = _downstream_timeout_seconds("web_dev")
+            launch_task_id = _derive_launch_task_id(
+                orchestrator_task_id=orchestrator_task_id,
+                task_id=task_id,
+                workspace_path=workspace_path,
+            )
             if _is_per_task_definition(definition):
                 result = _dispatch_via_launcher(
                     definition,
                     capability=capability,
-                    launch_task_id=orchestrator_task_id or task_id or "web-dev-task",
+                    launch_task_id=launch_task_id or "web-dev-task",
                     message_parts=[{"text": task_description}],
                     metadata=meta,
                     timeout=timeout_seconds,
@@ -634,11 +656,16 @@ class DispatchCodeReview(BaseTool):
         try:
             from framework.a2a.client import dispatch_sync
             timeout_seconds = _downstream_timeout_seconds("code_review")
+            launch_task_id = _derive_launch_task_id(
+                orchestrator_task_id=orchestrator_task_id,
+                task_id=task_id,
+                workspace_path=workspace_path,
+            )
             if _is_per_task_definition(definition):
                 result = _dispatch_via_launcher(
                     definition,
                     capability=capability,
-                    launch_task_id=orchestrator_task_id or task_id or "code-review-task",
+                    launch_task_id=launch_task_id or "code-review-task",
                     message_parts=[{"text": diff_summary or pr_url}],
                     metadata=meta,
                     timeout=timeout_seconds,

@@ -52,10 +52,16 @@ and tests — especially when the repository is empty or only contains a README.
 3. Do NOT add features, refactors, or improvements beyond the explicit request.
 4. Follow OWASP security guidelines: never introduce injection vectors, \
 hardcoded credentials, or unvalidated input.
-5. After all code changes are complete:
+5. This node is for implementation only. Do NOT start long-running or interactive \
+commands here. Never leave `npm run dev`, `vite`, `npm run test`, bare `vitest`, \
+Playwright UI mode, or any watcher/server process running from this node. The \
+workflow has dedicated later nodes for deterministic validation and screenshot \
+capture. If you need a quick executable check here, only use one-shot commands \
+that exit on their own, such as `npm run build` or `npx vitest --run`.
+6. After all code changes are complete:
    a. Stage all changes:  git add -A
    b. Commit with a descriptive message: git commit -m 'feat(<jira-key>): <summary>'
-6. Produce a brief summary of what was changed and why.
+7. Produce a brief summary of what was changed and why.
 
 BLANK SCREEN PREVENTION RULES (MANDATORY — apply to every React/Vue/Vite task):
 These rules prevent the most common cause of blank screens in React applications.
@@ -68,7 +74,9 @@ A. ROUTING & ENTRY POINT — MANDATORY:
        import LessonLibraryPage from './pages/LessonLibraryPage'
        function App() { return <LessonLibraryPage /> }
    - NEVER create a page component in isolation without wiring it into the app entry.
-   - After wiring, run `npm run dev` briefly to confirm the page renders.
+   - Do NOT start `npm run dev` from this node. Confirm wiring via code inspection \
+     and one-shot commands only. Later workflow nodes own browser rendering and \
+     screenshot capture.
 
 E. ROOT ROUTE REDIRECT — MANDATORY for single-feature apps:
    - If the app uses React Router AND the ONLY route is a named path like "/lessons",
@@ -105,6 +113,8 @@ D. BUILD VERIFICATION — MANDATORY BEFORE PR:
    - After all code is written, run: `npm run build`
    - If build fails with TypeScript errors, fix ALL errors — do not skip.
    - If build fails with missing module errors, check import paths and file names.
+  - Do NOT run bare `npm run test` here when it resolves to a watch-mode command \
+    such as `vitest`; the dedicated validation node will run tests deterministically.
    - Only proceed to PR when `npm run build` exits with code 0.
 
 STRICT DESIGN FIDELITY (MANDATORY for all UI tasks when a Design HTML Reference is provided):
@@ -203,6 +213,9 @@ A. ICON RENDERING — NEVER SHOW ICON NAMES AS TEXT:
    OPTION 1 — MATERIAL SYMBOLS OUTLINED (used by Google Stitch designs):
    This is the MOST COMMON icon approach in Google Stitch-generated designs.
    The key requirement is loading the VARIABLE FONT and setting CSS properties.
+  When the Design HTML Reference already contains the exact icon span/class,
+  preserve that same icon family and variant. Do NOT substitute another icon
+  family, inline SVG, or a different Material icon set just because it looks close.
    a. In index.html, load the variable-weight font (MUST include wght,FILL range):
       <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
    b. In index.css (or a global CSS file), add the class definition:
@@ -227,6 +240,7 @@ A. ICON RENDERING — NEVER SHOW ICON NAMES AS TEXT:
    d. Verify after implementation:
       - Build succeeds (npm run build)
       - No JSX with icon text inside <span> without "material-symbols-outlined" class
+    - If the Stitch HTML shows `material-symbols-outlined` + `arrow_forward`, keep that exact combination in the implemented UI
       - Run: grep -rn 'arrow_forward|chevron|close|search|menu' src/ | grep -v 'material-symbols'
         → If results found outside the class, fix them.
 

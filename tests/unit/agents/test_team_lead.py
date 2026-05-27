@@ -423,6 +423,34 @@ class TestDispatchDevAgentValidation:
         assert result["screenshot_included"] is True
         assert result["screenshot_uploaded"] is True
 
+    async def test_review_result_passes_master_task_id_to_code_review(self, monkeypatch):
+        from agents.team_lead.nodes import review_result
+
+        captured: dict[str, object] = {}
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                assert name == "dispatch_code_review"
+                captured.update(args)
+                return json.dumps({"verdict": "approved", "summary": "ok"})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await review_result(
+            {
+                "_task_id": "task-123",
+                "pr_url": "https://github.com/org/repo/pull/1",
+                "dev_result": {"summary": "done"},
+                "analysis_summary": "Implement CSTL-1",
+                "workspace_path": "/tmp/workspace",
+                "context_manifest_path": "team-lead/context-manifest.json",
+            }
+        )
+
+        assert captured["orchestrator_task_id"] == "task-123"
+        assert captured["task_id"] == "task-123"
+        assert result["route"] == "approved"
+
     async def test_report_success_propagates_screenshot_evidence(self):
         from agents.team_lead.nodes import report_success
 
@@ -733,3 +761,126 @@ class TestTeamLeadTools:
         DispatchCodeReview().execute_sync(pr_url="https://example.test/pr/1")
 
         assert captured["timeout"] == 1800
+
+    def test_dispatch_code_review_launches_per_task_agent(self, monkeypatch):
+        from agents.team_lead.tools import DispatchCodeReview
+
+        calls = {"dispatch": [], "launch": [], "destroy": []}
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return ""
+
+            def get_capability_definition(self, capability):
+                return {
+                    "agent_id": "code-review",
+                    "name": "Code Review Agent",
+                    "execution_mode": "per-task",
+                    "launch_spec": {
+                        "image": "constellation-v2-code-review:latest",
+                        "port": 8060,
+                    },
+                }
+
+        class StubLauncher:
+            def launch_instance(self, definition, task_id, launch_overrides=None):
+                calls["launch"].append((definition, task_id, launch_overrides))
+                return {
+                    "service_url": "http://launched-code-review:8060",
+                    "container_name": "code-review-task-1234",
+                }
+
+            def destroy_instance(self, agent_id, container_name):
+                calls["destroy"].append((agent_id, container_name))
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setattr("agents.team_lead.tools.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("agents.team_lead.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+
+        def _dispatch_sync(**kwargs):
+            calls["dispatch"].append(kwargs)
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [
+                        {
+                            "parts": [{"text": json.dumps({"verdict": "approved", "summary": "ok"})}],
+                            "metadata": {"agentId": "code-review"},
+                        }
+                    ],
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        result = DispatchCodeReview().execute_sync(
+            pr_url="https://example.test/pr/1",
+            workspace_path="/tmp/workspace",
+            orchestrator_task_id="task-123",
+            task_id="task-123",
+        )
+
+        payload = json.loads(result.output)
+        assert payload["verdict"] == "approved"
+        assert calls["launch"][0][1] == "task-123"
+        assert calls["dispatch"][0]["url"] == "http://launched-code-review:8060"
+        assert calls["dispatch"][0]["metadata"]["orchestratorTaskId"] == "task-123"
+        assert calls["dispatch"][0]["metadata"]["workspacePath"] == "/tmp/workspace"
+        assert calls["destroy"] == [("code-review", "code-review-task-1234")]
+
+    def test_dispatch_code_review_derives_launch_task_id_from_workspace_path(self, monkeypatch):
+        from agents.team_lead.tools import DispatchCodeReview
+
+        calls = {"launch": []}
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return ""
+
+            def get_capability_definition(self, capability):
+                return {
+                    "agent_id": "code-review",
+                    "name": "Code Review Agent",
+                    "execution_mode": "per-task",
+                    "launch_spec": {
+                        "image": "constellation-v2-code-review:latest",
+                        "port": 8060,
+                    },
+                }
+
+        class StubLauncher:
+            def launch_instance(self, definition, task_id, launch_overrides=None):
+                calls["launch"].append(task_id)
+                return {
+                    "service_url": "http://launched-code-review:8060",
+                    "container_name": "code-review-task-derived",
+                }
+
+            def destroy_instance(self, agent_id, container_name):
+                return None
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setattr("agents.team_lead.tools.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("agents.team_lead.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            "framework.a2a.client.dispatch_sync",
+            lambda **kwargs: {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"parts": [{"text": json.dumps({"verdict": "approved"})}]}],
+                }
+            },
+        )
+
+        DispatchCodeReview().execute_sync(
+            pr_url="https://example.test/pr/1",
+            workspace_path="/app/artifacts/task-39c4f352bb20",
+        )
+
+        assert calls["launch"] == ["task-39c4f352bb20"]
