@@ -224,6 +224,8 @@ def dispatch_sync(
         "configuration": {"returnImmediately": True},
     }
 
+    deadline = time.time() + timeout
+
     data = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         f"{url.rstrip('/')}/message:send",
@@ -231,26 +233,32 @@ def dispatch_sync(
         headers={"Content-Type": "application/json; charset=utf-8"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    initial_timeout = max(1, timeout)
+    with urllib.request.urlopen(req, timeout=initial_timeout) as resp:
         response = json.loads(resp.read())
 
     task_data = response.get("task", response)
     task_id = task_data.get("id", "")
+
+    terminal = {
+        "TASK_STATE_COMPLETED", "TASK_STATE_FAILED",
+        "TASK_STATE_CANCELLED", "TASK_STATE_INPUT_REQUIRED",
+    }
+    initial_state = task_data.get("status", {}).get("state", "")
+    if initial_state in terminal:
+        return response
+
     if not task_id:
         return response
 
     # Poll until terminal state
     poll_url = f"{url.rstrip('/')}/tasks/{task_id}"
-    deadline = time.time() + timeout
-    terminal = {
-        "TASK_STATE_COMPLETED", "TASK_STATE_FAILED",
-        "TASK_STATE_CANCELLED", "TASK_STATE_INPUT_REQUIRED",
-    }
 
     while time.time() < deadline:
         get_req = urllib.request.Request(poll_url, method="GET")
         try:
-            with urllib.request.urlopen(get_req, timeout=30) as resp:
+            remaining = max(1, int(deadline - time.time()))
+            with urllib.request.urlopen(get_req, timeout=min(30, remaining)) as resp:
                 result = json.loads(resp.read())
             state = result.get("task", result).get("status", {}).get("state", "")
             if state in terminal:

@@ -105,6 +105,35 @@ class TestScmAdapterCloneBehavior:
 
 
 class TestScmAdapterPrEvidenceCapabilities:
+    def test_dispatch_create_pr_flattens_pr_number(self):
+        class FakeClient:
+            def create_pr(self, owner, repo, from_branch, to_branch, title, description):
+                return {
+                    "id": 42,
+                    "title": title,
+                    "links": {"self": [{"href": "https://github.com/org/repo/pull/42"}]},
+                }, "created"
+
+        adapter = object.__new__(SCMAgentAdapter)
+        adapter._get_client = lambda: FakeClient()  # type: ignore[attr-defined]
+
+        result = adapter._dispatch(
+            "scm.pr.create",
+            "Create title",
+            {"metadata": {
+                "project": "org",
+                "repo": "repo",
+                "sourceBranch": "feature/test",
+                "targetBranch": "main",
+                "title": "Create title",
+                "description": "Body",
+            }},
+        )
+
+        assert result["status"] == "created"
+        assert result["prUrl"] == "https://github.com/org/repo/pull/42"
+        assert result["prNumber"] == 42
+
     def test_dispatch_upload_pr_image_calls_client(self, tmp_path):
         image_path = tmp_path / "screen.png"
         image_path.write_bytes(b"png")

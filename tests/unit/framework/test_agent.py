@@ -46,7 +46,31 @@ async def test_base_agent_start_registers_live_instance(monkeypatch):
     monkeypatch.setenv("ADVERTISED_BASE_URL", "http://team-lead:8030")
     monkeypatch.setenv("CONTAINER_ID", "container-123")
 
+    class _FakeConfig:
+        def to_dict(self):
+            return {
+                "agent_id": "team-lead",
+                "name": "Team Lead Agent",
+                "description": "test",
+                "version": "1.0.0",
+                "port": 8030,
+                "execution_mode": "persistent",
+                "capabilities": ["team-lead.task.execute"],
+                "scaling_policy": {"maxInstances": 1},
+            }
+
+    import framework.config as config_module
+
+    monkeypatch.setattr(config_module, "load_agent_config", lambda *_args, **_kwargs: _FakeConfig())
+
     await agent.start()
+
+    registry_client.upsert_agent.assert_called_once()
+    payload = registry_client.upsert_agent.call_args.args[0]
+    assert payload["agentId"] == "team-lead"
+    assert payload["cardUrl"] == "http://team-lead:8030/.well-known/agent-card.json"
+    assert payload["capabilities"] == ["team-lead.task.execute"]
+    assert payload["executionMode"] == "persistent"
 
     registry_client.register_instance.assert_called_once_with(
         "team-lead",

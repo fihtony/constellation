@@ -269,6 +269,89 @@ def _rendered_page_has_content(metrics: dict[str, Any]) -> bool:
     )
 
 
+_ICON_LIGATURE_TOKENS = (
+    "arrow_forward",
+    "arrow_back",
+    "arrow_upward",
+    "arrow_downward",
+    "chevron_right",
+    "chevron_left",
+    "navigate_next",
+    "navigate_before",
+    "expand_more",
+    "expand_less",
+    "close",
+    "menu",
+    "search",
+)
+
+
+def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
+    """Detect icon-font ligature patterns that render unreliably in containers."""
+    findings: dict[str, Any] = {
+        "issues": [],
+        "files": [],
+        "icon_tokens": [],
+        "uses_material_icon_class": False,
+        "uses_remote_material_font": False,
+    }
+    if not repo_path or not os.path.isdir(repo_path):
+        return findings
+
+    text_exts = {".html", ".css", ".scss", ".sass", ".less", ".js", ".jsx", ".ts", ".tsx"}
+    ignored_dirs = {".git", "node_modules", "dist", "build", ".next", "coverage"}
+    risky_files: set[str] = set()
+    icon_tokens: set[str] = set()
+
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [name for name in dirs if name not in ignored_dirs]
+        for filename in files:
+            if os.path.splitext(filename)[1].lower() not in text_exts:
+                continue
+            full_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(full_path, repo_path)
+            try:
+                with open(full_path, encoding="utf-8", errors="ignore") as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            lowered = content.lower()
+
+            if "material-symbols" in lowered or "material-icons" in lowered:
+                findings["uses_material_icon_class"] = True
+                risky_files.add(rel_path)
+
+            if (
+                "fonts.googleapis.com" in lowered
+                and ("material+symbols" in lowered or "material+icons" in lowered or "icon?family=material+icons" in lowered)
+            ):
+                findings["uses_remote_material_font"] = True
+                risky_files.add(rel_path)
+
+            for token in _ICON_LIGATURE_TOKENS:
+                if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", lowered):
+                    icon_tokens.add(token)
+                    risky_files.add(rel_path)
+
+    findings["files"] = sorted(risky_files)
+    findings["icon_tokens"] = sorted(icon_tokens)
+
+    if findings["uses_material_icon_class"] or findings["icon_tokens"]:
+        preview = ", ".join(findings["icon_tokens"][:3]) or "material icon ligatures"
+        findings["issues"].append(
+            "Fragile icon font usage detected "
+            f"({preview}) in {', '.join(findings['files'][:4])}. "
+            "Replace icon-font ligatures with inline SVG or a local React icon component so container screenshots never show icon names as text."
+        )
+    if findings["uses_material_icon_class"] and not findings["uses_remote_material_font"]:
+        findings["issues"].append(
+            "Material icon classes are present without a matching icon font stylesheet. "
+            "The page can render icon names as plain text."
+        )
+
+    return findings
+
+
 def _git_commit_all_pending(repo_path: str, jira_key: str) -> list[str]:
     """Stage all pending changes and commit if anything is staged.
 
@@ -1098,7 +1181,41 @@ async def self_assess(state: dict) -> dict:
     data = _safe_json(raw_response, fallback={})
     if not data:
         print(f"[{_AGENT_ID}] self_assess _safe_json returned empty — raw_response type={type(raw_response).__name__}, len={len(raw_response) if raw_response else 0}")
-    score = float(data.get("score", 0))
+
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("criteria_checks", [])
+    data.setdefault("component_checks", [])
+    data.setdefault("gaps", [])
+    data.setdefault("summary", "")
+
+    deterministic_gaps: list[str] = []
+    if _is_screenshot_required(state):
+        icon_validation = _detect_fragile_icon_font_usage(state.get("repo_path", ""))
+        deterministic_gaps.extend(icon_validation.get("issues") or [])
+        if icon_validation.get("issues"):
+            data["component_checks"].append(
+                {
+                    "component": "Icon rendering",
+                    "status": "incomplete",
+                    "notes": icon_validation["issues"][0],
+                }
+            )
+
+    if deterministic_gaps:
+        merged_gaps: list[str] = []
+        for gap in [*(data.get("gaps") or []), *deterministic_gaps]:
+            text = str(gap).strip()
+            if text and text not in merged_gaps:
+                merged_gaps.append(text)
+        data["gaps"] = merged_gaps
+        data["verdict"] = "fail"
+        data["score"] = min(float(data.get("score", 0) or 0), 0.89)
+        summary = str(data.get("summary", "")).strip()
+        if deterministic_gaps[0] not in summary:
+            data["summary"] = (summary + " " if summary else "") + deterministic_gaps[0]
+
+    score = float(data.get("score", 0) or 0)
     verdict = data.get("verdict", "fail")
     gaps = data.get("gaps", [])
 
@@ -1128,7 +1245,9 @@ async def self_assess(state: dict) -> dict:
     if score >= 0.9 and verdict != "fail":
         route = "pass"
     elif assess_cycles >= max_assess_cycles:
-        route = "pass"
+        failure_summary = "; ".join(str(gap) for gap in gaps[:4]) or str(data.get("summary", "self-assessment failed"))
+        log.warn("self_assess exhausted retries", cycle=assess_cycles, failure_summary=failure_summary[:400])
+        raise RuntimeError(f"self_assess failed after {max_assess_cycles} cycles: {failure_summary[:400]}")
     else:
         route = "fail"
 
@@ -1941,97 +2060,16 @@ async def create_pr(state: dict) -> dict:
     pr_title = pr_meta.get("title", "Implement task changes")
     pr_description = pr_meta.get("description", state.get("implementation_summary", ""))
 
-    # Step 2.5: Upload screenshots to GitHub CDN via Release Assets API.
-    # This avoids committing image files to the PR branch — screenshots are hosted
-    # in the repo's 'screenshot-assets' pre-release, giving stable CDN URLs like:
-    #   https://github.com/{owner}/{repo}/releases/download/screenshot-assets/{file}
-    # Falls back to the branch-commit approach if CDN upload fails.
+    # Step 2.5: Prepare screenshot artifacts. Screenshots must be hosted outside
+    # the PR branch and injected into the PR description only after PR creation.
     _screenshots = state.get("screenshots", [])
+    _png_screenshots = [s for s in _screenshots if s.endswith(".png") and os.path.isfile(s)]
     _screenshot_uploaded = False
     _screenshot_section = ""
-    if _screenshots:
-        import shutil as _shutil
-        import subprocess as _subprocess
-        from urllib.parse import urlparse as _urlparse
+    if screenshot_required and not _png_screenshots:
+        raise RuntimeError("Cannot create PR for a UI task because PNG screenshots are missing")
 
-        _png_screenshots = [s for s in _screenshots if s.endswith(".png") and os.path.isfile(s)]
-        if _png_screenshots:
-            _screenshot_entries: list[tuple[str, str]] = []
-            _cdn_upload_ok = True
-
-            # Try CDN upload first (GitHub Release Assets)
-            for _png in _png_screenshots:
-                _fname = os.path.basename(_png)
-                _label = "Desktop (1280×900)" if "desktop" in _png.lower() else "Mobile (375×812)"
-                _upload_result = _call_boundary_tool(
-                    state, "scm_upload_pr_image",
-                    {"repo_url": repo_url, "pr_number": 0,
-                     "image_path": _png, "task_id": task_id},
-                )
-                _cdn_url = _upload_result.get("image_url", "")
-                if _cdn_url:
-                    _screenshot_entries.append((_label, _cdn_url))
-                else:
-                    _cdn_upload_ok = False
-                    print(f"[{_AGENT_ID}] CDN upload failed for {_fname}: "
-                          f"{_upload_result.get('error', '(no error detail)')}")
-
-            if _screenshot_entries:
-                _section_parts = [
-                    f"**{_lbl}**\n\n![]({_url})" for _lbl, _url in _screenshot_entries
-                ]
-                _screenshot_section = "\n\n## Screenshots\n\n" + "\n\n".join(_section_parts)
-                _screenshot_uploaded = True
-                print(f"[{_AGENT_ID}] Screenshots uploaded to GitHub CDN — "
-                      f"{len(_screenshot_entries)} image(s) embedded in PR description")
-            elif not _cdn_upload_ok:
-                # Fallback: commit screenshots to the branch so raw.githubusercontent.com works.
-                # This path is taken when SCM backend is not GitHub or CDN upload is unsupported.
-                print(f"[{_AGENT_ID}] CDN upload unavailable, falling back to branch commit")
-                _parsed_url = _urlparse(repo_url)
-                _url_parts = _parsed_url.path.strip("/").split("/")
-                _gh_owner = _url_parts[0] if len(_url_parts) > 0 else ""
-                _gh_repo = _url_parts[1].replace(".git", "") if len(_url_parts) > 1 else ""
-                _screen_repo_dir = os.path.join(repo_path, "docs", "screenshots")
-                os.makedirs(_screen_repo_dir, exist_ok=True)
-                _fallback_entries: list[tuple[str, str]] = []
-                for _png in _png_screenshots:
-                    _fname = os.path.basename(_png)
-                    _label = "Desktop (1280×900)" if "desktop" in _png.lower() else "Mobile (375×812)"
-                    try:
-                        _shutil.copy2(_png, os.path.join(_screen_repo_dir, _fname))
-                        _raw_url = (
-                            f"https://raw.githubusercontent.com/{_gh_owner}/{_gh_repo}"
-                            f"/{branch_name}/docs/screenshots/{_fname}"
-                        )
-                        _fallback_entries.append((_label, _raw_url))
-                    except Exception as _copy_err:
-                        print(f"[{_AGENT_ID}] Screenshot copy failed for {_png}: {_copy_err}")
-                if _fallback_entries:
-                    _subprocess.run(
-                        ["git", "add", "-f", "docs/screenshots/"],  # -f to override gitignore
-                        cwd=repo_path, capture_output=True, text=True,
-                    )
-                    _commit_res = _subprocess.run(
-                        ["git", "commit", "-m", "docs: add implementation screenshots"],
-                        cwd=repo_path, capture_output=True, text=True,
-                    )
-                    if _commit_res.returncode == 0:
-                        _section_parts = [
-                            f"**{_lbl}**\n\n![]({_url})" for _lbl, _url in _fallback_entries
-                        ]
-                        _screenshot_section = "\n\n## Screenshots\n\n" + "\n\n".join(_section_parts)
-                        _screenshot_uploaded = True
-                        print(f"[{_AGENT_ID}] Screenshots committed to branch (fallback) "
-                              f"and embedded in PR description")
-                    else:
-                        print(f"[{_AGENT_ID}] Screenshot fallback commit failed: "
-                              f"{_commit_res.stderr[:200]}")
-
-    if _screenshot_section:
-        pr_description = pr_description.rstrip() + _screenshot_section
-    elif screenshot_required:
-        raise RuntimeError("Cannot create PR for a UI task because screenshots were not embedded in the PR description")
+    pr_description = pr_description.rstrip()
 
     # Step 3: Push branch then create PR via SCM boundary tools (not open agentic).
     task_id = state.get("_task_id", "")
@@ -2061,6 +2099,13 @@ async def create_pr(state: dict) -> dict:
     )
     pr_url = pr_payload.get("prUrl") or pr_payload.get("pr_url", "")
     pr_number = pr_payload.get("prNumber") or pr_payload.get("pr_number", 0)
+    if not pr_number and isinstance(pr_payload.get("pr"), dict):
+        pr_number = pr_payload["pr"].get("number") or pr_payload["pr"].get("id") or 0
+    if not pr_number and pr_url and "/pull/" in pr_url:
+        try:
+            pr_number = int(pr_url.rstrip("/").rsplit("/pull/", 1)[1])
+        except (TypeError, ValueError):
+            pr_number = 0
     commit_hash = pr_payload.get("commitHash") or pr_payload.get("commit_hash", "")
     pr_status = pr_payload.get("status", "")
     pr_error = pr_payload.get("error", "")
@@ -2071,10 +2116,62 @@ async def create_pr(state: dict) -> dict:
         log.info("PR created", pr_url=pr_url, branch=branch_name)
         print(f"[{_AGENT_ID}] create_pr done: prUrl={pr_url!r} prNumber={pr_number} status={pr_status!r}")
 
-    # Step 4: Screenshots were handled in Step 2.5 (CDN upload or fallback branch commit).
-    _screenshots = state.get("screenshots", [])
-    if _screenshots:
-        print(f"[{_AGENT_ID}] {len(_screenshots)} screenshot(s) processed for PR description")
+    # Step 4: Upload screenshots to GitHub CDN and PATCH the PR description.
+    if _png_screenshots:
+        log.info("uploading screenshots to CDN", screenshots=len(_png_screenshots), pr_number=pr_number)
+        _screenshot_entries: list[tuple[str, str]] = []
+        for _png in _png_screenshots:
+            _fname = os.path.basename(_png)
+            _label = "Desktop (1280×900)" if "desktop" in _png.lower() else "Mobile (375×812)"
+            _upload_result = _call_boundary_tool(
+                state,
+                "scm_upload_pr_image",
+                {
+                    "repo_url": repo_url,
+                    "pr_number": int(pr_number or 0),
+                    "image_path": _png,
+                    "task_id": task_id,
+                },
+            )
+            _cdn_url = _upload_result.get("image_url", "")
+            if _cdn_url:
+                _screenshot_entries.append((_label, _cdn_url))
+                continue
+
+            log.error("screenshot upload failed", screenshot=_fname, error=_upload_result.get("error", ""))
+            print(f"[{_AGENT_ID}] CDN upload failed for {_fname}: "
+                  f"{_upload_result.get('error', '(no error detail)')}")
+
+        if _screenshot_entries:
+            _section_parts = [
+                f"**{_lbl}**\n\n![]({_url})" for _lbl, _url in _screenshot_entries
+            ]
+            _screenshot_section = "\n\n## Screenshots\n\n" + "\n\n".join(_section_parts)
+            updated_description = pr_description + _screenshot_section
+            update_payload = _call_boundary_tool(
+                state,
+                "scm_update_pr",
+                {
+                    "repo_url": repo_url,
+                    "pr_number": int(pr_number or 0),
+                    "description": updated_description,
+                    "title": pr_title,
+                    "task_id": task_id,
+                },
+            )
+            if update_payload.get("error") or update_payload.get("status") not in ("ok", "no_changes", ""):
+                log.error("scm_update_pr failed", error=update_payload.get("error", ""), status=update_payload.get("status", ""))
+                raise RuntimeError("Cannot finalize PR for a UI task because screenshot URLs could not be added to the PR description")
+
+            pr_description = updated_description
+            _screenshot_uploaded = True
+            log.info("screenshot PR description updated", screenshots=len(_screenshot_entries), pr_number=pr_number)
+            print(f"[{_AGENT_ID}] Screenshots uploaded to GitHub CDN — "
+                  f"{len(_screenshot_entries)} image(s) embedded in PR description")
+        elif screenshot_required:
+            raise RuntimeError("Cannot finalize PR for a UI task because screenshot upload did not return CDN URLs")
+
+        print(f"[{_AGENT_ID}] {len(_png_screenshots)} screenshot(s) processed for PR description")
 
     # Write pr-evidence.json to workspace
     workspace_path = state.get("workspace_path", "")

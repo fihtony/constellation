@@ -11,10 +11,12 @@ from agents.web_dev.nodes import (
     implement_changes,
     run_tests,
     fix_tests,
+    self_assess,
     capture_screenshot,
     create_pr,
     report_result,
     _safe_json,
+    _detect_fragile_icon_font_usage,
     _rendered_page_has_content,
 )
 
@@ -89,6 +91,114 @@ class TestScreenshotRenderChecks:
                 "bodyHeight": 900,
             }
         ) is False
+
+    def test_detect_fragile_icon_font_usage_flags_material_ligatures(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        src_path.mkdir(parents=True)
+        (src_path / "Hero.jsx").write_text(
+            "<span className=\"material-symbols-outlined\">arrow_forward</span>\n",
+            encoding="utf-8",
+        )
+
+        findings = _detect_fragile_icon_font_usage(str(repo_path))
+
+        assert findings["issues"]
+        assert findings["uses_material_icon_class"] is True
+        assert findings["uses_remote_material_font"] is False
+        assert "arrow_forward" in findings["icon_tokens"]
+
+    def test_detect_fragile_icon_font_usage_ignores_plain_words(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        src_path.mkdir(parents=True)
+        (src_path / "LandingPage.jsx").write_text(
+            "<span>Research Writing</span>\n",
+            encoding="utf-8",
+        )
+
+        findings = _detect_fragile_icon_font_usage(str(repo_path))
+
+        assert findings["issues"] == []
+        assert findings["icon_tokens"] == []
+
+    async def test_self_assess_fails_fragile_icon_font_usage(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        src_path.mkdir(parents=True)
+        (src_path / "Hero.jsx").write_text(
+            "<span className=\"material-symbols-outlined\">arrow_forward</span>\n",
+            encoding="utf-8",
+        )
+
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 1.0,
+                            "verdict": "pass",
+                            "gaps": [],
+                            "component_checks": [],
+                            "criteria_checks": [],
+                            "summary": "Looks good.",
+                        }
+                    )
+                }
+
+        state = {
+            "_runtime": _MockRuntime(),
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": True},
+            "changes_made": ["src/Hero.jsx"],
+            "implementation_summary": "Added a hero section.",
+            "test_results": {"passed": 8, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        assert result["route"] == "fail"
+        assert result["self_assessment"]["verdict"] == "fail"
+        assert any("inline SVG or a local React icon component" in gap for gap in result["self_assessment"]["gaps"])
+
+    async def test_self_assess_raises_after_max_cycles(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        src_path.mkdir(parents=True)
+        (src_path / "Hero.jsx").write_text(
+            "<span className=\"material-symbols-outlined\">arrow_forward</span>\n",
+            encoding="utf-8",
+        )
+
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 1.0,
+                            "verdict": "pass",
+                            "gaps": [],
+                            "component_checks": [],
+                            "criteria_checks": [],
+                            "summary": "Looks good.",
+                        }
+                    )
+                }
+
+        state = {
+            "_runtime": _MockRuntime(),
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": True},
+            "changes_made": ["src/Hero.jsx"],
+            "implementation_summary": "Added a hero section.",
+            "test_results": {"passed": 8, "failed": 0},
+            "assess_cycles": 2,
+        }
+
+        with pytest.raises(RuntimeError, match="self_assess failed after 3 cycles"):
+            await self_assess(state)
 
 
 class TestWebDevNodes:

@@ -142,6 +142,7 @@ class SCMAgentAdapter(BaseAgent):
             # Args order: (project/owner, repo, from_branch, to_branch, title, description)
             data, status = client.create_pr(project, repo, source, target, title, description)
             pr_url = ""
+            pr_number = 0
             if isinstance(data, dict):
                 # Bitbucket: links.self[0].href  |  GitHub: links.self[0].href (normalised)
                 links = data.get("links", {}).get("self", [])
@@ -150,7 +151,19 @@ class SCMAgentAdapter(BaseAgent):
                 # Fallback: normalized PR dict uses htmlUrl (e.g. when PR already exists)
                 if not pr_url:
                     pr_url = data.get("htmlUrl", "")
-            return {"pr": data, "status": status, "prUrl": pr_url}
+                pr_number = data.get("number") or data.get("id") or 0
+            if not pr_number and "/pull/" in pr_url:
+                try:
+                    pr_number = int(pr_url.rstrip("/").rsplit("/pull/", 1)[1])
+                except (TypeError, ValueError):
+                    pr_number = 0
+            return {
+                "pr": data,
+                "status": status,
+                "prUrl": pr_url,
+                "prNumber": pr_number,
+                "pr_number": pr_number,
+            }
 
         if capability == "scm.pr.get":
             pr_id = meta.get("prId") or meta.get("prNumber") or text.strip()
