@@ -1,0 +1,43 @@
+# Development task workflow configuration
+name: development_task
+version: "1.0"
+
+definition_of_done:
+  build_must_pass: true
+  tests_must_pass: true
+  self_assessment_required: true
+  jira_state_management: true
+  pr_required: true
+  screenshot_required_for_ui: true
+
+validation_gates:
+  readiness:
+    jira_ticket_downloaded: true
+    repo_cloned: true
+    design_spec_for_ui_task: true
+    tech_stack_identified: true
+    requirements_clarified: true
+  planning:
+    implementation_plan_required: true
+    test_plan_required: true
+  implementation:
+    files_changed_required: true
+  build_test:
+    max_retry_cycles: 3
+    install_must_pass: true
+    build_must_pass: true
+    test_must_pass: true
+  self_assessment:
+    min_score: 0.9
+    criteria_coverage_required: true
+    max_cycles: 3
+  code_review:
+    max_revisions: 3
+    critical_issue_blocks: true
+
+limits:
+  max_test_cycles: 3
+  max_assess_cycles: 3
+  max_revisions: 3
+  implement_timeout_seconds: 1800
+  fix_timeout_seconds: 600

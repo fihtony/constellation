@@ -1,0 +1,18 @@
+# Permissions: Jira boundary agent (deterministic API adapter)
+agent_id: jira
+allowed_tools:
+  - fetch_jira_ticket
+  - jira_transition
+  - jira_comment
+  - jira_update
+  - jira_list_transitions
+  - jira_get_token_user
+  - jira_list_comments
+  - jira_search
+
+denied_tools: []
+
+scm: none
+filesystem: workspace-only
+agent_launching: false
+allowed_agents: []

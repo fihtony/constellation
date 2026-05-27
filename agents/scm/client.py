@@ -510,6 +510,76 @@ class GitHubClient:
         except Exception as exc:
             return {}, str(exc)
 
+    def get_pr_diff(
+        self, owner: str, repo: str, pr_id: str | int, timeout: int = 30
+    ) -> tuple[dict, str]:
+        """Get the full diff of a pull request and list of changed files."""
+        try:
+            # Get diff text via Accept header
+            import urllib.request
+            url = f"{self._base_url}/repos/{owner}/{repo}/pulls/{pr_id}"
+            req = urllib.request.Request(url, method="GET")
+            req.add_header("Authorization", f"Bearer {self._token}")
+            req.add_header("Accept", "application/vnd.github.v3.diff")
+            req.add_header("User-Agent", "constellation-scm-agent")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                diff_text = resp.read().decode("utf-8", errors="replace")
+
+            # Get changed files list via files endpoint
+            status, files_body = self._request(
+                "GET", f"repos/{owner}/{repo}/pulls/{pr_id}/files", timeout=timeout
+            )
+            changed_files = []
+            if status == 200 and isinstance(files_body, list):
+                changed_files = [
+                    {"filename": f.get("filename", ""), "status": f.get("status", ""),
+                     "additions": f.get("additions", 0), "deletions": f.get("deletions", 0)}
+                    for f in files_body
+                ]
+
+            return {
+                "diff_text": diff_text,
+                "changed_files": changed_files,
+            }, "ok"
+        except Exception as exc:
+            return {}, str(exc)
+
+    def get_pr_info(
+        self, owner: str, repo: str, pr_id: str | int, timeout: int = 15
+    ) -> tuple[dict, str]:
+        """Get pull request metadata (title, description, state, author, commits)."""
+        try:
+            status, body = self._request(
+                "GET", f"repos/{owner}/{repo}/pulls/{pr_id}", timeout=timeout
+            )
+            if status != 200:
+                return {}, f"http_{status}"
+
+            # Get commits
+            c_status, c_body = self._request(
+                "GET", f"repos/{owner}/{repo}/pulls/{pr_id}/commits", timeout=timeout
+            )
+            commits = []
+            if c_status == 200 and isinstance(c_body, list):
+                commits = [
+                    {"sha": c.get("sha", "")[:7],
+                     "message": c.get("commit", {}).get("message", "")[:100]}
+                    for c in c_body
+                ]
+
+            return {
+                "title": body.get("title", ""),
+                "description": body.get("body", ""),
+                "state": body.get("state", ""),
+                "author": body.get("user", {}).get("login", ""),
+                "base_branch": body.get("base", {}).get("ref", ""),
+                "head_branch": body.get("head", {}).get("ref", ""),
+                "commits": commits,
+                "html_url": body.get("html_url", ""),
+            }, "ok"
+        except Exception as exc:
+            return {}, str(exc)
+
     def add_pr_comment(
         self,
         owner: str,

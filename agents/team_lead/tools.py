@@ -510,6 +510,11 @@ class DispatchWebDev(BaseTool):
         if task_id:
             meta["taskId"] = task_id
 
+        # Pass execution contract for child agent permission enforcement
+        execution_contract = _.get("execution_contract") if isinstance(_, dict) else None
+        if execution_contract:
+            meta["executionContract"] = execution_contract
+
         try:
             from framework.a2a.client import dispatch_sync
             timeout_seconds = _downstream_timeout_seconds("web_dev")

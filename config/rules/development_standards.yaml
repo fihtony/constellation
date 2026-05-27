@@ -1,0 +1,25 @@
+# Development standards — branch naming, commit messages, PR description
+branch_naming:
+  pattern: "feature/{JIRA_KEY}-{TASK_ID_PREFIX}"
+  protected_patterns:
+    - "^main$"
+    - "^master$"
+    - "^develop$"
+    - "^release/.*$"
+
+commit_message:
+  format: "feat({JIRA_KEY}): {description}"
+  max_length: 72
+
+pr_description:
+  template: "agents/web_dev/templates/pr_description.md"
+  required_sections:
+    - summary
+    - changes
+    - test_results
+    - screenshots  # UI task only
+
+jira_workflow:
+  on_pickup: "In Progress"
+  on_pr_created: "In Review"
+  on_review_passed: "Ready for Merge"

@@ -1,0 +1,34 @@
+# Permissions: Team Lead agent (intelligence layer — analysis, planning, dispatch, review)
+agent_id: team-lead
+allowed_tools:
+  - read_file
+  - search_code
+  - glob
+  - grep
+  - query_registry
+  - request_clarification
+  - fetch_jira_ticket
+  - fetch_design
+  - clone_repo
+  - scm_clone
+  - scm_list_branches
+  - dispatch_web_dev
+  - dispatch_code_review
+  - dispatch_agent
+  # Jira boundary tools (called by workflow nodes)
+  - jira_list_transitions
+  - jira_transition
+  - jira_comment
+  - jira_update
+  - jira_get_token_user
+  - jira_list_comments
+
+denied_tools: []
+
+scm: read-write
+filesystem: workspace-only
+agent_launching: true
+allowed_agents:
+  - web-dev
+  - android-dev
+  - code-review

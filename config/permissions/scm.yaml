@@ -1,0 +1,22 @@
+# Permissions: SCM boundary agent (deterministic API adapter)
+agent_id: scm
+allowed_tools:
+  - scm_clone
+  - clone_repo
+  - scm_branch
+  - scm_commit
+  - scm_push
+  - scm_create_pr
+  - scm_add_pr_comment
+  - scm_upload_pr_image
+  - scm_update_pr
+  - scm_list_branches
+  - scm_get_pr_diff
+  - scm_get_pr_info
+
+denied_tools: []
+
+scm: read-write
+filesystem: workspace-only
+agent_launching: false
+allowed_agents: []

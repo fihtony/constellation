@@ -363,6 +363,86 @@ class SCMUpdatePR(BaseTool):
         return ToolResult(output=json.dumps({"ok": True, "status": status}))
 
 
+class SCMGetPRDiff(BaseTool):
+    """Get the full diff of a pull request."""
+
+    name = "scm_get_pr_diff"
+    description = "Get the full diff text and list of changed files for a pull request."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string", "description": "Full GitHub repo URL."},
+            "pr_number": {"type": "integer", "description": "Pull request number."},
+            "task_id": {"type": "string"},
+        },
+        "required": ["repo_url", "pr_number"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        pr_number: int = 0,
+        task_id: str = "",
+    ) -> ToolResult:
+        log = _log(task_id)
+        log.info("scm_get_pr_diff called", repo_url=repo_url, pr_number=pr_number)
+        owner, repo = _parse_repo_coordinates(repo_url)
+        from agents.scm.client import create_scm_client
+        import os as _os
+        client = create_scm_client(
+            base_url=repo_url,
+            token=_os.environ.get("SCM_TOKEN", ""),
+            backend="github-rest",
+        )
+        # Use GitHub's pull diff endpoint
+        result, status = client.get_pr_diff(owner, repo, pr_number)
+        if status != "ok":
+            log.error("scm_get_pr_diff failed", status=status, pr_number=pr_number)
+            return ToolResult(output=json.dumps({"error": f"status={status}", "detail": str(result)[:200]}))
+        log.info("scm_get_pr_diff ok", pr_number=pr_number,
+                 changed_files_count=len(result.get("changed_files", [])))
+        return ToolResult(output=json.dumps(result))
+
+
+class SCMGetPRInfo(BaseTool):
+    """Get pull request metadata (title, description, state, author, commits)."""
+
+    name = "scm_get_pr_info"
+    description = "Get pull request metadata including title, description, state, author, and commits."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string", "description": "Full GitHub repo URL."},
+            "pr_number": {"type": "integer", "description": "Pull request number."},
+            "task_id": {"type": "string"},
+        },
+        "required": ["repo_url", "pr_number"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        pr_number: int = 0,
+        task_id: str = "",
+    ) -> ToolResult:
+        log = _log(task_id)
+        log.info("scm_get_pr_info called", repo_url=repo_url, pr_number=pr_number)
+        owner, repo = _parse_repo_coordinates(repo_url)
+        from agents.scm.client import create_scm_client
+        import os as _os
+        client = create_scm_client(
+            base_url=repo_url,
+            token=_os.environ.get("SCM_TOKEN", ""),
+            backend="github-rest",
+        )
+        result, status = client.get_pr_info(owner, repo, pr_number)
+        if status != "ok":
+            log.error("scm_get_pr_info failed", status=status, pr_number=pr_number)
+            return ToolResult(output=json.dumps({"error": f"status={status}", "detail": str(result)[:200]}))
+        log.info("scm_get_pr_info ok", pr_number=pr_number, title=result.get("title", "")[:60])
+        return ToolResult(output=json.dumps(result))
+
+
 _TOOLS = [
     CloneRepo(),
     SCMListBranches(),
@@ -371,6 +451,8 @@ _TOOLS = [
     SCMAddPRComment(),
     SCMUploadPRImage(),
     SCMUpdatePR(),
+    SCMGetPRDiff(),
+    SCMGetPRInfo(),
 ]
 
 

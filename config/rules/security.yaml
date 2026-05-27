@@ -1,0 +1,39 @@
+# Security rules — OWASP Top 10 check items
+owasp_checks:
+  - id: A01
+    name: Broken Access Control
+    check: "Verify all endpoints validate authorization"
+  - id: A02
+    name: Cryptographic Failures
+    check: "No hardcoded secrets, proper key management"
+  - id: A03
+    name: Injection
+    check: "Parameterized queries, input validation"
+  - id: A04
+    name: Insecure Design
+    check: "Threat modeling for new features"
+  - id: A05
+    name: Security Misconfiguration
+    check: "Secure defaults, no unnecessary features"
+  - id: A06
+    name: Vulnerable Components
+    check: "No known-vulnerable dependencies"
+  - id: A07
+    name: Authentication Failures
+    check: "Strong auth, session management"
+  - id: A08
+    name: Software and Data Integrity Failures
+    check: "Verify integrity of CI/CD pipelines"
+  - id: A09
+    name: Security Logging Failures
+    check: "Adequate audit logging"
+  - id: A10
+    name: Server-Side Request Forgery
+    check: "Validate URLs, restrict outbound"
+
+general_rules:
+  no_credentials_in_code: true
+  no_credentials_in_urls: true
+  no_credentials_in_logs: true
+  input_validation_at_boundaries: true
+  output_encoding: true

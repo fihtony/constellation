@@ -584,8 +584,39 @@ async def gather_context(state: dict) -> dict:
     }
 
 
+async def validate_readiness(state: dict) -> dict:
+    """Deterministic gate: verify all prerequisites for planning/dispatch.
+
+    Checks: repo cloned, Jira context present (if key given), repo URL valid.
+    Returns route='ready' on success, raises RuntimeError on fatal failure.
+    """
+    from framework.validation_gates import validate_readiness as _gate
+
+    log = _logger(state)
+    log.node("validate_readiness")
+
+    result = _gate(
+        repo_cloned=state.get("repo_cloned", False),
+        repo_path=state.get("repo_path", ""),
+        jira_key=state.get("jira_key", ""),
+        jira_context=state.get("jira_context"),
+        repo_url=state.get("repo_url", ""),
+    )
+
+    if not result.passed:
+        log.error("readiness gate failed", gate=result.gate_name, feedback=result.feedback)
+        raise RuntimeError(f"Readiness gate failed: {result.feedback}")
+
+    log.info("readiness gate passed")
+    return {"readiness_validated": True, "route": "ready"}
+
+
 async def create_plan(state: dict) -> dict:
-    """Create a development plan based on analysis and context (LLM single-shot)."""
+    """Create a development plan based on analysis and context (LLM single-shot).
+
+    After planning, runs validate_readiness gate to ensure all critical
+    prerequisites are available before dispatching a dev agent.
+    """
     runtime = state.get("_runtime")
 
     if not runtime:
@@ -650,6 +681,14 @@ async def create_plan(state: dict) -> dict:
         except OSError as exc:
             print(f"[{_AGENT_ID}] Failed to write delivery-plan.json: {exc}")
 
+    # Validation gate: ensure plan has required structure
+    from framework.validation_gates import validate_plan_schema
+    gate_result = validate_plan_schema(plan)
+    if not gate_result.passed:
+        log = _logger(state)
+        log.warn("validate_plan_schema gate failed", feedback=gate_result.feedback)
+        # Non-fatal: plan may still be usable even if schema is loose
+
     return {
         "plan": plan,
         "skill_context": skill_context,
@@ -661,8 +700,12 @@ async def dispatch_dev_agent(state: dict) -> dict:
 
     Passes all gathered context including workspace_paths so the dev agent
     does not re-fetch or guess file locations.
+
+    Builds and attaches an ExecutionContract to the dispatch metadata,
+    ensuring the child agent receives its allowed_tools and workflow config.
     """
     from framework.tools.registry import get_registry
+    from framework.execution_contract import build_execution_contract
 
     registry = get_registry()
 
@@ -689,10 +732,24 @@ async def dispatch_dev_agent(state: dict) -> dict:
             "feature", "ui", "frontend", "frontend_feature", "ui_feature",
         ) or bool(state.get("design_context") or state.get("design_code_path") or state.get("stitch_screen_id"))
 
+    # Build execution contract for the child dev agent
+    execution_contract = None
     try:
-        result_str = registry.execute_sync(
-            "dispatch_web_dev",
-            {
+        execution_contract = build_execution_contract(
+            profile="web-dev",
+            workflow_ref="development_task",
+            rule_refs=["development_standards", "code_quality", "security"],
+            workspace_root=state.get("workspace_path", ""),
+            definition_of_done=definition_of_done,
+        )
+        log.info("execution contract built", profile="web-dev",
+                 tools_count=len(execution_contract.allowed_tools))
+    except Exception as exc:
+        log.warn("execution contract build failed (non-fatal)", error=str(exc))
+        # Non-fatal: dispatch continues without contract enforcement
+
+    try:
+        dispatch_args = {
                 "task_description": task_description,
                 "jira_context": state.get("jira_context", {}),
                 "design_context": state.get("design_context"),
@@ -711,7 +768,12 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "orchestrator_task_id": state.get("_task_id", ""),
                 "revision_feedback": revision_feedback,
                 "definition_of_done": definition_of_done,
-            },
+        }
+        if execution_contract:
+            dispatch_args["execution_contract"] = execution_contract.to_dict()
+        result_str = registry.execute_sync(
+            "dispatch_web_dev",
+            dispatch_args,
         )
         payload = json.loads(result_str) if result_str else {}
     except Exception as exc:

@@ -78,6 +78,28 @@ async def load_pr_context(state: dict) -> dict:
     pr_description = metadata.get("prDescription") or state.get("pr_description") or ""
     commit_messages = metadata.get("commitMessages") or state.get("commit_messages") or []
 
+    # If PR diff not provided, try to fetch via scm_get_pr_diff tool
+    pr_url = metadata.get("prUrl") or state.get("pr_url") or ""
+    repo_url = metadata.get("repoUrl") or state.get("repo_url") or ""
+    pr_number = metadata.get("prNumber") or state.get("pr_number") or 0
+    if not pr_diff and pr_url and repo_url and pr_number:
+        try:
+            from framework.tools.registry import get_registry
+            registry = get_registry()
+            diff_result_str = registry.execute_sync(
+                "scm_get_pr_diff",
+                {"repo_url": repo_url, "pr_number": int(pr_number), "task_id": state.get("_task_id", "")},
+            )
+            diff_payload = json.loads(diff_result_str) if diff_result_str else {}
+            if not diff_payload.get("error"):
+                pr_diff = diff_payload.get("diff_text", "")
+                changed_files = changed_files or [
+                    f.get("filename", "") for f in diff_payload.get("changed_files", [])
+                ]
+                print(f"[{_AGENT_ID}] Fetched PR diff via scm_get_pr_diff: {len(pr_diff)} chars")
+        except Exception as exc:
+            print(f"[{_AGENT_ID}] scm_get_pr_diff fallback failed (non-fatal): {exc}")
+
     # Jira and design context (passed by Team Lead)
     jira_context = metadata.get("jiraContext") or state.get("jira_context") or {}
     design_context = metadata.get("designContext") or state.get("design_context") or {}
@@ -337,6 +359,22 @@ async def generate_report(state: dict) -> dict:
     low = sum(1 for c in all_comments if c.get("severity") == "low")
 
     verdict = "approved" if (critical == 0 and high == 0) else "rejected"
+
+    # Validation gate: verify review report structure
+    from framework.validation_gates import validate_review_verdict
+    gate_result = validate_review_verdict({
+        "verdict": verdict,
+        "issues": all_comments,
+        "summary": f"Review complete: {len(all_comments)} issue(s) found.",
+        "severity_levels": {"critical": critical, "high": high, "medium": medium, "low": low},
+    })
+    if not gate_result.passed:
+        # Gate enforcement: if critical issues found but verdict was wrongly set, override
+        if "Critical issues" in gate_result.feedback:
+            verdict = "rejected"
+            print(f"[{_AGENT_ID}] validate_review_verdict: overriding verdict to 'rejected'")
+        else:
+            print(f"[{_AGENT_ID}] validate_review_verdict gate warning: {gate_result.feedback}")
 
     summary_parts = [
         f"Review complete: {len(all_comments)} issue(s) found ({len(ui_issues)} UI design).",

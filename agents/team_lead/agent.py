@@ -28,6 +28,7 @@ from agents.team_lead.nodes import (
     receive_task,
     analyze_requirements,
     gather_context,
+    validate_readiness,
     create_plan,
     dispatch_dev_agent,
     review_result,
@@ -54,7 +55,8 @@ team_lead_workflow = Workflow(
     edges=[
         (START, receive_task, analyze_requirements),
         (analyze_requirements, gather_context),
-        (gather_context, create_plan),
+        (gather_context, validate_readiness),
+        (validate_readiness, create_plan),
         (create_plan, dispatch_dev_agent),
         (dispatch_dev_agent, review_result),
         (review_result, {

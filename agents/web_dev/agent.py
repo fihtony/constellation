@@ -169,6 +169,7 @@ class WebDevAgent(BaseAgent):
             "analysis": metadata.get("analysis", ""),
             "revision_feedback": metadata.get("revisionFeedback", ""),
             "definition_of_done": metadata.get("definitionOfDone", {}),
+            "execution_contract": metadata.get("executionContract"),
             "test_cycles": 0,
             # max_test_cycles: can be set by caller via metadata, else uses env default.
             # WEB_DEV_MAX_TEST_CYCLES env var (default 3) controls production cycles.
@@ -186,6 +187,21 @@ class WebDevAgent(BaseAgent):
                 else None
             ),
         }
+
+        # Apply execution contract to enforce tool permissions from parent
+        exec_contract = metadata.get("executionContract")
+        if exec_contract and isinstance(exec_contract, dict):
+            from framework.execution_contract import ExecutionContract
+            try:
+                contract = ExecutionContract.from_dict(exec_contract)
+                if contract.verify_checksum():
+                    # Override allowed tools with contract-specified list
+                    if contract.allowed_tools:
+                        state["_allowed_tools"] = contract.allowed_tools
+                else:
+                    print("[web-dev] Execution contract checksum mismatch — ignoring")
+            except Exception as exc:
+                print(f"[web-dev] Execution contract parse error (non-fatal): {exc}")
 
         def _run() -> None:
             import asyncio

@@ -922,6 +922,16 @@ async def implement_changes(state: dict) -> dict:
 
     # With native tools, we can't track individual file writes from tool_calls.
     # changes_made is populated from git diff in create_pr via _git_commit_all_pending.
+
+    # Validation gate: ensure at least some files were changed
+    from framework.validation_gates import validate_files_changed
+    gate_result = validate_files_changed(state.get("repo_path", ""))
+    if not gate_result.passed and "No file changes detected" in gate_result.feedback:
+        log.error("validate_files_changed gate failed", feedback=gate_result.feedback)
+        raise RuntimeError(f"Implementation produced no file changes: {gate_result.feedback}")
+    elif not gate_result.passed:
+        log.warn("validate_files_changed gate inconclusive", feedback=gate_result.feedback)
+
     return {
         "changes_made": [],
         "implementation_summary": impl_summary,
@@ -1046,6 +1056,12 @@ async def fix_tests(state: dict) -> dict:
         timeout=600,
         plugin_manager=state.get("_plugin_manager"),
     )
+
+    # Validation gate: ensure fix actually changed files
+    from framework.validation_gates import validate_files_changed
+    gate_result = validate_files_changed(state.get("repo_path", ""))
+    if not gate_result.passed and "No file changes detected" in gate_result.feedback:
+        log.warn("fix_tests produced no file changes", feedback=gate_result.feedback)
 
     return {
         "fix_attempted": True,
@@ -1218,6 +1234,13 @@ async def self_assess(state: dict) -> dict:
     score = float(data.get("score", 0) or 0)
     verdict = data.get("verdict", "fail")
     gaps = data.get("gaps", [])
+
+    # Validation gate: structural check on self-assessment output
+    from framework.validation_gates import validate_self_assessment
+    acceptance_criteria_count = len(acceptance_criteria) if isinstance(acceptance_criteria, list) else 0
+    gate_result = validate_self_assessment(data, acceptance_criteria_count)
+    if not gate_result.passed:
+        log.warn("validate_self_assessment gate", feedback=gate_result.feedback)
 
     print(f"[{_AGENT_ID}] self_assess result: score={score} verdict={verdict} gaps={len(gaps)}")
 
