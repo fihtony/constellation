@@ -96,3 +96,37 @@ class TestBoundaryAdapterEnvelopeSupport:
         artifact_text = result["task"]["artifacts"][0]["parts"][0]["text"]
         payload = json.loads(artifact_text)
         assert payload["name"] == "Design"
+
+    async def test_ui_design_adapter_propagates_workspace_file_paths(self, monkeypatch, tmp_path):
+        stitch = MagicMock()
+        stitch.get_screen.return_value = ({"content": [], "text": "{}"}, "ok")
+        adapter = UIDesignAgentAdapter(ui_design_definition, _make_services(), stitch_client=stitch)
+
+        monkeypatch.setattr(
+            UIDesignAgentAdapter,
+            "_persist_workspace_outputs",
+            lambda self, cap, result, meta, task_id: {
+                **result,
+                "local_folder": str(tmp_path / "ui-design" / "stitch"),
+                "files": ["ui-design/stitch/code.html", "ui-design/stitch/DESIGN.md"],
+                "design_code_path": str(tmp_path / "ui-design" / "stitch" / "code.html"),
+                "design_md_path": str(tmp_path / "ui-design" / "stitch" / "DESIGN.md"),
+            },
+        )
+
+        result = await adapter.handle_message({
+            "message": {
+                "parts": [{"text": "13629074018280446337"}],
+                "metadata": {
+                    "requestedCapability": "stitch.screen.fetch",
+                    "stitchProjectId": "13629074018280446337",
+                    "stitchScreenId": "screen-1",
+                    "workspacePath": str(tmp_path),
+                },
+            }
+        })
+
+        artifact = result["task"]["artifacts"][0]
+        payload = json.loads(artifact["parts"][0]["text"])
+        assert payload["local_folder"].endswith("ui-design/stitch")
+        assert artifact["metadata"]["designMdPath"].endswith("ui-design/stitch/DESIGN.md")

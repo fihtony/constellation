@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path as _Path
 from typing import Any
 
@@ -107,6 +109,44 @@ def _safe_json(text: str, fallback: Any = None) -> Any:
     return fallback
 
 
+def _run_mandatory_validation(repo_path: str, workspace_path: str, cycle: int) -> dict:
+    """Run install, build, and tests through the deterministic validation script."""
+    script_path = _Path(__file__).resolve().parent / "scripts" / "validate_project.py"
+    output_path = ""
+    if workspace_path:
+        output_path = os.path.join(
+            workspace_path,
+            _AGENT_ID,
+            "test-results",
+            f"validation-run-{cycle}.json",
+        )
+
+    command = [sys.executable, str(script_path), repo_path]
+    if output_path:
+        command.extend(["--output", output_path])
+
+    proc = subprocess.run(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=int(os.environ.get("WEB_DEV_VALIDATION_TIMEOUT", "2400")),
+        check=False,
+    )
+    data = _safe_json(proc.stdout or "", fallback={}) or {}
+    if output_path and os.path.isfile(output_path):
+        try:
+            with open(output_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            pass
+    if proc.returncode != 0:
+        data.setdefault("failed", 1)
+        data.setdefault("errors", []).append("mandatory validation script failed")
+    data.setdefault("output", proc.stdout or "")
+    return data
+
+
 def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
     """Call a boundary agent tool via the global ToolRegistry.
 
@@ -139,6 +179,20 @@ def _is_screenshot_required(state: dict) -> bool:
         for key in ("task_type", "classification", "work_type")
     )
     return any(token in task_signals for token in ("ui", "frontend", "front-end", "visual", "design"))
+
+
+def _rendered_page_has_content(metrics: dict[str, Any]) -> bool:
+    """Return True when the browser page shows enough evidence of real rendering."""
+    root_children = int(metrics.get("rootChildren") or 0)
+    body_children = int(metrics.get("bodyChildren") or 0)
+    visible_text_chars = int(metrics.get("visibleTextChars") or 0)
+    body_width = int(metrics.get("bodyWidth") or 0)
+    body_height = int(metrics.get("bodyHeight") or 0)
+    return (
+        (root_children > 0 or body_children > 1 or visible_text_chars >= 20)
+        and body_width > 0
+        and body_height > 0
+    )
 
 
 def _git_commit_all_pending(repo_path: str, jira_key: str) -> list[str]:
@@ -714,44 +768,24 @@ async def run_tests(state: dict) -> dict:
         }
 
     repo_path = state.get("repo_path", "")
+    workspace_path = state.get("workspace_path", "")
+    if not repo_path or not os.path.isdir(repo_path):
+        raise RuntimeError("Mandatory validation cannot run because repo_path is missing")
+
     log.debug("run_tests running build+test", repo_path=repo_path)
     print(f"[{_AGENT_ID}] run_tests: cycle={test_cycles}/{max_test_cycles} repo_path={repo_path!r}")
 
-    result = runtime.run_agentic(
-        task=(
-            "Run the project's build and test suite. Report all results.\n"
-            "MANDATORY steps (execute in order — do NOT skip any step):\n"
-            f"1. Change into the repo directory: {repo_path}\n"
-            "2. Run `npm install` to install/update dependencies.\n"
-            "   If npm install fails (missing package), read the error,\n"
-            "   remove the invalid package from package.json, and re-run.\n"
-            "3. Run `npm run build` to check for TypeScript / compilation errors.\n"
-            "   If build fails, fix ALL errors before continuing.\n"
-            "   Common issues: missing imports, wrong export names, \n"
-            "   undefined variables, TypeScript type errors.\n"
-            "4. Detect the test runner (vitest, jest, pytest, etc.).\n"
-            "5. Run tests with verbose output: `npm test -- --run` (vitest) or equivalent.\n"
-            "   If no test command is configured, run `npx vitest --run` directly.\n"
-            "6. Return a JSON summary:\n"
-            '   {"passed": N, "failed": N, "build_ok": true/false, '
-            '"errors": ["error msg..."], "output": "...last 100 lines..."}'
-        ),
-        cwd=repo_path or None,
-        tools=None,
-        max_turns=20,
-        timeout=1800,
-        plugin_manager=state.get("_plugin_manager"),
-    )
-
-    data = _safe_json(result.summary, fallback={})
+    data = _run_mandatory_validation(repo_path, workspace_path, test_cycles)
     failed = data.get("failed", 0)
-    build_ok = data.get("build_ok", True)
-    test_passed = int(failed) == 0 and build_ok and result.success
+    install_ok = data.get("install_ok", True)
+    build_ok = data.get("build_ok", False)
+    test_ok = data.get("test_ok", False)
+    test_passed = int(failed) == 0 and install_ok and build_ok and test_ok
     log.info("run_tests result", passed=data.get("passed", 0), failed=failed,
-             build_ok=build_ok, test_passed=test_passed, cycle=test_cycles)
+             install_ok=install_ok, build_ok=build_ok, test_ok=test_ok,
+             test_passed=test_passed, cycle=test_cycles)
 
     # Write per-cycle test results for auditability
-    workspace_path = state.get("workspace_path", "")
     if workspace_path:
         import time as _time
         results_dir = os.path.join(workspace_path, _AGENT_ID, "test-results")
@@ -774,29 +808,21 @@ async def run_tests(state: dict) -> dict:
     if test_passed:
         return {
             "test_results": data,
-            "test_output": data.get("output", result.summary),
+            "test_output": data.get("output", ""),
             "test_cycles": test_cycles,
             "test_status": "pass",
             "route": "pass",
         }
 
     if test_cycles >= max_test_cycles:
-        # Exhausted fix cycles — proceed to PR; Team Lead will review.
-        # Record accurate status (not "skip").
-        final_status = "pass" if int(failed) == 0 else "fail_max_cycles"
-        print(f"[{_AGENT_ID}] run_tests: max cycles reached ({test_cycles}/{max_test_cycles}), "
-              f"proceeding with status={final_status}")
-        return {
-            "test_results": data,
-            "test_output": data.get("output", result.summary),
-            "test_cycles": test_cycles,
-            "test_status": final_status,
-            "route": "pass",  # proceed to PR despite failures; Team Lead will review
-        }
+        print(f"[{_AGENT_ID}] run_tests: max cycles reached ({test_cycles}/{max_test_cycles}); failing task")
+        raise RuntimeError(
+            "Mandatory validation failed after max cycles; Web Dev cannot proceed to self-assessment or PR"
+        )
 
     return {
         "test_results": data,
-        "test_output": data.get("output", result.summary),
+        "test_output": data.get("output", ""),
         "test_cycles": test_cycles,
         "test_status": "fail",
         "route": "fail",
@@ -1325,6 +1351,24 @@ async def capture_screenshot(state: dict) -> dict:
                             is_mobile=is_mobile,
                         )
                         pg = await ctx.new_page()
+                        console_errors: list[str] = []
+                        page_errors: list[str] = []
+
+                        def _capture_console(msg):
+                            try:
+                                if msg.type in {"error", "warning"}:
+                                    console_errors.append(msg.text)
+                            except Exception:
+                                pass
+
+                        def _capture_page_error(exc):
+                            try:
+                                page_errors.append(str(exc))
+                            except Exception:
+                                pass
+
+                        pg.on("console", _capture_console)
+                        pg.on("pageerror", _capture_page_error)
                         try:
                             # No font blocking — allow all requests through so the browser
                             # loads Google Fonts normally (Work Sans, Newsreader, Material
@@ -1353,25 +1397,55 @@ async def capture_screenshot(state: dict) -> dict:
                             # actively check for non-empty content.
                             root = pg.locator("#root")
                             try:
-                                # Wait for #root to have at least one child element
-                                # (React renders into this div; empty div = blank screen)
                                 await root.wait_for(state="attached", timeout=5000)
-                                child_count = await root.locator("> *").count()
-                                if child_count == 0:
-                                    # React hasn't mounted yet — wait longer
-                                    await pg.wait_for_timeout(5000)
-                                    child_count = await root.locator("> *").count()
-                                # Final check: ensure we have content before screenshot
-                                if child_count > 0:
-                                    # Verify body has rendered size (not 0x0 blank)
-                                    body_box = await pg.locator("body").bounding_box()
-                                    if body_box and body_box["width"] > 0 and body_box["height"] > 0:
-                                        pass  # content confirmed
-                                    else:
-                                        # One more wait for font/layout to settle
-                                        await pg.wait_for_timeout(3000)
                             except Exception:
-                                pass  # proceed even if checks fail
+                                pass
+
+                            metrics = await pg.evaluate(
+                                """() => {
+                                    const root = document.querySelector('#root');
+                                    const body = document.body;
+                                    const rect = body ? body.getBoundingClientRect() : { width: 0, height: 0 };
+                                    const visibleText = ((body && body.innerText) || '').replace(/\\s+/g, ' ').trim();
+                                    return {
+                                        rootChildren: root ? root.children.length : 0,
+                                        bodyChildren: body ? body.children.length : 0,
+                                        visibleTextChars: visibleText.length,
+                                        bodyWidth: Math.round(rect.width || 0),
+                                        bodyHeight: Math.round(rect.height || 0),
+                                        title: document.title || '',
+                                        readyState: document.readyState || '',
+                                    };
+                                }"""
+                            )
+                            if not _rendered_page_has_content(metrics):
+                                await pg.wait_for_timeout(4000)
+                                metrics = await pg.evaluate(
+                                    """() => {
+                                        const root = document.querySelector('#root');
+                                        const body = document.body;
+                                        const rect = body ? body.getBoundingClientRect() : { width: 0, height: 0 };
+                                        const visibleText = ((body && body.innerText) || '').replace(/\\s+/g, ' ').trim();
+                                        return {
+                                            rootChildren: root ? root.children.length : 0,
+                                            bodyChildren: body ? body.children.length : 0,
+                                            visibleTextChars: visibleText.length,
+                                            bodyWidth: Math.round(rect.width || 0),
+                                            bodyHeight: Math.round(rect.height || 0),
+                                            title: document.title || '',
+                                            readyState: document.readyState || '',
+                                        };
+                                    }"""
+                                )
+
+                            if not _rendered_page_has_content(metrics):
+                                print(
+                                    f"[{_AGENT_ID}] Screenshot rejected due to blank/unrendered page: "
+                                    f"route={url_path!r} metrics={metrics!r} console_errors={console_errors[-5:]} "
+                                    f"page_errors={page_errors[-5:]}"
+                                )
+                                return False
+
                             await pg.screenshot(path=out_path, full_page=False)
                         finally:
                             await ctx.close()

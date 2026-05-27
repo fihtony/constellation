@@ -57,6 +57,7 @@ class UIDesignAgentAdapter(BaseAgent):
         task_store = self.services.task_store
         msg = message.get("message", message)
         cap = (msg.get("metadata") or {}).get("requestedCapability", "")
+        meta = msg.get("metadata") or {}
         parts = msg.get("parts") or []
         text = next((p.get("text", "") for p in parts if p.get("text")), "")
 
@@ -66,11 +67,27 @@ class UIDesignAgentAdapter(BaseAgent):
         )
 
         result = self._dispatch(cap, text, msg)
+        result = self._persist_workspace_outputs(cap, result, meta, task.id)
+        artifact_metadata = {
+            "agentId": "ui-design",
+            "capability": cap,
+            "taskId": task.id,
+        }
+        if result.get("local_folder"):
+            artifact_metadata["localFolder"] = result.get("local_folder", "")
+        if result.get("design_code_path"):
+            artifact_metadata["designCodePath"] = result.get("design_code_path", "")
+        if result.get("design_md_path"):
+            artifact_metadata["designMdPath"] = result.get("design_md_path", "")
+        if result.get("design_screen_path"):
+            artifact_metadata["designScreenPath"] = result.get("design_screen_path", "")
+        if result.get("files"):
+            artifact_metadata["filesJson"] = json.dumps(result.get("files", []), ensure_ascii=False)
         artifacts = [Artifact(
             name="design-result",
             artifact_type="application/json",
             parts=[{"text": json.dumps(result, ensure_ascii=False)}],
-            metadata={"agentId": "ui-design", "capability": cap, "taskId": task.id},
+            metadata=artifact_metadata,
         )]
         task_store.complete_task(task.id, artifacts=artifacts)
         return task_store.get_task_dict(task.id)
@@ -184,3 +201,38 @@ class UIDesignAgentAdapter(BaseAgent):
             return {"tools": tools, "status": status}
 
         return {"error": f"Unknown Stitch capability: {cap!r}"}
+
+    def _persist_workspace_outputs(self, cap: str, result: dict, meta: dict, task_id: str) -> dict:
+        workspace_path = meta.get("workspacePath") or meta.get("workspace_path") or ""
+        if not workspace_path or result.get("error"):
+            return result
+
+        try:
+            from agents.ui_design.tools import _log, _save_figma_files, _save_stitch_files
+
+            log = _log(str(meta.get("taskId") or meta.get("task_id") or task_id))
+            saved: dict = {}
+            if cap.startswith("figma."):
+                saved = _save_figma_files(result, workspace_path, log)
+            elif cap == "stitch.screen.fetch":
+                project_id = meta.get("stitchProjectId") or meta.get("projectId") or ""
+                screen_id = meta.get("stitchScreenId") or meta.get("screenId") or ""
+                if project_id:
+                    project_result = self._dispatch_stitch(
+                        "stitch.project.get",
+                        project_id,
+                        {"stitchProjectId": project_id},
+                    )
+                    saved = _save_stitch_files(
+                        result,
+                        project_result,
+                        project_id,
+                        screen_id,
+                        workspace_path,
+                        log,
+                    )
+            if saved:
+                return {**result, **saved}
+        except Exception as exc:  # noqa: BLE001
+            return {**result, "workspace_save_error": str(exc)}
+        return result

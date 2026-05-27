@@ -12,6 +12,17 @@ Always ensure dependencies are installed and the project builds:
 2. Run `npm run build` to verify there are no compilation errors
 3. Only then run the test suite
 
+For Web Dev Agent work, this is a hard gate, not a recommendation. After any
+code change or repair attempt, the agent must run the repository validation
+script through the workflow node. The required order is always:
+1. Install dependencies with `npm install`
+2. Build with `npm run build`
+3. Run the configured test command or supported runner
+
+The agent must not run self-assessment, screenshot capture, Jira updates, or PR
+creation until the validation script reports install, build, and tests all
+passing. If validation fails, fix the local defect and rerun the same script.
+
 If `npm install` fails:
 - Read the error carefully — it usually names the missing/invalid package
 - Remove the offending package from package.json

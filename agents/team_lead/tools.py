@@ -236,6 +236,21 @@ class FetchDesign(BaseTool):
                 return ToolResult(output=json.dumps({"error": _task_error(task, "Design fetch failed")}))
             artifacts = task.get("artifacts", [])
             payload = _first_artifact_json(artifacts)
+            if not payload.get("local_folder"):
+                payload["local_folder"] = _find_metadata(artifacts, "localFolder")
+            if not payload.get("design_code_path"):
+                payload["design_code_path"] = _find_metadata(artifacts, "designCodePath")
+            if not payload.get("design_md_path"):
+                payload["design_md_path"] = _find_metadata(artifacts, "designMdPath")
+            if not payload.get("design_screen_path"):
+                payload["design_screen_path"] = _find_metadata(artifacts, "designScreenPath")
+            if not payload.get("files"):
+                files_json = _find_metadata(artifacts, "filesJson")
+                if files_json:
+                    try:
+                        payload["files"] = json.loads(files_json)
+                    except json.JSONDecodeError:
+                        pass
             return ToolResult(output=json.dumps(payload))
         except Exception as exc:
             return ToolResult(output=json.dumps({"error": str(exc)}))

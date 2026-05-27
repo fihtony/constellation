@@ -209,6 +209,72 @@ class TestGatherContextFailures:
                 "workspace_path": str(tmp_path),
             })
 
+    async def test_gather_context_requires_ui_design_workspace_outputs(self, monkeypatch, tmp_path):
+        from agents.team_lead.nodes import gather_context
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                if name == "fetch_design":
+                    return json.dumps({
+                        "screen": {"projectId": "p1", "screenId": "s1", "text": "{}"},
+                        "status": "ok",
+                    })
+                if name == "clone_repo":
+                    return json.dumps({"repo_path": str(tmp_path / "scm" / "repo"), "status": "ok"})
+                return json.dumps({})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        with pytest.raises(RuntimeError, match="UI Design files missing from workspace"):
+            await gather_context({
+                "repo_url": "https://github.com/org/repo.git",
+                "stitch_project_id": "13629074018280446337",
+                "stitch_screen_id": "screen-1",
+                "workspace_path": str(tmp_path),
+            })
+
+    async def test_gather_context_keeps_ui_design_paths_when_present(self, monkeypatch, tmp_path):
+        from agents.team_lead.nodes import gather_context
+
+        stitch_dir = tmp_path / "ui-design" / "stitch"
+        stitch_dir.mkdir(parents=True)
+        code_path = stitch_dir / "code.html"
+        md_path = stitch_dir / "DESIGN.md"
+        code_path.write_text("<html><body>Design</body></html>", encoding="utf-8")
+        md_path.write_text("# Design\n\ncolors:\n  primary: '#000'\n", encoding="utf-8")
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                if name == "fetch_design":
+                    return json.dumps({
+                        "screen": {"projectId": "p1", "screenId": "s1", "text": "{}"},
+                        "status": "ok",
+                        "local_folder": str(stitch_dir),
+                        "files": ["ui-design/stitch/code.html", "ui-design/stitch/DESIGN.md"],
+                        "design_code_path": str(code_path),
+                        "design_md_path": str(md_path),
+                    })
+                if name == "clone_repo":
+                    repo_path = tmp_path / "scm" / "repo.git"
+                    repo_path.mkdir(parents=True, exist_ok=True)
+                    (repo_path / "README.md").write_text("ok", encoding="utf-8")
+                    return json.dumps({"repo_path": str(repo_path), "status": "ok"})
+                return json.dumps({})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await gather_context({
+            "repo_url": "https://github.com/org/repo.git",
+            "stitch_project_id": "13629074018280446337",
+            "stitch_screen_id": "screen-1",
+            "workspace_path": str(tmp_path),
+        })
+
+        assert result["design_code_path"] == str(code_path)
+        assert result["design_md_path"] == str(md_path)
+        assert "ui-design/stitch/DESIGN.md" in result["design_files"]
+        assert not (tmp_path / "team-lead" / "design-spec.md").exists()
+
 
 class TestDispatchDevAgentValidation:
     async def test_dispatch_dev_agent_raises_when_web_dev_reports_error(self, monkeypatch):

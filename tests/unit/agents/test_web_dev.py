@@ -15,6 +15,7 @@ from agents.web_dev.nodes import (
     create_pr,
     report_result,
     _safe_json,
+    _rendered_page_has_content,
 )
 
 
@@ -63,6 +64,31 @@ class TestSafeJson:
 
     def test_none_returns_fallback(self):
         assert _safe_json(None, fallback=[]) == []
+
+
+class TestScreenshotRenderChecks:
+
+    def test_rendered_page_has_content_accepts_visible_dom(self):
+        assert _rendered_page_has_content(
+            {
+                "rootChildren": 1,
+                "bodyChildren": 2,
+                "visibleTextChars": 120,
+                "bodyWidth": 1280,
+                "bodyHeight": 900,
+            }
+        ) is True
+
+    def test_rendered_page_has_content_rejects_blank_page(self):
+        assert _rendered_page_has_content(
+            {
+                "rootChildren": 0,
+                "bodyChildren": 1,
+                "visibleTextChars": 0,
+                "bodyWidth": 1280,
+                "bodyHeight": 900,
+            }
+        ) is False
 
 
 class TestWebDevNodes:
@@ -180,47 +206,57 @@ class TestWebDevNodes:
         assert result["test_status"] == "pass"
         assert result["test_cycles"] == 1
 
-    async def test_run_tests_with_passing_runtime(self):
-        from framework.runtime.adapter import AgenticResult
+    async def test_run_tests_with_passing_validation(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "agents.web_dev.nodes._run_mandatory_validation",
+            lambda repo_path, workspace_path, cycle: {
+                "install_ok": True,
+                "build_ok": True,
+                "test_ok": True,
+                "passed": 5,
+                "failed": 0,
+                "output": "All good",
+            },
+        )
 
-        class _MockRuntime:
-            def run_agentic(self, task, **kw):
-                return AgenticResult(
-                    success=True,
-                    summary='{"passed": 5, "failed": 0, "output": "All good"}',
-                    backend_used="mock",
-                )
-
-        state = {"_runtime": _MockRuntime(), "test_cycles": 0}
+        state = {"_runtime": object(), "repo_path": str(tmp_path), "test_cycles": 0}
         result = await run_tests(state)
         assert result["route"] == "pass"
 
-    async def test_run_tests_with_failing_runtime(self):
-        from framework.runtime.adapter import AgenticResult
+    async def test_run_tests_with_failing_validation(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "agents.web_dev.nodes._run_mandatory_validation",
+            lambda repo_path, workspace_path, cycle: {
+                "install_ok": True,
+                "build_ok": False,
+                "test_ok": False,
+                "passed": 2,
+                "failed": 3,
+                "output": "FAILED",
+            },
+        )
 
-        class _MockRuntime:
-            def run_agentic(self, task, **kw):
-                return AgenticResult(
-                    success=True,
-                    summary='{"passed": 2, "failed": 3, "output": "FAILED"}',
-                    backend_used="mock",
-                )
-
-        state = {"_runtime": _MockRuntime(), "test_cycles": 0}
+        state = {"_runtime": object(), "repo_path": str(tmp_path), "test_cycles": 0}
         result = await run_tests(state)
         assert result["route"] == "fail"
         assert result["test_cycles"] == 1
 
-    async def test_run_tests_max_cycles_proceeds_to_pr(self):
-        from framework.runtime.adapter import AgenticResult
+    async def test_run_tests_max_cycles_fails_before_pr(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "agents.web_dev.nodes._run_mandatory_validation",
+            lambda repo_path, workspace_path, cycle: {
+                "install_ok": True,
+                "build_ok": False,
+                "test_ok": False,
+                "passed": 0,
+                "failed": 1,
+                "output": "FAILED",
+            },
+        )
 
-        class _MockRuntime:
-            def run_agentic(self, task, **kw):
-                return AgenticResult(success=True, summary='{"passed": 0, "failed": 1}', backend_used="mock")
-
-        state = {"_runtime": _MockRuntime(), "test_cycles": 4}  # already at max-1
-        result = await run_tests(state)
-        assert result["route"] == "pass"  # proceed despite failure
+        state = {"_runtime": object(), "repo_path": str(tmp_path), "test_cycles": 2, "max_test_cycles": 3}
+        with pytest.raises(RuntimeError, match="Mandatory validation failed"):
+            await run_tests(state)
 
     async def test_fix_tests_no_runtime(self):
         state = {}

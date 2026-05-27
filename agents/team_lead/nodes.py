@@ -340,6 +340,7 @@ async def gather_context(state: dict) -> dict:
     design_code_path_from_agent = ""
     design_md_path_from_agent = ""
     design_screen_path_from_agent = ""
+    returned_design_files: list[str] = []
     if (figma_url or stitch_id) and not design_context:
         log.info("fetching design context",
                  figma_url=figma_url, stitch_id=stitch_id, screen_id=stitch_screen_id,
@@ -404,12 +405,25 @@ async def gather_context(state: dict) -> dict:
             print(f"[{_AGENT_ID}] Failed to write design-spec.json: {exc}")
 
     # Use design file paths from the UI Design agent when available.
-    # Fall back to team-lead/ copies when the agent didn't save files.
     design_code_path = design_code_path_from_agent
     design_md_path = design_md_path_from_agent
     design_screen_path = design_screen_path_from_agent
 
-    if not design_code_path and design_context and workspace_path:
+    if workspace_path and stitch_id and design_context:
+        expected_folder = os.path.join(workspace_path, "ui-design", "stitch")
+        missing_design_outputs: list[str] = []
+        if not design_local_folder or not os.path.isdir(design_local_folder):
+            missing_design_outputs.append(expected_folder)
+        if not design_code_path or not os.path.isfile(design_code_path):
+            missing_design_outputs.append(os.path.join(expected_folder, "code.html"))
+        if not design_md_path or not os.path.isfile(design_md_path):
+            missing_design_outputs.append(os.path.join(expected_folder, "DESIGN.md"))
+        if missing_design_outputs:
+            raise RuntimeError(
+                "UI Design files missing from workspace: " + ", ".join(missing_design_outputs)
+            )
+
+    if not workspace_path and not design_code_path and design_context:
         # Legacy fallback: extract and save to team-lead/ directory
         tl_dir = os.path.join(workspace_path, _AGENT_ID)
         os.makedirs(tl_dir, exist_ok=True)

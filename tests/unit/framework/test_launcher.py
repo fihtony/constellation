@@ -4,8 +4,8 @@ from framework.agent import AgentDefinition, LaunchSpec
 from framework.launcher import Launcher
 
 
-def test_launch_instance_passes_artifact_root_env(monkeypatch):
-    """Launcher should export ARTIFACT_ROOT when it bind-mounts the artifacts volume."""
+def test_launch_instance_mounts_only_task_workspace(monkeypatch):
+    """Launcher should expose only the current task workspace to per-task agents."""
 
     monkeypatch.setenv("ARTIFACT_ROOT", "/app/artifacts")
     monkeypatch.setenv("REGISTRY_URL", "http://registry:9000")
@@ -34,8 +34,10 @@ def test_launch_instance_passes_artifact_root_env(monkeypatch):
     assert len(create_requests) == 1
 
     create_payload = create_requests[0]
-    assert "/host/artifacts:/app/artifacts" in create_payload["HostConfig"]["Binds"]
+    assert "/host/artifacts/task-123:/app/artifacts/task-123" in create_payload["HostConfig"]["Binds"]
+    assert "/host/artifacts:/app/artifacts" not in create_payload["HostConfig"]["Binds"]
     assert "ARTIFACT_ROOT=/app/artifacts" in create_payload["Env"]
+    assert "CONSTELLATION_TASK_WORKSPACE=/app/artifacts/task-123" in create_payload["Env"]
 
 
 def test_launch_instance_passes_through_claude_runtime_env(monkeypatch):
