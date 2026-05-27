@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 from agents.compass.ui.routes import handle_ui_request
@@ -280,8 +281,116 @@ def _dispatch_office_request(task_id: str, user_text: str, office_request: dict,
     return dispatch_data
 
 
+def _development_start_message(jira_key: str) -> str:
+    jira_label = jira_key or "N/A"
+    return (
+        "Development task accepted and running in the background.\n"
+        f"Jira: {jira_label}"
+    )
+
+
+def _development_final_message(dispatch_data: dict) -> str:
+    summary = str(dispatch_data.get("summary") or "").strip()
+    if summary:
+        return summary
+    status = str(dispatch_data.get("status") or "unknown").strip() or "unknown"
+    if status == "completed":
+        pr_url = str(dispatch_data.get("prUrl") or "").strip()
+        branch = str(dispatch_data.get("branch") or "").strip()
+        lines = ["Development task completed successfully."]
+        if pr_url:
+            lines.append(f"PR: {pr_url}")
+        if branch:
+            lines.append(f"Branch: {branch}")
+        return "\n".join(lines)
+    return str(dispatch_data.get("message") or f"Development task ended with status: {status}").strip()
+
+
 class CompassAgent(BaseAgent):
     """Compass Agent -- routes requests via heuristic + LLM classification."""
+
+    def _complete_development_task(
+        self,
+        *,
+        task_id: str,
+        user_text: str,
+        jira_key: str,
+        workspace_path: str,
+    ) -> None:
+        from framework.a2a.protocol import Artifact
+        from framework.devlog import AgentLogger
+        from framework.tools.registry import get_registry
+
+        task_store = self.services.task_store
+        log = AgentLogger(task_id=task_id, agent_name=self.definition.agent_id)
+        dispatch_data: dict[str, object] = {}
+
+        try:
+            registry = get_registry()
+            log.a2a("→", "team-lead", capability="dispatch_development_task", jira_key=jira_key)
+            dispatch_result_str = registry.execute_sync(
+                "dispatch_development_task",
+                {
+                    "task_description": user_text,
+                    "jira_key": jira_key,
+                    "orchestratorTaskId": task_id,
+                    "workspacePath": workspace_path,
+                },
+            )
+            dispatch_data = json.loads(dispatch_result_str) if dispatch_result_str else {}
+        except Exception as exc:
+            dispatch_data = {"status": "error", "message": str(exc)}
+            log.error("dispatch_development_task failed", error=str(exc))
+            print(f"[{self.definition.agent_id}] dispatch_development_task error: {exc}")
+
+        team_lead_task_id = str(dispatch_data.get("taskId") or "").strip()
+        if team_lead_task_id:
+            task_store.update_metadata(task_id, {"teamLeadTaskId": team_lead_task_id})
+
+        final_message = _development_final_message(dispatch_data)
+        artifact_metadata = {"agentId": self.definition.agent_id}
+        if team_lead_task_id:
+            artifact_metadata["teamLeadTaskId"] = team_lead_task_id
+        for key in ("prUrl", "branch", "jiraInReview"):
+            value = dispatch_data.get(key)
+            if value not in (None, ""):
+                artifact_metadata[key] = value
+
+        artifacts = [Artifact(
+            name="compass-response",
+            artifact_type="text/plain",
+            parts=[{"text": final_message}],
+            metadata=artifact_metadata,
+        )]
+
+        task_state = str(dispatch_data.get("state") or "").strip()
+        status = str(dispatch_data.get("status") or "unknown").strip() or "unknown"
+        if task_state == "TASK_STATE_INPUT_REQUIRED":
+            task_store.set_artifacts(task_id, artifacts)
+            task_store.pause_task(
+                task_id,
+                question=final_message or "Team Lead requested clarification.",
+                interrupt_metadata={"teamLeadTaskId": team_lead_task_id, "task_type": "development"},
+            )
+            log.warn("development task awaiting input", tl_task_id=team_lead_task_id)
+            log.a2a("←", "team-lead", status="input-required", tl_task_id=team_lead_task_id)
+            return
+
+        if status != "completed":
+            task_store.set_artifacts(task_id, artifacts)
+            task_store.fail_task(task_id, final_message)
+            log.error("development task failed", tl_task_id=team_lead_task_id, status=status)
+            log.a2a("←", "team-lead", status=status or "error", tl_task_id=team_lead_task_id)
+            return
+
+        task_store.complete_task(task_id, artifacts=artifacts, message=final_message)
+        log.info(
+            "development task complete",
+            tl_task_id=team_lead_task_id,
+            pr_url=str(dispatch_data.get("prUrl") or ""),
+            branch=str(dispatch_data.get("branch") or ""),
+        )
+        log.a2a("←", "team-lead", status="completed", tl_task_id=team_lead_task_id)
 
     async def handle_message(self, message: dict) -> dict:
         import os as _os
@@ -325,36 +434,40 @@ class CompassAgent(BaseAgent):
         dispatch_data = {}
         if task_type == "development":
             jira_key = _extract_jira_key(user_text)
-            log.info("dispatching development task", jira_key=jira_key)
-            log.a2a("→", "team-lead", capability="dispatch_development_task", jira_key=jira_key)
-            print(f"[{_aid}] dispatching development task: jira_key={jira_key!r}")
-            try:
-                dispatch_result_str = registry.execute_sync(
-                    "dispatch_development_task",
-                    {
-                        "task_description": user_text,
-                        "jira_key": jira_key,
-                        "orchestratorTaskId": task.id,
-                        "workspacePath": workspace_path,
-                    },
-                )
-                dispatch_data = json.loads(dispatch_result_str) if dispatch_result_str else {}
-            except Exception as exc:
-                dispatch_data = {"status": "error", "message": str(exc)}
-                log.error("dispatch_development_task failed", error=str(exc))
-                print(f"[{_aid}] dispatch_development_task error: {exc}")
-
-            status = dispatch_data.get("status", "unknown")
-            task_id_tl = dispatch_data.get("taskId", "N/A")
-            display_status = "dispatched" if status not in ("error", "failed", "unknown") else status
-            log.info("dispatch complete", status=display_status, tl_task_id=task_id_tl,
-                     pr_url=dispatch_data.get("prUrl", ""))
-            log.a2a("←", "team-lead", status=display_status, tl_task_id=task_id_tl)
-            response_text = (
-                f"Development task dispatched to Team Lead.\n"
-                f"Jira: {jira_key or 'N/A'}  Status: {display_status}  TL task: {task_id_tl}"
+            log.info("dispatching development task asynchronously", jira_key=jira_key)
+            task_store.update_metadata(
+                task.id,
+                {
+                    "task_type": "development",
+                    "jira_key": jira_key,
+                    "workspace_path": workspace_path,
+                },
             )
-            print(f"[{_aid}] dispatch result: status={display_status} taskId={task_id_tl}")
+            response_text = _development_start_message(jira_key)
+            ui_update = {
+                "task_id": task.id,
+                "task_status": "TASK_STATE_WORKING",
+                "chat_message": {
+                    "role": "COMPASS",
+                    "text": response_text,
+                    "style": "normal",
+                },
+            }
+            initial_response = {**task_store.get_task_dict(task.id), "ui_update": ui_update}
+            worker = threading.Thread(
+                target=self._complete_development_task,
+                kwargs={
+                    "task_id": task.id,
+                    "user_text": user_text,
+                    "jira_key": jira_key,
+                    "workspace_path": workspace_path,
+                },
+                daemon=True,
+                name="compass-development-dispatch",
+            )
+            worker.start()
+            print(f"[{_aid}] dispatch started in background: jira_key={jira_key!r} taskId={task.id}")
+            return initial_response
 
         elif task_type == "office":
             log.info("dispatching office task")

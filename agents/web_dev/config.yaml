@@ -27,9 +27,36 @@ tools:
   - scm_commit
   - scm_push
   - scm_create_pr
+  - scm_upload_pr_image
+  - scm_update_pr
 permissions:
   scm: read-write
   filesystem: workspace-only
 permission_profile: development
 capabilities:
   - web-dev.task.execute
+launch_spec:
+  image: constellation-v2-web-dev:latest
+  port: 8050
+  startup_delay_seconds: 1.5
+  pass_through_env:
+    - AGENT_RUNTIME
+    - AGENT_MODEL
+    - CONSTELLATION_RUNTIME_BACKEND
+    - CONSTELLATION_RUNTIME_MODEL
+    - OPENAI_MODEL
+    - OPENAI_BASE_URL
+    - OPENAI_API_KEY
+    - ANTHROPIC_AUTH_TOKEN
+    - ANTHROPIC_BASE_URL
+    - ANTHROPIC_MODEL
+    - ANTHROPIC_DEFAULT_HAIKU_MODEL
+    - ANTHROPIC_DEFAULT_SONNET_MODEL
+    - ANTHROPIC_DEFAULT_OPUS_MODEL
+    - ANTHROPIC_API_KEY
+    - API_TIMEOUT_MS
+    - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+    - COPILOT_GITHUB_TOKEN
+    - LOCAL_TIMEZONE
+    - TZ
+    - WEB_DEV_MAX_TEST_CYCLES

@@ -19,6 +19,11 @@ allowed_tools:
   - scm_list_branches
   - dispatch_agent
   - query_registry
+  - request_clarification
+  - fetch_jira_ticket
+  - fetch_design
+  - dispatch_web_dev
+  - dispatch_code_review
   # Jira boundary tools (called by workflow nodes, not LLM directly)
   - jira_list_transitions
   - jira_transition

@@ -123,6 +123,24 @@ def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
         return {"error": str(exc)}
 
 
+def _is_screenshot_required(state: dict) -> bool:
+    """Return whether this task must produce PNG implementation screenshots."""
+    definition_of_done = state.get("definition_of_done") or {}
+    if isinstance(definition_of_done, dict) and "screenshot_required" in definition_of_done:
+        return bool(definition_of_done.get("screenshot_required"))
+
+    if state.get("design_context") or state.get("design_spec"):
+        return True
+    if state.get("stitch_screen_id") or state.get("stitch_screen_name"):
+        return True
+
+    task_signals = " ".join(
+        str(state.get(key, "")).lower()
+        for key in ("task_type", "classification", "work_type")
+    )
+    return any(token in task_signals for token in ("ui", "frontend", "front-end", "visual", "design"))
+
+
 def _git_commit_all_pending(repo_path: str, jira_key: str) -> list[str]:
     """Stage all pending changes and commit if anything is staged.
 
@@ -1056,8 +1074,7 @@ async def capture_screenshot(state: dict) -> dict:
     import shutil
     import socket
 
-    definition_of_done = state.get("definition_of_done", {})
-    screenshot_required = definition_of_done.get("screenshot_required", True)
+    screenshot_required = _is_screenshot_required(state)
     log = _logger(state)
 
     if not screenshot_required:
@@ -1071,6 +1088,8 @@ async def capture_screenshot(state: dict) -> dict:
 
     if not repo_path or not os.path.isdir(repo_path):
         log.warn("capture_screenshot skipped — repo_path missing", repo_path=repo_path)
+        if screenshot_required:
+            raise RuntimeError("Required UI screenshot capture failed: repository path is missing")
         return {"screenshot_captured": False, "screenshots": []}
 
     try:
@@ -1476,6 +1495,10 @@ async def capture_screenshot(state: dict) -> dict:
     captured = bool(screenshots) and any(s.endswith(".png") for s in screenshots)
     log.info("screenshot result", captured=captured, count=len(screenshots),
              server_type=locals().get("server_type", "unknown"))
+    if screenshot_required and not captured:
+        raise RuntimeError(
+            "Required UI screenshot capture failed: no PNG screenshots were produced"
+        )
     return {
         "screenshot_captured": captured,
         "screenshots": screenshots,
@@ -1654,6 +1677,10 @@ async def create_pr(state: dict) -> dict:
             "commit_hash": "",
         }
 
+    screenshot_required = _is_screenshot_required(state)
+    if screenshot_required and not state.get("screenshot_captured"):
+        raise RuntimeError("Cannot create PR for a UI task without captured PNG screenshots")
+
     from agents.web_dev.prompts import PR_DESCRIPTION_SYSTEM, PR_DESCRIPTION_TEMPLATE
 
     jira_ctx = state.get("jira_context", {})
@@ -1713,6 +1740,7 @@ async def create_pr(state: dict) -> dict:
     #   https://github.com/{owner}/{repo}/releases/download/screenshot-assets/{file}
     # Falls back to the branch-commit approach if CDN upload fails.
     _screenshots = state.get("screenshots", [])
+    _screenshot_uploaded = False
     _screenshot_section = ""
     if _screenshots:
         import shutil as _shutil
@@ -1746,6 +1774,7 @@ async def create_pr(state: dict) -> dict:
                     f"**{_lbl}**\n\n![]({_url})" for _lbl, _url in _screenshot_entries
                 ]
                 _screenshot_section = "\n\n## Screenshots\n\n" + "\n\n".join(_section_parts)
+                _screenshot_uploaded = True
                 print(f"[{_AGENT_ID}] Screenshots uploaded to GitHub CDN — "
                       f"{len(_screenshot_entries)} image(s) embedded in PR description")
             elif not _cdn_upload_ok:
@@ -1785,6 +1814,7 @@ async def create_pr(state: dict) -> dict:
                             f"**{_lbl}**\n\n![]({_url})" for _lbl, _url in _fallback_entries
                         ]
                         _screenshot_section = "\n\n## Screenshots\n\n" + "\n\n".join(_section_parts)
+                        _screenshot_uploaded = True
                         print(f"[{_AGENT_ID}] Screenshots committed to branch (fallback) "
                               f"and embedded in PR description")
                     else:
@@ -1793,6 +1823,8 @@ async def create_pr(state: dict) -> dict:
 
     if _screenshot_section:
         pr_description = pr_description.rstrip() + _screenshot_section
+    elif screenshot_required:
+        raise RuntimeError("Cannot create PR for a UI task because screenshots were not embedded in the PR description")
 
     # Step 3: Push branch then create PR via SCM boundary tools (not open agentic).
     task_id = state.get("_task_id", "")
@@ -1863,6 +1895,8 @@ async def create_pr(state: dict) -> dict:
                         "test_status": state.get("test_status", "unknown"),
                         "self_assessment_score": state.get("self_assessment", {}).get("score", "N/A"),
                         "screenshot_included": state.get("screenshot_captured", False),
+                        "screenshot_uploaded": _screenshot_uploaded,
+                        "screenshots": _screenshots,
                     },
                 }, fh, ensure_ascii=False, indent=2)
         except OSError:
@@ -1875,6 +1909,7 @@ async def create_pr(state: dict) -> dict:
         "pr_description": pr_description,
         "commit_hash": commit_hash,
         "changes_made": all_changes,
+        "screenshot_uploaded": _screenshot_uploaded,
     }
 
 

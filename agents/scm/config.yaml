@@ -26,3 +26,5 @@ capabilities:
   - scm.pr.get
   - scm.pr.list
   - scm.pr.comment
+  - scm.pr.image.upload
+  - scm.pr.update

@@ -22,8 +22,34 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
+
+
+def _persistent_service_url(definition: dict[str, Any]) -> str:
+    execution_mode = str(
+        definition.get("execution_mode") or definition.get("executionMode") or ""
+    ).strip().lower()
+    if execution_mode == "per-task":
+        return ""
+
+    card_url = str(definition.get("card_url") or definition.get("cardUrl") or "").strip()
+    if not card_url:
+        return ""
+
+    parts = urlsplit(card_url)
+    if not parts.scheme or not parts.netloc:
+        return ""
+
+    suffix = "/.well-known/agent-card.json"
+    path = parts.path or ""
+    if path.endswith(suffix):
+        path = path[: -len(suffix)]
+    else:
+        path = path.rsplit("/", 1)[0] if "/" in path else ""
+    path = path.rstrip("/")
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
 @dataclass
@@ -106,9 +132,25 @@ class RegistryClient:
                 return cached[1]
 
         try:
-            instances = self.find_instances(capability)
-            for instance in instances:
-                svc_url = instance.get("serviceUrl") or instance.get("service_url") or ""
+            definitions = self.query_capability(capability)
+            for definition in definitions:
+                nested_instances = definition.get("instances")
+                if isinstance(nested_instances, list):
+                    for instance in nested_instances:
+                        svc_url = instance.get("serviceUrl") or instance.get("service_url") or ""
+                        if svc_url:
+                            with self._lock:
+                                self._cache[capability] = (time.time() + self._cache_ttl, svc_url)
+                            return svc_url
+
+                svc_url = definition.get("serviceUrl") or definition.get("service_url") or ""
+                if svc_url:
+                    with self._lock:
+                        self._cache[capability] = (time.time() + self._cache_ttl, svc_url)
+                    return svc_url
+
+            for definition in definitions:
+                svc_url = _persistent_service_url(definition)
                 if svc_url:
                     with self._lock:
                         self._cache[capability] = (time.time() + self._cache_ttl, svc_url)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 from framework.env_utils import build_isolated_git_env
@@ -27,6 +28,15 @@ scm_definition = AgentDefinition(
     workflow=None,
     tools=[],
 )
+
+
+def _is_retryable_clone_dir_error(stderr_text: str) -> bool:
+    text = (stderr_text or "").lower()
+    return (
+        "could not create leading directories" in text
+        or "operation not permitted" in text
+        or "permission denied" in text
+    )
 
 
 class SCMAgentAdapter(BaseAgent):
@@ -153,6 +163,27 @@ class SCMAgentAdapter(BaseAgent):
             data, status = client.add_pr_comment(project, repo, pr_id, comment_text)
             return {"comment": data, "status": status}
 
+        if capability == "scm.pr.image.upload":
+            pr_id = meta.get("prId") or meta.get("prNumber") or 0
+            image_path = meta.get("imagePath") or text.strip()
+            filename = meta.get("filename") or ""
+            data, status = client.upload_issue_image(
+                project, repo, int(pr_id or 0), image_path, filename=filename,
+                task_id=meta.get("task_id") or meta.get("taskId") or "",
+            )
+            if status != "ok":
+                return {"error": f"upload failed: status={status}", "detail": data, "status": status}
+            return {"ok": True, "image_url": data.get("href", ""), "asset_id": data.get("asset_id", 0), "status": status}
+
+        if capability == "scm.pr.update":
+            pr_id = meta.get("prId") or meta.get("prNumber") or text.strip()
+            description = meta.get("description") or text.strip()
+            title = meta.get("title") or ""
+            data, status = client.update_pr(project, repo, pr_id, body=description, title=title or None)
+            if status not in ("ok", "no_changes"):
+                return {"error": f"update failed: status={status}", "detail": data, "status": status}
+            return {"ok": True, "status": status, "pr": data}
+
         if capability == "scm.repo.clone":
             return self._handle_clone(meta)
 
@@ -181,6 +212,8 @@ class SCMAgentAdapter(BaseAgent):
         from urllib.parse import urlparse
 
         token = os.environ.get("SCM_TOKEN", "")
+        if not token:
+            return ""
         netloc = urlparse(repo_url).netloc.lower()
         username = os.environ.get("SCM_USERNAME", "")
 
@@ -260,7 +293,7 @@ class SCMAgentAdapter(BaseAgent):
 
         # Auth via http.extraHeader — credentials are NEVER in the remote URL
         auth_header = self._build_auth_header(git_url)
-        git_cfg = ["-c", f"http.extraHeader={auth_header}"]
+        git_cfg = ["-c", f"http.extraHeader={auth_header}"] if auth_header else []
         ca_bundle = os.environ.get("SCM_CA_BUNDLE", "")
         if ca_bundle and os.path.isfile(ca_bundle):
             git_cfg += ["-c", f"http.sslCAInfo={ca_bundle}"]
@@ -281,21 +314,32 @@ class SCMAgentAdapter(BaseAgent):
             print(f"[scm] Removed stale target directory: {target_path}")
         try:
             os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
-            result = subprocess.run(
-                ["git", *git_cfg, "clone", "--depth", "1", git_url, target_path],
-                capture_output=True, text=True, timeout=120,
-                env=git_env,
-            )
-            if result.returncode != 0:
+            for attempt in range(3):
+                result = subprocess.run(
+                    ["git", *git_cfg, "clone", "--depth", "1", git_url, target_path],
+                    capture_output=True, text=True, timeout=120,
+                    env=git_env,
+                )
+                if result.returncode == 0:
+                    return {"cloned": True, "path": target_path, "status": "ok"}
+
                 # stderr from git will not contain credentials (they are in -c, not in URL)
                 stderr_safe = result.stderr.strip()[:400]
+                if attempt < 2 and _is_retryable_clone_dir_error(stderr_safe):
+                    import shutil as _shutil
+
+                    os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+                    if os.path.isdir(target_path) and not os.path.isdir(os.path.join(target_path, ".git")):
+                        _shutil.rmtree(target_path, ignore_errors=True)
+                    time.sleep(1)
+                    continue
+
                 return {
                     "cloned": False,
                     "error": "Clone failed — check SCM_TOKEN and SCM_USERNAME.",
                     "detail": stderr_safe,
                     "status": "clone_failed",
                 }
-            return {"cloned": True, "path": target_path, "status": "ok"}
         except subprocess.TimeoutExpired:
             return {"cloned": False, "error": "clone timed out", "status": "timeout"}
         except Exception as exc:

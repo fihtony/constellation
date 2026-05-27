@@ -288,6 +288,14 @@ class DispatchDevelopmentTask(BaseTool):
                 "type": "string",
                 "description": "Figma or Stitch design URL for UI tasks.  Optional.",
             },
+            "orchestratorTaskId": {
+                "type": "string",
+                "description": "Caller task id used as the shared workflow task id. Optional.",
+            },
+            "workspacePath": {
+                "type": "string",
+                "description": "Shared workspace path created by Compass. Optional.",
+            },
         },
         "required": ["task_description"],
     }
@@ -298,6 +306,9 @@ class DispatchDevelopmentTask(BaseTool):
         jira_key: str = "",
         repo_url: str = "",
         design_url: str = "",
+        orchestratorTaskId: str = "",
+        workspacePath: str = "",
+        **_kwargs,
     ) -> ToolResult:
         import re as _re
         # Sanitize jira_key: MCP tool arguments may contain XML/control characters
@@ -319,6 +330,10 @@ class DispatchDevelopmentTask(BaseTool):
             meta["repoUrl"] = repo_url
         if design_url:
             meta["designUrl"] = design_url
+        if orchestratorTaskId:
+            meta["orchestratorTaskId"] = orchestratorTaskId
+        if workspacePath:
+            meta["workspacePath"] = workspacePath
 
         try:
             from framework.a2a.client import dispatch_sync
@@ -327,18 +342,38 @@ class DispatchDevelopmentTask(BaseTool):
                 capability="team-lead.task.analyze",
                 message_parts=[{"text": task_description}],
                 metadata=meta,
+                timeout=3600,
             )
             task = result.get("task", result)
+            task_id = task.get("id", "")
             task_state = task.get("status", {}).get("state", "")
             if task_state and task_state != "TASK_STATE_COMPLETED":
                 return ToolResult(output=json.dumps({
                     "status": "error",
                     "state": task_state,
+                    "taskId": task_id,
                     "message": _extract_status_text(task) or f"Team Lead ended in {task_state}",
                 }))
             artifacts = task.get("artifacts", [])
             summary = _extract_text(artifacts) or "Task completed."
-            return ToolResult(output=json.dumps({"status": "completed", "summary": summary}))
+            payload = {
+                "status": "completed",
+                "summary": summary,
+            }
+            if task_id:
+                payload["taskId"] = task_id
+            artifact_metadata = next(
+                (
+                    artifact.get("metadata", {})
+                    for artifact in artifacts
+                    if isinstance(artifact, dict) and isinstance(artifact.get("metadata"), dict)
+                ),
+                {},
+            )
+            for key in ("prUrl", "branch", "jiraInReview"):
+                if artifact_metadata.get(key) not in (None, ""):
+                    payload[key] = artifact_metadata.get(key)
+            return ToolResult(output=json.dumps(payload))
         except Exception as exc:
             return ToolResult(output=json.dumps({"status": "error", "message": str(exc)}))
 

@@ -82,6 +82,48 @@ class TestRegistryClientDiscover:
 
             assert client.discover("jira.ticket.fetch") == "http://jira:8010"
 
+    def test_discover_falls_back_to_persistent_card_url(self):
+        client = RegistryClient("http://registry:9000")
+        response = json.dumps([
+            {
+                "agent_id": "jira",
+                "capabilities": ["jira.ticket.fetch"],
+                "execution_mode": "persistent",
+                "card_url": "http://jira:8010/.well-known/agent-card.json",
+                "instances": [],
+            }
+        ]).encode()
+
+        with patch("urllib.request.urlopen") as mock_open:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = response
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_open.return_value = mock_resp
+
+            assert client.discover("jira.ticket.fetch") == "http://jira:8010"
+
+    def test_discover_does_not_fallback_to_per_task_card_url(self):
+        client = RegistryClient("http://registry:9000")
+        response = json.dumps([
+            {
+                "agent_id": "web-dev",
+                "capabilities": ["web-dev.task.execute"],
+                "execution_mode": "per-task",
+                "card_url": "http://web-dev:8050/.well-known/agent-card.json",
+                "instances": [],
+            }
+        ]).encode()
+
+        with patch("urllib.request.urlopen") as mock_open:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = response
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_open.return_value = mock_resp
+
+            assert client.discover("web-dev.task.execute") == ""
+
     def test_invalidate_clears_cache(self):
         client = RegistryClient("http://registry:9000", cache_ttl_seconds=60)
         # Seed cache

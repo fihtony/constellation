@@ -4,13 +4,14 @@ import os
 import pytest
 from framework.workflow import START, END
 from agents.web_dev.agent import web_dev_workflow, web_dev_definition
-from agents.web_dev.tools import SCMCreatePR, register_web_dev_tools
+from agents.web_dev.tools import SCMCreatePR, SCMUploadPRImage, register_web_dev_tools
 from agents.web_dev.nodes import (
     setup_workspace,
     analyze_task,
     implement_changes,
     run_tests,
     fix_tests,
+    capture_screenshot,
     create_pr,
     report_result,
     _safe_json,
@@ -243,10 +244,35 @@ class TestWebDevNodes:
         assert result["fix_attempted"] is True
         assert "Fixed" in result["fix_summary"]
 
+    async def test_capture_screenshot_requires_png_for_ui_task(self, tmp_path):
+        state = {
+            "_task_id": "task-123",
+            "repo_path": str(tmp_path / "missing-repo"),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": True},
+        }
+
+        with pytest.raises(RuntimeError, match="Required UI screenshot capture failed"):
+            await capture_screenshot(state)
+
     async def test_create_pr_no_runtime(self):
         state = {}
         result = await create_pr(state)
         assert "pr_url" in result
+
+    async def test_create_pr_requires_screenshot_for_ui_task(self):
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                return {"raw_response": '{"title": "Add UI", "description": "## Summary\\nAdded UI."}'}
+
+        state = {
+            "_runtime": _MockRuntime(),
+            "definition_of_done": {"screenshot_required": True},
+            "screenshot_captured": False,
+        }
+
+        with pytest.raises(RuntimeError, match="without captured PNG screenshots"):
+            await create_pr(state)
 
     async def test_create_pr_with_runtime(self):
         from framework.tools.registry import get_registry
@@ -366,6 +392,42 @@ class TestWebDevWorkflowExecution:
 
 class TestWebDevBoundaryTools:
 
+    def test_jira_tools_accept_task_metadata(self, monkeypatch):
+        from agents.web_dev.tools import JiraComment, JiraGetTokenUser, JiraListTransitions
+
+        dispatched = []
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return f"http://stub/{capability}"
+
+        def _dispatch_sync(url, capability, message_parts, metadata, **kwargs):
+            dispatched.append({
+                "capability": capability,
+                "metadata": metadata,
+            })
+            return {
+                "task": {
+                    "artifacts": [
+                        {"parts": [{"text": json.dumps({"status": "ok"})}]}
+                    ]
+                }
+            }
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        JiraGetTokenUser().execute_sync(task_id="task-123")
+        JiraListTransitions().execute_sync(ticket_key="CSTL-2", task_id="task-123")
+        JiraComment().execute_sync(ticket_key="CSTL-2", comment="picked up", task_id="task-123")
+
+        assert dispatched[0]["metadata"]["task_id"] == "task-123"
+        assert dispatched[1]["metadata"]["task_id"] == "task-123"
+        assert dispatched[2]["metadata"]["task_id"] == "task-123"
+
     def test_register_web_dev_tools_includes_scm_tools(self):
         from framework.tools.registry import get_registry
 
@@ -373,9 +435,15 @@ class TestWebDevBoundaryTools:
         registry = get_registry()
         assert registry.get("scm_push") is not None
         assert registry.get("scm_create_pr") is not None
+        assert registry.get("scm_upload_pr_image") is not None
+        assert registry.get("scm_update_pr") is not None
 
     def test_scm_create_pr_derives_bitbucket_coordinates(self, monkeypatch):
         dispatched = {}
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return f"http://stub/{capability}"
 
         def _dispatch_sync(url, capability, message_parts, metadata, **kwargs):
             dispatched["capability"] = capability
@@ -388,6 +456,10 @@ class TestWebDevBoundaryTools:
                 }
             }
 
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
         monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
 
         result = SCMCreatePR().execute_sync(
@@ -396,6 +468,7 @@ class TestWebDevBoundaryTools:
             target_branch="main",
             title="PROJ-123: add login page",
             description="PR body",
+            task_id="task-123",
         )
 
         payload = json.loads(result.output)
@@ -403,4 +476,46 @@ class TestWebDevBoundaryTools:
         assert dispatched["capability"] == "scm.pr.create"
         assert dispatched["metadata"]["project"] == "PROJ"
         assert dispatched["metadata"]["repo"] == "web-ui-test"
+        assert dispatched["metadata"]["task_id"] == "task-123"
+
+    def test_scm_upload_pr_image_derives_github_coordinates(self, monkeypatch, tmp_path):
+        image_file = tmp_path / "screen.png"
+        image_file.write_bytes(b"png")
+        dispatched = {}
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return f"http://stub/{capability}"
+
+        def _dispatch_sync(url, capability, message_parts, metadata, **kwargs):
+            dispatched["capability"] = capability
+            dispatched["metadata"] = metadata
+            return {
+                "task": {
+                    "artifacts": [
+                        {"parts": [{"text": json.dumps({"ok": True, "image_url": "https://cdn.example/screen.png"})}]}
+                    ]
+                }
+            }
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        result = SCMUploadPRImage().execute_sync(
+            repo_url="https://github.com/org/repo",
+            image_path=str(image_file),
+            pr_number=42,
+            task_id="task-123",
+        )
+
+        payload = json.loads(result.output)
+        assert payload["image_url"] == "https://cdn.example/screen.png"
+        assert dispatched["capability"] == "scm.pr.image.upload"
+        assert dispatched["metadata"]["project"] == "org"
+        assert dispatched["metadata"]["repo"] == "repo"
+        assert dispatched["metadata"]["imagePath"] == str(image_file)
+        assert dispatched["metadata"]["task_id"] == "task-123"
 

@@ -217,6 +217,8 @@ class WebDevAgent(BaseAgent):
                             "prUrl": result.get("pr_url", ""),
                             "branch": result.get("branch_name", ""),
                             "jiraInReview": result.get("jira_in_review", False),
+                            "screenshotIncluded": result.get("screenshot_captured", False),
+                            "screenshotUploaded": result.get("screenshot_uploaded", False),
                         },
                     )
                 ]
@@ -271,6 +273,8 @@ def _send_callback(
                     "prUrl": result.get("pr_url", ""),
                     "branch": result.get("branch_name", ""),
                     "jiraInReview": result.get("jira_in_review", False),
+                    "screenshotIncluded": result.get("screenshot_captured", False),
+                    "screenshotUploaded": result.get("screenshot_uploaded", False),
                 },
             }
         ],
@@ -397,12 +401,18 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                     pr_url = ""
                     branch = ""
                     jira_in_review = False
+                    screenshot_included = False
+                    screenshot_uploaded = False
                     for art in arts:
                         m = art.get("metadata", {})
                         pr_url = pr_url or m.get("prUrl", "")
                         branch = branch or m.get("branch", "")
                         if m.get("jiraInReview"):
                             jira_in_review = True
+                        if m.get("screenshotIncluded"):
+                            screenshot_included = True
+                        if m.get("screenshotUploaded"):
+                            screenshot_uploaded = True
                     summary = (arts[0].get("parts", [{}])[0].get("text", "Done.") if arts else "Done.")
                     print(f"[web-dev-dispatch] Done: state={state} pr={pr_url} branch={branch}")
                     return ToolResult(output=json.dumps({
@@ -411,6 +421,8 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                         "prUrl": pr_url,
                         "branch": branch,
                         "jiraInReview": jira_in_review,
+                        "screenshotIncluded": screenshot_included,
+                        "screenshotUploaded": screenshot_uploaded,
                     }))
                 time.sleep(2.0)
 

@@ -206,6 +206,8 @@ class TeamLeadAgent(BaseAgent):
                             "prUrl": result.get("pr_url", ""),
                             "branch": result.get("branch_name", ""),
                             "jiraInReview": result.get("jira_in_review", False),
+                            "screenshotIncluded": result.get("screenshot_included", False),
+                            "screenshotUploaded": result.get("screenshot_uploaded", False),
                         },
                     )
                 ]
@@ -280,6 +282,8 @@ class TeamLeadAgent(BaseAgent):
                             "prUrl": result.get("pr_url", "") if isinstance(result, dict) else "",
                             "branch": result.get("branch_name", "") if isinstance(result, dict) else "",
                             "jiraInReview": result.get("jira_in_review", False) if isinstance(result, dict) else False,
+                            "screenshotIncluded": result.get("screenshot_included", False) if isinstance(result, dict) else False,
+                            "screenshotUploaded": result.get("screenshot_uploaded", False) if isinstance(result, dict) else False,
                         },
                     )
                 ]
@@ -327,6 +331,8 @@ def _send_callback(
                     "prUrl": result.get("pr_url", ""),
                     "branch": result.get("branch_name", ""),
                     "jiraInReview": result.get("jira_in_review", False),
+                    "screenshotIncluded": result.get("screenshot_included", False),
+                    "screenshotUploaded": result.get("screenshot_uploaded", False),
                 },
             }
         ],

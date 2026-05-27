@@ -57,6 +57,43 @@ def _safe_json(text: str, fallback: Any = None) -> Any:
         return fallback
 
 
+def _is_success_status(status: Any) -> bool:
+    text = str(status or "").strip().lower()
+    if not text:
+        return False
+    return text in {"ok", "success", "fetched", "200", "201"} or text.startswith("2")
+
+
+def _validate_jira_payload(payload: dict, jira_key: str) -> dict:
+    """Return a Jira ticket dict or raise when the fetch result is unusable."""
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Jira fetch failed for {jira_key}: invalid response payload")
+    if payload.get("error"):
+        raise RuntimeError(f"Jira fetch failed for {jira_key}: {payload['error']}")
+
+    status = payload.get("status", "")
+    ticket = payload.get("ticket", payload)
+    if not _is_success_status(status):
+        raise RuntimeError(f"Jira fetch failed for {jira_key}: status={status or 'unknown'}")
+    if not isinstance(ticket, dict) or not ticket.get("key"):
+        raise RuntimeError(f"Jira fetch failed for {jira_key}: ticket payload missing key")
+    if jira_key and str(ticket.get("key", "")).upper() != jira_key.upper():
+        raise RuntimeError(
+            f"Jira fetch failed for {jira_key}: fetched ticket key {ticket.get('key')!r} does not match"
+        )
+    return ticket
+
+
+def _require_repo_url(repo_url: str, jira_key: str) -> None:
+    if not repo_url:
+        source = f"Jira ticket {jira_key}" if jira_key else "task context"
+        raise RuntimeError(f"No SCM repository URL was found in {source}; cannot dispatch development agent")
+
+    scm_hosts = ("github.com", "bitbucket.org", "gitlab.com", "dev.azure.com")
+    if not any(host in repo_url for host in scm_hosts):
+        raise RuntimeError(f"Repository URL is not a supported SCM URL: {repo_url!r}")
+
+
 async def receive_task(state: dict) -> dict:
     """Parse and validate the incoming task request."""
     import re as _re
@@ -205,22 +242,19 @@ async def gather_context(state: dict) -> dict:
                 {"ticket_key": jira_key, "task_id": task_id, "workspace_path": workspace_path}
             )
             payload = json.loads(result_str) if result_str else {}
-            if payload.get("error"):
-                log.warn("jira fetch warning", error=payload["error"])
-                print(f"[{_AGENT_ID}] Jira fetch warning: {payload['error']} (continuing without Jira context)")
-            else:
-                jira_context = payload.get("ticket", payload)
-                jira_local_folder = payload.get("local_folder", "")
-                returned_files = payload.get("files", [])
-                if returned_files:
-                    jira_files.extend(returned_files)
-                log.info("jira fetch ok", jira_key=jira_key, local_folder=jira_local_folder,
-                         files=returned_files)
-                log.a2a("←", "jira", capability="fetch_jira_ticket", jira_key=jira_key,
-                        local_folder=jira_local_folder, files_count=len(returned_files))
+            jira_context = _validate_jira_payload(payload, jira_key)
+            jira_local_folder = payload.get("local_folder", "")
+            returned_files = payload.get("files", [])
+            if returned_files:
+                jira_files.extend(returned_files)
+            log.info("jira fetch ok", jira_key=jira_key, local_folder=jira_local_folder,
+                     files=returned_files)
+            log.a2a("←", "jira", capability="fetch_jira_ticket", jira_key=jira_key,
+                    local_folder=jira_local_folder, files_count=len(returned_files))
         except Exception as exc:
             log.error("jira fetch failed", error=str(exc))
-            print(f"[{_AGENT_ID}] Jira fetch failed: {exc} (continuing without Jira context)")
+            print(f"[{_AGENT_ID}] Jira fetch failed: {exc}")
+            raise
 
     # Extract embedded URLs / IDs from Jira ticket content using LLM, falling back to regex.
     figma_url = state.get("figma_url", "")
@@ -272,9 +306,9 @@ async def gather_context(state: dict) -> dict:
         except OSError as exc:
             print(f"[{_AGENT_ID}] Failed to write jira-context-extracted.json: {exc}")
 
-    # Env var fallbacks (applied after extraction, before design fetch)
-    if not repo_url:
-        repo_url = os.environ.get("SCM_REPO_URL", "")
+    # Env var fallbacks for design endpoints only. Repository routing must come
+    # from the request or fetched Jira context so invalid tickets cannot drift to
+    # a default repository.
     if not stitch_id:
         stitch_id = os.environ.get("STITCH_PROJECT_ID", "")
     if not stitch_screen_id:
@@ -432,11 +466,8 @@ async def gather_context(state: dict) -> dict:
         except Exception as exc:
             print(f"[{_AGENT_ID}] Design content extraction fallback failed (non-fatal): {exc}")
 
-    # Derive repo name from URL — validate it's a real SCM URL first
-    _scm_hosts = ("github.com", "bitbucket.org", "gitlab.com", "dev.azure.com")
-    if repo_url and not any(h in repo_url for h in _scm_hosts):
-        print(f"[{_AGENT_ID}] Ignoring non-SCM repo_url: {repo_url!r}; falling back to SCM_REPO_URL env var")
-        repo_url = os.environ.get("SCM_REPO_URL", "")
+    # Derive repo name from URL — validate it is a real SCM URL first.
+    _require_repo_url(repo_url, jira_key)
     repo_name = ""
     if repo_url:
         parts = [p for p in repo_url.rstrip("/").split("/") if p]
@@ -630,6 +661,19 @@ async def dispatch_dev_agent(state: dict) -> dict:
     log.node("dispatch_dev_agent")
     revision_feedback = state.get("revision_feedback", "")
     task_description = _build_dev_brief(state)
+    definition_of_done = dict((state.get("plan", {}) or {}).get("definition_of_done", {}) or {})
+    if not definition_of_done:
+        definition_of_done = {
+            "build_must_pass": True,
+            "tests_must_pass": True,
+            "self_assessment_required": True,
+            "jira_state_management": True,
+            "pr_required": True,
+        }
+    if "screenshot_required" not in definition_of_done:
+        definition_of_done["screenshot_required"] = state.get("task_type", "") in (
+            "feature", "ui", "frontend", "frontend_feature", "ui_feature",
+        ) or bool(state.get("design_context") or state.get("design_code_path") or state.get("stitch_screen_id"))
 
     try:
         result_str = registry.execute_sync(
@@ -652,16 +696,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "stitch_screen_name": state.get("stitch_screen_name", ""),
                 "orchestrator_task_id": state.get("_task_id", ""),
                 "revision_feedback": revision_feedback,
-                "definition_of_done": state.get("plan", {}).get("definition_of_done", {
-                    "build_must_pass": True,
-                    "tests_must_pass": True,
-                    "self_assessment_required": True,
-                    "jira_state_management": True,
-                    "pr_required": True,
-                    "screenshot_required": state.get("task_type", "") in (
-                        "feature", "ui", "frontend", "frontend_feature", "ui_feature",
-                    ) or bool(state.get("design_context") or state.get("stitch_screen_id")),
-                }),
+                "definition_of_done": definition_of_done,
             },
         )
         payload = json.loads(result_str) if result_str else {}
@@ -673,6 +708,29 @@ async def dispatch_dev_agent(state: dict) -> dict:
     pr_url = payload.get("prUrl", "")
     branch_name = payload.get("branch", "")
     jira_in_review = payload.get("jiraInReview", False)
+    screenshot_included = bool(payload.get("screenshotIncluded") or payload.get("screenshot_included"))
+    screenshot_uploaded = bool(payload.get("screenshotUploaded") or payload.get("screenshot_uploaded"))
+    status = str(payload.get("status", "")).strip().lower()
+    jira_required = bool(definition_of_done.get("jira_state_management")) and bool(state.get("jira_key"))
+    missing_evidence: list[str] = []
+
+    if status == "error":
+        error_message = payload.get("message") or payload.get("error") or "Web Dev task failed"
+        log.error("dev dispatch returned error", detail=error_message)
+        raise RuntimeError(error_message)
+
+    if definition_of_done.get("pr_required") and not pr_url:
+        missing_evidence.append("prUrl")
+    if jira_required and not jira_in_review:
+        missing_evidence.append("jiraInReview")
+    if definition_of_done.get("screenshot_required") and not screenshot_included:
+        missing_evidence.append("screenshotIncluded")
+
+    if missing_evidence:
+        detail = ", ".join(missing_evidence)
+        log.error("dev dispatch missing delivery evidence", missing=detail)
+        raise RuntimeError(f"Web Dev completed without required delivery evidence: {detail}")
+
     log.info("dev dispatch result",
              status=payload.get("status", "?"), pr_url=pr_url,
              branch=branch_name, jira_in_review=jira_in_review)
@@ -690,6 +748,8 @@ async def dispatch_dev_agent(state: dict) -> dict:
         "pr_url": pr_url,
         "branch_name": branch_name,
         "jira_in_review": jira_in_review,
+        "screenshot_included": screenshot_included,
+        "screenshot_uploaded": screenshot_uploaded,
     }
 
 
@@ -770,6 +830,17 @@ async def report_success(state: dict) -> dict:
     analysis = state.get("analysis_summary", "")
     verdict = state.get("review_verdict", "approved")
     revision_count = state.get("revision_count", 0)
+    dev_result = state.get("dev_result", {}) if isinstance(state.get("dev_result", {}), dict) else {}
+    screenshot_included = bool(
+        state.get("screenshot_included")
+        or dev_result.get("screenshotIncluded")
+        or dev_result.get("screenshot_included")
+    )
+    screenshot_uploaded = bool(
+        state.get("screenshot_uploaded")
+        or dev_result.get("screenshotUploaded")
+        or dev_result.get("screenshot_uploaded")
+    )
 
     report_summary = (
         f"Task completed successfully.\n"
@@ -800,6 +871,8 @@ async def report_success(state: dict) -> dict:
                         "analysis": analysis,
                         "review_verdict": verdict,
                         "revision_count": revision_count,
+                        "screenshot_included": screenshot_included,
+                        "screenshot_uploaded": screenshot_uploaded,
                     },
                 }, fh, ensure_ascii=False, indent=2)
         except OSError as exc:
@@ -809,6 +882,8 @@ async def report_success(state: dict) -> dict:
         "report_summary": report_summary,
         "success": True,
         "jira_in_review": state.get("jira_in_review", False),
+        "screenshot_included": screenshot_included,
+        "screenshot_uploaded": screenshot_uploaded,
     }
 
 
