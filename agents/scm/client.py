@@ -517,7 +517,7 @@ class GitHubClient:
         try:
             # Get diff text via Accept header
             import urllib.request
-            url = f"{self._base_url}/repos/{owner}/{repo}/pulls/{pr_id}"
+            url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pr_id}"
             req = urllib.request.Request(url, method="GET")
             req.add_header("Authorization", f"Bearer {self._token}")
             req.add_header("Accept", "application/vnd.github.v3.diff")

@@ -105,7 +105,7 @@ def _build_office_definition() -> AgentDefinition:
         skills=cfg.get("skills", []),
         tools=cfg.get("tools", []),
         permissions=cfg.get("permissions", {}),
-        permission_profile=cfg.get("permission_profile", "office_readonly"),
+        permission_profile=cfg.get("permission_profile", "office"),
         runtime_backend=cfg.get("runtime_backend", "connect-agent"),
         model=cfg.get("model", "gpt-5-mini"),
         workflow=office_workflow,

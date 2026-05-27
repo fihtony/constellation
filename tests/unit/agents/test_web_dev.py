@@ -2,8 +2,11 @@
 import json
 import os
 import pytest
+from unittest.mock import MagicMock
+from framework.agent import AgentServices
+from framework.task_store import InMemoryTaskStore
 from framework.workflow import START, END
-from agents.web_dev.agent import web_dev_workflow, web_dev_definition
+from agents.web_dev.agent import WebDevAgent, web_dev_workflow, web_dev_definition
 from agents.web_dev.tools import SCMCreatePR, SCMUploadPRImage, register_web_dev_tools
 from agents.web_dev.nodes import (
     setup_workspace,
@@ -19,6 +22,20 @@ from agents.web_dev.nodes import (
     _detect_fragile_icon_font_usage,
     _rendered_page_has_content,
 )
+
+
+def _agent_services(runtime=None):
+    return AgentServices(
+        session_service=MagicMock(),
+        event_store=MagicMock(),
+        memory_service=MagicMock(),
+        skills_registry=MagicMock(),
+        plugin_manager=MagicMock(),
+        checkpoint_service=MagicMock(),
+        runtime=runtime or MagicMock(),
+        registry_client=None,
+        task_store=InMemoryTaskStore(),
+    )
 
 
 class TestWebDevWorkflowCompile:
@@ -47,6 +64,17 @@ class TestWebDevWorkflowCompile:
     def test_web_dev_definition_permissions(self):
         assert web_dev_definition.permissions.get("scm") == "read-write"
         assert web_dev_definition.permissions.get("filesystem") == "workspace-only"
+
+
+class TestWebDevExecutionContract:
+
+    async def test_handle_message_fails_closed_without_execution_contract(self):
+        agent = WebDevAgent(definition=web_dev_definition, services=_agent_services())
+
+        result = await agent.handle_message({"message": {"parts": [{"text": "Implement task"}], "metadata": {}}})
+
+        assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
+        assert "Missing executionContract" in result["task"]["status"]["message"]["parts"][0]["text"]
 
 
 class TestSafeJson:

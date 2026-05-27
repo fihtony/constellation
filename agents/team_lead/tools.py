@@ -443,6 +443,10 @@ class DispatchWebDev(BaseTool):
                 "type": "object",
                 "description": "Acceptance gate criteria (build, tests, PR, screenshot). Optional.",
             },
+            "execution_contract": {
+                "type": "object",
+                "description": "Parent-issued execution contract for the Web Dev child agent.",
+            },
         },
         "required": ["task_description"],
     }
@@ -621,6 +625,10 @@ class DispatchCodeReview(BaseTool):
                 "type": "string",
                 "description": "Path to context-manifest.json. Optional.",
             },
+            "execution_contract": {
+                "type": "object",
+                "description": "Parent-issued execution contract for the Code Review child agent.",
+            },
         },
         "required": [],
     }
@@ -657,6 +665,9 @@ class DispatchCodeReview(BaseTool):
             meta["orchestratorTaskId"] = orchestrator_task_id
         if task_id:
             meta["taskId"] = task_id
+        execution_contract = _.get("execution_contract") if isinstance(_, dict) else None
+        if execution_contract:
+            meta["executionContract"] = execution_contract
 
         try:
             from framework.a2a.client import dispatch_sync

@@ -157,6 +157,162 @@ class FetchDesign(BaseTool):
         return ToolResult(output=json.dumps(result))
 
 
+class FetchFigmaPage(BaseTool):
+    name = "fetch_figma_page"
+    description = "Fetch Figma page metadata and persist design data to the workspace."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "figma_url": {"type": "string"},
+            "page_name": {"type": "string"},
+            "workspace_path": {"type": "string"},
+            "task_id": {"type": "string"},
+        },
+        "required": ["figma_url", "workspace_path"],
+    }
+
+    def execute_sync(
+        self,
+        figma_url: str = "",
+        page_name: str = "",
+        workspace_path: str = "",
+        task_id: str = "",
+    ) -> ToolResult:
+        result = json.loads(FetchDesign().execute_sync(
+            figma_url=figma_url,
+            task_id=task_id,
+            workspace_path=workspace_path,
+        ).output)
+        pages = result.get("pages", [])
+        if page_name and pages:
+            wanted = page_name.lower()
+            result["matched_page"] = next(
+                (page for page in pages if wanted in str(page.get("name", "")).lower()),
+                None,
+            )
+        return ToolResult(output=json.dumps(result))
+
+
+class FetchStitchScreen(BaseTool):
+    name = "fetch_stitch_screen"
+    description = "Fetch a Google Stitch screen and persist code, spec, and screenshot files."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "string"},
+            "screen_id": {"type": "string"},
+            "screen_name": {"type": "string"},
+            "workspace_path": {"type": "string"},
+            "task_id": {"type": "string"},
+        },
+        "required": ["project_id", "workspace_path"],
+    }
+
+    def execute_sync(
+        self,
+        project_id: str = "",
+        screen_id: str = "",
+        screen_name: str = "",
+        workspace_path: str = "",
+        task_id: str = "",
+    ) -> ToolResult:
+        return FetchDesign().execute_sync(
+            stitch_project_id=project_id,
+            stitch_screen_id=screen_id,
+            screen_name=screen_name,
+            task_id=task_id,
+            workspace_path=workspace_path,
+        )
+
+
+class FetchDesignTokens(BaseTool):
+    name = "fetch_design_tokens"
+    description = "Fetch available design tokens from Figma styles or Stitch project metadata."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "figma_url": {"type": "string"},
+            "stitch_project_id": {"type": "string"},
+            "task_id": {"type": "string"},
+        },
+        "required": [],
+    }
+
+    def execute_sync(
+        self,
+        figma_url: str = "",
+        stitch_project_id: str = "",
+        task_id: str = "",
+    ) -> ToolResult:
+        log = _log(task_id)
+        adapter = _get_adapter()
+        if figma_url:
+            result = adapter._dispatch("figma.styles.fetch", figma_url, {"metadata": {"figmaUrl": figma_url}})
+            return ToolResult(output=json.dumps({
+                "tokens": result.get("styles", result),
+                "status": result.get("status", "ok"),
+            }))
+        if stitch_project_id:
+            result = adapter._dispatch(
+                "stitch.project.get",
+                stitch_project_id,
+                {"metadata": {"stitchProjectId": stitch_project_id}},
+            )
+            project = result.get("project", result)
+            tokens = {}
+            if isinstance(project, dict):
+                tokens = project.get("designTheme") or project.get("tokens") or {}
+            return ToolResult(output=json.dumps({"tokens": tokens, "status": result.get("status", "ok")}))
+        log.warn("fetch_design_tokens: no design source provided")
+        return ToolResult(output=json.dumps({"tokens": {}, "status": "no_source"}))
+
+
+class ExportDesignScreenshot(BaseTool):
+    name = "export_design_screenshot"
+    description = "Export or persist a design screenshot PNG in the workspace."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "figma_url": {"type": "string"},
+            "stitch_project_id": {"type": "string"},
+            "stitch_screen_id": {"type": "string"},
+            "workspace_path": {"type": "string"},
+            "task_id": {"type": "string"},
+        },
+        "required": ["workspace_path"],
+    }
+
+    def execute_sync(
+        self,
+        figma_url: str = "",
+        stitch_project_id: str = "",
+        stitch_screen_id: str = "",
+        workspace_path: str = "",
+        task_id: str = "",
+    ) -> ToolResult:
+        if stitch_project_id:
+            result = json.loads(FetchDesign().execute_sync(
+                stitch_project_id=stitch_project_id,
+                stitch_screen_id=stitch_screen_id,
+                task_id=task_id,
+                workspace_path=workspace_path,
+            ).output)
+            image_path = result.get("design_screen_path", "")
+            return ToolResult(output=json.dumps({
+                "status": "ok" if image_path else "missing_image",
+                "image_path": image_path,
+                **result,
+            }))
+        if figma_url:
+            result = json.loads(FetchDesign().execute_sync(
+                figma_url=figma_url,
+                task_id=task_id,
+                workspace_path=workspace_path,
+            ).output)
+            return ToolResult(output=json.dumps({"status": "not_supported", "image_path": "", **result}))
+        return ToolResult(output=json.dumps({"status": "no_source", "image_path": ""}))
+
+
 def _save_figma_files(result: dict, workspace_path: str, log) -> dict:
     """Save Figma design data to <workspace>/ui-design/figma/."""
     import json as _json
@@ -378,7 +534,13 @@ def _build_design_md(project_result: dict, screen_meta: dict, project_id: str, s
     return "\n".join(l for l in lines if l is not None)
 
 
-_TOOLS = [FetchDesign()]
+_TOOLS = [
+    FetchDesign(),
+    FetchFigmaPage(),
+    FetchStitchScreen(),
+    FetchDesignTokens(),
+    ExportDesignScreenshot(),
+]
 
 
 def register_ui_design_tools() -> None:

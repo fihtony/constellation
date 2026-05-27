@@ -9,7 +9,7 @@ import subprocess
 import pytest
 
 from agents.scm.adapter import SCMAgentAdapter
-from agents.scm.client import BitbucketClient, _parse_bb_project_repo
+from agents.scm.client import BitbucketClient, GitHubClient, GITHUB_API_BASE, _parse_bb_project_repo
 from agents.scm.providers.github_mcp import GitHubMCPProvider
 
 
@@ -69,6 +69,32 @@ class TestScmAdapterCloneBehavior:
         adapter = object.__new__(SCMAgentAdapter)
 
         assert adapter._build_auth_header("https://github.com/fihtony/english-study-hub.git") == ""
+
+    def test_github_pr_diff_uses_github_api_base(self, monkeypatch):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return b"diff --git a/file.js b/file.js"
+
+        def fake_urlopen(request, timeout=0):
+            captured["url"] = request.full_url
+            return FakeResponse()
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr(GitHubClient, "_request", lambda self, method, path, timeout=0: (200, []))
+
+        payload, status = GitHubClient("token").get_pr_diff("owner", "repo", 12)
+
+        assert status == "ok"
+        assert captured["url"] == f"{GITHUB_API_BASE}/repos/owner/repo/pulls/12"
+        assert payload["diff_text"].startswith("diff --git")
 
     def test_handle_clone_retries_directory_creation_failure(self, monkeypatch, tmp_path):
         target_path = tmp_path / "task" / "scm" / "english-study-hub"

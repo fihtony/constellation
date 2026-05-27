@@ -56,7 +56,11 @@ team_lead_workflow = Workflow(
         (START, receive_task, analyze_requirements),
         (analyze_requirements, gather_context),
         (gather_context, validate_readiness),
-        (validate_readiness, create_plan),
+        (validate_readiness, {
+            "ready": create_plan,
+            "missing_info": gather_context,
+            "need_user_input": escalate_to_user,
+        }),
         (create_plan, dispatch_dev_agent),
         (dispatch_dev_agent, review_result),
         (review_result, {

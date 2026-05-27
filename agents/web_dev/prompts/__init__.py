@@ -585,31 +585,13 @@ Self-assessment verdict: {assessment_verdict}
 Self-assessment gaps: {assessment_gaps}
 Screenshots in workspace: {screenshot_paths}
 
+Required Markdown template:
+{pr_description_template}
+
 Write a pull request title and description.
 Return JSON with:
 - "title": short PR title (≤72 chars, imperative mood, prefixed with Jira key)
-- "description": Markdown description following this template:
-
-## {jira_key}: {{summary}}
-
-### Changes
-{{implementation_summary}}
-
-### Files Changed
-{{files_changed_list}}
-
-### Test Results
-{{test_summary}}
-
-### Self-Assessment
-- Score: {{assessment_score}} ({{assessment_verdict}})
-- Remaining gaps: {{gaps_list}}
-
-### Screenshots
-{{screenshots_note}}
-
-### Jira Ticket
-[{jira_key}]({jira_url})
+- "description": Markdown description following the required template above.
 """
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,7 @@ Configuration (tests/.env — only credentials needed):
 
 Run:
     pytest tests/e2e/test_full_workflow_e2e.py -m live -v -s \\
-        --task "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2"
+        --task "$TEST_DEVELOPMENT_TASK"
 """
 from __future__ import annotations
 
@@ -129,7 +129,7 @@ def _load_live_config(task_arg: str) -> dict:
     jira_base_url = _infer_jira_base_url(jira_ticket_url) if jira_ticket_url else ""
     if not jira_base_url:
         # Try to infer from JIRA_BASE_URL env var
-        jira_base_url = _env("JIRA_BASE_URL", "https://tarch.atlassian.net")
+        jira_base_url = _env("JIRA_BASE_URL", "")
 
     # SCM: token required, repo URL optional (agents discover from Jira)
     scm_token = _env("TEST_SCM_TOKEN") or _env("TEST_GITHUB_TOKEN", "")
@@ -331,7 +331,7 @@ async def test_implement_jira_ticket_full_workflow(request):
     """E2E: send task to Compass, constellation system drives the full workflow.
 
     Pass the development task via --task CLI argument:
-        pytest ... --task "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2"
+        pytest ... --task "$TEST_DEVELOPMENT_TASK"
 
     The test only:
       1. Starts all constellation agents (they self-register their tools)
@@ -347,7 +347,7 @@ async def test_implement_jira_ticket_full_workflow(request):
         pytest.skip(
             "No --task argument provided.\n"
             "Usage: pytest tests/e2e/test_full_workflow_e2e.py -m live -v -s "
-            "--task \"implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2\""
+            "--task \"$TEST_DEVELOPMENT_TASK\""
         )
 
     cfg = _load_live_config(task_arg)

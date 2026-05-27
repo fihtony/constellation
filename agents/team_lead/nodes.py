@@ -178,6 +178,14 @@ async def analyze_requirements(state: dict) -> dict:
              task_type=analysis.get("task_type"),
              complexity=analysis.get("complexity"))
 
+    from framework.validation_gates import validate_analysis_schema
+    analysis_gate = validate_analysis_schema(analysis)
+    if not analysis_gate.passed:
+        log.warn("validate_analysis_schema gate failed", feedback=analysis_gate.feedback)
+        analysis.setdefault("task_type", "general")
+        analysis.setdefault("complexity", "medium")
+        analysis.setdefault("skills", [])
+
     # Write analysis.json to workspace
     workspace_path = state.get("workspace_path", "")
     if workspace_path:
@@ -588,24 +596,67 @@ async def validate_readiness(state: dict) -> dict:
     """Deterministic gate: verify all prerequisites for planning/dispatch.
 
     Checks: repo cloned, Jira context present (if key given), repo URL valid.
-    Returns route='ready' on success, raises RuntimeError on fatal failure.
+    Returns route='ready' on success, or a deterministic graph route for
+    retry/user input when prerequisites are not complete.
     """
     from framework.validation_gates import validate_readiness as _gate
 
     log = _logger(state)
     log.node("validate_readiness")
 
+    jira_key = str(state.get("jira_key") or "")
+    jira_context = state.get("jira_context") or {}
+    repo_path = str(state.get("repo_path") or "")
+    repo_cloned = bool(state.get("repo_cloned")) and bool(repo_path) and os.path.isdir(repo_path)
+    repo_non_empty = False
+    if repo_cloned:
+        with os.scandir(repo_path) as entries:
+            repo_non_empty = any(entries)
+    context_key = ""
+    if isinstance(jira_context, dict):
+        context_key = str(jira_context.get("key") or jira_context.get("ticket_key") or "")
+    is_ui_task = bool(
+        state.get("design_context")
+        or state.get("figma_url")
+        or state.get("stitch_project_id")
+        or state.get("stitch_screen_id")
+        or state.get("design_code_path")
+    )
+    design_spec_exists = bool(
+        state.get("design_context")
+        or (state.get("design_code_path") and os.path.isfile(str(state.get("design_code_path"))))
+        or (state.get("design_md_path") and os.path.isfile(str(state.get("design_md_path"))))
+    )
+
     result = _gate(
-        repo_cloned=state.get("repo_cloned", False),
-        repo_path=state.get("repo_path", ""),
-        jira_key=state.get("jira_key", ""),
-        jira_context=state.get("jira_context"),
-        repo_url=state.get("repo_url", ""),
+        jira_downloaded=(not jira_key) or bool(jira_context),
+        jira_key_matches=(not jira_key) or (context_key == jira_key),
+        repo_cloned=repo_cloned,
+        repo_non_empty=repo_non_empty,
+        is_ui_task=is_ui_task,
+        design_spec_exists=design_spec_exists,
+        tech_stack_identified=bool(state.get("tech_stack")),
+        requirements_clarified=bool(state.get("analysis_summary") or jira_context),
     )
 
     if not result.passed:
-        log.error("readiness gate failed", gate=result.gate_name, feedback=result.feedback)
-        raise RuntimeError(f"Readiness gate failed: {result.feedback}")
+        attempts = int(state.get("readiness_attempts", 0)) + 1
+        failed = set((result.details or {}).get("failed", []))
+        retryable = failed <= {"design_spec_exists", "tech_stack_identified"}
+        route = "missing_info" if attempts < 3 and retryable else "need_user_input"
+        log.warn(
+            "readiness gate failed",
+            gate=result.gate_name,
+            feedback=result.feedback,
+            attempts=attempts,
+            route=route,
+        )
+        return {
+            "readiness_validated": False,
+            "readiness_attempts": attempts,
+            "readiness_feedback": result.feedback,
+            "route": route,
+        }
 
     log.info("readiness gate passed")
     return {"readiness_validated": True, "route": "ready"}
@@ -687,7 +738,7 @@ async def create_plan(state: dict) -> dict:
     if not gate_result.passed:
         log = _logger(state)
         log.warn("validate_plan_schema gate failed", feedback=gate_result.feedback)
-        # Non-fatal: plan may still be usable even if schema is loose
+        plan = {"steps": [{"step": 1, "action": raw or state.get("analysis_summary") or "Execute task"}]}
 
     return {
         "plan": plan,
@@ -705,7 +756,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
     ensuring the child agent receives its allowed_tools and workflow config.
     """
     from framework.tools.registry import get_registry
-    from framework.execution_contract import build_execution_contract
+    from framework.execution_contract import build_execution_contract, load_child_profiles
 
     registry = get_registry()
 
@@ -735,18 +786,28 @@ async def dispatch_dev_agent(state: dict) -> dict:
     # Build execution contract for the child dev agent
     execution_contract = None
     try:
+        root = _Path(__file__).resolve().parents[2]
+        child_profiles = load_child_profiles({
+            "web-dev": str(root / "config" / "permissions" / "web-dev.yaml"),
+        })
         execution_contract = build_execution_contract(
-            profile="web-dev",
-            workflow_ref="development_task",
-            rule_refs=["development_standards", "code_quality", "security"],
+            profile=child_profiles["web-dev"],
+            workflow_ref="config/workflows/development_task.yaml",
+            rule_refs=[
+                "config/rules/development_standards.yaml",
+                "config/rules/code_quality.yaml",
+                "config/rules/security.yaml",
+            ],
             workspace_root=state.get("workspace_path", ""),
             definition_of_done=definition_of_done,
         )
+        if not execution_contract.allowed_tools:
+            raise ValueError("web-dev permission profile has no allowed_tools")
         log.info("execution contract built", profile="web-dev",
                  tools_count=len(execution_contract.allowed_tools))
     except Exception as exc:
-        log.warn("execution contract build failed (non-fatal)", error=str(exc))
-        # Non-fatal: dispatch continues without contract enforcement
+        log.error("execution contract build failed", error=str(exc))
+        raise RuntimeError(f"Cannot dispatch Web Dev without a valid execution contract: {exc}") from exc
 
     try:
         dispatch_args = {
@@ -847,6 +908,26 @@ async def review_result(state: dict) -> dict:
     dev_result = state.get("dev_result", {})
 
     try:
+        from framework.execution_contract import build_execution_contract, load_child_profiles
+
+        root = _Path(__file__).resolve().parents[2]
+        child_profiles = load_child_profiles({
+            "code-review": str(root / "config" / "permissions" / "code-review.yaml"),
+        })
+        review_contract = build_execution_contract(
+            profile=child_profiles["code-review"],
+            workflow_ref="config/workflows/code_review_task.yaml",
+            rule_refs=["config/rules/code_quality.yaml", "config/rules/security.yaml"],
+            workspace_root=state.get("workspace_path", ""),
+            definition_of_done={"critical_issue_blocks": True},
+        )
+        if not review_contract.allowed_tools:
+            raise ValueError("code-review permission profile has no allowed_tools")
+        review_contract = review_contract.to_dict()
+    except Exception as exc:
+        raise RuntimeError(f"Cannot dispatch Code Review without a valid execution contract: {exc}") from exc
+
+    try:
         result_str = registry.execute_sync(
             "dispatch_code_review",
             {
@@ -859,6 +940,7 @@ async def review_result(state: dict) -> dict:
                 "context_manifest_path": state.get("context_manifest_path", ""),
                 "orchestrator_task_id": state.get("_task_id", ""),
                 "task_id": state.get("_task_id", ""),
+                "execution_contract": review_contract,
             },
         )
         payload = json.loads(result_str) if result_str else {}
@@ -895,8 +977,26 @@ async def request_revision(state: dict) -> dict:
     for c in comments[:10]:  # Limit to top 10 comments
         feedback_lines.append(f"- [{c.get('severity', 'info')}] {c.get('message', '')}")
 
+    revision_feedback = "\n".join(feedback_lines) or "Code review rejected. Please fix issues."
+
+    jira_key = str(state.get("jira_key") or (state.get("jira_context") or {}).get("key") or "")
+    if jira_key:
+        try:
+            from framework.tools.registry import get_registry
+
+            get_registry().execute_sync(
+                "jira_comment",
+                {
+                    "ticket_key": jira_key,
+                    "comment": "Code review requested a revision.\n\n" + revision_feedback[:3000],
+                    "task_id": state.get("_task_id", ""),
+                },
+            )
+        except Exception as exc:
+            print(f"[{_AGENT_ID}] Jira review feedback comment failed: {exc}")
+
     return {
-        "revision_feedback": "\n".join(feedback_lines) or "Code review rejected. Please fix issues.",
+        "revision_feedback": revision_feedback,
         "revision_count": state.get("revision_count", 0) + 1,
     }
 
@@ -955,6 +1055,22 @@ async def report_success(state: dict) -> dict:
                 }, fh, ensure_ascii=False, indent=2)
         except OSError as exc:
             print(f"[{_AGENT_ID}] Failed to write final-report.json: {exc}")
+
+    jira_key = str(state.get("jira_key") or (state.get("jira_context") or {}).get("key") or "")
+    if jira_key:
+        try:
+            from framework.tools.registry import get_registry
+
+            get_registry().execute_sync(
+                "jira_comment",
+                {
+                    "ticket_key": jira_key,
+                    "comment": f"Code review passed. PR is ready for merge: {pr_url}",
+                    "task_id": state.get("_task_id", ""),
+                },
+            )
+        except Exception as exc:
+            print(f"[{_AGENT_ID}] Jira final review comment failed: {exc}")
 
     return {
         "report_summary": report_summary,

@@ -32,7 +32,7 @@ tools:
 permissions:
   scm: read-write
   filesystem: workspace-only
-permission_profile: development
+permission_profile: web-dev
 capabilities:
   - web-dev.task.execute
 launch_spec:

@@ -17,6 +17,12 @@ from agents.jira.adapter import JiraAgentAdapter, jira_definition, _make_provide
 from agents.jira.providers.base import JiraProvider
 
 
+def test_jira_search_tool_is_registered_in_tool_list():
+    from agents.jira.tools import _TOOLS
+
+    assert "jira_search" in {tool.name for tool in _TOOLS}
+
+
 # ---------------------------------------------------------------------------
 # Stub provider for unit tests (no network I/O)
 # ---------------------------------------------------------------------------

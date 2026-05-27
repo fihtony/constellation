@@ -9,7 +9,7 @@ mode: task
 execution_mode: persistent
 runtime_env_required: true
 
-permission_profile: "development"
+permission_profile: "team-lead"
 
 # runtime and model inherit from global constellation.yaml:
 #   runtime.backend: connect-agent

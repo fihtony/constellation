@@ -1,8 +1,11 @@
 """Tests for Code Review Agent workflow."""
 import json
 import pytest
+from unittest.mock import MagicMock
+from framework.agent import AgentServices
+from framework.task_store import InMemoryTaskStore
 from framework.workflow import START, END
-from agents.code_review.agent import code_review_workflow, code_review_definition
+from agents.code_review.agent import CodeReviewAgent, code_review_workflow, code_review_definition
 from agents.code_review.nodes import (
     load_pr_context,
     review_quality,
@@ -24,6 +27,20 @@ def _make_runtime(response: str):
         def run(self, prompt, **kw):
             return {"raw_response": response}
     return _MockRuntime()
+
+
+def _agent_services(runtime=None):
+    return AgentServices(
+        session_service=MagicMock(),
+        event_store=MagicMock(),
+        memory_service=MagicMock(),
+        skills_registry=MagicMock(),
+        plugin_manager=MagicMock(),
+        checkpoint_service=MagicMock(),
+        runtime=runtime or MagicMock(),
+        registry_client=None,
+        task_store=InMemoryTaskStore(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +67,17 @@ class TestCodeReviewWorkflowCompile:
         assert code_review_definition.mode == AgentMode.TASK
         assert code_review_definition.execution_mode == ExecutionMode.PER_TASK
         assert code_review_definition.permissions.get("scm") == "read"
+
+
+class TestCodeReviewExecutionContract:
+
+    async def test_handle_message_fails_closed_without_execution_contract(self):
+        agent = CodeReviewAgent(definition=code_review_definition, services=_agent_services())
+
+        result = await agent.handle_message({"message": {"parts": [{"text": "Review PR"}], "metadata": {}}})
+
+        assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
+        assert "Missing executionContract" in result["task"]["status"]["message"]["parts"][0]["text"]
 
 
 # ---------------------------------------------------------------------------

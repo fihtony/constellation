@@ -451,6 +451,26 @@ class TestDispatchDevAgentValidation:
         assert captured["task_id"] == "task-123"
         assert result["route"] == "approved"
 
+    async def test_validate_readiness_routes_to_missing_info_for_retryable_context(self, tmp_path):
+        from agents.team_lead.nodes import validate_readiness
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        (repo_path / "README.md").write_text("ok", encoding="utf-8")
+
+        result = await validate_readiness({
+            "repo_cloned": True,
+            "repo_path": str(repo_path),
+            "jira_key": "",
+            "analysis_summary": "Implement a UI task",
+            "design_context": {"source": "fixture"},
+            "tech_stack": [],
+            "readiness_attempts": 0,
+        })
+
+        assert result["route"] == "missing_info"
+        assert result["readiness_validated"] is False
+
     async def test_report_success_propagates_screenshot_evidence(self):
         from agents.team_lead.nodes import report_success
 

@@ -85,7 +85,8 @@ if _env("TEST_STITCH_PROJECT_URL"):
 if _env("TEST_STITCH_SCREEN_ID"):
     os.environ.setdefault("STITCH_SCREEN_ID", _env("TEST_STITCH_SCREEN_ID"))
 os.environ.setdefault("JIRA_BACKEND", "mcp")
-os.environ.setdefault("JIRA_BASE_URL", "https://tarch.atlassian.net")
+if _env("TEST_JIRA_BASE_URL"):
+    os.environ.setdefault("JIRA_BASE_URL", _env("TEST_JIRA_BASE_URL"))
 
 
 # ---------------------------------------------------------------------------

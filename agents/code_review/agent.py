@@ -76,7 +76,7 @@ def _build_code_review_definition() -> AgentDefinition:
         skills=cfg.get("skills", ["code-review"]),
         tools=cfg.get("tools", ["read_file", "search_code"]),
         permissions=cfg.get("permissions", {"scm": "read"}),
-        permission_profile=cfg.get("permission_profile", "read_only"),
+        permission_profile=cfg.get("permission_profile", "code-review"),
         config=cfg.get("config", {}),
         launch_spec=cfg.get("launch_spec"),
     )
@@ -128,6 +128,31 @@ class CodeReviewAgent(BaseAgent):
             "original_requirements": metadata.get("originalRequirements", ""),
             "metadata": metadata,
         }
+
+        exec_contract = metadata.get("executionContract")
+        if not exec_contract or not isinstance(exec_contract, dict):
+            task_store.fail_task(task.id, "Missing executionContract metadata")
+            return task_store.get_task_dict(task.id)
+
+        from framework.execution_contract import ExecutionContract
+        from framework.permissions import PermissionEngine, PermissionSet
+        try:
+            contract = ExecutionContract.from_dict(exec_contract)
+            if not contract.verify_checksum() or contract.version != "1.0":
+                raise ValueError("checksum or version verification failed")
+            if not contract.allowed_tools:
+                raise ValueError("allowedTools must be non-empty")
+            self._permission_engine = PermissionEngine(PermissionSet(
+                allowed_tools=contract.allowed_tools,
+                denied_tools=contract.denied_tools,
+                scm="read-write" if any(t.startswith("scm_") for t in contract.allowed_tools) else "read",
+                filesystem="workspace-only",
+                agent_launching=False,
+                allowed_agents=[],
+            ))
+        except Exception as exc:
+            task_store.fail_task(task.id, f"Invalid executionContract metadata: {exc}")
+            return task_store.get_task_dict(task.id)
 
         def _run() -> None:
             import asyncio
@@ -251,6 +276,7 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
                 "design_context": {"type": "object"},
                 "workspace_path": {"type": "string"},
                 "context_manifest_path": {"type": "string"},
+                "execution_contract": {"type": "object"},
             },
             "required": [],
         }
@@ -284,6 +310,9 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
                             },
                         }
                     }
+                    execution_contract = kw.get("execution_contract")
+                    if execution_contract:
+                        msg["message"]["metadata"]["executionContract"] = execution_contract
                     result = loop.run_until_complete(code_review_agent.handle_message(msg))
                     task_id_holder["task_id"] = result["task"]["id"]
                 except Exception as exc:

@@ -88,7 +88,7 @@ def _build_web_dev_definition() -> AgentDefinition:
             "jira_list_transitions", "jira_get_token_user", "jira_list_comments",
         ]),
         permissions=cfg.get("permissions", {"scm": "read-write", "filesystem": "workspace-only"}),
-        permission_profile=cfg.get("permission_profile", "development"),
+        permission_profile=cfg.get("permission_profile", "web-dev"),
         config=cfg.get("config", {}),
         launch_spec=cfg.get("launch_spec"),
     )
@@ -188,20 +188,34 @@ class WebDevAgent(BaseAgent):
             ),
         }
 
-        # Apply execution contract to enforce tool permissions from parent
+        # Apply execution contract to enforce tool permissions from parent.
+        # Per-task Web Dev fails closed here; direct node/unit tests bypass
+        # handle_message and can still exercise isolated logic.
         exec_contract = metadata.get("executionContract")
-        if exec_contract and isinstance(exec_contract, dict):
-            from framework.execution_contract import ExecutionContract
-            try:
-                contract = ExecutionContract.from_dict(exec_contract)
-                if contract.verify_checksum():
-                    # Override allowed tools with contract-specified list
-                    if contract.allowed_tools:
-                        state["_allowed_tools"] = contract.allowed_tools
-                else:
-                    print("[web-dev] Execution contract checksum mismatch — ignoring")
-            except Exception as exc:
-                print(f"[web-dev] Execution contract parse error (non-fatal): {exc}")
+        if not exec_contract or not isinstance(exec_contract, dict):
+            task_store.fail_task(task.id, "Missing executionContract metadata")
+            return task_store.get_task_dict(task.id)
+
+        from framework.execution_contract import ExecutionContract
+        from framework.permissions import PermissionEngine, PermissionSet
+        try:
+            contract = ExecutionContract.from_dict(exec_contract)
+            if not contract.verify_checksum() or contract.version != "1.0":
+                raise ValueError("checksum or version verification failed")
+            if not contract.allowed_tools:
+                raise ValueError("allowedTools must be non-empty")
+            state["_allowed_tools"] = contract.allowed_tools
+            self._permission_engine = PermissionEngine(PermissionSet(
+                allowed_tools=contract.allowed_tools,
+                denied_tools=contract.denied_tools,
+                scm="read-write" if any(t.startswith("scm_") for t in contract.allowed_tools) else "read",
+                filesystem="workspace-only",
+                agent_launching=False,
+                allowed_agents=[],
+            ))
+        except Exception as exc:
+            task_store.fail_task(task.id, f"Invalid executionContract metadata: {exc}")
+            return task_store.get_task_dict(task.id)
 
         def _run() -> None:
             import asyncio
@@ -341,6 +355,7 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                 "orchestrator_task_id": {"type": "string"},
                 "revision_feedback": {"type": "string"},
                 "definition_of_done": {"type": "object"},
+                "execution_contract": {"type": "object"},
             },
             "required": ["task_description"],
         }
@@ -390,6 +405,9 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                             },
                         }
                     }
+                    execution_contract = kw.get("execution_contract")
+                    if execution_contract:
+                        msg["message"]["metadata"]["executionContract"] = execution_contract
                     result = loop.run_until_complete(web_dev_agent.handle_message(msg))
                     task_id_holder["task_id"] = result["task"]["id"]
                 except Exception as exc:

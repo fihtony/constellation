@@ -20,7 +20,7 @@ tools:
   - search_code
 permissions:
   scm: read
-permission_profile: read_only
+permission_profile: code-review
 capabilities:
   - review.code.check
 launch_spec:

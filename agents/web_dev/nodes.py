@@ -735,6 +735,30 @@ async def analyze_task(state: dict) -> dict:
             pass
 
     plan = "\n".join(plan_parts) if plan_parts else analysis
+    structured_plan = {
+        "implementation_steps": [],
+        "test_plan": [],
+        "risks": [],
+    }
+    if isinstance(delivery_plan, dict) and delivery_plan.get("steps"):
+        structured_plan["implementation_steps"] = [
+            str(step.get("action") or step.get("description") or step)
+            for step in delivery_plan.get("steps", [])
+            if isinstance(step, dict) or step
+        ]
+    if not structured_plan["implementation_steps"] and plan:
+        structured_plan["implementation_steps"] = [plan]
+    structured_plan["test_plan"] = [
+        "Run deterministic install, build, and test validation before PR creation."
+    ]
+    structured_plan["risks"] = [
+        "External service credentials or repository baseline health may affect validation."
+    ]
+
+    from framework.validation_gates import validate_implementation_plan
+    gate_result = validate_implementation_plan(structured_plan)
+    if not gate_result.passed:
+        raise RuntimeError(f"Implementation plan gate failed: {gate_result.feedback}")
 
     # Write implementation-plan.json to workspace for auditability
     if workspace_path:
@@ -751,6 +775,7 @@ async def analyze_task(state: dict) -> dict:
                     },
                     "data": {
                         "implementation_plan": plan,
+                        "structured_plan": structured_plan,
                         "delivery_plan_loaded": bool(delivery_plan),
                     },
                 }, fh, ensure_ascii=False, indent=2)
@@ -759,6 +784,7 @@ async def analyze_task(state: dict) -> dict:
 
     return {
         "implementation_plan": plan,
+        "implementation_plan_details": structured_plan,
     }
 
 
@@ -2012,6 +2038,15 @@ async def update_jira(state: dict) -> dict:
     return {"jira_updated": True, "jira_in_review": can_review}
 
 
+def _load_pr_description_template() -> str:
+    template_path = os.path.join(os.path.dirname(__file__), "templates", "pr_description.md")
+    try:
+        with open(template_path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
 async def create_pr(state: dict) -> dict:
     """Generate a PR description and create the pull request via SCM tools."""
     runtime = state.get("_runtime")
@@ -2062,7 +2097,9 @@ async def create_pr(state: dict) -> dict:
     if jira_key:
         _jira_ctx = state.get("jira_context", {})
         if isinstance(_jira_ctx, dict):
-            _jira_url = _jira_ctx.get("url", "") or f"https://tarch.atlassian.net/browse/{jira_key}"
+            jira_base_url = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
+            _jira_url = _jira_ctx.get("url", "") or (f"{jira_base_url}/browse/{jira_key}" if jira_base_url else "")
+    pr_template = _load_pr_description_template()
     desc_prompt = PR_DESCRIPTION_TEMPLATE.format(
         user_request=state.get("user_request", ""),
         branch_name=branch_name,
@@ -2076,6 +2113,7 @@ async def create_pr(state: dict) -> dict:
         assessment_verdict=_assessment.get("verdict", "N/A"),
         assessment_gaps=", ".join(_assessment.get("gaps", [])) or "none",
         screenshot_paths=", ".join(_screenshots) or "none captured",
+        pr_description_template=pr_template or "Use the standard Constellation PR sections.",
     )
     desc_result = runtime.run(desc_prompt, system_prompt=PR_DESCRIPTION_SYSTEM,
                               plugin_manager=state.get("_plugin_manager"))
@@ -2139,7 +2177,13 @@ async def create_pr(state: dict) -> dict:
         log.info("PR created", pr_url=pr_url, branch=branch_name)
         print(f"[{_AGENT_ID}] create_pr done: prUrl={pr_url!r} prNumber={pr_number} status={pr_status!r}")
 
+    from framework.validation_gates import validate_pr_created, validate_screenshot_upload
+    pr_gate = validate_pr_created(pr_url, int(pr_number or 0) if pr_number else None)
+    if not pr_gate.passed:
+        raise RuntimeError(f"PR creation gate failed: {pr_gate.feedback}")
+
     # Step 4: Upload screenshots to GitHub CDN and PATCH the PR description.
+    _first_screenshot_url = ""
     if _png_screenshots:
         log.info("uploading screenshots to CDN", screenshots=len(_png_screenshots), pr_number=pr_number)
         _screenshot_entries: list[tuple[str, str]] = []
@@ -2159,6 +2203,7 @@ async def create_pr(state: dict) -> dict:
             _cdn_url = _upload_result.get("image_url", "")
             if _cdn_url:
                 _screenshot_entries.append((_label, _cdn_url))
+                _first_screenshot_url = _first_screenshot_url or _cdn_url
                 continue
 
             log.error("screenshot upload failed", screenshot=_fname, error=_upload_result.get("error", ""))
@@ -2195,6 +2240,14 @@ async def create_pr(state: dict) -> dict:
             raise RuntimeError("Cannot finalize PR for a UI task because screenshot upload did not return CDN URLs")
 
         print(f"[{_AGENT_ID}] {len(_png_screenshots)} screenshot(s) processed for PR description")
+
+    screenshot_gate = validate_screenshot_upload(
+        screenshot_required=screenshot_required,
+        screenshot_uploaded=_screenshot_uploaded,
+        screenshot_url=_first_screenshot_url,
+    )
+    if not screenshot_gate.passed:
+        raise RuntimeError(f"Screenshot upload gate failed: {screenshot_gate.feedback}")
 
     # Write pr-evidence.json to workspace
     workspace_path = state.get("workspace_path", "")

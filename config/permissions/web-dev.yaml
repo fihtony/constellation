@@ -13,6 +13,8 @@ allowed_tools:
   - scm_add_pr_comment
   - scm_upload_pr_image
   - scm_update_pr
+  - scm_get_pr_diff
+  - scm_get_pr_info
   - scm_branch
   - scm_commit
   - jira_transition

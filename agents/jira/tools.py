@@ -223,6 +223,51 @@ class JiraListComments(BaseTool):
         return ToolResult(output=json.dumps({"comments": data, "status": status}))
 
 
+class JiraSearch(BaseTool):
+    name = "jira_search"
+    description = "Search Jira issues using JQL."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "jql": {"type": "string"},
+            "max_results": {"type": "integer"},
+            "fields": {"type": "array", "items": {"type": "string"}},
+            "task_id": {"type": "string"},
+        },
+        "required": ["jql"],
+    }
+
+    def execute_sync(
+        self,
+        jql: str = "",
+        max_results: int = 10,
+        fields: list | None = None,
+        task_id: str = "",
+    ) -> ToolResult:
+        log = _log(task_id)
+        log.info("jira_search called", jql_len=len(jql), max_results=max_results)
+        if not jql.strip():
+            return ToolResult(output=json.dumps({
+                "issues": [],
+                "status": "missing_jql",
+                "error": "jql is required",
+            }))
+        data, status = _get_provider().search_issues(jql, max_results, fields)
+        issues = data.get("issues", []) if isinstance(data, dict) else []
+        normalized = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            fields_data = issue.get("fields") or {}
+            normalized.append({
+                "key": issue.get("key", ""),
+                "summary": fields_data.get("summary", ""),
+                "status": (fields_data.get("status") or {}).get("name", ""),
+            })
+        log.info("jira_search result", status=status, issues=len(normalized))
+        return ToolResult(output=json.dumps({"issues": normalized, "raw": data, "status": status}))
+
+
 _TOOLS = [
     FetchJiraTicket(),
     JiraTransition(),
@@ -231,6 +276,7 @@ _TOOLS = [
     JiraListTransitions(),
     JiraGetTokenUser(),
     JiraListComments(),
+    JiraSearch(),
 ]
 
 

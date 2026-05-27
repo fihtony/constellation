@@ -3,7 +3,13 @@ import asyncio
 import json
 import pytest
 from unittest.mock import MagicMock, patch
-from agents.compass.agent import CompassAgent, compass_definition, _classify_request, _extract_jira_key
+from agents.compass.agent import (
+    CompassAgent,
+    compass_definition,
+    _classify_request,
+    _extract_jira_key,
+    _parse_classification_payload,
+)
 from framework.agent import AgentMode, AgentServices, ExecutionMode
 
 
@@ -65,7 +71,7 @@ class TestCompassClassification:
     # ---------------------------------------------------------------
     def test_jira_url_with_implement(self):
         assert _classify_request(
-            "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2", None
+            "implement the jira ticket: https://company.atlassian.net/browse/PROJ-2", None
         ) == "development"
 
     def test_jira_key_with_fix_bug(self):
@@ -86,7 +92,7 @@ class TestCompassClassification:
 
     def test_implement_ticket_phrase(self):
         assert _classify_request(
-            "implement the jira ticket https://tarch.atlassian.net/browse/CSTL-3", None
+            "implement the jira ticket https://company.atlassian.net/browse/PROJ-3", None
         ) == "development"
 
     def test_write_unit_tests(self):
@@ -119,6 +125,14 @@ class TestCompassClassification:
         mock_runtime.run.return_value = {"raw_response": "office"}
         result = _classify_request("please process my documents", mock_runtime)
         assert result == "office"
+
+    def test_llm_json_payload_is_validated(self):
+        assert _parse_classification_payload('{"type":"development","confidence":0.87}') == (
+            "development", 0.87
+        )
+
+    def test_invalid_llm_json_payload_is_rejected(self):
+        assert _parse_classification_payload('{"type":"admin","confidence":0.9}') == ("", 0.0)
 
     # ---------------------------------------------------------------
     # Office tasks
@@ -172,8 +186,8 @@ class TestCompassClassification:
 
     def test_extract_jira_key_from_url(self):
         assert _extract_jira_key(
-            "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2"
-        ) == "CSTL-2"
+            "implement the jira ticket: https://company.atlassian.net/browse/PROJ-2"
+        ) == "PROJ-2"
 
 
 class TestCompassAgent:
@@ -183,7 +197,7 @@ class TestCompassAgent:
         agent = _make_agent(runtime)
 
         message = {
-            "parts": [{"text": "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2"}],
+            "parts": [{"text": "implement the jira ticket: https://company.atlassian.net/browse/PROJ-2"}],
             "metadata": {},
         }
         with patch("framework.tools.registry.get_registry") as mock_get_reg:
@@ -193,7 +207,7 @@ class TestCompassAgent:
                 "taskId": "tl-001",
                 "summary": "Task completed successfully.",
                 "prUrl": "https://example.com/pr/1",
-                "branch": "feature/CSTL-2",
+                "branch": "feature/PROJ-2",
             })
             mock_get_reg.return_value = mock_reg
             result = await agent.handle_message(message)
@@ -210,8 +224,8 @@ class TestCompassAgent:
         call_args = mock_reg.execute_sync.call_args
         assert call_args[0][0] == "dispatch_development_task"
         payload = call_args[0][1]
-        assert payload["task_description"] == "implement the jira ticket: https://tarch.atlassian.net/browse/CSTL-2"
-        assert payload["jira_key"] == "CSTL-2"
+        assert payload["task_description"] == "implement the jira ticket: https://company.atlassian.net/browse/PROJ-2"
+        assert payload["jira_key"] == "PROJ-2"
         assert "orchestratorTaskId" in payload
         assert "workspacePath" in payload
 
