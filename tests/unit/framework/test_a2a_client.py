@@ -90,6 +90,22 @@ class TestDispatchSyncTerminalStates:
         task = result.get("task", result)
         assert task["status"]["state"] == "TASK_STATE_CANCELLED"
 
+    @patch("framework.a2a.client.urllib.request.urlopen")
+    def test_initial_post_uses_total_timeout_budget(self, mock_urlopen):
+        """dispatch_sync should let a synchronous boundary handler use the configured timeout budget."""
+        send_resp = self._mock_response("TASK_STATE_COMPLETED", "t-005")
+        mock_urlopen.side_effect = [send_resp]
+
+        dispatch_sync(
+            url="http://fake:8000",
+            capability="test.cap",
+            message_parts=[{"text": "hello"}],
+            timeout=120,
+            poll_interval=0,
+        )
+
+        assert mock_urlopen.call_args_list[0].kwargs["timeout"] == 120
+
 
 class TestA2AClientAsync:
     """Test async A2AClient methods."""

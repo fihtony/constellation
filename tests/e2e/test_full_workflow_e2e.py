@@ -574,25 +574,19 @@ def _validate_workspace_artifacts(workspace_path: str, jira_key: str) -> None:
 
     # Checkpoint 2b: Stitch design HTML file download (new path: ui-design/stitch/code.html)
     design_html_path = os.path.join(workspace_path, "ui-design", "stitch", "code.html")
-    if not os.path.isfile(design_html_path):
-        # fallback to legacy path
-        design_html_path = os.path.join(workspace_path, "team-lead", "design-code.html")
     if os.path.isfile(design_html_path):
         size = os.path.getsize(design_html_path)
         print(f"[workspace] CP-2b: Design HTML downloaded ✓ ({size} bytes)")
     else:
-        print("[workspace] CP-2b: Design HTML NOT found (Stitch content download may have failed)")
+        print("[workspace] CP-2b: Design HTML NOT found in ui-design/stitch/code.html")
 
     # Checkpoint 2c: Design spec markdown (new path: ui-design/stitch/DESIGN.md)
     design_spec_md_path = os.path.join(workspace_path, "ui-design", "stitch", "DESIGN.md")
-    if not os.path.isfile(design_spec_md_path):
-        # fallback to legacy path
-        design_spec_md_path = os.path.join(workspace_path, "team-lead", "design-spec.md")
     if os.path.isfile(design_spec_md_path):
         size = os.path.getsize(design_spec_md_path)
         print(f"[workspace] CP-2c: Design spec (markdown) ✓ ({size} bytes)")
     else:
-        print("[workspace] CP-2c: Design spec (markdown) NOT found")
+        print("[workspace] CP-2c: Design spec (markdown) NOT found in ui-design/stitch/DESIGN.md")
 
     # Checkpoint 3: Team Lead analysis + repo clone
     ctx = _check("team-lead/context-manifest.json")

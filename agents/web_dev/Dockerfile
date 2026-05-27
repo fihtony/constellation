@@ -2,13 +2,16 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 COPY pyproject.toml /app/
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git nodejs npm \
+    && apt-get install -y --no-install-recommends ca-certificates chromium curl git nodejs npm \
     && npm install -g @anthropic-ai/claude-code \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir pyyaml>=6.0 \
+    && pip install --no-cache-dir "playwright>=1.45,<2" \
     && apt-get clean
 
 COPY framework/ /app/framework/

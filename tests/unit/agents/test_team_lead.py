@@ -48,6 +48,22 @@ class TestTeamLeadDefinition:
     def test_has_tools(self):
         assert len(team_lead_definition.tools) > 0
 
+    def test_declared_tools_are_allowed_by_development_profile(self):
+        from pathlib import Path
+
+        from framework.permissions import PermissionEngine
+
+        permissions_path = (
+            Path(__file__).resolve().parents[3]
+            / "config"
+            / "permissions"
+            / "development.yaml"
+        )
+        engine = PermissionEngine.from_yaml(str(permissions_path))
+
+        for tool_name in team_lead_definition.tools:
+            assert engine.check_tool(tool_name), f"development.yaml must allow Team Lead tool: {tool_name}"
+
 
 class TestTeamLeadAgent:
     async def test_handle_message_returns_working(self):
@@ -108,28 +124,75 @@ class TestTeamLeadAgent:
 
 
 class TestGatherContextFailures:
-    async def test_gather_context_continues_when_jira_fetch_fails(self, monkeypatch, tmp_path):
-        """Jira fetch failure is best-effort — workflow continues without Jira context."""
+    def test_jira_payload_validation_accepts_fetched_status(self):
+        from agents.team_lead.nodes import _validate_jira_payload
+
+        ticket = _validate_jira_payload(
+            {"ticket": {"key": "PROJ-123", "fields": {"summary": "Ready"}}, "status": "fetched"},
+            "PROJ-123",
+        )
+
+        assert ticket["key"] == "PROJ-123"
+
+    async def test_gather_context_raises_when_jira_fetch_fails(self, monkeypatch, tmp_path):
+        """Jira fetch failure is fatal so invalid tickets do not drift to a default repo."""
         from agents.team_lead.nodes import gather_context
 
         class StubRegistry:
             def execute_sync(self, name, args):
                 if name == "fetch_jira_ticket":
-                    return json.dumps({"error": "401 unauthorized"})
+                    return json.dumps({"ticket": None, "status": "HTTP 404"})
                 return json.dumps({})
 
         monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
 
-        # Should NOT raise — best-effort continuation
-        result = await gather_context({
-            "jira_key": "PROJ-123",
-            "workspace_path": str(tmp_path),
-        })
-        # jira_context should remain empty/None
-        assert not result.get("jira_context")
+        with pytest.raises(RuntimeError, match="Jira fetch failed"):
+            await gather_context({
+                "jira_key": "PROJ-123",
+                "workspace_path": str(tmp_path),
+            })
 
-    async def test_gather_context_continues_when_repo_clone_fails(self, monkeypatch, tmp_path):
-        """Repo clone failure is best-effort — workflow continues without clone."""
+    async def test_gather_context_raises_when_jira_ticket_missing_key(self, monkeypatch, tmp_path):
+        """A successful-looking Jira response still must contain the fetched ticket key."""
+        from agents.team_lead.nodes import gather_context
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                if name == "fetch_jira_ticket":
+                    return json.dumps({"ticket": {"fields": {"summary": "Missing key"}}, "status": "ok"})
+                return json.dumps({})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        with pytest.raises(RuntimeError, match="ticket payload missing key"):
+            await gather_context({
+                "jira_key": "PROJ-123",
+                "workspace_path": str(tmp_path),
+            })
+
+    async def test_gather_context_requires_repo_url_after_jira_fetch(self, monkeypatch, tmp_path):
+        """Repo URL must come from the request or Jira context before dev dispatch."""
+        from agents.team_lead.nodes import gather_context
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                if name == "fetch_jira_ticket":
+                    return json.dumps({
+                        "ticket": {"key": "PROJ-123", "fields": {"summary": "No repo URL"}},
+                        "status": "ok",
+                    })
+                return json.dumps({})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        with pytest.raises(RuntimeError, match="No SCM repository URL"):
+            await gather_context({
+                "jira_key": "PROJ-123",
+                "workspace_path": str(tmp_path),
+            })
+
+    async def test_gather_context_raises_when_repo_clone_fails(self, monkeypatch, tmp_path):
+        """Repo clone failure is fatal because Web Dev must receive a real cloned repo."""
         from agents.team_lead.nodes import gather_context
 
         class StubRegistry:
@@ -140,16 +203,399 @@ class TestGatherContextFailures:
 
         monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
 
-        # Should NOT raise — best-effort continuation
+        with pytest.raises(RuntimeError, match="Repo clone FAILED"):
+            await gather_context({
+                "repo_url": "https://github.com/org/repo.git",
+                "workspace_path": str(tmp_path),
+            })
+
+    async def test_gather_context_requires_ui_design_workspace_outputs(self, monkeypatch, tmp_path):
+        from agents.team_lead.nodes import gather_context
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                if name == "fetch_design":
+                    return json.dumps({
+                        "screen": {"projectId": "p1", "screenId": "s1", "text": "{}"},
+                        "status": "ok",
+                    })
+                if name == "clone_repo":
+                    return json.dumps({"repo_path": str(tmp_path / "scm" / "repo"), "status": "ok"})
+                return json.dumps({})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        with pytest.raises(RuntimeError, match="UI Design files missing from workspace"):
+            await gather_context({
+                "repo_url": "https://github.com/org/repo.git",
+                "stitch_project_id": "13629074018280446337",
+                "stitch_screen_id": "screen-1",
+                "workspace_path": str(tmp_path),
+            })
+
+    async def test_gather_context_keeps_ui_design_paths_when_present(self, monkeypatch, tmp_path):
+        from agents.team_lead.nodes import gather_context
+
+        stitch_dir = tmp_path / "ui-design" / "stitch"
+        stitch_dir.mkdir(parents=True)
+        code_path = stitch_dir / "code.html"
+        md_path = stitch_dir / "DESIGN.md"
+        code_path.write_text("<html><body>Design</body></html>", encoding="utf-8")
+        md_path.write_text("# Design\n\ncolors:\n  primary: '#000'\n", encoding="utf-8")
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                if name == "fetch_design":
+                    return json.dumps({
+                        "screen": {"projectId": "p1", "screenId": "s1", "text": "{}"},
+                        "status": "ok",
+                        "local_folder": str(stitch_dir),
+                        "files": ["ui-design/stitch/code.html", "ui-design/stitch/DESIGN.md"],
+                        "design_code_path": str(code_path),
+                        "design_md_path": str(md_path),
+                    })
+                if name == "clone_repo":
+                    repo_path = tmp_path / "scm" / "repo.git"
+                    repo_path.mkdir(parents=True, exist_ok=True)
+                    (repo_path / "README.md").write_text("ok", encoding="utf-8")
+                    return json.dumps({"repo_path": str(repo_path), "status": "ok"})
+                return json.dumps({})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
         result = await gather_context({
-            "repo_url": "https://example.com/org/repo.git",
+            "repo_url": "https://github.com/org/repo.git",
+            "stitch_project_id": "13629074018280446337",
+            "stitch_screen_id": "screen-1",
             "workspace_path": str(tmp_path),
         })
-        # repo_cloned should be False in the manifest
-        assert result.get("repo_cloned") is False or result.get("repo_cloned") is None
+
+        assert result["design_code_path"] == str(code_path)
+        assert result["design_md_path"] == str(md_path)
+        assert "ui-design/stitch/DESIGN.md" in result["design_files"]
+        assert not (tmp_path / "team-lead" / "design-spec.md").exists()
+
+
+class TestDispatchDevAgentValidation:
+    async def test_dispatch_dev_agent_raises_when_web_dev_reports_error(self, monkeypatch):
+        from agents.team_lead.nodes import dispatch_dev_agent
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "web-dev"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                assert name == "dispatch_web_dev"
+                return json.dumps({"status": "error", "message": "Web Dev task failed"})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        with pytest.raises(RuntimeError, match="Web Dev task failed"):
+            await dispatch_dev_agent(
+                {
+                    "_task_id": "task-123",
+                    "user_request": "Implement CSTL-2",
+                    "analysis_summary": "Implement the ticket",
+                    "workspace_path": "/tmp/workspace",
+                }
+            )
+
+    async def test_dispatch_dev_agent_requires_pr_and_jira_evidence(self, monkeypatch):
+        from agents.team_lead.nodes import dispatch_dev_agent
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "web-dev"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                assert name == "dispatch_web_dev"
+                return json.dumps({"status": "completed", "summary": "done"})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        with pytest.raises(RuntimeError, match="prUrl, jiraInReview"):
+            await dispatch_dev_agent(
+                {
+                    "_task_id": "task-123",
+                    "user_request": "Implement CSTL-2",
+                    "analysis_summary": "Implement the ticket",
+                    "jira_key": "CSTL-2",
+                    "workspace_path": "/tmp/workspace",
+                    "plan": {
+                        "definition_of_done": {
+                            "pr_required": True,
+                            "jira_state_management": True,
+                        }
+                    },
+                }
+            )
+
+    async def test_dispatch_dev_agent_requires_screenshot_evidence_for_ui_tasks(self, monkeypatch):
+        from agents.team_lead.nodes import dispatch_dev_agent
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "web-dev"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                assert name == "dispatch_web_dev"
+                assert args["definition_of_done"]["screenshot_required"] is True
+                return json.dumps({
+                    "status": "completed",
+                    "summary": "done",
+                    "prUrl": "https://github.com/org/repo/pull/1",
+                    "branch": "feature/ui",
+                    "jiraInReview": True,
+                })
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        with pytest.raises(RuntimeError, match="screenshotIncluded"):
+            await dispatch_dev_agent(
+                {
+                    "_task_id": "task-123",
+                    "user_request": "Implement UI",
+                    "analysis_summary": "Implement a UI page",
+                    "jira_key": "PROJ-123",
+                    "workspace_path": "/tmp/workspace",
+                    "design_context": {"screen": {"id": "screen-1"}},
+                    "plan": {
+                        "definition_of_done": {
+                            "pr_required": True,
+                            "jira_state_management": True,
+                            "screenshot_required": True,
+                        }
+                    },
+                }
+            )
+
+    async def test_dispatch_dev_agent_propagates_screenshot_evidence(self, monkeypatch):
+        from agents.team_lead.nodes import dispatch_dev_agent
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "web-dev"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                assert name == "dispatch_web_dev"
+                return json.dumps({
+                    "status": "completed",
+                    "summary": "done",
+                    "prUrl": "https://github.com/org/repo/pull/1",
+                    "branch": "feature/ui",
+                    "jiraInReview": True,
+                    "screenshotIncluded": True,
+                    "screenshotUploaded": True,
+                })
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await dispatch_dev_agent(
+            {
+                "_task_id": "task-123",
+                "user_request": "Implement UI",
+                "analysis_summary": "Implement a UI page",
+                "jira_key": "PROJ-123",
+                "workspace_path": "/tmp/workspace",
+                "design_context": {"screen": {"id": "screen-1"}},
+                "plan": {
+                    "definition_of_done": {
+                        "pr_required": True,
+                        "jira_state_management": True,
+                        "screenshot_required": True,
+                    }
+                },
+            }
+        )
+
+        assert result["screenshot_included"] is True
+        assert result["screenshot_uploaded"] is True
+
+    async def test_review_result_passes_master_task_id_to_code_review(self, monkeypatch):
+        from agents.team_lead.nodes import review_result
+
+        captured: dict[str, object] = {}
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                assert name == "dispatch_code_review"
+                captured.update(args)
+                return json.dumps({"verdict": "approved", "summary": "ok"})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await review_result(
+            {
+                "_task_id": "task-123",
+                "pr_url": "https://github.com/org/repo/pull/1",
+                "dev_result": {"summary": "done"},
+                "analysis_summary": "Implement CSTL-1",
+                "workspace_path": "/tmp/workspace",
+                "context_manifest_path": "team-lead/context-manifest.json",
+            }
+        )
+
+        assert captured["orchestrator_task_id"] == "task-123"
+        assert captured["task_id"] == "task-123"
+        assert result["route"] == "approved"
+
+    async def test_report_success_propagates_screenshot_evidence(self):
+        from agents.team_lead.nodes import report_success
+
+        result = await report_success({
+            "pr_url": "https://github.com/org/repo/pull/1",
+            "branch_name": "feature/ui",
+            "analysis_summary": "Implemented UI",
+            "review_verdict": "approved",
+            "revision_count": 0,
+            "jira_in_review": True,
+            "screenshot_included": True,
+            "screenshot_uploaded": True,
+        })
+
+        assert result["screenshot_included"] is True
+        assert result["screenshot_uploaded"] is True
+
+    def test_callback_propagates_screenshot_evidence(self, monkeypatch):
+        from agents.team_lead.agent import _send_callback
+
+        captured = {}
+
+        class StubResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        def fake_urlopen(request, timeout):
+            captured["timeout"] = timeout
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return StubResponse()
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+        _send_callback(
+            "http://compass/tasks/task-123/callbacks",
+            "task-team-lead",
+            {
+                "report_summary": "done",
+                "pr_url": "https://github.com/org/repo/pull/1",
+                "branch_name": "feature/ui",
+                "jira_in_review": True,
+                "screenshot_included": True,
+                "screenshot_uploaded": True,
+            },
+            "team-lead",
+        )
+
+        metadata = captured["payload"]["artifacts"][0]["metadata"]
+        assert metadata["screenshotIncluded"] is True
+        assert metadata["screenshotUploaded"] is True
 
 
 class TestTeamLeadTools:
+    def test_cross_agent_tools_accept_workflow_metadata(self, monkeypatch):
+        from agents.team_lead.tools import (
+            CloneRepo,
+            DispatchCodeReview,
+            DispatchWebDev,
+            FetchDesign,
+            FetchJiraTicket,
+        )
+
+        calls = []
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return f"http://stub/{capability}"
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+
+        def _dispatch_sync(**kwargs):
+            calls.append(kwargs)
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [
+                        {
+                            "parts": [{"text": json.dumps({"status": "ok"})}],
+                            "metadata": {
+                                "prUrl": "https://example.test/pr/1",
+                                "branch": "feature/cstl-2",
+                                "jiraInReview": True,
+                            },
+                        }
+                    ],
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        FetchJiraTicket().execute_sync(
+            ticket_key="CSTL-2",
+            task_id="task-123",
+            workspace_path="/tmp/workspace",
+        )
+        FetchDesign().execute_sync(
+            stitch_project_id="proj-1",
+            stitch_screen_id="screen-2",
+            task_id="task-123",
+            workspace_path="/tmp/workspace",
+        )
+        CloneRepo().execute_sync(
+            repo_url="https://example.test/org/repo.git",
+            target_path="/tmp/workspace/scm/repo",
+            task_id="task-123",
+        )
+        DispatchWebDev().execute_sync(
+            task_description="Implement CSTL-2",
+            workspace_path="/tmp/workspace",
+            orchestrator_task_id="task-123",
+        )
+        DispatchCodeReview().execute_sync(
+            pr_url="https://example.test/pr/1",
+            workspace_path="/tmp/workspace",
+            orchestrator_task_id="task-123",
+        )
+
+        assert calls[0]["metadata"] == {
+            "ticketKey": "CSTL-2",
+            "taskId": "task-123",
+            "workspacePath": "/tmp/workspace",
+        }
+        assert calls[1]["metadata"] == {
+            "stitchProjectId": "proj-1",
+            "stitchScreenId": "screen-2",
+            "screenName": "",
+            "taskId": "task-123",
+            "workspacePath": "/tmp/workspace",
+        }
+        assert calls[2]["metadata"] == {
+            "repoUrl": "https://example.test/org/repo.git",
+            "targetPath": "/tmp/workspace/scm/repo",
+            "taskId": "task-123",
+        }
+        assert calls[3]["metadata"]["orchestratorTaskId"] == "task-123"
+        assert calls[3]["metadata"]["workspacePath"] == "/tmp/workspace"
+        assert calls[4]["metadata"]["orchestratorTaskId"] == "task-123"
+        assert calls[4]["metadata"]["workspacePath"] == "/tmp/workspace"
+
     def test_dispatch_web_dev_propagates_failed_task_state(self, monkeypatch):
         from agents.team_lead.tools import DispatchWebDev
 
@@ -179,3 +625,262 @@ class TestTeamLeadTools:
         payload = json.loads(result.output)
         assert payload["status"] == "error"
         assert payload["state"] == "TASK_STATE_FAILED"
+
+    def test_dispatch_web_dev_launches_per_task_agent(self, monkeypatch):
+        from agents.team_lead.tools import DispatchWebDev
+
+        calls = {"dispatch": [], "launch": [], "destroy": []}
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return ""
+
+            def get_capability_definition(self, capability):
+                return {
+                    "agent_id": "web-dev",
+                    "name": "Web Dev Agent",
+                    "execution_mode": "per-task",
+                    "launch_spec": {
+                        "image": "constellation-v2-web-dev:latest",
+                        "port": 8050,
+                    },
+                }
+
+        class StubLauncher:
+            def launch_instance(self, definition, task_id, launch_overrides=None):
+                calls["launch"].append((definition, task_id, launch_overrides))
+                return {
+                    "service_url": "http://launched-web-dev:8050",
+                    "container_name": "web-dev-task-1234",
+                }
+
+            def destroy_instance(self, agent_id, container_name):
+                calls["destroy"].append((agent_id, container_name))
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setattr("agents.team_lead.tools.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("agents.team_lead.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+
+        def _dispatch_sync(**kwargs):
+            calls["dispatch"].append(kwargs)
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [
+                        {
+                            "parts": [{"text": "Dev task completed."}],
+                            "metadata": {
+                                "prUrl": "https://example.test/pr/2",
+                                "branch": "feature/cstl-2",
+                                "jiraInReview": True,
+                                "screenshotIncluded": True,
+                                "screenshotUploaded": True,
+                            },
+                        }
+                    ],
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        result = DispatchWebDev().execute_sync(
+            task_description="Implement CSTL-2",
+            workspace_path="/tmp/workspace",
+            orchestrator_task_id="task-123",
+        )
+
+        payload = json.loads(result.output)
+        assert payload["status"] == "completed"
+        assert payload["screenshotIncluded"] is True
+        assert payload["screenshotUploaded"] is True
+        assert calls["launch"][0][1] == "task-123"
+        assert calls["dispatch"][0]["url"] == "http://launched-web-dev:8050"
+        assert calls["dispatch"][0]["timeout"] == 3600
+        assert calls["dispatch"][0]["metadata"]["orchestratorTaskId"] == "task-123"
+        assert calls["destroy"] == [("web-dev", "web-dev-task-1234")]
+
+    def test_dispatch_web_dev_uses_configurable_timeout(self, monkeypatch):
+        from agents.team_lead.tools import DispatchWebDev
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return "http://web-dev:8050"
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setenv("TEAM_LEAD_WEB_DEV_TIMEOUT_SECONDS", "5400")
+
+        captured: dict[str, Any] = {}
+
+        def _dispatch_sync(**kwargs):
+            captured.update(kwargs)
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [],
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        DispatchWebDev().execute_sync(task_description="Implement CSTL-1")
+
+        assert captured["timeout"] == 5400
+
+    def test_dispatch_code_review_uses_configurable_timeout(self, monkeypatch):
+        from agents.team_lead.tools import DispatchCodeReview
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return "http://code-review:8050"
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setenv("TEAM_LEAD_CODE_REVIEW_TIMEOUT_SECONDS", "1800")
+
+        captured: dict[str, Any] = {}
+
+        def _dispatch_sync(**kwargs):
+            captured.update(kwargs)
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [],
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        DispatchCodeReview().execute_sync(pr_url="https://example.test/pr/1")
+
+        assert captured["timeout"] == 1800
+
+    def test_dispatch_code_review_launches_per_task_agent(self, monkeypatch):
+        from agents.team_lead.tools import DispatchCodeReview
+
+        calls = {"dispatch": [], "launch": [], "destroy": []}
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return ""
+
+            def get_capability_definition(self, capability):
+                return {
+                    "agent_id": "code-review",
+                    "name": "Code Review Agent",
+                    "execution_mode": "per-task",
+                    "launch_spec": {
+                        "image": "constellation-v2-code-review:latest",
+                        "port": 8060,
+                    },
+                }
+
+        class StubLauncher:
+            def launch_instance(self, definition, task_id, launch_overrides=None):
+                calls["launch"].append((definition, task_id, launch_overrides))
+                return {
+                    "service_url": "http://launched-code-review:8060",
+                    "container_name": "code-review-task-1234",
+                }
+
+            def destroy_instance(self, agent_id, container_name):
+                calls["destroy"].append((agent_id, container_name))
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setattr("agents.team_lead.tools.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("agents.team_lead.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+
+        def _dispatch_sync(**kwargs):
+            calls["dispatch"].append(kwargs)
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [
+                        {
+                            "parts": [{"text": json.dumps({"verdict": "approved", "summary": "ok"})}],
+                            "metadata": {"agentId": "code-review"},
+                        }
+                    ],
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        result = DispatchCodeReview().execute_sync(
+            pr_url="https://example.test/pr/1",
+            workspace_path="/tmp/workspace",
+            orchestrator_task_id="task-123",
+            task_id="task-123",
+        )
+
+        payload = json.loads(result.output)
+        assert payload["verdict"] == "approved"
+        assert calls["launch"][0][1] == "task-123"
+        assert calls["dispatch"][0]["url"] == "http://launched-code-review:8060"
+        assert calls["dispatch"][0]["metadata"]["orchestratorTaskId"] == "task-123"
+        assert calls["dispatch"][0]["metadata"]["workspacePath"] == "/tmp/workspace"
+        assert calls["destroy"] == [("code-review", "code-review-task-1234")]
+
+    def test_dispatch_code_review_derives_launch_task_id_from_workspace_path(self, monkeypatch):
+        from agents.team_lead.tools import DispatchCodeReview
+
+        calls = {"launch": []}
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return ""
+
+            def get_capability_definition(self, capability):
+                return {
+                    "agent_id": "code-review",
+                    "name": "Code Review Agent",
+                    "execution_mode": "per-task",
+                    "launch_spec": {
+                        "image": "constellation-v2-code-review:latest",
+                        "port": 8060,
+                    },
+                }
+
+        class StubLauncher:
+            def launch_instance(self, definition, task_id, launch_overrides=None):
+                calls["launch"].append(task_id)
+                return {
+                    "service_url": "http://launched-code-review:8060",
+                    "container_name": "code-review-task-derived",
+                }
+
+            def destroy_instance(self, agent_id, container_name):
+                return None
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setattr("agents.team_lead.tools.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("agents.team_lead.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            "framework.a2a.client.dispatch_sync",
+            lambda **kwargs: {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"parts": [{"text": json.dumps({"verdict": "approved"})}]}],
+                }
+            },
+        )
+
+        DispatchCodeReview().execute_sync(
+            pr_url="https://example.test/pr/1",
+            workspace_path="/app/artifacts/task-39c4f352bb20",
+        )
+
+        assert calls["launch"] == ["task-39c4f352bb20"]

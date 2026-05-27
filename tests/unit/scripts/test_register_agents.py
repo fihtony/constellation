@@ -25,6 +25,26 @@ def test_build_registration_payload_uses_office_capabilities_and_launch_spec():
     assert payload["launchSpec"]["port"] == 8060
 
 
+def test_build_registration_payload_uses_web_dev_launch_spec():
+    payload = _build_registration_payload("web-dev")
+
+    assert payload["agentId"] == "web-dev"
+    assert payload["executionMode"] == "per-task"
+    assert payload["capabilities"] == ["web-dev.task.execute"]
+    assert payload["launchSpec"]["image"] == "constellation-v2-web-dev:latest"
+    assert payload["launchSpec"]["port"] == 8050
+
+
+def test_build_registration_payload_uses_code_review_launch_spec():
+    payload = _build_registration_payload("code-review")
+
+    assert payload["agentId"] == "code-review"
+    assert payload["executionMode"] == "per-task"
+    assert payload["capabilities"] == ["review.code.check"]
+    assert payload["launchSpec"]["image"] == "constellation-v2-code-review:latest"
+    assert payload["launchSpec"]["port"] == 8060
+
+
 def test_build_registration_payload_uses_team_lead_capabilities():
     payload = _build_registration_payload("team-lead")
 

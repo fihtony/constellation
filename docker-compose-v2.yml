@@ -115,9 +115,14 @@ services:
       CONSTELLATION_RUNTIME_ENV_FILE: /app/config/.runtime.env
       ARTIFACT_ROOT: /app/artifacts
       CONTAINER_RUNTIME: docker
+      DYNAMIC_AGENT_NETWORK: constellation-v2-network
+      DOCKER_SOCKET: /var/run/docker.sock
     volumes:
       - ./artifacts:/app/artifacts
+      - /var/run/docker.sock:/var/run/docker.sock
       - ./config/.env:/app/config/.runtime.env:ro
+    group_add:
+      - "${DOCKER_SOCKET_GID:-0}"
     labels:
       constellation.agent_id: "team-lead"
       constellation.agent_name: "Team Lead Agent"

@@ -291,14 +291,44 @@ class BaseAgent:
             agent_id = os.environ.get("AGENT_ID", self.definition.agent_id).strip() or self.definition.agent_id
             port = int(os.environ.get("PORT", "0") or 0)
             service_url = os.environ.get("ADVERTISED_BASE_URL", "").strip()
-            if not service_url and port > 0:
-                service_url = f"http://{agent_id}:{port}"
-            if not service_url or port <= 0:
+
+            from framework.config import load_agent_config
+
+            cfg = load_agent_config(agent_id)
+            cfg_data = cfg.to_dict()
+            effective_port = port or int(cfg_data.get("port", 0) or 0)
+            if not service_url and effective_port > 0:
+                service_url = f"http://{agent_id}:{effective_port}"
+
+            capabilities = list(cfg_data.get("capabilities") or [])
+            if capabilities and service_url:
+                payload = {
+                    "agentId": cfg_data.get("agent_id", agent_id),
+                    "version": str(cfg_data.get("version", self.definition.version or "1.0.0")),
+                    "cardUrl": f"{service_url.rstrip('/')}/.well-known/agent-card.json",
+                    "capabilities": capabilities,
+                    "executionMode": cfg_data.get(
+                        "execution_mode",
+                        getattr(self.definition.execution_mode, "value", self.definition.execution_mode),
+                    ),
+                    "displayName": cfg_data.get("name", self.definition.name),
+                    "description": cfg_data.get("description", self.definition.description),
+                    "registeredBy": "agent-startup",
+                }
+                scaling_policy = cfg_data.get("scaling_policy") or cfg_data.get("scalingPolicy") or {}
+                if scaling_policy:
+                    payload["scalingPolicy"] = scaling_policy
+                launch_spec = cfg_data.get("launch_spec") or cfg_data.get("launchSpec") or {}
+                if launch_spec:
+                    payload["launchSpec"] = launch_spec
+                client.upsert_agent(payload)
+
+            if not service_url or effective_port <= 0:
                 return
             client.register_instance(
                 agent_id,
                 service_url=service_url,
-                port=port,
+                port=effective_port,
                 container_id=os.environ.get("CONTAINER_ID", "").strip(),
             )
         except Exception as exc:  # noqa: BLE001

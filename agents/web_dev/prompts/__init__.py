@@ -52,10 +52,16 @@ and tests — especially when the repository is empty or only contains a README.
 3. Do NOT add features, refactors, or improvements beyond the explicit request.
 4. Follow OWASP security guidelines: never introduce injection vectors, \
 hardcoded credentials, or unvalidated input.
-5. After all code changes are complete:
+5. This node is for implementation only. Do NOT start long-running or interactive \
+commands here. Never leave `npm run dev`, `vite`, `npm run test`, bare `vitest`, \
+Playwright UI mode, or any watcher/server process running from this node. The \
+workflow has dedicated later nodes for deterministic validation and screenshot \
+capture. If you need a quick executable check here, only use one-shot commands \
+that exit on their own, such as `npm run build` or `npx vitest --run`.
+6. After all code changes are complete:
    a. Stage all changes:  git add -A
    b. Commit with a descriptive message: git commit -m 'feat(<jira-key>): <summary>'
-6. Produce a brief summary of what was changed and why.
+7. Produce a brief summary of what was changed and why.
 
 BLANK SCREEN PREVENTION RULES (MANDATORY — apply to every React/Vue/Vite task):
 These rules prevent the most common cause of blank screens in React applications.
@@ -68,7 +74,9 @@ A. ROUTING & ENTRY POINT — MANDATORY:
        import LessonLibraryPage from './pages/LessonLibraryPage'
        function App() { return <LessonLibraryPage /> }
    - NEVER create a page component in isolation without wiring it into the app entry.
-   - After wiring, run `npm run dev` briefly to confirm the page renders.
+   - Do NOT start `npm run dev` from this node. Confirm wiring via code inspection \
+     and one-shot commands only. Later workflow nodes own browser rendering and \
+     screenshot capture.
 
 E. ROOT ROUTE REDIRECT — MANDATORY for single-feature apps:
    - If the app uses React Router AND the ONLY route is a named path like "/lessons",
@@ -105,6 +113,8 @@ D. BUILD VERIFICATION — MANDATORY BEFORE PR:
    - After all code is written, run: `npm run build`
    - If build fails with TypeScript errors, fix ALL errors — do not skip.
    - If build fails with missing module errors, check import paths and file names.
+  - Do NOT run bare `npm run test` here when it resolves to a watch-mode command \
+    such as `vitest`; the dedicated validation node will run tests deterministically.
    - Only proceed to PR when `npm run build` exits with code 0.
 
 STRICT DESIGN FIDELITY (MANDATORY for all UI tasks when a Design HTML Reference is provided):
@@ -190,58 +200,38 @@ A. ICON RENDERING — NEVER SHOW ICON NAMES AS TEXT:
    "chevron_right") instead of the actual icon glyph. ALWAYS identify which icon
    system the Design HTML Reference uses BEFORE writing any icon code.
 
+   CONTAINER RELIABILITY RULE:
+   - For this workflow, DO NOT rely on remote icon fonts for critical UI icons.
+   - If the design reference uses Material Symbols or Material Icons ligatures,
+     reproduce the same visual with inline SVG or a local React icon component instead.
+   - The screenshot must show a real icon even when Google font requests fail.
+
    DETECT THE ICON SYSTEM FROM THE DESIGN HTML REFERENCE:
    - If the HTML has `<link ... "Material+Symbols+Outlined"...>` AND
      `<span class="material-symbols-outlined">icon_name</span>`:
-     → Use Material Symbols Outlined (variable icon font, see below)
+     → Use a local icon implementation that visually matches Material Symbols Outlined
    - If the HTML has `<link ... "Material+Icons"...>` AND
      `<span class="material-icons">icon_name</span>`:
-     → Use Material Icons (classic fixed font, same CSS class approach)
+     → Use a local icon implementation that visually matches Material Icons
    - If the HTML imports from "@mui/icons-material":
      → Use MUI React icon components
 
-   OPTION 1 — MATERIAL SYMBOLS OUTLINED (used by Google Stitch designs):
-   This is the MOST COMMON icon approach in Google Stitch-generated designs.
-   The key requirement is loading the VARIABLE FONT and setting CSS properties.
-   a. In index.html, load the variable-weight font (MUST include wght,FILL range):
-      <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
-   b. In index.css (or a global CSS file), add the class definition:
-      .material-symbols-outlined {
-        font-family: 'Material Symbols Outlined';
-        font-weight: normal;
-        font-style: normal;
-        font-size: 24px;
-        line-height: 1;
-        letter-spacing: normal;
-        text-transform: none;
-        display: inline-block;
-        white-space: nowrap;
-        word-wrap: normal;
-        direction: ltr;
-        font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
-        -webkit-font-smoothing: antialiased;
-      }
-   c. In JSX, render icons as: <span className="material-symbols-outlined">arrow_forward</span>
-      The text content BECOMES the icon when the font and CSS are loaded correctly.
-      NEVER use <span>arrow_forward</span> without the class — it shows as text.
-   d. Verify after implementation:
-      - Build succeeds (npm run build)
-      - No JSX with icon text inside <span> without "material-symbols-outlined" class
-      - Run: grep -rn 'arrow_forward|chevron|close|search|menu' src/ | grep -v 'material-symbols'
-        → If results found outside the class, fix them.
+   OPTION 1 — INLINE SVG (preferred for Stitch-style Material icons):
+   - Translate each icon ligature from the design reference into an inline SVG that matches
+     the intended shape, weight, and size.
+   - Keep SVG markup in the component or in a small local icon component file.
+   - Preserve spacing, alignment, and color from the design.
+   - NEVER leave `arrow_forward`, `chevron_right`, or similar ligature text in JSX.
 
-   OPTION 2 — MUI React Icons (if project uses Material UI):
-   Only use this if the project already has @mui/material as a dependency.
-   Install: npm install @mui/icons-material
-   Import: import ArrowForwardIcon from '@mui/icons-material/ArrowForward';
-   Render: <ArrowForwardIcon fontSize="small" />  NOT the text "arrow_forward".
+   OPTION 2 — LOCAL REACT ICON COMPONENT:
+   - If the project already uses a local icon library or `@mui/icons-material`, reuse it.
+   - Example: `import ArrowForwardIcon from '@mui/icons-material/ArrowForward'`
+   - Render: `<ArrowForwardIcon fontSize="small" />`
+   - Do NOT add a new remote icon-font dependency just to render one arrow.
 
-   OPTION 3 — Material Icons classic (if design uses material-icons class):
-   In index.html: <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-   In JSX: <span className="material-icons">chevron_right</span>
-
-   RULE: NEVER render an icon name as a plain text node. If unsure which option to use,
-   choose OPTION 1 (Material Symbols Outlined) as it is the default for Stitch designs.
+  RULE: NEVER render an icon name as a plain text node. Visible icon-name text in the
+  rendered page or captured screenshot is a hard failure. If unsure which option to use,
+   choose OPTION 1 (inline SVG) so the result is deterministic inside containers.
 
 B. FOOTER POSITIONING — ALWAYS STICKY TO BOTTOM OF VIEWPORT:
    The footer MUST always appear at the bottom of the visible viewport — never floating
@@ -512,7 +502,9 @@ For UI tasks — MANDATORY steps (in order):
         → Should find the CSS class, not raw icon names outside a class
       - Check footer: grep -o 'Terms of Service|Privacy Policy' /tmp/rendered.html
    d. Common issues to check:
-      - If page shows plain text "arrow_forward" → Material Symbols CSS class missing
+      - If page or screenshot shows plain text "arrow_forward" → remote icon font is not
+        rendering reliably; replace the icon with inline SVG or a local icon component before
+        continuing
       - If footer is floating midpage → missing flex-col min-h-screen on root wrapper
       - If design colors are wrong → Tailwind config not set up with tokens
       - If fonts are wrong → Google Fonts link missing or font-family not applied

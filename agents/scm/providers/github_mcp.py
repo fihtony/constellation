@@ -531,6 +531,43 @@ class GitHubMCPProvider:
             ], "ok"
         return [], "ok"
 
+    def update_pr(
+        self,
+        owner: str,
+        repo: str,
+        pr_id: int | str,
+        body: str = "",
+        title: str | None = None,
+        timeout: int = 20,
+    ) -> tuple[dict, str]:
+        from agents.scm.client import GitHubClient
+
+        return GitHubClient(token=self._token).update_pr(
+            owner, repo, pr_id, body=body, title=title, timeout=timeout
+        )
+
+    def upload_issue_image(
+        self,
+        owner: str,
+        repo: str,
+        issue_number: int,
+        image_path: str,
+        filename: str = "",
+        task_id: str = "",
+        timeout: int = 60,
+    ) -> tuple[dict, str]:
+        from agents.scm.client import GitHubClient
+
+        return GitHubClient(token=self._token).upload_issue_image(
+            owner,
+            repo,
+            issue_number,
+            image_path,
+            filename=filename,
+            task_id=task_id,
+            timeout=timeout,
+        )
+
     # ------------------------------------------------------------------
     # Git operations
     # ------------------------------------------------------------------

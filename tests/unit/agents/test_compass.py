@@ -1,4 +1,5 @@
 """Tests for Compass Agent (hybrid heuristic + LLM routing)."""
+import asyncio
 import json
 import pytest
 from unittest.mock import MagicMock, patch
@@ -27,6 +28,16 @@ def _mock_runtime(summary="Task dispatched.", success=True):
     runtime.run_agentic.return_value = result
     runtime.run.return_value = {"raw_response": "development"}
     return runtime
+
+
+async def _wait_for_task_state(agent, task_id: str, expected_state: str, attempts: int = 50):
+    last = None
+    for _ in range(attempts):
+        last = await agent.get_task(task_id)
+        if last["task"]["status"]["state"] == expected_state:
+            return last
+        await asyncio.sleep(0.01)
+    return last
 
 
 class TestCompassDefinition:
@@ -178,16 +189,23 @@ class TestCompassAgent:
         with patch("framework.tools.registry.get_registry") as mock_get_reg:
             mock_reg = MagicMock()
             mock_reg.execute_sync.return_value = json.dumps({
-                "status": "submitted", "taskId": "tl-001",
+                "status": "completed",
+                "taskId": "tl-001",
+                "summary": "Task completed successfully.",
+                "prUrl": "https://example.com/pr/1",
+                "branch": "feature/CSTL-2",
             })
             mock_get_reg.return_value = mock_reg
             result = await agent.handle_message(message)
 
-        assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
-        artifacts = result["task"]["artifacts"]
-        assert any("dispatched" in a["parts"][0]["text"].lower() for a in artifacts)
+        assert result["task"]["status"]["state"] == "TASK_STATE_WORKING"
+        assert "background" in result["ui_update"]["chat_message"]["text"].lower()
         # Direct dispatch should NOT call run_agentic
         runtime.run_agentic.assert_not_called()
+
+        final_task = await _wait_for_task_state(agent, result["task"]["id"], "TASK_STATE_COMPLETED")
+        assert final_task["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+        assert "Task completed successfully." in final_task["task"]["artifacts"][0]["parts"][0]["text"]
         mock_reg.execute_sync.assert_called_once()
         call_args = mock_reg.execute_sync.call_args
         assert call_args[0][0] == "dispatch_development_task"
@@ -242,6 +260,7 @@ class TestCompassAgent:
     async def test_get_task_returns_real_state(self):
         """After handle_message, get_task returns real completed state."""
         runtime = _mock_runtime("Done.")
+        runtime.run.return_value = {"raw_response": "general"}
         agent = _make_agent(runtime)
 
         message = {"parts": [{"text": "Hello there"}], "metadata": {}}
@@ -267,13 +286,20 @@ class TestCompassAgent:
         }
         with patch("framework.tools.registry.get_registry") as mock_get_reg:
             mock_reg = MagicMock()
-            mock_reg.execute_sync.return_value = json.dumps({"status": "submitted", "taskId": "tl-001"})
+            mock_reg.execute_sync.return_value = json.dumps({
+                "status": "completed",
+                "taskId": "tl-001",
+                "summary": "Done.",
+            })
             mock_get_reg.return_value = mock_reg
             result = await agent.handle_message(message)
 
-        assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+        assert result["task"]["status"]["state"] == "TASK_STATE_WORKING"
         # Development task → direct dispatch, not run_agentic
         runtime.run_agentic.assert_not_called()
+
+        final_task = await _wait_for_task_state(agent, result["task"]["id"], "TASK_STATE_COMPLETED")
+        assert final_task["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
 
 
 class TestCompassTools:
@@ -296,8 +322,10 @@ class TestCompassTools:
             dispatched["url"] = url
             dispatched["capability"] = capability
             dispatched["metadata"] = metadata
+            dispatched["timeout"] = kwargs.get("timeout")
             return {
                 "task": {
+                    "id": "tl-001",
                     "artifacts": [
                         {
                             "parts": [{"text": "Task completed."}],
@@ -312,13 +340,19 @@ class TestCompassTools:
         result = DispatchDevelopmentTask().execute_sync(
             task_description="Implement PROJ-123",
             jira_key="PROJ-123",
+            orchestratorTaskId="compass-001",
+            workspacePath="/tmp/workspace/compass-001",
         )
 
         payload = json.loads(result.output)
         assert payload["status"] == "completed"
+        assert payload["taskId"] == "tl-001"
         assert dispatched["url"] == "http://registry-team-lead:8030"
         assert dispatched["capability"] == "team-lead.task.analyze"
         assert dispatched["metadata"]["jiraKey"] == "PROJ-123"
+        assert dispatched["metadata"]["orchestratorTaskId"] == "compass-001"
+        assert dispatched["metadata"]["workspacePath"] == "/tmp/workspace/compass-001"
+        assert dispatched["timeout"] == 3600
 
     def test_dispatch_development_task_propagates_failed_team_lead_state(self, monkeypatch):
         from agents.compass.tools import DispatchDevelopmentTask
@@ -336,6 +370,7 @@ class TestCompassTools:
             "framework.a2a.client.dispatch_sync",
             lambda **kwargs: {
                 "task": {
+                    "id": "tl-002",
                     "status": {
                         "state": "TASK_STATE_FAILED",
                         "message": {"parts": [{"text": "Jira ticket not accessible: PROJ-123"}]},
@@ -349,6 +384,7 @@ class TestCompassTools:
         payload = json.loads(result.output)
         assert payload["status"] == "error"
         assert payload["state"] == "TASK_STATE_FAILED"
+        assert payload["taskId"] == "tl-002"
         assert "Jira ticket not accessible" in payload["message"]
 
     def test_dispatch_development_task_requires_registry_registration(self, monkeypatch):

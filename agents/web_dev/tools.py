@@ -118,11 +118,12 @@ class JiraTransition(BaseTool):
         "required": ["ticket_key", "transition_name"],
     }
 
-    def execute_sync(self, ticket_key: str = "", transition_name: str = "") -> ToolResult:
+    def execute_sync(self, ticket_key: str = "", transition_name: str = "", **_kwargs) -> ToolResult:
         result = _dispatch_jira(
             "jira.ticket.transition",
             ticket_key=ticket_key,
             transitionName=transition_name,
+            **_kwargs,
         )
         return ToolResult(output=json.dumps(result))
 
@@ -140,11 +141,12 @@ class JiraComment(BaseTool):
         "required": ["ticket_key", "comment"],
     }
 
-    def execute_sync(self, ticket_key: str = "", comment: str = "") -> ToolResult:
+    def execute_sync(self, ticket_key: str = "", comment: str = "", **_kwargs) -> ToolResult:
         result = _dispatch_jira(
             "jira.ticket.comment",
             ticket_key=ticket_key,
             comment=comment,
+            **_kwargs,
         )
         return ToolResult(output=json.dumps(result))
 
@@ -162,11 +164,12 @@ class JiraUpdate(BaseTool):
         "required": ["ticket_key", "fields"],
     }
 
-    def execute_sync(self, ticket_key: str = "", fields: dict | None = None) -> ToolResult:
+    def execute_sync(self, ticket_key: str = "", fields: dict | None = None, **_kwargs) -> ToolResult:
         result = _dispatch_jira(
             "jira.ticket.update",
             ticket_key=ticket_key,
             fields=fields or {},
+            **_kwargs,
         )
         return ToolResult(output=json.dumps(result))
 
@@ -183,8 +186,8 @@ class JiraListTransitions(BaseTool):
         "required": ["ticket_key"],
     }
 
-    def execute_sync(self, ticket_key: str = "") -> ToolResult:
-        result = _dispatch_jira("jira.transitions.list", ticket_key=ticket_key)
+    def execute_sync(self, ticket_key: str = "", **_kwargs) -> ToolResult:
+        result = _dispatch_jira("jira.transitions.list", ticket_key=ticket_key, **_kwargs)
         return ToolResult(output=json.dumps(result))
 
 
@@ -194,8 +197,8 @@ class JiraGetTokenUser(BaseTool):
     description = "Get the identity of the Jira user associated with the current API token."
     parameters_schema = {"type": "object", "properties": {}, "required": []}
 
-    def execute_sync(self) -> ToolResult:
-        result = _dispatch_jira("jira.user.me")
+    def execute_sync(self, **_kwargs) -> ToolResult:
+        result = _dispatch_jira("jira.user.me", **_kwargs)
         return ToolResult(output=json.dumps(result))
 
 
@@ -211,8 +214,8 @@ class JiraListComments(BaseTool):
         "required": ["ticket_key"],
     }
 
-    def execute_sync(self, ticket_key: str = "") -> ToolResult:
-        result = _dispatch_jira("jira.comment.list", ticket_key=ticket_key)
+    def execute_sync(self, ticket_key: str = "", **_kwargs) -> ToolResult:
+        result = _dispatch_jira("jira.comment.list", ticket_key=ticket_key, **_kwargs)
         return ToolResult(output=json.dumps(result))
 
 
@@ -229,7 +232,7 @@ class SCMListBranches(BaseTool):
         "required": ["repo_url"],
     }
 
-    def execute_sync(self, repo_url: str = "") -> ToolResult:
+    def execute_sync(self, repo_url: str = "", **_kwargs) -> ToolResult:
         project, repo = _parse_repo_coordinates(repo_url)
         if not project or not repo:
             return ToolResult(output=json.dumps({"branches": [], "error": "Cannot infer project/repo from repo_url"}))
@@ -238,6 +241,7 @@ class SCMListBranches(BaseTool):
             text=f"{project}/{repo}",
             project=project,
             repo=repo,
+            **_kwargs,
         )
         return ToolResult(output=json.dumps(result))
 
@@ -256,12 +260,13 @@ class SCMPush(BaseTool):
         "required": ["repo_path", "branch"],
     }
 
-    def execute_sync(self, repo_path: str = "", branch: str = "") -> ToolResult:
+    def execute_sync(self, repo_path: str = "", branch: str = "", **_kwargs) -> ToolResult:
         result = _dispatch_scm(
             "scm.branch.push",
             text=branch,
             repoPath=repo_path,
             branch=branch,
+            **_kwargs,
         )
         return ToolResult(output=json.dumps(result))
 
@@ -290,6 +295,7 @@ class SCMCreatePR(BaseTool):
         target_branch: str = "main",
         title: str = "",
         description: str = "",
+        **_kwargs,
     ) -> ToolResult:
         project, repo = _parse_repo_coordinates(repo_url)
         if not project or not repo:
@@ -304,6 +310,89 @@ class SCMCreatePR(BaseTool):
             targetBranch=target_branch,
             title=title,
             description=description,
+            **_kwargs,
+        )
+        return ToolResult(output=json.dumps(result))
+
+
+class SCMUploadPRImage(BaseTool):
+    """Upload a screenshot image through the SCM Agent and return an embeddable URL."""
+
+    name = "scm_upload_pr_image"
+    description = "Upload a local screenshot image through the SCM Agent and return an embeddable URL."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string", "description": "Repository URL used to derive project/owner and repo"},
+            "pr_number": {"type": "integer", "description": "Pull request number, if available"},
+            "image_path": {"type": "string", "description": "Absolute path to the local screenshot image"},
+            "filename": {"type": "string", "description": "Optional upload filename override"},
+        },
+        "required": ["repo_url", "image_path"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        pr_number: int = 0,
+        image_path: str = "",
+        filename: str = "",
+        **_kwargs,
+    ) -> ToolResult:
+        project, repo = _parse_repo_coordinates(repo_url)
+        if not project or not repo:
+            return ToolResult(output=json.dumps({"error": "Unable to infer project/repo from repo_url"}))
+
+        result = _dispatch_scm(
+            "scm.pr.image.upload",
+            text=image_path,
+            project=project,
+            repo=repo,
+            prNumber=pr_number,
+            imagePath=image_path,
+            filename=filename,
+            **_kwargs,
+        )
+        return ToolResult(output=json.dumps(result))
+
+
+class SCMUpdatePR(BaseTool):
+    """Update a pull request through the SCM Agent."""
+
+    name = "scm_update_pr"
+    description = "Update a pull request title and/or description through the SCM Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string", "description": "Repository URL used to derive project/owner and repo"},
+            "pr_number": {"type": "integer", "description": "Pull request number"},
+            "description": {"type": "string", "description": "Replacement PR description body"},
+            "title": {"type": "string", "description": "Optional replacement PR title"},
+        },
+        "required": ["repo_url", "pr_number", "description"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        pr_number: int = 0,
+        description: str = "",
+        title: str = "",
+        **_kwargs,
+    ) -> ToolResult:
+        project, repo = _parse_repo_coordinates(repo_url)
+        if not project or not repo:
+            return ToolResult(output=json.dumps({"error": "Unable to infer project/repo from repo_url"}))
+
+        result = _dispatch_scm(
+            "scm.pr.update",
+            text=description,
+            project=project,
+            repo=repo,
+            prNumber=pr_number,
+            description=description,
+            title=title,
+            **_kwargs,
         )
         return ToolResult(output=json.dumps(result))
 
@@ -332,6 +421,8 @@ def register_web_dev_tools():
         SCMListBranches,
         SCMPush,
         SCMCreatePR,
+        SCMUploadPRImage,
+        SCMUpdatePR,
     ):
         tool = tool_cls()
         if tool.name not in existing:

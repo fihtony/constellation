@@ -277,7 +277,7 @@ class TestScreenshotEmbeddedInPRDescription:
 
     @pytest.mark.asyncio
     async def test_screenshots_embedded_via_cdn_upload(self):
-        """create_pr calls scm_upload_pr_image and embeds the CDN URL in PR description."""
+        """create_pr uploads screenshots after PR creation and patches the PR description."""
         from agents.web_dev.nodes import create_pr
 
         desktop_png_path, _ = _make_png_file()
@@ -295,9 +295,11 @@ class TestScreenshotEmbeddedInPRDescription:
                     return {
                         "status": "ok",
                         "prUrl": "https://github.com/fihtony/english-study-hub/pull/99",
-                        "prNumber": 99,
+                        "pr": {"id": 99},
                         "commitHash": "abc123",
                     }
+                if tool_name == "scm_update_pr":
+                    return {"ok": True, "status": "ok"}
                 return {}
 
             mock_runtime = MagicMock()
@@ -320,6 +322,7 @@ class TestScreenshotEmbeddedInPRDescription:
                 "implementation_summary": "Implement landing page.",
                 "test_status": "passed",
                 "changes_made": ["src/App.tsx"],
+                "definition_of_done": {"screenshot_required": True},
                 "workspace_path": tempfile.mkdtemp(),
             }
 
@@ -332,20 +335,25 @@ class TestScreenshotEmbeddedInPRDescription:
 
             upload_calls = [c for c in tool_calls if c["tool"] == "scm_upload_pr_image"]
             assert upload_calls, "scm_upload_pr_image must be called"
+            assert upload_calls[0]["args"].get("pr_number") == 99
 
             create_pr_calls = [c for c in tool_calls if c["tool"] == "scm_create_pr"]
             assert create_pr_calls, "scm_create_pr must be called"
             pr_desc = create_pr_calls[0]["args"].get("description", "")
-            assert CDN_URL in pr_desc, (
-                f"CDN URL not in PR description.\nExpected: {CDN_URL}\nDescription: {pr_desc[:500]}"
+            assert CDN_URL not in pr_desc, "base PR create call should not contain screenshot URLs yet"
+
+            update_pr_calls = [c for c in tool_calls if c["tool"] == "scm_update_pr"]
+            assert update_pr_calls, "scm_update_pr must be called after screenshots upload"
+            updated_desc = update_pr_calls[0]["args"].get("description", "")
+            assert CDN_URL in updated_desc, (
+                f"CDN URL not in updated PR description.\nExpected: {CDN_URL}\nDescription: {updated_desc[:500]}"
             )
         finally:
             os.unlink(desktop_png_path)
 
     @pytest.mark.asyncio
-    async def test_screenshots_fallback_when_cdn_fails(self):
-        """When CDN upload fails, description contains raw.githubusercontent.com fallback URLs."""
-        import subprocess as _subprocess
+    async def test_screenshots_upload_failure_raises(self):
+        """When CDN upload fails, create_pr must fail instead of committing screenshots to the branch."""
         from agents.web_dev.nodes import create_pr
 
         desktop_png_path, _ = _make_png_file()
@@ -362,7 +370,7 @@ class TestScreenshotEmbeddedInPRDescription:
                     return {
                         "status": "ok",
                         "prUrl": "https://github.com/fihtony/english-study-hub/pull/88",
-                        "prNumber": 88,
+                        "pr": {"id": 88},
                         "commitHash": "def456",
                     }
                 return {}
@@ -374,9 +382,6 @@ class TestScreenshotEmbeddedInPRDescription:
                     "description": "Initial PR description.",
                 })
             }
-
-            commit_result = MagicMock()
-            commit_result.returncode = 0
 
             state = {
                 "_task_id": "test-task",
@@ -390,23 +395,18 @@ class TestScreenshotEmbeddedInPRDescription:
                 "implementation_summary": "test",
                 "test_status": "passed",
                 "changes_made": ["src/App.tsx"],
+                "definition_of_done": {"screenshot_required": True},
                 "workspace_path": tempfile.mkdtemp(),
             }
 
             with patch("agents.web_dev.nodes._call_boundary_tool", side_effect=fake_boundary_tool), \
-                 patch("agents.web_dev.nodes._git_commit_all_pending", return_value=["src/App.tsx"]), \
-                 patch("shutil.copy2"), \
-                 patch("subprocess.run", return_value=commit_result), \
-                 patch("os.makedirs"):
-                result = await create_pr(state)
+                 patch("agents.web_dev.nodes._git_commit_all_pending", return_value=["src/App.tsx"]):
+                with pytest.raises(RuntimeError, match="screenshot upload"):
+                    await create_pr(state)
 
-            assert result.get("pr_url"), "PR URL must be set even with CDN failure"
             create_pr_calls = [c for c in tool_calls if c["tool"] == "scm_create_pr"]
             assert create_pr_calls, "scm_create_pr must be called"
-            pr_desc = create_pr_calls[0]["args"].get("description", "")
-            assert "raw.githubusercontent.com" in pr_desc, (
-                f"Expected raw.githubusercontent.com in fallback description.\n"
-                f"Description: {pr_desc[:500]}"
-            )
+            update_pr_calls = [c for c in tool_calls if c["tool"] == "scm_update_pr"]
+            assert not update_pr_calls, "PR description must not be updated when screenshot upload failed"
         finally:
             os.unlink(desktop_png_path)

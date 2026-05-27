@@ -32,6 +32,51 @@ def _get_provider():
     return _make_provider(backend)
 
 
+def _fetch_jira_ticket_payload(
+    ticket_key: str,
+    task_id: str = "",
+    workspace_path: str = "",
+    provider=None,
+) -> dict:
+    import time as _time
+
+    log = _log(task_id)
+    log.info("fetch_jira_ticket called", ticket_key=ticket_key, workspace_path=workspace_path or "(not set)")
+    active_provider = provider or _get_provider()
+    data, status = active_provider.fetch_issue(ticket_key)
+    log.info("fetch_jira_ticket result", status=status, ticket_key=ticket_key)
+
+    local_folder = ""
+    files = []
+    if workspace_path and data:
+        try:
+            local_folder = os.path.join(workspace_path, _AGENT_ID, ticket_key)
+            os.makedirs(local_folder, exist_ok=True)
+            ticket_file = os.path.join(local_folder, "ticket.json")
+            with open(ticket_file, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "metadata": {
+                        "agent_id": _AGENT_ID,
+                        "step": "fetch_jira_ticket",
+                        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "ticket_key": ticket_key,
+                    },
+                    "data": data,
+                }, fh, ensure_ascii=False, indent=2)
+            files.append(f"jira/{ticket_key}/ticket.json")
+            log.info("jira ticket saved", local_folder=local_folder, file="ticket.json")
+            print(f"[{_AGENT_ID}] Jira ticket {ticket_key} saved to {local_folder}")
+        except OSError as exc:
+            log.warn("jira ticket save failed", error=str(exc))
+
+    return {
+        "ticket": data,
+        "status": status,
+        "local_folder": local_folder,
+        "files": files,
+    }
+
+
 class FetchJiraTicket(BaseTool):
     name = "fetch_jira_ticket"
     description = "Fetch the details of a Jira ticket (summary, description, status, labels)."
@@ -46,41 +91,11 @@ class FetchJiraTicket(BaseTool):
     }
 
     def execute_sync(self, ticket_key: str = "", task_id: str = "", workspace_path: str = "") -> ToolResult:
-        import time as _time
-        log = _log(task_id)
-        log.info("fetch_jira_ticket called", ticket_key=ticket_key, workspace_path=workspace_path or "(not set)")
-        data, status = _get_provider().fetch_issue(ticket_key)
-        log.info("fetch_jira_ticket result", status=status, ticket_key=ticket_key)
-
-        local_folder = ""
-        files = []
-        if workspace_path and data:
-            try:
-                local_folder = os.path.join(workspace_path, _AGENT_ID, ticket_key)
-                os.makedirs(local_folder, exist_ok=True)
-                ticket_file = os.path.join(local_folder, "ticket.json")
-                with open(ticket_file, "w", encoding="utf-8") as fh:
-                    json.dump({
-                        "metadata": {
-                            "agent_id": _AGENT_ID,
-                            "step": "fetch_jira_ticket",
-                            "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                            "ticket_key": ticket_key,
-                        },
-                        "data": data,
-                    }, fh, ensure_ascii=False, indent=2)
-                files.append(f"jira/{ticket_key}/ticket.json")
-                log.info("jira ticket saved", local_folder=local_folder, file="ticket.json")
-                print(f"[{_AGENT_ID}] Jira ticket {ticket_key} saved to {local_folder}")
-            except OSError as exc:
-                log.warn("jira ticket save failed", error=str(exc))
-
-        return ToolResult(output=json.dumps({
-            "ticket": data,
-            "status": status,
-            "local_folder": local_folder,
-            "files": files,
-        }))
+        return ToolResult(output=json.dumps(_fetch_jira_ticket_payload(
+            ticket_key=ticket_key,
+            task_id=task_id,
+            workspace_path=workspace_path,
+        )))
 
 
 class JiraTransition(BaseTool):

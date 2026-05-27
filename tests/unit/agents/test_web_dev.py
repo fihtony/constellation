@@ -4,16 +4,20 @@ import os
 import pytest
 from framework.workflow import START, END
 from agents.web_dev.agent import web_dev_workflow, web_dev_definition
-from agents.web_dev.tools import SCMCreatePR, register_web_dev_tools
+from agents.web_dev.tools import SCMCreatePR, SCMUploadPRImage, register_web_dev_tools
 from agents.web_dev.nodes import (
     setup_workspace,
     analyze_task,
     implement_changes,
     run_tests,
     fix_tests,
+    self_assess,
+    capture_screenshot,
     create_pr,
     report_result,
     _safe_json,
+    _detect_fragile_icon_font_usage,
+    _rendered_page_has_content,
 )
 
 
@@ -62,6 +66,139 @@ class TestSafeJson:
 
     def test_none_returns_fallback(self):
         assert _safe_json(None, fallback=[]) == []
+
+
+class TestScreenshotRenderChecks:
+
+    def test_rendered_page_has_content_accepts_visible_dom(self):
+        assert _rendered_page_has_content(
+            {
+                "rootChildren": 1,
+                "bodyChildren": 2,
+                "visibleTextChars": 120,
+                "bodyWidth": 1280,
+                "bodyHeight": 900,
+            }
+        ) is True
+
+    def test_rendered_page_has_content_rejects_blank_page(self):
+        assert _rendered_page_has_content(
+            {
+                "rootChildren": 0,
+                "bodyChildren": 1,
+                "visibleTextChars": 0,
+                "bodyWidth": 1280,
+                "bodyHeight": 900,
+            }
+        ) is False
+
+    def test_detect_fragile_icon_font_usage_flags_material_ligatures(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        src_path.mkdir(parents=True)
+        (src_path / "Hero.jsx").write_text(
+            "<span className=\"material-symbols-outlined\">arrow_forward</span>\n",
+            encoding="utf-8",
+        )
+
+        findings = _detect_fragile_icon_font_usage(str(repo_path))
+
+        assert findings["issues"]
+        assert findings["uses_material_icon_class"] is True
+        assert findings["uses_remote_material_font"] is False
+        assert "arrow_forward" in findings["icon_tokens"]
+
+    def test_detect_fragile_icon_font_usage_ignores_plain_words(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        src_path.mkdir(parents=True)
+        (src_path / "LandingPage.jsx").write_text(
+            "<span>Research Writing</span>\n",
+            encoding="utf-8",
+        )
+
+        findings = _detect_fragile_icon_font_usage(str(repo_path))
+
+        assert findings["issues"] == []
+        assert findings["icon_tokens"] == []
+
+    async def test_self_assess_fails_fragile_icon_font_usage(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        src_path.mkdir(parents=True)
+        (src_path / "Hero.jsx").write_text(
+            "<span className=\"material-symbols-outlined\">arrow_forward</span>\n",
+            encoding="utf-8",
+        )
+
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 1.0,
+                            "verdict": "pass",
+                            "gaps": [],
+                            "component_checks": [],
+                            "criteria_checks": [],
+                            "summary": "Looks good.",
+                        }
+                    )
+                }
+
+        state = {
+            "_runtime": _MockRuntime(),
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": True},
+            "changes_made": ["src/Hero.jsx"],
+            "implementation_summary": "Added a hero section.",
+            "test_results": {"passed": 8, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        assert result["route"] == "fail"
+        assert result["self_assessment"]["verdict"] == "fail"
+        assert any("inline SVG or a local React icon component" in gap for gap in result["self_assessment"]["gaps"])
+
+    async def test_self_assess_raises_after_max_cycles(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        src_path.mkdir(parents=True)
+        (src_path / "Hero.jsx").write_text(
+            "<span className=\"material-symbols-outlined\">arrow_forward</span>\n",
+            encoding="utf-8",
+        )
+
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 1.0,
+                            "verdict": "pass",
+                            "gaps": [],
+                            "component_checks": [],
+                            "criteria_checks": [],
+                            "summary": "Looks good.",
+                        }
+                    )
+                }
+
+        state = {
+            "_runtime": _MockRuntime(),
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": True},
+            "changes_made": ["src/Hero.jsx"],
+            "implementation_summary": "Added a hero section.",
+            "test_results": {"passed": 8, "failed": 0},
+            "assess_cycles": 2,
+        }
+
+        with pytest.raises(RuntimeError, match="self_assess failed after 3 cycles"):
+            await self_assess(state)
 
 
 class TestWebDevNodes:
@@ -179,47 +316,57 @@ class TestWebDevNodes:
         assert result["test_status"] == "pass"
         assert result["test_cycles"] == 1
 
-    async def test_run_tests_with_passing_runtime(self):
-        from framework.runtime.adapter import AgenticResult
+    async def test_run_tests_with_passing_validation(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "agents.web_dev.nodes._run_mandatory_validation",
+            lambda repo_path, workspace_path, cycle: {
+                "install_ok": True,
+                "build_ok": True,
+                "test_ok": True,
+                "passed": 5,
+                "failed": 0,
+                "output": "All good",
+            },
+        )
 
-        class _MockRuntime:
-            def run_agentic(self, task, **kw):
-                return AgenticResult(
-                    success=True,
-                    summary='{"passed": 5, "failed": 0, "output": "All good"}',
-                    backend_used="mock",
-                )
-
-        state = {"_runtime": _MockRuntime(), "test_cycles": 0}
+        state = {"_runtime": object(), "repo_path": str(tmp_path), "test_cycles": 0}
         result = await run_tests(state)
         assert result["route"] == "pass"
 
-    async def test_run_tests_with_failing_runtime(self):
-        from framework.runtime.adapter import AgenticResult
+    async def test_run_tests_with_failing_validation(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "agents.web_dev.nodes._run_mandatory_validation",
+            lambda repo_path, workspace_path, cycle: {
+                "install_ok": True,
+                "build_ok": False,
+                "test_ok": False,
+                "passed": 2,
+                "failed": 3,
+                "output": "FAILED",
+            },
+        )
 
-        class _MockRuntime:
-            def run_agentic(self, task, **kw):
-                return AgenticResult(
-                    success=True,
-                    summary='{"passed": 2, "failed": 3, "output": "FAILED"}',
-                    backend_used="mock",
-                )
-
-        state = {"_runtime": _MockRuntime(), "test_cycles": 0}
+        state = {"_runtime": object(), "repo_path": str(tmp_path), "test_cycles": 0}
         result = await run_tests(state)
         assert result["route"] == "fail"
         assert result["test_cycles"] == 1
 
-    async def test_run_tests_max_cycles_proceeds_to_pr(self):
-        from framework.runtime.adapter import AgenticResult
+    async def test_run_tests_max_cycles_fails_before_pr(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "agents.web_dev.nodes._run_mandatory_validation",
+            lambda repo_path, workspace_path, cycle: {
+                "install_ok": True,
+                "build_ok": False,
+                "test_ok": False,
+                "passed": 0,
+                "failed": 1,
+                "output": "FAILED",
+            },
+        )
 
-        class _MockRuntime:
-            def run_agentic(self, task, **kw):
-                return AgenticResult(success=True, summary='{"passed": 0, "failed": 1}', backend_used="mock")
-
-        state = {"_runtime": _MockRuntime(), "test_cycles": 4}  # already at max-1
-        result = await run_tests(state)
-        assert result["route"] == "pass"  # proceed despite failure
+        state = {"_runtime": object(), "repo_path": str(tmp_path), "test_cycles": 2, "max_test_cycles": 3}
+        with pytest.raises(RuntimeError, match="Mandatory validation failed"):
+            await run_tests(state)
 
     async def test_fix_tests_no_runtime(self):
         state = {}
@@ -243,10 +390,35 @@ class TestWebDevNodes:
         assert result["fix_attempted"] is True
         assert "Fixed" in result["fix_summary"]
 
+    async def test_capture_screenshot_requires_png_for_ui_task(self, tmp_path):
+        state = {
+            "_task_id": "task-123",
+            "repo_path": str(tmp_path / "missing-repo"),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": True},
+        }
+
+        with pytest.raises(RuntimeError, match="Required UI screenshot capture failed"):
+            await capture_screenshot(state)
+
     async def test_create_pr_no_runtime(self):
         state = {}
         result = await create_pr(state)
         assert "pr_url" in result
+
+    async def test_create_pr_requires_screenshot_for_ui_task(self):
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                return {"raw_response": '{"title": "Add UI", "description": "## Summary\\nAdded UI."}'}
+
+        state = {
+            "_runtime": _MockRuntime(),
+            "definition_of_done": {"screenshot_required": True},
+            "screenshot_captured": False,
+        }
+
+        with pytest.raises(RuntimeError, match="without captured PNG screenshots"):
+            await create_pr(state)
 
     async def test_create_pr_with_runtime(self):
         from framework.tools.registry import get_registry
@@ -366,6 +538,42 @@ class TestWebDevWorkflowExecution:
 
 class TestWebDevBoundaryTools:
 
+    def test_jira_tools_accept_task_metadata(self, monkeypatch):
+        from agents.web_dev.tools import JiraComment, JiraGetTokenUser, JiraListTransitions
+
+        dispatched = []
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return f"http://stub/{capability}"
+
+        def _dispatch_sync(url, capability, message_parts, metadata, **kwargs):
+            dispatched.append({
+                "capability": capability,
+                "metadata": metadata,
+            })
+            return {
+                "task": {
+                    "artifacts": [
+                        {"parts": [{"text": json.dumps({"status": "ok"})}]}
+                    ]
+                }
+            }
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        JiraGetTokenUser().execute_sync(task_id="task-123")
+        JiraListTransitions().execute_sync(ticket_key="CSTL-2", task_id="task-123")
+        JiraComment().execute_sync(ticket_key="CSTL-2", comment="picked up", task_id="task-123")
+
+        assert dispatched[0]["metadata"]["task_id"] == "task-123"
+        assert dispatched[1]["metadata"]["task_id"] == "task-123"
+        assert dispatched[2]["metadata"]["task_id"] == "task-123"
+
     def test_register_web_dev_tools_includes_scm_tools(self):
         from framework.tools.registry import get_registry
 
@@ -373,9 +581,15 @@ class TestWebDevBoundaryTools:
         registry = get_registry()
         assert registry.get("scm_push") is not None
         assert registry.get("scm_create_pr") is not None
+        assert registry.get("scm_upload_pr_image") is not None
+        assert registry.get("scm_update_pr") is not None
 
     def test_scm_create_pr_derives_bitbucket_coordinates(self, monkeypatch):
         dispatched = {}
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return f"http://stub/{capability}"
 
         def _dispatch_sync(url, capability, message_parts, metadata, **kwargs):
             dispatched["capability"] = capability
@@ -388,6 +602,10 @@ class TestWebDevBoundaryTools:
                 }
             }
 
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
         monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
 
         result = SCMCreatePR().execute_sync(
@@ -396,6 +614,7 @@ class TestWebDevBoundaryTools:
             target_branch="main",
             title="PROJ-123: add login page",
             description="PR body",
+            task_id="task-123",
         )
 
         payload = json.loads(result.output)
@@ -403,4 +622,46 @@ class TestWebDevBoundaryTools:
         assert dispatched["capability"] == "scm.pr.create"
         assert dispatched["metadata"]["project"] == "PROJ"
         assert dispatched["metadata"]["repo"] == "web-ui-test"
+        assert dispatched["metadata"]["task_id"] == "task-123"
+
+    def test_scm_upload_pr_image_derives_github_coordinates(self, monkeypatch, tmp_path):
+        image_file = tmp_path / "screen.png"
+        image_file.write_bytes(b"png")
+        dispatched = {}
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return f"http://stub/{capability}"
+
+        def _dispatch_sync(url, capability, message_parts, metadata, **kwargs):
+            dispatched["capability"] = capability
+            dispatched["metadata"] = metadata
+            return {
+                "task": {
+                    "artifacts": [
+                        {"parts": [{"text": json.dumps({"ok": True, "image_url": "https://cdn.example/screen.png"})}]}
+                    ]
+                }
+            }
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        result = SCMUploadPRImage().execute_sync(
+            repo_url="https://github.com/org/repo",
+            image_path=str(image_file),
+            pr_number=42,
+            task_id="task-123",
+        )
+
+        payload = json.loads(result.output)
+        assert payload["image_url"] == "https://cdn.example/screen.png"
+        assert dispatched["capability"] == "scm.pr.image.upload"
+        assert dispatched["metadata"]["project"] == "org"
+        assert dispatched["metadata"]["repo"] == "repo"
+        assert dispatched["metadata"]["imagePath"] == str(image_file)
+        assert dispatched["metadata"]["task_id"] == "task-123"
 

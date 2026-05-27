@@ -94,9 +94,14 @@ def create_services(
 
 
 def main():
+    try:
+        default_port = int(os.environ.get("PORT", "8000") or "8000")
+    except ValueError:
+        default_port = 8000
+
     parser = argparse.ArgumentParser(description="Run a Constellation v2 agent locally")
     parser.add_argument("agent", choices=list(AGENTS.keys()), help="Agent to run")
-    parser.add_argument("--port", type=int, default=8000, help="HTTP port (default: 8000)")
+    parser.add_argument("--port", type=int, default=default_port, help="HTTP port (default: PORT env or 8000)")
     parser.add_argument("--skills-dir", default="skills", help="Skills directory")
     args = parser.parse_args()
 

@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path as _Path
 from typing import Any
 
@@ -107,6 +109,118 @@ def _safe_json(text: str, fallback: Any = None) -> Any:
     return fallback
 
 
+def _run_mandatory_validation(repo_path: str, workspace_path: str, cycle: int) -> dict:
+    """Run install, build, and tests through the deterministic validation script."""
+    script_path = _Path(__file__).resolve().parent / "scripts" / "validate_project.py"
+    output_path = ""
+    if workspace_path:
+        output_path = os.path.join(
+            workspace_path,
+            _AGENT_ID,
+            "test-results",
+            f"validation-run-{cycle}.json",
+        )
+
+    command = [sys.executable, str(script_path), repo_path]
+    if output_path:
+        command.extend(["--output", output_path])
+
+    proc = subprocess.run(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=int(os.environ.get("WEB_DEV_VALIDATION_TIMEOUT", "2400")),
+        check=False,
+    )
+    data = _safe_json(proc.stdout or "", fallback={}) or {}
+    if output_path and os.path.isfile(output_path):
+        try:
+            with open(output_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            pass
+    if proc.returncode != 0:
+        data.setdefault("failed", 1)
+        data.setdefault("errors", []).append("mandatory validation script failed")
+    data.setdefault("output", proc.stdout or "")
+    return data
+
+
+def _tail_text(text: str, limit: int = 600) -> str:
+    """Return the last *limit* characters of text for compact logging."""
+    normalized = str(text or "").strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[-limit:]
+
+
+def _git_worktree_changed_files(repo_path: str) -> list[str]:
+    """Return tracked/untracked worktree files from git status."""
+    if not repo_path or not os.path.isdir(repo_path):
+        return []
+    try:
+        from framework.env_utils import build_isolated_git_env
+
+        proc = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=repo_path,
+            env=build_isolated_git_env(scope="web-dev-worktree-status"),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    files: list[str] = []
+    for line in proc.stdout.splitlines():
+        path = line[3:].strip() if len(line) > 3 else line.strip()
+        if path:
+            files.append(path)
+    return sorted(set(files))
+
+
+def _git_branch_changed_files(repo_path: str, base_ref: str = "main") -> list[str]:
+    """Return files changed on the current branch relative to *base_ref*."""
+    if not repo_path or not os.path.isdir(repo_path):
+        return []
+    try:
+        from framework.env_utils import build_isolated_git_env
+
+        proc = subprocess.run(
+            ["git", "diff", "--name-only", f"{base_ref}..HEAD"],
+            cwd=repo_path,
+            env=build_isolated_git_env(scope="web-dev-branch-status"),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
+
+
+def _summarize_validation_commands(data: dict) -> list[dict[str, Any]]:
+    """Return compact validation command summaries for agent.log."""
+    summaries: list[dict[str, Any]] = []
+    for command in data.get("commands") or []:
+        parts = command.get("command") or []
+        summaries.append(
+            {
+                "command": " ".join(str(part) for part in parts),
+                "returncode": command.get("returncode"),
+                "duration_seconds": command.get("duration_seconds"),
+            }
+        )
+    return summaries
+
+
 def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
     """Call a boundary agent tool via the global ToolRegistry.
 
@@ -121,6 +235,121 @@ def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
     except Exception as exc:
         print(f"[{_AGENT_ID}] Tool {tool_name} failed: {exc}")
         return {"error": str(exc)}
+
+
+def _is_screenshot_required(state: dict) -> bool:
+    """Return whether this task must produce PNG implementation screenshots."""
+    definition_of_done = state.get("definition_of_done") or {}
+    if isinstance(definition_of_done, dict) and "screenshot_required" in definition_of_done:
+        return bool(definition_of_done.get("screenshot_required"))
+
+    if state.get("design_context") or state.get("design_spec"):
+        return True
+    if state.get("stitch_screen_id") or state.get("stitch_screen_name"):
+        return True
+
+    task_signals = " ".join(
+        str(state.get(key, "")).lower()
+        for key in ("task_type", "classification", "work_type")
+    )
+    return any(token in task_signals for token in ("ui", "frontend", "front-end", "visual", "design"))
+
+
+def _rendered_page_has_content(metrics: dict[str, Any]) -> bool:
+    """Return True when the browser page shows enough evidence of real rendering."""
+    root_children = int(metrics.get("rootChildren") or 0)
+    body_children = int(metrics.get("bodyChildren") or 0)
+    visible_text_chars = int(metrics.get("visibleTextChars") or 0)
+    body_width = int(metrics.get("bodyWidth") or 0)
+    body_height = int(metrics.get("bodyHeight") or 0)
+    return (
+        (root_children > 0 or body_children > 1 or visible_text_chars >= 20)
+        and body_width > 0
+        and body_height > 0
+    )
+
+
+_ICON_LIGATURE_TOKENS = (
+    "arrow_forward",
+    "arrow_back",
+    "arrow_upward",
+    "arrow_downward",
+    "chevron_right",
+    "chevron_left",
+    "navigate_next",
+    "navigate_before",
+    "expand_more",
+    "expand_less",
+    "close",
+    "menu",
+    "search",
+)
+
+
+def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
+    """Detect icon-font ligature patterns that render unreliably in containers."""
+    findings: dict[str, Any] = {
+        "issues": [],
+        "files": [],
+        "icon_tokens": [],
+        "uses_material_icon_class": False,
+        "uses_remote_material_font": False,
+    }
+    if not repo_path or not os.path.isdir(repo_path):
+        return findings
+
+    text_exts = {".html", ".css", ".scss", ".sass", ".less", ".js", ".jsx", ".ts", ".tsx"}
+    ignored_dirs = {".git", "node_modules", "dist", "build", ".next", "coverage"}
+    risky_files: set[str] = set()
+    icon_tokens: set[str] = set()
+
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [name for name in dirs if name not in ignored_dirs]
+        for filename in files:
+            if os.path.splitext(filename)[1].lower() not in text_exts:
+                continue
+            full_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(full_path, repo_path)
+            try:
+                with open(full_path, encoding="utf-8", errors="ignore") as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            lowered = content.lower()
+
+            if "material-symbols" in lowered or "material-icons" in lowered:
+                findings["uses_material_icon_class"] = True
+                risky_files.add(rel_path)
+
+            if (
+                "fonts.googleapis.com" in lowered
+                and ("material+symbols" in lowered or "material+icons" in lowered or "icon?family=material+icons" in lowered)
+            ):
+                findings["uses_remote_material_font"] = True
+                risky_files.add(rel_path)
+
+            for token in _ICON_LIGATURE_TOKENS:
+                if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", lowered):
+                    icon_tokens.add(token)
+                    risky_files.add(rel_path)
+
+    findings["files"] = sorted(risky_files)
+    findings["icon_tokens"] = sorted(icon_tokens)
+
+    if findings["uses_material_icon_class"] or findings["icon_tokens"]:
+        preview = ", ".join(findings["icon_tokens"][:3]) or "material icon ligatures"
+        findings["issues"].append(
+            "Fragile icon font usage detected "
+            f"({preview}) in {', '.join(findings['files'][:4])}. "
+            "Replace icon-font ligatures with inline SVG or a local React icon component so container screenshots never show icon names as text."
+        )
+    if findings["uses_material_icon_class"] and not findings["uses_remote_material_font"]:
+        findings["issues"].append(
+            "Material icon classes are present without a matching icon font stylesheet. "
+            "The page can render icon names as plain text."
+        )
+
+    return findings
 
 
 def _git_commit_all_pending(repo_path: str, jira_key: str) -> list[str]:
@@ -626,6 +855,16 @@ async def implement_changes(state: dict) -> dict:
 
     # Use Claude Code native tools (Bash, Read, Write, Glob, Grep) — no constellation
     # MCP bridge needed.  With cwd=repo_path, all relative paths resolve correctly.
+    repo_path = state.get("repo_path", "")
+    branch_name = state.get("branch_name", "")
+    changed_before = set(_git_branch_changed_files(repo_path)) | set(_git_worktree_changed_files(repo_path))
+    log.info(
+        "implement_changes started",
+        repo_path=repo_path,
+        branch=branch_name,
+        jira_local_folder=state.get("jira_local_folder", ""),
+        design_local_folder=state.get("design_local_folder", ""),
+    )
     print(f"[{_AGENT_ID}] implement_changes: repo_path={state.get('repo_path', '')!r} (native tools)")
     result = runtime.run_agentic(
         task=prompt,
@@ -636,6 +875,21 @@ async def implement_changes(state: dict) -> dict:
         timeout=1800,
         plugin_manager=state.get("_plugin_manager"),
     )
+    changed_after = set(_git_branch_changed_files(repo_path)) | set(_git_worktree_changed_files(repo_path))
+    changed_files = sorted(changed_after)
+    new_files = sorted(changed_after - changed_before)
+    log.info(
+        "implement_changes result",
+        success=result.success,
+        turns=result.turns_used,
+        files_changed=len(changed_files),
+        new_files=len(new_files),
+        files=changed_files[:12],
+    )
+    if new_files:
+        log.debug("implement_changes new files", files=new_files[:20])
+    if result.summary:
+        log.debug("implement_changes summary", summary=result.summary[:500])
     print(f"[{_AGENT_ID}] implement_changes done: success={result.success} turns={result.turns_used} summary={result.summary[:300]!r}")
 
     if not result.success:
@@ -696,44 +950,31 @@ async def run_tests(state: dict) -> dict:
         }
 
     repo_path = state.get("repo_path", "")
+    workspace_path = state.get("workspace_path", "")
+    if not repo_path or not os.path.isdir(repo_path):
+        raise RuntimeError("Mandatory validation cannot run because repo_path is missing")
+
     log.debug("run_tests running build+test", repo_path=repo_path)
     print(f"[{_AGENT_ID}] run_tests: cycle={test_cycles}/{max_test_cycles} repo_path={repo_path!r}")
 
-    result = runtime.run_agentic(
-        task=(
-            "Run the project's build and test suite. Report all results.\n"
-            "MANDATORY steps (execute in order — do NOT skip any step):\n"
-            f"1. Change into the repo directory: {repo_path}\n"
-            "2. Run `npm install` to install/update dependencies.\n"
-            "   If npm install fails (missing package), read the error,\n"
-            "   remove the invalid package from package.json, and re-run.\n"
-            "3. Run `npm run build` to check for TypeScript / compilation errors.\n"
-            "   If build fails, fix ALL errors before continuing.\n"
-            "   Common issues: missing imports, wrong export names, \n"
-            "   undefined variables, TypeScript type errors.\n"
-            "4. Detect the test runner (vitest, jest, pytest, etc.).\n"
-            "5. Run tests with verbose output: `npm test -- --run` (vitest) or equivalent.\n"
-            "   If no test command is configured, run `npx vitest --run` directly.\n"
-            "6. Return a JSON summary:\n"
-            '   {"passed": N, "failed": N, "build_ok": true/false, '
-            '"errors": ["error msg..."], "output": "...last 100 lines..."}'
-        ),
-        cwd=repo_path or None,
-        tools=None,
-        max_turns=20,
-        timeout=1800,
-        plugin_manager=state.get("_plugin_manager"),
-    )
-
-    data = _safe_json(result.summary, fallback={})
+    data = _run_mandatory_validation(repo_path, workspace_path, test_cycles)
     failed = data.get("failed", 0)
-    build_ok = data.get("build_ok", True)
-    test_passed = int(failed) == 0 and build_ok and result.success
+    install_ok = data.get("install_ok", True)
+    build_ok = data.get("build_ok", False)
+    test_ok = data.get("test_ok", False)
+    test_passed = int(failed) == 0 and install_ok and build_ok and test_ok
+    command_summaries = _summarize_validation_commands(data)
     log.info("run_tests result", passed=data.get("passed", 0), failed=failed,
-             build_ok=build_ok, test_passed=test_passed, cycle=test_cycles)
+             install_ok=install_ok, build_ok=build_ok, test_ok=test_ok,
+             test_passed=test_passed, cycle=test_cycles)
+    if command_summaries:
+        log.info("run_tests commands", commands=command_summaries)
+    if data.get("errors"):
+        log.warn("run_tests errors", errors=data.get("errors", []), output_tail=_tail_text(data.get("output", ""), 1200))
+    else:
+        log.debug("run_tests output tail", output_tail=_tail_text(data.get("output", ""), 500))
 
     # Write per-cycle test results for auditability
-    workspace_path = state.get("workspace_path", "")
     if workspace_path:
         import time as _time
         results_dir = os.path.join(workspace_path, _AGENT_ID, "test-results")
@@ -756,29 +997,21 @@ async def run_tests(state: dict) -> dict:
     if test_passed:
         return {
             "test_results": data,
-            "test_output": data.get("output", result.summary),
+            "test_output": data.get("output", ""),
             "test_cycles": test_cycles,
             "test_status": "pass",
             "route": "pass",
         }
 
     if test_cycles >= max_test_cycles:
-        # Exhausted fix cycles — proceed to PR; Team Lead will review.
-        # Record accurate status (not "skip").
-        final_status = "pass" if int(failed) == 0 else "fail_max_cycles"
-        print(f"[{_AGENT_ID}] run_tests: max cycles reached ({test_cycles}/{max_test_cycles}), "
-              f"proceeding with status={final_status}")
-        return {
-            "test_results": data,
-            "test_output": data.get("output", result.summary),
-            "test_cycles": test_cycles,
-            "test_status": final_status,
-            "route": "pass",  # proceed to PR despite failures; Team Lead will review
-        }
+        print(f"[{_AGENT_ID}] run_tests: max cycles reached ({test_cycles}/{max_test_cycles}); failing task")
+        raise RuntimeError(
+            "Mandatory validation failed after max cycles; Web Dev cannot proceed to self-assessment or PR"
+        )
 
     return {
         "test_results": data,
-        "test_output": data.get("output", result.summary),
+        "test_output": data.get("output", ""),
         "test_cycles": test_cycles,
         "test_status": "fail",
         "route": "fail",
@@ -828,6 +1061,7 @@ async def self_assess(state: dict) -> dict:
     runtime = state.get("_runtime")
     assess_cycles = state.get("assess_cycles", 0) + 1
     max_assess_cycles = 3
+    log.info("self_assess started", cycle=assess_cycles, max_cycles=max_assess_cycles)
 
     if not runtime:
         return {
@@ -947,7 +1181,41 @@ async def self_assess(state: dict) -> dict:
     data = _safe_json(raw_response, fallback={})
     if not data:
         print(f"[{_AGENT_ID}] self_assess _safe_json returned empty — raw_response type={type(raw_response).__name__}, len={len(raw_response) if raw_response else 0}")
-    score = float(data.get("score", 0))
+
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("criteria_checks", [])
+    data.setdefault("component_checks", [])
+    data.setdefault("gaps", [])
+    data.setdefault("summary", "")
+
+    deterministic_gaps: list[str] = []
+    if _is_screenshot_required(state):
+        icon_validation = _detect_fragile_icon_font_usage(state.get("repo_path", ""))
+        deterministic_gaps.extend(icon_validation.get("issues") or [])
+        if icon_validation.get("issues"):
+            data["component_checks"].append(
+                {
+                    "component": "Icon rendering",
+                    "status": "incomplete",
+                    "notes": icon_validation["issues"][0],
+                }
+            )
+
+    if deterministic_gaps:
+        merged_gaps: list[str] = []
+        for gap in [*(data.get("gaps") or []), *deterministic_gaps]:
+            text = str(gap).strip()
+            if text and text not in merged_gaps:
+                merged_gaps.append(text)
+        data["gaps"] = merged_gaps
+        data["verdict"] = "fail"
+        data["score"] = min(float(data.get("score", 0) or 0), 0.89)
+        summary = str(data.get("summary", "")).strip()
+        if deterministic_gaps[0] not in summary:
+            data["summary"] = (summary + " " if summary else "") + deterministic_gaps[0]
+
+    score = float(data.get("score", 0) or 0)
     verdict = data.get("verdict", "fail")
     gaps = data.get("gaps", [])
 
@@ -975,14 +1243,26 @@ async def self_assess(state: dict) -> dict:
             pass
 
     if score >= 0.9 and verdict != "fail":
-        return {
-            "self_assessment": data,
-            "assess_cycles": assess_cycles,
-            "route": "pass",
-        }
+        route = "pass"
+    elif assess_cycles >= max_assess_cycles:
+        failure_summary = "; ".join(str(gap) for gap in gaps[:4]) or str(data.get("summary", "self-assessment failed"))
+        log.warn("self_assess exhausted retries", cycle=assess_cycles, failure_summary=failure_summary[:400])
+        raise RuntimeError(f"self_assess failed after {max_assess_cycles} cycles: {failure_summary[:400]}")
+    else:
+        route = "fail"
 
-    if assess_cycles >= max_assess_cycles:
-        # Exhausted assess cycles — proceed to PR rather than blocking on user input
+    log.info(
+        "self_assess result",
+        score=score,
+        verdict=verdict,
+        gaps=len(gaps),
+        route=route,
+        cycle=assess_cycles,
+    )
+    if gaps:
+        log.warn("self_assess gaps", gaps=gaps[:10], summary=str(data.get("summary", ""))[:300])
+
+    if route == "pass":
         return {
             "self_assessment": data,
             "assess_cycles": assess_cycles,
@@ -998,9 +1278,12 @@ async def self_assess(state: dict) -> dict:
 
 async def fix_gaps(state: dict) -> dict:
     """Fix self-assessment gaps before re-running tests and self-assessment."""
+    log = _logger(state)
+    log.node("fix_gaps")
     runtime = state.get("_runtime")
 
     if not runtime:
+        log.info("fix_gaps skipped — no runtime")
         return {"fix_gaps_attempted": True}
 
     from agents.web_dev.prompts import FIX_GAPS_SYSTEM, FIX_GAPS_TEMPLATE
@@ -1008,6 +1291,7 @@ async def fix_gaps(state: dict) -> dict:
     assessment = state.get("self_assessment", {})
     gaps = assessment.get("gaps", [])
     changed_files = state.get("changes_made", [])
+    log.info("fix_gaps started", gaps=len(gaps), files_changed=len(changed_files))
 
     prompt = FIX_GAPS_TEMPLATE.format(
         gaps="\n".join(f"- {g}" for g in gaps) if gaps else "No specific gaps listed.",
@@ -1023,6 +1307,7 @@ async def fix_gaps(state: dict) -> dict:
         timeout=300,
         plugin_manager=state.get("_plugin_manager"),
     )
+    log.info("fix_gaps result", success=result.success, summary=result.summary[:300])
 
     return {
         "fix_gaps_attempted": True,
@@ -1056,8 +1341,7 @@ async def capture_screenshot(state: dict) -> dict:
     import shutil
     import socket
 
-    definition_of_done = state.get("definition_of_done", {})
-    screenshot_required = definition_of_done.get("screenshot_required", True)
+    screenshot_required = _is_screenshot_required(state)
     log = _logger(state)
 
     if not screenshot_required:
@@ -1071,6 +1355,8 @@ async def capture_screenshot(state: dict) -> dict:
 
     if not repo_path or not os.path.isdir(repo_path):
         log.warn("capture_screenshot skipped — repo_path missing", repo_path=repo_path)
+        if screenshot_required:
+            raise RuntimeError("Required UI screenshot capture failed: repository path is missing")
         return {"screenshot_captured": False, "screenshots": []}
 
     try:
@@ -1306,11 +1592,30 @@ async def capture_screenshot(state: dict) -> dict:
                             is_mobile=is_mobile,
                         )
                         pg = await ctx.new_page()
+                        console_errors: list[str] = []
+                        page_errors: list[str] = []
+
+                        def _capture_console(msg):
+                            try:
+                                if msg.type in {"error", "warning"}:
+                                    console_errors.append(msg.text)
+                            except Exception:
+                                pass
+
+                        def _capture_page_error(exc):
+                            try:
+                                page_errors.append(str(exc))
+                            except Exception:
+                                pass
+
+                        pg.on("console", _capture_console)
+                        pg.on("pageerror", _capture_page_error)
                         try:
                             # No font blocking — allow all requests through so the browser
                             # loads Google Fonts normally (Work Sans, Newsreader, Material
-                            # Symbols). Playwright's 'load' event fires when all resources
-                            # (including fonts) are ready, so no extra wait is needed.
+                            # Symbols). Wait for the Font Loading API as well so screenshot
+                            # evidence reflects the real rendered icon glyphs instead of the
+                            # raw icon token text.
 
                             # Navigate to the detected feature URL (not just root).
                             # For React Router SPAs, vite preview serves all routes
@@ -1324,6 +1629,16 @@ async def capture_screenshot(state: dict) -> dict:
                                 wait_until="load",
                                 timeout=30000,
                             )
+                            try:
+                                await pg.evaluate(
+                                    """async () => {
+                                        if (document.fonts && document.fonts.ready) {
+                                            await document.fonts.ready;
+                                        }
+                                    }"""
+                                )
+                            except Exception:
+                                pass
                             # Wait for React to hydrate and CSS animations to settle.
                             # Use a longer wait for production builds via vite preview
                             # since the bundled JS needs to parse + execute + render.
@@ -1334,25 +1649,55 @@ async def capture_screenshot(state: dict) -> dict:
                             # actively check for non-empty content.
                             root = pg.locator("#root")
                             try:
-                                # Wait for #root to have at least one child element
-                                # (React renders into this div; empty div = blank screen)
                                 await root.wait_for(state="attached", timeout=5000)
-                                child_count = await root.locator("> *").count()
-                                if child_count == 0:
-                                    # React hasn't mounted yet — wait longer
-                                    await pg.wait_for_timeout(5000)
-                                    child_count = await root.locator("> *").count()
-                                # Final check: ensure we have content before screenshot
-                                if child_count > 0:
-                                    # Verify body has rendered size (not 0x0 blank)
-                                    body_box = await pg.locator("body").bounding_box()
-                                    if body_box and body_box["width"] > 0 and body_box["height"] > 0:
-                                        pass  # content confirmed
-                                    else:
-                                        # One more wait for font/layout to settle
-                                        await pg.wait_for_timeout(3000)
                             except Exception:
-                                pass  # proceed even if checks fail
+                                pass
+
+                            metrics = await pg.evaluate(
+                                """() => {
+                                    const root = document.querySelector('#root');
+                                    const body = document.body;
+                                    const rect = body ? body.getBoundingClientRect() : { width: 0, height: 0 };
+                                    const visibleText = ((body && body.innerText) || '').replace(/\\s+/g, ' ').trim();
+                                    return {
+                                        rootChildren: root ? root.children.length : 0,
+                                        bodyChildren: body ? body.children.length : 0,
+                                        visibleTextChars: visibleText.length,
+                                        bodyWidth: Math.round(rect.width || 0),
+                                        bodyHeight: Math.round(rect.height || 0),
+                                        title: document.title || '',
+                                        readyState: document.readyState || '',
+                                    };
+                                }"""
+                            )
+                            if not _rendered_page_has_content(metrics):
+                                await pg.wait_for_timeout(4000)
+                                metrics = await pg.evaluate(
+                                    """() => {
+                                        const root = document.querySelector('#root');
+                                        const body = document.body;
+                                        const rect = body ? body.getBoundingClientRect() : { width: 0, height: 0 };
+                                        const visibleText = ((body && body.innerText) || '').replace(/\\s+/g, ' ').trim();
+                                        return {
+                                            rootChildren: root ? root.children.length : 0,
+                                            bodyChildren: body ? body.children.length : 0,
+                                            visibleTextChars: visibleText.length,
+                                            bodyWidth: Math.round(rect.width || 0),
+                                            bodyHeight: Math.round(rect.height || 0),
+                                            title: document.title || '',
+                                            readyState: document.readyState || '',
+                                        };
+                                    }"""
+                                )
+
+                            if not _rendered_page_has_content(metrics):
+                                print(
+                                    f"[{_AGENT_ID}] Screenshot rejected due to blank/unrendered page: "
+                                    f"route={url_path!r} metrics={metrics!r} console_errors={console_errors[-5:]} "
+                                    f"page_errors={page_errors[-5:]}"
+                                )
+                                return False
+
                             await pg.screenshot(path=out_path, full_page=False)
                         finally:
                             await ctx.close()
@@ -1421,10 +1766,10 @@ async def capture_screenshot(state: dict) -> dict:
                         "--headless=new", "--no-sandbox", "--disable-gpu",
                         "--disable-dev-shm-usage",
                         "--run-all-compositor-stages-before-draw",
-                        # Block external font CDNs so Chrome doesn't wait on them.
-                        "--host-rules=MAP fonts.googleapis.com 127.0.0.1,"
-                        "MAP fonts.gstatic.com 127.0.0.1,"
-                        "MAP use.typekit.net 127.0.0.1",
+                        # Keep Google Fonts/Material Symbols reachable so UI screenshots
+                        # reflect the same icon/font rendering that the real page uses.
+                        # Only block unrelated font CDNs that sometimes hang in CI.
+                        "--host-rules=MAP use.typekit.net 127.0.0.1",
                     ]
                     for _out_path, _size in [(desktop_png, "1280,900"), (mobile_png, "375,812")]:
                         chrome_result = subprocess.run(
@@ -1476,6 +1821,10 @@ async def capture_screenshot(state: dict) -> dict:
     captured = bool(screenshots) and any(s.endswith(".png") for s in screenshots)
     log.info("screenshot result", captured=captured, count=len(screenshots),
              server_type=locals().get("server_type", "unknown"))
+    if screenshot_required and not captured:
+        raise RuntimeError(
+            "Required UI screenshot capture failed: no PNG screenshots were produced"
+        )
     return {
         "screenshot_captured": captured,
         "screenshots": screenshots,
@@ -1654,6 +2003,10 @@ async def create_pr(state: dict) -> dict:
             "commit_hash": "",
         }
 
+    screenshot_required = _is_screenshot_required(state)
+    if screenshot_required and not state.get("screenshot_captured"):
+        raise RuntimeError("Cannot create PR for a UI task without captured PNG screenshots")
+
     from agents.web_dev.prompts import PR_DESCRIPTION_SYSTEM, PR_DESCRIPTION_TEMPLATE
 
     jira_ctx = state.get("jira_context", {})
@@ -1707,92 +2060,16 @@ async def create_pr(state: dict) -> dict:
     pr_title = pr_meta.get("title", "Implement task changes")
     pr_description = pr_meta.get("description", state.get("implementation_summary", ""))
 
-    # Step 2.5: Upload screenshots to GitHub CDN via Release Assets API.
-    # This avoids committing image files to the PR branch — screenshots are hosted
-    # in the repo's 'screenshot-assets' pre-release, giving stable CDN URLs like:
-    #   https://github.com/{owner}/{repo}/releases/download/screenshot-assets/{file}
-    # Falls back to the branch-commit approach if CDN upload fails.
+    # Step 2.5: Prepare screenshot artifacts. Screenshots must be hosted outside
+    # the PR branch and injected into the PR description only after PR creation.
     _screenshots = state.get("screenshots", [])
+    _png_screenshots = [s for s in _screenshots if s.endswith(".png") and os.path.isfile(s)]
+    _screenshot_uploaded = False
     _screenshot_section = ""
-    if _screenshots:
-        import shutil as _shutil
-        import subprocess as _subprocess
-        from urllib.parse import urlparse as _urlparse
+    if screenshot_required and not _png_screenshots:
+        raise RuntimeError("Cannot create PR for a UI task because PNG screenshots are missing")
 
-        _png_screenshots = [s for s in _screenshots if s.endswith(".png") and os.path.isfile(s)]
-        if _png_screenshots:
-            _screenshot_entries: list[tuple[str, str]] = []
-            _cdn_upload_ok = True
-
-            # Try CDN upload first (GitHub Release Assets)
-            for _png in _png_screenshots:
-                _fname = os.path.basename(_png)
-                _label = "Desktop (1280×900)" if "desktop" in _png.lower() else "Mobile (375×812)"
-                _upload_result = _call_boundary_tool(
-                    state, "scm_upload_pr_image",
-                    {"repo_url": repo_url, "pr_number": 0,
-                     "image_path": _png, "task_id": task_id},
-                )
-                _cdn_url = _upload_result.get("image_url", "")
-                if _cdn_url:
-                    _screenshot_entries.append((_label, _cdn_url))
-                else:
-                    _cdn_upload_ok = False
-                    print(f"[{_AGENT_ID}] CDN upload failed for {_fname}: "
-                          f"{_upload_result.get('error', '(no error detail)')}")
-
-            if _screenshot_entries:
-                _section_parts = [
-                    f"**{_lbl}**\n\n![]({_url})" for _lbl, _url in _screenshot_entries
-                ]
-                _screenshot_section = "\n\n## Screenshots\n\n" + "\n\n".join(_section_parts)
-                print(f"[{_AGENT_ID}] Screenshots uploaded to GitHub CDN — "
-                      f"{len(_screenshot_entries)} image(s) embedded in PR description")
-            elif not _cdn_upload_ok:
-                # Fallback: commit screenshots to the branch so raw.githubusercontent.com works.
-                # This path is taken when SCM backend is not GitHub or CDN upload is unsupported.
-                print(f"[{_AGENT_ID}] CDN upload unavailable, falling back to branch commit")
-                _parsed_url = _urlparse(repo_url)
-                _url_parts = _parsed_url.path.strip("/").split("/")
-                _gh_owner = _url_parts[0] if len(_url_parts) > 0 else ""
-                _gh_repo = _url_parts[1].replace(".git", "") if len(_url_parts) > 1 else ""
-                _screen_repo_dir = os.path.join(repo_path, "docs", "screenshots")
-                os.makedirs(_screen_repo_dir, exist_ok=True)
-                _fallback_entries: list[tuple[str, str]] = []
-                for _png in _png_screenshots:
-                    _fname = os.path.basename(_png)
-                    _label = "Desktop (1280×900)" if "desktop" in _png.lower() else "Mobile (375×812)"
-                    try:
-                        _shutil.copy2(_png, os.path.join(_screen_repo_dir, _fname))
-                        _raw_url = (
-                            f"https://raw.githubusercontent.com/{_gh_owner}/{_gh_repo}"
-                            f"/{branch_name}/docs/screenshots/{_fname}"
-                        )
-                        _fallback_entries.append((_label, _raw_url))
-                    except Exception as _copy_err:
-                        print(f"[{_AGENT_ID}] Screenshot copy failed for {_png}: {_copy_err}")
-                if _fallback_entries:
-                    _subprocess.run(
-                        ["git", "add", "-f", "docs/screenshots/"],  # -f to override gitignore
-                        cwd=repo_path, capture_output=True, text=True,
-                    )
-                    _commit_res = _subprocess.run(
-                        ["git", "commit", "-m", "docs: add implementation screenshots"],
-                        cwd=repo_path, capture_output=True, text=True,
-                    )
-                    if _commit_res.returncode == 0:
-                        _section_parts = [
-                            f"**{_lbl}**\n\n![]({_url})" for _lbl, _url in _fallback_entries
-                        ]
-                        _screenshot_section = "\n\n## Screenshots\n\n" + "\n\n".join(_section_parts)
-                        print(f"[{_AGENT_ID}] Screenshots committed to branch (fallback) "
-                              f"and embedded in PR description")
-                    else:
-                        print(f"[{_AGENT_ID}] Screenshot fallback commit failed: "
-                              f"{_commit_res.stderr[:200]}")
-
-    if _screenshot_section:
-        pr_description = pr_description.rstrip() + _screenshot_section
+    pr_description = pr_description.rstrip()
 
     # Step 3: Push branch then create PR via SCM boundary tools (not open agentic).
     task_id = state.get("_task_id", "")
@@ -1822,6 +2099,13 @@ async def create_pr(state: dict) -> dict:
     )
     pr_url = pr_payload.get("prUrl") or pr_payload.get("pr_url", "")
     pr_number = pr_payload.get("prNumber") or pr_payload.get("pr_number", 0)
+    if not pr_number and isinstance(pr_payload.get("pr"), dict):
+        pr_number = pr_payload["pr"].get("number") or pr_payload["pr"].get("id") or 0
+    if not pr_number and pr_url and "/pull/" in pr_url:
+        try:
+            pr_number = int(pr_url.rstrip("/").rsplit("/pull/", 1)[1])
+        except (TypeError, ValueError):
+            pr_number = 0
     commit_hash = pr_payload.get("commitHash") or pr_payload.get("commit_hash", "")
     pr_status = pr_payload.get("status", "")
     pr_error = pr_payload.get("error", "")
@@ -1832,10 +2116,62 @@ async def create_pr(state: dict) -> dict:
         log.info("PR created", pr_url=pr_url, branch=branch_name)
         print(f"[{_AGENT_ID}] create_pr done: prUrl={pr_url!r} prNumber={pr_number} status={pr_status!r}")
 
-    # Step 4: Screenshots were handled in Step 2.5 (CDN upload or fallback branch commit).
-    _screenshots = state.get("screenshots", [])
-    if _screenshots:
-        print(f"[{_AGENT_ID}] {len(_screenshots)} screenshot(s) processed for PR description")
+    # Step 4: Upload screenshots to GitHub CDN and PATCH the PR description.
+    if _png_screenshots:
+        log.info("uploading screenshots to CDN", screenshots=len(_png_screenshots), pr_number=pr_number)
+        _screenshot_entries: list[tuple[str, str]] = []
+        for _png in _png_screenshots:
+            _fname = os.path.basename(_png)
+            _label = "Desktop (1280×900)" if "desktop" in _png.lower() else "Mobile (375×812)"
+            _upload_result = _call_boundary_tool(
+                state,
+                "scm_upload_pr_image",
+                {
+                    "repo_url": repo_url,
+                    "pr_number": int(pr_number or 0),
+                    "image_path": _png,
+                    "task_id": task_id,
+                },
+            )
+            _cdn_url = _upload_result.get("image_url", "")
+            if _cdn_url:
+                _screenshot_entries.append((_label, _cdn_url))
+                continue
+
+            log.error("screenshot upload failed", screenshot=_fname, error=_upload_result.get("error", ""))
+            print(f"[{_AGENT_ID}] CDN upload failed for {_fname}: "
+                  f"{_upload_result.get('error', '(no error detail)')}")
+
+        if _screenshot_entries:
+            _section_parts = [
+                f"**{_lbl}**\n\n![]({_url})" for _lbl, _url in _screenshot_entries
+            ]
+            _screenshot_section = "\n\n## Screenshots\n\n" + "\n\n".join(_section_parts)
+            updated_description = pr_description + _screenshot_section
+            update_payload = _call_boundary_tool(
+                state,
+                "scm_update_pr",
+                {
+                    "repo_url": repo_url,
+                    "pr_number": int(pr_number or 0),
+                    "description": updated_description,
+                    "title": pr_title,
+                    "task_id": task_id,
+                },
+            )
+            if update_payload.get("error") or update_payload.get("status") not in ("ok", "no_changes", ""):
+                log.error("scm_update_pr failed", error=update_payload.get("error", ""), status=update_payload.get("status", ""))
+                raise RuntimeError("Cannot finalize PR for a UI task because screenshot URLs could not be added to the PR description")
+
+            pr_description = updated_description
+            _screenshot_uploaded = True
+            log.info("screenshot PR description updated", screenshots=len(_screenshot_entries), pr_number=pr_number)
+            print(f"[{_AGENT_ID}] Screenshots uploaded to GitHub CDN — "
+                  f"{len(_screenshot_entries)} image(s) embedded in PR description")
+        elif screenshot_required:
+            raise RuntimeError("Cannot finalize PR for a UI task because screenshot upload did not return CDN URLs")
+
+        print(f"[{_AGENT_ID}] {len(_png_screenshots)} screenshot(s) processed for PR description")
 
     # Write pr-evidence.json to workspace
     workspace_path = state.get("workspace_path", "")
@@ -1863,6 +2199,8 @@ async def create_pr(state: dict) -> dict:
                         "test_status": state.get("test_status", "unknown"),
                         "self_assessment_score": state.get("self_assessment", {}).get("score", "N/A"),
                         "screenshot_included": state.get("screenshot_captured", False),
+                        "screenshot_uploaded": _screenshot_uploaded,
+                        "screenshots": _screenshots,
                     },
                 }, fh, ensure_ascii=False, indent=2)
         except OSError:
@@ -1875,6 +2213,7 @@ async def create_pr(state: dict) -> dict:
         "pr_description": pr_description,
         "commit_hash": commit_hash,
         "changes_made": all_changes,
+        "screenshot_uploaded": _screenshot_uploaded,
     }
 
 

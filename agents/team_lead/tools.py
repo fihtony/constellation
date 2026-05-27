@@ -6,8 +6,12 @@ workflow orchestration — intelligence comes from the LLM + instructions.
 from __future__ import annotations
 
 import json
+import os
+import time
+import urllib.request
 from typing import Any
 
+from framework.launcher import get_launcher
 from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
 
@@ -35,6 +39,100 @@ def _resolve_agent_url(env_var: str, config_key: str, default: str, capability: 
     return ""
 
 
+def _capability_definition(capability: str) -> dict[str, Any]:
+    try:
+        from framework.registry_client import RegistryClient
+
+        return RegistryClient.from_config().get_capability_definition(capability) or {}
+    except Exception:
+        return {}
+
+
+def _is_per_task_definition(definition: dict[str, Any]) -> bool:
+    execution_mode = str(
+        definition.get("execution_mode") or definition.get("executionMode") or ""
+    ).strip().lower()
+    return execution_mode == "per-task" or bool(definition.get("launch_spec") or definition.get("launchSpec"))
+
+
+def _wait_for_agent_ready(base_url: str, timeout: int = 30) -> None:
+    deadline = time.time() + timeout
+    health_url = f"{base_url.rstrip('/')}/health"
+    last_error = "agent did not become ready"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(health_url, timeout=2):
+                return
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            time.sleep(0.5)
+    raise TimeoutError(f"Timed out waiting for launched agent: {last_error}")
+
+
+def _downstream_timeout_seconds(kind: str) -> int:
+    env_map = {
+        "web_dev": ("TEAM_LEAD_WEB_DEV_TIMEOUT_SECONDS", 3600),
+        "code_review": ("TEAM_LEAD_CODE_REVIEW_TIMEOUT_SECONDS", 1200),
+    }
+    env_name, default = env_map.get(kind, ("TEAM_LEAD_DOWNSTREAM_TIMEOUT_SECONDS", 600))
+    raw_value = os.environ.get(env_name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = int(raw_value)
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def _derive_launch_task_id(
+    orchestrator_task_id: str = "",
+    task_id: str = "",
+    workspace_path: str = "",
+) -> str:
+    explicit = (orchestrator_task_id or task_id or "").strip()
+    if explicit:
+        return explicit
+
+    workspace = (workspace_path or "").strip().rstrip("/")
+    if workspace:
+        leaf = os.path.basename(workspace)
+        if leaf:
+            return leaf
+    return ""
+
+
+def _dispatch_via_launcher(
+    definition: dict[str, Any],
+    *,
+    capability: str,
+    launch_task_id: str,
+    message_parts: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    timeout: int,
+) -> dict:
+    from framework.a2a.client import dispatch_sync
+
+    launcher = get_launcher()
+    launch = launcher.launch_instance(definition, launch_task_id or "per-task-agent")
+    agent_id = str(definition.get("agent_id") or definition.get("agentId") or capability).strip() or capability
+
+    try:
+        _wait_for_agent_ready(launch["service_url"])
+        return dispatch_sync(
+            url=launch["service_url"],
+            capability=capability,
+            message_parts=message_parts,
+            metadata=metadata,
+            timeout=timeout,
+        )
+    finally:
+        try:
+            launcher.destroy_instance(agent_id, launch["container_name"])
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Tool: fetch_jira_ticket
 # ---------------------------------------------------------------------------
@@ -55,17 +153,28 @@ class FetchJiraTicket(BaseTool):
         "required": ["ticket_key"],
     }
 
-    def execute_sync(self, ticket_key: str = "") -> ToolResult:
+    def execute_sync(
+        self,
+        ticket_key: str = "",
+        task_id: str = "",
+        workspace_path: str = "",
+        **_: Any,
+    ) -> ToolResult:
         jira_url = _resolve_agent_url("JIRA_AGENT_URL", "jira_agent_url", "http://jira:8010", "jira.ticket.fetch")
         if not jira_url:
             return ToolResult(output=json.dumps({"error": "No registered Jira instance was found in the registry.", "ticketKey": ticket_key}))
         try:
             from framework.a2a.client import dispatch_sync
+            metadata: dict[str, Any] = {"ticketKey": ticket_key}
+            if task_id:
+                metadata["taskId"] = task_id
+            if workspace_path:
+                metadata["workspacePath"] = workspace_path
             result = dispatch_sync(
                 url=jira_url,
                 capability="jira.ticket.fetch",
                 message_parts=[{"text": ticket_key}],
-                metadata={"ticketKey": ticket_key},
+                metadata=metadata,
             )
             task = result.get("task", result)
             if _task_state(task) != "TASK_STATE_COMPLETED":
@@ -118,6 +227,9 @@ class FetchDesign(BaseTool):
         stitch_project_id: str = "",
         stitch_screen_id: str = "",
         screen_name: str = "",
+        task_id: str = "",
+        workspace_path: str = "",
+        **_: Any,
     ) -> ToolResult:
         ui_url = _resolve_agent_url("UI_DESIGN_AGENT_URL", "ui_design_agent_url", "http://ui-design:8040", "figma.file.fetch")
         if not ui_url:
@@ -142,6 +254,11 @@ class FetchDesign(BaseTool):
             else:
                 return ToolResult(output=json.dumps({"error": "No design URL or project ID provided"}))
 
+            if task_id:
+                meta["taskId"] = task_id
+            if workspace_path:
+                meta["workspacePath"] = workspace_path
+
             result = dispatch_sync(
                 url=ui_url,
                 capability=capability,
@@ -153,6 +270,21 @@ class FetchDesign(BaseTool):
                 return ToolResult(output=json.dumps({"error": _task_error(task, "Design fetch failed")}))
             artifacts = task.get("artifacts", [])
             payload = _first_artifact_json(artifacts)
+            if not payload.get("local_folder"):
+                payload["local_folder"] = _find_metadata(artifacts, "localFolder")
+            if not payload.get("design_code_path"):
+                payload["design_code_path"] = _find_metadata(artifacts, "designCodePath")
+            if not payload.get("design_md_path"):
+                payload["design_md_path"] = _find_metadata(artifacts, "designMdPath")
+            if not payload.get("design_screen_path"):
+                payload["design_screen_path"] = _find_metadata(artifacts, "designScreenPath")
+            if not payload.get("files"):
+                files_json = _find_metadata(artifacts, "filesJson")
+                if files_json:
+                    try:
+                        payload["files"] = json.loads(files_json)
+                    except json.JSONDecodeError:
+                        pass
             return ToolResult(output=json.dumps(payload))
         except Exception as exc:
             return ToolResult(output=json.dumps({"error": str(exc)}))
@@ -182,7 +314,13 @@ class CloneRepo(BaseTool):
         "required": ["repo_url", "target_path"],
     }
 
-    def execute_sync(self, repo_url: str = "", target_path: str = "") -> ToolResult:
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        target_path: str = "",
+        task_id: str = "",
+        **_: Any,
+    ) -> ToolResult:
         scm_url = _resolve_agent_url(
             "SCM_AGENT_URL", "scm_agent_url", "http://scm:8020", "scm.repo.clone"
         )
@@ -194,11 +332,14 @@ class CloneRepo(BaseTool):
             }))
         try:
             from framework.a2a.client import dispatch_sync
+            metadata: dict[str, Any] = {"repoUrl": repo_url, "targetPath": target_path}
+            if task_id:
+                metadata["taskId"] = task_id
             result = dispatch_sync(
                 url=scm_url,
                 capability="scm.repo.clone",
                 message_parts=[{"text": repo_url}],
-                metadata={"repoUrl": repo_url, "targetPath": target_path},
+                metadata=metadata,
                 timeout=120,
             )
             task = result.get("task", result)
@@ -323,15 +464,14 @@ class DispatchWebDev(BaseTool):
         design_files: list | None = None,
         tech_stack: list | None = None,
         stitch_screen_name: str = "",
+        orchestrator_task_id: str = "",
         revision_feedback: str = "",
         definition_of_done: dict | None = None,
+        task_id: str = "",
+        **_: Any,
     ) -> ToolResult:
-        web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", "web-dev.task.execute")
-        if not web_dev_url:
-            return ToolResult(output=json.dumps({
-                "status": "error",
-                "message": "No registered Web Dev instance was found in the registry.",
-            }))
+        capability = "web-dev.task.execute"
+        definition = _capability_definition(capability)
         meta: dict[str, Any] = {}
         if jira_context:
             meta["jiraContext"] = jira_context
@@ -361,20 +501,46 @@ class DispatchWebDev(BaseTool):
             meta["techStack"] = tech_stack
         if stitch_screen_name:
             meta["stitchScreenName"] = stitch_screen_name
+        if orchestrator_task_id:
+            meta["orchestratorTaskId"] = orchestrator_task_id
         if revision_feedback:
             meta["revisionFeedback"] = revision_feedback
         if definition_of_done:
             meta["definitionOfDone"] = definition_of_done
+        if task_id:
+            meta["taskId"] = task_id
 
         try:
             from framework.a2a.client import dispatch_sync
-            result = dispatch_sync(
-                url=web_dev_url,
-                capability="web-dev.task.execute",
-                message_parts=[{"text": task_description}],
-                metadata=meta,
-                timeout=600,
+            timeout_seconds = _downstream_timeout_seconds("web_dev")
+            launch_task_id = _derive_launch_task_id(
+                orchestrator_task_id=orchestrator_task_id,
+                task_id=task_id,
+                workspace_path=workspace_path,
             )
+            if _is_per_task_definition(definition):
+                result = _dispatch_via_launcher(
+                    definition,
+                    capability=capability,
+                    launch_task_id=launch_task_id or "web-dev-task",
+                    message_parts=[{"text": task_description}],
+                    metadata=meta,
+                    timeout=timeout_seconds,
+                )
+            else:
+                web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", capability)
+                if not web_dev_url:
+                    return ToolResult(output=json.dumps({
+                        "status": "error",
+                        "message": "No registered Web Dev instance was found in the registry.",
+                    }))
+                result = dispatch_sync(
+                    url=web_dev_url,
+                    capability=capability,
+                    message_parts=[{"text": task_description}],
+                    metadata=meta,
+                    timeout=timeout_seconds,
+                )
             task = result.get("task", result)
             task_state = _task_state(task)
             if task_state != "TASK_STATE_COMPLETED":
@@ -388,14 +554,20 @@ class DispatchWebDev(BaseTool):
             pr_url = _find_metadata(artifacts, "prUrl")
             branch = _find_metadata(artifacts, "branch")
             jira_in_review_raw = _find_metadata(artifacts, "jiraInReview")
+            screenshot_included_raw = _find_metadata(artifacts, "screenshotIncluded")
+            screenshot_uploaded_raw = _find_metadata(artifacts, "screenshotUploaded")
             # _find_metadata returns a string; normalise to bool
             jira_in_review = jira_in_review_raw in (True, "True", "true", "1")
+            screenshot_included = screenshot_included_raw in (True, "True", "true", "1")
+            screenshot_uploaded = screenshot_uploaded_raw in (True, "True", "true", "1")
             return ToolResult(output=json.dumps({
                 "status": "completed",
                 "summary": summary,
                 "prUrl": pr_url,
                 "branch": branch,
                 "jiraInReview": jira_in_review,
+                "screenshotIncluded": screenshot_included,
+                "screenshotUploaded": screenshot_uploaded,
             }))
         except Exception as exc:
             return ToolResult(output=json.dumps({"status": "error", "message": str(exc)}))
@@ -457,13 +629,12 @@ class DispatchCodeReview(BaseTool):
         design_context: dict | None = None,
         workspace_path: str = "",
         context_manifest_path: str = "",
+        orchestrator_task_id: str = "",
+        task_id: str = "",
+        **_: Any,
     ) -> ToolResult:
-        review_url = _resolve_agent_url("CODE_REVIEW_AGENT_URL", "code_review_agent_url", "http://code-review:8050", "review.code.check")
-        if not review_url:
-            return ToolResult(output=json.dumps({
-                "verdict": "error",
-                "message": "No registered Code Review instance was found in the registry.",
-            }))
+        capability = "review.code.check"
+        definition = _capability_definition(capability)
         meta: dict[str, Any] = {}
         if pr_url:
             meta["prUrl"] = pr_url
@@ -477,16 +648,42 @@ class DispatchCodeReview(BaseTool):
             meta["workspacePath"] = workspace_path
         if context_manifest_path:
             meta["contextManifestPath"] = context_manifest_path
+        if orchestrator_task_id:
+            meta["orchestratorTaskId"] = orchestrator_task_id
+        if task_id:
+            meta["taskId"] = task_id
 
         try:
             from framework.a2a.client import dispatch_sync
-            result = dispatch_sync(
-                url=review_url,
-                capability="review.code.check",
-                message_parts=[{"text": diff_summary or pr_url}],
-                metadata=meta,
-                timeout=300,
+            timeout_seconds = _downstream_timeout_seconds("code_review")
+            launch_task_id = _derive_launch_task_id(
+                orchestrator_task_id=orchestrator_task_id,
+                task_id=task_id,
+                workspace_path=workspace_path,
             )
+            if _is_per_task_definition(definition):
+                result = _dispatch_via_launcher(
+                    definition,
+                    capability=capability,
+                    launch_task_id=launch_task_id or "code-review-task",
+                    message_parts=[{"text": diff_summary or pr_url}],
+                    metadata=meta,
+                    timeout=timeout_seconds,
+                )
+            else:
+                review_url = _resolve_agent_url("CODE_REVIEW_AGENT_URL", "code_review_agent_url", "http://code-review:8050", capability)
+                if not review_url:
+                    return ToolResult(output=json.dumps({
+                        "verdict": "error",
+                        "message": "No registered Code Review instance was found in the registry.",
+                    }))
+                result = dispatch_sync(
+                    url=review_url,
+                    capability=capability,
+                    message_parts=[{"text": diff_summary or pr_url}],
+                    metadata=meta,
+                    timeout=timeout_seconds,
+                )
             task = result.get("task", result)
             if _task_state(task) != "TASK_STATE_COMPLETED":
                 return ToolResult(output=json.dumps({
@@ -523,7 +720,7 @@ class RequestClarification(BaseTool):
         "required": ["question"],
     }
 
-    def execute_sync(self, question: str = "") -> ToolResult:
+    def execute_sync(self, question: str = "", **_: Any) -> ToolResult:
         # In production this triggers INPUT_REQUIRED via the workflow interrupt mechanism.
         # For now, signal the LLM that user input is needed.
         return ToolResult(output=json.dumps({
