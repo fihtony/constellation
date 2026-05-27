@@ -6,6 +6,7 @@ workflow orchestration — intelligence comes from the LLM + instructions.
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.request
 from typing import Any
@@ -66,6 +67,22 @@ def _wait_for_agent_ready(base_url: str, timeout: int = 30) -> None:
             last_error = str(exc)
             time.sleep(0.5)
     raise TimeoutError(f"Timed out waiting for launched agent: {last_error}")
+
+
+def _downstream_timeout_seconds(kind: str) -> int:
+    env_map = {
+        "web_dev": ("TEAM_LEAD_WEB_DEV_TIMEOUT_SECONDS", 3600),
+        "code_review": ("TEAM_LEAD_CODE_REVIEW_TIMEOUT_SECONDS", 1200),
+    }
+    env_name, default = env_map.get(kind, ("TEAM_LEAD_DOWNSTREAM_TIMEOUT_SECONDS", 600))
+    raw_value = os.environ.get(env_name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = int(raw_value)
+        return value if value > 0 else default
+    except ValueError:
+        return default
 
 
 def _dispatch_via_launcher(
@@ -478,6 +495,7 @@ class DispatchWebDev(BaseTool):
 
         try:
             from framework.a2a.client import dispatch_sync
+            timeout_seconds = _downstream_timeout_seconds("web_dev")
             if _is_per_task_definition(definition):
                 result = _dispatch_via_launcher(
                     definition,
@@ -485,7 +503,7 @@ class DispatchWebDev(BaseTool):
                     launch_task_id=orchestrator_task_id or task_id or "web-dev-task",
                     message_parts=[{"text": task_description}],
                     metadata=meta,
-                    timeout=600,
+                    timeout=timeout_seconds,
                 )
             else:
                 web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", capability)
@@ -499,7 +517,7 @@ class DispatchWebDev(BaseTool):
                     capability=capability,
                     message_parts=[{"text": task_description}],
                     metadata=meta,
-                    timeout=600,
+                    timeout=timeout_seconds,
                 )
             task = result.get("task", result)
             task_state = _task_state(task)
@@ -615,6 +633,7 @@ class DispatchCodeReview(BaseTool):
 
         try:
             from framework.a2a.client import dispatch_sync
+            timeout_seconds = _downstream_timeout_seconds("code_review")
             if _is_per_task_definition(definition):
                 result = _dispatch_via_launcher(
                     definition,
@@ -622,7 +641,7 @@ class DispatchCodeReview(BaseTool):
                     launch_task_id=orchestrator_task_id or task_id or "code-review-task",
                     message_parts=[{"text": diff_summary or pr_url}],
                     metadata=meta,
-                    timeout=300,
+                    timeout=timeout_seconds,
                 )
             else:
                 review_url = _resolve_agent_url("CODE_REVIEW_AGENT_URL", "code_review_agent_url", "http://code-review:8050", capability)
@@ -636,7 +655,7 @@ class DispatchCodeReview(BaseTool):
                     capability=capability,
                     message_parts=[{"text": diff_summary or pr_url}],
                     metadata=meta,
-                    timeout=300,
+                    timeout=timeout_seconds,
                 )
             task = result.get("task", result)
             if _task_state(task) != "TASK_STATE_COMPLETED":

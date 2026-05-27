@@ -670,5 +670,66 @@ class TestTeamLeadTools:
         assert payload["screenshotUploaded"] is True
         assert calls["launch"][0][1] == "task-123"
         assert calls["dispatch"][0]["url"] == "http://launched-web-dev:8050"
+        assert calls["dispatch"][0]["timeout"] == 3600
         assert calls["dispatch"][0]["metadata"]["orchestratorTaskId"] == "task-123"
         assert calls["destroy"] == [("web-dev", "web-dev-task-1234")]
+
+    def test_dispatch_web_dev_uses_configurable_timeout(self, monkeypatch):
+        from agents.team_lead.tools import DispatchWebDev
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return "http://web-dev:8050"
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setenv("TEAM_LEAD_WEB_DEV_TIMEOUT_SECONDS", "5400")
+
+        captured: dict[str, Any] = {}
+
+        def _dispatch_sync(**kwargs):
+            captured.update(kwargs)
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [],
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        DispatchWebDev().execute_sync(task_description="Implement CSTL-1")
+
+        assert captured["timeout"] == 5400
+
+    def test_dispatch_code_review_uses_configurable_timeout(self, monkeypatch):
+        from agents.team_lead.tools import DispatchCodeReview
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return "http://code-review:8050"
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setenv("TEAM_LEAD_CODE_REVIEW_TIMEOUT_SECONDS", "1800")
+
+        captured: dict[str, Any] = {}
+
+        def _dispatch_sync(**kwargs):
+            captured.update(kwargs)
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [],
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        DispatchCodeReview().execute_sync(pr_url="https://example.test/pr/1")
+
+        assert captured["timeout"] == 1800
