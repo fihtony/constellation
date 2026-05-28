@@ -813,13 +813,22 @@ class GitHubClient:
         timeout: int = 15,
     ) -> str:
         """Return the browser_download_url for an existing release asset by name."""
-        status, body = self._request(
-            "GET", f"repos/{owner}/{repo}/releases/{release_id}/assets", timeout=timeout
-        )
-        if status == 200 and isinstance(body, list):
+        page = 1
+        per_page = 100
+        while True:
+            status, body = self._request(
+                "GET",
+                f"repos/{owner}/{repo}/releases/{release_id}/assets?per_page={per_page}&page={page}",
+                timeout=timeout,
+            )
+            if status != 200 or not isinstance(body, list) or not body:
+                return ""
             for asset in body:
                 if asset.get("name") == filename:
                     return asset.get("browser_download_url", "")
+            if len(body) < per_page:
+                return ""
+            page += 1
         return ""
 
     # ------------------------------------------------------------------

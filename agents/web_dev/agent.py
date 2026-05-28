@@ -238,7 +238,9 @@ class WebDevAgent(BaseAgent):
                             "agentId": self.definition.agent_id,
                             "prUrl": result.get("pr_url", ""),
                             "prNumber": result.get("pr_number", 0),
+                            "repoUrl": result.get("repo_url", ""),
                             "branch": result.get("branch_name", ""),
+                            "changedFiles": result.get("changed_files", result.get("changes_made", [])),
                             "jiraInReview": result.get("jira_in_review", False),
                             "screenshotIncluded": result.get("screenshot_captured", False),
                             "screenshotUploaded": result.get("screenshot_uploaded", False),
@@ -295,7 +297,9 @@ def _send_callback(
                     "agentId": agent_id,
                     "prUrl": result.get("pr_url", ""),
                     "prNumber": result.get("pr_number", 0),
+                    "repoUrl": result.get("repo_url", ""),
                     "branch": result.get("branch_name", ""),
+                    "changedFiles": result.get("changed_files", result.get("changes_made", [])),
                     "jiraInReview": result.get("jira_in_review", False),
                     "screenshotIncluded": result.get("screenshot_captured", False),
                     "screenshotUploaded": result.get("screenshot_uploaded", False),
@@ -402,6 +406,9 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                     execution_contract = kw.get("execution_contract")
                     if execution_contract:
                         msg["message"]["metadata"]["executionContract"] = execution_contract
+                    permissions = kw.get("permissions")
+                    if isinstance(permissions, dict):
+                        msg["message"]["metadata"]["permissions"] = permissions
                     result = loop.run_until_complete(web_dev_agent.handle_message(msg))
                     task_id_holder["task_id"] = result["task"]["id"]
                 except Exception as exc:

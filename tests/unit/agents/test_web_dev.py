@@ -66,6 +66,10 @@ class TestWebDevWorkflowCompile:
         assert web_dev_definition.permissions.get("scm") == "read-write"
         assert web_dev_definition.permissions.get("filesystem") == "workspace-only"
 
+    def test_web_dev_definition_tools_include_runtime_boundary_calls(self):
+        assert "jira_update" in web_dev_definition.tools
+        assert "scm_list_branches" in web_dev_definition.tools
+
 
 class TestWebDevExecutionContract:
 
@@ -541,6 +545,7 @@ class TestWebDevNodes:
     async def test_create_pr_with_runtime(self):
         from framework.tools.registry import get_registry
         from framework.tools.base import BaseTool, ToolResult
+        from unittest.mock import patch
 
         class _MockSCMPush(BaseTool):
             name = "scm_push"
@@ -574,9 +579,14 @@ class TestWebDevNodes:
             "changes_made": ["src/login.py"],
             "jira_context": {"key": "ABC-123"},
         }
-        result = await create_pr(state)
+        with patch("agents.web_dev.nodes._git_commit_all_pending", return_value=["src/login.py"]), patch(
+            "agents.web_dev.nodes._git_branch_changed_files",
+            return_value=["package.json", "src/App.tsx", "src/login.py"],
+        ):
+            result = await create_pr(state)
         assert result["pr_url"] == "https://github.com/org/repo/pull/42"
         assert result["pr_title"] == "Add login page"
+        assert result["changes_made"] == ["package.json", "src/App.tsx", "src/login.py"]
 
     async def test_report_result(self):
         state = {

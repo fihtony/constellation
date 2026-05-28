@@ -3,6 +3,7 @@ import pytest
 import asyncio
 import time
 import json
+from typing import Any
 from unittest.mock import MagicMock
 from agents.team_lead.agent import TeamLeadAgent, team_lead_definition
 from framework.agent import AgentMode, AgentServices, ExecutionMode
@@ -435,6 +436,53 @@ class TestDispatchDevAgentValidation:
         assert "scm_push" in captured["args"]["permissions"]["allowedTools"]
         assert "dispatch_web_dev" not in captured["args"]["permissions"]["allowedTools"]
 
+    async def test_dispatch_dev_agent_reuses_existing_branch_name(self, monkeypatch):
+        from agents.team_lead.nodes import dispatch_dev_agent
+
+        captured = {}
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "web-dev"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                captured["name"] = name
+                captured["args"] = args
+                return json.dumps({
+                    "status": "completed",
+                    "summary": "done",
+                    "prUrl": "https://github.com/org/repo/pull/1",
+                    "branch": "feature/cstl-3-practice-quiz-page_3",
+                    "jiraInReview": True,
+                })
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        await dispatch_dev_agent(
+            {
+                "_task_id": "task-123",
+                "user_request": "Implement UI",
+                "analysis_summary": "Implement a UI page",
+                "jira_key": "PROJ-123",
+                "workspace_path": "/tmp/workspace",
+                "repo_url": "https://github.com/org/repo",
+                "repo_path": "/tmp/workspace/repo",
+                "branch_name": "feature/cstl-3-practice-quiz-page_3",
+                "plan": {
+                    "definition_of_done": {
+                        "pr_required": True,
+                        "jira_state_management": True,
+                    }
+                },
+            }
+        )
+
+        assert captured["name"] == "dispatch_web_dev"
+        assert captured["args"]["branch_name"] == "feature/cstl-3-practice-quiz-page_3"
+
     async def test_dispatch_dev_agent_propagates_screenshot_evidence(self, monkeypatch):
         from agents.team_lead.nodes import dispatch_dev_agent
 
@@ -604,6 +652,40 @@ class TestDispatchDevAgentValidation:
         assert captured["name"] == "dispatch_code_review"
         assert "scm_get_pr_diff" in captured["args"]["permissions"]["allowedTools"]
         assert "dispatch_code_review" not in captured["args"]["permissions"]["allowedTools"]
+
+    async def test_review_result_uses_dev_result_repo_inputs_when_state_missing(self, monkeypatch):
+        from agents.team_lead.nodes import review_result
+
+        captured: dict[str, object] = {}
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                captured.update(args)
+                return json.dumps({"verdict": "approved", "summary": "ok"})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await review_result(
+            {
+                "_task_id": "task-123",
+                "pr_url": "https://github.com/org/repo/pull/85",
+                "pr_number": 0,
+                "repo_url": "",
+                "dev_result": {
+                    "summary": "done",
+                    "prNumber": 85,
+                    "repoUrl": "https://github.com/org/repo",
+                    "changedFiles": ["src/App.jsx"],
+                },
+                "analysis_summary": "Implement CSTL-3",
+                "workspace_path": "/tmp/workspace",
+            }
+        )
+
+        assert captured["repo_url"] == "https://github.com/org/repo"
+        assert captured["pr_number"] == 85
+        assert captured["changed_files"] == ["src/App.jsx"]
+        assert result["route"] == "approved"
 
     async def test_validate_readiness_routes_to_missing_info_for_retryable_context(self, tmp_path):
         from agents.team_lead.nodes import validate_readiness
@@ -922,7 +1004,10 @@ class TestTeamLeadTools:
                             "parts": [{"text": "Dev task completed."}],
                             "metadata": {
                                 "prUrl": "https://example.test/pr/2",
+                                "prNumber": 2,
+                                "repoUrl": "https://example.test/org/repo.git",
                                 "branch": "feature/cstl-2",
+                                "changedFiles": ["src/App.jsx"],
                                 "jiraInReview": True,
                                 "screenshotIncluded": True,
                                 "screenshotUploaded": True,
@@ -942,6 +1027,9 @@ class TestTeamLeadTools:
 
         payload = json.loads(result.output)
         assert payload["status"] == "completed"
+        assert payload["prNumber"] == 2
+        assert payload["repoUrl"] == "https://example.test/org/repo.git"
+        assert payload["changedFiles"] == ["src/App.jsx"]
         assert payload["screenshotIncluded"] is True
         assert payload["screenshotUploaded"] is True
         assert payload["childServiceUrl"] == "http://launched-web-dev:8050"

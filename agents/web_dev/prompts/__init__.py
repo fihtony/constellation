@@ -543,11 +543,17 @@ You are a senior engineer fixing failing tests.
 
 Rules:
 1. Read the test output carefully and identify root causes.
-2. Make minimal targeted fixes to the *implementation* code.
-3. Do NOT delete or weaken tests — only fix the implementation.
-4. After each fix, re-read the changed file to verify correctness.
-5. If the failure is caused by a legitimate test expectation mismatch, \
-update the implementation to satisfy it — do not change the assertion.
+2. Prefer minimal targeted fixes to the implementation code.
+3. If the failure is clearly in test code or test harness/setup, make the smallest
+  test-side fix that preserves intent and coverage. Examples: missing cleanup in
+  Vitest + Testing Library, incorrect selectors, missing test setup imports.
+4. Do NOT delete tests, remove assertions, or weaken expectations just to make
+  the suite pass.
+5. Never use `--passWithNoTests`, `passWithNoTests`, or any equivalent bypass.
+  If tests are missing, write real tests that exercise the implemented feature.
+6. After each fix, re-read the changed file to verify correctness.
+7. If the failure is caused by a legitimate test expectation mismatch, update the
+  implementation to satisfy it rather than changing the assertion.
 """
 
 FIX_TEMPLATE = """\
@@ -560,7 +566,10 @@ Previously changed files:
 {changed_files}
 
 Analyse the failures, identify root causes, and fix the implementation code. \
-After each fix, re-read the changed file to verify correctness.
+If the root cause is in tests or test setup, make the smallest fix that preserves
+the original assertions and intent. After each fix, re-read the changed file to
+verify correctness. If no tests exist yet, add real tests instead of bypassing
+the validation command.
 """
 
 # ---------------------------------------------------------------------------

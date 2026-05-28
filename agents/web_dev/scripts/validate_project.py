@@ -21,6 +21,8 @@ import time
 
 
 MAX_OUTPUT_CHARS = 20000
+TEST_FILE_PATTERN = re.compile(r"\.(test|spec)\.(c|m)?[jt]sx?$", re.IGNORECASE)
+TEST_SEARCH_EXCLUDES = {".git", ".vite", "build", "coverage", "dist", "node_modules"}
 
 
 def _command_env() -> dict[str, str]:
@@ -76,6 +78,16 @@ def _load_package_json(repo_path: Path) -> dict:
         return json.load(fh)
 
 
+def _count_test_files(repo_path: Path) -> int:
+    count = 0
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [directory for directory in dirs if directory not in TEST_SEARCH_EXCLUDES]
+        for file_name in files:
+            if TEST_FILE_PATTERN.search(file_name):
+                count += 1
+    return count
+
+
 def _has_dependency(package: dict, name: str) -> bool:
     for section in ("dependencies", "devDependencies", "peerDependencies"):
         deps = package.get(section) or {}
@@ -122,6 +134,8 @@ def validate(repo_path: Path) -> dict:
     scripts = package.get("scripts") or {}
     if "build" not in scripts:
         raise RuntimeError("package.json must define a build script")
+    test_script = str(scripts.get("test") or "")
+    test_file_count = _count_test_files(repo_path)
 
     commands: list[dict] = []
     errors: list[str] = []
@@ -145,6 +159,13 @@ def validate(repo_path: Path) -> dict:
         test = _run(_test_command(package), repo_path, timeout=900)
         commands.append(test)
         tests_ok = test["returncode"] == 0
+        test_output = str(test.get("output") or "")
+        if "passWithNoTests" in test_script:
+            tests_ok = False
+            errors.append("package.json test script must not use passWithNoTests")
+        if test_file_count == 0 or "No test files found" in test_output:
+            tests_ok = False
+            errors.append("no test files found")
         if not tests_ok:
             errors.append("test command failed")
 

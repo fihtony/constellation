@@ -88,6 +88,36 @@ def _record_checked_artifact(checked_artifacts: list[str], workspace_path: str, 
         checked_artifacts.append(relative)
 
 
+def _review_input_wait_seconds() -> float:
+    raw = os.environ.get("CODE_REVIEW_INPUT_WAIT_SECONDS", "300")
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 300.0
+
+
+def _review_input_poll_seconds() -> float:
+    raw = os.environ.get("CODE_REVIEW_INPUT_POLL_SECONDS", "2")
+    try:
+        return max(float(raw), 0.1)
+    except ValueError:
+        return 2.0
+
+
+def _review_input_attempts() -> int:
+    wait_seconds = _review_input_wait_seconds()
+    poll_seconds = _review_input_poll_seconds()
+    if wait_seconds <= 0:
+        return 1
+    return max(1, int(wait_seconds / poll_seconds) + 1)
+
+
+def _child_permissions(state: dict) -> dict[str, Any] | None:
+    metadata = state.get("metadata", {})
+    permissions = metadata.get("permissions")
+    return permissions if isinstance(permissions, dict) else None
+
+
 def _find_latest_self_assessment(agent_dir: str) -> str:
     if not os.path.isdir(agent_dir):
         return ""
@@ -172,6 +202,7 @@ async def load_pr_context(state: dict) -> dict:
         or state.get("context_manifest_path")
         or ""
     )
+    permissions = _child_permissions(state)
 
     if workspace_path:
         if context_manifest_path:
@@ -253,11 +284,24 @@ async def load_pr_context(state: dict) -> dict:
         try:
             from framework.tools.registry import get_registry
             registry = get_registry()
-            info_result_str = registry.execute_sync(
-                "scm_get_pr_info",
-                {"repo_url": repo_url, "pr_number": int(pr_number), "task_id": state.get("_task_id", "")},
-            )
+            info_args = {
+                "repo_url": repo_url,
+                "pr_number": int(pr_number),
+                "task_id": state.get("_task_id", ""),
+            }
+            if permissions:
+                info_args["permissions"] = permissions
+            info_result_str = registry.execute_sync("scm_get_pr_info", info_args)
             info_payload = json.loads(info_result_str) if info_result_str else {}
+            if info_payload.get("error") == "Tool 'scm_get_pr_info' is not registered":
+                from agents.code_review.tools import fetch_pr_info
+
+                info_payload = fetch_pr_info(
+                    repo_url,
+                    int(pr_number),
+                    task_id=state.get("_task_id", ""),
+                    permissions=permissions if isinstance(permissions, dict) else None,
+                )
             if not info_payload.get("error"):
                 pr_description = pr_description or info_payload.get("description", "")
                 commit_messages = commit_messages or [
@@ -266,15 +310,56 @@ async def load_pr_context(state: dict) -> dict:
         except Exception as exc:
             log.warn("scm_get_pr_info fallback failed", error=str(exc))
 
-    if not pr_diff and pr_url and repo_url and pr_number:
+    review_attempts = _review_input_attempts()
+    poll_seconds = _review_input_poll_seconds()
+    last_diff_error = ""
+    review_input_wait_logged = False
+    web_dev_dir = os.path.join(workspace_path, _WEB_DEV_AGENT_ID) if workspace_path else ""
+
+    for attempt in range(review_attempts):
+        if web_dev_dir and not os.path.isfile(pr_evidence_path if workspace_path else ""):
+            current_pr_evidence_path = os.path.join(web_dev_dir, "pr-evidence.json")
+            if os.path.isfile(current_pr_evidence_path):
+                try:
+                    pr_evidence = _load_json_file(current_pr_evidence_path) or {}
+                    _record_checked_artifact(checked_artifacts, workspace_path, current_pr_evidence_path)
+                    pr_url = pr_url or str(pr_evidence.get("pr_url", ""))
+                    pr_number = pr_number or pr_evidence.get("pr_number") or 0
+                    changed_files = changed_files or list(pr_evidence.get("changed_files", []) or [])
+                    pr_evidence_path = current_pr_evidence_path
+                except Exception as exc:
+                    log.warn("failed to load PR evidence", error=str(exc), path=current_pr_evidence_path)
+
+        if web_dev_dir:
+            current_self_assessment_path = _find_latest_self_assessment(web_dev_dir)
+            if current_self_assessment_path:
+                _record_checked_artifact(checked_artifacts, workspace_path, current_self_assessment_path)
+
+        pr_number = _parse_pr_number(pr_url, pr_number)
+        if pr_diff or not (pr_url and repo_url and pr_number):
+            break
+
         try:
             from framework.tools.registry import get_registry
             registry = get_registry()
-            diff_result_str = registry.execute_sync(
-                "scm_get_pr_diff",
-                {"repo_url": repo_url, "pr_number": int(pr_number), "task_id": state.get("_task_id", "")},
-            )
+            diff_args = {
+                "repo_url": repo_url,
+                "pr_number": int(pr_number),
+                "task_id": state.get("_task_id", ""),
+            }
+            if permissions:
+                diff_args["permissions"] = permissions
+            diff_result_str = registry.execute_sync("scm_get_pr_diff", diff_args)
             diff_payload = json.loads(diff_result_str) if diff_result_str else {}
+            if diff_payload.get("error") == "Tool 'scm_get_pr_diff' is not registered":
+                from agents.code_review.tools import fetch_pr_diff
+
+                diff_payload = fetch_pr_diff(
+                    repo_url,
+                    int(pr_number),
+                    task_id=state.get("_task_id", ""),
+                    permissions=permissions if isinstance(permissions, dict) else None,
+                )
             if not diff_payload.get("error"):
                 pr_diff = diff_payload.get("diff_text", "")
                 changed_files = changed_files or [
@@ -282,9 +367,35 @@ async def load_pr_context(state: dict) -> dict:
                 ]
                 log.info("fetched PR diff", pr_number=pr_number, diff_chars=len(pr_diff), files=len(changed_files))
                 print(f"[{_AGENT_ID}] Fetched PR diff via scm_get_pr_diff: {len(pr_diff)} chars")
+                break
+            last_diff_error = str(diff_payload.get("error") or diff_payload.get("detail") or "")
         except Exception as exc:
-            log.warn("scm_get_pr_diff fallback failed", error=str(exc))
-            print(f"[{_AGENT_ID}] scm_get_pr_diff fallback failed (non-fatal): {exc}")
+            last_diff_error = str(exc)
+
+        if attempt < review_attempts - 1:
+            if not review_input_wait_logged:
+                log.info(
+                    "waiting for review inputs",
+                    pr_url=pr_url,
+                    pr_number=pr_number,
+                    attempts=review_attempts,
+                    poll_seconds=poll_seconds,
+                )
+                review_input_wait_logged = True
+            time.sleep(poll_seconds)
+
+    if last_diff_error and not pr_diff:
+        log.warn("scm_get_pr_diff unavailable", error=last_diff_error, pr_number=pr_number)
+
+    review_input_issues: list[dict[str, Any]] = []
+    if pr_url and not pr_diff:
+        review_input_issues.append({
+            "severity": "high",
+            "category": "review-input",
+            "message": "Unable to load the PR diff, so code review could not validate the submitted code changes.",
+            "suggestion": "Ensure code-review receives repoUrl/prNumber metadata and can access web-dev/pr-evidence.json before review dispatch.",
+        })
+        log.warn("review input incomplete", pr_url=pr_url, repo_url=repo_url, pr_number=pr_number)
 
     # Extract original requirements from Jira context
     original_requirements = state.get("original_requirements", "")
@@ -361,6 +472,7 @@ async def load_pr_context(state: dict) -> dict:
         "pr_url": pr_url,
         "pr_number": pr_number,
         "checked_artifacts": checked_artifacts,
+        "review_input_issues": review_input_issues,
     }
 
 
@@ -561,10 +673,11 @@ async def generate_report(state: dict) -> dict:
     tests = state.get("test_issues", [])
     requirements = state.get("requirement_gaps", [])
     ui_issues = state.get("ui_issues", [])
+    review_input_issues = state.get("review_input_issues", [])
     log = _logger(state)
     log.node("generate_report")
 
-    all_comments = quality + security + tests + requirements + ui_issues
+    all_comments = review_input_issues + quality + security + tests + requirements + ui_issues
 
     # Count by severity
     critical = sum(1 for c in all_comments if c.get("severity") == "critical")

@@ -437,6 +437,10 @@ class DispatchWebDev(BaseTool):
                 "type": "string",
                 "description": "Local clone path. Optional.",
             },
+            "branch_name": {
+                "type": "string",
+                "description": "Existing development branch to continue using for revisions. Optional.",
+            },
             "workspace_path": {
                 "type": "string",
                 "description": "Shared workspace root. Optional.",
@@ -488,6 +492,7 @@ class DispatchWebDev(BaseTool):
         jira_local_folder: str = "",
         repo_url: str = "",
         repo_path: str = "",
+        branch_name: str = "",
         workspace_path: str = "",
         context_manifest_path: str = "",
         jira_files: list | None = None,
@@ -513,6 +518,8 @@ class DispatchWebDev(BaseTool):
             meta["repoUrl"] = repo_url
         if repo_path:
             meta["repoPath"] = repo_path
+        if branch_name:
+            meta["branchName"] = branch_name
         if workspace_path:
             meta["workspacePath"] = workspace_path
         if context_manifest_path:
@@ -596,7 +603,10 @@ class DispatchWebDev(BaseTool):
             artifacts = task.get("artifacts", [])
             summary = _extract_text(artifacts) or "Dev task completed."
             pr_url = _find_metadata(artifacts, "prUrl")
+            pr_number = _find_metadata(artifacts, "prNumber")
+            result_repo_url = _find_metadata(artifacts, "repoUrl")
             branch = _find_metadata(artifacts, "branch")
+            changed_files = _find_metadata(artifacts, "changedFiles")
             child_task_id = str(task.get("id") or "").strip()
             child_service_url = str((launch_info or {}).get("serviceUrl") or web_dev_url or "").strip()
             child_container_name = str((launch_info or {}).get("containerName") or "").strip()
@@ -612,7 +622,10 @@ class DispatchWebDev(BaseTool):
                 "status": "completed",
                 "summary": summary,
                 "prUrl": pr_url,
+                "prNumber": pr_number,
+                "repoUrl": result_repo_url,
                 "branch": branch,
+                "changedFiles": changed_files,
                 "jiraInReview": jira_in_review,
                 "screenshotIncluded": screenshot_included,
                 "screenshotUploaded": screenshot_uploaded,
@@ -658,6 +671,10 @@ class DispatchCodeReview(BaseTool):
                 "type": "string",
                 "description": "Repository URL that owns the pull request.",
             },
+            "changed_files": {
+                "type": "array",
+                "description": "Changed files reported by the dev agent. Optional.",
+            },
             "diff_summary": {
                 "type": "string",
                 "description": "Summary of the changes made.",
@@ -695,6 +712,7 @@ class DispatchCodeReview(BaseTool):
         pr_url: str = "",
         pr_number: int = 0,
         repo_url: str = "",
+        changed_files: list | None = None,
         diff_summary: str = "",
         requirements: str = "",
         jira_context: dict | None = None,
@@ -714,6 +732,8 @@ class DispatchCodeReview(BaseTool):
             meta["prNumber"] = pr_number
         if repo_url:
             meta["repoUrl"] = repo_url
+        if changed_files:
+            meta["changedFiles"] = changed_files
         if requirements:
             meta["originalRequirements"] = requirements
         if jira_context:

@@ -17,10 +17,12 @@ Discovery:
 from __future__ import annotations
 
 import json
+import io
 import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError
 
 import pytest
 
@@ -174,6 +176,68 @@ class TestGitHubClientUploadIssueImage:
             out, err = capfd.readouterr()
             assert "super-secret-token" not in out
             assert "super-secret-token" not in err
+        finally:
+            os.unlink(path)
+
+    def test_reuses_existing_asset_when_duplicate_is_on_later_page(self):
+        """upload_issue_image must page through release assets when handling already_exists."""
+        from agents.scm.client import GitHubClient
+
+        path, _ = _make_png_file()
+        asset_name = "task-c586b18064d1-practice-quiz-desktop.png"
+        cdn_url = f"https://github.com/o/r/releases/download/screenshot-assets/{asset_name}"
+
+        def fake_request(method, path, payload=None, timeout=None):
+            if method == "GET" and path == "repos/o/r/releases/tags/screenshot-assets":
+                return 200, {"id": 42}
+            if method == "GET" and path == "repos/o/r/releases/42/assets?per_page=100&page=1":
+                return 200, [
+                    {
+                        "name": f"old-{index}.png",
+                        "browser_download_url": f"https://github.com/o/r/releases/download/screenshot-assets/old-{index}.png",
+                    }
+                    for index in range(100)
+                ]
+            if method == "GET" and path == "repos/o/r/releases/42/assets?per_page=100&page=2":
+                return 200, [
+                    {
+                        "name": asset_name,
+                        "browser_download_url": cdn_url,
+                    }
+                ]
+            raise AssertionError(f"Unexpected request: {method} {path}")
+
+        def fake_urlopen(req, timeout=None):
+            error_body = json.dumps(
+                {
+                    "message": "Validation Failed",
+                    "errors": [
+                        {
+                            "resource": "ReleaseAsset",
+                            "code": "already_exists",
+                            "field": "name",
+                        }
+                    ],
+                }
+            ).encode()
+            raise HTTPError(req.full_url, 422, "Validation Failed", hdrs={}, fp=io.BytesIO(error_body))
+
+        try:
+            client = GitHubClient(token="test-token")
+            with patch.object(client, "_request", side_effect=fake_request), \
+                 patch("agents.scm.client.urlopen", side_effect=fake_urlopen):
+                result, status = client.upload_issue_image(
+                    "o",
+                    "r",
+                    90,
+                    path,
+                    filename="practice-quiz-desktop.png",
+                    task_id="task-c586b18064d1",
+                )
+
+            assert status == "ok"
+            assert result.get("href") == cdn_url
+            assert result.get("reused") is True
         finally:
             os.unlink(path)
 

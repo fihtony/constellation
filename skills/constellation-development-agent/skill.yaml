@@ -1,0 +1,14 @@
+id: constellation-development-agent
+name: "Constellation Development Agent Authoring"
+description: "Author or review a new Constellation development agent such as Android, iOS, or database execution agents, including workflow rules, permission profiles, tool sets, packaging, and validation requirements"
+version: "1.0.0"
+tags: ["constellation", "agent", "android", "ios", "database", "permissions", "workflow"]
+priority: 20
+allowed_tools:
+  - read_file
+  - write_file
+  - edit_file
+  - run_command
+  - search_code
+  - glob
+  - grep

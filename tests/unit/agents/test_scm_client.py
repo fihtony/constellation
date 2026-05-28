@@ -12,6 +12,7 @@ import pytest
 from agents.scm.adapter import SCMAgentAdapter
 from agents.scm.client import BitbucketClient, GitHubClient, GITHUB_API_BASE, _parse_bb_project_repo
 from agents.scm.providers.github_mcp import GitHubMCPProvider
+from framework.config import load_agent_config
 
 
 @pytest.fixture(autouse=True)
@@ -137,6 +138,13 @@ class TestScmAdapterCloneBehavior:
 
 
 class TestScmAdapterPrEvidenceCapabilities:
+    def test_scm_config_advertises_pr_evidence_capabilities(self):
+        cfg = load_agent_config("scm")
+        capabilities = cfg.to_dict().get("capabilities", [])
+
+        assert "scm.pr.info" in capabilities
+        assert "scm.pr.diff" in capabilities
+
     def test_dispatch_get_pr_diff_calls_client(self):
         calls = {}
 
@@ -374,6 +382,70 @@ class TestGitHubClientPullRequestCollision:
 
 
 class TestGitHubMCPProviderPrEvidenceCompatibility:
+    def test_get_pr_diff_delegates_to_rest_client(self, monkeypatch):
+        calls = {}
+
+        class FakeGitHubClient:
+            def __init__(self, token=""):
+                calls["token"] = token
+
+            def get_pr_diff(self, owner, repo, pr_id, timeout=30):
+                calls.update({
+                    "owner": owner,
+                    "repo": repo,
+                    "pr_id": pr_id,
+                    "timeout": timeout,
+                })
+                return {"diff_text": "diff --git a b", "changed_files": []}, "ok"
+
+        monkeypatch.setattr("agents.scm.client.GitHubClient", FakeGitHubClient)
+
+        data, status = GitHubMCPProvider(token="token-123").get_pr_diff(
+            "org", "repo", 42, timeout=45
+        )
+
+        assert status == "ok"
+        assert data["diff_text"].startswith("diff --git")
+        assert calls == {
+            "token": "token-123",
+            "owner": "org",
+            "repo": "repo",
+            "pr_id": 42,
+            "timeout": 45,
+        }
+
+    def test_get_pr_info_delegates_to_rest_client(self, monkeypatch):
+        calls = {}
+
+        class FakeGitHubClient:
+            def __init__(self, token=""):
+                calls["token"] = token
+
+            def get_pr_info(self, owner, repo, pr_id, timeout=20):
+                calls.update({
+                    "owner": owner,
+                    "repo": repo,
+                    "pr_id": pr_id,
+                    "timeout": timeout,
+                })
+                return {"title": "PR title", "description": "PR body"}, "ok"
+
+        monkeypatch.setattr("agents.scm.client.GitHubClient", FakeGitHubClient)
+
+        data, status = GitHubMCPProvider(token="token-123").get_pr_info(
+            "org", "repo", 42, timeout=35
+        )
+
+        assert status == "ok"
+        assert data == {"title": "PR title", "description": "PR body"}
+        assert calls == {
+            "token": "token-123",
+            "owner": "org",
+            "repo": "repo",
+            "pr_id": 42,
+            "timeout": 35,
+        }
+
     def test_update_pr_delegates_to_rest_client(self, monkeypatch):
         calls = {}
 

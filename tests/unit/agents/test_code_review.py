@@ -6,6 +6,7 @@ from framework.agent import AgentServices
 from framework.task_store import InMemoryTaskStore
 from framework.workflow import START, END
 from agents.code_review.agent import CodeReviewAgent, code_review_workflow, code_review_definition
+from agents.code_review.tools import SCMGetPRDiff
 from agents.code_review.nodes import (
     load_pr_context,
     review_quality,
@@ -78,6 +79,90 @@ class TestCodeReviewExecutionContract:
 
         assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
         assert "Missing executionContract" in result["task"]["status"]["message"]["parts"][0]["text"]
+
+
+class TestCodeReviewStartup:
+
+    async def test_start_registers_boundary_tools_and_dispatch(self, monkeypatch):
+        calls = []
+
+        async def fake_base_start(self):
+            calls.append("base")
+
+        monkeypatch.setattr("framework.agent.BaseAgent.start", fake_base_start)
+        monkeypatch.setattr(
+            "agents.code_review.tools.register_code_review_tools",
+            lambda: calls.append("tools"),
+        )
+        monkeypatch.setattr(
+            "agents.code_review.agent._register_code_review_dispatch",
+            lambda agent: calls.append(("dispatch", agent.definition.agent_id)),
+        )
+
+        agent = CodeReviewAgent(definition=code_review_definition, services=_agent_services())
+
+        await agent.start()
+
+        assert calls == ["base", "tools", ("dispatch", "code-review")]
+
+
+class TestCodeReviewScmTools:
+
+    def test_scm_get_pr_diff_dispatches_via_scm_agent(self, monkeypatch):
+        captured = {}
+
+        monkeypatch.setattr("agents.code_review.tools._resolve_agent_url", lambda capability: "http://scm:8020")
+
+        def fake_dispatch_sync(url, capability, message_parts, metadata):
+            captured.update({
+                "url": url,
+                "capability": capability,
+                "message_parts": message_parts,
+                "metadata": metadata,
+            })
+            return {
+                "task": {
+                    "artifacts": [
+                        {
+                            "parts": [
+                                {
+                                    "text": json.dumps({
+                                        "diff_text": "diff --git a/app.py b/app.py",
+                                        "changed_files": [{"filename": "app.py"}],
+                                    })
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", fake_dispatch_sync)
+
+        result = SCMGetPRDiff().execute_sync(
+            repo_url="https://github.com/org/repo",
+            pr_number=86,
+            task_id="task-123",
+            permissions={"scm": "read"},
+        )
+
+        assert json.loads(result.output) == {
+            "diff_text": "diff --git a/app.py b/app.py",
+            "changed_files": [{"filename": "app.py"}],
+        }
+        assert captured == {
+            "url": "http://scm:8020",
+            "capability": "scm.pr.diff",
+            "message_parts": [{"text": "org/repo"}],
+            "metadata": {
+                "project": "org",
+                "repo": "repo",
+                "repoUrl": "https://github.com/org/repo",
+                "prNumber": 86,
+                "taskId": "task-123",
+                "permissions": {"scm": "read"},
+            },
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +292,193 @@ class TestLoadPrContext:
         assert "ui-design/stitch/DESIGN.md" in result["checked_artifacts"]
         assert "web-dev/pr-evidence.json" in result["checked_artifacts"]
         assert "web-dev/self-assessment-2.json" in result["checked_artifacts"]
+        assert all(not path.startswith("code-review/") for path in result["checked_artifacts"])
         assert (workspace_path / "code-review" / "review-checkpoints" / "review-start.json").exists()
+
+    async def test_forwards_parent_supplied_child_permissions_to_scm_fallbacks(self, monkeypatch):
+        captured: list[dict] = []
+
+        class StubRegistry:
+            def execute_sync(self, name, arguments):
+                captured.append({"name": name, "arguments": arguments})
+                if name == "scm_get_pr_info":
+                    return json.dumps({"description": "Review this PR", "commits": []})
+                if name == "scm_get_pr_diff":
+                    return json.dumps({
+                        "diff_text": "diff --git a/src/App.tsx b/src/App.tsx",
+                        "changed_files": [{"filename": "src/App.tsx"}],
+                    })
+                raise AssertionError(f"unexpected tool {name}")
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        permissions = {
+            "allowedTools": ["scm_get_pr_info", "scm_get_pr_diff"],
+            "deniedTools": [],
+            "scm": "read",
+            "filesystem": "workspace-only",
+            "custom": {},
+        }
+        result = await load_pr_context(
+            {
+                "_task_id": "task-123",
+                "metadata": {
+                    "prUrl": "https://github.com/org/repo/pull/12",
+                    "repoUrl": "https://github.com/org/repo",
+                    "prNumber": 12,
+                    "permissions": permissions,
+                },
+            }
+        )
+
+        assert result["pr_diff"].startswith("diff --git")
+        assert [entry["name"] for entry in captured] == ["scm_get_pr_info", "scm_get_pr_diff"]
+        assert captured[0]["arguments"]["permissions"] == permissions
+        assert captured[1]["arguments"]["permissions"] == permissions
+
+
+    async def test_falls_back_to_direct_scm_dispatch_when_registry_tool_missing(self, monkeypatch):
+        class StubRegistry:
+            def execute_sync(self, name, arguments):
+                return json.dumps({"error": f"Tool '{name}' is not registered"})
+
+        info_calls: list[dict] = []
+        diff_calls: list[dict] = []
+
+        def _fake_fetch_pr_info(repo_url, pr_number, *, task_id="", permissions=None, **_kwargs):
+            info_calls.append({
+                "repo_url": repo_url,
+                "pr_number": pr_number,
+                "task_id": task_id,
+                "permissions": permissions,
+            })
+            return {"description": "Review this PR", "commits": [{"message": "feat: ship it"}]}
+
+        def _fake_fetch_pr_diff(repo_url, pr_number, *, task_id="", permissions=None, **_kwargs):
+            diff_calls.append({
+                "repo_url": repo_url,
+                "pr_number": pr_number,
+                "task_id": task_id,
+                "permissions": permissions,
+            })
+            return {
+                "diff_text": "diff --git a/src/App.tsx b/src/App.tsx",
+                "changed_files": [{"filename": "src/App.tsx"}],
+            }
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+        monkeypatch.setattr("agents.code_review.tools.fetch_pr_info", _fake_fetch_pr_info)
+        monkeypatch.setattr("agents.code_review.tools.fetch_pr_diff", _fake_fetch_pr_diff)
+
+        permissions = {
+            "allowedTools": ["scm_get_pr_info", "scm_get_pr_diff"],
+            "deniedTools": [],
+            "scm": "read",
+            "filesystem": "workspace-only",
+            "custom": {},
+        }
+
+        result = await load_pr_context(
+            {
+                "_task_id": "task-123",
+                "metadata": {
+                    "prUrl": "https://github.com/org/repo/pull/42",
+                    "repoUrl": "https://github.com/org/repo",
+                    "prNumber": 42,
+                    "permissions": permissions,
+                },
+            }
+        )
+
+        assert result["pr_description"] == "Review this PR"
+        assert result["commit_messages"] == ["feat: ship it"]
+        assert result["pr_diff"] == "diff --git a/src/App.tsx b/src/App.tsx"
+        assert result["changed_files"] == ["src/App.tsx"]
+        assert info_calls == [{
+            "repo_url": "https://github.com/org/repo",
+            "pr_number": 42,
+            "task_id": "task-123",
+            "permissions": permissions,
+        }]
+        assert diff_calls == [{
+            "repo_url": "https://github.com/org/repo",
+            "pr_number": 42,
+            "task_id": "task-123",
+            "permissions": permissions,
+        }]
+    async def test_marks_missing_pr_diff_as_review_input_issue(self, monkeypatch):
+        monkeypatch.setenv("CODE_REVIEW_INPUT_WAIT_SECONDS", "0")
+
+        class StubRegistry:
+            def execute_sync(self, name, arguments):
+                if name == "scm_get_pr_info":
+                    return json.dumps({"description": "Review this PR", "commits": []})
+                if name == "scm_get_pr_diff":
+                    return json.dumps({"error": "diff unavailable"})
+                raise AssertionError(f"unexpected tool {name}")
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await load_pr_context(
+            {
+                "_task_id": "task-123",
+                "metadata": {
+                    "prUrl": "https://github.com/org/repo/pull/12",
+                    "repoUrl": "https://github.com/org/repo",
+                    "prNumber": 12,
+                },
+            }
+        )
+
+        assert result["pr_diff"] == ""
+        assert result["review_input_issues"]
+        assert result["review_input_issues"][0]["severity"] == "high"
+
+    async def test_retries_diff_fetch_until_available(self, monkeypatch):
+        monkeypatch.setenv("CODE_REVIEW_INPUT_WAIT_SECONDS", "2")
+        monkeypatch.setenv("CODE_REVIEW_INPUT_POLL_SECONDS", "1")
+        monkeypatch.setattr("agents.code_review.nodes.time.sleep", lambda _: None)
+
+        calls: list[str] = []
+
+        class StubRegistry:
+            def execute_sync(self, name, arguments):
+                calls.append(name)
+                if name == "scm_get_pr_info":
+                    return json.dumps({"description": "Review this PR", "commits": []})
+                if name == "scm_get_pr_diff":
+                    if calls.count("scm_get_pr_diff") == 1:
+                        return json.dumps({"error": "diff unavailable"})
+                    return json.dumps({
+                        "diff_text": "diff --git a/src/App.tsx b/src/App.tsx",
+                        "changed_files": [{"filename": "src/App.tsx"}],
+                    })
+                raise AssertionError(f"unexpected tool {name}")
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await load_pr_context(
+            {
+                "_task_id": "task-123",
+                "metadata": {
+                    "prUrl": "https://github.com/org/repo/pull/12",
+                    "repoUrl": "https://github.com/org/repo",
+                    "prNumber": 12,
+                },
+            }
+        )
+
+        assert result["pr_diff"].startswith("diff --git")
+        assert result["changed_files"] == ["src/App.tsx"]
+        assert not result["review_input_issues"]
+        assert calls.count("scm_get_pr_diff") == 2
+
+    async def test_load_pr_context_writes_agent_log(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path))
+
+        await load_pr_context({"_task_id": "task-123"})
+
+        assert (tmp_path / "task-123" / "code-review" / "agent.log").exists()
 
 
 class TestReviewQuality:
@@ -402,6 +673,26 @@ class TestGenerateReport:
         assert "jira/PROJ-123/ticket.json" in result["checked_artifacts"]
         assert "ui-design/stitch/DESIGN.md" in result["checked_artifacts"]
 
+    async def test_missing_pr_diff_rejects_report(self):
+        state = {
+            "review_input_issues": [
+                {
+                    "severity": "high",
+                    "message": "Unable to load the PR diff.",
+                    "suggestion": "Retry with explicit repo metadata.",
+                }
+            ],
+            "quality_issues": [],
+            "security_issues": [],
+            "test_issues": [],
+            "requirement_gaps": [],
+        }
+
+        result = await generate_report(state)
+
+        assert result["verdict"] == "rejected"
+        assert result["severity_levels"]["high"] == 1
+
 
 class TestCodeReviewWorkflowExecution:
 
@@ -410,6 +701,8 @@ class TestCodeReviewWorkflowExecution:
         state = {
             "pr_url": "https://github.com/test/pr/1",
             "repo_url": "https://github.com/test",
+            "pr_diff": "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py",
+            "changed_files": ["src/app.py"],
         }
         result = await compiled.invoke(state)
         assert result["verdict"] == "approved"

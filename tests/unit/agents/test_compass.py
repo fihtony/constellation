@@ -491,6 +491,8 @@ class TestCompassTools:
         assert dispatched["url"] == "http://office-task-1:8060"
         assert dispatched["capability"] == "office.document.summarize"
         assert dispatched["metadata"]["source_paths"] == ["/app/userdata/input-0/report.txt"]
+        assert "read_pdf" in dispatched["metadata"]["permissions"]["allowedTools"]
+        assert "dispatch_office_task" not in dispatched["metadata"]["permissions"]["allowedTools"]
         assert destroyed == {"agent_id": "office", "container_name": "office-task-1"}
 
     def test_dispatch_office_task_uses_writable_mounts_for_inplace_mode(self, monkeypatch, tmp_path):
@@ -543,6 +545,45 @@ class TestCompassTools:
         assert launched["overrides"]["env"]["OFFICE_ALLOW_INPLACE_WRITES"] == "true"
         assert launched["overrides"]["extra_binds"] == [f"/host{source_dir}:/app/userdata/input-0/folder"]
         assert launched["overrides"]["env"]["OFFICE_ALLOWED_BASE_PATHS"] == "/app/userdata/input-0/folder"
+
+    def test_dispatch_office_task_direct_dispatch_attaches_child_permissions(self, monkeypatch, tmp_path):
+        from agents.compass.tools import DispatchOfficeTask
+
+        source_file = tmp_path / "report.txt"
+        source_file.write_text("hello", encoding="utf-8")
+        dispatched = {}
+
+        def _dispatch_sync(url, capability, message_parts, metadata, **kwargs):
+            dispatched["url"] = url
+            dispatched["capability"] = capability
+            dispatched["metadata"] = metadata
+            return {
+                "task": {
+                    "id": "office-direct-1",
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"parts": [{"text": "Done."}], "metadata": {}}],
+                }
+            }
+
+        monkeypatch.setattr("agents.compass.tools._should_use_per_task_office_launch", lambda: False)
+        monkeypatch.setattr("agents.compass.tools._resolve_office_url", lambda: "http://office:8060")
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        result = DispatchOfficeTask().execute_sync(
+            task_description="Summarize the authorized file.",
+            source_paths=[str(source_file)],
+            output_mode="workspace",
+            capability="summarize",
+            orchestrator_task_id="compass-direct-123",
+        )
+
+        payload = json.loads(result.output)
+        assert payload["status"] == "completed"
+        assert dispatched["url"] == "http://office:8060"
+        assert dispatched["metadata"]["compassTaskId"] == "compass-direct-123"
+        assert "permissions" in dispatched["metadata"]
+        assert "read_pdf" in dispatched["metadata"]["permissions"]["allowedTools"]
+        assert "dispatch_office_task" not in dispatched["metadata"]["permissions"]["allowedTools"]
 
     def test_dispatch_office_task_translates_host_paths_visible_only_via_workspace_mount(self, monkeypatch, tmp_path):
         from agents.compass.tools import DispatchOfficeTask
