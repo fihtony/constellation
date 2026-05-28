@@ -378,6 +378,63 @@ class TestDispatchDevAgentValidation:
                 }
             )
 
+    async def test_dispatch_dev_agent_passes_child_permissions_not_parent_snapshot(self, monkeypatch):
+        from agents.team_lead.nodes import dispatch_dev_agent
+
+        captured = {}
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "web-dev"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                captured["name"] = name
+                captured["args"] = args
+                return json.dumps({
+                    "status": "completed",
+                    "summary": "done",
+                    "prUrl": "https://github.com/org/repo/pull/1",
+                    "branch": "feature/ui",
+                    "jiraInReview": True,
+                    "screenshotIncluded": True,
+                })
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        await dispatch_dev_agent(
+            {
+                "_task_id": "task-123",
+                "user_request": "Implement UI",
+                "analysis_summary": "Implement a UI page",
+                "jira_key": "PROJ-123",
+                "workspace_path": "/tmp/workspace",
+                "design_context": {"screen": {"id": "screen-1"}},
+                "metadata": {
+                    "permissions": {
+                        "allowedTools": ["dispatch_web_dev"],
+                        "deniedTools": [],
+                        "scm": "read",
+                        "filesystem": "workspace-only",
+                        "custom": {},
+                    }
+                },
+                "plan": {
+                    "definition_of_done": {
+                        "pr_required": True,
+                        "jira_state_management": True,
+                        "screenshot_required": True,
+                    }
+                },
+            }
+        )
+
+        assert captured["name"] == "dispatch_web_dev"
+        assert "scm_push" in captured["args"]["permissions"]["allowedTools"]
+        assert "dispatch_web_dev" not in captured["args"]["permissions"]["allowedTools"]
+
     async def test_dispatch_dev_agent_propagates_screenshot_evidence(self, monkeypatch):
         from agents.team_lead.nodes import dispatch_dev_agent
 
@@ -507,6 +564,46 @@ class TestDispatchDevAgentValidation:
         assert captured["repo_url"] == "https://github.com/org/repo"
         assert captured["pr_number"] == 1
         assert result["route"] == "approved"
+
+    async def test_review_result_passes_child_permissions_not_parent_snapshot(self, monkeypatch):
+        from agents.team_lead.nodes import review_result
+
+        captured: dict[str, object] = {}
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                captured.update({"name": name, "args": args})
+                return json.dumps({"verdict": "approved", "summary": "ok"})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await review_result(
+            {
+                "_task_id": "task-123",
+                "pr_url": "https://github.com/org/repo/pull/1",
+                "pr_number": 1,
+                "repo_url": "https://github.com/org/repo",
+                "dev_result": {"summary": "done", "prNumber": 1},
+                "analysis_summary": "Implement CSTL-1",
+                "workspace_path": "/tmp/workspace",
+                "metadata": {
+                    "permissions": {
+                        "allowedTools": ["dispatch_code_review"],
+                        "deniedTools": [],
+                        "scm": "read",
+                        "filesystem": "workspace-only",
+                        "custom": {},
+                    }
+                },
+                "revision_count": 0,
+                "max_revisions": 3,
+            }
+        )
+
+        assert result["route"] == "approved"
+        assert captured["name"] == "dispatch_code_review"
+        assert "scm_get_pr_diff" in captured["args"]["permissions"]["allowedTools"]
+        assert "dispatch_code_review" not in captured["args"]["permissions"]["allowedTools"]
 
     async def test_validate_readiness_routes_to_missing_info_for_retryable_context(self, tmp_path):
         from agents.team_lead.nodes import validate_readiness

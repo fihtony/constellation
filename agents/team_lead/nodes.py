@@ -800,7 +800,12 @@ async def dispatch_dev_agent(state: dict) -> dict:
     ensuring the child agent receives its allowed_tools and workflow config.
     """
     from framework.tools.registry import get_registry
-    from framework.execution_contract import build_execution_contract, load_child_profiles
+    from framework.execution_contract import (
+        build_execution_contract,
+        load_child_profiles,
+        permission_snapshot_from_permission_set,
+        resolve_execution_contract_permission_set,
+    )
 
     registry = get_registry()
 
@@ -829,6 +834,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
 
     # Build execution contract for the child dev agent
     execution_contract = None
+    child_permissions = None
     try:
         root = _Path(__file__).resolve().parents[2]
         child_profiles = load_child_profiles({
@@ -847,6 +853,11 @@ async def dispatch_dev_agent(state: dict) -> dict:
         )
         if not execution_contract.allowed_tools:
             raise ValueError("web-dev permission profile has no allowed_tools")
+        _resolved_contract, child_permission_set = resolve_execution_contract_permission_set(
+            "web-dev",
+            execution_contract.to_dict(),
+        )
+        child_permissions = permission_snapshot_from_permission_set(child_permission_set)
         log.info("execution contract built", profile="web-dev",
                  tools_count=len(execution_contract.allowed_tools))
     except Exception as exc:
@@ -876,6 +887,8 @@ async def dispatch_dev_agent(state: dict) -> dict:
         }
         if execution_contract:
             dispatch_args["execution_contract"] = execution_contract.to_dict()
+        if child_permissions:
+            dispatch_args["permissions"] = child_permissions
         result_str = registry.execute_sync(
             "dispatch_web_dev",
             dispatch_args,
@@ -959,7 +972,12 @@ async def review_result(state: dict) -> dict:
     dev_result = state.get("dev_result", {})
 
     try:
-        from framework.execution_contract import build_execution_contract, load_child_profiles
+        from framework.execution_contract import (
+            build_execution_contract,
+            load_child_profiles,
+            permission_snapshot_from_permission_set,
+            resolve_execution_contract_permission_set,
+        )
 
         root = _Path(__file__).resolve().parents[2]
         child_profiles = load_child_profiles({
@@ -974,6 +992,11 @@ async def review_result(state: dict) -> dict:
         )
         if not review_contract.allowed_tools:
             raise ValueError("code-review permission profile has no allowed_tools")
+        _resolved_contract, review_permission_set = resolve_execution_contract_permission_set(
+            "code-review",
+            review_contract.to_dict(),
+        )
+        review_permissions = permission_snapshot_from_permission_set(review_permission_set)
         review_contract = review_contract.to_dict()
     except Exception as exc:
         raise RuntimeError(f"Cannot dispatch Code Review without a valid execution contract: {exc}") from exc
@@ -994,6 +1017,7 @@ async def review_result(state: dict) -> dict:
                 "orchestrator_task_id": state.get("_task_id", ""),
                 "task_id": state.get("_task_id", ""),
                 "execution_contract": review_contract,
+                "permissions": review_permissions,
             },
         )
         payload = json.loads(result_str) if result_str else {}

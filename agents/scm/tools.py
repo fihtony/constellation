@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 from pathlib import Path as _Path
 
+from framework.boundary_permissions import current_permission_snapshot
 from framework.config import load_agent_config as _load_agent_cfg
 from framework.devlog import AgentLogger
 from framework.tools.base import BaseTool, ToolResult
@@ -61,6 +62,15 @@ def _parse_repo_coordinates(repo_url: str) -> tuple[str, str]:
     return "", ""
 
 
+def _metadata_with_permissions(metadata: dict) -> dict:
+    enriched = dict(metadata)
+    if not isinstance(enriched.get("permissions"), dict):
+        snapshot = current_permission_snapshot()
+        if isinstance(snapshot, dict):
+            enriched["permissions"] = snapshot
+    return enriched
+
+
 class CloneRepo(BaseTool):
     name = "clone_repo"
     description = "Clone a Git repository to a local workspace path."
@@ -80,7 +90,7 @@ class CloneRepo(BaseTool):
         adapter = _get_adapter()
         result = adapter._dispatch(
             "scm.repo.clone", "",
-            {"metadata": {"repoUrl": repo_url, "targetPath": target_path}},
+            {"metadata": _metadata_with_permissions({"repoUrl": repo_url, "targetPath": target_path})},
         )
         if result.get("error"):
             log.error("clone_repo failed", error=result["error"], repo_url=repo_url)
@@ -110,7 +120,7 @@ class SCMListBranches(BaseTool):
         project, repo = _parse_repo_coordinates(repo_url)
         result = adapter._dispatch(
             "scm.branch.list", f"{project}/{repo}",
-            {"metadata": {"project": project, "repo": repo}},
+            {"metadata": _metadata_with_permissions({"project": project, "repo": repo})},
         )
         log.debug("scm_list_branches result", count=len(result.get("branches", [])))
         return ToolResult(output=json.dumps(result))
@@ -136,7 +146,7 @@ class SCMListPRs(BaseTool):
         project, repo = _parse_repo_coordinates(repo_url)
         result = adapter._dispatch(
             "scm.pr.list", f"{project}/{repo}",
-            {"metadata": {"project": project, "repo": repo, "state": state}},
+            {"metadata": _metadata_with_permissions({"project": project, "repo": repo, "state": state})},
         )
         log.debug("scm_list_prs result", count=len(result.get("prs", [])))
         return ToolResult(output=json.dumps(result))
@@ -161,7 +171,7 @@ class SCMPush(BaseTool):
         adapter = _get_adapter()
         result = adapter._dispatch(
             "scm.branch.push", "",
-            {"metadata": {"repoPath": repo_path, "branch": branch}},
+            {"metadata": _metadata_with_permissions({"repoPath": repo_path, "branch": branch})},
         )
         if result.get("error"):
             log.error("scm_push failed", error=result["error"])
@@ -204,14 +214,14 @@ class SCMCreatePR(BaseTool):
         result = adapter._dispatch(
             "scm.pr.create", title,
             {
-                "metadata": {
+                "metadata": _metadata_with_permissions({
                     "project": project,
                     "repo": repo,
                     "sourceBranch": source_branch,
                     "targetBranch": target_branch,
                     "title": title,
                     "description": description,
-                }
+                })
             },
         )
         pr_url = result.get("prUrl", result.get("url", ""))

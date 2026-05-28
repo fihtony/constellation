@@ -8,7 +8,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git nodejs npm \
     && npm install -g @anthropic-ai/claude-code \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir pyyaml>=6.0 \
+    && pip install --no-cache-dir "pyyaml>=6.0" \
     && apt-get clean
 
 COPY framework/ /app/framework/

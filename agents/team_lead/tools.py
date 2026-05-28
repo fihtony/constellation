@@ -546,6 +546,9 @@ class DispatchWebDev(BaseTool):
         execution_contract = _.get("execution_contract") if isinstance(_, dict) else None
         if execution_contract:
             meta["executionContract"] = execution_contract
+        permissions = _.get("permissions") if isinstance(_, dict) else None
+        if isinstance(permissions, dict):
+            meta["permissions"] = permissions
 
         try:
             from framework.a2a.client import dispatch_sync
@@ -728,6 +731,9 @@ class DispatchCodeReview(BaseTool):
         execution_contract = _.get("execution_contract") if isinstance(_, dict) else None
         if execution_contract:
             meta["executionContract"] = execution_contract
+        permissions = _.get("permissions") if isinstance(_, dict) else None
+        if isinstance(permissions, dict):
+            meta["permissions"] = permissions
 
         try:
             from framework.a2a.client import dispatch_sync

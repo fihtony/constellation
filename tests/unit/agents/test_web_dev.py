@@ -18,6 +18,7 @@ from agents.web_dev.nodes import (
     capture_screenshot,
     create_pr,
     report_result,
+    _call_boundary_tool,
     _safe_json,
     _detect_fragile_icon_font_usage,
     _rendered_page_has_content,
@@ -654,6 +655,60 @@ class TestWebDevWorkflowExecution:
 
 
 class TestWebDevBoundaryTools:
+
+    def test_call_boundary_tool_forwards_parent_supplied_child_permissions(self, monkeypatch):
+        captured = {}
+
+        class FakeRegistry:
+            def execute_sync(self, name, arguments):
+                captured["name"] = name
+                captured["arguments"] = arguments
+                return "{}"
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: FakeRegistry())
+
+        result = _call_boundary_tool(
+            {
+                "metadata": {
+                    "permissions": {
+                        "allowedTools": ["scm_push", "scm_create_pr"],
+                        "deniedTools": [],
+                        "scm": "read-write",
+                        "filesystem": "workspace-only",
+                        "custom": {},
+                    }
+                }
+            },
+            "scm_push",
+            {"repo_path": "/tmp/repo", "branch": "feature/test"},
+        )
+
+        assert result == {}
+        assert captured["name"] == "scm_push"
+        assert captured["arguments"]["branch"] == "feature/test"
+        assert captured["arguments"]["permissions"]["scm"] == "read-write"
+
+    def test_call_boundary_tool_does_not_invent_permissions_when_parent_did_not_pass_any(self, monkeypatch):
+        captured = {}
+
+        class FakeRegistry:
+            def execute_sync(self, name, arguments):
+                captured["name"] = name
+                captured["arguments"] = arguments
+                return "{}"
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: FakeRegistry())
+
+        result = _call_boundary_tool(
+            {"metadata": {}},
+            "scm_push",
+            {"repo_path": "/tmp/repo", "branch": "feature/test"},
+        )
+
+        assert result == {}
+        assert captured["name"] == "scm_push"
+        assert captured["arguments"]["branch"] == "feature/test"
+        assert "permissions" not in captured["arguments"]
 
     def test_jira_tools_accept_task_metadata(self, monkeypatch):
         from agents.web_dev.tools import JiraComment, JiraGetTokenUser, JiraListTransitions
