@@ -13,6 +13,11 @@ from agents.scm.client import BitbucketClient, GitHubClient, GITHUB_API_BASE, _p
 from agents.scm.providers.github_mcp import GitHubMCPProvider
 
 
+@pytest.fixture(autouse=True)
+def _default_permission_enforcement_off(monkeypatch):
+    monkeypatch.setenv("PERMISSION_ENFORCEMENT", "off")
+
+
 class TestParseProjectRepo:
     """Verify _parse_bb_project_repo handles all Bitbucket URL formats."""
 
@@ -131,6 +136,90 @@ class TestScmAdapterCloneBehavior:
 
 
 class TestScmAdapterPrEvidenceCapabilities:
+    def test_dispatch_get_pr_diff_calls_client(self):
+        calls = {}
+
+        class FakeClient:
+            def get_pr_diff(self, owner, repo, pr_id):
+                calls.update({
+                    "owner": owner,
+                    "repo": repo,
+                    "pr_id": pr_id,
+                })
+                return {
+                    "diff_text": "diff --git a/app.py b/app.py",
+                    "changed_files": [{"filename": "app.py"}],
+                }, "ok"
+
+        adapter = object.__new__(SCMAgentAdapter)
+        adapter._get_client = lambda: FakeClient()  # type: ignore[attr-defined]
+
+        result = adapter._dispatch(
+            "scm.pr.diff",
+            "",
+            {"metadata": {
+                "project": "org",
+                "repo": "repo",
+                "prNumber": 42,
+            }},
+        )
+
+        assert result == {
+            "diff_text": "diff --git a/app.py b/app.py",
+            "changed_files": [{"filename": "app.py"}],
+            "status": "ok",
+        }
+        assert calls == {
+            "owner": "org",
+            "repo": "repo",
+            "pr_id": 42,
+        }
+
+    def test_dispatch_get_pr_info_calls_client(self):
+        calls = {}
+
+        class FakeClient:
+            def get_pr_info(self, owner, repo, pr_id):
+                calls.update({
+                    "owner": owner,
+                    "repo": repo,
+                    "pr_id": pr_id,
+                })
+                return {
+                    "title": "Improve workflow",
+                    "description": "Structured PR body",
+                    "state": "open",
+                    "author": {"login": "octocat"},
+                    "commits": [{"sha": "abc123"}],
+                }, "ok"
+
+        adapter = object.__new__(SCMAgentAdapter)
+        adapter._get_client = lambda: FakeClient()  # type: ignore[attr-defined]
+
+        result = adapter._dispatch(
+            "scm.pr.info",
+            "",
+            {"metadata": {
+                "project": "org",
+                "repo": "repo",
+                "prNumber": 42,
+            }},
+        )
+
+        assert result == {
+            "title": "Improve workflow",
+            "description": "Structured PR body",
+            "state": "open",
+            "author": {"login": "octocat"},
+            "commits": [{"sha": "abc123"}],
+            "status": "ok",
+        }
+        assert calls == {
+            "owner": "org",
+            "repo": "repo",
+            "pr_id": 42,
+        }
+
     def test_dispatch_create_pr_flattens_pr_number(self):
         class FakeClient:
             def create_pr(self, owner, repo, from_branch, to_branch, title, description):

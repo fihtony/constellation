@@ -17,6 +17,7 @@ import subprocess
 import time
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
+from framework.boundary_permissions import branch_scope, enforce_boundary_permission
 from framework.env_utils import build_isolated_git_env
 
 scm_definition = AgentDefinition(
@@ -36,6 +37,75 @@ def _is_retryable_clone_dir_error(stderr_text: str) -> bool:
         "could not create leading directories" in text
         or "operation not permitted" in text
         or "permission denied" in text
+    )
+
+
+_SCM_CAPABILITY_RULES: dict[str, dict[str, object]] = {
+    "scm.repo.inspect": {"tools": ["clone_repo"], "action": "repo.inspect"},
+    "scm.repo.get": {"tools": ["clone_repo"], "action": "repo.inspect"},
+    "scm.branch.list": {"tools": ["scm_list_branches"], "action": "branch.list"},
+    "scm.branch.create": {
+        "tools": ["scm_branch", "scm_push"],
+        "action": "branch.create",
+        "requires_scm_write": True,
+        "scope_from": "branch",
+    },
+    "scm.pr.list": {"tools": ["scm_get_pr_info"], "action": "pr.list"},
+    "scm.pr.create": {
+        "tools": ["scm_create_pr"],
+        "action": "pr.create",
+        "requires_scm_write": True,
+    },
+    "scm.pr.get": {"tools": ["scm_get_pr_info"], "action": "pr.get"},
+    "scm.pr.info": {"tools": ["scm_get_pr_info"], "action": "pr.get"},
+    "scm.pr.diff": {"tools": ["scm_get_pr_diff"], "action": "pr.get"},
+    "scm.pr.comment": {
+        "tools": ["scm_add_pr_comment"],
+        "action": "pr.comment",
+        "requires_scm_write": True,
+        "scope": "self",
+    },
+    "scm.pr.image.upload": {
+        "tools": ["scm_upload_pr_image"],
+        "action": "pr.update",
+        "requires_scm_write": True,
+        "scope": "self",
+    },
+    "scm.pr.update": {
+        "tools": ["scm_update_pr"],
+        "action": "pr.update",
+        "requires_scm_write": True,
+        "scope": "self",
+    },
+    "scm.repo.clone": {"tools": ["clone_repo"], "action": "repo.clone"},
+    "scm.branch.push": {
+        "tools": ["scm_push"],
+        "action": "branch.push",
+        "requires_scm_write": True,
+        "scope_from": "branch",
+    },
+}
+
+
+def _enforce_scm_permission(capability: str, meta: dict) -> dict | None:
+    rule = _SCM_CAPABILITY_RULES.get(capability)
+    if not rule:
+        return None
+
+    scope = str(rule.get("scope") or "*")
+    if rule.get("scope_from") == "branch":
+        branch_name = str(meta.get("branchName") or meta.get("branch") or "")
+        scope = branch_scope(branch_name, meta.get("permissions"))
+
+    return enforce_boundary_permission(
+        agent_id="scm",
+        capability=capability,
+        metadata=meta,
+        required_tools=list(rule.get("tools") or []),
+        grant_agent="scm",
+        grant_action=str(rule.get("action") or ""),
+        scope=scope,
+        require_scm_write=bool(rule.get("requires_scm_write")),
     )
 
 
@@ -108,6 +178,9 @@ class SCMAgentAdapter(BaseAgent):
     def _dispatch(self, capability: str, text: str, message: dict) -> dict:
         client = self._get_client()
         meta = message.get("metadata") or {}
+        permission_error = _enforce_scm_permission(capability, meta)
+        if permission_error:
+            return permission_error
         project = meta.get("project") or ""
         repo = meta.get("repo") or ""
 
@@ -169,6 +242,29 @@ class SCMAgentAdapter(BaseAgent):
             pr_id = meta.get("prId") or meta.get("prNumber") or text.strip()
             data, status = client.get_pr(project, repo, pr_id)
             return {"pr": data, "status": status}
+
+        if capability == "scm.pr.diff":
+            pr_id = meta.get("prId") or meta.get("prNumber") or text.strip()
+            data, status = client.get_pr_diff(project, repo, pr_id)
+            return {
+                "diff_text": data.get("diff_text", "") if isinstance(data, dict) else "",
+                "changed_files": data.get("changed_files", []) if isinstance(data, dict) else [],
+                "status": status,
+            }
+
+        if capability == "scm.pr.info":
+            pr_id = meta.get("prId") or meta.get("prNumber") or text.strip()
+            data, status = client.get_pr_info(project, repo, pr_id)
+            if isinstance(data, dict):
+                return {
+                    "title": data.get("title", ""),
+                    "description": data.get("description", ""),
+                    "state": data.get("state", ""),
+                    "author": data.get("author"),
+                    "commits": data.get("commits", []),
+                    "status": status,
+                }
+            return {"title": "", "description": "", "state": "", "author": None, "commits": [], "status": status}
 
         if capability == "scm.pr.comment":
             pr_id = meta.get("prId") or meta.get("prNumber") or ""

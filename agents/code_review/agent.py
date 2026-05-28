@@ -123,6 +123,7 @@ class CodeReviewAgent(BaseAgent):
             "_skills_registry": self.skills_registry,
             "_plugin_manager": self.plugin_manager,
             "pr_url": metadata.get("prUrl", ""),
+            "pr_number": metadata.get("prNumber", 0),
             "repo_url": metadata.get("repoUrl", ""),
             "jira_context": metadata.get("jiraContext", {}),
             "original_requirements": metadata.get("originalRequirements", ""),
@@ -134,22 +135,14 @@ class CodeReviewAgent(BaseAgent):
             task_store.fail_task(task.id, "Missing executionContract metadata")
             return task_store.get_task_dict(task.id)
 
-        from framework.execution_contract import ExecutionContract
-        from framework.permissions import PermissionEngine, PermissionSet
+        from framework.execution_contract import resolve_execution_contract_permission_set
+        from framework.permissions import PermissionEngine
         try:
-            contract = ExecutionContract.from_dict(exec_contract)
-            if not contract.verify_checksum() or contract.version != "1.0":
-                raise ValueError("checksum or version verification failed")
-            if not contract.allowed_tools:
-                raise ValueError("allowedTools must be non-empty")
-            self._permission_engine = PermissionEngine(PermissionSet(
-                allowed_tools=contract.allowed_tools,
-                denied_tools=contract.denied_tools,
-                scm="read-write" if any(t.startswith("scm_") for t in contract.allowed_tools) else "read",
-                filesystem="workspace-only",
-                agent_launching=False,
-                allowed_agents=[],
-            ))
+            _contract, permission_set = resolve_execution_contract_permission_set(
+                self.definition.permission_profile,
+                exec_contract,
+            )
+            self._permission_engine = PermissionEngine(permission_set)
         except Exception as exc:
             task_store.fail_task(task.id, f"Invalid executionContract metadata: {exc}")
             return task_store.get_task_dict(task.id)
@@ -270,6 +263,8 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
             "type": "object",
             "properties": {
                 "pr_url": {"type": "string"},
+                "pr_number": {"type": "integer"},
+                "repo_url": {"type": "string"},
                 "diff_summary": {"type": "string"},
                 "requirements": {"type": "string"},
                 "jira_context": {"type": "object"},
@@ -284,6 +279,8 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
         def execute_sync(
             self,
             pr_url: str = "",
+            pr_number: int = 0,
+            repo_url: str = "",
             diff_summary: str = "",
             requirements: str = "",
             jira_context=None,
@@ -302,6 +299,8 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
                             "parts": [{"text": diff_summary or pr_url}],
                             "metadata": {
                                 "prUrl": pr_url,
+                                "prNumber": pr_number,
+                                "repoUrl": repo_url,
                                 "originalRequirements": requirements,
                                 "jiraContext": jira_context or {},
                                 "designContext": design_context or {},

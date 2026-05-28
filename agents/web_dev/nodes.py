@@ -2322,7 +2322,11 @@ async def report_result(state: dict) -> dict:
         "summary": " ".join(summary_parts),
         "implementation_summary": " ".join(summary_parts),
         "pr_url": pr_url,
+        "pr_number": state.get("pr_number", 0),
         "branch_name": branch_name,
+        "pr_title": pr_title,
+        "pr_description": state.get("pr_description", ""),
+        "changes_made": changes,
     }
 
 

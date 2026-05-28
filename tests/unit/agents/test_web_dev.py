@@ -76,6 +76,27 @@ class TestWebDevExecutionContract:
         assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
         assert "Missing executionContract" in result["task"]["status"]["message"]["parts"][0]["text"]
 
+    async def test_handle_message_rejects_contract_broader_than_local_profile(self):
+        from framework.execution_contract import build_execution_contract
+
+        agent = WebDevAgent(definition=web_dev_definition, services=_agent_services())
+        broad_contract = build_execution_contract(
+            profile={"agent_id": "web-dev", "allowed_tools": ["read_file", "dispatch_web_dev"]},
+            workflow_ref="config/workflows/development_task.yaml",
+            rule_refs=[],
+            workspace_root="/tmp/workspace",
+        )
+
+        result = await agent.handle_message({
+            "message": {
+                "parts": [{"text": "Implement feature"}],
+                "metadata": {"executionContract": broad_contract.to_dict()},
+            }
+        })
+
+        assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
+        assert "exceed local profile" in result["task"]["status"]["message"]["parts"][0]["text"]
+
 
 class TestSafeJson:
 

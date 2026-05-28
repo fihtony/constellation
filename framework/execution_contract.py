@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 
@@ -168,3 +169,82 @@ def apply_execution_contract(
     # Bind permission engine to the tool registry (thread-local)
     if hasattr(tool_registry, "set_permission_engine"):
         tool_registry.set_permission_engine(engine)
+
+
+def resolve_execution_contract_permission_set(
+    permission_profile: str,
+    contract_data: dict[str, Any] | ExecutionContract,
+) -> tuple[ExecutionContract, "PermissionSet"]:
+    """Resolve a child execution contract against its local permission profile.
+
+    The local permission profile defines the child's maximum capability envelope.
+    The parent-supplied execution contract may only narrow that envelope; it may
+    not broaden it.
+    """
+    from framework.permissions import PermissionEngine, PermissionSet
+
+    contract = (
+        contract_data
+        if isinstance(contract_data, ExecutionContract)
+        else ExecutionContract.from_dict(contract_data)
+    )
+    if not contract.verify_checksum() or contract.version != "1.0":
+        raise ValueError("checksum or version verification failed")
+    if not contract.allowed_tools:
+        raise ValueError("allowedTools must be non-empty")
+    if permission_profile and contract.profile_name and contract.profile_name != permission_profile:
+        raise ValueError(
+            f"contract profileName {contract.profile_name!r} does not match local profile {permission_profile!r}"
+        )
+
+    baseline: PermissionSet | None = None
+    if permission_profile:
+        root = Path(__file__).resolve().parent.parent
+        perm_path = root / "config" / "permissions" / f"{permission_profile}.yaml"
+        if not perm_path.is_file():
+            raise ValueError(f"permission profile not found: {permission_profile}")
+        baseline = PermissionEngine.from_yaml(str(perm_path)).permissions
+
+    baseline_allowed = set((baseline.allowed_tools if baseline else []) or [])
+    requested_allowed = list(contract.allowed_tools)
+    if baseline_allowed:
+        unexpected = sorted(set(requested_allowed) - baseline_allowed)
+        if unexpected:
+            raise ValueError(
+                "contract allowedTools exceed local profile: " + ", ".join(unexpected)
+            )
+        effective_allowed = [tool for tool in requested_allowed if tool in baseline_allowed]
+    else:
+        effective_allowed = requested_allowed
+
+    denied = set(contract.denied_tools)
+    if baseline:
+        denied.update(baseline.denied_tools)
+    effective_denied = sorted(denied)
+
+    if baseline:
+        scm = baseline.scm
+        filesystem = baseline.filesystem
+        agent_launching = baseline.agent_launching
+        allowed_agents = list(baseline.allowed_agents)
+        custom = dict(baseline.custom)
+    else:
+        scm = "read-write" if any(tool.startswith("scm_") for tool in effective_allowed) else "read"
+        filesystem = "workspace-only"
+        agent_launching = False
+        allowed_agents = []
+        custom = {}
+
+    if scm == "read-write" and not any(tool.startswith("scm_") for tool in effective_allowed):
+        scm = "read"
+
+    permission_set = PermissionSet(
+        allowed_tools=effective_allowed,
+        denied_tools=effective_denied,
+        scm=scm,
+        filesystem=filesystem,
+        custom=custom,
+        agent_launching=agent_launching,
+        allowed_agents=allowed_agents,
+    )
+    return contract, permission_set

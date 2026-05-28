@@ -196,23 +196,15 @@ class WebDevAgent(BaseAgent):
             task_store.fail_task(task.id, "Missing executionContract metadata")
             return task_store.get_task_dict(task.id)
 
-        from framework.execution_contract import ExecutionContract
-        from framework.permissions import PermissionEngine, PermissionSet
+        from framework.execution_contract import resolve_execution_contract_permission_set
+        from framework.permissions import PermissionEngine
         try:
-            contract = ExecutionContract.from_dict(exec_contract)
-            if not contract.verify_checksum() or contract.version != "1.0":
-                raise ValueError("checksum or version verification failed")
-            if not contract.allowed_tools:
-                raise ValueError("allowedTools must be non-empty")
-            state["_allowed_tools"] = contract.allowed_tools
-            self._permission_engine = PermissionEngine(PermissionSet(
-                allowed_tools=contract.allowed_tools,
-                denied_tools=contract.denied_tools,
-                scm="read-write" if any(t.startswith("scm_") for t in contract.allowed_tools) else "read",
-                filesystem="workspace-only",
-                agent_launching=False,
-                allowed_agents=[],
-            ))
+            _contract, permission_set = resolve_execution_contract_permission_set(
+                self.definition.permission_profile,
+                exec_contract,
+            )
+            state["_allowed_tools"] = permission_set.allowed_tools[:]
+            self._permission_engine = PermissionEngine(permission_set)
         except Exception as exc:
             task_store.fail_task(task.id, f"Invalid executionContract metadata: {exc}")
             return task_store.get_task_dict(task.id)
@@ -245,6 +237,7 @@ class WebDevAgent(BaseAgent):
                         metadata={
                             "agentId": self.definition.agent_id,
                             "prUrl": result.get("pr_url", ""),
+                            "prNumber": result.get("pr_number", 0),
                             "branch": result.get("branch_name", ""),
                             "jiraInReview": result.get("jira_in_review", False),
                             "screenshotIncluded": result.get("screenshot_captured", False),
@@ -301,6 +294,7 @@ def _send_callback(
                 "metadata": {
                     "agentId": agent_id,
                     "prUrl": result.get("pr_url", ""),
+                    "prNumber": result.get("pr_number", 0),
                     "branch": result.get("branch_name", ""),
                     "jiraInReview": result.get("jira_in_review", False),
                     "screenshotIncluded": result.get("screenshot_captured", False),
@@ -433,6 +427,7 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                 if state in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_INPUT_REQUIRED"):
                     arts = td["task"].get("artifacts", [])
                     pr_url = ""
+                    pr_number = 0
                     branch = ""
                     jira_in_review = False
                     screenshot_included = False
@@ -440,6 +435,7 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                     for art in arts:
                         m = art.get("metadata", {})
                         pr_url = pr_url or m.get("prUrl", "")
+                        pr_number = pr_number or m.get("prNumber", 0)
                         branch = branch or m.get("branch", "")
                         if m.get("jiraInReview"):
                             jira_in_review = True
@@ -453,6 +449,7 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                         "status": "completed" if state == "TASK_STATE_COMPLETED" else "error",
                         "summary": summary,
                         "prUrl": pr_url,
+                        "prNumber": pr_number,
                         "branch": branch,
                         "jiraInReview": jira_in_review,
                         "screenshotIncluded": screenshot_included,

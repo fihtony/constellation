@@ -13,6 +13,7 @@ import json
 import os
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
+from framework.boundary_permissions import enforce_boundary_permission
 
 jira_definition = AgentDefinition(
     agent_id="jira",
@@ -23,6 +24,48 @@ jira_definition = AgentDefinition(
     workflow=None,
     tools=[],
 )
+
+
+_JIRA_CAPABILITY_RULES: dict[str, dict[str, object]] = {
+    "jira.ticket.fetch": {"tools": ["fetch_jira_ticket"], "action": "ticket.read"},
+    "jira.ticket.get": {"tools": ["fetch_jira_ticket"], "action": "ticket.read"},
+    "jira.ticket.search": {"tools": ["jira_search"], "action": "read"},
+    "jira.comment.add": {"tools": ["jira_comment"], "action": "comment.add"},
+    "jira.ticket.comment": {"tools": ["jira_comment"], "action": "comment.add"},
+    "jira.transitions.list": {"tools": ["jira_list_transitions"], "action": "read"},
+    "jira.ticket.update": {"tools": ["jira_update"], "action": "issue.update.labels"},
+    "jira.ticket.transition": {"tools": ["jira_transition"], "action": "ticket.transition"},
+    "jira.user.me": {"tools": ["jira_get_token_user"], "action": "read"},
+    "jira.comment.list": {"tools": ["jira_list_comments"], "action": "comment.list"},
+}
+
+
+def _jira_grant_action(capability: str, meta: dict) -> str:
+    if capability != "jira.ticket.update":
+        rule = _JIRA_CAPABILITY_RULES.get(capability, {})
+        return str(rule.get("action") or "")
+
+    fields = meta.get("fields") or {}
+    if isinstance(fields, dict):
+        if "assignee" in fields:
+            return "assignee.update"
+        if "labels" in fields:
+            return "issue.update.labels"
+    return "issue.update.labels"
+
+
+def _enforce_jira_permission(capability: str, meta: dict) -> dict | None:
+    rule = _JIRA_CAPABILITY_RULES.get(capability)
+    if not rule:
+        return None
+    return enforce_boundary_permission(
+        agent_id="jira",
+        capability=capability,
+        metadata=meta,
+        required_tools=list(rule.get("tools") or []),
+        grant_agent="jira",
+        grant_action=_jira_grant_action(capability, meta),
+    )
 
 
 def _make_provider(backend: str = "rest", **kwargs):
@@ -125,6 +168,9 @@ class JiraAgentAdapter(BaseAgent):
 
     def _dispatch(self, capability: str, text: str, meta: dict) -> dict:
         provider = self._get_provider()
+        permission_error = _enforce_jira_permission(capability, meta)
+        if permission_error:
+            return permission_error
 
         if capability in ("jira.ticket.fetch", "jira.ticket.get"):
             from agents.jira.tools import _fetch_jira_ticket_payload

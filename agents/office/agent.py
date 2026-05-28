@@ -181,22 +181,14 @@ class OfficeAgent(BaseAgent):
             task_store.fail_task(canonical_task_id, "Missing executionContract metadata")
             return task_store.get_task_dict(canonical_task_id)
 
-        from framework.execution_contract import ExecutionContract
-        from framework.permissions import PermissionEngine, PermissionSet
+        from framework.execution_contract import resolve_execution_contract_permission_set
+        from framework.permissions import PermissionEngine
         try:
-            contract = ExecutionContract.from_dict(exec_contract)
-            if not contract.verify_checksum() or contract.version != "1.0":
-                raise ValueError("checksum or version verification failed")
-            if not contract.allowed_tools:
-                raise ValueError("allowedTools must be non-empty")
-            self._permission_engine = PermissionEngine(PermissionSet(
-                allowed_tools=contract.allowed_tools,
-                denied_tools=contract.denied_tools,
-                scm="none",
-                filesystem="workspace-only",
-                agent_launching=False,
-                allowed_agents=[],
-            ))
+            _contract, permission_set = resolve_execution_contract_permission_set(
+                self.definition.permission_profile,
+                exec_contract,
+            )
+            self._permission_engine = PermissionEngine(permission_set)
         except Exception as exc:
             task_store.fail_task(canonical_task_id, f"Invalid executionContract metadata: {exc}")
             return task_store.get_task_dict(canonical_task_id)

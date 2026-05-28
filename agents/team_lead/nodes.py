@@ -933,6 +933,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
             "agent_id": str(payload.get("childAgentId") or "web-dev").strip() or "web-dev",
         },
         "pr_url": pr_url,
+        "pr_number": payload.get("prNumber") or payload.get("pr_number") or 0,
         "branch_name": branch_name,
         "jira_in_review": jira_in_review,
         "screenshot_included": screenshot_included,
@@ -982,6 +983,8 @@ async def review_result(state: dict) -> dict:
             "dispatch_code_review",
             {
                 "pr_url": pr_url,
+                "pr_number": state.get("pr_number") or dev_result.get("prNumber") or dev_result.get("pr_number") or 0,
+                "repo_url": state.get("repo_url", ""),
                 "diff_summary": dev_result.get("summary", ""),
                 "requirements": state.get("analysis_summary", "") or state.get("user_request", ""),
                 "jira_context": state.get("jira_context", {}),

@@ -647,6 +647,14 @@ class DispatchCodeReview(BaseTool):
                 "type": "string",
                 "description": "Pull request URL to review.",
             },
+            "pr_number": {
+                "type": "integer",
+                "description": "Pull request number to review.",
+            },
+            "repo_url": {
+                "type": "string",
+                "description": "Repository URL that owns the pull request.",
+            },
             "diff_summary": {
                 "type": "string",
                 "description": "Summary of the changes made.",
@@ -682,6 +690,8 @@ class DispatchCodeReview(BaseTool):
     def execute_sync(
         self,
         pr_url: str = "",
+        pr_number: int = 0,
+        repo_url: str = "",
         diff_summary: str = "",
         requirements: str = "",
         jira_context: dict | None = None,
@@ -697,6 +707,10 @@ class DispatchCodeReview(BaseTool):
         meta: dict[str, Any] = {}
         if pr_url:
             meta["prUrl"] = pr_url
+        if pr_number:
+            meta["prNumber"] = pr_number
+        if repo_url:
+            meta["repoUrl"] = repo_url
         if requirements:
             meta["originalRequirements"] = requirements
         if jira_context:

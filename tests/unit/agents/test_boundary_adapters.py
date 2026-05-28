@@ -12,6 +12,20 @@ from agents.scm.adapter import scm_definition, SCMAgentAdapter
 from agents.ui_design.adapter import ui_design_definition, UIDesignAgentAdapter
 
 
+@pytest.fixture(autouse=True)
+def _default_permission_enforcement_off(monkeypatch):
+    monkeypatch.setenv("PERMISSION_ENFORCEMENT", "off")
+
+
+def _permissions(*allowed_tools: str, scm: str = "read") -> dict:
+    return {
+        "allowedTools": list(allowed_tools),
+        "deniedTools": [],
+        "scm": scm,
+        "filesystem": "workspace-only",
+    }
+
+
 def _make_services():
     mock = MagicMock()
     return AgentServices(
@@ -130,3 +144,64 @@ class TestBoundaryAdapterEnvelopeSupport:
         payload = json.loads(artifact["parts"][0]["text"])
         assert payload["local_folder"].endswith("ui-design/stitch")
         assert artifact["metadata"]["designMdPath"].endswith("ui-design/stitch/DESIGN.md")
+
+    async def test_jira_adapter_denies_missing_permissions_in_strict(self, monkeypatch):
+        monkeypatch.setenv("PERMISSION_ENFORCEMENT", "strict")
+        provider = MagicMock()
+        adapter = JiraAgentAdapter(jira_definition, _make_services(), jira_provider=provider)
+
+        result = await adapter.handle_message({
+            "message": {
+                "parts": [{"text": "PROJ-123"}],
+                "metadata": {"requestedCapability": "jira.ticket.fetch", "ticketKey": "PROJ-123"},
+            }
+        })
+
+        artifact_text = result["task"]["artifacts"][0]["parts"][0]["text"]
+        payload = json.loads(artifact_text)
+        assert payload["status"] == "permission_denied"
+        provider.fetch_issue.assert_not_called()
+
+    async def test_scm_adapter_denies_missing_tool_permission_in_strict(self, monkeypatch):
+        monkeypatch.setenv("PERMISSION_ENFORCEMENT", "strict")
+        client = MagicMock()
+        adapter = SCMAgentAdapter(scm_definition, _make_services(), scm_client=client)
+
+        result = await adapter.handle_message({
+            "message": {
+                "parts": [{"text": "PROJ/repo"}],
+                "metadata": {
+                    "requestedCapability": "scm.pr.diff",
+                    "project": "PROJ",
+                    "repo": "repo",
+                    "prNumber": 42,
+                    "permissions": _permissions("clone_repo", scm="read"),
+                },
+            }
+        })
+
+        artifact_text = result["task"]["artifacts"][0]["parts"][0]["text"]
+        payload = json.loads(artifact_text)
+        assert payload["status"] == "permission_denied"
+        client.get_pr_diff.assert_not_called()
+
+    async def test_ui_design_adapter_accepts_permissions_in_strict(self, monkeypatch):
+        monkeypatch.setenv("PERMISSION_ENFORCEMENT", "strict")
+        figma = MagicMock()
+        figma.get_file.return_value = ({"name": "Design", "document": {"children": []}, "lastModified": "now"}, 200)
+        adapter = UIDesignAgentAdapter(ui_design_definition, _make_services(), figma_client=figma)
+
+        result = await adapter.handle_message({
+            "message": {
+                "parts": [{"text": "https://www.figma.com/design/file-id/mock"}],
+                "metadata": {
+                    "requestedCapability": "figma.file.fetch",
+                    "figmaUrl": "https://www.figma.com/design/file-id/mock",
+                    "permissions": _permissions("fetch_design", "fetch_figma_page"),
+                },
+            }
+        })
+
+        artifact_text = result["task"]["artifacts"][0]["parts"][0]["text"]
+        payload = json.loads(artifact_text)
+        assert payload["name"] == "Design"

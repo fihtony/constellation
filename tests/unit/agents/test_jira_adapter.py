@@ -17,6 +17,11 @@ from agents.jira.adapter import JiraAgentAdapter, jira_definition, _make_provide
 from agents.jira.providers.base import JiraProvider
 
 
+@pytest.fixture(autouse=True)
+def _default_permission_enforcement_off(monkeypatch):
+    monkeypatch.setenv("PERMISSION_ENFORCEMENT", "off")
+
+
 def test_jira_search_tool_is_registered_in_tool_list():
     from agents.jira.tools import _TOOLS
 
