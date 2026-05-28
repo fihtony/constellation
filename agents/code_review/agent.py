@@ -94,6 +94,9 @@ class CodeReviewAgent(BaseAgent):
 
     async def start(self) -> None:
         await super().start()
+        from agents.code_review.tools import register_code_review_tools
+
+        register_code_review_tools()
         _register_code_review_dispatch(self)
 
     async def handle_message(self, message: dict) -> dict:

@@ -24,6 +24,8 @@ capabilities:
   - scm.branch.push
   - scm.pr.create
   - scm.pr.get
+  - scm.pr.info
+  - scm.pr.diff
   - scm.pr.list
   - scm.pr.comment
   - scm.pr.image.upload

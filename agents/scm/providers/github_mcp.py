@@ -411,6 +411,24 @@ class GitHubMCPProvider:
             return self._normalize_pr(data), "ok"
         return {}, "error_parse"
 
+    def get_pr_diff(
+        self, owner: str, repo: str, pr_id: int | str, timeout: int = 30
+    ) -> tuple[dict, str]:
+        from agents.scm.client import GitHubClient
+
+        return GitHubClient(token=self._token).get_pr_diff(
+            owner, repo, pr_id, timeout=timeout
+        )
+
+    def get_pr_info(
+        self, owner: str, repo: str, pr_id: int | str, timeout: int = 20
+    ) -> tuple[dict, str]:
+        from agents.scm.client import GitHubClient
+
+        return GitHubClient(token=self._token).get_pr_info(
+            owner, repo, pr_id, timeout=timeout
+        )
+
     def _find_existing_open_pr(self, owner: str, repo: str, from_branch: str, to_branch: str) -> dict:
         prs, status = self.list_prs(owner, repo, "open")
         if status != "ok":

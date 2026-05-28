@@ -293,6 +293,15 @@ async def load_pr_context(state: dict) -> dict:
                 info_args["permissions"] = permissions
             info_result_str = registry.execute_sync("scm_get_pr_info", info_args)
             info_payload = json.loads(info_result_str) if info_result_str else {}
+            if info_payload.get("error") == "Tool 'scm_get_pr_info' is not registered":
+                from agents.code_review.tools import fetch_pr_info
+
+                info_payload = fetch_pr_info(
+                    repo_url,
+                    int(pr_number),
+                    task_id=state.get("_task_id", ""),
+                    permissions=permissions if isinstance(permissions, dict) else None,
+                )
             if not info_payload.get("error"):
                 pr_description = pr_description or info_payload.get("description", "")
                 commit_messages = commit_messages or [
@@ -342,6 +351,15 @@ async def load_pr_context(state: dict) -> dict:
                 diff_args["permissions"] = permissions
             diff_result_str = registry.execute_sync("scm_get_pr_diff", diff_args)
             diff_payload = json.loads(diff_result_str) if diff_result_str else {}
+            if diff_payload.get("error") == "Tool 'scm_get_pr_diff' is not registered":
+                from agents.code_review.tools import fetch_pr_diff
+
+                diff_payload = fetch_pr_diff(
+                    repo_url,
+                    int(pr_number),
+                    task_id=state.get("_task_id", ""),
+                    permissions=permissions if isinstance(permissions, dict) else None,
+                )
             if not diff_payload.get("error"):
                 pr_diff = diff_payload.get("diff_text", "")
                 changed_files = changed_files or [
