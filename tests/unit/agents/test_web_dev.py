@@ -66,6 +66,10 @@ class TestWebDevWorkflowCompile:
         assert web_dev_definition.permissions.get("scm") == "read-write"
         assert web_dev_definition.permissions.get("filesystem") == "workspace-only"
 
+    def test_web_dev_definition_tools_include_runtime_boundary_calls(self):
+        assert "jira_update" in web_dev_definition.tools
+        assert "scm_list_branches" in web_dev_definition.tools
+
 
 class TestWebDevExecutionContract:
 

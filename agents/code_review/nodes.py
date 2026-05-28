@@ -88,6 +88,30 @@ def _record_checked_artifact(checked_artifacts: list[str], workspace_path: str, 
         checked_artifacts.append(relative)
 
 
+def _wait_for_file(path: str, timeout_seconds: float = 3.0) -> str:
+    if os.path.isfile(path):
+        return path
+    deadline = time.monotonic() + max(timeout_seconds, 0.0)
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        if os.path.isfile(path):
+            return path
+    return path if os.path.isfile(path) else ""
+
+
+def _wait_for_latest_self_assessment(agent_dir: str, timeout_seconds: float = 3.0) -> str:
+    candidate = _find_latest_self_assessment(agent_dir)
+    if candidate:
+        return candidate
+    deadline = time.monotonic() + max(timeout_seconds, 0.0)
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        candidate = _find_latest_self_assessment(agent_dir)
+        if candidate:
+            return candidate
+    return ""
+
+
 def _child_permissions(state: dict) -> dict[str, Any] | None:
     metadata = state.get("metadata", {})
     permissions = metadata.get("permissions")
@@ -222,8 +246,8 @@ async def load_pr_context(state: dict) -> dict:
                 log.warn("failed to load design metadata", error=str(exc), path=design_meta_path)
 
         web_dev_dir = os.path.join(workspace_path, _WEB_DEV_AGENT_ID)
-        pr_evidence_path = os.path.join(web_dev_dir, "pr-evidence.json")
-        if os.path.isfile(pr_evidence_path):
+        pr_evidence_path = _wait_for_file(os.path.join(web_dev_dir, "pr-evidence.json"))
+        if pr_evidence_path:
             try:
                 pr_evidence = _load_json_file(pr_evidence_path) or {}
                 _record_checked_artifact(checked_artifacts, workspace_path, pr_evidence_path)
@@ -233,7 +257,7 @@ async def load_pr_context(state: dict) -> dict:
             except Exception as exc:
                 log.warn("failed to load PR evidence", error=str(exc), path=pr_evidence_path)
 
-        self_assessment_path = _find_latest_self_assessment(web_dev_dir)
+        self_assessment_path = _wait_for_latest_self_assessment(web_dev_dir)
         if self_assessment_path:
             _record_checked_artifact(checked_artifacts, workspace_path, self_assessment_path)
 
@@ -300,6 +324,16 @@ async def load_pr_context(state: dict) -> dict:
         except Exception as exc:
             log.warn("scm_get_pr_diff fallback failed", error=str(exc))
             print(f"[{_AGENT_ID}] scm_get_pr_diff fallback failed (non-fatal): {exc}")
+
+    review_input_issues: list[dict[str, Any]] = []
+    if pr_url and not pr_diff:
+        review_input_issues.append({
+            "severity": "high",
+            "category": "review-input",
+            "message": "Unable to load the PR diff, so code review could not validate the submitted code changes.",
+            "suggestion": "Ensure code-review receives repoUrl/prNumber metadata and can access web-dev/pr-evidence.json before review dispatch.",
+        })
+        log.warn("review input incomplete", pr_url=pr_url, repo_url=repo_url, pr_number=pr_number)
 
     # Extract original requirements from Jira context
     original_requirements = state.get("original_requirements", "")
@@ -376,6 +410,7 @@ async def load_pr_context(state: dict) -> dict:
         "pr_url": pr_url,
         "pr_number": pr_number,
         "checked_artifacts": checked_artifacts,
+        "review_input_issues": review_input_issues,
     }
 
 
@@ -576,10 +611,11 @@ async def generate_report(state: dict) -> dict:
     tests = state.get("test_issues", [])
     requirements = state.get("requirement_gaps", [])
     ui_issues = state.get("ui_issues", [])
+    review_input_issues = state.get("review_input_issues", [])
     log = _logger(state)
     log.node("generate_report")
 
-    all_comments = quality + security + tests + requirements + ui_issues
+    all_comments = review_input_issues + quality + security + tests + requirements + ui_issues
 
     # Count by severity
     critical = sum(1 for c in all_comments if c.get("severity") == "critical")

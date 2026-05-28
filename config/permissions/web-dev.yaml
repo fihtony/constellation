@@ -16,10 +16,12 @@ allowed_tools:
   - scm_update_pr
   - scm_get_pr_diff
   - scm_get_pr_info
+  - scm_list_branches
   - scm_branch
   - scm_commit
   - jira_transition
   - jira_comment
+  - jira_update
   - jira_list_transitions
   - jira_get_token_user
 

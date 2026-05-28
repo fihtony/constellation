@@ -605,6 +605,40 @@ class TestDispatchDevAgentValidation:
         assert "scm_get_pr_diff" in captured["args"]["permissions"]["allowedTools"]
         assert "dispatch_code_review" not in captured["args"]["permissions"]["allowedTools"]
 
+    async def test_review_result_uses_dev_result_repo_inputs_when_state_missing(self, monkeypatch):
+        from agents.team_lead.nodes import review_result
+
+        captured: dict[str, object] = {}
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                captured.update(args)
+                return json.dumps({"verdict": "approved", "summary": "ok"})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await review_result(
+            {
+                "_task_id": "task-123",
+                "pr_url": "https://github.com/org/repo/pull/85",
+                "pr_number": 0,
+                "repo_url": "",
+                "dev_result": {
+                    "summary": "done",
+                    "prNumber": 85,
+                    "repoUrl": "https://github.com/org/repo",
+                    "changedFiles": ["src/App.jsx"],
+                },
+                "analysis_summary": "Implement CSTL-3",
+                "workspace_path": "/tmp/workspace",
+            }
+        )
+
+        assert captured["repo_url"] == "https://github.com/org/repo"
+        assert captured["pr_number"] == 85
+        assert captured["changed_files"] == ["src/App.jsx"]
+        assert result["route"] == "approved"
+
     async def test_validate_readiness_routes_to_missing_info_for_retryable_context(self, tmp_path):
         from agents.team_lead.nodes import validate_readiness
 
@@ -922,7 +956,10 @@ class TestTeamLeadTools:
                             "parts": [{"text": "Dev task completed."}],
                             "metadata": {
                                 "prUrl": "https://example.test/pr/2",
+                                "prNumber": 2,
+                                "repoUrl": "https://example.test/org/repo.git",
                                 "branch": "feature/cstl-2",
+                                "changedFiles": ["src/App.jsx"],
                                 "jiraInReview": True,
                                 "screenshotIncluded": True,
                                 "screenshotUploaded": True,
@@ -942,6 +979,9 @@ class TestTeamLeadTools:
 
         payload = json.loads(result.output)
         assert payload["status"] == "completed"
+        assert payload["prNumber"] == 2
+        assert payload["repoUrl"] == "https://example.test/org/repo.git"
+        assert payload["changedFiles"] == ["src/App.jsx"]
         assert payload["screenshotIncluded"] is True
         assert payload["screenshotUploaded"] is True
         assert payload["childServiceUrl"] == "http://launched-web-dev:8050"

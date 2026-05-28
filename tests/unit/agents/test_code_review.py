@@ -251,6 +251,32 @@ class TestLoadPrContext:
         assert captured[0]["arguments"]["permissions"] == permissions
         assert captured[1]["arguments"]["permissions"] == permissions
 
+    async def test_marks_missing_pr_diff_as_review_input_issue(self, monkeypatch):
+        class StubRegistry:
+            def execute_sync(self, name, arguments):
+                if name == "scm_get_pr_info":
+                    return json.dumps({"description": "Review this PR", "commits": []})
+                if name == "scm_get_pr_diff":
+                    return json.dumps({"error": "diff unavailable"})
+                raise AssertionError(f"unexpected tool {name}")
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await load_pr_context(
+            {
+                "_task_id": "task-123",
+                "metadata": {
+                    "prUrl": "https://github.com/org/repo/pull/12",
+                    "repoUrl": "https://github.com/org/repo",
+                    "prNumber": 12,
+                },
+            }
+        )
+
+        assert result["pr_diff"] == ""
+        assert result["review_input_issues"]
+        assert result["review_input_issues"][0]["severity"] == "high"
+
     async def test_load_pr_context_writes_agent_log(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path))
 
@@ -451,6 +477,26 @@ class TestGenerateReport:
         assert "jira/PROJ-123/ticket.json" in result["checked_artifacts"]
         assert "ui-design/stitch/DESIGN.md" in result["checked_artifacts"]
 
+    async def test_missing_pr_diff_rejects_report(self):
+        state = {
+            "review_input_issues": [
+                {
+                    "severity": "high",
+                    "message": "Unable to load the PR diff.",
+                    "suggestion": "Retry with explicit repo metadata.",
+                }
+            ],
+            "quality_issues": [],
+            "security_issues": [],
+            "test_issues": [],
+            "requirement_gaps": [],
+        }
+
+        result = await generate_report(state)
+
+        assert result["verdict"] == "rejected"
+        assert result["severity_levels"]["high"] == 1
+
 
 class TestCodeReviewWorkflowExecution:
 
@@ -459,6 +505,8 @@ class TestCodeReviewWorkflowExecution:
         state = {
             "pr_url": "https://github.com/test/pr/1",
             "repo_url": "https://github.com/test",
+            "pr_diff": "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py",
+            "changed_files": ["src/app.py"],
         }
         result = await compiled.invoke(state)
         assert result["verdict"] == "approved"

@@ -1002,12 +1002,23 @@ async def review_result(state: dict) -> dict:
         raise RuntimeError(f"Cannot dispatch Code Review without a valid execution contract: {exc}") from exc
 
     try:
+        review_repo_url = (
+            state.get("repo_url", "")
+            or dev_result.get("repoUrl", "")
+            or dev_result.get("repo_url", "")
+        )
+        review_changed_files = (
+            dev_result.get("changedFiles")
+            or dev_result.get("changed_files")
+            or []
+        )
         result_str = registry.execute_sync(
             "dispatch_code_review",
             {
                 "pr_url": pr_url,
                 "pr_number": state.get("pr_number") or dev_result.get("prNumber") or dev_result.get("pr_number") or 0,
-                "repo_url": state.get("repo_url", ""),
+                "repo_url": review_repo_url,
+                "changed_files": review_changed_files,
                 "diff_summary": dev_result.get("summary", ""),
                 "requirements": state.get("analysis_summary", "") or state.get("user_request", ""),
                 "jira_context": state.get("jira_context", {}),
