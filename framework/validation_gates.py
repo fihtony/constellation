@@ -1,4 +1,4 @@
-"""Validation Gates — deterministic checkpoints after LLM outputs.
+"""Validation Gates - deterministic checkpoints after LLM outputs.
 
 Each gate is a pure function that verifies LLM output meets format/completeness
 requirements. Gates return a ValidationResult indicating pass/fail with details.
@@ -11,8 +11,6 @@ Usage:
 """
 from __future__ import annotations
 
-import json
-import os
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any
@@ -69,7 +67,7 @@ def validate_analysis_schema(analysis: dict[str, Any]) -> ValidationResult:
 
 
 # ---------------------------------------------------------------------------
-# Gate: Readiness validation (Step 3 — after gather_context)
+# Gate: Readiness validation (Step 3 - after gather_context)
 # ---------------------------------------------------------------------------
 
 def validate_readiness(
@@ -167,24 +165,112 @@ def validate_implementation_plan(plan: dict[str, Any]) -> ValidationResult:
 
 
 # ---------------------------------------------------------------------------
-# Gate: File change verification (Step 5/6 — after implement/fix)
+# Gate: File change verification (Step 5/6 - after implement/fix)
 # ---------------------------------------------------------------------------
 
+def _git_env() -> dict[str, str] | None:
+    try:
+        from framework.env_utils import build_isolated_git_env
+
+        return build_isolated_git_env(scope="validation-gates")
+    except Exception:
+        return None
+
+
+def _verified_git_ref(repo_path: str, ref: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", ref],
+            cwd=repo_path,
+            env=_git_env(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return ref if result.returncode == 0 else None
+
+
+def _origin_head_ref(repo_path: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+            cwd=repo_path,
+            env=_git_env(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    ref = result.stdout.strip()
+    return ref if result.returncode == 0 and ref else None
+
+
+def _candidate_base_refs(repo_path: str) -> list[str]:
+    refs: list[str] = []
+    origin_head = _origin_head_ref(repo_path)
+    if origin_head:
+        refs.append(origin_head)
+    refs.extend(["origin/main", "origin/master", "main", "master", "origin/develop", "develop"])
+
+    unique_refs: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if ref not in seen:
+            unique_refs.append(ref)
+            seen.add(ref)
+    return unique_refs
+
+
+def _branch_changed_files(repo_path: str) -> tuple[str | None, list[str]]:
+    for ref in _candidate_base_refs(repo_path):
+        verified_ref = _verified_git_ref(repo_path, ref)
+        if not verified_ref:
+            continue
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--name-only", "--diff-filter=ACMRTUXB", f"{verified_ref}...HEAD"],
+                cwd=repo_path,
+                env=_git_env(),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        if result.returncode != 0:
+            continue
+        changed_files = sorted({line.strip() for line in result.stdout.splitlines() if line.strip()})
+        if changed_files:
+            return verified_ref, changed_files
+    return None, []
+
+
 def validate_files_changed(repo_path: str) -> ValidationResult:
-    """Verify git working tree has actual file changes."""
+    """Verify git working tree or current branch has actual file changes."""
     try:
         result = subprocess.run(
             ["git", "status", "--short"],
-            cwd=repo_path, capture_output=True, text=True, timeout=30,
+            cwd=repo_path,
+            env=_git_env(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
         )
         changed_files = [
             line.strip() for line in result.stdout.strip().split("\n")
             if line.strip()
         ]
-    except (subprocess.TimeoutExpired, OSError) as e:
+    except (subprocess.TimeoutExpired, OSError) as exc:
         return ValidationResult(
             passed=False, gate_name="files_changed",
-            feedback=f"Could not check git status: {e}",
+            feedback=f"Could not check git status: {exc}",
         )
 
     if changed_files:
@@ -192,6 +278,19 @@ def validate_files_changed(repo_path: str) -> ValidationResult:
             passed=True, gate_name="files_changed",
             details={"changed_files": changed_files[:20], "count": len(changed_files)},
         )
+
+    base_ref, branch_files = _branch_changed_files(repo_path)
+    if branch_files:
+        return ValidationResult(
+            passed=True,
+            gate_name="files_changed",
+            details={
+                "base_ref": base_ref,
+                "committed_files": branch_files[:20],
+                "count": len(branch_files),
+            },
+        )
+
     return ValidationResult(
         passed=False, gate_name="files_changed",
         feedback="No file changes detected after implementation/fix. LLM must produce actual code changes.",
@@ -316,7 +415,7 @@ def validate_pr_created(pr_url: str | None, pr_number: int | None = None) -> Val
 
 
 # ---------------------------------------------------------------------------
-# Gate: Screenshot upload verification (Step 8 — UI tasks)
+# Gate: Screenshot upload verification (Step 8 - UI tasks)
 # ---------------------------------------------------------------------------
 
 def validate_screenshot_upload(

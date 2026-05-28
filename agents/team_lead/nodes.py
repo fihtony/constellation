@@ -29,6 +29,50 @@ def _logger(state: dict) -> AgentLogger:
     return AgentLogger(state.get("_task_id", ""), _AGENT_ID)
 
 
+async def _ack_and_cleanup_dev_agent(state: dict) -> dict[str, Any]:
+    """Acknowledge the current Web Dev child task and tear down any per-task instance."""
+    session = state.get("dev_agent_session") or {}
+    if not isinstance(session, dict):
+        session = {}
+
+    child_task_id = str(session.get("task_id") or "").strip()
+    child_service_url = str(session.get("service_url") or "").strip()
+    child_container_name = str(session.get("container_name") or "").strip()
+    child_agent_id = str(session.get("agent_id") or "web-dev").strip() or "web-dev"
+    if not child_task_id and not child_container_name:
+        return {}
+
+    log = _logger(state)
+    acknowledged = False
+    cleaned_up = False
+
+    if child_task_id and child_service_url:
+        try:
+            from framework.a2a.client import A2AClient
+
+            await A2AClient(timeout=10).send_ack(child_service_url, child_task_id)
+            acknowledged = True
+            log.a2a("→", child_agent_id, action="ack", child_task_id=child_task_id)
+        except Exception as exc:
+            log.warn("dev agent ack failed", error=str(exc), child_task_id=child_task_id)
+
+    if child_container_name:
+        try:
+            from framework.launcher import get_launcher
+
+            get_launcher().destroy_instance(child_agent_id, child_container_name)
+            cleaned_up = True
+            log.info("dev agent instance destroyed", agent_id=child_agent_id, container_name=child_container_name)
+        except Exception as exc:
+            log.warn("dev agent cleanup failed", error=str(exc), container_name=child_container_name)
+
+    return {
+        "dev_agent_acknowledged": acknowledged,
+        "dev_agent_cleaned_up": cleaned_up,
+        "dev_agent_session": {},
+    }
+
+
 def _safe_json(text: str, fallback: Any = None) -> Any:
     """Extract and parse the first JSON object/array from *text*.
 
@@ -882,6 +926,12 @@ async def dispatch_dev_agent(state: dict) -> dict:
     return {
         "dev_dispatched": True,
         "dev_result": payload,
+        "dev_agent_session": {
+            "task_id": str(payload.get("childTaskId") or "").strip(),
+            "service_url": str(payload.get("childServiceUrl") or "").strip(),
+            "container_name": str(payload.get("childContainerName") or "").strip(),
+            "agent_id": str(payload.get("childAgentId") or "web-dev").strip() or "web-dev",
+        },
         "pr_url": pr_url,
         "branch_name": branch_name,
         "jira_in_review": jira_in_review,
@@ -995,9 +1045,12 @@ async def request_revision(state: dict) -> dict:
         except Exception as exc:
             print(f"[{_AGENT_ID}] Jira review feedback comment failed: {exc}")
 
+    cleanup = await _ack_and_cleanup_dev_agent(state)
+
     return {
         "revision_feedback": revision_feedback,
         "revision_count": state.get("revision_count", 0) + 1,
+        **cleanup,
     }
 
 
@@ -1072,12 +1125,15 @@ async def report_success(state: dict) -> dict:
         except Exception as exc:
             print(f"[{_AGENT_ID}] Jira final review comment failed: {exc}")
 
+    cleanup = await _ack_and_cleanup_dev_agent(state)
+
     return {
         "report_summary": report_summary,
         "success": True,
         "jira_in_review": state.get("jira_in_review", False),
         "screenshot_included": screenshot_included,
         "screenshot_uploaded": screenshot_uploaded,
+        **cleanup,
     }
 
 
@@ -1108,6 +1164,10 @@ async def escalate_to_user(state: dict) -> dict:
     # First entry: interrupt
     # ------------------------------------------------------------------
     from framework.workflow import interrupt
+
+    cleanup = await _ack_and_cleanup_dev_agent(state)
+    if cleanup.get("dev_agent_session") == {}:
+        state["dev_agent_session"] = {}
 
     revision_count = state.get("revision_count", 0)
     review = state.get("review_result", {})

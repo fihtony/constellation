@@ -10,6 +10,7 @@ from agents.compass.agent import (
     _extract_jira_key,
     _parse_classification_payload,
 )
+from agents.compass.tools import _build_office_execution_contract
 from framework.agent import AgentMode, AgentServices, ExecutionMode
 
 
@@ -191,6 +192,14 @@ class TestCompassClassification:
 
 
 class TestCompassAgent:
+    def test_builds_office_execution_contract(self):
+        contract = _build_office_execution_contract("workspace")
+
+        assert contract["profileName"] == "office"
+        assert "read_pdf" in contract["allowedTools"]
+        assert contract["workflowRef"] == "config/workflows/office_task.yaml"
+        assert contract["checksum"].startswith("sha256:")
+
     async def test_handles_development_task(self):
         """Development tasks are dispatched directly via registry (not run_agentic)."""
         runtime = _mock_runtime()

@@ -176,6 +176,31 @@ class OfficeAgent(BaseAgent):
 
         canonical_task_id = task.id
 
+        exec_contract = metadata.get("executionContract")
+        if not exec_contract or not isinstance(exec_contract, dict):
+            task_store.fail_task(canonical_task_id, "Missing executionContract metadata")
+            return task_store.get_task_dict(canonical_task_id)
+
+        from framework.execution_contract import ExecutionContract
+        from framework.permissions import PermissionEngine, PermissionSet
+        try:
+            contract = ExecutionContract.from_dict(exec_contract)
+            if not contract.verify_checksum() or contract.version != "1.0":
+                raise ValueError("checksum or version verification failed")
+            if not contract.allowed_tools:
+                raise ValueError("allowedTools must be non-empty")
+            self._permission_engine = PermissionEngine(PermissionSet(
+                allowed_tools=contract.allowed_tools,
+                denied_tools=contract.denied_tools,
+                scm="none",
+                filesystem="workspace-only",
+                agent_launching=False,
+                allowed_agents=[],
+            ))
+        except Exception as exc:
+            task_store.fail_task(canonical_task_id, f"Invalid executionContract metadata: {exc}")
+            return task_store.get_task_dict(canonical_task_id)
+
         # Setup logging - use compass_task_id if available, else own task id
         log_task_id = compass_task_id if compass_task_id else canonical_task_id
         log = AgentLogger(task_id=log_task_id, agent_name=self.definition.agent_id)
@@ -215,7 +240,7 @@ class OfficeAgent(BaseAgent):
             "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,
             "_plugin_manager": self.plugin_manager,
-            "_allowed_tools": metadata.get("allowed_tools"),
+            "_allowed_tools": contract.allowed_tools,
             "_permission_engine": getattr(self, "_permission_engine", None),
             "required_skills": list(self.definition.skills or []),
             "user_request": user_text,

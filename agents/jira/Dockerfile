@@ -5,8 +5,7 @@ WORKDIR /app
 COPY pyproject.toml /app/
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git nodejs npm \
-    && npm install -g @anthropic-ai/claude-code \
+    && apt-get install -y --no-install-recommends ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir pyyaml>=6.0 \
     && apt-get clean
@@ -23,8 +22,7 @@ COPY scripts/run_local.py /app/scripts/run_local.py
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
-    ARTIFACT_ROOT=/app/artifacts \
-    AGENT_RUNTIME=claude-code
+    ARTIFACT_ROOT=/app/artifacts
 
 LABEL constellation.agent_id="jira"
 LABEL constellation.agent_name="Jira Agent"

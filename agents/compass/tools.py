@@ -10,6 +10,7 @@ import json
 import os
 import time
 import urllib.request
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -181,6 +182,31 @@ def _office_mount_plan(source_paths: list[str], output_mode: str, launcher) -> d
     }
 
 
+def _build_office_execution_contract(output_mode: str = "workspace") -> dict[str, Any]:
+    """Build the parent-issued execution contract for Office per-task work."""
+    from framework.execution_contract import build_execution_contract, load_child_profiles
+
+    root = Path(__file__).resolve().parents[2]
+    child_profiles = load_child_profiles({
+        "office": str(root / "config" / "permissions" / "office.yaml"),
+    })
+    definition_of_done = {
+        "output_mode": output_mode if output_mode in {"workspace", "inplace"} else "workspace",
+        "delivery_report_required": True,
+        "workspace_output_required": output_mode != "inplace",
+    }
+    contract = build_execution_contract(
+        profile=child_profiles["office"],
+        workflow_ref="config/workflows/office_task.yaml",
+        rule_refs=[],
+        workspace_root=os.environ.get("ARTIFACT_ROOT", ""),
+        definition_of_done=definition_of_done,
+    )
+    if not contract.allowed_tools:
+        raise ValueError("office permission profile has no allowed_tools")
+    return contract.to_dict()
+
+
 def _wait_for_agent_ready(base_url: str, timeout: int = 30) -> None:
     deadline = time.time() + timeout
     health_url = f"{base_url.rstrip('/')}/health"
@@ -222,6 +248,7 @@ def _dispatch_office_task_via_launcher(
 
     try:
         _wait_for_agent_ready(launch["service_url"])
+        execution_contract = _build_office_execution_contract(output_mode)
         result = dispatch_sync(
             url=launch["service_url"],
             capability=_office_requested_capability(capability),
@@ -231,6 +258,7 @@ def _dispatch_office_task_via_launcher(
                 "output_mode": output_mode,
                 "capability": capability,
                 "compassTaskId": orchestrator_task_id,
+                "executionContract": execution_contract,
             },
             timeout=3600,
         )
@@ -470,6 +498,7 @@ class DispatchOfficeTask(BaseTool):
                 meta["compassTaskId"] = orchestrator_task_id
             if callback_url:
                 meta["orchestratorCallbackUrl"] = callback_url
+            meta["executionContract"] = _build_office_execution_contract(output_mode)
 
             from framework.a2a.client import dispatch_sync
 

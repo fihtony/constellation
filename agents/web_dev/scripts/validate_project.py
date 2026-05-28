@@ -89,9 +89,13 @@ def _test_command(package: dict) -> list[str]:
     test_script = str(scripts.get("test") or "")
     if "vitest" in test_script or _has_dependency(package, "vitest"):
         if test_script:
+            if re.search(r"(^|\s)--run(\s|$)", test_script):
+                return ["npm", "test"]
             return ["npm", "test", "--", "--run"]
         return ["npx", "vitest", "--run"]
     if "jest" in test_script or _has_dependency(package, "jest"):
+        if test_script and re.search(r"(^|\s)--runInBand(\s|$)", test_script):
+            return ["npm", "test"]
         return ["npm", "test", "--", "--runInBand"] if test_script else ["npx", "jest", "--runInBand"]
     if test_script:
         return ["npm", "test"]

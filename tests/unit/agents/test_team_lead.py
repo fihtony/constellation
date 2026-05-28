@@ -423,6 +423,59 @@ class TestDispatchDevAgentValidation:
         assert result["screenshot_included"] is True
         assert result["screenshot_uploaded"] is True
 
+    async def test_dispatch_dev_agent_tracks_child_session_metadata(self, monkeypatch):
+        from agents.team_lead.nodes import dispatch_dev_agent
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "web-dev"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                assert name == "dispatch_web_dev"
+                return json.dumps({
+                    "status": "completed",
+                    "summary": "done",
+                    "prUrl": "https://github.com/org/repo/pull/1",
+                    "branch": "feature/ui",
+                    "jiraInReview": True,
+                    "screenshotIncluded": True,
+                    "screenshotUploaded": True,
+                    "childTaskId": "task-web-dev-1",
+                    "childServiceUrl": "http://web-dev-task-1:8050",
+                    "childContainerName": "web-dev-task-1",
+                    "childAgentId": "web-dev",
+                })
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await dispatch_dev_agent(
+            {
+                "_task_id": "task-123",
+                "user_request": "Implement UI",
+                "analysis_summary": "Implement a UI page",
+                "jira_key": "PROJ-123",
+                "workspace_path": "/tmp/workspace",
+                "design_context": {"screen": {"id": "screen-1"}},
+                "plan": {
+                    "definition_of_done": {
+                        "pr_required": True,
+                        "jira_state_management": True,
+                        "screenshot_required": True,
+                    }
+                },
+            }
+        )
+
+        assert result["dev_agent_session"] == {
+            "task_id": "task-web-dev-1",
+            "service_url": "http://web-dev-task-1:8050",
+            "container_name": "web-dev-task-1",
+            "agent_id": "web-dev",
+        }
+
     async def test_review_result_passes_master_task_id_to_code_review(self, monkeypatch):
         from agents.team_lead.nodes import review_result
 
@@ -487,6 +540,80 @@ class TestDispatchDevAgentValidation:
 
         assert result["screenshot_included"] is True
         assert result["screenshot_uploaded"] is True
+
+    async def test_report_success_acknowledges_and_cleans_dev_agent(self, monkeypatch):
+        from agents.team_lead.nodes import report_success
+
+        captured = {"ack": [], "destroy": []}
+
+        async def fake_send_ack(self, base_url, task_id):
+            captured["ack"].append((base_url, task_id))
+
+        class StubLauncher:
+            def destroy_instance(self, agent_id, container_name):
+                captured["destroy"].append((agent_id, container_name))
+
+        monkeypatch.setattr("framework.a2a.client.A2AClient.send_ack", fake_send_ack)
+        monkeypatch.setattr("framework.launcher.get_launcher", lambda: StubLauncher())
+
+        result = await report_success({
+            "_task_id": "task-team-lead",
+            "pr_url": "https://github.com/org/repo/pull/1",
+            "branch_name": "feature/ui",
+            "analysis_summary": "Implemented UI",
+            "review_verdict": "approved",
+            "revision_count": 0,
+            "jira_in_review": True,
+            "screenshot_included": True,
+            "screenshot_uploaded": True,
+            "dev_agent_session": {
+                "task_id": "task-web-dev-1",
+                "service_url": "http://web-dev-task-1:8050",
+                "container_name": "web-dev-task-1",
+                "agent_id": "web-dev",
+            },
+        })
+
+        assert captured["ack"] == [("http://web-dev-task-1:8050", "task-web-dev-1")]
+        assert captured["destroy"] == [("web-dev", "web-dev-task-1")]
+        assert result["dev_agent_acknowledged"] is True
+        assert result["dev_agent_cleaned_up"] is True
+        assert result["dev_agent_session"] == {}
+
+    async def test_request_revision_acknowledges_and_cleans_dev_agent(self, monkeypatch):
+        from agents.team_lead.nodes import request_revision
+
+        captured = {"ack": [], "destroy": []}
+
+        async def fake_send_ack(self, base_url, task_id):
+            captured["ack"].append((base_url, task_id))
+
+        class StubLauncher:
+            def destroy_instance(self, agent_id, container_name):
+                captured["destroy"].append((agent_id, container_name))
+
+        monkeypatch.setattr("framework.a2a.client.A2AClient.send_ack", fake_send_ack)
+        monkeypatch.setattr("framework.launcher.get_launcher", lambda: StubLauncher())
+
+        result = await request_revision({
+            "_task_id": "task-team-lead",
+            "review_result": {
+                "summary": "Needs spacing fix",
+                "comments": [{"severity": "medium", "message": "Fix spacing"}],
+            },
+            "dev_agent_session": {
+                "task_id": "task-web-dev-1",
+                "service_url": "http://web-dev-task-1:8050",
+                "container_name": "web-dev-task-1",
+                "agent_id": "web-dev",
+            },
+        })
+
+        assert captured["ack"] == [("http://web-dev-task-1:8050", "task-web-dev-1")]
+        assert captured["destroy"] == [("web-dev", "web-dev-task-1")]
+        assert result["dev_agent_acknowledged"] is True
+        assert result["dev_agent_cleaned_up"] is True
+        assert result["dev_agent_session"] == {}
 
     def test_callback_propagates_screenshot_evidence(self, monkeypatch):
         from agents.team_lead.agent import _send_callback
@@ -716,11 +843,14 @@ class TestTeamLeadTools:
         assert payload["status"] == "completed"
         assert payload["screenshotIncluded"] is True
         assert payload["screenshotUploaded"] is True
+        assert payload["childServiceUrl"] == "http://launched-web-dev:8050"
+        assert payload["childContainerName"] == "web-dev-task-1234"
+        assert payload["childAgentId"] == "web-dev"
         assert calls["launch"][0][1] == "task-123"
         assert calls["dispatch"][0]["url"] == "http://launched-web-dev:8050"
         assert calls["dispatch"][0]["timeout"] == 3600
         assert calls["dispatch"][0]["metadata"]["orchestratorTaskId"] == "task-123"
-        assert calls["destroy"] == [("web-dev", "web-dev-task-1234")]
+        assert calls["destroy"] == []
 
     def test_dispatch_web_dev_uses_configurable_timeout(self, monkeypatch):
         from agents.team_lead.tools import DispatchWebDev

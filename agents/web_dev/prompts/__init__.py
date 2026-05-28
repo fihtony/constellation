@@ -464,6 +464,9 @@ For UI tasks — MANDATORY steps (in order):
      - 5 lesson list items (each with unit label, lesson title, arrow icon) → implement exactly 5
      - Footer with copyright and policy links → implement it
    If a component is NOT in this list, do NOT implement it.
+   CRITICAL: You MUST implement ALL structural sections present in the Design HTML Reference
+   (header/nav, main content area, footer). A page with ONLY the main section but missing
+   the header and footer from the design reference is INCOMPLETE and will fail review.
    FORBIDDEN: search bars, filter controls, tags, badges, duration metadata, author fields,
    rating stars, pagination, loading states, extra CTA sections, breadcrumbs — unless
    explicitly present in the Design HTML Reference.

@@ -110,6 +110,7 @@ def _dispatch_via_launcher(
     message_parts: list[dict[str, Any]],
     metadata: dict[str, Any],
     timeout: int,
+    preserve_instance: bool = False,
 ) -> dict:
     from framework.a2a.client import dispatch_sync
 
@@ -119,18 +120,43 @@ def _dispatch_via_launcher(
 
     try:
         _wait_for_agent_ready(launch["service_url"])
-        return dispatch_sync(
+        result = dispatch_sync(
             url=launch["service_url"],
             capability=capability,
             message_parts=message_parts,
             metadata=metadata,
             timeout=timeout,
         )
+        if preserve_instance and isinstance(result, dict):
+            result = dict(result)
+            result["_launch"] = {
+                "agentId": agent_id,
+                "serviceUrl": launch["service_url"],
+                "containerName": launch["container_name"],
+            }
+        return result
     finally:
-        try:
-            launcher.destroy_instance(agent_id, launch["container_name"])
-        except Exception:
-            pass
+        if not preserve_instance:
+            try:
+                launcher.destroy_instance(agent_id, launch["container_name"])
+            except Exception:
+                pass
+
+
+def _destroy_launch_instance(launch_info: dict[str, Any] | None) -> bool:
+    if not isinstance(launch_info, dict):
+        return False
+
+    container_name = str(launch_info.get("containerName") or "").strip()
+    if not container_name:
+        return False
+
+    agent_id = str(launch_info.get("agentId") or "unknown-agent").strip() or "unknown-agent"
+    try:
+        get_launcher().destroy_instance(agent_id, container_name)
+    except Exception:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +503,8 @@ class DispatchWebDev(BaseTool):
         capability = "web-dev.task.execute"
         definition = _capability_definition(capability)
         meta: dict[str, Any] = {}
+        web_dev_url = ""
+        launch_info: dict[str, Any] | None = None
         if jira_context:
             meta["jiraContext"] = jira_context
         if design_context:
@@ -535,7 +563,10 @@ class DispatchWebDev(BaseTool):
                     message_parts=[{"text": task_description}],
                     metadata=meta,
                     timeout=timeout_seconds,
+                    preserve_instance=True,
                 )
+                if isinstance(result, dict) and isinstance(result.get("_launch"), dict):
+                    launch_info = dict(result["_launch"])
             else:
                 web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", capability)
                 if not web_dev_url:
@@ -553,6 +584,7 @@ class DispatchWebDev(BaseTool):
             task = result.get("task", result)
             task_state = _task_state(task)
             if task_state != "TASK_STATE_COMPLETED":
+                _destroy_launch_instance(launch_info)
                 return ToolResult(output=json.dumps({
                     "status": "error",
                     "state": task_state,
@@ -562,6 +594,10 @@ class DispatchWebDev(BaseTool):
             summary = _extract_text(artifacts) or "Dev task completed."
             pr_url = _find_metadata(artifacts, "prUrl")
             branch = _find_metadata(artifacts, "branch")
+            child_task_id = str(task.get("id") or "").strip()
+            child_service_url = str((launch_info or {}).get("serviceUrl") or web_dev_url or "").strip()
+            child_container_name = str((launch_info or {}).get("containerName") or "").strip()
+            child_agent_id = str((launch_info or {}).get("agentId") or "web-dev").strip() or "web-dev"
             jira_in_review_raw = _find_metadata(artifacts, "jiraInReview")
             screenshot_included_raw = _find_metadata(artifacts, "screenshotIncluded")
             screenshot_uploaded_raw = _find_metadata(artifacts, "screenshotUploaded")
@@ -569,7 +605,7 @@ class DispatchWebDev(BaseTool):
             jira_in_review = jira_in_review_raw in (True, "True", "true", "1")
             screenshot_included = screenshot_included_raw in (True, "True", "true", "1")
             screenshot_uploaded = screenshot_uploaded_raw in (True, "True", "true", "1")
-            return ToolResult(output=json.dumps({
+            payload = {
                 "status": "completed",
                 "summary": summary,
                 "prUrl": pr_url,
@@ -577,8 +613,18 @@ class DispatchWebDev(BaseTool):
                 "jiraInReview": jira_in_review,
                 "screenshotIncluded": screenshot_included,
                 "screenshotUploaded": screenshot_uploaded,
-            }))
+            }
+            if child_task_id:
+                payload["childTaskId"] = child_task_id
+            if child_service_url:
+                payload["childServiceUrl"] = child_service_url
+            if child_container_name:
+                payload["childContainerName"] = child_container_name
+            if child_agent_id:
+                payload["childAgentId"] = child_agent_id
+            return ToolResult(output=json.dumps(payload))
         except Exception as exc:
+            _destroy_launch_instance(launch_info)
             return ToolResult(output=json.dumps({"status": "error", "message": str(exc)}))
 
 
