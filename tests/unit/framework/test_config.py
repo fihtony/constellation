@@ -39,7 +39,7 @@ def project_dir(tmp_path):
         execution_mode: persistent
         runtime_backend: claude-code
         model: claude-haiku-4-5-20251001
-                permission_profile: team-lead
+        permission_profile: team-lead
         port: 8030
     """))
 
@@ -72,14 +72,14 @@ def project_dir(tmp_path):
         scm: read-write
         filesystem: workspace-only
     """))
-        (perm_dir / "team-lead.yaml").write_text(textwrap.dedent("""\
-                allowed_tools:
-                    - dispatch_agent
-                    - query_registry
-                denied_tools: []
-                scm: read-write
-                filesystem: workspace-only
-        """))
+    (perm_dir / "team-lead.yaml").write_text(textwrap.dedent("""\
+        allowed_tools:
+          - dispatch_agent
+          - query_registry
+        denied_tools: []
+        scm: read-write
+        filesystem: workspace-only
+    """))
     (perm_dir / "web-dev.yaml").write_text(textwrap.dedent("""\
         allowed_tools:
           - read_file

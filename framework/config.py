@@ -238,12 +238,12 @@ def build_agent_definition_from_config(
     if permission_profile:
         profile_permissions = _load_yaml(root / "config" / "permissions" / f"{permission_profile}.yaml")
     tools = data.get("tools", [])
-    if not tools and isinstance(profile_permissions, dict):
-        tools = list(profile_permissions.get("allowed_tools", []) or [])
     inline_permissions = data.get("permissions", {})
     permissions = dict(profile_permissions)
     if isinstance(inline_permissions, dict) and inline_permissions:
         _deep_merge(permissions, inline_permissions)
+    if not tools and isinstance(permissions, dict):
+        tools = list(permissions.get("allowed_tools", []) or [])
 
     return {
         "agent_id": data.get("agent_id", agent_id),
