@@ -10,7 +10,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates chromium curl git nodejs npm \
     && npm install -g @anthropic-ai/claude-code \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir pyyaml>=6.0 \
+    && pip install --no-cache-dir "pyyaml>=6.0" \
     && pip install --no-cache-dir "playwright>=1.45,<2" \
     && apt-get clean
 
@@ -21,6 +21,7 @@ COPY skills/react-nextjs/ /app/skills/react-nextjs/
 COPY skills/testing/ /app/skills/testing/
 RUN mkdir -p /app/config/permissions /app/config/rules /app/config/workflows
 COPY config/constellation.yaml /app/config/constellation.yaml
+COPY config/permissions/web-dev.yaml /app/config/permissions/web-dev.yaml
 COPY config/rules/ /app/config/rules/
 COPY config/workflows/ /app/config/workflows/
 COPY scripts/run_local.py /app/scripts/run_local.py

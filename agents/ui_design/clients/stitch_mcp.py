@@ -126,6 +126,9 @@ class StitchMcpClient:
             return {}, _error_status(resp)
         result = resp.get("result", {})
         if result.get("isError"):
+            fallback = self._screen_from_list_screens(project_id, screen_id, timeout)
+            if fallback:
+                return fallback, "ok"
             return {}, "tool_error"
         content = result.get("content", [])
         if isinstance(content, list):
@@ -171,6 +174,37 @@ class StitchMcpClient:
                 "imageUrls": image_urls,
             }, "ok"
         return result, "ok"
+
+    def _screen_from_list_screens(
+        self,
+        project_id: str,
+        screen_id: str,
+        timeout: int = 60,
+    ) -> dict | None:
+        """Fallback for transient get_screen failures.
+
+        Stitch's list_screens response already includes the screen HTML and
+        screenshot download URLs, which is enough for workspace persistence.
+        """
+        screens, status = self.list_screens(project_id, timeout)
+        if status != "ok":
+            return None
+
+        matched = _match_screen_entry(screens, screen_id)
+        if not matched:
+            return None
+
+        screenshot_url = (matched.get("screenshot") or {}).get("downloadUrl", "")
+        image_urls = [screenshot_url] if screenshot_url else []
+        text = json.dumps(matched, ensure_ascii=False)
+        return {
+            **matched,
+            "projectId": project_id,
+            "screenId": _screen_entry_id(matched) or screen_id,
+            "content": [{"type": "text", "text": text}],
+            "text": text,
+            "imageUrls": image_urls,
+        }
 
     def get_screen_image(
         self,
@@ -257,6 +291,26 @@ class StitchMcpClient:
 def _error_status(resp: dict) -> str:
     code = resp.get("error", {}).get("code", "unknown")
     return f"error_{code}"
+
+
+def _screen_entry_id(screen: dict) -> str:
+    name = str(screen.get("name", ""))
+    if "/screens/" in name:
+        return name.rsplit("/", 1)[-1]
+    return str(screen.get("id", ""))
+
+
+def _match_screen_entry(screens: list[dict], screen_id: str) -> dict | None:
+    if not screen_id:
+        return None
+
+    normalized = screen_id.strip()
+    for screen in screens:
+        entry_id = _screen_entry_id(screen)
+        name = str(screen.get("name", ""))
+        if entry_id == normalized or name == normalized or name.endswith(f"/{normalized}"):
+            return screen
+    return None
 
 
 def _parse_screens_text(text: str) -> list[dict]:

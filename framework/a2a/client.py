@@ -14,6 +14,19 @@ import urllib.request
 from typing import Any
 
 from framework.a2a.protocol import Task, TaskState
+from framework.boundary_permissions import current_permission_snapshot
+
+
+def _attach_current_permissions(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    """Attach the current permission snapshot unless the caller already supplied one."""
+    meta = dict(metadata or {})
+    if isinstance(meta.get("permissions"), dict):
+        return meta
+
+    snapshot = current_permission_snapshot()
+    if isinstance(snapshot, dict):
+        meta["permissions"] = snapshot
+    return meta
 
 
 class A2AClient:
@@ -107,7 +120,8 @@ class A2AClient:
     def _build_envelope(self, message: dict, callback_url: str | None) -> dict:
         """Wrap a message in the A2A send envelope."""
         import uuid
-        metadata = message.pop("metadata", {})
+        raw_metadata = message.pop("metadata", {})
+        metadata = _attach_current_permissions(raw_metadata if isinstance(raw_metadata, dict) else {})
         if callback_url:
             metadata["orchestratorCallbackUrl"] = callback_url
 
@@ -213,7 +227,8 @@ def dispatch_sync(
     """
     import uuid
 
-    meta = {**(metadata or {}), "requestedCapability": capability}
+    meta = _attach_current_permissions(metadata)
+    meta["requestedCapability"] = capability
     envelope = {
         "message": {
             "messageId": str(uuid.uuid4()),

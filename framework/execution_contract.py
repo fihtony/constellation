@@ -248,3 +248,14 @@ def resolve_execution_contract_permission_set(
         allowed_agents=allowed_agents,
     )
     return contract, permission_set
+
+
+def permission_snapshot_from_permission_set(permission_set: "PermissionSet") -> dict[str, Any]:
+    """Serialize a resolved child PermissionSet for A2A metadata handoff."""
+    return {
+        "allowedTools": list(permission_set.allowed_tools or []),
+        "deniedTools": list(permission_set.denied_tools or []),
+        "scm": permission_set.scm,
+        "filesystem": permission_set.filesystem,
+        "custom": dict(permission_set.custom or {}),
+    }

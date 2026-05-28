@@ -229,8 +229,13 @@ def _call_boundary_tool(state: dict, tool_name: str, args: dict) -> dict:
     from framework.tools.registry import get_registry
 
     registry = get_registry()
+    tool_args = dict(args)
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+    permissions = metadata.get("permissions")
+    if isinstance(permissions, dict) and not isinstance(tool_args.get("permissions"), dict):
+        tool_args["permissions"] = permissions
     try:
-        result_str = registry.execute_sync(tool_name, args)
+        result_str = registry.execute_sync(tool_name, tool_args)
         return json.loads(result_str) if result_str else {}
     except Exception as exc:
         print(f"[{_AGENT_ID}] Tool {tool_name} failed: {exc}")

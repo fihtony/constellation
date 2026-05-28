@@ -106,6 +106,57 @@ class TestDispatchSyncTerminalStates:
 
         assert mock_urlopen.call_args_list[0].kwargs["timeout"] == 120
 
+    @patch("framework.a2a.client.current_permission_snapshot")
+    @patch("framework.a2a.client.urllib.request.urlopen")
+    def test_dispatch_sync_attaches_current_permissions(self, mock_urlopen, mock_snapshot):
+        """dispatch_sync should attach the caller permission snapshot to outbound metadata."""
+        mock_snapshot.return_value = {
+            "allowedTools": ["fetch_jira_ticket"],
+            "scm": "read-write",
+            "filesystem": "workspace-only",
+        }
+        send_resp = self._mock_response("TASK_STATE_COMPLETED", "t-006")
+        mock_urlopen.side_effect = [send_resp]
+
+        dispatch_sync(
+            url="http://fake:8000",
+            capability="jira.ticket.fetch",
+            message_parts=[{"text": "PROJ-123"}],
+            metadata={"ticketKey": "PROJ-123"},
+            poll_interval=0,
+        )
+
+        request = mock_urlopen.call_args_list[0].args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        metadata = payload["message"]["metadata"]
+        assert metadata["ticketKey"] == "PROJ-123"
+        assert metadata["requestedCapability"] == "jira.ticket.fetch"
+        assert metadata["permissions"]["allowedTools"] == ["fetch_jira_ticket"]
+
+    @patch("framework.a2a.client.current_permission_snapshot")
+    @patch("framework.a2a.client.urllib.request.urlopen")
+    def test_dispatch_sync_preserves_explicit_permissions(self, mock_urlopen, mock_snapshot):
+        """dispatch_sync must not overwrite an explicit permission snapshot."""
+        mock_snapshot.return_value = {"allowedTools": ["wrong"]}
+        send_resp = self._mock_response("TASK_STATE_COMPLETED", "t-007")
+        mock_urlopen.side_effect = [send_resp]
+
+        dispatch_sync(
+            url="http://fake:8000",
+            capability="jira.ticket.fetch",
+            message_parts=[{"text": "PROJ-123"}],
+            metadata={
+                "ticketKey": "PROJ-123",
+                "permissions": {"allowedTools": ["fetch_jira_ticket"], "scm": "read"},
+            },
+            poll_interval=0,
+        )
+
+        request = mock_urlopen.call_args_list[0].args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        metadata = payload["message"]["metadata"]
+        assert metadata["permissions"] == {"allowedTools": ["fetch_jira_ticket"], "scm": "read"}
+
 
 class TestA2AClientAsync:
     """Test async A2AClient methods."""
@@ -115,3 +166,32 @@ class TestA2AClientAsync:
         client = A2AClient()
         with pytest.raises(ValueError, match="Either url or"):
             await client.dispatch(message={"text": "hi"})
+
+    @pytest.mark.asyncio
+    @patch("framework.a2a.client.current_permission_snapshot")
+    @patch("framework.a2a.client.A2AClient._http_post")
+    async def test_async_dispatch_envelope_attaches_current_permissions(self, mock_post, mock_snapshot):
+        mock_snapshot.return_value = {
+            "allowedTools": ["fetch_jira_ticket"],
+            "scm": "read-write",
+            "filesystem": "workspace-only",
+        }
+        mock_post.return_value = {
+            "task": {
+                "id": "t-008",
+                "status": {"state": "TASK_STATE_COMPLETED"},
+                "artifacts": [],
+            }
+        }
+
+        client = A2AClient()
+        await client.dispatch(
+            url="http://fake:8000",
+            message={"text": "hello", "metadata": {"ticketKey": "PROJ-123"}},
+            wait=False,
+        )
+
+        envelope = mock_post.call_args.args[1]
+        metadata = envelope["message"]["metadata"]
+        assert metadata["ticketKey"] == "PROJ-123"
+        assert metadata["permissions"]["allowedTools"] == ["fetch_jira_ticket"]

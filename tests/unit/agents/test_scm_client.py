@@ -4,6 +4,7 @@ Covers both project-based and user-based repo URL formats.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 
 import pytest
@@ -463,3 +464,83 @@ class TestGitHubMCPProviderPrEvidenceCompatibility:
             "task_id": "task-123",
             "timeout": 30,
         }
+
+
+class TestScmToolPermissionPropagation:
+    def test_scm_push_forwards_current_permission_snapshot(self, monkeypatch):
+        from agents.scm.tools import SCMPush
+
+        captured = {}
+
+        class FakeAdapter:
+            def _dispatch(self, capability, text, message):
+                captured["capability"] = capability
+                captured["text"] = text
+                captured["metadata"] = message["metadata"]
+                return {"status": "ok", "pushed": True}
+
+        monkeypatch.setattr("agents.scm.tools._get_adapter", lambda: FakeAdapter())
+        monkeypatch.setattr(
+            "agents.scm.tools.current_permission_snapshot",
+            lambda: {
+                "allowedTools": ["scm_push", "scm_create_pr"],
+                "deniedTools": [],
+                "scm": "read-write",
+                "filesystem": "workspace-only",
+                "custom": {},
+            },
+        )
+
+        result = json.loads(
+            SCMPush().execute_sync(repo_path="/tmp/repo", branch="feature/test", task_id="task-1").output
+        )
+
+        assert result["status"] == "ok"
+        assert captured["capability"] == "scm.branch.push"
+        assert captured["metadata"]["branch"] == "feature/test"
+        assert captured["metadata"]["permissions"]["scm"] == "read-write"
+
+    def test_scm_create_pr_forwards_current_permission_snapshot(self, monkeypatch):
+        from agents.scm.tools import SCMCreatePR
+
+        captured = {}
+
+        class FakeAdapter:
+            def _dispatch(self, capability, text, message):
+                captured["capability"] = capability
+                captured["text"] = text
+                captured["metadata"] = message["metadata"]
+                return {
+                    "status": "created",
+                    "prUrl": "https://github.com/org/repo/pull/42",
+                    "pr": {"id": 42},
+                }
+
+        monkeypatch.setattr("agents.scm.tools._get_adapter", lambda: FakeAdapter())
+        monkeypatch.setattr(
+            "agents.scm.tools.current_permission_snapshot",
+            lambda: {
+                "allowedTools": ["scm_push", "scm_create_pr"],
+                "deniedTools": [],
+                "scm": "read-write",
+                "filesystem": "workspace-only",
+                "custom": {},
+            },
+        )
+
+        result = json.loads(
+            SCMCreatePR().execute_sync(
+                repo_url="https://github.com/org/repo",
+                source_branch="feature/test",
+                target_branch="main",
+                title="Test PR",
+                description="Body",
+                task_id="task-2",
+            ).output
+        )
+
+        assert result["status"] == "created"
+        assert result["prUrl"] == "https://github.com/org/repo/pull/42"
+        assert captured["capability"] == "scm.pr.create"
+        assert captured["metadata"]["sourceBranch"] == "feature/test"
+        assert captured["metadata"]["permissions"]["allowedTools"] == ["scm_push", "scm_create_pr"]
