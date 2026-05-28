@@ -515,6 +515,18 @@ class JiraMCPProvider(JiraProvider):
         # MCP does not expose a list_comments tool; fallback to REST
         return self._rest.list_comments(ticket_key, max_results)
 
+    def get_sprint(
+        self, board_id: str = "", ticket_key: str = ""
+    ) -> tuple[dict | None, str]:
+        # MCP does not expose sprint helpers; fallback to REST.
+        return self._rest.get_sprint(board_id=board_id, ticket_key=ticket_key)
+
+    def link_issue(
+        self, ticket_key: str, linked_key: str, link_type: str
+    ) -> tuple[dict | None, str]:
+        # MCP does not expose issue-link helpers; fallback to REST.
+        return self._rest.link_issue(ticket_key, linked_key, link_type)
+
     @property
     def backend_name(self) -> str:
         return "mcp"

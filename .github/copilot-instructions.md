@@ -904,6 +904,11 @@ constellation/
 └── v1/                  # Archived v1 codebase kept for reference and compatibility
 ```
 
+### v2 Agent Config Conventions
+
+- `agents/<name>/config.yaml` should declare `permission_profile`, but should not duplicate `tools:` when the runtime tool surface matches `config/permissions/<profile>.yaml`.
+- `framework.config.build_agent_definition_from_config()` now defaults `AgentDefinition.tools` from that profile's `allowed_tools`; only keep an explicit `tools:` list in agent config when the advertised/runtime tool surface must intentionally differ from the maximum permission envelope.
+
 ### v2 Testing
 
 ```bash

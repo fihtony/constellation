@@ -19,7 +19,10 @@ COPY agents/__init__.py /app/agents/__init__.py
 COPY agents/web_dev/ /app/agents/web_dev/
 COPY skills/react-nextjs/ /app/skills/react-nextjs/
 COPY skills/testing/ /app/skills/testing/
-COPY config/ /app/config/
+RUN mkdir -p /app/config/permissions /app/config/rules /app/config/workflows
+COPY config/constellation.yaml /app/config/constellation.yaml
+COPY config/rules/ /app/config/rules/
+COPY config/workflows/ /app/config/workflows/
 COPY scripts/run_local.py /app/scripts/run_local.py
 
 ENV PYTHONUNBUFFERED=1 \

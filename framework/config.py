@@ -230,8 +230,20 @@ def build_agent_definition_from_config(
 
     Returns a dict suitable for ``AgentDefinition(**result)``.
     """
-    cfg = load_agent_config(agent_id, project_root, overrides)
+    root = Path(project_root) if project_root else _find_project_root()
+    cfg = load_agent_config(agent_id, root, overrides)
     data = cfg.to_dict()
+    permission_profile = data.get("permission_profile", "")
+    profile_permissions = {}
+    if permission_profile:
+        profile_permissions = _load_yaml(root / "config" / "permissions" / f"{permission_profile}.yaml")
+    tools = data.get("tools", [])
+    inline_permissions = data.get("permissions", {})
+    permissions = dict(profile_permissions)
+    if isinstance(inline_permissions, dict) and inline_permissions:
+        _deep_merge(permissions, inline_permissions)
+    if not tools and isinstance(permissions, dict):
+        tools = list(permissions.get("allowed_tools", []) or [])
 
     return {
         "agent_id": data.get("agent_id", agent_id),
@@ -241,9 +253,9 @@ def build_agent_definition_from_config(
         "mode": data.get("mode", "task"),
         "execution_mode": data.get("execution_mode", "per-task"),
         "skills": data.get("default_skills", data.get("skills", [])),
-        "tools": data.get("tools", []),
-        "permissions": data.get("permissions", {}),
-        "permission_profile": data.get("permission_profile", ""),
+        "tools": tools,
+        "permissions": permissions,
+        "permission_profile": permission_profile,
         "runtime_backend": data.get("runtime_backend", cfg.get("runtime.backend", "connect-agent")),
         "model": data.get("model", cfg.get("runtime.model", "gpt-5-mini")),
         "config": data,

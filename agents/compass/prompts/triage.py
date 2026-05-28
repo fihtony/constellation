@@ -63,54 +63,55 @@ action verb ("implement", "fix", "review", "develop") → ALWAYS development.
 2. A Jira key alone (e.g. "PROJ-123") with no further context → development (assume implementation).
 3. File paths or document names with operation verbs ("summarize", "analyze", "organize") → office.
 4. Ambiguous requests with both code and document hints → development takes precedence.
-5. Respond with ONLY the category name (one lowercase word): development, office, or general.
+5. Respond with ONLY compact JSON in this shape:
+  {"type":"development|office|general","confidence":0.0-1.0}
 
 EXAMPLES
 --------
-Request: "implement the jira ticket CSTL-2 lesson library page"
-Category: development
+Request: "implement the jira ticket PROJ-123 lesson library page"
+Response: {"type":"development","confidence":0.98}
 
 Request: "please fix bug https://github.com/org/repo/issues/42"
-Category: development
+Response: {"type":"development","confidence":0.98}
 
 Request: "create a PR for branch feature/login-page"
-Category: development
+Response: {"type":"development","confidence":0.96}
 
 Request: "do a code review for PR #99 in english-study-hub"
-Category: development
+Response: {"type":"development","confidence":0.96}
 
 Request: "refactor the auth module to use JWT tokens"
-Category: development
+Response: {"type":"development","confidence":0.95}
 
 Request: "write unit tests for the payment service"
-Category: development
+Response: {"type":"development","confidence":0.95}
 
 Request: "set up docker compose for the backend services"
-Category: development
+Response: {"type":"development","confidence":0.94}
 
 Request: "summarize the quarterly report in ~/Documents/Q3-report.pdf"
-Category: office
+Response: {"type":"office","confidence":0.97}
 
 Request: "analyze the sales data in the spreadsheet /home/user/data/sales.xlsx"
-Category: office
+Response: {"type":"office","confidence":0.97}
 
 Request: "organize files in the /downloads folder by date"
-Category: office
+Response: {"type":"office","confidence":0.96}
 
 Request: "What is the difference between REST and GraphQL?"
-Category: general
+Response: {"type":"general","confidence":0.95}
 
 Request: "explain how JWT authentication works"
-Category: general
+Response: {"type":"general","confidence":0.95}
 
 Request: "hello, what can you help me with?"
-Category: general
+Response: {"type":"general","confidence":0.92}
 """
 
 TRIAGE_TEMPLATE = """\
 Classify this user request into one category (development, office, or general).
-Reply with ONLY the category name — nothing else.
+Reply with ONLY compact JSON: {{"type":"development|office|general","confidence":0.0-1.0}}
 
 Request: {user_request}
 
-Category:"""
+JSON:"""

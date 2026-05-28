@@ -1,8 +1,11 @@
 """Tests for Code Review Agent workflow."""
 import json
 import pytest
+from unittest.mock import MagicMock
+from framework.agent import AgentServices
+from framework.task_store import InMemoryTaskStore
 from framework.workflow import START, END
-from agents.code_review.agent import code_review_workflow, code_review_definition
+from agents.code_review.agent import CodeReviewAgent, code_review_workflow, code_review_definition
 from agents.code_review.nodes import (
     load_pr_context,
     review_quality,
@@ -24,6 +27,20 @@ def _make_runtime(response: str):
         def run(self, prompt, **kw):
             return {"raw_response": response}
     return _MockRuntime()
+
+
+def _agent_services(runtime=None):
+    return AgentServices(
+        session_service=MagicMock(),
+        event_store=MagicMock(),
+        memory_service=MagicMock(),
+        skills_registry=MagicMock(),
+        plugin_manager=MagicMock(),
+        checkpoint_service=MagicMock(),
+        runtime=runtime or MagicMock(),
+        registry_client=None,
+        task_store=InMemoryTaskStore(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +67,17 @@ class TestCodeReviewWorkflowCompile:
         assert code_review_definition.mode == AgentMode.TASK
         assert code_review_definition.execution_mode == ExecutionMode.PER_TASK
         assert code_review_definition.permissions.get("scm") == "read"
+
+
+class TestCodeReviewExecutionContract:
+
+    async def test_handle_message_fails_closed_without_execution_contract(self):
+        agent = CodeReviewAgent(definition=code_review_definition, services=_agent_services())
+
+        result = await agent.handle_message({"message": {"parts": [{"text": "Review PR"}], "metadata": {}}})
+
+        assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
+        assert "Missing executionContract" in result["task"]["status"]["message"]["parts"][0]["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +155,59 @@ class TestLoadPrContext:
 
         checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-start.json"
         assert checkpoint_file.exists()
+
+    async def test_loads_workspace_boundary_artifacts_and_latest_self_assessment(self, tmp_path):
+        workspace_path = tmp_path / "task-123"
+        jira_dir = workspace_path / "jira" / "PROJ-123"
+        jira_dir.mkdir(parents=True)
+        (jira_dir / "ticket.json").write_text(json.dumps({
+            "data": {
+                "key": "PROJ-123",
+                "fields": {"description": "Ship the lesson page"},
+            }
+        }))
+
+        design_dir = workspace_path / "ui-design" / "stitch"
+        design_dir.mkdir(parents=True)
+        (design_dir / "DESIGN.md").write_text("# Design spec")
+        (design_dir / "code.html").write_text("<main>lesson</main>")
+        (design_dir / "screen-meta.json").write_text(json.dumps({"screen": {"title": "Lesson Library"}}))
+
+        web_dev_dir = workspace_path / "web-dev"
+        web_dev_dir.mkdir(parents=True)
+        (web_dev_dir / "pr-evidence.json").write_text(json.dumps({
+            "data": {
+                "pr_url": "https://github.com/org/repo/pull/12",
+                "pr_number": 12,
+                "changed_files": ["src/App.tsx"],
+            }
+        }))
+        (web_dev_dir / "self-assessment-1.json").write_text(json.dumps({"data": {"score": 0.9}}))
+        (web_dev_dir / "self-assessment-2.json").write_text(json.dumps({"data": {"score": 1.0}}))
+
+        state = {
+            "_task_id": "task-123",
+            "metadata": {
+                "repoUrl": "https://github.com/org/repo",
+                "workspacePath": str(workspace_path),
+                "contextManifestPath": "team-lead/context-manifest.json",
+                "jiraContext": {"key": "PROJ-123"},
+            },
+        }
+        (workspace_path / "team-lead").mkdir(parents=True)
+        (workspace_path / "team-lead" / "context-manifest.json").write_text("{}")
+
+        result = await load_pr_context(state)
+
+        assert result["pr_number"] == 12
+        assert result["changed_files"] == ["src/App.tsx"]
+        assert result["jira_context"]["key"] == "PROJ-123"
+        assert result["design_context"]["spec_markdown"] == "# Design spec"
+        assert "jira/PROJ-123/ticket.json" in result["checked_artifacts"]
+        assert "ui-design/stitch/DESIGN.md" in result["checked_artifacts"]
+        assert "web-dev/pr-evidence.json" in result["checked_artifacts"]
+        assert "web-dev/self-assessment-2.json" in result["checked_artifacts"]
+        assert (workspace_path / "code-review" / "review-checkpoints" / "review-start.json").exists()
 
 
 class TestReviewQuality:
@@ -306,17 +387,20 @@ class TestGenerateReport:
             "test_issues": [],
             "requirement_gaps": [],
             "workspace_path": str(tmp_path),
-            "context_manifest_path": "team-lead/context-manifest.json",
-            "jira_context": {"key": "PROJ-123"},
-            "design_context": {"screen": "Login"},
+            "checked_artifacts": [
+                "jira/PROJ-123/ticket.json",
+                "ui-design/stitch/DESIGN.md",
+                "web-dev/self-assessment-2.json",
+                "web-dev/pr-evidence.json",
+            ],
         }
 
         result = await generate_report(state)
 
         checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-summary.json"
         assert checkpoint_file.exists()
-        assert "team-lead/jira-ticket.json" in result["checked_artifacts"]
-        assert "team-lead/design-spec.json" in result["checked_artifacts"]
+        assert "jira/PROJ-123/ticket.json" in result["checked_artifacts"]
+        assert "ui-design/stitch/DESIGN.md" in result["checked_artifacts"]
 
 
 class TestCodeReviewWorkflowExecution:

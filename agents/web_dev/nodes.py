@@ -612,21 +612,52 @@ async def setup_workspace(state: dict) -> dict:
         else:
             branch_name = f"feature/{task_suffix}"
 
-    # -- Check remote for branch name conflicts; add _<n> suffix when taken --
+    local_branch_exists = False
+    if repo_path and os.path.isdir(repo_path) and branch_name:
+        import subprocess
+        from framework.env_utils import build_isolated_git_env
+
+        git_env = build_isolated_git_env("web-dev-setup-local-branch")
+        exists = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+            cwd=repo_path,
+            env=git_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        local_branch_exists = exists.returncode == 0
+
+    # -- Check remote branches and open PR source branches for conflicts; add _<n> suffix when taken --
     # Must not delete or alter existing remote branches or PRs.
-    if branch_name and repo_url:
+    if branch_name and repo_url and not local_branch_exists:
         remote_result = _call_boundary_tool(state, "scm_list_branches", {"repo_url": repo_url})
         remote_branch_names = {
-            b.get("displayId", "") for b in remote_result.get("branches", [])
+            candidate
+            for b in remote_result.get("branches", [])
+            for candidate in [
+                b.get("displayId", ""),
+                b.get("name", ""),
+                str(b.get("id", "")).replace("refs/heads/", ""),
+            ]
+            if candidate
         }
-        if branch_name in remote_branch_names:
+        pr_result = _call_boundary_tool(state, "scm_list_prs", {"repo_url": repo_url, "state": "open"})
+        reserved_pr_branches = {
+            str(pr.get("fromBranch") or pr.get("fromRef") or pr.get("sourceBranch") or "").strip()
+            for pr in pr_result.get("prs", [])
+            if str(pr.get("fromBranch") or pr.get("fromRef") or pr.get("sourceBranch") or "").strip()
+        }
+        reserved_names = remote_branch_names | reserved_pr_branches
+        if branch_name in reserved_names:
+            base_name = branch_name
             n = 2
-            while f"{branch_name}_{n}" in remote_branch_names:
+            while f"{base_name}_{n}" in reserved_names:
                 n += 1
-            new_name = f"{branch_name}_{n}"
+            new_name = f"{base_name}_{n}"
             print(
-                f"[{_AGENT_ID}] setup_workspace: branch {branch_name!r} exists on remote, "
-                f"using {new_name!r} to avoid conflict"
+                f"[{_AGENT_ID}] setup_workspace: branch {branch_name!r} is already reserved "
+                f"by a remote branch or open PR, using {new_name!r} to avoid conflict"
             )
             branch_name = new_name
 
@@ -735,6 +766,30 @@ async def analyze_task(state: dict) -> dict:
             pass
 
     plan = "\n".join(plan_parts) if plan_parts else analysis
+    structured_plan = {
+        "implementation_steps": [],
+        "test_plan": [],
+        "risks": [],
+    }
+    if isinstance(delivery_plan, dict) and delivery_plan.get("steps"):
+        structured_plan["implementation_steps"] = [
+            str(step.get("action") or step.get("description") or step)
+            for step in delivery_plan.get("steps", [])
+            if isinstance(step, dict) or step
+        ]
+    if not structured_plan["implementation_steps"] and plan:
+        structured_plan["implementation_steps"] = [plan]
+    structured_plan["test_plan"] = [
+        "Run deterministic install, build, and test validation before PR creation."
+    ]
+    structured_plan["risks"] = [
+        "External service credentials or repository baseline health may affect validation."
+    ]
+
+    from framework.validation_gates import validate_implementation_plan
+    gate_result = validate_implementation_plan(structured_plan)
+    if not gate_result.passed:
+        raise RuntimeError(f"Implementation plan gate failed: {gate_result.feedback}")
 
     # Write implementation-plan.json to workspace for auditability
     if workspace_path:
@@ -751,6 +806,7 @@ async def analyze_task(state: dict) -> dict:
                     },
                     "data": {
                         "implementation_plan": plan,
+                        "structured_plan": structured_plan,
                         "delivery_plan_loaded": bool(delivery_plan),
                     },
                 }, fh, ensure_ascii=False, indent=2)
@@ -759,6 +815,7 @@ async def analyze_task(state: dict) -> dict:
 
     return {
         "implementation_plan": plan,
+        "implementation_plan_details": structured_plan,
     }
 
 
@@ -922,6 +979,16 @@ async def implement_changes(state: dict) -> dict:
 
     # With native tools, we can't track individual file writes from tool_calls.
     # changes_made is populated from git diff in create_pr via _git_commit_all_pending.
+
+    # Validation gate: ensure at least some files were changed
+    from framework.validation_gates import validate_files_changed
+    gate_result = validate_files_changed(state.get("repo_path", ""))
+    if not gate_result.passed and "No file changes detected" in gate_result.feedback:
+        log.error("validate_files_changed gate failed", feedback=gate_result.feedback)
+        raise RuntimeError(f"Implementation produced no file changes: {gate_result.feedback}")
+    elif not gate_result.passed:
+        log.warn("validate_files_changed gate inconclusive", feedback=gate_result.feedback)
+
     return {
         "changes_made": [],
         "implementation_summary": impl_summary,
@@ -1046,6 +1113,12 @@ async def fix_tests(state: dict) -> dict:
         timeout=600,
         plugin_manager=state.get("_plugin_manager"),
     )
+
+    # Validation gate: ensure fix actually changed files
+    from framework.validation_gates import validate_files_changed
+    gate_result = validate_files_changed(state.get("repo_path", ""))
+    if not gate_result.passed and "No file changes detected" in gate_result.feedback:
+        log.warn("fix_tests produced no file changes", feedback=gate_result.feedback)
 
     return {
         "fix_attempted": True,
@@ -1218,6 +1291,13 @@ async def self_assess(state: dict) -> dict:
     score = float(data.get("score", 0) or 0)
     verdict = data.get("verdict", "fail")
     gaps = data.get("gaps", [])
+
+    # Validation gate: structural check on self-assessment output
+    from framework.validation_gates import validate_self_assessment
+    acceptance_criteria_count = len(acceptance_criteria) if isinstance(acceptance_criteria, list) else 0
+    gate_result = validate_self_assessment(data, acceptance_criteria_count)
+    if not gate_result.passed:
+        log.warn("validate_self_assessment gate", feedback=gate_result.feedback)
 
     print(f"[{_AGENT_ID}] self_assess result: score={score} verdict={verdict} gaps={len(gaps)}")
 
@@ -1989,6 +2069,15 @@ async def update_jira(state: dict) -> dict:
     return {"jira_updated": True, "jira_in_review": can_review}
 
 
+def _load_pr_description_template() -> str:
+    template_path = os.path.join(os.path.dirname(__file__), "templates", "pr_description.md")
+    try:
+        with open(template_path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
 async def create_pr(state: dict) -> dict:
     """Generate a PR description and create the pull request via SCM tools."""
     runtime = state.get("_runtime")
@@ -2039,7 +2128,9 @@ async def create_pr(state: dict) -> dict:
     if jira_key:
         _jira_ctx = state.get("jira_context", {})
         if isinstance(_jira_ctx, dict):
-            _jira_url = _jira_ctx.get("url", "") or f"https://tarch.atlassian.net/browse/{jira_key}"
+            jira_base_url = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
+            _jira_url = _jira_ctx.get("url", "") or (f"{jira_base_url}/browse/{jira_key}" if jira_base_url else "")
+    pr_template = _load_pr_description_template()
     desc_prompt = PR_DESCRIPTION_TEMPLATE.format(
         user_request=state.get("user_request", ""),
         branch_name=branch_name,
@@ -2053,6 +2144,7 @@ async def create_pr(state: dict) -> dict:
         assessment_verdict=_assessment.get("verdict", "N/A"),
         assessment_gaps=", ".join(_assessment.get("gaps", [])) or "none",
         screenshot_paths=", ".join(_screenshots) or "none captured",
+        pr_description_template=pr_template or "Use the standard Constellation PR sections.",
     )
     desc_result = runtime.run(desc_prompt, system_prompt=PR_DESCRIPTION_SYSTEM,
                               plugin_manager=state.get("_plugin_manager"))
@@ -2116,7 +2208,13 @@ async def create_pr(state: dict) -> dict:
         log.info("PR created", pr_url=pr_url, branch=branch_name)
         print(f"[{_AGENT_ID}] create_pr done: prUrl={pr_url!r} prNumber={pr_number} status={pr_status!r}")
 
+    from framework.validation_gates import validate_pr_created, validate_screenshot_upload
+    pr_gate = validate_pr_created(pr_url, int(pr_number or 0) if pr_number else None)
+    if not pr_gate.passed:
+        raise RuntimeError(f"PR creation gate failed: {pr_gate.feedback}")
+
     # Step 4: Upload screenshots to GitHub CDN and PATCH the PR description.
+    _first_screenshot_url = ""
     if _png_screenshots:
         log.info("uploading screenshots to CDN", screenshots=len(_png_screenshots), pr_number=pr_number)
         _screenshot_entries: list[tuple[str, str]] = []
@@ -2136,6 +2234,7 @@ async def create_pr(state: dict) -> dict:
             _cdn_url = _upload_result.get("image_url", "")
             if _cdn_url:
                 _screenshot_entries.append((_label, _cdn_url))
+                _first_screenshot_url = _first_screenshot_url or _cdn_url
                 continue
 
             log.error("screenshot upload failed", screenshot=_fname, error=_upload_result.get("error", ""))
@@ -2172,6 +2271,14 @@ async def create_pr(state: dict) -> dict:
             raise RuntimeError("Cannot finalize PR for a UI task because screenshot upload did not return CDN URLs")
 
         print(f"[{_AGENT_ID}] {len(_png_screenshots)} screenshot(s) processed for PR description")
+
+    screenshot_gate = validate_screenshot_upload(
+        screenshot_required=screenshot_required,
+        screenshot_uploaded=_screenshot_uploaded,
+        screenshot_url=_first_screenshot_url,
+    )
+    if not screenshot_gate.passed:
+        raise RuntimeError(f"Screenshot upload gate failed: {screenshot_gate.feedback}")
 
     # Write pr-evidence.json to workspace
     workspace_path = state.get("workspace_path", "")
@@ -2246,7 +2353,11 @@ async def report_result(state: dict) -> dict:
         "summary": " ".join(summary_parts),
         "implementation_summary": " ".join(summary_parts),
         "pr_url": pr_url,
+        "pr_number": state.get("pr_number", 0),
         "branch_name": branch_name,
+        "pr_title": pr_title,
+        "pr_description": state.get("pr_description", ""),
+        "changes_made": changes,
     }
 
 

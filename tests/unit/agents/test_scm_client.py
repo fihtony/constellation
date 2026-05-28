@@ -9,8 +9,13 @@ import subprocess
 import pytest
 
 from agents.scm.adapter import SCMAgentAdapter
-from agents.scm.client import BitbucketClient, _parse_bb_project_repo
+from agents.scm.client import BitbucketClient, GitHubClient, GITHUB_API_BASE, _parse_bb_project_repo
 from agents.scm.providers.github_mcp import GitHubMCPProvider
+
+
+@pytest.fixture(autouse=True)
+def _default_permission_enforcement_off(monkeypatch):
+    monkeypatch.setenv("PERMISSION_ENFORCEMENT", "off")
 
 
 class TestParseProjectRepo:
@@ -70,6 +75,32 @@ class TestScmAdapterCloneBehavior:
 
         assert adapter._build_auth_header("https://github.com/fihtony/english-study-hub.git") == ""
 
+    def test_github_pr_diff_uses_github_api_base(self, monkeypatch):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return b"diff --git a/file.js b/file.js"
+
+        def fake_urlopen(request, timeout=0):
+            captured["url"] = request.full_url
+            return FakeResponse()
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr(GitHubClient, "_request", lambda self, method, path, timeout=0: (200, []))
+
+        payload, status = GitHubClient("token").get_pr_diff("owner", "repo", 12)
+
+        assert status == "ok"
+        assert captured["url"] == f"{GITHUB_API_BASE}/repos/owner/repo/pulls/12"
+        assert payload["diff_text"].startswith("diff --git")
+
     def test_handle_clone_retries_directory_creation_failure(self, monkeypatch, tmp_path):
         target_path = tmp_path / "task" / "scm" / "english-study-hub"
         repo_url = "https://github.com/fihtony/english-study-hub"
@@ -105,6 +136,90 @@ class TestScmAdapterCloneBehavior:
 
 
 class TestScmAdapterPrEvidenceCapabilities:
+    def test_dispatch_get_pr_diff_calls_client(self):
+        calls = {}
+
+        class FakeClient:
+            def get_pr_diff(self, owner, repo, pr_id):
+                calls.update({
+                    "owner": owner,
+                    "repo": repo,
+                    "pr_id": pr_id,
+                })
+                return {
+                    "diff_text": "diff --git a/app.py b/app.py",
+                    "changed_files": [{"filename": "app.py"}],
+                }, "ok"
+
+        adapter = object.__new__(SCMAgentAdapter)
+        adapter._get_client = lambda: FakeClient()  # type: ignore[attr-defined]
+
+        result = adapter._dispatch(
+            "scm.pr.diff",
+            "",
+            {"metadata": {
+                "project": "org",
+                "repo": "repo",
+                "prNumber": 42,
+            }},
+        )
+
+        assert result == {
+            "diff_text": "diff --git a/app.py b/app.py",
+            "changed_files": [{"filename": "app.py"}],
+            "status": "ok",
+        }
+        assert calls == {
+            "owner": "org",
+            "repo": "repo",
+            "pr_id": 42,
+        }
+
+    def test_dispatch_get_pr_info_calls_client(self):
+        calls = {}
+
+        class FakeClient:
+            def get_pr_info(self, owner, repo, pr_id):
+                calls.update({
+                    "owner": owner,
+                    "repo": repo,
+                    "pr_id": pr_id,
+                })
+                return {
+                    "title": "Improve workflow",
+                    "description": "Structured PR body",
+                    "state": "open",
+                    "author": {"login": "octocat"},
+                    "commits": [{"sha": "abc123"}],
+                }, "ok"
+
+        adapter = object.__new__(SCMAgentAdapter)
+        adapter._get_client = lambda: FakeClient()  # type: ignore[attr-defined]
+
+        result = adapter._dispatch(
+            "scm.pr.info",
+            "",
+            {"metadata": {
+                "project": "org",
+                "repo": "repo",
+                "prNumber": 42,
+            }},
+        )
+
+        assert result == {
+            "title": "Improve workflow",
+            "description": "Structured PR body",
+            "state": "open",
+            "author": {"login": "octocat"},
+            "commits": [{"sha": "abc123"}],
+            "status": "ok",
+        }
+        assert calls == {
+            "owner": "org",
+            "repo": "repo",
+            "pr_id": 42,
+        }
+
     def test_dispatch_create_pr_flattens_pr_number(self):
         class FakeClient:
             def create_pr(self, owner, repo, from_branch, to_branch, title, description):
@@ -133,6 +248,46 @@ class TestScmAdapterPrEvidenceCapabilities:
         assert result["status"] == "created"
         assert result["prUrl"] == "https://github.com/org/repo/pull/42"
         assert result["prNumber"] == 42
+
+
+class TestGitHubClientPullRequestCollision:
+    def test_create_pr_returns_existing_open_pr_on_422(self, monkeypatch):
+        client = GitHubClient("token")
+
+        def _request(self, method, path, payload=None, timeout=20):
+            assert method == "POST"
+            assert path == "repos/org/repo/pulls"
+            return 422, {"message": "A pull request already exists for this branch"}
+
+        monkeypatch.setattr(GitHubClient, "_request", _request)
+        monkeypatch.setattr(
+            GitHubClient,
+            "list_prs",
+            lambda self, owner, repo, state="open", timeout=20: (
+                [
+                    {
+                        "id": 74,
+                        "title": "Existing PR",
+                        "fromBranch": "feature/existing",
+                        "toBranch": "main",
+                        "links": {"self": [{"href": "https://github.com/org/repo/pull/74"}]},
+                    }
+                ],
+                "ok",
+            ),
+        )
+
+        data, status = client.create_pr(
+            "org",
+            "repo",
+            "feature/existing",
+            "main",
+            "Existing PR",
+            "Body",
+        )
+
+        assert status == "already_exists"
+        assert data["id"] == 74
 
     def test_dispatch_upload_pr_image_calls_client(self, tmp_path):
         image_path = tmp_path / "screen.png"

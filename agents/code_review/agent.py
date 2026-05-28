@@ -76,7 +76,7 @@ def _build_code_review_definition() -> AgentDefinition:
         skills=cfg.get("skills", ["code-review"]),
         tools=cfg.get("tools", ["read_file", "search_code"]),
         permissions=cfg.get("permissions", {"scm": "read"}),
-        permission_profile=cfg.get("permission_profile", "read_only"),
+        permission_profile=cfg.get("permission_profile", "code-review"),
         config=cfg.get("config", {}),
         launch_spec=cfg.get("launch_spec"),
     )
@@ -123,11 +123,29 @@ class CodeReviewAgent(BaseAgent):
             "_skills_registry": self.skills_registry,
             "_plugin_manager": self.plugin_manager,
             "pr_url": metadata.get("prUrl", ""),
+            "pr_number": metadata.get("prNumber", 0),
             "repo_url": metadata.get("repoUrl", ""),
             "jira_context": metadata.get("jiraContext", {}),
             "original_requirements": metadata.get("originalRequirements", ""),
             "metadata": metadata,
         }
+
+        exec_contract = metadata.get("executionContract")
+        if not exec_contract or not isinstance(exec_contract, dict):
+            task_store.fail_task(task.id, "Missing executionContract metadata")
+            return task_store.get_task_dict(task.id)
+
+        from framework.execution_contract import resolve_execution_contract_permission_set
+        from framework.permissions import PermissionEngine
+        try:
+            _contract, permission_set = resolve_execution_contract_permission_set(
+                self.definition.permission_profile,
+                exec_contract,
+            )
+            self._permission_engine = PermissionEngine(permission_set)
+        except Exception as exc:
+            task_store.fail_task(task.id, f"Invalid executionContract metadata: {exc}")
+            return task_store.get_task_dict(task.id)
 
         def _run() -> None:
             import asyncio
@@ -245,12 +263,15 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
             "type": "object",
             "properties": {
                 "pr_url": {"type": "string"},
+                "pr_number": {"type": "integer"},
+                "repo_url": {"type": "string"},
                 "diff_summary": {"type": "string"},
                 "requirements": {"type": "string"},
                 "jira_context": {"type": "object"},
                 "design_context": {"type": "object"},
                 "workspace_path": {"type": "string"},
                 "context_manifest_path": {"type": "string"},
+                "execution_contract": {"type": "object"},
             },
             "required": [],
         }
@@ -258,6 +279,8 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
         def execute_sync(
             self,
             pr_url: str = "",
+            pr_number: int = 0,
+            repo_url: str = "",
             diff_summary: str = "",
             requirements: str = "",
             jira_context=None,
@@ -276,6 +299,8 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
                             "parts": [{"text": diff_summary or pr_url}],
                             "metadata": {
                                 "prUrl": pr_url,
+                                "prNumber": pr_number,
+                                "repoUrl": repo_url,
                                 "originalRequirements": requirements,
                                 "jiraContext": jira_context or {},
                                 "designContext": design_context or {},
@@ -284,6 +309,9 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
                             },
                         }
                     }
+                    execution_contract = kw.get("execution_contract")
+                    if execution_contract:
+                        msg["message"]["metadata"]["executionContract"] = execution_contract
                     result = loop.run_until_complete(code_review_agent.handle_message(msg))
                     task_id_holder["task_id"] = result["task"]["id"]
                 except Exception as exc:

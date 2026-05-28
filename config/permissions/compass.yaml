@@ -1,0 +1,18 @@
+# Permissions: Compass agent (control-plane routing, task creation)
+agent_id: compass
+allowed_tools:
+  - dispatch_development_task
+  - dispatch_office_task
+  - dispatch_agent_task
+  - query_registry
+  - request_clarification
+  - validate_office_paths
+
+denied_tools: []
+
+scm: none
+filesystem: workspace-only
+agent_launching: true
+allowed_agents:
+  - team-lead
+  - office

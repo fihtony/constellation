@@ -1,0 +1,22 @@
+# Permissions: Code Review agent (per-task read-only review pipeline)
+agent_id: code-review
+allowed_tools:
+  - read_file
+  - search_code
+  - glob
+  - grep
+  - scm_get_pr_diff
+  - scm_get_pr_info
+  - query_registry
+
+denied_tools:
+  - write_file
+  - edit_file
+  - run_command
+  - scm_push
+  - scm_create_pr
+
+scm: read
+filesystem: workspace-only
+agent_launching: false
+allowed_agents: []

@@ -10,6 +10,7 @@ import json
 import os
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
+from framework.boundary_permissions import enforce_boundary_permission
 
 ui_design_definition = AgentDefinition(
     agent_id="ui-design",
@@ -20,6 +21,38 @@ ui_design_definition = AgentDefinition(
     workflow=None,
     tools=[],
 )
+
+
+_UI_DESIGN_CAPABILITY_RULES: dict[str, dict[str, object]] = {
+    "figma.page.fetch": {"tools": ["fetch_figma_page", "fetch_design"], "action": "figma.read"},
+    "figma.file.fetch": {"tools": ["fetch_figma_page", "fetch_design"], "action": "figma.read"},
+    "figma.design.fetch": {"tools": ["fetch_design"], "action": "figma.read"},
+    "figma.pages.list": {"tools": ["fetch_figma_page", "fetch_design"], "action": "figma.read"},
+    "figma.node.fetch": {"tools": ["fetch_figma_page", "fetch_design"], "action": "element.inspect"},
+    "figma.styles.fetch": {"tools": ["fetch_design_tokens", "fetch_design"], "action": "element.inspect"},
+    "stitch.project.get": {"tools": ["fetch_stitch_screen", "fetch_design"], "action": "stitch.read"},
+    "stitch.screens.list": {"tools": ["fetch_stitch_screen", "fetch_design"], "action": "stitch.read"},
+    "stitch.screen.fetch": {"tools": ["fetch_stitch_screen", "fetch_design"], "action": "stitch.read"},
+    "stitch.screen.image": {"tools": ["export_design_screenshot", "fetch_stitch_screen", "fetch_design"], "action": "stitch.read"},
+    "stitch.tools.list": {"tools": ["fetch_design"], "action": "stitch.read"},
+}
+
+
+def _enforce_ui_design_permission(capability: str, meta: dict) -> dict | None:
+    normalized_capability = capability
+    if capability.startswith("design."):
+        normalized_capability = "figma.design.fetch" if "figma.com" in str(meta.get("designUrl") or "").lower() else "stitch.screen.fetch"
+    rule = _UI_DESIGN_CAPABILITY_RULES.get(normalized_capability)
+    if not rule:
+        return None
+    return enforce_boundary_permission(
+        agent_id="ui-design",
+        capability=capability,
+        metadata=meta,
+        required_tools=list(rule.get("tools") or []),
+        grant_agent="ui-design",
+        grant_action=str(rule.get("action") or "element.inspect"),
+    )
 
 
 class UIDesignAgentAdapter(BaseAgent):
@@ -101,6 +134,9 @@ class UIDesignAgentAdapter(BaseAgent):
 
     def _dispatch(self, cap: str, text: str, message: dict) -> dict:
         meta = message.get("metadata") or {}
+        permission_error = _enforce_ui_design_permission(cap, meta)
+        if permission_error:
+            return permission_error
         if cap.startswith("figma."):
             return self._dispatch_figma(cap, text, meta)
         if cap.startswith("stitch."):

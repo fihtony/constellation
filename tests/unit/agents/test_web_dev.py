@@ -2,8 +2,11 @@
 import json
 import os
 import pytest
+from unittest.mock import MagicMock
+from framework.agent import AgentServices
+from framework.task_store import InMemoryTaskStore
 from framework.workflow import START, END
-from agents.web_dev.agent import web_dev_workflow, web_dev_definition
+from agents.web_dev.agent import WebDevAgent, web_dev_workflow, web_dev_definition
 from agents.web_dev.tools import SCMCreatePR, SCMUploadPRImage, register_web_dev_tools
 from agents.web_dev.nodes import (
     setup_workspace,
@@ -19,6 +22,20 @@ from agents.web_dev.nodes import (
     _detect_fragile_icon_font_usage,
     _rendered_page_has_content,
 )
+
+
+def _agent_services(runtime=None):
+    return AgentServices(
+        session_service=MagicMock(),
+        event_store=MagicMock(),
+        memory_service=MagicMock(),
+        skills_registry=MagicMock(),
+        plugin_manager=MagicMock(),
+        checkpoint_service=MagicMock(),
+        runtime=runtime or MagicMock(),
+        registry_client=None,
+        task_store=InMemoryTaskStore(),
+    )
 
 
 class TestWebDevWorkflowCompile:
@@ -47,6 +64,38 @@ class TestWebDevWorkflowCompile:
     def test_web_dev_definition_permissions(self):
         assert web_dev_definition.permissions.get("scm") == "read-write"
         assert web_dev_definition.permissions.get("filesystem") == "workspace-only"
+
+
+class TestWebDevExecutionContract:
+
+    async def test_handle_message_fails_closed_without_execution_contract(self):
+        agent = WebDevAgent(definition=web_dev_definition, services=_agent_services())
+
+        result = await agent.handle_message({"message": {"parts": [{"text": "Implement task"}], "metadata": {}}})
+
+        assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
+        assert "Missing executionContract" in result["task"]["status"]["message"]["parts"][0]["text"]
+
+    async def test_handle_message_rejects_contract_broader_than_local_profile(self):
+        from framework.execution_contract import build_execution_contract
+
+        agent = WebDevAgent(definition=web_dev_definition, services=_agent_services())
+        broad_contract = build_execution_contract(
+            profile={"agent_id": "web-dev", "allowed_tools": ["read_file", "dispatch_web_dev"]},
+            workflow_ref="config/workflows/development_task.yaml",
+            rule_refs=[],
+            workspace_root="/tmp/workspace",
+        )
+
+        result = await agent.handle_message({
+            "message": {
+                "parts": [{"text": "Implement feature"}],
+                "metadata": {"executionContract": broad_contract.to_dict()},
+            }
+        })
+
+        assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
+        assert "exceed local profile" in result["task"]["status"]["message"]["parts"][0]["text"]
 
 
 class TestSafeJson:
@@ -266,6 +315,74 @@ class TestWebDevNodes:
         with patch("agents.web_dev.nodes._call_boundary_tool", return_value={"branches": []}):
             result = await setup_workspace(state)
         assert result["branch_name"] == "feature/ABC-1-login"
+
+    async def test_setup_workspace_suffixes_when_remote_branch_exists(self, tmp_path):
+        import subprocess
+        from unittest.mock import patch
+
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        subprocess.run(["git", "init", repo_path], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.email", "test@test.com"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.name", "Test"],
+                       check=True, capture_output=True)
+        (tmp_path / "repo" / "README.md").write_text("hi")
+        subprocess.run(["git", "-C", repo_path, "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "commit", "-m", "init"],
+                       check=True, capture_output=True)
+
+        def _boundary(_state, tool_name, payload):
+            if tool_name == "scm_list_branches":
+                return {"branches": [{"displayId": "feature/CSTL-1-landing-page"}]}
+            if tool_name == "scm_list_prs":
+                return {"prs": []}
+            return {}
+
+        state = {
+            "_task_id": "t-1",
+            "repo_url": "https://github.com/org/repo",
+            "repo_path": repo_path,
+            "workspace_path": str(tmp_path),
+            "branch_name": "feature/CSTL-1-landing-page",
+        }
+        with patch("agents.web_dev.nodes._call_boundary_tool", side_effect=_boundary):
+            result = await setup_workspace(state)
+        assert result["branch_name"] == "feature/CSTL-1-landing-page_2"
+
+    async def test_setup_workspace_suffixes_when_open_pr_uses_branch(self, tmp_path):
+        import subprocess
+        from unittest.mock import patch
+
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        subprocess.run(["git", "init", repo_path], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.email", "test@test.com"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.name", "Test"],
+                       check=True, capture_output=True)
+        (tmp_path / "repo" / "README.md").write_text("hi")
+        subprocess.run(["git", "-C", repo_path, "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "commit", "-m", "init"],
+                       check=True, capture_output=True)
+
+        def _boundary(_state, tool_name, payload):
+            if tool_name == "scm_list_branches":
+                return {"branches": []}
+            if tool_name == "scm_list_prs":
+                return {"prs": [{"fromBranch": "feature/CSTL-1-landing-page", "toBranch": "main"}]}
+            return {}
+
+        state = {
+            "_task_id": "t-2",
+            "repo_url": "https://github.com/org/repo",
+            "repo_path": repo_path,
+            "workspace_path": str(tmp_path),
+            "branch_name": "feature/CSTL-1-landing-page",
+        }
+        with patch("agents.web_dev.nodes._call_boundary_tool", side_effect=_boundary):
+            result = await setup_workspace(state)
+        assert result["branch_name"] == "feature/CSTL-1-landing-page_2"
 
     async def test_analyze_task_uses_analysis(self):
         state = {"analysis": "Implement login feature", "user_request": "Add login"}

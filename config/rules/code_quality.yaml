@@ -1,0 +1,21 @@
+# Code quality rules — enforced by validation gates and code review
+naming_conventions:
+  functions: snake_case
+  classes: PascalCase
+  constants: UPPER_SNAKE_CASE
+  files: snake_case
+
+complexity:
+  max_function_lines: 100
+  max_file_lines: 500
+  max_cyclomatic_complexity: 15
+
+documentation:
+  public_functions_require_docstring: true
+  module_level_docstring: true
+
+patterns:
+  no_hardcoded_credentials: true
+  no_debug_statements_in_production: true
+  prefer_explicit_imports: true
+  no_wildcard_imports: true

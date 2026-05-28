@@ -223,6 +223,110 @@ class JiraListComments(BaseTool):
         return ToolResult(output=json.dumps({"comments": data, "status": status}))
 
 
+class JiraSearch(BaseTool):
+    name = "jira_search"
+    description = "Search Jira issues using JQL."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "jql": {"type": "string"},
+            "max_results": {"type": "integer"},
+            "fields": {"type": "array", "items": {"type": "string"}},
+            "task_id": {"type": "string"},
+        },
+        "required": ["jql"],
+    }
+
+    def execute_sync(
+        self,
+        jql: str = "",
+        max_results: int = 10,
+        fields: list | None = None,
+        task_id: str = "",
+    ) -> ToolResult:
+        log = _log(task_id)
+        log.info("jira_search called", jql_len=len(jql), max_results=max_results)
+        if not jql.strip():
+            return ToolResult(output=json.dumps({
+                "issues": [],
+                "status": "missing_jql",
+                "error": "jql is required",
+            }))
+        data, status = _get_provider().search_issues(jql, max_results, fields)
+        issues = data.get("issues", []) if isinstance(data, dict) else []
+        normalized = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            fields_data = issue.get("fields") or {}
+            normalized.append({
+                "key": issue.get("key", ""),
+                "summary": fields_data.get("summary", ""),
+                "status": (fields_data.get("status") or {}).get("name", ""),
+            })
+        log.info("jira_search result", status=status, issues=len(normalized))
+        return ToolResult(output=json.dumps({"issues": normalized, "raw": data, "status": status}))
+
+
+class JiraGetSprint(BaseTool):
+    name = "jira_get_sprint"
+    description = "Get the active sprint for a Jira board or ticket."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "board_id": {"type": "string"},
+            "ticket_key": {"type": "string"},
+            "task_id": {"type": "string"},
+        },
+        "required": [],
+    }
+
+    def execute_sync(
+        self,
+        board_id: str = "",
+        ticket_key: str = "",
+        task_id: str = "",
+    ) -> ToolResult:
+        log = _log(task_id)
+        log.info("jira_get_sprint called", board_id=board_id, ticket_key=ticket_key)
+        data, status = _get_provider().get_sprint(board_id=board_id, ticket_key=ticket_key)
+        log.info("jira_get_sprint result", status=status, has_sprint=bool(data))
+        return ToolResult(output=json.dumps({"sprint": data, "status": status}))
+
+
+class JiraLinkIssue(BaseTool):
+    name = "jira_link_issue"
+    description = "Create a Jira issue link between two tickets."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "ticket_key": {"type": "string"},
+            "linked_key": {"type": "string"},
+            "link_type": {"type": "string"},
+            "task_id": {"type": "string"},
+        },
+        "required": ["ticket_key", "linked_key", "link_type"],
+    }
+
+    def execute_sync(
+        self,
+        ticket_key: str = "",
+        linked_key: str = "",
+        link_type: str = "",
+        task_id: str = "",
+    ) -> ToolResult:
+        log = _log(task_id)
+        log.info(
+            "jira_link_issue called",
+            ticket_key=ticket_key,
+            linked_key=linked_key,
+            link_type=link_type,
+        )
+        data, status = _get_provider().link_issue(ticket_key, linked_key, link_type)
+        log.info("jira_link_issue result", status=status)
+        return ToolResult(output=json.dumps({"link": data, "status": status}))
+
+
 _TOOLS = [
     FetchJiraTicket(),
     JiraTransition(),
@@ -231,6 +335,9 @@ _TOOLS = [
     JiraListTransitions(),
     JiraGetTokenUser(),
     JiraListComments(),
+    JiraSearch(),
+    JiraGetSprint(),
+    JiraLinkIssue(),
 ]
 
 

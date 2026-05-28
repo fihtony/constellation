@@ -21,20 +21,75 @@ import json
 import os
 import re
 import threading
+from typing import Any
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 from agents.compass.ui.routes import handle_ui_request
 from agents.compass.tools import TOOL_NAMES, _should_use_per_task_office_launch, register_compass_tools
 
-compass_definition = AgentDefinition(
-    agent_id="compass",
-    name="Compass Agent",
-    description="Control plane: task classification, routing, and user summary (ReAct-first)",
-    mode=AgentMode.CHAT,
-    execution_mode=ExecutionMode.PERSISTENT,
-    workflow=None,
-    tools=TOOL_NAMES,
-)
+
+def _build_compass_definition() -> AgentDefinition:
+    """Build Compass's AgentDefinition from YAML config, with tool fallback."""
+    from framework.config import build_agent_definition_from_config
+
+    try:
+        cfg = build_agent_definition_from_config("compass")
+    except Exception:
+        cfg = {}
+
+    return AgentDefinition(
+        agent_id=cfg.get("agent_id", "compass"),
+        name=cfg.get("name", "Compass Agent"),
+        description=cfg.get(
+            "description",
+            "Control plane: task classification, permission check, routing, and user summary",
+        ),
+        mode=AgentMode.CHAT,
+        execution_mode=ExecutionMode.PERSISTENT,
+        workflow=None,
+        tools=cfg.get("tools", TOOL_NAMES),
+        permissions=cfg.get("permissions", {"scm": "none", "filesystem": "workspace-only"}),
+        permission_profile=cfg.get("permission_profile", "compass"),
+        config=cfg.get("config", {}),
+    )
+
+
+compass_definition = _build_compass_definition()
+
+
+def _parse_classification_payload(raw_output: str) -> tuple[str, float]:
+    """Parse and validate an LLM triage response.
+
+    Preferred response shape is JSON: {"type": "development", "confidence": 0.9}.
+    Legacy one-word responses are accepted for compatibility, but still pass
+    through the deterministic classification gate.
+    """
+    from framework.validation_gates import validate_classification
+
+    raw = (raw_output or "").strip()
+    parsed: Any = None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        candidate = str(parsed.get("type") or parsed.get("category") or "").strip().lower()
+        try:
+            confidence = float(parsed.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+    else:
+        cleaned = raw.strip().lower().strip(".`'\" ")
+        candidate = cleaned.split()[0] if cleaned else ""
+        confidence = 1.0
+
+    gate = validate_classification(candidate)
+    if not gate.passed:
+        return "", 0.0
+    if confidence < 0 or confidence > 1:
+        confidence = 0.0
+    return candidate, confidence
 
 
 def _classify_request(user_text: str, runtime) -> str:
@@ -95,15 +150,17 @@ def _classify_request(user_text: str, runtime) -> str:
         result = runtime.run(
             prompt=TRIAGE_TEMPLATE.format(user_request=user_text),
             system_prompt=TRIAGE_SYSTEM,
-            max_tokens=16,
+            max_tokens=128,
         )
-        raw = (result.get("raw_response") or "").strip().lower()
-        # Accept partial matches — LLM may output "development\n" or "development."
-        if "development" in raw:
-            return "development"
-        if "office" in raw:
-            return "office"
-        if "general" in raw:
+        raw = (result.get("raw_response") or "").strip()
+        classification, confidence = _parse_classification_payload(raw)
+        if classification and confidence >= 0.45:
+            return classification
+        if classification:
+            print(
+                f"[compass] LLM triage low confidence: "
+                f"classification={classification!r} confidence={confidence:.2f} — defaulting to general"
+            )
             return "general"
         # Unexpected output: log and fall back
         print(f"[compass] LLM triage unexpected response: {raw!r} — defaulting to general")

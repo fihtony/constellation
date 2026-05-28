@@ -16,23 +16,12 @@ runtime_env_required: true
 default_skills:
   - react-nextjs
   - testing
-tools:
-  - read_file
-  - write_file
-  - edit_file
-  - run_command
-  - search_code
-  - scm_clone
-  - scm_branch
-  - scm_commit
-  - scm_push
-  - scm_create_pr
-  - scm_upload_pr_image
-  - scm_update_pr
-permissions:
-  scm: read-write
-  filesystem: workspace-only
-permission_profile: development
+
+# Permission model:
+# - permission_profile is the authoritative maximum capability envelope.
+# - Team Lead sends executionContract at runtime to narrow this profile per task.
+# - AgentDefinition.tools also defaults from config/permissions/web-dev.yaml.
+permission_profile: web-dev
 capabilities:
   - web-dev.task.execute
 launch_spec:

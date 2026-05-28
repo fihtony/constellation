@@ -99,20 +99,19 @@ class TestConfigSingleSource:
         from framework.config import build_agent_definition_from_config
 
         result = build_agent_definition_from_config("web-dev")
-        assert result.get("permission_profile") == "development"
+        assert result.get("permission_profile") == "web-dev"
 
     def test_build_code_review_profile(self):
         from framework.config import build_agent_definition_from_config
 
         result = build_agent_definition_from_config("code-review")
-        assert result.get("permission_profile") == "read_only"
+        assert result.get("permission_profile") == "code-review"
 
     def test_build_team_lead_no_profile(self):
         from framework.config import build_agent_definition_from_config
 
         result = build_agent_definition_from_config("team-lead")
-        # Team Lead has permission_profile: "development" in config.yaml (spec compliance)
-        assert result.get("permission_profile") == "development"
+        assert result.get("permission_profile") == "team-lead"
 
     def test_build_includes_tools_from_yaml(self):
         from framework.config import build_agent_definition_from_config

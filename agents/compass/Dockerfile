@@ -14,7 +14,12 @@ RUN apt-get update \
 COPY framework/ /app/framework/
 COPY agents/__init__.py /app/agents/__init__.py
 COPY agents/compass/ /app/agents/compass/
-COPY config/ /app/config/
+RUN mkdir -p /app/config/permissions /app/config/rules /app/config/workflows
+COPY config/constellation.yaml /app/config/constellation.yaml
+COPY config/rules/ /app/config/rules/
+COPY config/workflows/ /app/config/workflows/
+COPY config/permissions/compass.yaml /app/config/permissions/compass.yaml
+COPY config/permissions/office.yaml /app/config/permissions/office.yaml
 COPY scripts/run_local.py /app/scripts/run_local.py
 
 ENV PYTHONUNBUFFERED=1 \

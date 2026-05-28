@@ -311,6 +311,71 @@ class JiraClient:
             return data.get("comments", []), "ok"
         return [], self._status_message(status, data)
 
+    def get_sprint(
+        self,
+        board_id: str = "",
+        ticket_key: str = "",
+    ) -> tuple[dict | None, str]:
+        """Fetch the active sprint for a board or ticket."""
+        resolved_board_id = str(board_id or "").strip()
+        if not resolved_board_id and ticket_key:
+            query = urlencode({"issueKeyOrId": ticket_key, "maxResults": 1})
+            status, data = self.request_agile("GET", f"board?{query}")
+            if status == 200:
+                boards = data.get("values") or []
+                if boards:
+                    resolved_board_id = str(boards[0].get("id") or "")
+            if not resolved_board_id:
+                return None, self._status_message(status, data)
+
+        if not resolved_board_id:
+            return None, "missing_board_id"
+
+        query = urlencode({"state": "active", "maxResults": 1})
+        status, data = self.request_agile(
+            "GET",
+            f"board/{resolved_board_id}/sprint?{query}",
+        )
+        if status == 200:
+            sprints = data.get("values") or []
+            if not sprints:
+                return None, "no_active_sprint"
+            sprint = sprints[0]
+            return {
+                "id": sprint.get("id"),
+                "name": sprint.get("name", ""),
+                "state": sprint.get("state", ""),
+                "startDate": sprint.get("startDate", ""),
+                "endDate": sprint.get("endDate", ""),
+                "goal": sprint.get("goal", ""),
+                "boardId": resolved_board_id,
+            }, "ok"
+        return None, self._status_message(status, data)
+
+    def link_issue(
+        self,
+        ticket_key: str,
+        linked_key: str,
+        link_type: str,
+    ) -> tuple[dict | None, str]:
+        """Create an issue link between two Jira tickets."""
+        if not ticket_key or not linked_key or not link_type:
+            return None, "missing_link_fields"
+
+        payload = {
+            "type": {"name": link_type},
+            "inwardIssue": {"key": ticket_key},
+            "outwardIssue": {"key": linked_key},
+        }
+        status, data = self.request("POST", "issueLink", payload)
+        if status in (200, 201, 204):
+            return {
+                "ticketKey": ticket_key,
+                "linkedKey": linked_key,
+                "linkType": link_type,
+            }, "ok"
+        return None, self._status_message(status, data)
+
     def _expand_issue_documents(self, issues: list[dict]) -> list[dict]:
         """Hydrate issue-id-only search results into full issue documents."""
         expanded: list[dict] = []
@@ -378,6 +443,12 @@ class JiraClient:
             return ""
         return f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3"
 
+    def _scoped_agile_base_url(self) -> str:
+        cloud_id = self.discover_cloud_id()
+        if not cloud_id:
+            return ""
+        return f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/agile/1.0"
+
     def _candidate_api_base_urls(self) -> list[str]:
         candidates: list[str] = []
         if self._looks_like_cloud(self._api):
@@ -386,6 +457,17 @@ class JiraClient:
                 candidates.append(scoped)
         if self._api and self._api not in candidates:
             candidates.append(self._api)
+        return candidates
+
+    def _candidate_agile_base_urls(self) -> list[str]:
+        candidates: list[str] = []
+        if self._looks_like_cloud(self._api):
+            scoped = self._scoped_agile_base_url()
+            if scoped:
+                candidates.append(scoped)
+        local_agile = f"{self._base}/rest/agile/1.0"
+        if local_agile not in candidates:
+            candidates.append(local_agile)
         return candidates
 
     def _auth_header(self) -> str | None:
@@ -448,6 +530,37 @@ class JiraClient:
         candidates = self._candidate_api_base_urls()
         if not candidates:
             return 0, {"error": "Jira API base URL is not configured"}
+
+        for index, api_base_url in enumerate(candidates):
+            status, body = self._request_once(
+                api_base_url,
+                method,
+                path,
+                payload=payload,
+                timeout=timeout,
+            )
+            last_status, last_body = status, body
+            should_retry = (
+                index == 0
+                and len(candidates) > 1
+                and status in (401, 403, 404)
+            )
+            if not should_retry:
+                return status, body
+        return last_status, last_body
+
+    def request_agile(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        timeout: int = 20,
+    ) -> tuple[int, dict]:
+        """Issue a Jira Agile REST request with cloud scoped-gateway retry."""
+        last_status, last_body = 0, {}
+        candidates = self._candidate_agile_base_urls()
+        if not candidates:
+            return 0, {"error": "Jira Agile API base URL is not configured"}
 
         for index, api_base_url in enumerate(candidates):
             status, body = self._request_once(

@@ -9,18 +9,17 @@ mode: task
 execution_mode: persistent
 runtime_env_required: true
 
-permission_profile: "development"
+# Permission model:
+# - permission_profile is authoritative for Team Lead's own runtime permissions.
+# - Team Lead also reads child permission profiles to build executionContract
+#   values that can only narrow each child agent's local capability envelope.
+# - AgentDefinition.tools also defaults from config/permissions/team-lead.yaml.
+permission_profile: "team-lead"
 
 # runtime and model inherit from global constellation.yaml:
 #   runtime.backend: connect-agent
 #   runtime.model: gpt-5-mini
 
-tools:
-  - fetch_jira_ticket
-  - fetch_design
-  - dispatch_web_dev
-  - dispatch_code_review
-  - request_clarification
 port: 8030
 capabilities:
   - team-lead.task.analyze

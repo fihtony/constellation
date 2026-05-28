@@ -29,6 +29,50 @@ def _logger(state: dict) -> AgentLogger:
     return AgentLogger(state.get("_task_id", ""), _AGENT_ID)
 
 
+async def _ack_and_cleanup_dev_agent(state: dict) -> dict[str, Any]:
+    """Acknowledge the current Web Dev child task and tear down any per-task instance."""
+    session = state.get("dev_agent_session") or {}
+    if not isinstance(session, dict):
+        session = {}
+
+    child_task_id = str(session.get("task_id") or "").strip()
+    child_service_url = str(session.get("service_url") or "").strip()
+    child_container_name = str(session.get("container_name") or "").strip()
+    child_agent_id = str(session.get("agent_id") or "web-dev").strip() or "web-dev"
+    if not child_task_id and not child_container_name:
+        return {}
+
+    log = _logger(state)
+    acknowledged = False
+    cleaned_up = False
+
+    if child_task_id and child_service_url:
+        try:
+            from framework.a2a.client import A2AClient
+
+            await A2AClient(timeout=10).send_ack(child_service_url, child_task_id)
+            acknowledged = True
+            log.a2a("→", child_agent_id, action="ack", child_task_id=child_task_id)
+        except Exception as exc:
+            log.warn("dev agent ack failed", error=str(exc), child_task_id=child_task_id)
+
+    if child_container_name:
+        try:
+            from framework.launcher import get_launcher
+
+            get_launcher().destroy_instance(child_agent_id, child_container_name)
+            cleaned_up = True
+            log.info("dev agent instance destroyed", agent_id=child_agent_id, container_name=child_container_name)
+        except Exception as exc:
+            log.warn("dev agent cleanup failed", error=str(exc), container_name=child_container_name)
+
+    return {
+        "dev_agent_acknowledged": acknowledged,
+        "dev_agent_cleaned_up": cleaned_up,
+        "dev_agent_session": {},
+    }
+
+
 def _safe_json(text: str, fallback: Any = None) -> Any:
     """Extract and parse the first JSON object/array from *text*.
 
@@ -177,6 +221,14 @@ async def analyze_requirements(state: dict) -> dict:
     log.info("analysis complete",
              task_type=analysis.get("task_type"),
              complexity=analysis.get("complexity"))
+
+    from framework.validation_gates import validate_analysis_schema
+    analysis_gate = validate_analysis_schema(analysis)
+    if not analysis_gate.passed:
+        log.warn("validate_analysis_schema gate failed", feedback=analysis_gate.feedback)
+        analysis.setdefault("task_type", "general")
+        analysis.setdefault("complexity", "medium")
+        analysis.setdefault("skills", [])
 
     # Write analysis.json to workspace
     workspace_path = state.get("workspace_path", "")
@@ -584,8 +636,82 @@ async def gather_context(state: dict) -> dict:
     }
 
 
+async def validate_readiness(state: dict) -> dict:
+    """Deterministic gate: verify all prerequisites for planning/dispatch.
+
+    Checks: repo cloned, Jira context present (if key given), repo URL valid.
+    Returns route='ready' on success, or a deterministic graph route for
+    retry/user input when prerequisites are not complete.
+    """
+    from framework.validation_gates import validate_readiness as _gate
+
+    log = _logger(state)
+    log.node("validate_readiness")
+
+    jira_key = str(state.get("jira_key") or "")
+    jira_context = state.get("jira_context") or {}
+    repo_path = str(state.get("repo_path") or "")
+    repo_cloned = bool(state.get("repo_cloned")) and bool(repo_path) and os.path.isdir(repo_path)
+    repo_non_empty = False
+    if repo_cloned:
+        with os.scandir(repo_path) as entries:
+            repo_non_empty = any(entries)
+    context_key = ""
+    if isinstance(jira_context, dict):
+        context_key = str(jira_context.get("key") or jira_context.get("ticket_key") or "")
+    is_ui_task = bool(
+        state.get("design_context")
+        or state.get("figma_url")
+        or state.get("stitch_project_id")
+        or state.get("stitch_screen_id")
+        or state.get("design_code_path")
+    )
+    design_spec_exists = bool(
+        state.get("design_context")
+        or (state.get("design_code_path") and os.path.isfile(str(state.get("design_code_path"))))
+        or (state.get("design_md_path") and os.path.isfile(str(state.get("design_md_path"))))
+    )
+
+    result = _gate(
+        jira_downloaded=(not jira_key) or bool(jira_context),
+        jira_key_matches=(not jira_key) or (context_key == jira_key),
+        repo_cloned=repo_cloned,
+        repo_non_empty=repo_non_empty,
+        is_ui_task=is_ui_task,
+        design_spec_exists=design_spec_exists,
+        tech_stack_identified=bool(state.get("tech_stack")),
+        requirements_clarified=bool(state.get("analysis_summary") or jira_context),
+    )
+
+    if not result.passed:
+        attempts = int(state.get("readiness_attempts", 0)) + 1
+        failed = set((result.details or {}).get("failed", []))
+        retryable = failed <= {"design_spec_exists", "tech_stack_identified"}
+        route = "missing_info" if attempts < 3 and retryable else "need_user_input"
+        log.warn(
+            "readiness gate failed",
+            gate=result.gate_name,
+            feedback=result.feedback,
+            attempts=attempts,
+            route=route,
+        )
+        return {
+            "readiness_validated": False,
+            "readiness_attempts": attempts,
+            "readiness_feedback": result.feedback,
+            "route": route,
+        }
+
+    log.info("readiness gate passed")
+    return {"readiness_validated": True, "route": "ready"}
+
+
 async def create_plan(state: dict) -> dict:
-    """Create a development plan based on analysis and context (LLM single-shot)."""
+    """Create a development plan based on analysis and context (LLM single-shot).
+
+    After planning, runs validate_readiness gate to ensure all critical
+    prerequisites are available before dispatching a dev agent.
+    """
     runtime = state.get("_runtime")
 
     if not runtime:
@@ -650,6 +776,14 @@ async def create_plan(state: dict) -> dict:
         except OSError as exc:
             print(f"[{_AGENT_ID}] Failed to write delivery-plan.json: {exc}")
 
+    # Validation gate: ensure plan has required structure
+    from framework.validation_gates import validate_plan_schema
+    gate_result = validate_plan_schema(plan)
+    if not gate_result.passed:
+        log = _logger(state)
+        log.warn("validate_plan_schema gate failed", feedback=gate_result.feedback)
+        plan = {"steps": [{"step": 1, "action": raw or state.get("analysis_summary") or "Execute task"}]}
+
     return {
         "plan": plan,
         "skill_context": skill_context,
@@ -661,8 +795,12 @@ async def dispatch_dev_agent(state: dict) -> dict:
 
     Passes all gathered context including workspace_paths so the dev agent
     does not re-fetch or guess file locations.
+
+    Builds and attaches an ExecutionContract to the dispatch metadata,
+    ensuring the child agent receives its allowed_tools and workflow config.
     """
     from framework.tools.registry import get_registry
+    from framework.execution_contract import build_execution_contract, load_child_profiles
 
     registry = get_registry()
 
@@ -689,10 +827,34 @@ async def dispatch_dev_agent(state: dict) -> dict:
             "feature", "ui", "frontend", "frontend_feature", "ui_feature",
         ) or bool(state.get("design_context") or state.get("design_code_path") or state.get("stitch_screen_id"))
 
+    # Build execution contract for the child dev agent
+    execution_contract = None
     try:
-        result_str = registry.execute_sync(
-            "dispatch_web_dev",
-            {
+        root = _Path(__file__).resolve().parents[2]
+        child_profiles = load_child_profiles({
+            "web-dev": str(root / "config" / "permissions" / "web-dev.yaml"),
+        })
+        execution_contract = build_execution_contract(
+            profile=child_profiles["web-dev"],
+            workflow_ref="config/workflows/development_task.yaml",
+            rule_refs=[
+                "config/rules/development_standards.yaml",
+                "config/rules/code_quality.yaml",
+                "config/rules/security.yaml",
+            ],
+            workspace_root=state.get("workspace_path", ""),
+            definition_of_done=definition_of_done,
+        )
+        if not execution_contract.allowed_tools:
+            raise ValueError("web-dev permission profile has no allowed_tools")
+        log.info("execution contract built", profile="web-dev",
+                 tools_count=len(execution_contract.allowed_tools))
+    except Exception as exc:
+        log.error("execution contract build failed", error=str(exc))
+        raise RuntimeError(f"Cannot dispatch Web Dev without a valid execution contract: {exc}") from exc
+
+    try:
+        dispatch_args = {
                 "task_description": task_description,
                 "jira_context": state.get("jira_context", {}),
                 "design_context": state.get("design_context"),
@@ -711,7 +873,12 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "orchestrator_task_id": state.get("_task_id", ""),
                 "revision_feedback": revision_feedback,
                 "definition_of_done": definition_of_done,
-            },
+        }
+        if execution_contract:
+            dispatch_args["execution_contract"] = execution_contract.to_dict()
+        result_str = registry.execute_sync(
+            "dispatch_web_dev",
+            dispatch_args,
         )
         payload = json.loads(result_str) if result_str else {}
     except Exception as exc:
@@ -759,7 +926,14 @@ async def dispatch_dev_agent(state: dict) -> dict:
     return {
         "dev_dispatched": True,
         "dev_result": payload,
+        "dev_agent_session": {
+            "task_id": str(payload.get("childTaskId") or "").strip(),
+            "service_url": str(payload.get("childServiceUrl") or "").strip(),
+            "container_name": str(payload.get("childContainerName") or "").strip(),
+            "agent_id": str(payload.get("childAgentId") or "web-dev").strip() or "web-dev",
+        },
         "pr_url": pr_url,
+        "pr_number": payload.get("prNumber") or payload.get("pr_number") or 0,
         "branch_name": branch_name,
         "jira_in_review": jira_in_review,
         "screenshot_included": screenshot_included,
@@ -785,10 +959,32 @@ async def review_result(state: dict) -> dict:
     dev_result = state.get("dev_result", {})
 
     try:
+        from framework.execution_contract import build_execution_contract, load_child_profiles
+
+        root = _Path(__file__).resolve().parents[2]
+        child_profiles = load_child_profiles({
+            "code-review": str(root / "config" / "permissions" / "code-review.yaml"),
+        })
+        review_contract = build_execution_contract(
+            profile=child_profiles["code-review"],
+            workflow_ref="config/workflows/code_review_task.yaml",
+            rule_refs=["config/rules/code_quality.yaml", "config/rules/security.yaml"],
+            workspace_root=state.get("workspace_path", ""),
+            definition_of_done={"critical_issue_blocks": True},
+        )
+        if not review_contract.allowed_tools:
+            raise ValueError("code-review permission profile has no allowed_tools")
+        review_contract = review_contract.to_dict()
+    except Exception as exc:
+        raise RuntimeError(f"Cannot dispatch Code Review without a valid execution contract: {exc}") from exc
+
+    try:
         result_str = registry.execute_sync(
             "dispatch_code_review",
             {
                 "pr_url": pr_url,
+                "pr_number": state.get("pr_number") or dev_result.get("prNumber") or dev_result.get("pr_number") or 0,
+                "repo_url": state.get("repo_url", ""),
                 "diff_summary": dev_result.get("summary", ""),
                 "requirements": state.get("analysis_summary", "") or state.get("user_request", ""),
                 "jira_context": state.get("jira_context", {}),
@@ -797,6 +993,7 @@ async def review_result(state: dict) -> dict:
                 "context_manifest_path": state.get("context_manifest_path", ""),
                 "orchestrator_task_id": state.get("_task_id", ""),
                 "task_id": state.get("_task_id", ""),
+                "execution_contract": review_contract,
             },
         )
         payload = json.loads(result_str) if result_str else {}
@@ -833,9 +1030,30 @@ async def request_revision(state: dict) -> dict:
     for c in comments[:10]:  # Limit to top 10 comments
         feedback_lines.append(f"- [{c.get('severity', 'info')}] {c.get('message', '')}")
 
+    revision_feedback = "\n".join(feedback_lines) or "Code review rejected. Please fix issues."
+
+    jira_key = str(state.get("jira_key") or (state.get("jira_context") or {}).get("key") or "")
+    if jira_key:
+        try:
+            from framework.tools.registry import get_registry
+
+            get_registry().execute_sync(
+                "jira_comment",
+                {
+                    "ticket_key": jira_key,
+                    "comment": "Code review requested a revision.\n\n" + revision_feedback[:3000],
+                    "task_id": state.get("_task_id", ""),
+                },
+            )
+        except Exception as exc:
+            print(f"[{_AGENT_ID}] Jira review feedback comment failed: {exc}")
+
+    cleanup = await _ack_and_cleanup_dev_agent(state)
+
     return {
-        "revision_feedback": "\n".join(feedback_lines) or "Code review rejected. Please fix issues.",
+        "revision_feedback": revision_feedback,
         "revision_count": state.get("revision_count", 0) + 1,
+        **cleanup,
     }
 
 
@@ -894,12 +1112,31 @@ async def report_success(state: dict) -> dict:
         except OSError as exc:
             print(f"[{_AGENT_ID}] Failed to write final-report.json: {exc}")
 
+    jira_key = str(state.get("jira_key") or (state.get("jira_context") or {}).get("key") or "")
+    if jira_key:
+        try:
+            from framework.tools.registry import get_registry
+
+            get_registry().execute_sync(
+                "jira_comment",
+                {
+                    "ticket_key": jira_key,
+                    "comment": f"Code review passed. PR is ready for merge: {pr_url}",
+                    "task_id": state.get("_task_id", ""),
+                },
+            )
+        except Exception as exc:
+            print(f"[{_AGENT_ID}] Jira final review comment failed: {exc}")
+
+    cleanup = await _ack_and_cleanup_dev_agent(state)
+
     return {
         "report_summary": report_summary,
         "success": True,
         "jira_in_review": state.get("jira_in_review", False),
         "screenshot_included": screenshot_included,
         "screenshot_uploaded": screenshot_uploaded,
+        **cleanup,
     }
 
 
@@ -930,6 +1167,10 @@ async def escalate_to_user(state: dict) -> dict:
     # First entry: interrupt
     # ------------------------------------------------------------------
     from framework.workflow import interrupt
+
+    cleanup = await _ack_and_cleanup_dev_agent(state)
+    if cleanup.get("dev_agent_session") == {}:
+        state["dev_agent_session"] = {}
 
     revision_count = state.get("revision_count", 0)
     review = state.get("review_result", {})

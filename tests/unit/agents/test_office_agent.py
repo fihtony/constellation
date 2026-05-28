@@ -4,6 +4,24 @@ import pytest
 import os
 import tempfile
 import json
+from unittest.mock import MagicMock
+
+from framework.agent import AgentServices
+from framework.task_store import InMemoryTaskStore
+
+
+def _agent_services(runtime=None):
+    return AgentServices(
+        session_service=MagicMock(),
+        event_store=MagicMock(),
+        memory_service=MagicMock(),
+        skills_registry=MagicMock(),
+        plugin_manager=MagicMock(),
+        checkpoint_service=MagicMock(),
+        runtime=runtime or MagicMock(),
+        registry_client=None,
+        task_store=InMemoryTaskStore(),
+    )
 
 
 def test_office_agent_class_exists():
@@ -24,6 +42,17 @@ def test_office_agent_class_exists():
     assert "analyze_request" in node_names
     assert "execute_office_work" in node_names
     assert "report_result" in node_names
+
+
+@pytest.mark.asyncio
+async def test_office_agent_fails_closed_without_execution_contract():
+    from agents.office.agent import OfficeAgent, office_definition
+
+    agent = OfficeAgent(definition=office_definition, services=_agent_services())
+    result = await agent.handle_message({"message": {"parts": [{"text": "summarize a file"}], "metadata": {}}})
+
+    assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
+    assert "Missing executionContract" in result["task"]["status"]["message"]["parts"][0]["text"]
 
 
 def test_office_tools_register():

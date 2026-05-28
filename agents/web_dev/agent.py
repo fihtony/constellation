@@ -88,7 +88,7 @@ def _build_web_dev_definition() -> AgentDefinition:
             "jira_list_transitions", "jira_get_token_user", "jira_list_comments",
         ]),
         permissions=cfg.get("permissions", {"scm": "read-write", "filesystem": "workspace-only"}),
-        permission_profile=cfg.get("permission_profile", "development"),
+        permission_profile=cfg.get("permission_profile", "web-dev"),
         config=cfg.get("config", {}),
         launch_spec=cfg.get("launch_spec"),
     )
@@ -169,6 +169,7 @@ class WebDevAgent(BaseAgent):
             "analysis": metadata.get("analysis", ""),
             "revision_feedback": metadata.get("revisionFeedback", ""),
             "definition_of_done": metadata.get("definitionOfDone", {}),
+            "execution_contract": metadata.get("executionContract"),
             "test_cycles": 0,
             # max_test_cycles: can be set by caller via metadata, else uses env default.
             # WEB_DEV_MAX_TEST_CYCLES env var (default 3) controls production cycles.
@@ -186,6 +187,27 @@ class WebDevAgent(BaseAgent):
                 else None
             ),
         }
+
+        # Apply execution contract to enforce tool permissions from parent.
+        # Per-task Web Dev fails closed here; direct node/unit tests bypass
+        # handle_message and can still exercise isolated logic.
+        exec_contract = metadata.get("executionContract")
+        if not exec_contract or not isinstance(exec_contract, dict):
+            task_store.fail_task(task.id, "Missing executionContract metadata")
+            return task_store.get_task_dict(task.id)
+
+        from framework.execution_contract import resolve_execution_contract_permission_set
+        from framework.permissions import PermissionEngine
+        try:
+            _contract, permission_set = resolve_execution_contract_permission_set(
+                self.definition.permission_profile,
+                exec_contract,
+            )
+            state["_allowed_tools"] = permission_set.allowed_tools[:]
+            self._permission_engine = PermissionEngine(permission_set)
+        except Exception as exc:
+            task_store.fail_task(task.id, f"Invalid executionContract metadata: {exc}")
+            return task_store.get_task_dict(task.id)
 
         def _run() -> None:
             import asyncio
@@ -215,6 +237,7 @@ class WebDevAgent(BaseAgent):
                         metadata={
                             "agentId": self.definition.agent_id,
                             "prUrl": result.get("pr_url", ""),
+                            "prNumber": result.get("pr_number", 0),
                             "branch": result.get("branch_name", ""),
                             "jiraInReview": result.get("jira_in_review", False),
                             "screenshotIncluded": result.get("screenshot_captured", False),
@@ -271,6 +294,7 @@ def _send_callback(
                 "metadata": {
                     "agentId": agent_id,
                     "prUrl": result.get("pr_url", ""),
+                    "prNumber": result.get("pr_number", 0),
                     "branch": result.get("branch_name", ""),
                     "jiraInReview": result.get("jira_in_review", False),
                     "screenshotIncluded": result.get("screenshot_captured", False),
@@ -325,6 +349,7 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                 "orchestrator_task_id": {"type": "string"},
                 "revision_feedback": {"type": "string"},
                 "definition_of_done": {"type": "object"},
+                "execution_contract": {"type": "object"},
             },
             "required": ["task_description"],
         }
@@ -374,6 +399,9 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                             },
                         }
                     }
+                    execution_contract = kw.get("execution_contract")
+                    if execution_contract:
+                        msg["message"]["metadata"]["executionContract"] = execution_contract
                     result = loop.run_until_complete(web_dev_agent.handle_message(msg))
                     task_id_holder["task_id"] = result["task"]["id"]
                 except Exception as exc:
@@ -399,6 +427,7 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                 if state in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_INPUT_REQUIRED"):
                     arts = td["task"].get("artifacts", [])
                     pr_url = ""
+                    pr_number = 0
                     branch = ""
                     jira_in_review = False
                     screenshot_included = False
@@ -406,6 +435,7 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                     for art in arts:
                         m = art.get("metadata", {})
                         pr_url = pr_url or m.get("prUrl", "")
+                        pr_number = pr_number or m.get("prNumber", 0)
                         branch = branch or m.get("branch", "")
                         if m.get("jiraInReview"):
                             jira_in_review = True
@@ -419,6 +449,7 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                         "status": "completed" if state == "TASK_STATE_COMPLETED" else "error",
                         "summary": summary,
                         "prUrl": pr_url,
+                        "prNumber": pr_number,
                         "branch": branch,
                         "jiraInReview": jira_in_review,
                         "screenshotIncluded": screenshot_included,

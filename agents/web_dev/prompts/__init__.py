@@ -464,6 +464,9 @@ For UI tasks — MANDATORY steps (in order):
      - 5 lesson list items (each with unit label, lesson title, arrow icon) → implement exactly 5
      - Footer with copyright and policy links → implement it
    If a component is NOT in this list, do NOT implement it.
+   CRITICAL: You MUST implement ALL structural sections present in the Design HTML Reference
+   (header/nav, main content area, footer). A page with ONLY the main section but missing
+   the header and footer from the design reference is INCOMPLETE and will fail review.
    FORBIDDEN: search bars, filter controls, tags, badges, duration metadata, author fields,
    rating stars, pagination, loading states, extra CTA sections, breadcrumbs — unless
    explicitly present in the Design HTML Reference.
@@ -585,31 +588,13 @@ Self-assessment verdict: {assessment_verdict}
 Self-assessment gaps: {assessment_gaps}
 Screenshots in workspace: {screenshot_paths}
 
+Required Markdown template:
+{pr_description_template}
+
 Write a pull request title and description.
 Return JSON with:
 - "title": short PR title (≤72 chars, imperative mood, prefixed with Jira key)
-- "description": Markdown description following this template:
-
-## {jira_key}: {{summary}}
-
-### Changes
-{{implementation_summary}}
-
-### Files Changed
-{{files_changed_list}}
-
-### Test Results
-{{test_summary}}
-
-### Self-Assessment
-- Score: {{assessment_score}} ({{assessment_verdict}})
-- Remaining gaps: {{gaps_list}}
-
-### Screenshots
-{{screenshots_note}}
-
-### Jira Ticket
-[{jira_key}]({jira_url})
+- "description": Markdown description following the required template above.
 """
 
 # ---------------------------------------------------------------------------

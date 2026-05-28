@@ -10,6 +10,7 @@ import json
 import os
 import time
 import urllib.request
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -148,16 +149,20 @@ def _office_mount_plan(source_paths: list[str], output_mode: str, launcher) -> d
 
         if is_directory_request:
             host_bind_source = host_path_stripped
+            bind_relative_path = os.path.basename(host_path_stripped)
             relative_path = ""
         elif relative_path:
             host_bind_source = os.path.dirname(host_path_stripped) or os.sep
+            bind_relative_path = ""
         else:
             host_bind_source = host_path_stripped
+            bind_relative_path = ""
 
-        bind_key = (os.path.realpath(host_bind_source), read_only)
+        bind_key = (os.path.realpath(host_bind_source), read_only, bind_relative_path)
         mount_target = mount_targets.get(bind_key)
         if not mount_target:
-            mount_target = f"{source_root}/input-{len(mount_targets)}"
+            mount_base = f"{source_root}/input-{len(mount_targets)}"
+            mount_target = os.path.join(mount_base, bind_relative_path) if bind_relative_path else mount_base
             mount_targets[bind_key] = mount_target
             bind_suffix = ":ro" if read_only else ""
             extra_binds.append(f"{host_bind_source}:{mount_target}{bind_suffix}")
@@ -175,6 +180,31 @@ def _office_mount_plan(source_paths: list[str], output_mode: str, launcher) -> d
             "OFFICE_ALLOW_INPLACE_WRITES": "true" if output_mode == "inplace" else "false",
         },
     }
+
+
+def _build_office_execution_contract(output_mode: str = "workspace") -> dict[str, Any]:
+    """Build the parent-issued execution contract for Office per-task work."""
+    from framework.execution_contract import build_execution_contract, load_child_profiles
+
+    root = Path(__file__).resolve().parents[2]
+    child_profiles = load_child_profiles({
+        "office": str(root / "config" / "permissions" / "office.yaml"),
+    })
+    definition_of_done = {
+        "output_mode": output_mode if output_mode in {"workspace", "inplace"} else "workspace",
+        "delivery_report_required": True,
+        "workspace_output_required": output_mode != "inplace",
+    }
+    contract = build_execution_contract(
+        profile=child_profiles["office"],
+        workflow_ref="config/workflows/office_task.yaml",
+        rule_refs=[],
+        workspace_root=os.environ.get("ARTIFACT_ROOT", ""),
+        definition_of_done=definition_of_done,
+    )
+    if not contract.allowed_tools:
+        raise ValueError("office permission profile has no allowed_tools")
+    return contract.to_dict()
 
 
 def _wait_for_agent_ready(base_url: str, timeout: int = 30) -> None:
@@ -218,6 +248,7 @@ def _dispatch_office_task_via_launcher(
 
     try:
         _wait_for_agent_ready(launch["service_url"])
+        execution_contract = _build_office_execution_contract(output_mode)
         result = dispatch_sync(
             url=launch["service_url"],
             capability=_office_requested_capability(capability),
@@ -227,6 +258,7 @@ def _dispatch_office_task_via_launcher(
                 "output_mode": output_mode,
                 "capability": capability,
                 "compassTaskId": orchestrator_task_id,
+                "executionContract": execution_contract,
             },
             timeout=3600,
         )
@@ -466,6 +498,7 @@ class DispatchOfficeTask(BaseTool):
                 meta["compassTaskId"] = orchestrator_task_id
             if callback_url:
                 meta["orchestratorCallbackUrl"] = callback_url
+            meta["executionContract"] = _build_office_execution_contract(output_mode)
 
             from framework.a2a.client import dispatch_sync
 

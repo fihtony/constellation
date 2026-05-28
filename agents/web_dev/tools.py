@@ -246,6 +246,35 @@ class SCMListBranches(BaseTool):
         return ToolResult(output=json.dumps(result))
 
 
+class SCMListPRs(BaseTool):
+    """List open pull requests for a repository via SCM Agent."""
+
+    name = "scm_list_prs"
+    description = "List pull requests for a repository through the SCM Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string", "description": "Repository URL"},
+            "state": {"type": "string", "description": "PR state filter", "default": "open"},
+        },
+        "required": ["repo_url"],
+    }
+
+    def execute_sync(self, repo_url: str = "", state: str = "open", **_kwargs) -> ToolResult:
+        project, repo = _parse_repo_coordinates(repo_url)
+        if not project or not repo:
+            return ToolResult(output=json.dumps({"prs": [], "error": "Cannot infer project/repo from repo_url"}))
+        result = _dispatch_scm(
+            "scm.pr.list",
+            text=f"{project}/{repo}",
+            project=project,
+            repo=repo,
+            state=state,
+            **_kwargs,
+        )
+        return ToolResult(output=json.dumps(result))
+
+
 class SCMPush(BaseTool):
     """Push a local branch to the remote via SCM Agent."""
 
@@ -419,6 +448,7 @@ def register_web_dev_tools():
         JiraGetTokenUser,
         JiraListComments,
         SCMListBranches,
+        SCMListPRs,
         SCMPush,
         SCMCreatePR,
         SCMUploadPRImage,

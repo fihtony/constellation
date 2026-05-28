@@ -1,0 +1,28 @@
+# Code review task workflow configuration
+name: code_review_task
+version: "1.0"
+
+definition_of_done:
+  all_dimensions_reviewed: true
+  verdict_determined: true
+  report_generated: true
+
+validation_gates:
+  pr_context:
+    pr_diff_loaded: true
+    requirements_extracted: true
+  report:
+    verdict_required: true
+    issues_list_required: true
+    summary_required: true
+    critical_issue_blocks_approval: true
+
+review_dimensions:
+  - quality
+  - security
+  - tests
+  - requirements
+  - ui_design  # only if design_context available
+
+limits:
+  max_issues_per_dimension: 20

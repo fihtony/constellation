@@ -1,0 +1,18 @@
+# Office task workflow configuration
+name: office_task
+version: "1.0"
+
+definition_of_done:
+  output_generated: true
+  output_mode_confirmed: true
+
+validation_gates:
+  input:
+    source_path_exists: true
+    output_mode_specified: true
+  output:
+    output_file_exists: true
+
+limits:
+  max_document_pages: 500
+  max_folder_items: 1000

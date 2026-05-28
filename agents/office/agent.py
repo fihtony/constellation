@@ -105,7 +105,7 @@ def _build_office_definition() -> AgentDefinition:
         skills=cfg.get("skills", []),
         tools=cfg.get("tools", []),
         permissions=cfg.get("permissions", {}),
-        permission_profile=cfg.get("permission_profile", "office_readonly"),
+        permission_profile=cfg.get("permission_profile", "office"),
         runtime_backend=cfg.get("runtime_backend", "connect-agent"),
         model=cfg.get("model", "gpt-5-mini"),
         workflow=office_workflow,
@@ -176,6 +176,23 @@ class OfficeAgent(BaseAgent):
 
         canonical_task_id = task.id
 
+        exec_contract = metadata.get("executionContract")
+        if not exec_contract or not isinstance(exec_contract, dict):
+            task_store.fail_task(canonical_task_id, "Missing executionContract metadata")
+            return task_store.get_task_dict(canonical_task_id)
+
+        from framework.execution_contract import resolve_execution_contract_permission_set
+        from framework.permissions import PermissionEngine
+        try:
+            _contract, permission_set = resolve_execution_contract_permission_set(
+                self.definition.permission_profile,
+                exec_contract,
+            )
+            self._permission_engine = PermissionEngine(permission_set)
+        except Exception as exc:
+            task_store.fail_task(canonical_task_id, f"Invalid executionContract metadata: {exc}")
+            return task_store.get_task_dict(canonical_task_id)
+
         # Setup logging - use compass_task_id if available, else own task id
         log_task_id = compass_task_id if compass_task_id else canonical_task_id
         log = AgentLogger(task_id=log_task_id, agent_name=self.definition.agent_id)
@@ -215,7 +232,7 @@ class OfficeAgent(BaseAgent):
             "_runtime": self.services.runtime,
             "_skills_registry": self.skills_registry,
             "_plugin_manager": self.plugin_manager,
-            "_allowed_tools": metadata.get("allowed_tools"),
+            "_allowed_tools": contract.allowed_tools,
             "_permission_engine": getattr(self, "_permission_engine", None),
             "required_skills": list(self.definition.skills or []),
             "user_request": user_text,

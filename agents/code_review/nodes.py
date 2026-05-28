@@ -16,6 +16,7 @@ from pathlib import Path as _Path
 from typing import Any
 
 from framework.config import load_agent_config as _load_agent_cfg
+from framework.devlog import AgentLogger
 
 # Load own agent_id from config.yaml — single source of truth
 _AGENT_ID: str = _load_agent_cfg(
@@ -59,6 +60,82 @@ def _parse_issue_list(text: str) -> list[dict]:
     return []
 
 
+def _logger(state: dict) -> AgentLogger:
+    return AgentLogger(task_id=state.get("_task_id", ""), agent_name=_AGENT_ID)
+
+
+def _unwrap_artifact_payload(payload: Any) -> Any:
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        return payload["data"]
+    return payload
+
+
+def _load_json_file(path: str) -> Any:
+    with open(path, encoding="utf-8") as fh:
+        return _unwrap_artifact_payload(json.load(fh))
+
+
+def _load_text_file(path: str, max_chars: int = 8000) -> str:
+    with open(path, encoding="utf-8") as fh:
+        return fh.read(max_chars)
+
+
+def _record_checked_artifact(checked_artifacts: list[str], workspace_path: str, path: str) -> None:
+    if not workspace_path or not path or not os.path.isfile(path):
+        return
+    relative = os.path.relpath(path, workspace_path).replace(os.sep, "/")
+    if relative not in checked_artifacts:
+        checked_artifacts.append(relative)
+
+
+def _find_latest_self_assessment(agent_dir: str) -> str:
+    if not os.path.isdir(agent_dir):
+        return ""
+    candidates = []
+    for name in os.listdir(agent_dir):
+        if name == "self-assessment.json" and os.path.isfile(os.path.join(agent_dir, name)):
+            candidates.append((10_000, os.path.join(agent_dir, name)))
+            continue
+        match = re.fullmatch(r"self-assessment-(\d+)\.json", name)
+        if match and os.path.isfile(os.path.join(agent_dir, name)):
+            candidates.append((int(match.group(1)), os.path.join(agent_dir, name)))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _find_jira_ticket_path(workspace_path: str, jira_context: dict[str, Any]) -> str:
+    jira_key = str((jira_context or {}).get("key", "")).strip()
+    if jira_key:
+        candidate = os.path.join(workspace_path, "jira", jira_key, "ticket.json")
+        if os.path.isfile(candidate):
+            return candidate
+    jira_root = os.path.join(workspace_path, "jira")
+    if not os.path.isdir(jira_root):
+        return ""
+    for entry in sorted(os.listdir(jira_root)):
+        candidate = os.path.join(jira_root, entry, "ticket.json")
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def _parse_pr_number(pr_url: str, pr_number: Any) -> int:
+    try:
+        number = int(pr_number or 0)
+    except (TypeError, ValueError):
+        number = 0
+    if number:
+        return number
+    if pr_url and "/pull/" in pr_url:
+        try:
+            return int(pr_url.rstrip("/").rsplit("/pull/", 1)[1])
+        except (TypeError, ValueError, IndexError):
+            return 0
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Node implementations
 # ---------------------------------------------------------------------------
@@ -71,12 +148,20 @@ async def load_pr_context(state: dict) -> dict:
     Also loads Jira and design context for requirements-aware review.
     """
     metadata = state.get("metadata", {})
+    log = _logger(state)
+    log.node("load_pr_context")
 
     # PR context
     pr_diff = metadata.get("prDiff") or state.get("pr_diff") or ""
     changed_files = metadata.get("changedFiles") or state.get("changed_files") or []
     pr_description = metadata.get("prDescription") or state.get("pr_description") or ""
     commit_messages = metadata.get("commitMessages") or state.get("commit_messages") or []
+    checked_artifacts: list[str] = []
+
+    # If PR diff not provided, try to fetch via scm_get_pr_diff tool
+    pr_url = metadata.get("prUrl") or state.get("pr_url") or ""
+    repo_url = metadata.get("repoUrl") or state.get("repo_url") or ""
+    pr_number = metadata.get("prNumber") or state.get("pr_number") or 0
 
     # Jira and design context (passed by Team Lead)
     jira_context = metadata.get("jiraContext") or state.get("jira_context") or {}
@@ -87,6 +172,119 @@ async def load_pr_context(state: dict) -> dict:
         or state.get("context_manifest_path")
         or ""
     )
+
+    if workspace_path:
+        if context_manifest_path:
+            manifest_file = context_manifest_path
+            if not os.path.isabs(manifest_file):
+                manifest_file = os.path.join(workspace_path, manifest_file)
+            _record_checked_artifact(checked_artifacts, workspace_path, manifest_file)
+
+        jira_ticket_path = _find_jira_ticket_path(workspace_path, jira_context)
+        if jira_ticket_path:
+            try:
+                jira_context = _load_json_file(jira_ticket_path) or jira_context
+                _record_checked_artifact(checked_artifacts, workspace_path, jira_ticket_path)
+            except Exception as exc:
+                log.warn("failed to load jira ticket artifact", error=str(exc), path=jira_ticket_path)
+
+        ui_design_root = os.path.join(workspace_path, "ui-design")
+        design_md_path = os.path.join(ui_design_root, "stitch", "DESIGN.md")
+        design_html_path = os.path.join(ui_design_root, "stitch", "code.html")
+        design_meta_path = os.path.join(ui_design_root, "stitch", "screen-meta.json")
+        if os.path.isfile(design_md_path):
+            try:
+                design_context = dict(design_context or {})
+                design_context["spec_markdown"] = _load_text_file(design_md_path)
+                _record_checked_artifact(checked_artifacts, workspace_path, design_md_path)
+            except Exception as exc:
+                log.warn("failed to load design markdown", error=str(exc), path=design_md_path)
+        if os.path.isfile(design_html_path):
+            try:
+                design_context = dict(design_context or {})
+                design_context["design_html"] = _load_text_file(design_html_path)
+                _record_checked_artifact(checked_artifacts, workspace_path, design_html_path)
+            except Exception as exc:
+                log.warn("failed to load design html", error=str(exc), path=design_html_path)
+        if os.path.isfile(design_meta_path):
+            try:
+                design_context = dict(design_context or {})
+                design_context["screen_meta"] = _load_json_file(design_meta_path)
+                _record_checked_artifact(checked_artifacts, workspace_path, design_meta_path)
+            except Exception as exc:
+                log.warn("failed to load design metadata", error=str(exc), path=design_meta_path)
+
+        web_dev_dir = os.path.join(workspace_path, _WEB_DEV_AGENT_ID)
+        pr_evidence_path = os.path.join(web_dev_dir, "pr-evidence.json")
+        if os.path.isfile(pr_evidence_path):
+            try:
+                pr_evidence = _load_json_file(pr_evidence_path) or {}
+                _record_checked_artifact(checked_artifacts, workspace_path, pr_evidence_path)
+                pr_url = pr_url or str(pr_evidence.get("pr_url", ""))
+                pr_number = pr_number or pr_evidence.get("pr_number") or 0
+                changed_files = changed_files or list(pr_evidence.get("changed_files", []) or [])
+            except Exception as exc:
+                log.warn("failed to load PR evidence", error=str(exc), path=pr_evidence_path)
+
+        self_assessment_path = _find_latest_self_assessment(web_dev_dir)
+        if self_assessment_path:
+            _record_checked_artifact(checked_artifacts, workspace_path, self_assessment_path)
+
+        if not jira_context:
+            team_lead_ticket_path = os.path.join(workspace_path, _TEAM_LEAD_AGENT_ID, "jira-ticket.json")
+            if os.path.isfile(team_lead_ticket_path):
+                try:
+                    jira_context = _load_json_file(team_lead_ticket_path) or jira_context
+                    _record_checked_artifact(checked_artifacts, workspace_path, team_lead_ticket_path)
+                except Exception as exc:
+                    log.warn("failed to load team-lead jira ticket", error=str(exc), path=team_lead_ticket_path)
+        if not design_context:
+            team_lead_design_path = os.path.join(workspace_path, _TEAM_LEAD_AGENT_ID, "design-spec.json")
+            if os.path.isfile(team_lead_design_path):
+                try:
+                    design_context = _load_json_file(team_lead_design_path) or design_context
+                    _record_checked_artifact(checked_artifacts, workspace_path, team_lead_design_path)
+                except Exception as exc:
+                    log.warn("failed to load team-lead design spec", error=str(exc), path=team_lead_design_path)
+
+    pr_number = _parse_pr_number(pr_url, pr_number)
+
+    if repo_url and pr_number and (not pr_description or not commit_messages):
+        try:
+            from framework.tools.registry import get_registry
+            registry = get_registry()
+            info_result_str = registry.execute_sync(
+                "scm_get_pr_info",
+                {"repo_url": repo_url, "pr_number": int(pr_number), "task_id": state.get("_task_id", "")},
+            )
+            info_payload = json.loads(info_result_str) if info_result_str else {}
+            if not info_payload.get("error"):
+                pr_description = pr_description or info_payload.get("description", "")
+                commit_messages = commit_messages or [
+                    commit.get("message", "") for commit in info_payload.get("commits", []) if commit.get("message")
+                ]
+        except Exception as exc:
+            log.warn("scm_get_pr_info fallback failed", error=str(exc))
+
+    if not pr_diff and pr_url and repo_url and pr_number:
+        try:
+            from framework.tools.registry import get_registry
+            registry = get_registry()
+            diff_result_str = registry.execute_sync(
+                "scm_get_pr_diff",
+                {"repo_url": repo_url, "pr_number": int(pr_number), "task_id": state.get("_task_id", "")},
+            )
+            diff_payload = json.loads(diff_result_str) if diff_result_str else {}
+            if not diff_payload.get("error"):
+                pr_diff = diff_payload.get("diff_text", "")
+                changed_files = changed_files or [
+                    f.get("filename", "") for f in diff_payload.get("changed_files", [])
+                ]
+                log.info("fetched PR diff", pr_number=pr_number, diff_chars=len(pr_diff), files=len(changed_files))
+                print(f"[{_AGENT_ID}] Fetched PR diff via scm_get_pr_diff: {len(pr_diff)} chars")
+        except Exception as exc:
+            log.warn("scm_get_pr_diff fallback failed", error=str(exc))
+            print(f"[{_AGENT_ID}] scm_get_pr_diff fallback failed (non-fatal): {exc}")
 
     # Extract original requirements from Jira context
     original_requirements = state.get("original_requirements", "")
@@ -119,6 +317,7 @@ async def load_pr_context(state: dict) -> dict:
                         "changed_files_count": len(changed_files) if isinstance(changed_files, list) else 0,
                         "has_jira_context": bool(jira_context),
                         "has_design_context": bool(design_context),
+                        "checked_artifacts": checked_artifacts,
                     },
                 }, fh, ensure_ascii=False, indent=2)
 
@@ -134,10 +333,19 @@ async def load_pr_context(state: dict) -> dict:
                         "context_manifest_path": context_manifest_path,
                         "has_jira_context": bool(jira_context),
                         "has_design_context": bool(design_context),
+                        "checked_artifacts": checked_artifacts,
                     },
                 }, fh, ensure_ascii=False, indent=2)
         except OSError:
             pass
+
+    log.info(
+        "PR context loaded",
+        pr_number=pr_number,
+        changed_files=len(changed_files) if isinstance(changed_files, list) else 0,
+        checked_artifacts=len(checked_artifacts),
+        has_diff=bool(pr_diff),
+    )
 
     return {
         "pr_diff": pr_diff,
@@ -149,14 +357,21 @@ async def load_pr_context(state: dict) -> dict:
         "original_requirements": original_requirements,
         "workspace_path": workspace_path,
         "context_manifest_path": context_manifest_path,
+        "repo_url": repo_url,
+        "pr_url": pr_url,
+        "pr_number": pr_number,
+        "checked_artifacts": checked_artifacts,
     }
 
 
 async def review_quality(state: dict) -> dict:
     """Check code quality, style, and patterns using a single-shot LLM call."""
     runtime = state.get("_runtime")
+    log = _logger(state)
+    log.node("review_quality")
 
     if not runtime or not state.get("pr_diff"):
+        log.info("skipping quality review", has_runtime=bool(runtime), has_diff=bool(state.get("pr_diff")))
         return {"quality_issues": []}
 
     from agents.code_review.prompts import QUALITY_SYSTEM, QUALITY_TEMPLATE
@@ -169,6 +384,7 @@ async def review_quality(state: dict) -> dict:
     result = runtime.run(prompt, system_prompt=QUALITY_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
+    log.info("quality review complete", issues=len(issues))
 
     return {"quality_issues": issues}
 
@@ -176,8 +392,11 @@ async def review_quality(state: dict) -> dict:
 async def review_security(state: dict) -> dict:
     """Check for security vulnerabilities (OWASP Top 10) using a single-shot LLM call."""
     runtime = state.get("_runtime")
+    log = _logger(state)
+    log.node("review_security")
 
     if not runtime or not state.get("pr_diff"):
+        log.info("skipping security review", has_runtime=bool(runtime), has_diff=bool(state.get("pr_diff")))
         return {"security_issues": []}
 
     from agents.code_review.prompts import SECURITY_SYSTEM, SECURITY_TEMPLATE
@@ -190,6 +409,7 @@ async def review_security(state: dict) -> dict:
     result = runtime.run(prompt, system_prompt=SECURITY_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
+    log.info("security review complete", issues=len(issues))
 
     return {"security_issues": issues}
 
@@ -197,8 +417,11 @@ async def review_security(state: dict) -> dict:
 async def review_tests(state: dict) -> dict:
     """Check test coverage and test quality using a single-shot LLM call."""
     runtime = state.get("_runtime")
+    log = _logger(state)
+    log.node("review_tests")
 
     if not runtime or not state.get("pr_diff"):
+        log.info("skipping test review", has_runtime=bool(runtime), has_diff=bool(state.get("pr_diff")))
         return {"test_issues": []}
 
     from agents.code_review.prompts import TESTS_SYSTEM, TESTS_TEMPLATE
@@ -211,6 +434,7 @@ async def review_tests(state: dict) -> dict:
     result = runtime.run(prompt, system_prompt=TESTS_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
+    log.info("test review complete", issues=len(issues))
 
     return {"test_issues": issues}
 
@@ -218,12 +442,16 @@ async def review_tests(state: dict) -> dict:
 async def review_requirements(state: dict) -> dict:
     """Check requirements compliance against Jira acceptance criteria."""
     runtime = state.get("_runtime")
+    log = _logger(state)
+    log.node("review_requirements")
 
     if not runtime or not state.get("pr_diff"):
+        log.info("skipping requirements review", has_runtime=bool(runtime), has_diff=bool(state.get("pr_diff")))
         return {"requirement_gaps": []}
 
     original_requirements = state.get("original_requirements", "")
     if not original_requirements:
+        log.info("skipping requirements review", reason="missing original requirements")
         return {"requirement_gaps": []}
 
     from agents.code_review.prompts import REQUIREMENTS_SYSTEM, REQUIREMENTS_TEMPLATE
@@ -239,6 +467,7 @@ async def review_requirements(state: dict) -> dict:
     result = runtime.run(prompt, system_prompt=REQUIREMENTS_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
+    log.info("requirements review complete", issues=len(issues))
 
     return {"requirement_gaps": issues}
 
@@ -251,8 +480,11 @@ async def review_ui_design(state: dict) -> dict:
     neither condition is true, so it is safe to run for every review.
     """
     runtime = state.get("_runtime")
+    log = _logger(state)
+    log.node("review_ui_design")
 
     if not runtime or not state.get("pr_diff"):
+        log.info("skipping UI review", has_runtime=bool(runtime), has_diff=bool(state.get("pr_diff")))
         return {"ui_issues": []}
 
     # Determine whether this is a UI task — check file extensions and PR description
@@ -268,6 +500,7 @@ async def review_ui_design(state: dict) -> dict:
     ) or any(kw in pr_description.lower() for kw in _ui_keywords)
 
     if not is_ui_task:
+        log.info("skipping UI review", reason="non-UI task")
         return {"ui_issues": []}
 
     from agents.code_review.prompts import UI_DESIGN_SYSTEM, UI_DESIGN_TEMPLATE
@@ -311,6 +544,7 @@ async def review_ui_design(state: dict) -> dict:
     result = runtime.run(prompt, system_prompt=UI_DESIGN_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
+    log.info("UI review complete", issues=len(issues), has_design_spec=bool(design_spec), has_design_html=bool(design_html))
 
     return {"ui_issues": issues}
 
@@ -327,6 +561,8 @@ async def generate_report(state: dict) -> dict:
     tests = state.get("test_issues", [])
     requirements = state.get("requirement_gaps", [])
     ui_issues = state.get("ui_issues", [])
+    log = _logger(state)
+    log.node("generate_report")
 
     all_comments = quality + security + tests + requirements + ui_issues
 
@@ -337,6 +573,22 @@ async def generate_report(state: dict) -> dict:
     low = sum(1 for c in all_comments if c.get("severity") == "low")
 
     verdict = "approved" if (critical == 0 and high == 0) else "rejected"
+
+    # Validation gate: verify review report structure
+    from framework.validation_gates import validate_review_verdict
+    gate_result = validate_review_verdict({
+        "verdict": verdict,
+        "issues": all_comments,
+        "summary": f"Review complete: {len(all_comments)} issue(s) found.",
+        "severity_levels": {"critical": critical, "high": high, "medium": medium, "low": low},
+    })
+    if not gate_result.passed:
+        # Gate enforcement: if critical issues found but verdict was wrongly set, override
+        if "Critical issues" in gate_result.feedback:
+            verdict = "rejected"
+            print(f"[{_AGENT_ID}] validate_review_verdict: overriding verdict to 'rejected'")
+        else:
+            print(f"[{_AGENT_ID}] validate_review_verdict gate warning: {gate_result.feedback}")
 
     summary_parts = [
         f"Review complete: {len(all_comments)} issue(s) found ({len(ui_issues)} UI design).",
@@ -353,15 +605,7 @@ async def generate_report(state: dict) -> dict:
             "medium": medium,
             "low": low,
         },
-        "checked_artifacts": [
-            p for p in [
-                f"{_TEAM_LEAD_AGENT_ID}/jira-ticket.json" if state.get("jira_context") else "",
-                f"{_TEAM_LEAD_AGENT_ID}/design-spec.json" if state.get("design_context") else "",
-                state.get("context_manifest_path", ""),
-                f"{_WEB_DEV_AGENT_ID}/self-assessment.json",
-                f"{_WEB_DEV_AGENT_ID}/pr-evidence.json",
-            ] if p
-        ],
+        "checked_artifacts": list(state.get("checked_artifacts", [])),
     }
 
     # Write review report to workspace
@@ -397,6 +641,8 @@ async def generate_report(state: dict) -> dict:
                 }, fh, ensure_ascii=False, indent=2)
         except OSError:
             pass
+
+    log.info("review report generated", verdict=verdict, issues=len(all_comments), checked_artifacts=len(report["checked_artifacts"]))
 
     return {
         "verdict": verdict,

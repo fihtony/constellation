@@ -165,12 +165,12 @@ class TestBuildRunConfig:
 
 
 class TestWebDevPermissionProfile:
-    """Verify the web-dev definition includes the development profile."""
+    """Verify agent definitions include owner-specific permission profiles."""
 
     def test_web_dev_has_profile(self):
         from agents.web_dev.agent import web_dev_definition
-        assert web_dev_definition.permission_profile == "development"
+        assert web_dev_definition.permission_profile == "web-dev"
 
     def test_code_review_has_profile(self):
         from agents.code_review.agent import code_review_definition
-        assert code_review_definition.permission_profile == "read_only"
+        assert code_review_definition.permission_profile == "code-review"

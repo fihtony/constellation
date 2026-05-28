@@ -1,0 +1,15 @@
+# Permissions: UI Design boundary agent (deterministic API adapter)
+agent_id: ui-design
+allowed_tools:
+  - fetch_design
+  - fetch_figma_page
+  - fetch_stitch_screen
+  - fetch_design_tokens
+  - export_design_screenshot
+
+denied_tools: []
+
+scm: none
+filesystem: workspace-only
+agent_launching: false
+allowed_agents: []

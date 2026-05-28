@@ -1,8 +1,5 @@
-# Permissions: Office task execution with controlled file access.
-# Note:
-# - Source read access is constrained by OFFICE_SOURCE_ROOT / OFFICE_ALLOWED_BASE_PATHS in tools.
-# - Write destination is controlled by output mode and tool-level checks.
-
+# Permissions: Office agent (per-task document execution)
+agent_id: office
 allowed_tools:
   - read_pdf
   - read_docx
@@ -25,3 +22,5 @@ denied_tools:
 
 scm: none
 filesystem: workspace-only
+agent_launching: false
+allowed_agents: []

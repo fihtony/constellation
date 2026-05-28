@@ -1,0 +1,31 @@
+# Permissions: Web Dev agent (per-task development execution)
+agent_id: web-dev
+allowed_tools:
+  - read_file
+  - write_file
+  - edit_file
+  - run_command
+  - search_code
+  - glob
+  - grep
+  - scm_push
+  - scm_create_pr
+  - scm_list_prs
+  - scm_add_pr_comment
+  - scm_upload_pr_image
+  - scm_update_pr
+  - scm_get_pr_diff
+  - scm_get_pr_info
+  - scm_branch
+  - scm_commit
+  - jira_transition
+  - jira_comment
+  - jira_list_transitions
+  - jira_get_token_user
+
+denied_tools: []
+
+scm: read-write
+filesystem: workspace-only
+agent_launching: false
+allowed_agents: []
