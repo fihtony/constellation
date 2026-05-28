@@ -402,6 +402,9 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                     execution_contract = kw.get("execution_contract")
                     if execution_contract:
                         msg["message"]["metadata"]["executionContract"] = execution_contract
+                    permissions = kw.get("permissions")
+                    if isinstance(permissions, dict):
+                        msg["message"]["metadata"]["permissions"] = permissions
                     result = loop.run_until_complete(web_dev_agent.handle_message(msg))
                     task_id_holder["task_id"] = result["task"]["id"]
                 except Exception as exc:

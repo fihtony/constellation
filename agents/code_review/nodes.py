@@ -88,6 +88,12 @@ def _record_checked_artifact(checked_artifacts: list[str], workspace_path: str, 
         checked_artifacts.append(relative)
 
 
+def _child_permissions(state: dict) -> dict[str, Any] | None:
+    metadata = state.get("metadata", {})
+    permissions = metadata.get("permissions")
+    return permissions if isinstance(permissions, dict) else None
+
+
 def _find_latest_self_assessment(agent_dir: str) -> str:
     if not os.path.isdir(agent_dir):
         return ""
@@ -172,6 +178,7 @@ async def load_pr_context(state: dict) -> dict:
         or state.get("context_manifest_path")
         or ""
     )
+    permissions = _child_permissions(state)
 
     if workspace_path:
         if context_manifest_path:
@@ -253,10 +260,14 @@ async def load_pr_context(state: dict) -> dict:
         try:
             from framework.tools.registry import get_registry
             registry = get_registry()
-            info_result_str = registry.execute_sync(
-                "scm_get_pr_info",
-                {"repo_url": repo_url, "pr_number": int(pr_number), "task_id": state.get("_task_id", "")},
-            )
+            info_args = {
+                "repo_url": repo_url,
+                "pr_number": int(pr_number),
+                "task_id": state.get("_task_id", ""),
+            }
+            if permissions:
+                info_args["permissions"] = permissions
+            info_result_str = registry.execute_sync("scm_get_pr_info", info_args)
             info_payload = json.loads(info_result_str) if info_result_str else {}
             if not info_payload.get("error"):
                 pr_description = pr_description or info_payload.get("description", "")
@@ -270,10 +281,14 @@ async def load_pr_context(state: dict) -> dict:
         try:
             from framework.tools.registry import get_registry
             registry = get_registry()
-            diff_result_str = registry.execute_sync(
-                "scm_get_pr_diff",
-                {"repo_url": repo_url, "pr_number": int(pr_number), "task_id": state.get("_task_id", "")},
-            )
+            diff_args = {
+                "repo_url": repo_url,
+                "pr_number": int(pr_number),
+                "task_id": state.get("_task_id", ""),
+            }
+            if permissions:
+                diff_args["permissions"] = permissions
+            diff_result_str = registry.execute_sync("scm_get_pr_diff", diff_args)
             diff_payload = json.loads(diff_result_str) if diff_result_str else {}
             if not diff_payload.get("error"):
                 pr_diff = diff_payload.get("diff_text", "")

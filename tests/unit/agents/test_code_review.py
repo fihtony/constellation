@@ -207,7 +207,56 @@ class TestLoadPrContext:
         assert "ui-design/stitch/DESIGN.md" in result["checked_artifacts"]
         assert "web-dev/pr-evidence.json" in result["checked_artifacts"]
         assert "web-dev/self-assessment-2.json" in result["checked_artifacts"]
+        assert all(not path.startswith("code-review/") for path in result["checked_artifacts"])
         assert (workspace_path / "code-review" / "review-checkpoints" / "review-start.json").exists()
+
+    async def test_forwards_parent_supplied_child_permissions_to_scm_fallbacks(self, monkeypatch):
+        captured: list[dict] = []
+
+        class StubRegistry:
+            def execute_sync(self, name, arguments):
+                captured.append({"name": name, "arguments": arguments})
+                if name == "scm_get_pr_info":
+                    return json.dumps({"description": "Review this PR", "commits": []})
+                if name == "scm_get_pr_diff":
+                    return json.dumps({
+                        "diff_text": "diff --git a/src/App.tsx b/src/App.tsx",
+                        "changed_files": [{"filename": "src/App.tsx"}],
+                    })
+                raise AssertionError(f"unexpected tool {name}")
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        permissions = {
+            "allowedTools": ["scm_get_pr_info", "scm_get_pr_diff"],
+            "deniedTools": [],
+            "scm": "read",
+            "filesystem": "workspace-only",
+            "custom": {},
+        }
+        result = await load_pr_context(
+            {
+                "_task_id": "task-123",
+                "metadata": {
+                    "prUrl": "https://github.com/org/repo/pull/12",
+                    "repoUrl": "https://github.com/org/repo",
+                    "prNumber": 12,
+                    "permissions": permissions,
+                },
+            }
+        )
+
+        assert result["pr_diff"].startswith("diff --git")
+        assert [entry["name"] for entry in captured] == ["scm_get_pr_info", "scm_get_pr_diff"]
+        assert captured[0]["arguments"]["permissions"] == permissions
+        assert captured[1]["arguments"]["permissions"] == permissions
+
+    async def test_load_pr_context_writes_agent_log(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path))
+
+        await load_pr_context({"_task_id": "task-123"})
+
+        assert (tmp_path / "task-123" / "code-review" / "agent.log").exists()
 
 
 class TestReviewQuality:

@@ -98,6 +98,7 @@ class CodeReviewAgent(BaseAgent):
 
     async def handle_message(self, message: dict) -> dict:
         from framework.a2a.protocol import Artifact
+        from framework.devlog import AgentLogger
         from framework.workflow import RunConfig
 
         msg = message.get("message", message)
@@ -116,6 +117,14 @@ class CodeReviewAgent(BaseAgent):
         # Use the Compass orchestrator task ID as canonical _task_id for AgentLogger
         orchestrator_task_id = metadata.get("orchestratorTaskId", "")
         canonical_task_id = orchestrator_task_id or task.id
+        log = AgentLogger(task_id=canonical_task_id, agent_name=self.definition.agent_id)
+        log.node(
+            "handle_message",
+            orchestrator_task_id=orchestrator_task_id or task.id,
+            has_execution_contract=bool(metadata.get("executionContract")),
+            has_permissions=isinstance(metadata.get("permissions"), dict),
+            has_workspace=bool(metadata.get("workspacePath")),
+        )
 
         state = {
             "_task_id": canonical_task_id,
@@ -143,7 +152,14 @@ class CodeReviewAgent(BaseAgent):
                 exec_contract,
             )
             self._permission_engine = PermissionEngine(permission_set)
+            log.info(
+                "execution contract accepted",
+                allowed_tools=len(permission_set.allowed_tools or []),
+                scm=permission_set.scm,
+                filesystem=permission_set.filesystem,
+            )
         except Exception as exc:
+            log.error("execution contract rejected", error=str(exc))
             task_store.fail_task(task.id, f"Invalid executionContract metadata: {exc}")
             return task_store.get_task_dict(task.id)
 
@@ -167,6 +183,11 @@ class CodeReviewAgent(BaseAgent):
                 )
                 result = loop.run_until_complete(
                     self._compiled_workflow.invoke(state, config)
+                )
+                log.info(
+                    "workflow completed",
+                    verdict=result.get("verdict", "unknown"),
+                    issues=len(result.get("all_comments", []) or []),
                 )
                 report = {
                     "verdict": result.get("verdict", "rejected"),
@@ -198,6 +219,7 @@ class CodeReviewAgent(BaseAgent):
                         callback_url, task.id, report, self.definition.agent_id
                     )
             except Exception as e:
+                log.error("workflow failed", error=str(e))
                 task_store.fail_task(task.id, str(e))
             finally:
                 loop.close()
@@ -287,6 +309,8 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
             design_context=None,
             workspace_path: str = "",
             context_manifest_path: str = "",
+            orchestrator_task_id: str = "",
+            task_id: str = "",
             **kw,
         ) -> ToolResult:
             task_id_holder: dict = {}
@@ -306,12 +330,17 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
                                 "designContext": design_context or {},
                                 "workspacePath": workspace_path,
                                 "contextManifestPath": context_manifest_path,
+                                "orchestratorTaskId": orchestrator_task_id or task_id,
+                                "taskId": task_id,
                             },
                         }
                     }
                     execution_contract = kw.get("execution_contract")
                     if execution_contract:
                         msg["message"]["metadata"]["executionContract"] = execution_contract
+                    permissions = kw.get("permissions")
+                    if isinstance(permissions, dict):
+                        msg["message"]["metadata"]["permissions"] = permissions
                     result = loop.run_until_complete(code_review_agent.handle_message(msg))
                     task_id_holder["task_id"] = result["task"]["id"]
                 except Exception as exc:

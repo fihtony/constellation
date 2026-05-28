@@ -184,7 +184,18 @@ def _office_mount_plan(source_paths: list[str], output_mode: str, launcher) -> d
 
 def _build_office_execution_contract(output_mode: str = "workspace") -> dict[str, Any]:
     """Build the parent-issued execution contract for Office per-task work."""
-    from framework.execution_contract import build_execution_contract, load_child_profiles
+    contract, _permissions = _build_office_dispatch_contract(output_mode)
+    return contract
+
+
+def _build_office_dispatch_contract(output_mode: str = "workspace") -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build both executionContract and child-scoped permission snapshot for Office."""
+    from framework.execution_contract import (
+        build_execution_contract,
+        load_child_profiles,
+        permission_snapshot_from_permission_set,
+        resolve_execution_contract_permission_set,
+    )
 
     root = Path(__file__).resolve().parents[2]
     child_profiles = load_child_profiles({
@@ -204,7 +215,12 @@ def _build_office_execution_contract(output_mode: str = "workspace") -> dict[str
     )
     if not contract.allowed_tools:
         raise ValueError("office permission profile has no allowed_tools")
-    return contract.to_dict()
+    contract_dict = contract.to_dict()
+    _resolved_contract, permission_set = resolve_execution_contract_permission_set(
+        "office",
+        contract_dict,
+    )
+    return contract_dict, permission_snapshot_from_permission_set(permission_set)
 
 
 def _wait_for_agent_ready(base_url: str, timeout: int = 30) -> None:
@@ -248,7 +264,7 @@ def _dispatch_office_task_via_launcher(
 
     try:
         _wait_for_agent_ready(launch["service_url"])
-        execution_contract = _build_office_execution_contract(output_mode)
+        execution_contract, permissions = _build_office_dispatch_contract(output_mode)
         result = dispatch_sync(
             url=launch["service_url"],
             capability=_office_requested_capability(capability),
@@ -259,6 +275,7 @@ def _dispatch_office_task_via_launcher(
                 "capability": capability,
                 "compassTaskId": orchestrator_task_id,
                 "executionContract": execution_contract,
+                "permissions": permissions,
             },
             timeout=3600,
         )
@@ -498,7 +515,9 @@ class DispatchOfficeTask(BaseTool):
                 meta["compassTaskId"] = orchestrator_task_id
             if callback_url:
                 meta["orchestratorCallbackUrl"] = callback_url
-            meta["executionContract"] = _build_office_execution_contract(output_mode)
+            execution_contract, permissions = _build_office_dispatch_contract(output_mode)
+            meta["executionContract"] = execution_contract
+            meta["permissions"] = permissions
 
             from framework.a2a.client import dispatch_sync
 

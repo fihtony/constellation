@@ -28,6 +28,7 @@ COPY agents/office/ /app/agents/office/
 COPY skills/office-generic-methodology/ /app/skills/office-generic-methodology/
 RUN mkdir -p /app/config/permissions /app/config/rules /app/config/workflows
 COPY config/constellation.yaml /app/config/constellation.yaml
+COPY config/permissions/office.yaml /app/config/permissions/office.yaml
 COPY config/rules/ /app/config/rules/
 COPY config/workflows/ /app/config/workflows/
 COPY scripts/run_local.py /app/scripts/run_local.py
