@@ -88,28 +88,28 @@ def _record_checked_artifact(checked_artifacts: list[str], workspace_path: str, 
         checked_artifacts.append(relative)
 
 
-def _wait_for_file(path: str, timeout_seconds: float = 3.0) -> str:
-    if os.path.isfile(path):
-        return path
-    deadline = time.monotonic() + max(timeout_seconds, 0.0)
-    while time.monotonic() < deadline:
-        time.sleep(0.2)
-        if os.path.isfile(path):
-            return path
-    return path if os.path.isfile(path) else ""
+def _review_input_wait_seconds() -> float:
+    raw = os.environ.get("CODE_REVIEW_INPUT_WAIT_SECONDS", "300")
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 300.0
 
 
-def _wait_for_latest_self_assessment(agent_dir: str, timeout_seconds: float = 3.0) -> str:
-    candidate = _find_latest_self_assessment(agent_dir)
-    if candidate:
-        return candidate
-    deadline = time.monotonic() + max(timeout_seconds, 0.0)
-    while time.monotonic() < deadline:
-        time.sleep(0.2)
-        candidate = _find_latest_self_assessment(agent_dir)
-        if candidate:
-            return candidate
-    return ""
+def _review_input_poll_seconds() -> float:
+    raw = os.environ.get("CODE_REVIEW_INPUT_POLL_SECONDS", "2")
+    try:
+        return max(float(raw), 0.1)
+    except ValueError:
+        return 2.0
+
+
+def _review_input_attempts() -> int:
+    wait_seconds = _review_input_wait_seconds()
+    poll_seconds = _review_input_poll_seconds()
+    if wait_seconds <= 0:
+        return 1
+    return max(1, int(wait_seconds / poll_seconds) + 1)
 
 
 def _child_permissions(state: dict) -> dict[str, Any] | None:
@@ -246,8 +246,8 @@ async def load_pr_context(state: dict) -> dict:
                 log.warn("failed to load design metadata", error=str(exc), path=design_meta_path)
 
         web_dev_dir = os.path.join(workspace_path, _WEB_DEV_AGENT_ID)
-        pr_evidence_path = _wait_for_file(os.path.join(web_dev_dir, "pr-evidence.json"))
-        if pr_evidence_path:
+        pr_evidence_path = os.path.join(web_dev_dir, "pr-evidence.json")
+        if os.path.isfile(pr_evidence_path):
             try:
                 pr_evidence = _load_json_file(pr_evidence_path) or {}
                 _record_checked_artifact(checked_artifacts, workspace_path, pr_evidence_path)
@@ -257,7 +257,7 @@ async def load_pr_context(state: dict) -> dict:
             except Exception as exc:
                 log.warn("failed to load PR evidence", error=str(exc), path=pr_evidence_path)
 
-        self_assessment_path = _wait_for_latest_self_assessment(web_dev_dir)
+        self_assessment_path = _find_latest_self_assessment(web_dev_dir)
         if self_assessment_path:
             _record_checked_artifact(checked_artifacts, workspace_path, self_assessment_path)
 
@@ -301,7 +301,35 @@ async def load_pr_context(state: dict) -> dict:
         except Exception as exc:
             log.warn("scm_get_pr_info fallback failed", error=str(exc))
 
-    if not pr_diff and pr_url and repo_url and pr_number:
+    review_attempts = _review_input_attempts()
+    poll_seconds = _review_input_poll_seconds()
+    last_diff_error = ""
+    review_input_wait_logged = False
+    web_dev_dir = os.path.join(workspace_path, _WEB_DEV_AGENT_ID) if workspace_path else ""
+
+    for attempt in range(review_attempts):
+        if web_dev_dir and not os.path.isfile(pr_evidence_path if workspace_path else ""):
+            current_pr_evidence_path = os.path.join(web_dev_dir, "pr-evidence.json")
+            if os.path.isfile(current_pr_evidence_path):
+                try:
+                    pr_evidence = _load_json_file(current_pr_evidence_path) or {}
+                    _record_checked_artifact(checked_artifacts, workspace_path, current_pr_evidence_path)
+                    pr_url = pr_url or str(pr_evidence.get("pr_url", ""))
+                    pr_number = pr_number or pr_evidence.get("pr_number") or 0
+                    changed_files = changed_files or list(pr_evidence.get("changed_files", []) or [])
+                    pr_evidence_path = current_pr_evidence_path
+                except Exception as exc:
+                    log.warn("failed to load PR evidence", error=str(exc), path=current_pr_evidence_path)
+
+        if web_dev_dir:
+            current_self_assessment_path = _find_latest_self_assessment(web_dev_dir)
+            if current_self_assessment_path:
+                _record_checked_artifact(checked_artifacts, workspace_path, current_self_assessment_path)
+
+        pr_number = _parse_pr_number(pr_url, pr_number)
+        if pr_diff or not (pr_url and repo_url and pr_number):
+            break
+
         try:
             from framework.tools.registry import get_registry
             registry = get_registry()
@@ -321,9 +349,25 @@ async def load_pr_context(state: dict) -> dict:
                 ]
                 log.info("fetched PR diff", pr_number=pr_number, diff_chars=len(pr_diff), files=len(changed_files))
                 print(f"[{_AGENT_ID}] Fetched PR diff via scm_get_pr_diff: {len(pr_diff)} chars")
+                break
+            last_diff_error = str(diff_payload.get("error") or diff_payload.get("detail") or "")
         except Exception as exc:
-            log.warn("scm_get_pr_diff fallback failed", error=str(exc))
-            print(f"[{_AGENT_ID}] scm_get_pr_diff fallback failed (non-fatal): {exc}")
+            last_diff_error = str(exc)
+
+        if attempt < review_attempts - 1:
+            if not review_input_wait_logged:
+                log.info(
+                    "waiting for review inputs",
+                    pr_url=pr_url,
+                    pr_number=pr_number,
+                    attempts=review_attempts,
+                    poll_seconds=poll_seconds,
+                )
+                review_input_wait_logged = True
+            time.sleep(poll_seconds)
+
+    if last_diff_error and not pr_diff:
+        log.warn("scm_get_pr_diff unavailable", error=last_diff_error, pr_number=pr_number)
 
     review_input_issues: list[dict[str, Any]] = []
     if pr_url and not pr_diff:

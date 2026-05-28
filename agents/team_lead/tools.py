@@ -437,6 +437,10 @@ class DispatchWebDev(BaseTool):
                 "type": "string",
                 "description": "Local clone path. Optional.",
             },
+            "branch_name": {
+                "type": "string",
+                "description": "Existing development branch to continue using for revisions. Optional.",
+            },
             "workspace_path": {
                 "type": "string",
                 "description": "Shared workspace root. Optional.",
@@ -488,6 +492,7 @@ class DispatchWebDev(BaseTool):
         jira_local_folder: str = "",
         repo_url: str = "",
         repo_path: str = "",
+        branch_name: str = "",
         workspace_path: str = "",
         context_manifest_path: str = "",
         jira_files: list | None = None,
@@ -513,6 +518,8 @@ class DispatchWebDev(BaseTool):
             meta["repoUrl"] = repo_url
         if repo_path:
             meta["repoPath"] = repo_path
+        if branch_name:
+            meta["branchName"] = branch_name
         if workspace_path:
             meta["workspacePath"] = workspace_path
         if context_manifest_path:

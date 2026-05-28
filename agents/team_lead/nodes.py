@@ -872,6 +872,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "design_code_path": state.get("design_code_path", ""),
                 "repo_url": state.get("repo_url", ""),
                 "repo_path": state.get("repo_path", ""),
+                "branch_name": state.get("branch_name", ""),
                 "workspace_path": state.get("workspace_path", ""),
                 "context_manifest_path": state.get("context_manifest_path", ""),
                 "jira_files": state.get("jira_files", []),

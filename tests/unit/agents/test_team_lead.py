@@ -435,6 +435,53 @@ class TestDispatchDevAgentValidation:
         assert "scm_push" in captured["args"]["permissions"]["allowedTools"]
         assert "dispatch_web_dev" not in captured["args"]["permissions"]["allowedTools"]
 
+    async def test_dispatch_dev_agent_reuses_existing_branch_name(self, monkeypatch):
+        from agents.team_lead.nodes import dispatch_dev_agent
+
+        captured = {}
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "web-dev"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                captured["name"] = name
+                captured["args"] = args
+                return json.dumps({
+                    "status": "completed",
+                    "summary": "done",
+                    "prUrl": "https://github.com/org/repo/pull/1",
+                    "branch": "feature/cstl-3-practice-quiz-page_3",
+                    "jiraInReview": True,
+                })
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        await dispatch_dev_agent(
+            {
+                "_task_id": "task-123",
+                "user_request": "Implement UI",
+                "analysis_summary": "Implement a UI page",
+                "jira_key": "PROJ-123",
+                "workspace_path": "/tmp/workspace",
+                "repo_url": "https://github.com/org/repo",
+                "repo_path": "/tmp/workspace/repo",
+                "branch_name": "feature/cstl-3-practice-quiz-page_3",
+                "plan": {
+                    "definition_of_done": {
+                        "pr_required": True,
+                        "jira_state_management": True,
+                    }
+                },
+            }
+        )
+
+        assert captured["name"] == "dispatch_web_dev"
+        assert captured["args"]["branch_name"] == "feature/cstl-3-practice-quiz-page_3"
+
     async def test_dispatch_dev_agent_propagates_screenshot_evidence(self, monkeypatch):
         from agents.team_lead.nodes import dispatch_dev_agent
 

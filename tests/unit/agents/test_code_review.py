@@ -252,6 +252,8 @@ class TestLoadPrContext:
         assert captured[1]["arguments"]["permissions"] == permissions
 
     async def test_marks_missing_pr_diff_as_review_input_issue(self, monkeypatch):
+        monkeypatch.setenv("CODE_REVIEW_INPUT_WAIT_SECONDS", "0")
+
         class StubRegistry:
             def execute_sync(self, name, arguments):
                 if name == "scm_get_pr_info":
@@ -276,6 +278,45 @@ class TestLoadPrContext:
         assert result["pr_diff"] == ""
         assert result["review_input_issues"]
         assert result["review_input_issues"][0]["severity"] == "high"
+
+    async def test_retries_diff_fetch_until_available(self, monkeypatch):
+        monkeypatch.setenv("CODE_REVIEW_INPUT_WAIT_SECONDS", "2")
+        monkeypatch.setenv("CODE_REVIEW_INPUT_POLL_SECONDS", "1")
+        monkeypatch.setattr("agents.code_review.nodes.time.sleep", lambda _: None)
+
+        calls: list[str] = []
+
+        class StubRegistry:
+            def execute_sync(self, name, arguments):
+                calls.append(name)
+                if name == "scm_get_pr_info":
+                    return json.dumps({"description": "Review this PR", "commits": []})
+                if name == "scm_get_pr_diff":
+                    if calls.count("scm_get_pr_diff") == 1:
+                        return json.dumps({"error": "diff unavailable"})
+                    return json.dumps({
+                        "diff_text": "diff --git a/src/App.tsx b/src/App.tsx",
+                        "changed_files": [{"filename": "src/App.tsx"}],
+                    })
+                raise AssertionError(f"unexpected tool {name}")
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await load_pr_context(
+            {
+                "_task_id": "task-123",
+                "metadata": {
+                    "prUrl": "https://github.com/org/repo/pull/12",
+                    "repoUrl": "https://github.com/org/repo",
+                    "prNumber": 12,
+                },
+            }
+        )
+
+        assert result["pr_diff"].startswith("diff --git")
+        assert result["changed_files"] == ["src/App.tsx"]
+        assert not result["review_input_issues"]
+        assert calls.count("scm_get_pr_diff") == 2
 
     async def test_load_pr_context_writes_agent_log(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path))

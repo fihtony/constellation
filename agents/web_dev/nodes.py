@@ -2117,7 +2117,8 @@ async def create_pr(state: dict) -> dict:
 
     committed_files = _git_commit_all_pending(repo_path, jira_key or "task")
     existing_changes = state.get("changes_made", [])
-    all_changes = sorted(set(existing_changes) | set(committed_files))
+    branch_changes = _git_branch_changed_files(repo_path)
+    all_changes = sorted(set(existing_changes) | set(committed_files) | set(branch_changes))
 
     if not all_changes:
         raise RuntimeError(
