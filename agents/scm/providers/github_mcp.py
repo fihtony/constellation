@@ -332,21 +332,27 @@ class GitHubMCPProvider:
     # ------------------------------------------------------------------
 
     def list_branches(self, owner: str, repo: str, timeout: int = 20) -> tuple[list[dict], str]:
-        resp = self._call("list_branches", {"owner": owner, "repo": repo, "perPage": 100}, timeout)
-        if _is_error(resp):
-            return [], f"error: {_extract_text(resp)[:100]}"
-        data = _parse_json(_extract_text(resp))
-        if not isinstance(data, list):
-            return [], "error_parse"
-        branches = [
-            {
-                "id": f"refs/heads/{b.get('name', '')}",
-                "displayId": b.get("name", ""),
-                "latestCommit": (b.get("commit") or {}).get("sha", ""),
-                "isDefault": b.get("name") in ("main", "master"),
-            }
-            for b in data
-        ]
+        page = 1
+        branches: list[dict] = []
+        while True:
+            resp = self._call("list_branches", {"owner": owner, "repo": repo, "perPage": 100, "page": page}, timeout)
+            if _is_error(resp):
+                return [], f"error: {_extract_text(resp)[:100]}"
+            data = _parse_json(_extract_text(resp))
+            if not isinstance(data, list):
+                return [], "error_parse"
+            branches.extend(
+                {
+                    "id": f"refs/heads/{b.get('name', '')}",
+                    "displayId": b.get("name", ""),
+                    "latestCommit": (b.get("commit") or {}).get("sha", ""),
+                    "isDefault": b.get("name") in ("main", "master"),
+                }
+                for b in data
+            )
+            if len(data) < 100:
+                break
+            page += 1
         return branches, "ok"
 
     def create_branch(
@@ -375,15 +381,22 @@ class GitHubMCPProvider:
         s = (state or "open").lower()
         if s not in ("open", "closed", "all"):
             s = "open"
-        resp = self._call("list_pull_requests", {
-            "owner": owner, "repo": repo, "state": s, "perPage": 50,
-        }, timeout)
-        if _is_error(resp):
-            return [], f"error: {_extract_text(resp)[:100]}"
-        data = _parse_json(_extract_text(resp))
-        if isinstance(data, list):
-            return [self._normalize_pr(pr) for pr in data], "ok"
-        return [], "ok"
+        page = 1
+        prs: list[dict] = []
+        while True:
+            resp = self._call("list_pull_requests", {
+                "owner": owner, "repo": repo, "state": s, "perPage": 100, "page": page,
+            }, timeout)
+            if _is_error(resp):
+                return [], f"error: {_extract_text(resp)[:100]}"
+            data = _parse_json(_extract_text(resp))
+            if not isinstance(data, list):
+                return [], "ok"
+            prs.extend(self._normalize_pr(pr) for pr in data)
+            if len(data) < 100:
+                break
+            page += 1
+        return prs, "ok"
 
     def get_pr(self, owner: str, repo: str, pr_id: int | str, timeout: int = 20) -> tuple[dict, str]:
         resp = self._call("pull_request_read", {

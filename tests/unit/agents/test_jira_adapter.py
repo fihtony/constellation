@@ -26,6 +26,8 @@ def test_jira_search_tool_is_registered_in_tool_list():
     from agents.jira.tools import _TOOLS
 
     assert "jira_search" in {tool.name for tool in _TOOLS}
+    assert "jira_get_sprint" in {tool.name for tool in _TOOLS}
+    assert "jira_link_issue" in {tool.name for tool in _TOOLS}
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +83,31 @@ class StubJiraProvider(JiraProvider):
     ) -> tuple[dict, str]:
         self.calls.append(("list_comments", {"ticket_key": ticket_key}))
         return {"comments": [], "total": 0}, "ok"
+
+    def get_sprint(
+        self, board_id: str = "", ticket_key: str = ""
+    ) -> tuple[dict | None, str]:
+        self.calls.append(("get_sprint", {"board_id": board_id, "ticket_key": ticket_key}))
+        return {
+            "id": 101,
+            "name": "Sprint 42",
+            "startDate": "2025-01-01",
+            "endDate": "2025-01-14",
+            "goal": "Ship the backlog",
+        }, "ok"
+
+    def link_issue(
+        self, ticket_key: str, linked_key: str, link_type: str
+    ) -> tuple[dict | None, str]:
+        self.calls.append((
+            "link_issue",
+            {"ticket_key": ticket_key, "linked_key": linked_key, "link_type": link_type},
+        ))
+        return {
+            "ticketKey": ticket_key,
+            "linkedKey": linked_key,
+            "linkType": link_type,
+        }, "ok"
 
     @property
     def backend_name(self) -> str:
@@ -216,6 +243,43 @@ class TestJiraAdapterDispatch:
         art_text = task["artifacts"][0]["parts"][0]["text"]
         data = json.loads(art_text)
         assert data["issues"]["total"] == 1
+
+    @pytest.mark.asyncio
+    async def test_get_sprint(self):
+        msg = {
+            "parts": [],
+            "metadata": {
+                "requestedCapability": "jira.sprint.get",
+                "boardId": "12",
+            },
+        }
+        result = await self.adapter.handle_message(msg)
+        task = result.get("task", result)
+        art_text = task["artifacts"][0]["parts"][0]["text"]
+        data = json.loads(art_text)
+        assert data["sprint"]["name"] == "Sprint 42"
+        assert self.provider.calls[-1] == ("get_sprint", {"board_id": "12", "ticket_key": ""})
+
+    @pytest.mark.asyncio
+    async def test_link_issue(self):
+        msg = {
+            "parts": [],
+            "metadata": {
+                "requestedCapability": "jira.issue.link",
+                "ticketKey": "PROJ-1",
+                "linkedKey": "PROJ-2",
+                "linkType": "Relates",
+            },
+        }
+        result = await self.adapter.handle_message(msg)
+        task = result.get("task", result)
+        art_text = task["artifacts"][0]["parts"][0]["text"]
+        data = json.loads(art_text)
+        assert data["link"]["linkedKey"] == "PROJ-2"
+        assert self.provider.calls[-1] == (
+            "link_issue",
+            {"ticket_key": "PROJ-1", "linked_key": "PROJ-2", "link_type": "Relates"},
+        )
 
     @pytest.mark.asyncio
     async def test_add_comment(self):

@@ -30,6 +30,8 @@ _JIRA_CAPABILITY_RULES: dict[str, dict[str, object]] = {
     "jira.ticket.fetch": {"tools": ["fetch_jira_ticket"], "action": "ticket.read"},
     "jira.ticket.get": {"tools": ["fetch_jira_ticket"], "action": "ticket.read"},
     "jira.ticket.search": {"tools": ["jira_search"], "action": "read"},
+    "jira.sprint.get": {"tools": ["jira_get_sprint"], "action": "read"},
+    "jira.issue.link": {"tools": ["jira_link_issue"], "action": "issue.update.links"},
     "jira.comment.add": {"tools": ["jira_comment"], "action": "comment.add"},
     "jira.ticket.comment": {"tools": ["jira_comment"], "action": "comment.add"},
     "jira.transitions.list": {"tools": ["jira_list_transitions"], "action": "read"},
@@ -187,6 +189,19 @@ class JiraAgentAdapter(BaseAgent):
             jql = meta.get("jql") or text.strip()
             data, status = provider.search_issues(jql)
             return {"issues": data, "status": status}
+
+        if capability == "jira.sprint.get":
+            board_id = str(meta.get("boardId") or "")
+            ticket_key = meta.get("ticketKey") or text.strip()
+            data, status = provider.get_sprint(board_id=board_id, ticket_key=ticket_key)
+            return {"sprint": data, "status": status}
+
+        if capability == "jira.issue.link":
+            key = meta.get("ticketKey") or ""
+            linked_key = meta.get("linkedKey") or ""
+            link_type = meta.get("linkType") or meta.get("linkTypeName") or text.strip()
+            data, status = provider.link_issue(key, linked_key, link_type)
+            return {"link": data, "status": status}
 
         if capability in ("jira.comment.add", "jira.ticket.comment"):
             key = meta.get("ticketKey") or ""

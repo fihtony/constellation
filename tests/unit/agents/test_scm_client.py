@@ -249,6 +249,46 @@ class TestScmAdapterPrEvidenceCapabilities:
         assert result["prUrl"] == "https://github.com/org/repo/pull/42"
         assert result["prNumber"] == 42
 
+
+class TestGitHubClientPullRequestCollision:
+    def test_create_pr_returns_existing_open_pr_on_422(self, monkeypatch):
+        client = GitHubClient("token")
+
+        def _request(self, method, path, payload=None, timeout=20):
+            assert method == "POST"
+            assert path == "repos/org/repo/pulls"
+            return 422, {"message": "A pull request already exists for this branch"}
+
+        monkeypatch.setattr(GitHubClient, "_request", _request)
+        monkeypatch.setattr(
+            GitHubClient,
+            "list_prs",
+            lambda self, owner, repo, state="open", timeout=20: (
+                [
+                    {
+                        "id": 74,
+                        "title": "Existing PR",
+                        "fromBranch": "feature/existing",
+                        "toBranch": "main",
+                        "links": {"self": [{"href": "https://github.com/org/repo/pull/74"}]},
+                    }
+                ],
+                "ok",
+            ),
+        )
+
+        data, status = client.create_pr(
+            "org",
+            "repo",
+            "feature/existing",
+            "main",
+            "Existing PR",
+            "Body",
+        )
+
+        assert status == "already_exists"
+        assert data["id"] == 74
+
     def test_dispatch_upload_pr_image_calls_client(self, tmp_path):
         image_path = tmp_path / "screen.png"
         image_path.write_bytes(b"png")

@@ -53,6 +53,18 @@ class JiraProvider(ABC):
     ) -> tuple[list, str]:
         """List comments on a ticket. Returns (comments_list, status)."""
 
+    @abstractmethod
+    def get_sprint(
+        self, board_id: str = "", ticket_key: str = ""
+    ) -> tuple[dict | None, str]:
+        """Get the active sprint for a board or ticket. Returns (sprint_dict | None, status)."""
+
+    @abstractmethod
+    def link_issue(
+        self, ticket_key: str, linked_key: str, link_type: str
+    ) -> tuple[dict | None, str]:
+        """Create an issue link. Returns (result_dict | None, status)."""
+
     @property
     def backend_name(self) -> str:
         """Return the backend identifier."""

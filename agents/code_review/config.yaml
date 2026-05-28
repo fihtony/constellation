@@ -15,11 +15,11 @@ runtime_env_required: true
 
 default_skills:
   - code-review
-tools:
-  - read_file
-  - search_code
-permissions:
-  scm: read
+
+# Permission model:
+# - permission_profile is the authoritative maximum capability envelope.
+# - Team Lead sends executionContract at runtime to narrow this profile per task.
+# - AgentDefinition.tools also defaults from config/permissions/code-review.yaml.
 permission_profile: code-review
 capabilities:
   - review.code.check

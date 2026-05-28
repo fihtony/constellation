@@ -39,9 +39,7 @@ def project_dir(tmp_path):
         execution_mode: persistent
         runtime_backend: claude-code
         model: claude-haiku-4-5-20251001
-        tools:
-          - dispatch_agent
-          - query_registry
+                permission_profile: team-lead
         port: 8030
     """))
 
@@ -53,6 +51,7 @@ def project_dir(tmp_path):
         mode: task
         execution_mode: per-task
         model: gpt-5-mini
+        permission_profile: web-dev
         launch_spec:
           image: constellation-v2-web-dev:latest
           port: 8050
@@ -61,16 +60,27 @@ def project_dir(tmp_path):
         default_skills:
           - react-nextjs
           - testing
-        tools:
-          - read_file
-          - write_file
-        permissions:
-          scm: read-write
     """))
 
     perm_dir = config_dir / "permissions"
     perm_dir.mkdir()
     (perm_dir / "development.yaml").write_text(textwrap.dedent("""\
+        allowed_tools:
+          - read_file
+          - write_file
+        denied_tools: []
+        scm: read-write
+        filesystem: workspace-only
+    """))
+        (perm_dir / "team-lead.yaml").write_text(textwrap.dedent("""\
+                allowed_tools:
+                    - dispatch_agent
+                    - query_registry
+                denied_tools: []
+                scm: read-write
+                filesystem: workspace-only
+        """))
+    (perm_dir / "web-dev.yaml").write_text(textwrap.dedent("""\
         allowed_tools:
           - read_file
           - write_file
@@ -181,6 +191,18 @@ class TestBuildAgentDefinitionFromConfig:
             "port": 8050,
             "extra_binds": ["/tmp/source:/app/source:ro"],
         }
+
+    def test_permissions_default_from_permission_profile(self, project_dir):
+        from framework.config import build_agent_definition_from_config
+
+        definition = build_agent_definition_from_config("web-dev", project_dir)
+        assert definition["permissions"]["scm"] == "read-write"
+
+    def test_tools_default_from_permission_profile(self, project_dir):
+        from framework.config import build_agent_definition_from_config
+
+        definition = build_agent_definition_from_config("web-dev", project_dir)
+        assert definition["tools"] == ["read_file", "write_file"]
 
 
 class TestDeepMerge:

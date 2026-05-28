@@ -612,21 +612,52 @@ async def setup_workspace(state: dict) -> dict:
         else:
             branch_name = f"feature/{task_suffix}"
 
-    # -- Check remote for branch name conflicts; add _<n> suffix when taken --
+    local_branch_exists = False
+    if repo_path and os.path.isdir(repo_path) and branch_name:
+        import subprocess
+        from framework.env_utils import build_isolated_git_env
+
+        git_env = build_isolated_git_env("web-dev-setup-local-branch")
+        exists = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+            cwd=repo_path,
+            env=git_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        local_branch_exists = exists.returncode == 0
+
+    # -- Check remote branches and open PR source branches for conflicts; add _<n> suffix when taken --
     # Must not delete or alter existing remote branches or PRs.
-    if branch_name and repo_url:
+    if branch_name and repo_url and not local_branch_exists:
         remote_result = _call_boundary_tool(state, "scm_list_branches", {"repo_url": repo_url})
         remote_branch_names = {
-            b.get("displayId", "") for b in remote_result.get("branches", [])
+            candidate
+            for b in remote_result.get("branches", [])
+            for candidate in [
+                b.get("displayId", ""),
+                b.get("name", ""),
+                str(b.get("id", "")).replace("refs/heads/", ""),
+            ]
+            if candidate
         }
-        if branch_name in remote_branch_names:
+        pr_result = _call_boundary_tool(state, "scm_list_prs", {"repo_url": repo_url, "state": "open"})
+        reserved_pr_branches = {
+            str(pr.get("fromBranch") or pr.get("fromRef") or pr.get("sourceBranch") or "").strip()
+            for pr in pr_result.get("prs", [])
+            if str(pr.get("fromBranch") or pr.get("fromRef") or pr.get("sourceBranch") or "").strip()
+        }
+        reserved_names = remote_branch_names | reserved_pr_branches
+        if branch_name in reserved_names:
+            base_name = branch_name
             n = 2
-            while f"{branch_name}_{n}" in remote_branch_names:
+            while f"{base_name}_{n}" in reserved_names:
                 n += 1
-            new_name = f"{branch_name}_{n}"
+            new_name = f"{base_name}_{n}"
             print(
-                f"[{_AGENT_ID}] setup_workspace: branch {branch_name!r} exists on remote, "
-                f"using {new_name!r} to avoid conflict"
+                f"[{_AGENT_ID}] setup_workspace: branch {branch_name!r} is already reserved "
+                f"by a remote branch or open PR, using {new_name!r} to avoid conflict"
             )
             branch_name = new_name
 

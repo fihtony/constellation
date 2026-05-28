@@ -493,7 +493,9 @@ class TestDispatchDevAgentValidation:
             {
                 "_task_id": "task-123",
                 "pr_url": "https://github.com/org/repo/pull/1",
-                "dev_result": {"summary": "done"},
+                "pr_number": 1,
+                "repo_url": "https://github.com/org/repo",
+                "dev_result": {"summary": "done", "prNumber": 1},
                 "analysis_summary": "Implement CSTL-1",
                 "workspace_path": "/tmp/workspace",
                 "context_manifest_path": "team-lead/context-manifest.json",
@@ -502,6 +504,8 @@ class TestDispatchDevAgentValidation:
 
         assert captured["orchestrator_task_id"] == "task-123"
         assert captured["task_id"] == "task-123"
+        assert captured["repo_url"] == "https://github.com/org/repo"
+        assert captured["pr_number"] == 1
         assert result["route"] == "approved"
 
     async def test_validate_readiness_routes_to_missing_info_for_retryable_context(self, tmp_path):

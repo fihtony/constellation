@@ -157,7 +157,8 @@ class TestLoadPrContext:
         assert checkpoint_file.exists()
 
     async def test_loads_workspace_boundary_artifacts_and_latest_self_assessment(self, tmp_path):
-        jira_dir = tmp_path / "jira" / "PROJ-123"
+        workspace_path = tmp_path / "task-123"
+        jira_dir = workspace_path / "jira" / "PROJ-123"
         jira_dir.mkdir(parents=True)
         (jira_dir / "ticket.json").write_text(json.dumps({
             "data": {
@@ -166,13 +167,13 @@ class TestLoadPrContext:
             }
         }))
 
-        design_dir = tmp_path / "ui-design" / "stitch"
+        design_dir = workspace_path / "ui-design" / "stitch"
         design_dir.mkdir(parents=True)
         (design_dir / "DESIGN.md").write_text("# Design spec")
         (design_dir / "code.html").write_text("<main>lesson</main>")
         (design_dir / "screen-meta.json").write_text(json.dumps({"screen": {"title": "Lesson Library"}}))
 
-        web_dev_dir = tmp_path / "web-dev"
+        web_dev_dir = workspace_path / "web-dev"
         web_dev_dir.mkdir(parents=True)
         (web_dev_dir / "pr-evidence.json").write_text(json.dumps({
             "data": {
@@ -188,13 +189,13 @@ class TestLoadPrContext:
             "_task_id": "task-123",
             "metadata": {
                 "repoUrl": "https://github.com/org/repo",
-                "workspacePath": str(tmp_path),
+                "workspacePath": str(workspace_path),
                 "contextManifestPath": "team-lead/context-manifest.json",
                 "jiraContext": {"key": "PROJ-123"},
             },
         }
-        (tmp_path / "team-lead").mkdir(parents=True)
-        (tmp_path / "team-lead" / "context-manifest.json").write_text("{}")
+        (workspace_path / "team-lead").mkdir(parents=True)
+        (workspace_path / "team-lead" / "context-manifest.json").write_text("{}")
 
         result = await load_pr_context(state)
 
@@ -206,7 +207,7 @@ class TestLoadPrContext:
         assert "ui-design/stitch/DESIGN.md" in result["checked_artifacts"]
         assert "web-dev/pr-evidence.json" in result["checked_artifacts"]
         assert "web-dev/self-assessment-2.json" in result["checked_artifacts"]
-        assert (tmp_path / "code-review" / "agent.log").exists()
+        assert (workspace_path / "code-review" / "review-checkpoints" / "review-start.json").exists()
 
 
 class TestReviewQuality:

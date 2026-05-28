@@ -10,6 +10,7 @@ allowed_tools:
   - grep
   - scm_push
   - scm_create_pr
+  - scm_list_prs
   - scm_add_pr_comment
   - scm_upload_pr_image
   - scm_update_pr

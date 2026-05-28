@@ -6,43 +6,12 @@ execution_mode: per-task
 runtime_env_required: true
 default_skills:
   - office-generic-methodology
-tools:
-  - read_pdf
-  - read_docx
-  - read_txt
-  - read_csv
-  - read_xlsx
-  - read_xls
-  - read_pptx
-  - list_directory
-  - write_workspace
-  - write_file
-  - organize_folder
-  - organize_move_file
+
+# Permission model:
+# - permission_profile is the authoritative maximum capability envelope.
+# - Compass sends executionContract at runtime to narrow this profile per task.
+# - AgentDefinition.tools also defaults from config/permissions/office.yaml.
 permission_profile: office
-permissions:
-  allowed_tools:
-    - read_pdf
-    - read_docx
-    - read_txt
-    - read_csv
-    - read_xlsx
-    - read_xls
-    - read_pptx
-    - list_directory
-    - write_workspace
-    - write_file
-    - organize_folder
-    - organize_move_file
-  denied_tools:
-    - run_command
-    - edit_file
-    - scm_push
-    - scm_create_pr
-  scm: none
-  filesystem: workspace-only
-  agent_launching: false
-  allowed_agents: []
 runtime_backend: claude-code
 model: MiniMax-M2.7
 capabilities:

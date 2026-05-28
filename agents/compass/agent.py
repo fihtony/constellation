@@ -27,15 +27,34 @@ from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent
 from agents.compass.ui.routes import handle_ui_request
 from agents.compass.tools import TOOL_NAMES, _should_use_per_task_office_launch, register_compass_tools
 
-compass_definition = AgentDefinition(
-    agent_id="compass",
-    name="Compass Agent",
-    description="Control plane: task classification, routing, and user summary (ReAct-first)",
-    mode=AgentMode.CHAT,
-    execution_mode=ExecutionMode.PERSISTENT,
-    workflow=None,
-    tools=TOOL_NAMES,
-)
+
+def _build_compass_definition() -> AgentDefinition:
+    """Build Compass's AgentDefinition from YAML config, with tool fallback."""
+    from framework.config import build_agent_definition_from_config
+
+    try:
+        cfg = build_agent_definition_from_config("compass")
+    except Exception:
+        cfg = {}
+
+    return AgentDefinition(
+        agent_id=cfg.get("agent_id", "compass"),
+        name=cfg.get("name", "Compass Agent"),
+        description=cfg.get(
+            "description",
+            "Control plane: task classification, permission check, routing, and user summary",
+        ),
+        mode=AgentMode.CHAT,
+        execution_mode=ExecutionMode.PERSISTENT,
+        workflow=None,
+        tools=cfg.get("tools", TOOL_NAMES),
+        permissions=cfg.get("permissions", {"scm": "none", "filesystem": "workspace-only"}),
+        permission_profile=cfg.get("permission_profile", "compass"),
+        config=cfg.get("config", {}),
+    )
+
+
+compass_definition = _build_compass_definition()
 
 
 def _parse_classification_payload(raw_output: str) -> tuple[str, float]:

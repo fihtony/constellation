@@ -116,6 +116,32 @@ class SCMListBranches(BaseTool):
         return ToolResult(output=json.dumps(result))
 
 
+class SCMListPRs(BaseTool):
+    name = "scm_list_prs"
+    description = "List pull requests in a repository."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string"},
+            "state": {"type": "string"},
+            "task_id": {"type": "string"},
+        },
+        "required": ["repo_url"],
+    }
+
+    def execute_sync(self, repo_url: str = "", state: str = "open", task_id: str = "") -> ToolResult:
+        log = _log(task_id)
+        log.debug("scm_list_prs called", repo_url=repo_url, state=state)
+        adapter = _get_adapter()
+        project, repo = _parse_repo_coordinates(repo_url)
+        result = adapter._dispatch(
+            "scm.pr.list", f"{project}/{repo}",
+            {"metadata": {"project": project, "repo": repo, "state": state}},
+        )
+        log.debug("scm_list_prs result", count=len(result.get("prs", [])))
+        return ToolResult(output=json.dumps(result))
+
+
 class SCMPush(BaseTool):
     name = "scm_push"
     description = "Push a local branch to the remote origin."
@@ -446,6 +472,7 @@ class SCMGetPRInfo(BaseTool):
 _TOOLS = [
     CloneRepo(),
     SCMListBranches(),
+    SCMListPRs(),
     SCMPush(),
     SCMCreatePR(),
     SCMAddPRComment(),

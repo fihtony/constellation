@@ -165,11 +165,20 @@ class BitbucketClient:
     ) -> tuple[list[dict], str]:
         """List branches. Returns ([{id, displayId, latestCommit, isDefault}, ...], status)."""
         try:
-            data = self._get(
-                f"/projects/{project}/repos/{repo}/branches?limit=50",
-                timeout=timeout,
-            )
-            return data.get("values", []), "ok"
+            branches: list[dict] = []
+            start = 0
+            limit = 100
+            while True:
+                data = self._get(
+                    f"/projects/{project}/repos/{repo}/branches?limit={limit}&start={start}",
+                    timeout=timeout,
+                )
+                values = data.get("values", [])
+                branches.extend(values)
+                if data.get("isLastPage", True) or not values:
+                    break
+                start = int(data.get("nextPageStart", start + len(values)))
+            return branches, "ok"
         except HTTPError as exc:
             return [], f"HTTP {exc.code}"
         except Exception as exc:
@@ -201,12 +210,21 @@ class BitbucketClient:
     ) -> tuple[list[dict], str]:
         """List pull requests."""
         try:
-            data = self._get(
-                f"/projects/{project}/repos/{repo}/pull-requests"
-                f"?state={state.upper()}&limit=25",
-                timeout=timeout,
-            )
-            return data.get("values", []), "ok"
+            prs: list[dict] = []
+            start = 0
+            limit = 100
+            while True:
+                data = self._get(
+                    f"/projects/{project}/repos/{repo}/pull-requests"
+                    f"?state={state.upper()}&limit={limit}&start={start}",
+                    timeout=timeout,
+                )
+                values = data.get("values", [])
+                prs.extend(values)
+                if data.get("isLastPage", True) or not values:
+                    break
+                start = int(data.get("nextPageStart", start + len(values)))
+            return prs, "ok"
         except HTTPError as exc:
             return [], f"HTTP {exc.code}"
         except Exception as exc:
@@ -389,11 +407,15 @@ class GitHubClient:
     def list_branches(self, owner: str, repo: str, timeout: int = 20) -> tuple[list[dict], str]:
         """List branches. Returns ([{id, displayId, latestCommit, isDefault}, ...], status)."""
         try:
-            status, body = self._request(
-                "GET", f"repos/{owner}/{repo}/branches?per_page=50", timeout=timeout
-            )
-            if status == 200:
-                branches = [
+            branches: list[dict] = []
+            page = 1
+            while True:
+                status, body = self._request(
+                    "GET", f"repos/{owner}/{repo}/branches?per_page=100&page={page}", timeout=timeout
+                )
+                if status != 200:
+                    return [], f"http_{status}"
+                page_items = [
                     {
                         "id": f"refs/heads/{b['name']}",
                         "displayId": b["name"],
@@ -402,8 +424,11 @@ class GitHubClient:
                     }
                     for b in body
                 ]
-                return branches, "ok"
-            return [], f"http_{status}"
+                branches.extend(page_items)
+                if len(body) < 100:
+                    break
+                page += 1
+            return branches, "ok"
         except Exception as exc:
             return [], str(exc)
 
@@ -438,27 +463,47 @@ class GitHubClient:
     ) -> tuple[list[dict], str]:
         """List pull requests."""
         try:
-            status, body = self._request(
-                "GET",
-                f"repos/{owner}/{repo}/pulls?state={state}&per_page=25",
-                timeout=timeout,
-            )
-            if status == 200:
-                prs = [
+            prs: list[dict] = []
+            page = 1
+            while True:
+                status, body = self._request(
+                    "GET",
+                    f"repos/{owner}/{repo}/pulls?state={state}&per_page=100&page={page}",
+                    timeout=timeout,
+                )
+                if status != 200:
+                    return [], f"http_{status}"
+                page_items = [
                     {
                         "id": pr.get("number"),
                         "title": pr.get("title"),
                         "state": pr.get("state"),
+                        "fromBranch": pr.get("head", {}).get("ref", ""),
+                        "toBranch": pr.get("base", {}).get("ref", ""),
                         "fromRef": pr.get("head", {}).get("ref", ""),
                         "toRef": pr.get("base", {}).get("ref", ""),
                         "links": {"self": [{"href": pr.get("html_url", "")}]},
                     }
                     for pr in body
                 ]
-                return prs, "ok"
-            return [], f"http_{status}"
+                prs.extend(page_items)
+                if len(body) < 100:
+                    break
+                page += 1
+            return prs, "ok"
         except Exception as exc:
             return [], str(exc)
+
+    def _find_existing_open_pr(self, owner: str, repo: str, from_branch: str, to_branch: str) -> dict:
+        prs, status = self.list_prs(owner, repo, "open")
+        if status != "ok":
+            return {}
+        for pr in prs:
+            source = pr.get("fromBranch") or pr.get("fromRef") or ""
+            target = pr.get("toBranch") or pr.get("toRef") or ""
+            if source == from_branch and target == to_branch:
+                return pr
+        return {}
 
     def create_pr(
         self,
@@ -487,6 +532,10 @@ class GitHubClient:
                     "title": body.get("title"),
                     "links": {"self": [{"href": body.get("html_url", "")}]},
                 }, "ok"
+            if status == 422:
+                existing_pr = self._find_existing_open_pr(owner, repo, from_branch, to_branch)
+                if existing_pr:
+                    return existing_pr, "already_exists"
             return body, f"http_{status}"
         except Exception as exc:
             return {}, str(exc)
