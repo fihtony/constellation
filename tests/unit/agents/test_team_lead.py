@@ -764,6 +764,7 @@ class TestDispatchDevAgentValidation:
         assert result["dev_agent_session"] == {}
 
     async def test_request_revision_acknowledges_and_cleans_dev_agent(self, monkeypatch):
+        """request_revision should NOT ACK or destroy the dev agent (container reuse)."""
         from agents.team_lead.nodes import request_revision
 
         captured = {"ack": [], "destroy": []}
@@ -792,11 +793,11 @@ class TestDispatchDevAgentValidation:
             },
         })
 
-        assert captured["ack"] == [("http://web-dev-task-1:8050", "task-web-dev-1")]
-        assert captured["destroy"] == [("web-dev", "web-dev-task-1")]
-        assert result["dev_agent_acknowledged"] is True
-        assert result["dev_agent_cleaned_up"] is True
-        assert result["dev_agent_session"] == {}
+        # No ACK or cleanup during revision — container is reused
+        assert captured["ack"] == []
+        assert captured["destroy"] == []
+        assert "dev_agent_acknowledged" not in result
+        assert "dev_agent_cleaned_up" not in result
 
     def test_callback_propagates_screenshot_evidence(self, monkeypatch):
         from agents.team_lead.agent import _send_callback

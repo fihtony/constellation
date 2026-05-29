@@ -2,21 +2,33 @@
 agent_id: code-review
 allowed_tools:
   - read_file
+  - read_local_file
   - search_code
   - glob
   - grep
+  - list_local_dir
   - scm_get_pr_diff
   - scm_get_pr_info
   - query_registry
 
 denied_tools:
   - write_file
+  - write_local_file
   - edit_file
+  - edit_local_file
   - run_command
   - scm_push
   - scm_create_pr
+  - scm_update_pr
+  - jira_transition
+  - jira_comment
 
 scm: read
 filesystem: workspace-only
 agent_launching: false
 allowed_agents: []
+
+internal_artifact_write:
+  enabled: true
+  owned_paths:
+    - code-review/

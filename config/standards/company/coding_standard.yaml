@@ -1,0 +1,64 @@
+# Company coding standard — shared rules enforced across all projects.
+# Override severity of base rules or add company-specific conventions.
+id: company-coding-standard
+name: "Company Coding Standard"
+version: "1.0.0"
+applies_to:
+  - development
+  - code-review
+
+rules:
+  - id: naming-components-pascal
+    severity: medium
+    category: naming
+    description: "React/Vue components must use PascalCase naming"
+  - id: naming-hooks-use-prefix
+    severity: medium
+    category: naming
+    description: "Custom hooks must start with 'use' prefix (e.g. useAuth, useFetch)"
+  - id: naming-utils-camel
+    severity: low
+    category: naming
+    description: "Utility functions and files must use camelCase"
+  - id: naming-constants-upper-snake
+    severity: low
+    category: naming
+    description: "Constants must use UPPER_SNAKE_CASE"
+  - id: max-function-lines
+    severity: medium
+    category: structure
+    description: "Functions must not exceed 80 lines; extract sub-functions when larger"
+  - id: max-file-lines
+    severity: medium
+    category: structure
+    description: "Source files must not exceed 400 lines; split into modules when larger"
+  - id: max-component-props
+    severity: low
+    category: structure
+    description: "Components should not accept more than 8 props; consider composition"
+  - id: prefer-composition
+    severity: low
+    category: patterns
+    description: "Prefer composition over inheritance for code reuse"
+  - id: error-boundary-async
+    severity: high
+    category: patterns
+    description: "Async UI components must be wrapped in Error Boundaries"
+  - id: loading-states-required
+    severity: medium
+    category: patterns
+    description: "Data fetching components must show loading states"
+  - id: no-any-without-comment
+    severity: medium
+    category: typescript
+    description: "TypeScript 'any' type must include a justification comment"
+  - id: no-inline-styles
+    severity: medium
+    category: patterns
+    description: "Avoid inline styles; use CSS modules, styled-components, or Tailwind classes"
+
+severity_overrides:
+  - rule: no-inline-styles
+    severity: high
+  - rule: max-file-lines
+    severity: medium

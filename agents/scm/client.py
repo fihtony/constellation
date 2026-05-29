@@ -651,6 +651,67 @@ class GitHubClient:
         except Exception as exc:
             return {}, str(exc)
 
+    def add_pr_inline_comment(
+        self,
+        owner: str,
+        repo: str,
+        pr_id: str | int,
+        file_path: str,
+        line: int,
+        body: str,
+        commit_id: str = "",
+        side: str = "RIGHT",
+        timeout: int = 15,
+    ) -> tuple[dict, str]:
+        """Add an inline review comment to a specific file and line in a PR.
+
+        Uses the GitHub Pull Request Review Comments API:
+        POST /repos/{owner}/{repo}/pulls/{pr_id}/comments
+
+        If commit_id is not provided, the comment targets the HEAD commit
+        of the PR (fetched automatically).
+
+        Falls back to a regular PR comment if the inline comment API fails
+        (e.g. the file/line is not part of the diff).
+        """
+        # Resolve commit_id if not provided
+        if not commit_id:
+            try:
+                info_status, info_body = self._request(
+                    "GET", f"repos/{owner}/{repo}/pulls/{pr_id}", timeout=timeout
+                )
+                if info_status == 200 and isinstance(info_body, dict):
+                    commit_id = info_body.get("head", {}).get("sha", "")
+            except Exception:
+                pass
+
+        payload: dict = {
+            "body": body,
+            "path": file_path,
+            "line": line,
+            "side": side,
+        }
+        if commit_id:
+            payload["commit_id"] = commit_id
+
+        try:
+            status, resp = self._request(
+                "POST",
+                f"repos/{owner}/{repo}/pulls/{pr_id}/comments",
+                payload,
+                timeout=timeout,
+            )
+            if status in (200, 201):
+                return {"id": resp.get("id"), "body": body, "path": file_path, "line": line}, "ok"
+            # GitHub returns 422 if line is not part of the diff
+            if status == 422:
+                # Fallback: post as regular comment with file/line context
+                fallback_body = f"**{file_path}:{line}**\n\n{body}"
+                return self.add_pr_comment(owner, repo, pr_id, fallback_body, timeout)
+            return resp if isinstance(resp, dict) else {}, f"http_{status}"
+        except Exception as exc:
+            return {}, str(exc)
+
     def update_pr(
         self,
         owner: str,

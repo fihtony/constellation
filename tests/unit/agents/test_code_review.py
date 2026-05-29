@@ -238,10 +238,11 @@ class TestLoadPrContext:
 
         await load_pr_context(state)
 
-        checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-start.json"
+        checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-start-1.json"
         assert checkpoint_file.exists()
 
-    async def test_loads_workspace_boundary_artifacts_and_latest_self_assessment(self, tmp_path):
+    async def test_loads_workspace_boundary_artifacts_and_latest_self_assessment(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CODE_REVIEW_INPUT_WAIT_SECONDS", "0")
         workspace_path = tmp_path / "task-123"
         jira_dir = workspace_path / "jira" / "PROJ-123"
         jira_dir.mkdir(parents=True)
@@ -293,7 +294,7 @@ class TestLoadPrContext:
         assert "web-dev/pr-evidence.json" in result["checked_artifacts"]
         assert "web-dev/self-assessment-2.json" in result["checked_artifacts"]
         assert all(not path.startswith("code-review/") for path in result["checked_artifacts"])
-        assert (workspace_path / "code-review" / "review-checkpoints" / "review-start.json").exists()
+        assert (workspace_path / "code-review" / "review-checkpoints" / "review-start-1.json").exists()
 
     async def test_forwards_parent_supplied_child_permissions_to_scm_fallbacks(self, monkeypatch):
         captured: list[dict] = []
@@ -668,7 +669,7 @@ class TestGenerateReport:
 
         result = await generate_report(state)
 
-        checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-summary.json"
+        checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-summary-1.json"
         assert checkpoint_file.exists()
         assert "jira/PROJ-123/ticket.json" in result["checked_artifacts"]
         assert "ui-design/stitch/DESIGN.md" in result["checked_artifacts"]

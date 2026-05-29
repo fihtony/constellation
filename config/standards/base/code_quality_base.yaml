@@ -1,0 +1,50 @@
+# Base code quality standards — applied to ALL projects regardless of tech stack.
+# These are the minimum quality bar; company/ and tech-stack/ layers override/augment.
+id: code-quality-base
+name: "Code Quality Baseline"
+version: "1.0.0"
+applies_to:
+  - development
+  - code-review
+
+rules:
+  - id: no-console-log
+    severity: warning
+    category: code-quality
+    description: "Remove console.log/print debug statements before PR submission"
+  - id: no-hardcoded-secrets
+    severity: critical
+    category: security
+    description: "Never hardcode API keys, tokens, passwords, or PII in source code; use environment variables or secret management"
+  - id: error-handling-required
+    severity: error
+    category: code-quality
+    description: "All async operations and I/O calls must have proper error handling (try/catch, .catch, error boundaries)"
+  - id: no-unused-imports
+    severity: warning
+    category: code-quality
+    description: "Remove unused imports and dead code before submission"
+  - id: single-responsibility
+    severity: medium
+    category: code-quality
+    description: "Functions should have a single responsibility; max 80 lines per function, max 400 lines per file"
+  - id: meaningful-names
+    severity: medium
+    category: code-quality
+    description: "Use descriptive variable, function, and class names; avoid single-letter names outside loop indices"
+  - id: dry-principle
+    severity: medium
+    category: code-quality
+    description: "Avoid code duplication; extract repeated logic into shared functions or modules"
+  - id: no-magic-numbers
+    severity: low
+    category: code-quality
+    description: "Replace magic numbers and strings with named constants"
+  - id: input-validation
+    severity: high
+    category: security
+    description: "Validate and sanitize all external inputs at system boundaries"
+  - id: no-credential-in-url
+    severity: critical
+    category: security
+    description: "Never embed credentials in URLs; use Authorization headers"

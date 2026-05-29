@@ -580,6 +580,17 @@ async def gather_context(state: dict) -> dict:
             log.error("repo clone unexpected error", error=str(exc))
             raise RuntimeError(f"Repo clone raised unexpected error for {repo_url!r}: {exc}") from exc
 
+    # Auto-detect tech stack from cloned repo if not yet determined
+    if not tech_stack and repo_path and os.path.isdir(repo_path):
+        try:
+            from framework.standards_loader import detect_tech_stack_from_repo
+            tech_stack = detect_tech_stack_from_repo(repo_path)
+            if tech_stack:
+                log.info("auto-detected tech_stack from repo", tech_stack=tech_stack)
+                print(f"[{_AGENT_ID}] Auto-detected tech_stack: {tech_stack}")
+        except Exception:
+            pass
+
 
     # Write context manifest
     context_manifest_path = ""
@@ -884,6 +895,11 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "stitch_screen_name": state.get("stitch_screen_name", ""),
                 "orchestrator_task_id": state.get("_task_id", ""),
                 "revision_feedback": revision_feedback,
+                "review_report_path": state.get("review_report_path", ""),
+                "revision_mode": bool(revision_feedback),
+                "revision_round": state.get("revision_count", 0) + 1 if revision_feedback else 0,
+                "existing_pr_url": state.get("pr_url", ""),
+                "existing_pr_number": state.get("pr_number", 0),
                 "definition_of_done": definition_of_done,
         }
         if execution_contract:
@@ -898,7 +914,33 @@ async def dispatch_dev_agent(state: dict) -> dict:
     except Exception as exc:
         log.error("dev dispatch failed", error=str(exc))
         print(f"[{_AGENT_ID}] Dev dispatch failed: {exc}")
-        payload = {"status": "error", "message": str(exc)}
+        # Container crash recovery: check if workspace has partial progress
+        workspace_path = state.get("workspace_path", "")
+        if workspace_path:
+            web_dev_dir = os.path.join(workspace_path, "web-dev")
+            pr_evidence_path = os.path.join(web_dev_dir, "pr-evidence.json")
+            if os.path.isfile(pr_evidence_path):
+                # Dev agent produced PR before crashing — recover evidence
+                try:
+                    with open(pr_evidence_path, encoding="utf-8") as _f:
+                        evidence = json.load(_f)
+                    recovered_pr = evidence.get("data", evidence).get("pr_url", "")
+                    if recovered_pr:
+                        log.info("recovered PR evidence from crashed dev agent",
+                                 pr_url=recovered_pr)
+                        payload = {
+                            "status": "completed",
+                            "prUrl": recovered_pr,
+                            "branch": evidence.get("data", evidence).get("branch", ""),
+                            "jiraInReview": evidence.get("data", evidence).get("jira_in_review", False),
+                            "screenshotIncluded": evidence.get("data", evidence).get("screenshot_included", False),
+                            "screenshotUploaded": evidence.get("data", evidence).get("screenshot_uploaded", False),
+                            "recovered_from_crash": True,
+                        }
+                except Exception:
+                    pass
+        if not payload or payload.get("status") == "error":
+            payload = {"status": "error", "message": str(exc)}
 
     pr_url = payload.get("prUrl", "")
     branch_name = payload.get("branch", "")
@@ -1030,6 +1072,13 @@ async def review_result(state: dict) -> dict:
                 "task_id": state.get("_task_id", ""),
                 "execution_contract": review_contract,
                 "permissions": review_permissions,
+                "repo_path": state.get("repo_path", ""),
+                "review_round": state.get("revision_count", 0) + 1,
+                "previous_review_path": (
+                    f"code-review/review-report-{state.get('revision_count', 0)}.json"
+                    if state.get("revision_count", 0) > 0 else None
+                ),
+                "tech_stack": state.get("tech_stack") or [],
             },
         )
         payload = json.loads(result_str) if result_str else {}
@@ -1068,6 +1117,11 @@ async def request_revision(state: dict) -> dict:
 
     revision_feedback = "\n".join(feedback_lines) or "Code review rejected. Please fix issues."
 
+    # Determine review report path for dev agent self-assessment reference
+    revision_count = state.get("revision_count", 0)
+    review_round = revision_count + 1
+    review_report_path = f"code-review/review-report-{review_round}.json"
+
     jira_key = str(state.get("jira_key") or (state.get("jira_context") or {}).get("key") or "")
     if jira_key:
         try:
@@ -1084,12 +1138,34 @@ async def request_revision(state: dict) -> dict:
         except Exception as exc:
             print(f"[{_AGENT_ID}] Jira review feedback comment failed: {exc}")
 
-    cleanup = await _ack_and_cleanup_dev_agent(state)
+    # Post inline review comments to PR if available
+    pr_url = state.get("pr_url", "")
+    pr_number = state.get("pr_number", 0)
+    repo_url = state.get("repo_url", "")
+    if pr_url and repo_url and pr_number:
+        try:
+            from framework.tools.registry import get_registry as _get_registry
+            tool_registry = _get_registry()
+            inline_comments = [c for c in comments if c.get("file") and c.get("line")]
+            for ic in inline_comments[:5]:  # Limit to top 5 inline comments per round
+                tool_registry.execute_sync(
+                    "scm_add_pr_inline_comment",
+                    {
+                        "repo_url": repo_url,
+                        "pr_number": pr_number,
+                        "file_path": ic["file"],
+                        "line": ic["line"],
+                        "comment": f"[{ic.get('severity', 'info').upper()}] {ic.get('message', '')}",
+                        "task_id": state.get("_task_id", ""),
+                    },
+                )
+        except Exception as exc:
+            print(f"[{_AGENT_ID}] Inline PR comments failed (non-critical): {exc}")
 
     return {
         "revision_feedback": revision_feedback,
         "revision_count": state.get("revision_count", 0) + 1,
-        **cleanup,
+        "review_report_path": review_report_path,
     }
 
 
@@ -1161,8 +1237,17 @@ async def report_success(state: dict) -> dict:
                     "task_id": state.get("_task_id", ""),
                 },
             )
+            # Transition Jira to "Ready for Merge" state
+            get_registry().execute_sync(
+                "jira_transition",
+                {
+                    "ticket_key": jira_key,
+                    "transition_name": "Ready for Merge",
+                    "task_id": state.get("_task_id", ""),
+                },
+            )
         except Exception as exc:
-            print(f"[{_AGENT_ID}] Jira final review comment failed: {exc}")
+            print(f"[{_AGENT_ID}] Jira final review comment/transition failed: {exc}")
 
     cleanup = await _ack_and_cleanup_dev_agent(state)
 

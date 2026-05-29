@@ -287,6 +287,67 @@ class SCMAddPRComment(BaseTool):
         return ToolResult(output=json.dumps({"ok": True, "comment_id": result.get("id")}))
 
 
+class SCMAddPRInlineComment(BaseTool):
+    """Post an inline review comment on a specific file and line in a pull request.
+
+    Uses the GitHub Pull Request Review Comments API for precise code annotations.
+    Falls back to a regular PR comment with file/line context if the line is not
+    part of the current diff.
+    """
+
+    name = "scm_add_pr_inline_comment"
+    description = (
+        "Post an inline review comment on a specific file and line in a PR. "
+        "Falls back to a regular PR comment if the line is not part of the diff."
+    )
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {"type": "string", "description": "Full GitHub repo URL."},
+            "pr_number": {"type": "integer", "description": "Pull request number."},
+            "file_path": {"type": "string", "description": "Path of the file to comment on (relative to repo root)."},
+            "line": {"type": "integer", "description": "Line number in the file to comment on."},
+            "comment": {"type": "string", "description": "Markdown comment body."},
+            "commit_id": {"type": "string", "description": "Commit SHA to attach comment to (optional, defaults to PR head)."},
+            "task_id": {"type": "string"},
+        },
+        "required": ["repo_url", "pr_number", "file_path", "line", "comment"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        pr_number: int = 0,
+        file_path: str = "",
+        line: int = 0,
+        comment: str = "",
+        commit_id: str = "",
+        task_id: str = "",
+    ) -> ToolResult:
+        log = _log(task_id)
+        log.info("scm_add_pr_inline_comment called",
+                 repo_url=repo_url, pr_number=pr_number, file=file_path, line=line)
+        owner, repo = _parse_repo_coordinates(repo_url)
+        from agents.scm.client import create_scm_client
+        import os as _os
+        client = create_scm_client(
+            base_url=repo_url,
+            token=_os.environ.get("SCM_TOKEN", ""),
+            backend="github-rest",
+        )
+        result, status = client.add_pr_inline_comment(
+            owner, repo, pr_number, file_path, line, comment,
+            commit_id=commit_id,
+        )
+        if status != "ok":
+            log.error("scm_add_pr_inline_comment failed", status=status,
+                      file=file_path, line=line, pr_number=pr_number)
+            return ToolResult(output=json.dumps({"error": f"status={status}", "detail": result}))
+        log.info("scm_add_pr_inline_comment ok",
+                 pr_number=pr_number, file=file_path, line=line, comment_id=result.get("id"))
+        return ToolResult(output=json.dumps({"ok": True, "comment_id": result.get("id"), "fallback": "path" in str(result.get("body", ""))}))
+
+
 class SCMUploadPRImage(BaseTool):
     """Upload a local image file to a GitHub PR and return the CDN URL.
 
@@ -486,6 +547,7 @@ _TOOLS = [
     SCMPush(),
     SCMCreatePR(),
     SCMAddPRComment(),
+    SCMAddPRInlineComment(),
     SCMUploadPRImage(),
     SCMUpdatePR(),
     SCMGetPRDiff(),

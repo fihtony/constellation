@@ -290,6 +290,8 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
                 "pr_url": {"type": "string"},
                 "pr_number": {"type": "integer"},
                 "repo_url": {"type": "string"},
+                "repo_path": {"type": "string"},
+                "review_round": {"type": "integer"},
                 "diff_summary": {"type": "string"},
                 "requirements": {"type": "string"},
                 "jira_context": {"type": "object"},
@@ -314,6 +316,8 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
             context_manifest_path: str = "",
             orchestrator_task_id: str = "",
             task_id: str = "",
+            repo_path: str = "",
+            review_round: int = 0,
             **kw,
         ) -> ToolResult:
             task_id_holder: dict = {}
@@ -328,6 +332,8 @@ def _register_code_review_dispatch(code_review_agent: "CodeReviewAgent") -> None
                                 "prUrl": pr_url,
                                 "prNumber": pr_number,
                                 "repoUrl": repo_url,
+                                "repoPath": repo_path,
+                                "reviewRound": review_round or 0,
                                 "originalRequirements": requirements,
                                 "jiraContext": jira_context or {},
                                 "designContext": design_context or {},
