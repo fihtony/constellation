@@ -389,6 +389,53 @@ class TestWebDevNodes:
             result = await setup_workspace(state)
         assert result["branch_name"] == "feature/CSTL-1-landing-page_2"
 
+    async def test_setup_workspace_revision_mode_reuses_existing_branch(self, tmp_path):
+        import subprocess
+        from unittest.mock import patch
+
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        subprocess.run(["git", "init", repo_path], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.email", "test@test.com"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.name", "Test"],
+                       check=True, capture_output=True)
+        (tmp_path / "repo" / "README.md").write_text("hi")
+        subprocess.run(["git", "-C", repo_path, "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "commit", "-m", "init"],
+                       check=True, capture_output=True)
+        default_branch = subprocess.run(
+            ["git", "-C", repo_path, "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", repo_path, "checkout", "-b", "feature/reuse-me"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "checkout", default_branch],
+                       check=True, capture_output=True)
+
+        state = {
+            "_task_id": "t-3",
+            "repo_url": "https://github.com/org/repo",
+            "repo_path": repo_path,
+            "workspace_path": str(tmp_path),
+            "revision_mode": True,
+            "existing_branch": "feature/reuse-me",
+        }
+
+        with patch("agents.web_dev.nodes._call_boundary_tool", side_effect=AssertionError("revision mode should not query remote branch conflicts")):
+            result = await setup_workspace(state)
+
+        current_branch = subprocess.run(
+            ["git", "-C", repo_path, "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert result["branch_name"] == "feature/reuse-me"
+        assert current_branch == "feature/reuse-me"
+
     async def test_analyze_task_uses_analysis(self):
         state = {"analysis": "Implement login feature", "user_request": "Add login"}
         result = await analyze_task(state)

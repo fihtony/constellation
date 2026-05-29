@@ -262,8 +262,8 @@ def _load_previous_review(workspace_path: str, current_round: int) -> list[dict]
     try:
         with open(prev_report_path, encoding="utf-8") as fh:
             report = json.load(fh)
-        data = report.get("data", report)
-        return data.get("all_comments", []) or data.get("comments", []) or []
+        data = report.get("data", report)  # backward compat for old nested format
+        return data.get("comments", []) or data.get("all_comments", []) or []
     except Exception:
         return []
 
@@ -1012,7 +1012,7 @@ async def generate_report(state: dict) -> dict:
                         "diff_source": diff_source,
                         "repo_path": repo_path,
                     },
-                    "data": report,
+                    **report,
                 }, fh, ensure_ascii=False, indent=2)
 
             checkpoint_file = os.path.join(checkpoints_dir, f"review-summary-{review_round}.json")

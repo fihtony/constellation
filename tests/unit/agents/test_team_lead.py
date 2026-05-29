@@ -1028,6 +1028,56 @@ class TestTeamLeadTools:
 
         payload = json.loads(result.output)
         assert payload["status"] == "completed"
+
+    def test_dispatch_web_dev_propagates_revision_metadata(self, monkeypatch):
+        from agents.team_lead.tools import DispatchWebDev
+
+        calls = []
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return "http://web-dev:8050"
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+
+        def _dispatch_sync(**kwargs):
+            calls.append(kwargs)
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"parts": [{"text": "done"}], "metadata": {}}],
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        DispatchWebDev().execute_sync(
+            task_description="Apply requested revision",
+            repo_url="https://github.com/org/repo",
+            repo_path="/tmp/workspace/scm/repo",
+            branch_name="feature/proj-1-task",
+            workspace_path="/tmp/workspace",
+            revision_feedback="Fix the review findings",
+            review_report_path="code-review/review-report-1.json",
+            revision_mode=True,
+            revision_round=2,
+            existing_pr_url="https://github.com/org/repo/pull/42",
+            existing_pr_number=42,
+            existing_branch="feature/proj-1-task",
+            orchestrator_task_id="task-123",
+        )
+
+        metadata = calls[0]["metadata"]
+        assert metadata["revisionFeedback"] == "Fix the review findings"
+        assert metadata["reviewReportPath"] == "code-review/review-report-1.json"
+        assert metadata["revisionMode"] is True
+        assert metadata["revisionRound"] == 2
+        assert metadata["existingPrUrl"] == "https://github.com/org/repo/pull/42"
+        assert metadata["existingPrNumber"] == 42
+        assert metadata["existingBranch"] == "feature/proj-1-task"
         assert payload["prNumber"] == 2
         assert payload["repoUrl"] == "https://example.test/org/repo.git"
         assert payload["changedFiles"] == ["src/App.jsx"]

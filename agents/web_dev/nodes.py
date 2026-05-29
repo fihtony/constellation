@@ -570,6 +570,8 @@ async def setup_workspace(state: dict) -> dict:
     repo_path = state.get("repo_path", "")
     workspace_path = state.get("workspace_path", "")
     branch_name = state.get("branch_name", "")
+    existing_branch = state.get("existing_branch", "")
+    revision_mode = bool(state.get("revision_mode", False))
     task_id = state.get("_task_id", "unknown")
     log.debug("setup_workspace", repo_path=repo_path)
     print(f"[{_AGENT_ID}] setup_workspace: repo_path={repo_path!r} workspace_path={workspace_path!r}")
@@ -584,11 +586,19 @@ async def setup_workspace(state: dict) -> dict:
     if not repo_path:
         repo_path = os.path.join(workspace_path, "repo")
 
+    if revision_mode:
+        branch_name = existing_branch or branch_name
+
     # Fail fast if repo does not exist — Team Lead must have cloned it first
     if not os.path.isdir(repo_path):
         raise RuntimeError(
             f"[{_AGENT_ID}] Repo not found at {repo_path!r}. "
             "Team Lead must clone the repo before dispatching to Web Dev."
+        )
+
+    if revision_mode and not branch_name:
+        raise RuntimeError(
+            f"[{_AGENT_ID}] Revision mode requires an existing branch name to reuse."
         )
 
     # Derive branch name: use provided value, then LLM, then Jira-key fallback
@@ -635,7 +645,7 @@ async def setup_workspace(state: dict) -> dict:
 
     # -- Check remote branches and open PR source branches for conflicts; add _<n> suffix when taken --
     # Must not delete or alter existing remote branches or PRs.
-    if branch_name and repo_url and not local_branch_exists:
+    if branch_name and repo_url and not local_branch_exists and not revision_mode:
         remote_result = _call_boundary_tool(state, "scm_list_branches", {"repo_url": repo_url})
         remote_branch_names = {
             candidate
@@ -672,29 +682,64 @@ async def setup_workspace(state: dict) -> dict:
         import subprocess
         from framework.env_utils import build_isolated_git_env
         git_env = build_isolated_git_env("web-dev-setup")
-        r = subprocess.run(
-            ["git", "checkout", "-b", branch_name],
-            cwd=repo_path, env=git_env,
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode == 0:
-            branch_created = True
-            print(f"[{_AGENT_ID}] setup_workspace: created branch {branch_name!r}")
+        if revision_mode:
+            if local_branch_exists:
+                r = subprocess.run(
+                    ["git", "checkout", branch_name],
+                    cwd=repo_path, env=git_env,
+                    capture_output=True, text=True, timeout=30,
+                )
+                if r.returncode != 0:
+                    raise RuntimeError(
+                        f"[{_AGENT_ID}] Failed to switch to existing branch {branch_name!r}: {r.stderr.strip()[:200]}"
+                    )
+                branch_created = True
+                print(f"[{_AGENT_ID}] setup_workspace: reusing existing branch {branch_name!r}")
+            else:
+                fetch_result = subprocess.run(
+                    ["git", "fetch", "origin", branch_name],
+                    cwd=repo_path, env=git_env,
+                    capture_output=True, text=True, timeout=60,
+                )
+                if fetch_result.returncode != 0:
+                    raise RuntimeError(
+                        f"[{_AGENT_ID}] Revision branch {branch_name!r} is missing locally and could not be fetched: {fetch_result.stderr.strip()[:200]}"
+                    )
+                checkout_result = subprocess.run(
+                    ["git", "checkout", "-B", branch_name, f"origin/{branch_name}"],
+                    cwd=repo_path, env=git_env,
+                    capture_output=True, text=True, timeout=30,
+                )
+                if checkout_result.returncode != 0:
+                    raise RuntimeError(
+                        f"[{_AGENT_ID}] Failed to track existing revision branch {branch_name!r}: {checkout_result.stderr.strip()[:200]}"
+                    )
+                branch_created = True
+                print(f"[{_AGENT_ID}] setup_workspace: fetched and reused branch {branch_name!r}")
         else:
-            # Branch might already exist — try switching to it
-            r2 = subprocess.run(
-                ["git", "checkout", branch_name],
+            r = subprocess.run(
+                ["git", "checkout", "-b", branch_name],
                 cwd=repo_path, env=git_env,
                 capture_output=True, text=True, timeout=30,
             )
-            if r2.returncode == 0:
+            if r.returncode == 0:
                 branch_created = True
-                print(f"[{_AGENT_ID}] setup_workspace: switched to existing branch {branch_name!r}")
+                print(f"[{_AGENT_ID}] setup_workspace: created branch {branch_name!r}")
             else:
-                print(f"[{_AGENT_ID}] setup_workspace: git checkout failed: {r2.stderr.strip()[:200]}")
-                raise RuntimeError(
-                    f"[{_AGENT_ID}] Failed to create/switch branch {branch_name!r}: {r2.stderr.strip()[:200]}"
+                # Branch might already exist — try switching to it
+                r2 = subprocess.run(
+                    ["git", "checkout", branch_name],
+                    cwd=repo_path, env=git_env,
+                    capture_output=True, text=True, timeout=30,
                 )
+                if r2.returncode == 0:
+                    branch_created = True
+                    print(f"[{_AGENT_ID}] setup_workspace: switched to existing branch {branch_name!r}")
+                else:
+                    print(f"[{_AGENT_ID}] setup_workspace: git checkout failed: {r2.stderr.strip()[:200]}")
+                    raise RuntimeError(
+                        f"[{_AGENT_ID}] Failed to create/switch branch {branch_name!r}: {r2.stderr.strip()[:200]}"
+                    )
 
     # Write git setup log
     if workspace_path:

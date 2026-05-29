@@ -313,6 +313,57 @@ class BitbucketClient:
         except Exception as exc:
             return {}, str(exc)
 
+    def add_pr_inline_comment(
+        self,
+        project: str,
+        repo: str,
+        pr_id: str | int,
+        file_path: str,
+        line: int,
+        body: str,
+        commit_id: str = "",
+        side: str = "RIGHT",
+        timeout: int = 15,
+    ) -> tuple[dict, str]:
+        """Add an inline PR comment in Bitbucket Server, falling back to a general comment.
+
+        Bitbucket Server stores inline PR comments under the same comments API
+        using an anchor payload that targets the destination file and line.
+        """
+        del commit_id, side
+        payload = {
+            "text": body,
+            "anchor": {
+                "path": file_path,
+                "line": line,
+                "lineType": "ADDED",
+                "fileType": "TO",
+            },
+        }
+        try:
+            data = self._post(
+                f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments",
+                payload,
+                timeout=timeout,
+            )
+            return {
+                "id": data.get("id"),
+                "body": body,
+                "path": file_path,
+                "line": line,
+                "fallback": False,
+            }, "ok"
+        except HTTPError as exc:
+            if exc.code == 400:
+                fallback_body = f"**{file_path}:{line}**\n\n{body}"
+                result, status = self.add_pr_comment(project, repo, pr_id, fallback_body, timeout)
+                if status == "ok":
+                    result = {**result, "path": file_path, "line": line, "fallback": True}
+                return result, status
+            return {}, f"HTTP {exc.code}"
+        except Exception as exc:
+            return {}, str(exc)
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -702,12 +753,21 @@ class GitHubClient:
                 timeout=timeout,
             )
             if status in (200, 201):
-                return {"id": resp.get("id"), "body": body, "path": file_path, "line": line}, "ok"
+                return {
+                    "id": resp.get("id"),
+                    "body": body,
+                    "path": file_path,
+                    "line": line,
+                    "fallback": False,
+                }, "ok"
             # GitHub returns 422 if line is not part of the diff
             if status == 422:
                 # Fallback: post as regular comment with file/line context
                 fallback_body = f"**{file_path}:{line}**\n\n{body}"
-                return self.add_pr_comment(owner, repo, pr_id, fallback_body, timeout)
+                result, comment_status = self.add_pr_comment(owner, repo, pr_id, fallback_body, timeout)
+                if comment_status == "ok":
+                    result = {**result, "path": file_path, "line": line, "fallback": True}
+                return result, comment_status
             return resp if isinstance(resp, dict) else {}, f"http_{status}"
         except Exception as exc:
             return {}, str(exc)

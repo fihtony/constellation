@@ -540,6 +540,32 @@ class GitHubMCPProvider:
             "htmlUrl": data.get("html_url", ""),
         }, "ok"
 
+    def add_pr_inline_comment(
+        self,
+        owner: str,
+        repo: str,
+        pr_id: int | str,
+        file_path: str,
+        line: int,
+        body: str,
+        commit_id: str = "",
+        side: str = "RIGHT",
+        timeout: int = 20,
+    ) -> tuple[dict, str]:
+        from agents.scm.client import GitHubClient
+
+        return GitHubClient(token=self._token).add_pr_inline_comment(
+            owner,
+            repo,
+            pr_id,
+            file_path,
+            line,
+            body,
+            commit_id=commit_id,
+            side=side,
+            timeout=timeout,
+        )
+
     def list_pr_comments(
         self, owner: str, repo: str, pr_id: int | str, timeout: int = 20
     ) -> tuple[list[dict], str]:

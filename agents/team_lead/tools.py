@@ -469,6 +469,30 @@ class DispatchWebDev(BaseTool):
                 "type": "string",
                 "description": "Code review rejection reason for revision. Optional.",
             },
+            "review_report_path": {
+                "type": "string",
+                "description": "Relative path to the prior code review report for revision mode. Optional.",
+            },
+            "revision_mode": {
+                "type": "boolean",
+                "description": "Whether the child task is a revision against an existing PR.",
+            },
+            "revision_round": {
+                "type": "integer",
+                "description": "Current revision round number (1-based when revising). Optional.",
+            },
+            "existing_pr_url": {
+                "type": "string",
+                "description": "Existing PR URL to update during revision mode. Optional.",
+            },
+            "existing_pr_number": {
+                "type": "integer",
+                "description": "Existing PR number to update during revision mode. Optional.",
+            },
+            "existing_branch": {
+                "type": "string",
+                "description": "Existing branch name to reuse during revision mode. Optional.",
+            },
             "definition_of_done": {
                 "type": "object",
                 "description": "Acceptance gate criteria (build, tests, PR, screenshot). Optional.",
@@ -501,6 +525,12 @@ class DispatchWebDev(BaseTool):
         stitch_screen_name: str = "",
         orchestrator_task_id: str = "",
         revision_feedback: str = "",
+        review_report_path: str = "",
+        revision_mode: bool = False,
+        revision_round: int = 0,
+        existing_pr_url: str = "",
+        existing_pr_number: int = 0,
+        existing_branch: str = "",
         definition_of_done: dict | None = None,
         task_id: str = "",
         **_: Any,
@@ -544,6 +574,18 @@ class DispatchWebDev(BaseTool):
             meta["orchestratorTaskId"] = orchestrator_task_id
         if revision_feedback:
             meta["revisionFeedback"] = revision_feedback
+        if review_report_path:
+            meta["reviewReportPath"] = review_report_path
+        if revision_mode:
+            meta["revisionMode"] = True
+        if revision_round:
+            meta["revisionRound"] = revision_round
+        if existing_pr_url:
+            meta["existingPrUrl"] = existing_pr_url
+        if existing_pr_number:
+            meta["existingPrNumber"] = existing_pr_number
+        if existing_branch:
+            meta["existingBranch"] = existing_branch
         if definition_of_done:
             meta["definitionOfDone"] = definition_of_done
         if task_id:
@@ -754,6 +796,19 @@ class DispatchCodeReview(BaseTool):
         permissions = _.get("permissions") if isinstance(_, dict) else None
         if isinstance(permissions, dict):
             meta["permissions"] = permissions
+        # Pass through fields needed by CR agent (§12.1)
+        _repo_path = _.get("repo_path", "") if isinstance(_, dict) else ""
+        if _repo_path:
+            meta["repoPath"] = _repo_path
+        _review_round = _.get("review_round") if isinstance(_, dict) else None
+        if _review_round:
+            meta["reviewRound"] = _review_round
+        _prev_review = _.get("previous_review_path") if isinstance(_, dict) else None
+        if _prev_review:
+            meta["previousReviewPath"] = _prev_review
+        _tech_stack = _.get("tech_stack") if isinstance(_, dict) else None
+        if _tech_stack:
+            meta["techStack"] = _tech_stack
 
         try:
             from framework.a2a.client import dispatch_sync
