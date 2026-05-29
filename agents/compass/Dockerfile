@@ -14,6 +14,7 @@ RUN apt-get update \
 COPY framework/ /app/framework/
 COPY agents/__init__.py /app/agents/__init__.py
 COPY agents/compass/ /app/agents/compass/
+COPY agents/log_store/ /app/agents/log_store/
 RUN mkdir -p /app/config/permissions /app/config/rules /app/config/workflows
 COPY config/constellation.yaml /app/config/constellation.yaml
 COPY config/rules/ /app/config/rules/

@@ -417,9 +417,24 @@ _INLINE_JS = r"""
       if (autoSelect && !state.tasks[state.selectedTaskId] && state.selectedTaskId !== NEW_REQUEST_ID) {
         state.selectedTaskId = state.order[0] || NEW_REQUEST_ID;
       }
+      if (state.selectedTaskId !== NEW_REQUEST_ID && state.tasks[state.selectedTaskId]) {
+        await loadTaskDetail(state.selectedTaskId);
+      }
       renderTaskList(); renderChat(); renderDetail();
       if (state.selectedTaskId !== NEW_REQUEST_ID) subscribeLogs(state.selectedTaskId);
     } catch (e) { console.error('loadTasks failed', e); }
+  }
+
+  async function loadTaskDetail(tid) {
+    if (!tid || tid === NEW_REQUEST_ID) return;
+    try {
+      const resp = await fetch(`/api/tasks/${encodeURIComponent(tid)}`);
+      const data = await resp.json();
+      const task = data.task || data;
+      if (task && task.task_id) upsertTask(task);
+    } catch (e) {
+      console.error('loadTaskDetail failed', e);
+    }
   }
 
   function renderTaskList() {
@@ -453,6 +468,9 @@ _INLINE_JS = r"""
     state.selectedTaskId = tid;
     renderTaskList(); renderChat(); renderDetail();
     if (tid !== NEW_REQUEST_ID) subscribeLogs(tid);
+    loadTaskDetail(tid).then(() => {
+      renderTaskList(); renderChat(); renderDetail();
+    });
   }
 
   function renderChat() {

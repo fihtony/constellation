@@ -1,4 +1,6 @@
 """Tests for Compass UI routes."""
+from pathlib import Path
+
 import pytest
 from framework.task_store import InMemoryTaskStore
 from agents.compass.ui.routes import handle_ui_request
@@ -48,3 +50,19 @@ class TestUIRoutes:
         result = handle_ui_request("GET", "/ui/events", task_store=task_store)
         assert result["status"] == 200
         assert result["headers"]["Content-Type"].startswith("text/event-stream")
+
+    def test_logs_route_uses_filesystem_fallback(self, monkeypatch, tmp_path: Path):
+        task_id = "task-logs"
+        agent_dir = tmp_path / task_id / "compass"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "agent.log").write_text(
+            "2026-05-28 10:30:00 [INFO] [compass] Accepted task\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path))
+
+        result = handle_ui_request("GET", f"/logs/{task_id}")
+
+        assert result["status"] == 200
+        assert result["body"]["logs"][0]["task_id"] == task_id
+        assert result["body"]["logs"][0]["message"] == "Accepted task"

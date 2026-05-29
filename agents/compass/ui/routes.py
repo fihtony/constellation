@@ -15,11 +15,13 @@ Exposes:
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime, timezone
 from typing import Iterable
 
 from agents.compass.ui.templates import render_compass_ui
+from agents.log_store.log_aggregator import LogAggregator
 
 
 def _now_iso() -> str:
@@ -253,6 +255,19 @@ def _sse_format(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+def _artifact_root() -> str:
+    return os.environ.get("ARTIFACT_ROOT", "artifacts/")
+
+
+def _aggregate_local_logs(task_id: str) -> list[dict]:
+    aggregator = LogAggregator(_artifact_root())
+    logs = aggregator.aggregate_task(task_id)
+    enriched: list[dict] = []
+    for index, entry in enumerate(logs, start=1):
+        enriched.append({**entry, "task_id": task_id, "sequence": index})
+    return enriched
+
+
 def _ui_events_generator(task_store, *, poll_interval: float = 1.0,
                           max_iterations: int | None = None) -> Iterable[str]:
     """Yield SSE chunks reflecting task lifecycle changes.
@@ -335,7 +350,7 @@ def proxy_to_log_store(task_id: str, log_store_url: str | None) -> dict:
         return {
             "status": 200,
             "headers": {"Content-Type": "application/json"},
-            "body": {"task_id": task_id, "logs": []},
+            "body": {"task_id": task_id, "logs": _aggregate_local_logs(task_id)},
         }
     import urllib.request
     try:
@@ -360,13 +375,23 @@ def proxy_log_stream(task_id: str, log_store_url: str | None) -> dict:
     client receives ``log.appended`` events in near-real time.
     """
     if not log_store_url:
-        def _empty():
-            yield ": no-log-store\n\n"
-            time.sleep(1)
+        def _local_stream():
+            previous = _aggregate_local_logs(task_id)
+            for entry in previous:
+                yield _sse_format("log.appended", entry)
+            yield ": local-log-fallback\n\n"
+            while True:
+                time.sleep(1)
+                current = _aggregate_local_logs(task_id)
+                if len(current) > len(previous):
+                    for entry in current[len(previous):]:
+                        yield _sse_format("log.appended", entry)
+                previous = current
+                yield ": heartbeat\n\n"
         return {
             "status": 200,
             "headers": {"Content-Type": "text/event-stream; charset=utf-8"},
-            "body": _empty(),
+            "body": _local_stream(),
         }
 
     import urllib.request

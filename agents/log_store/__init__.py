@@ -1,5 +1,8 @@
-"""Import-compatible package wrapper for the log-store agent."""
+"""Import-compatible package namespace for log-store modules.
 
-from agents.log_store.agent import LOGSTORE_DEFINITION, LogStoreAgent
+Keep package import side effects minimal so containers can import submodules
+such as ``agents.log_store.log_aggregator`` without also requiring the full
+legacy ``agents/log-store`` tree.
+"""
 
-__all__ = ["LogStoreAgent", "LOGSTORE_DEFINITION"]
+__all__: list[str] = []

@@ -1,20 +1,81 @@
-"""Wrapper that loads the canonical log-store aggregator module by file path."""
+"""Filesystem log aggregator for LogStore and Compass UI fallback."""
 from __future__ import annotations
 
-from importlib.util import module_from_spec, spec_from_file_location
-from pathlib import Path
+import os
+import re
+from typing import Any
 
 
-_SOURCE = Path(__file__).resolve().parent.parent / "log-store" / "log_aggregator.py"
-_SPEC = spec_from_file_location("agents._log_store_legacy_aggregator", _SOURCE)
-if _SPEC is None or _SPEC.loader is None:
-    raise ImportError(f"Unable to load log aggregator module from {_SOURCE}")
+LOG_LINE_PATTERN = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) "
+    r"\[(\w+)\s*\] "
+    r"\[([\w-]+)\] "
+    r"(.+)$"
+)
 
-_MODULE = module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_MODULE)
 
-LOG_LINE_PATTERN = _MODULE.LOG_LINE_PATTERN
-LogAggregator = _MODULE.LogAggregator
-parse_log_line = _MODULE.parse_log_line
+def parse_log_line(line: str) -> dict[str, Any] | None:
+    """Parse a single log line into structured dict."""
+    match = LOG_LINE_PATTERN.match(line.strip())
+    if not match:
+        return None
+    timestamp, level, agent, message = match.groups()
+    return {
+        "timestamp": timestamp,
+        "level": level,
+        "agent": agent,
+        "message": message,
+    }
+
+
+class LogAggregator:
+    """Aggregates logs from filesystem for a task."""
+
+    def __init__(self, artifact_root: str = "/artifacts"):
+        self.artifact_root = artifact_root
+
+    def get_task_log_dir(self, task_id: str) -> str:
+        """Get directory containing all agent logs for a task."""
+        return os.path.join(self.artifact_root, task_id)
+
+    def aggregate_task(self, task_id: str) -> list[dict]:
+        """Aggregate all logs for a given task from all agents."""
+        logs = []
+        task_dir = self.get_task_log_dir(task_id)
+
+        if not os.path.isdir(task_dir):
+            return logs
+
+        for agent_name in os.listdir(task_dir):
+            agent_dir = os.path.join(task_dir, agent_name)
+            if not os.path.isdir(agent_dir):
+                continue
+
+            log_file = os.path.join(agent_dir, "agent.log")
+            if os.path.isfile(log_file):
+                agent_logs = self._read_agent_logs(log_file, agent_name)
+                logs.extend(agent_logs)
+
+        return sorted(logs, key=lambda item: item["timestamp"])
+
+    def _read_agent_logs(self, log_file: str, agent_name: str) -> list[dict]:
+        logs = []
+        try:
+            with open(log_file, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    parsed = parse_log_line(line)
+                    if parsed:
+                        parsed["source"] = agent_name
+                        logs.append(parsed)
+        except OSError:
+            pass
+        return logs
+
+    def aggregate_since(self, task_id: str, since_timestamp: str | None = None) -> list[dict]:
+        """Aggregate logs since a given timestamp."""
+        all_logs = self.aggregate_task(task_id)
+        if since_timestamp is None:
+            return all_logs
+        return [log for log in all_logs if log["timestamp"] > since_timestamp]
 
 __all__ = ["LOG_LINE_PATTERN", "LogAggregator", "parse_log_line"]
