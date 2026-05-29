@@ -102,6 +102,17 @@ def _derive_launch_task_id(
     return ""
 
 
+def _validate_task_workspace_root(workspace_path: str, agent_name: str) -> None:
+    workspace = (workspace_path or "").strip()
+    if not workspace:
+        return
+    artifact_root = os.path.abspath(os.environ.get("ARTIFACT_ROOT", "artifacts"))
+    if os.path.abspath(workspace) == artifact_root:
+        raise ValueError(
+            f"{agent_name} requires a single task workspace root, not the shared ARTIFACT_ROOT directory"
+        )
+
+
 def _dispatch_via_launcher(
     definition: dict[str, Any],
     *,
@@ -768,6 +779,7 @@ class DispatchCodeReview(BaseTool):
         capability = "review.code.check"
         definition = _capability_definition(capability)
         meta: dict[str, Any] = {}
+        _validate_task_workspace_root(workspace_path, "Code Review")
         if pr_url:
             meta["prUrl"] = pr_url
         if pr_number:

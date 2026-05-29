@@ -136,6 +136,68 @@ def _review_input_attempts() -> int:
     return max(1, int(wait_seconds / poll_seconds) + 1)
 
 
+def _validate_workspace_path(workspace_path: str) -> None:
+    workspace = (workspace_path or "").strip()
+    if not workspace:
+        return
+    artifact_root = os.path.abspath(os.environ.get("ARTIFACT_ROOT", "artifacts"))
+    if os.path.abspath(workspace) == artifact_root:
+        raise RuntimeError(
+            "workspacePath must point to a single task workspace root, not ARTIFACT_ROOT"
+        )
+
+
+def _build_standards_section(state: dict) -> str:
+    standards_text = state.get("standards_text", "")
+    return f"\n\n{standards_text}\n" if standards_text else ""
+
+
+def _build_previous_issues_section(state: dict) -> str:
+    previous_issues = state.get("previous_issues", [])
+    if not previous_issues:
+        return ""
+    high_crit = [issue for issue in previous_issues if issue.get("severity") in ("high", "critical")]
+    if not high_crit:
+        return ""
+    lines = [
+        f"- [{issue.get('severity')}] {issue.get('file', 'unknown')}: {issue.get('message', '')}"
+        for issue in high_crit[:10]
+    ]
+    return (
+        "\n\nPREVIOUS ROUND HIGH/CRITICAL ISSUES (must validate these first before the full review):\n"
+        "First verify whether each item below is fixed in the current PR. "
+        "After that validation, perform a full review of the current PR and report any new issues.\n"
+        + "\n".join(lines)
+    )
+
+
+def _detect_large_changed_files(pr_diff: str, threshold: int = 2000) -> list[dict[str, Any]]:
+    if not pr_diff:
+        return []
+
+    counts: dict[str, int] = {}
+    current_file = ""
+    for line in pr_diff.splitlines():
+        if line.startswith("diff --git "):
+            match = re.match(r"diff --git a/(.+?) b/(.+)", line)
+            if match:
+                current_file = match.group(2)
+                counts.setdefault(current_file, 0)
+            else:
+                current_file = ""
+            continue
+        if not current_file:
+            continue
+        if (line.startswith("+") or line.startswith("-")) and not line.startswith(("+++", "---")):
+            counts[current_file] = counts.get(current_file, 0) + 1
+
+    return [
+        {"file": file_path, "changed_lines": changed_lines}
+        for file_path, changed_lines in counts.items()
+        if changed_lines > threshold
+    ]
+
+
 def _child_permissions(state: dict) -> dict[str, Any] | None:
     metadata = state.get("metadata", {})
     permissions = metadata.get("permissions")
@@ -304,6 +366,7 @@ async def load_pr_context(state: dict) -> dict:
         or state.get("context_manifest_path")
         or ""
     )
+    _validate_workspace_path(workspace_path)
     permissions = _child_permissions(state)
 
     if workspace_path:
@@ -666,18 +729,8 @@ async def review_quality(state: dict) -> dict:
 
     from agents.code_review.prompts import QUALITY_SYSTEM, QUALITY_TEMPLATE
 
-    # Include previous round's high/critical issues for verification (round 2+)
-    previous_issues = state.get("previous_issues", [])
-    prev_issues_text = ""
-    if previous_issues:
-        high_crit = [i for i in previous_issues if i.get("severity") in ("high", "critical")]
-        if high_crit:
-            lines = [f"- [{i.get('severity')}] {i.get('file', 'unknown')}: {i.get('message', '')}" for i in high_crit[:10]]
-            prev_issues_text = "\n\nPREVIOUS ROUND HIGH/CRITICAL ISSUES (verify these are fixed):\n" + "\n".join(lines)
-
-    # Inject coding standards into review prompt
-    standards_text = state.get("standards_text", "")
-    standards_section = f"\n\n{standards_text}\n" if standards_text else ""
+    standards_section = _build_standards_section(state)
+    prev_issues_text = _build_previous_issues_section(state)
 
     prompt = QUALITY_TEMPLATE.format(
         pr_description=state.get("pr_description", "N/A"),
@@ -708,9 +761,8 @@ async def review_security(state: dict) -> dict:
 
     from agents.code_review.prompts import SECURITY_SYSTEM, SECURITY_TEMPLATE
 
-    # Inject security-related standards
-    standards_text = state.get("standards_text", "")
-    standards_section = f"\n\n{standards_text}\n" if standards_text else ""
+    standards_section = _build_standards_section(state)
+    prev_issues_text = _build_previous_issues_section(state)
 
     prompt = SECURITY_TEMPLATE.format(
         pr_description=state.get("pr_description", "N/A"),
@@ -719,6 +771,8 @@ async def review_security(state: dict) -> dict:
     )
     if standards_section:
         prompt += standards_section
+    if prev_issues_text:
+        prompt += prev_issues_text
     result = _run_review_with_retry(runtime, prompt, system_prompt=SECURITY_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
@@ -739,9 +793,8 @@ async def review_tests(state: dict) -> dict:
 
     from agents.code_review.prompts import TESTS_SYSTEM, TESTS_TEMPLATE
 
-    # Inject testing-related standards
-    standards_text = state.get("standards_text", "")
-    standards_section = f"\n\n{standards_text}\n" if standards_text else ""
+    standards_section = _build_standards_section(state)
+    prev_issues_text = _build_previous_issues_section(state)
 
     prompt = TESTS_TEMPLATE.format(
         pr_description=state.get("pr_description", "N/A"),
@@ -750,6 +803,8 @@ async def review_tests(state: dict) -> dict:
     )
     if standards_section:
         prompt += standards_section
+    if prev_issues_text:
+        prompt += prev_issues_text
     result = _run_review_with_retry(runtime, prompt, system_prompt=TESTS_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
@@ -776,6 +831,8 @@ async def review_requirements(state: dict) -> dict:
     from agents.code_review.prompts import REQUIREMENTS_SYSTEM, REQUIREMENTS_TEMPLATE
 
     jira_ctx = state.get("jira_context", {})
+    standards_section = _build_standards_section(state)
+    prev_issues_text = _build_previous_issues_section(state)
     prompt = REQUIREMENTS_TEMPLATE.format(
         original_requirements=original_requirements,
         jira_context=json.dumps(jira_ctx, ensure_ascii=False) if jira_ctx else "N/A",
@@ -783,6 +840,10 @@ async def review_requirements(state: dict) -> dict:
         changed_files=", ".join(state.get("changed_files", [])) or "N/A",
         pr_diff=state.get("pr_diff", ""),
     )
+    if standards_section:
+        prompt += standards_section
+    if prev_issues_text:
+        prompt += prev_issues_text
     result = _run_review_with_retry(runtime, prompt, system_prompt=REQUIREMENTS_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
@@ -853,6 +914,8 @@ async def review_ui_design(state: dict) -> dict:
         # No design reference available — skip UI review silently
         return {"ui_issues": []}
 
+    standards_section = _build_standards_section(state)
+    prev_issues_text = _build_previous_issues_section(state)
     prompt = UI_DESIGN_TEMPLATE.format(
         pr_description=pr_description or "N/A",
         changed_files=", ".join(changed_files) or "N/A",
@@ -860,6 +923,10 @@ async def review_ui_design(state: dict) -> dict:
         design_html=design_html[:4000] if design_html else "N/A",
         pr_diff=state.get("pr_diff", ""),
     )
+    if standards_section:
+        prompt += standards_section
+    if prev_issues_text:
+        prompt += prev_issues_text
     result = _run_review_with_retry(runtime, prompt, system_prompt=UI_DESIGN_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
@@ -914,6 +981,17 @@ async def generate_report(state: dict) -> dict:
             "suggestion": "Consider splitting large changes for more thorough automated review.",
         })
         medium += 1
+
+    large_changed_files = _detect_large_changed_files(state.get("pr_diff", ""))
+    for entry in large_changed_files[:5]:
+        all_comments.append({
+            "severity": "low",
+            "category": "large-change",
+            "file": entry["file"],
+            "message": f"Single-file change is very large ({entry['changed_lines']} changed lines).",
+            "suggestion": "Split this file change into smaller logical steps when possible.",
+        })
+        low += 1
 
     # Validation gate: verify review report structure
     from framework.validation_gates import validate_review_verdict

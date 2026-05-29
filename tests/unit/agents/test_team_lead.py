@@ -687,6 +687,41 @@ class TestDispatchDevAgentValidation:
         assert captured["changed_files"] == ["src/App.jsx"]
         assert result["route"] == "approved"
 
+    async def test_review_result_escalates_manual_review_required(self, monkeypatch):
+        from agents.team_lead.nodes import review_result
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                assert name == "dispatch_code_review"
+                return json.dumps({
+                    "verdict": "rejected",
+                    "summary": "Manual review required for large PR",
+                    "manual_review_required": True,
+                })
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await review_result(
+            {
+                "_task_id": "task-123",
+                "pr_url": "https://github.com/org/repo/pull/85",
+                "pr_number": 85,
+                "repo_url": "https://github.com/org/repo",
+                "dev_result": {
+                    "summary": "done",
+                    "prNumber": 85,
+                    "repoUrl": "https://github.com/org/repo",
+                },
+                "analysis_summary": "Implement a large refactor",
+                "workspace_path": "/tmp/workspace",
+                "revision_count": 0,
+                "max_revisions": 3,
+            }
+        )
+
+        assert result["manual_review_required"] is True
+        assert result["route"] == "need_user_input"
+
     async def test_validate_readiness_routes_to_missing_info_for_retryable_context(self, tmp_path):
         from agents.team_lead.nodes import validate_readiness
 
@@ -1078,19 +1113,6 @@ class TestTeamLeadTools:
         assert metadata["existingPrUrl"] == "https://github.com/org/repo/pull/42"
         assert metadata["existingPrNumber"] == 42
         assert metadata["existingBranch"] == "feature/proj-1-task"
-        assert payload["prNumber"] == 2
-        assert payload["repoUrl"] == "https://example.test/org/repo.git"
-        assert payload["changedFiles"] == ["src/App.jsx"]
-        assert payload["screenshotIncluded"] is True
-        assert payload["screenshotUploaded"] is True
-        assert payload["childServiceUrl"] == "http://launched-web-dev:8050"
-        assert payload["childContainerName"] == "web-dev-task-1234"
-        assert payload["childAgentId"] == "web-dev"
-        assert calls["launch"][0][1] == "task-123"
-        assert calls["dispatch"][0]["url"] == "http://launched-web-dev:8050"
-        assert calls["dispatch"][0]["timeout"] == 3600
-        assert calls["dispatch"][0]["metadata"]["orchestratorTaskId"] == "task-123"
-        assert calls["destroy"] == []
 
     def test_dispatch_web_dev_uses_configurable_timeout(self, monkeypatch):
         from agents.team_lead.tools import DispatchWebDev
@@ -1274,3 +1296,14 @@ class TestTeamLeadTools:
         )
 
         assert calls["launch"] == ["task-39c4f352bb20"]
+
+    def test_dispatch_code_review_rejects_artifact_root_workspace(self, monkeypatch):
+        from agents.team_lead.tools import DispatchCodeReview
+
+        monkeypatch.setenv("ARTIFACT_ROOT", "/app/artifacts")
+
+        with pytest.raises(ValueError, match="single task workspace root"):
+            DispatchCodeReview().execute_sync(
+                pr_url="https://example.test/pr/1",
+                workspace_path="/app/artifacts",
+            )

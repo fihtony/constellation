@@ -1088,9 +1088,12 @@ async def review_result(state: dict) -> dict:
 
     verdict = payload.get("verdict", "rejected")
     revision_count = state.get("revision_count", 0)
+    manual_review_required = bool(payload.get("manual_review_required", False))
 
     if verdict == "approved":
         route = "approved"
+    elif manual_review_required:
+        route = "need_user_input"
     elif revision_count >= state.get("max_revisions", 3):
         route = "need_user_input"
     else:
@@ -1099,6 +1102,7 @@ async def review_result(state: dict) -> dict:
     return {
         "review_result": payload,
         "review_verdict": verdict,
+        "manual_review_required": manual_review_required,
         "route": route,
     }
 
