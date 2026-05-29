@@ -155,6 +155,29 @@ def _tail_text(text: str, limit: int = 600) -> str:
     return normalized[-limit:]
 
 
+_NON_ACTIONABLE_REVIEW_CATEGORIES = {"review-process", "large-change"}
+_NON_ACTIONABLE_REVIEW_PHRASES = (
+    "diff was truncated",
+    "truncated in diff",
+    "not fully visible",
+    "review focused on visible portion only",
+    "single-file change is very large",
+)
+
+
+def _is_actionable_review_comment(comment: dict[str, Any]) -> bool:
+    """Return True when a code-review comment can be acted on by the dev agent."""
+    category = str(comment.get("category", "")).strip().lower()
+    if category in _NON_ACTIONABLE_REVIEW_CATEGORIES:
+        return False
+
+    combined = " ".join(
+        str(comment.get(key, "")).strip().lower()
+        for key in ("message", "suggestion")
+    )
+    return not any(phrase in combined for phrase in _NON_ACTIONABLE_REVIEW_PHRASES)
+
+
 def _git_worktree_changed_files(repo_path: str) -> list[str]:
     """Return tracked/untracked worktree files from git status."""
     if not repo_path or not os.path.isdir(repo_path):
@@ -1294,6 +1317,7 @@ async def self_assess(state: dict) -> dict:
     ac_str = json.dumps(acceptance_criteria[:5], ensure_ascii=False)
     if len(ac_str) > 3000:
         ac_str = ac_str[:3000] + "...]"
+    acceptance_criteria_count = len(acceptance_criteria) if isinstance(acceptance_criteria, list) else 0
 
     # Derive changed files from the actual cloned repo's git status when
     # changes_made is empty (native tool runs don't track individual writes).
@@ -1332,6 +1356,8 @@ async def self_assess(state: dict) -> dict:
                     comments = report_body.get("all_comments", []) or report_body.get("comments", [])
                     cr_lines = []
                     for c in comments[:15]:
+                        if not _is_actionable_review_comment(c):
+                            continue
                         sev = c.get("severity", "info")
                         msg = c.get("message", "")
                         file_ref = c.get("file", "")
@@ -1384,25 +1410,55 @@ If any high/critical issue is NOT fixed, set verdict to "fail" and list
 the unresolved issues in gaps.
 """
 
-    result = runtime.run(
-        prompt, system_prompt=SELF_ASSESS_SYSTEM,
-        max_tokens=4096,
-        plugin_manager=state.get("_plugin_manager"),
-        cwd=state.get("repo_path") or None,
-    )
+    from framework.validation_gates import validate_self_assessment
 
-    raw_response = result.get("raw_response", "")
-    print(f"[{_AGENT_ID}] self_assess raw_response (first 500 chars): {raw_response[:500]!r}")
-    data = _safe_json(raw_response, fallback={})
-    if not data:
-        print(f"[{_AGENT_ID}] self_assess _safe_json returned empty — raw_response type={type(raw_response).__name__}, len={len(raw_response) if raw_response else 0}")
+    gate_result = None
+    data: dict[str, Any] = {}
+    max_schema_attempts = 2
+    for schema_attempt in range(1, max_schema_attempts + 1):
+        attempt_prompt = prompt
+        if gate_result and gate_result.feedback:
+            attempt_prompt += f"""
 
-    if not isinstance(data, dict):
-        data = {}
-    data.setdefault("criteria_checks", [])
-    data.setdefault("component_checks", [])
-    data.setdefault("gaps", [])
-    data.setdefault("summary", "")
+IMPORTANT: Your previous self-assessment response was invalid.
+Return valid JSON only, and correct this validation feedback:
+{gate_result.feedback}
+"""
+
+        result = runtime.run(
+            attempt_prompt,
+            system_prompt=SELF_ASSESS_SYSTEM,
+            max_tokens=4096,
+            plugin_manager=state.get("_plugin_manager"),
+            cwd=state.get("repo_path") or None,
+        )
+
+        raw_response = result.get("raw_response", "")
+        print(f"[{_AGENT_ID}] self_assess raw_response (first 500 chars): {raw_response[:500]!r}")
+        parsed = _safe_json(raw_response, fallback={})
+        if not parsed:
+            print(f"[{_AGENT_ID}] self_assess _safe_json returned empty — raw_response type={type(raw_response).__name__}, len={len(raw_response) if raw_response else 0}")
+
+        data = parsed if isinstance(parsed, dict) else {}
+        data.setdefault("criteria_checks", [])
+        data.setdefault("component_checks", [])
+        data.setdefault("gaps", [])
+        data.setdefault("summary", "")
+
+        gate_result = validate_self_assessment(data, acceptance_criteria_count)
+        if gate_result.passed:
+            break
+        log.warn("validate_self_assessment gate", feedback=gate_result.feedback, schema_attempt=schema_attempt)
+    else:
+        feedback = gate_result.feedback if gate_result else "Self-assessment output was invalid."
+        data = {
+            "score": 0.0,
+            "verdict": "fail",
+            "criteria_checks": data.get("criteria_checks", []) if isinstance(data, dict) else [],
+            "component_checks": data.get("component_checks", []) if isinstance(data, dict) else [],
+            "gaps": [feedback],
+            "summary": feedback,
+        }
 
     deterministic_gaps: list[str] = []
     if _is_screenshot_required(state):
@@ -1433,13 +1489,6 @@ the unresolved issues in gaps.
     score = float(data.get("score", 0) or 0)
     verdict = data.get("verdict", "fail")
     gaps = data.get("gaps", [])
-
-    # Validation gate: structural check on self-assessment output
-    from framework.validation_gates import validate_self_assessment
-    acceptance_criteria_count = len(acceptance_criteria) if isinstance(acceptance_criteria, list) else 0
-    gate_result = validate_self_assessment(data, acceptance_criteria_count)
-    if not gate_result.passed:
-        log.warn("validate_self_assessment gate", feedback=gate_result.feedback)
 
     print(f"[{_AGENT_ID}] self_assess result: score={score} verdict={verdict} gaps={len(gaps)}")
 

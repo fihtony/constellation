@@ -254,6 +254,119 @@ class TestScreenshotRenderChecks:
         with pytest.raises(RuntimeError, match="self_assess failed after 3 cycles"):
             await self_assess(state)
 
+    async def test_self_assess_retries_invalid_schema_same_cycle(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        class _MockRuntime:
+            def __init__(self):
+                self.calls = 0
+                self.prompts = []
+
+            def run(self, prompt, **kw):
+                self.calls += 1
+                self.prompts.append(prompt)
+                if self.calls == 1:
+                    return {"raw_response": json.dumps({"summary": "", "gaps": []})}
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 0.95,
+                            "verdict": "pass",
+                            "gaps": [],
+                            "component_checks": [],
+                            "criteria_checks": [],
+                            "summary": "Looks good.",
+                        }
+                    )
+                }
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/App.jsx"],
+            "implementation_summary": "Implemented the page.",
+            "test_results": {"passed": 4, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        assert runtime.calls == 2
+        assert result["assess_cycles"] == 1
+        assert result["route"] == "pass"
+        assert "previous self-assessment response was invalid" in runtime.prompts[1]
+
+    async def test_self_assess_filters_non_actionable_review_comments(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        report_path = tmp_path / "review-report.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "comments": [
+                        {
+                            "severity": "high",
+                            "file": "src/pages/__tests__/PracticeQuizPage.test.jsx",
+                            "message": "Test file content is truncated in diff - actual test assertions not fully visible for review.",
+                        },
+                        {
+                            "severity": "medium",
+                            "file": "src/pages/PracticeQuizPage.jsx",
+                            "message": "Real actionable issue.",
+                        },
+                        {
+                            "severity": "low",
+                            "category": "large-change",
+                            "message": "Single-file change is very large.",
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        class _MockRuntime:
+            def __init__(self):
+                self.prompt = ""
+
+            def run(self, prompt, **kw):
+                self.prompt = prompt
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 0.95,
+                            "verdict": "pass",
+                            "gaps": [],
+                            "component_checks": [],
+                            "criteria_checks": [],
+                            "summary": "Looks good.",
+                        }
+                    )
+                }
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "review_report_path": "review-report.json",
+            "revision_feedback": "please address review comments",
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/pages/PracticeQuizPage.jsx"],
+            "implementation_summary": "Adjusted the page.",
+            "test_results": {"passed": 4, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        assert result["route"] == "pass"
+        assert "Real actionable issue." in runtime.prompt
+        assert "truncated in diff" not in runtime.prompt
+        assert "Single-file change is very large." not in runtime.prompt
+
 
 class TestWebDevNodes:
 
