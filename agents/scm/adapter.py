@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import time
+from urllib.parse import urlparse
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 from framework.boundary_permissions import branch_scope, enforce_boundary_permission
@@ -29,6 +30,19 @@ scm_definition = AgentDefinition(
     workflow=None,
     tools=[],
 )
+
+
+def _parse_repo_coordinates(repo_url: str) -> tuple[str, str]:
+    parsed = urlparse(repo_url)
+    if "bitbucket" in parsed.netloc.lower():
+        from agents.scm.client import _parse_bb_project_repo
+
+        _, project, repo = _parse_bb_project_repo(repo_url)
+        return project, repo
+    path_parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(path_parts) >= 2:
+        return path_parts[0], path_parts[1].rstrip(".git")
+    return "", ""
 
 
 def _is_retryable_clone_dir_error(stderr_text: str) -> bool:
@@ -194,6 +208,10 @@ class SCMAgentAdapter(BaseAgent):
             if "/" in text:
                 parts = text.strip().split("/", 1)
                 project, repo = parts[0], parts[1]
+            else:
+                project, repo = _parse_repo_coordinates(
+                    str(meta.get("repoUrl") or meta.get("repo_url") or "")
+                )
 
         if capability in ("scm.repo.inspect", "scm.repo.get"):
             data, status = client.get_repo(project, repo)

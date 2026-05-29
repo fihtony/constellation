@@ -215,8 +215,7 @@ class TestScmAdapterPrEvidenceCapabilities:
             "scm.pr.comment.inline",
             "",
             {"metadata": {
-                "project": "org",
-                "repo": "repo",
+                "repoUrl": "https://github.com/org/repo",
                 "prNumber": 42,
                 "filePath": "src/App.jsx",
                 "line": 17,

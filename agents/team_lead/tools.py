@@ -727,6 +727,14 @@ class DispatchWebDev(BaseTool):
                 "type": "object",
                 "description": "Parent-issued execution contract for the Web Dev child agent.",
             },
+            "child_service_url": {
+                "type": "string",
+                "description": "Existing container service URL to reuse for a revision dispatch (avoids launching a new container). Optional.",
+            },
+            "child_container_name": {
+                "type": "string",
+                "description": "Existing container name matching child_service_url. Returned unchanged in response so dev_agent_session stays consistent. Optional.",
+            },
         },
         "required": ["task_description"],
     }
@@ -759,6 +767,8 @@ class DispatchWebDev(BaseTool):
         existing_branch: str = "",
         definition_of_done: dict | None = None,
         task_id: str = "",
+        child_service_url: str = "",
+        child_container_name: str = "",
         **_: Any,
     ) -> ToolResult:
         capability = "web-dev.task.execute"
@@ -825,6 +835,7 @@ class DispatchWebDev(BaseTool):
         if isinstance(permissions, dict):
             meta["permissions"] = permissions
 
+        new_launch = False  # True only when we create a fresh container (destroy on error)
         try:
             from framework.a2a.client import dispatch_sync
             timeout_seconds = _downstream_timeout_seconds("web_dev")
@@ -833,36 +844,65 @@ class DispatchWebDev(BaseTool):
                 task_id=task_id,
                 workspace_path=workspace_path,
             )
-            if _is_per_task_definition(definition):
-                result = _dispatch_via_launcher(
-                    definition,
-                    capability=capability,
-                    launch_task_id=launch_task_id or "web-dev-task",
-                    message_parts=[{"text": task_description}],
-                    metadata=meta,
-                    timeout=timeout_seconds,
-                    preserve_instance=True,
-                )
-                if isinstance(result, dict) and isinstance(result.get("_launch"), dict):
-                    launch_info = dict(result["_launch"])
-            else:
-                web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", capability)
-                if not web_dev_url:
-                    return ToolResult(output=json.dumps({
-                        "status": "error",
-                        "message": "No registered Web Dev instance was found in the registry.",
-                    }))
-                result = dispatch_sync(
-                    url=web_dev_url,
-                    capability=capability,
-                    message_parts=[{"text": task_description}],
-                    metadata=meta,
-                    timeout=timeout_seconds,
-                )
+            # Reuse an existing container when one is provided (revision cycles).
+            # Per architecture spec: Team Lead must NOT launch a new container for
+            # revisions — it sends a new /message:send to the same container.
+            if child_service_url and _is_per_task_definition(definition):
+                try:
+                    result = dispatch_sync(
+                        url=child_service_url,
+                        capability=capability,
+                        message_parts=[{"text": task_description}],
+                        metadata=meta,
+                        timeout=timeout_seconds,
+                    )
+                    agent_id_label = str(definition.get("agent_id") or capability).strip() or capability
+                    result = dict(result)
+                    result["_launch"] = {
+                        "agentId": agent_id_label,
+                        "serviceUrl": child_service_url,
+                        "containerName": child_container_name,
+                    }
+                    launch_info = result["_launch"]
+                except Exception as reuse_exc:
+                    # Container is gone — fall through to launch a fresh one.
+                    print(f"[team-lead] Existing web-dev container unreachable ({reuse_exc}), launching new one.")
+                    child_service_url = ""
+                    child_container_name = ""
+
+            if not child_service_url:
+                if _is_per_task_definition(definition):
+                    result = _dispatch_via_launcher(
+                        definition,
+                        capability=capability,
+                        launch_task_id=launch_task_id or "web-dev-task",
+                        message_parts=[{"text": task_description}],
+                        metadata=meta,
+                        timeout=timeout_seconds,
+                        preserve_instance=True,
+                    )
+                    new_launch = True
+                    if isinstance(result, dict) and isinstance(result.get("_launch"), dict):
+                        launch_info = dict(result["_launch"])
+                else:
+                    web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", capability)
+                    if not web_dev_url:
+                        return ToolResult(output=json.dumps({
+                            "status": "error",
+                            "message": "No registered Web Dev instance was found in the registry.",
+                        }))
+                    result = dispatch_sync(
+                        url=web_dev_url,
+                        capability=capability,
+                        message_parts=[{"text": task_description}],
+                        metadata=meta,
+                        timeout=timeout_seconds,
+                    )
             task = result.get("task", result)
             task_state = _task_state(task)
             if task_state != "TASK_STATE_COMPLETED":
-                _destroy_launch_instance(launch_info)
+                if new_launch:
+                    _destroy_launch_instance(launch_info)
                 return ToolResult(output=json.dumps({
                     "status": "error",
                     "state": task_state,
@@ -908,7 +948,8 @@ class DispatchWebDev(BaseTool):
                 payload["childAgentId"] = child_agent_id
             return ToolResult(output=json.dumps(payload))
         except Exception as exc:
-            _destroy_launch_instance(launch_info)
+            if new_launch:
+                _destroy_launch_instance(launch_info)
             return ToolResult(output=json.dumps({"status": "error", "message": str(exc)}))
 
 

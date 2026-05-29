@@ -876,6 +876,13 @@ async def dispatch_dev_agent(state: dict) -> dict:
         raise RuntimeError(f"Cannot dispatch Web Dev without a valid execution contract: {exc}") from exc
 
     try:
+        # For revision cycles, reuse the existing container instead of launching a new one.
+        # Per architecture spec: "Team Lead reuses the same dev-agent container (same service
+        # URL, new task ID via POST /message:send). It does NOT launch a new container."
+        existing_session = state.get("dev_agent_session") or {}
+        existing_service_url = str(existing_session.get("service_url") or "").strip()
+        existing_container_name = str(existing_session.get("container_name") or "").strip()
+
         dispatch_args = {
                 "task_description": task_description,
                 "jira_context": state.get("jira_context", {}),
@@ -901,11 +908,18 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "existing_pr_url": state.get("pr_url", ""),
                 "existing_pr_number": state.get("pr_number", 0),
                 "definition_of_done": definition_of_done,
+                # Pass existing container info so the tool can reuse it for revisions
+                # instead of launching a fresh container every cycle.
+                "child_service_url": existing_service_url,
+                "child_container_name": existing_container_name,
         }
         if execution_contract:
             dispatch_args["execution_contract"] = execution_contract.to_dict()
         if child_permissions:
             dispatch_args["permissions"] = child_permissions
+        if existing_service_url:
+            log.info("reusing existing web-dev container for revision",
+                     service_url=existing_service_url, container=existing_container_name)
         result_str = registry.execute_sync(
             "dispatch_web_dev",
             dispatch_args,
@@ -1109,6 +1123,7 @@ async def review_result(state: dict) -> dict:
 
 async def request_revision(state: dict) -> dict:
     """Prepare revision feedback for the dev agent and loop back."""
+    log = _logger(state)
     review = state.get("review_result", {})
     comments = review.get("comments", [])
     summary = review.get("summary", review.get("message", ""))
@@ -1131,14 +1146,19 @@ async def request_revision(state: dict) -> dict:
         try:
             from framework.tools.registry import get_registry
 
-            get_registry().execute_sync(
-                "jira_comment",
-                {
-                    "ticket_key": jira_key,
-                    "comment": "Code review requested a revision.\n\n" + revision_feedback[:3000],
-                    "task_id": state.get("_task_id", ""),
-                },
+            jira_result = _safe_json(
+                get_registry().execute_sync(
+                    "jira_comment",
+                    {
+                        "ticket_key": jira_key,
+                        "comment": "Code review requested a revision.\n\n" + revision_feedback[:3000],
+                        "task_id": state.get("_task_id", ""),
+                    },
+                ),
+                {},
             )
+            if isinstance(jira_result, dict) and jira_result.get("error"):
+                log.warn("jira review feedback comment failed", jira_key=jira_key, error=str(jira_result.get("error")))
         except Exception as exc:
             print(f"[{_AGENT_ID}] Jira review feedback comment failed: {exc}")
 
@@ -1152,17 +1172,29 @@ async def request_revision(state: dict) -> dict:
             tool_registry = _get_registry()
             inline_comments = [c for c in comments if c.get("file") and c.get("line")]
             for ic in inline_comments[:5]:  # Limit to top 5 inline comments per round
-                tool_registry.execute_sync(
-                    "scm_add_pr_inline_comment",
-                    {
-                        "repo_url": repo_url,
-                        "pr_number": pr_number,
-                        "file_path": ic["file"],
-                        "line": ic["line"],
-                        "comment": f"[{ic.get('severity', 'info').upper()}] {ic.get('message', '')}",
-                        "task_id": state.get("_task_id", ""),
-                    },
+                inline_result = _safe_json(
+                    tool_registry.execute_sync(
+                        "scm_add_pr_inline_comment",
+                        {
+                            "repo_url": repo_url,
+                            "pr_number": pr_number,
+                            "file_path": ic["file"],
+                            "line": ic["line"],
+                            "comment": f"[{ic.get('severity', 'info').upper()}] {ic.get('message', '')}",
+                            "task_id": state.get("_task_id", ""),
+                        },
+                    ),
+                    {},
                 )
+                if isinstance(inline_result, dict) and inline_result.get("error"):
+                    log.warn(
+                        "inline PR comment failed",
+                        repo_url=repo_url,
+                        pr_number=pr_number,
+                        file=ic.get("file", ""),
+                        line=ic.get("line", 0),
+                        error=str(inline_result.get("error")),
+                    )
         except Exception as exc:
             print(f"[{_AGENT_ID}] Inline PR comments failed (non-critical): {exc}")
 
@@ -1175,6 +1207,7 @@ async def request_revision(state: dict) -> dict:
 
 async def report_success(state: dict) -> dict:
     """Build final success report."""
+    log = _logger(state)
     pr_url = state.get("pr_url", "N/A")
     branch = state.get("branch_name", "N/A")
     analysis = state.get("analysis_summary", "")
@@ -1233,23 +1266,33 @@ async def report_success(state: dict) -> dict:
         try:
             from framework.tools.registry import get_registry
 
-            get_registry().execute_sync(
-                "jira_comment",
-                {
-                    "ticket_key": jira_key,
-                    "comment": f"Code review passed. PR is ready for merge: {pr_url}",
-                    "task_id": state.get("_task_id", ""),
-                },
+            jira_comment_result = _safe_json(
+                get_registry().execute_sync(
+                    "jira_comment",
+                    {
+                        "ticket_key": jira_key,
+                        "comment": f"Code review passed. PR is ready for merge: {pr_url}",
+                        "task_id": state.get("_task_id", ""),
+                    },
+                ),
+                {},
             )
+            if isinstance(jira_comment_result, dict) and jira_comment_result.get("error"):
+                log.warn("jira final review comment failed", jira_key=jira_key, error=str(jira_comment_result.get("error")))
             # Transition Jira to "Ready for Merge" state
-            get_registry().execute_sync(
-                "jira_transition",
-                {
-                    "ticket_key": jira_key,
-                    "transition_name": "Ready for Merge",
-                    "task_id": state.get("_task_id", ""),
-                },
+            jira_transition_result = _safe_json(
+                get_registry().execute_sync(
+                    "jira_transition",
+                    {
+                        "ticket_key": jira_key,
+                        "transition_name": "Ready for Merge",
+                        "task_id": state.get("_task_id", ""),
+                    },
+                ),
+                {},
             )
+            if isinstance(jira_transition_result, dict) and jira_transition_result.get("error"):
+                log.warn("jira ready-for-merge transition failed", jira_key=jira_key, error=str(jira_transition_result.get("error")))
         except Exception as exc:
             print(f"[{_AGENT_ID}] Jira final review comment/transition failed: {exc}")
 
