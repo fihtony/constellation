@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from shutil import which
 from typing import Any
 
 
@@ -306,6 +307,23 @@ class ConfigValidationError(Exception):
     """Raised when startup configuration is inconsistent or incomplete."""
 
 
+# Supported values for global selectors. Keep this in sync with
+# config/constellation.yaml comments and config/.env.example.
+_SUPPORTED_SELECTOR_VALUES: dict[str, tuple[str, ...]] = {
+    "JIRA_BACKEND": ("mcp", "rest"),
+    "SCM_BACKEND": ("bitbucket", "github-rest", "github-mcp"),
+    "UI_DESIGN_DEFAULT_PROVIDER": ("stitch", "figma"),
+    "AGENT_RUNTIME": ("claude-code", "copilot-cli", "codex-cli", "connect-agent"),
+    "CONTAINER_RUNTIME": ("docker", "rancher"),
+}
+
+_RUNTIME_EXECUTABLES: dict[str, tuple[str, ...]] = {
+    "claude-code": ("claude", "claude-code"),
+    "copilot-cli": ("copilot-cli", "gh"),
+    "codex-cli": ("codex", "codex-cli"),
+}
+
+
 # Keys that are global deployment selectors and must NOT be redefined in
 # agent-level .env files.
 _SHARED_SELECTOR_KEYS: frozenset[str] = frozenset({
@@ -341,6 +359,14 @@ def _check_agent_env_leakage(
                     f"file to avoid configuration conflicts."
                 )
     return warnings
+
+
+def _runtime_executable_available(runtime: str) -> bool:
+    """Return True when the configured runtime has a matching executable in PATH."""
+    candidates = _RUNTIME_EXECUTABLES.get(runtime, ())
+    if not candidates:
+        return True
+    return any(which(candidate) for candidate in candidates)
 
 
 def validate_startup_config(
@@ -382,9 +408,39 @@ def validate_startup_config(
     warnings: list[str] = []
 
     # ------------------------------------------------------------------
+    # Shared selector values
+    # ------------------------------------------------------------------
+    jira_backend = str(cfg.get("boundary.jira.backend", "mcp")).strip().lower()
+    if jira_backend not in _SUPPORTED_SELECTOR_VALUES["JIRA_BACKEND"]:
+        errors.append(
+            f"JIRA_BACKEND={jira_backend!r} is not valid. "
+            "Supported values: mcp | rest."
+        )
+
+    scm_backend = str(cfg.get("boundary.scm.backend", "github-mcp")).strip().lower()
+    if scm_backend not in _SUPPORTED_SELECTOR_VALUES["SCM_BACKEND"]:
+        errors.append(
+            f"SCM_BACKEND={scm_backend!r} is not valid. "
+            "Supported values: bitbucket | github-rest | github-mcp."
+        )
+
+    ui_provider = str(cfg.get("boundary.ui_design.default_provider", "stitch")).strip().lower()
+    if ui_provider not in _SUPPORTED_SELECTOR_VALUES["UI_DESIGN_DEFAULT_PROVIDER"]:
+        errors.append(
+            f"UI_DESIGN_DEFAULT_PROVIDER={ui_provider!r} is not valid. "
+            "Supported values: stitch | figma."
+        )
+
+    runtime = str(cfg.get("runtime.backend", "claude-code")).strip().lower()
+    if runtime not in _SUPPORTED_SELECTOR_VALUES["AGENT_RUNTIME"]:
+        errors.append(
+            f"AGENT_RUNTIME={runtime!r} is not valid. "
+            "Supported values: claude-code | copilot-cli | codex-cli | connect-agent."
+        )
+
+    # ------------------------------------------------------------------
     # SCM backend vs URL consistency
     # ------------------------------------------------------------------
-    scm_backend = cfg.get("boundary.scm.backend", "github-mcp")
     scm_base_url = os.environ.get("SCM_BASE_URL", "").lower().strip()
 
     if scm_base_url:
@@ -405,7 +461,6 @@ def validate_startup_config(
     # UI Design provider vs credentials
     # ------------------------------------------------------------------
     if not skip_credential_check:
-        ui_provider = cfg.get("boundary.ui_design.default_provider", "stitch")
         if ui_provider == "figma" and not os.environ.get("FIGMA_TOKEN", "").strip():
             errors.append(
                 "UI_DESIGN_DEFAULT_PROVIDER=figma but FIGMA_TOKEN is not set. "
@@ -421,7 +476,13 @@ def validate_startup_config(
     # Agentic runtime vs credentials
     # ------------------------------------------------------------------
     if not skip_credential_check:
-        runtime = cfg.get("runtime.backend", "claude-code")
+        if runtime in _RUNTIME_EXECUTABLES and not _runtime_executable_available(runtime):
+            candidates = " | ".join(_RUNTIME_EXECUTABLES[runtime])
+            errors.append(
+                f"AGENT_RUNTIME={runtime!r} but no matching executable is available in PATH "
+                f"({candidates}). Install the runtime CLI in the host/container image, "
+                "or switch AGENT_RUNTIME to a runtime that is installed."
+            )
         if runtime == "claude-code":
             if not os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip():
                 errors.append(

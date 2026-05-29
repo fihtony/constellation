@@ -60,3 +60,27 @@ def test_load_agent_environment_loads_runtime_env_for_runtime_enabled_agent(tmp_
     assert os.environ["AGENT_RUNTIME"] == "claude-code"
     assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "shared-token"
     assert os.environ["OFFICE_BACKUP_ENABLED"] == "true"
+
+
+def test_load_agent_environment_strips_inline_comments_from_env_values(tmp_path, monkeypatch):
+    project_root = Path(tmp_path)
+    (project_root / "config").mkdir()
+    (project_root / "config" / ".runtime.env").write_text(
+        "AGENT_RUNTIME=claude-code  # active runtime\n"
+        "AGENT_MODEL=claude-haiku-4-5-20251001  # fallback model\n",
+        encoding="utf-8",
+    )
+    agent_dir = project_root / "agents" / "office"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / ".env").write_text("OFFICE_BACKUP_ENABLED=true\n", encoding="utf-8")
+
+    monkeypatch.delenv("CONSTELLATION_RUNTIME_ENV_FILE", raising=False)
+    monkeypatch.delenv("AGENT_RUNTIME", raising=False)
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+
+    load_agent_environment(str(project_root), "office", include_runtime_env=True)
+
+    import os
+
+    assert os.environ["AGENT_RUNTIME"] == "claude-code"
+    assert os.environ["AGENT_MODEL"] == "claude-haiku-4-5-20251001"

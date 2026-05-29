@@ -6,6 +6,34 @@ import textwrap
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolated_config_env(monkeypatch):
+    """Keep config loader tests independent from the developer shell environment."""
+    for key in [
+        "AGENT_RUNTIME",
+        "AGENT_MODEL",
+        "ANTHROPIC_MODEL",
+        "OPENAI_MODEL",
+        "REGISTRY_URL",
+        "CONTAINER_RUNTIME",
+        "JIRA_BACKEND",
+        "SCM_BACKEND",
+        "UI_DESIGN_DEFAULT_PROVIDER",
+        "CONSTELLATION_RUNTIME_BACKEND",
+        "CONSTELLATION_RUNTIME_MODEL",
+        "CONSTELLATION_REGISTRY_URL",
+        "CONSTELLATION_CONTAINER_RUNTIME",
+        "CONSTELLATION_DATA_DIR",
+        "SCM_BASE_URL",
+        "FIGMA_TOKEN",
+        "STITCH_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CONNECT_AGENT_URL",
+        "COPILOT_GITHUB_TOKEN",
+    ]:
+        monkeypatch.delenv(key, raising=False)
+
+
 @pytest.fixture()
 def project_dir(tmp_path):
     """Create a minimal project directory with global and agent configs."""
@@ -478,6 +506,73 @@ class TestValidateStartupConfig:
         monkeypatch.setenv("AGENT_RUNTIME", "connect-agent")
         monkeypatch.delenv("SCM_BASE_URL", raising=False)
         with pytest.raises(ConfigValidationError, match="CONTAINER_RUNTIME="):
+            validate_startup_config(project_dir)
+
+    def test_invalid_jira_backend_fails(self, project_dir, monkeypatch):
+        """JIRA_BACKEND with an unsupported value should fail fast."""
+        from framework.config import ConfigValidationError, validate_startup_config
+
+        monkeypatch.setenv("JIRA_BACKEND", "graphql")
+        monkeypatch.setenv("AGENT_RUNTIME", "connect-agent")
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        with pytest.raises(ConfigValidationError, match="JIRA_BACKEND="):
+            validate_startup_config(project_dir, skip_credential_check=True)
+
+    def test_invalid_scm_backend_fails(self, project_dir, monkeypatch):
+        """SCM_BACKEND with an unsupported value should fail fast."""
+        from framework.config import ConfigValidationError, validate_startup_config
+
+        monkeypatch.setenv("SCM_BACKEND", "gitlab")
+        monkeypatch.setenv("AGENT_RUNTIME", "connect-agent")
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        with pytest.raises(ConfigValidationError, match="SCM_BACKEND="):
+            validate_startup_config(project_dir, skip_credential_check=True)
+
+    def test_invalid_ui_design_provider_fails(self, project_dir, monkeypatch):
+        """UI_DESIGN_DEFAULT_PROVIDER with an unsupported value should fail fast."""
+        from framework.config import ConfigValidationError, validate_startup_config
+
+        monkeypatch.setenv("UI_DESIGN_DEFAULT_PROVIDER", "sketch")
+        monkeypatch.setenv("AGENT_RUNTIME", "connect-agent")
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        with pytest.raises(ConfigValidationError, match="UI_DESIGN_DEFAULT_PROVIDER="):
+            validate_startup_config(project_dir, skip_credential_check=True)
+
+    def test_invalid_runtime_backend_fails(self, project_dir, monkeypatch):
+        """AGENT_RUNTIME with an unsupported value should fail fast."""
+        from framework.config import ConfigValidationError, validate_startup_config
+
+        monkeypatch.setenv("AGENT_RUNTIME", "llama-cli")
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        with pytest.raises(ConfigValidationError, match="AGENT_RUNTIME="):
+            validate_startup_config(project_dir, skip_credential_check=True)
+
+    @pytest.mark.parametrize(
+        ("runtime", "required_env", "match_text"),
+        [
+            ("claude-code", {"ANTHROPIC_AUTH_TOKEN": "test-token"}, "no matching executable"),
+            ("copilot-cli", {"COPILOT_GITHUB_TOKEN": "test-token"}, "no matching executable"),
+            ("codex-cli", {}, "no matching executable"),
+        ],
+    )
+    def test_missing_runtime_executable_fails(
+        self,
+        project_dir,
+        monkeypatch,
+        runtime,
+        required_env,
+        match_text,
+    ):
+        """Configured runtime should fail fast when its executable is absent."""
+        from framework.config import ConfigValidationError, validate_startup_config
+
+        monkeypatch.setenv("AGENT_RUNTIME", runtime)
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        for key, value in required_env.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setattr("framework.config.which", lambda _cmd: None)
+
+        with pytest.raises(ConfigValidationError, match=match_text):
             validate_startup_config(project_dir)
 
     def test_skip_credential_check_bypasses_token_checks(self, project_dir, monkeypatch):

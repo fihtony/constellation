@@ -14,6 +14,22 @@ _ISOLATED_RUNTIME_ROOT = os.path.join(tempfile.gettempdir(), "constellation-runt
 _RUNTIME_ENV_FILENAMES = (".runtime.env", ".env")
 
 
+def _normalize_env_value(raw_value: str) -> str:
+    """Normalize a .env value, stripping quotes and trailing inline comments."""
+    value = raw_value.strip()
+    if not value:
+        return ""
+
+    quote = value[0]
+    if quote in {'"', "'"}:
+        if len(value) >= 2 and value[-1] == quote:
+            return value[1:-1]
+        return value.strip(quote)
+
+    value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+    return value
+
+
 def _parse_env_file(path: str) -> dict[str, str]:
     """Parse a simple KEY=VALUE .env file (ignoring comments)."""
     values: dict[str, str] = {}
@@ -26,7 +42,7 @@ def _parse_env_file(path: str) -> dict[str, str]:
                 continue
             key, value = line.split("=", 1)
             key = key.strip()
-            value = value.strip().strip('"').strip("'")
+            value = _normalize_env_value(value)
             if key:
                 values[key] = value
     return values

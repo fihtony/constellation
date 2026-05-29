@@ -66,10 +66,8 @@ services:
       HOST: "0.0.0.0"
       PORT: "8000"
       REGISTRY_URL: "http://registry:9000"
-      AGENT_RUNTIME: "claude-code"
       CONSTELLATION_RUNTIME_ENV_FILE: /app/config/.runtime.env
       ARTIFACT_ROOT: /app/artifacts
-      CONTAINER_RUNTIME: docker
       DYNAMIC_AGENT_NETWORK: constellation-v2-network
       DOCKER_SOCKET: /var/run/docker.sock
     volumes:
@@ -111,10 +109,8 @@ services:
       HOST: "0.0.0.0"
       PORT: "8030"
       REGISTRY_URL: "http://registry:9000"
-      AGENT_RUNTIME: "claude-code"
       CONSTELLATION_RUNTIME_ENV_FILE: /app/config/.runtime.env
       ARTIFACT_ROOT: /app/artifacts
-      CONTAINER_RUNTIME: docker
       DYNAMIC_AGENT_NETWORK: constellation-v2-network
       DOCKER_SOCKET: /var/run/docker.sock
     volumes:
@@ -269,7 +265,6 @@ services:
       HOST: "0.0.0.0"
       PORT: "8060"
       REGISTRY_URL: "http://registry:9000"
-      AGENT_RUNTIME: "claude-code"
       CONSTELLATION_RUNTIME_ENV_FILE: /app/config/.runtime.env
       ARTIFACT_ROOT: /app/artifacts
       OFFICE_SOURCE_ROOT: ${OFFICE_SOURCE_ROOT:-/app/userdata}
