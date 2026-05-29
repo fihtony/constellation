@@ -683,6 +683,47 @@ class TestGenerateReport:
         result = await generate_report(state)
         assert result["verdict"] == "rejected"
 
+    async def test_high_quality_issue_without_blocking_is_advisory(self):
+        state = {
+            "quality_issues": [{"severity": "high", "message": "Bad naming"}],
+            "security_issues": [],
+            "test_issues": [],
+            "requirement_gaps": [],
+        }
+
+        result = await generate_report(state)
+
+        assert result["verdict"] == "approved"
+        assert result["severity_levels"]["high"] == 1
+        assert result["blocking_issue_count"] == 0
+
+    async def test_high_test_issue_without_blocking_is_advisory(self):
+        state = {
+            "quality_issues": [],
+            "security_issues": [],
+            "test_issues": [{"severity": "high", "message": "No tests for login()"}],
+            "requirement_gaps": [],
+        }
+
+        result = await generate_report(state)
+
+        assert result["verdict"] == "approved"
+        assert result["severity_levels"]["high"] == 1
+        assert result["blocking_issue_count"] == 0
+
+    async def test_blocking_high_quality_issue_is_rejected(self):
+        state = {
+            "quality_issues": [{"severity": "high", "blocking": True, "message": "Swallowed exception breaks checkout flow"}],
+            "security_issues": [],
+            "test_issues": [],
+            "requirement_gaps": [],
+        }
+
+        result = await generate_report(state)
+
+        assert result["verdict"] == "rejected"
+        assert result["blocking_issue_count"] == 1
+
     async def test_medium_only_approved(self):
         state = {
             "quality_issues": [{"severity": "medium", "message": "Magic number"}],
@@ -817,8 +858,8 @@ class TestCodeReviewWorkflowExecution:
             "pr_description": "Refactor",
         }
         result = await compiled.invoke(state)
-        # high severity → rejected
-        assert result["verdict"] == "rejected"
+        # non-blocking high quality issue stays advisory
+        assert result["verdict"] == "approved"
 
     async def test_full_review_pipeline_keys(self):
         compiled = code_review_workflow.compile()

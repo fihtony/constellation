@@ -198,6 +198,51 @@ def _detect_large_changed_files(pr_diff: str, threshold: int = 2000) -> list[dic
     ]
 
 
+def _coerce_review_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _issues_with_source(issues: Any, source_phase: str) -> list[dict[str, Any]]:
+    tagged: list[dict[str, Any]] = []
+    if not isinstance(issues, list):
+        return tagged
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        tagged_issue = dict(issue)
+        tagged_issue.setdefault("source_phase", source_phase)
+        tagged.append(tagged_issue)
+    return tagged
+
+
+def _issue_blocks_merge(issue: dict[str, Any]) -> bool:
+    severity = str(issue.get("severity", "")).strip().lower()
+    if severity == "critical":
+        return True
+    if severity != "high":
+        return False
+
+    if "blocking" in issue:
+        return _coerce_review_bool(issue.get("blocking"))
+
+    source_phase = str(issue.get("source_phase", "")).strip().lower()
+    if source_phase in {"review-input", "security", "requirements"}:
+        return True
+    if source_phase == "ui-design":
+        return str(issue.get("category", "")).strip().lower() in {
+            "icon_rendering",
+            "footer_positioning",
+            "components",
+        }
+    return False
+
+
 def _child_permissions(state: dict) -> dict[str, Any] | None:
     metadata = state.get("metadata", {})
     permissions = metadata.get("permissions")
@@ -563,6 +608,7 @@ async def load_pr_context(state: dict) -> dict:
     if pr_url and not pr_diff:
         review_input_issues.append({
             "severity": "high",
+            "blocking": True,
             "category": "review-input",
             "message": "Unable to load the PR diff, so code review could not validate the submitted code changes.",
             "suggestion": "Ensure code-review receives repoUrl/prNumber metadata and can access web-dev/pr-evidence.json before review dispatch.",
@@ -942,12 +988,12 @@ async def generate_report(state: dict) -> dict:
     Verdict: "approved" only when there are zero critical or high severity issues.
     Writes review-report.json to the workspace for audit.
     """
-    quality = state.get("quality_issues", [])
-    security = state.get("security_issues", [])
-    tests = state.get("test_issues", [])
-    requirements = state.get("requirement_gaps", [])
-    ui_issues = state.get("ui_issues", [])
-    review_input_issues = state.get("review_input_issues", [])
+    quality = _issues_with_source(state.get("quality_issues", []), "quality")
+    security = _issues_with_source(state.get("security_issues", []), "security")
+    tests = _issues_with_source(state.get("test_issues", []), "tests")
+    requirements = _issues_with_source(state.get("requirement_gaps", []), "requirements")
+    ui_issues = _issues_with_source(state.get("ui_issues", []), "ui-design")
+    review_input_issues = _issues_with_source(state.get("review_input_issues", []), "review-input")
     log = _logger(state)
     log.node("generate_report")
 
@@ -959,7 +1005,11 @@ async def generate_report(state: dict) -> dict:
     medium = sum(1 for c in all_comments if c.get("severity") == "medium")
     low = sum(1 for c in all_comments if c.get("severity") == "low")
 
-    verdict = "approved" if (critical == 0 and high == 0) else "rejected"
+    blocking_issues = [issue for issue in all_comments if _issue_blocks_merge(issue)]
+    blocking_critical = sum(1 for issue in blocking_issues if issue.get("severity") == "critical")
+    blocking_high = sum(1 for issue in blocking_issues if issue.get("severity") == "high")
+
+    verdict = "approved" if not blocking_issues else "rejected"
 
     # Handle large PR escalation (>50 files → manual_review_required)
     manual_review_required = state.get("manual_review_required", False)
@@ -967,6 +1017,8 @@ async def generate_report(state: dict) -> dict:
     if manual_review_required:
         all_comments.append({
             "severity": "high",
+            "blocking": True,
+            "source_phase": "review-process",
             "category": "review-process",
             "message": "PR exceeds 50 changed files — automatic review cannot provide reliable coverage. Manual review required.",
             "suggestion": "Split this PR into smaller, focused PRs or request human reviewer escalation.",
@@ -1012,6 +1064,8 @@ async def generate_report(state: dict) -> dict:
     report_summary = (
         f"Review complete: {len(all_comments)} issue(s) found. "
         f"Critical: {critical}, High: {high}, Medium: {medium}, Low: {low}. "
+        f"Blocking critical/high: {blocking_critical + blocking_high} "
+        f"(critical: {blocking_critical}, high: {blocking_high}). "
         f"Verdict: {verdict}."
     )
 
@@ -1032,6 +1086,11 @@ async def generate_report(state: dict) -> dict:
             "high": high,
             "medium": medium,
             "low": low,
+        },
+        "blocking_issue_count": len(blocking_issues),
+        "blocking_severity_levels": {
+            "critical": blocking_critical,
+            "high": blocking_high,
         },
         "ui_design_review": ui_design_review,
         "manual_review_required": manual_review_required,
@@ -1129,6 +1188,8 @@ async def generate_report(state: dict) -> dict:
         "all_comments": all_comments,  # backward compat alias
         "report_summary": report_summary,
         "severity_levels": report["severity_levels"],
+        "blocking_issue_count": report["blocking_issue_count"],
+        "blocking_severity_levels": report["blocking_severity_levels"],
         "checked_artifacts": report["checked_artifacts"],
     }
 

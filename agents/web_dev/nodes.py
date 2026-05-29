@@ -2425,6 +2425,12 @@ async def create_pr(state: dict) -> dict:
         )
         if push_payload.get("error"):
             log.error("scm_push failed in revision mode", error=push_payload["error"])
+            detail = str(push_payload.get("detail", "")).strip()
+            raise RuntimeError(
+                "Revision push failed: "
+                f"{push_payload['error']}"
+                f" ({detail})" if detail else f"Revision push failed: {push_payload['error']}"
+            )
 
         # Add PR comment with revision summary
         revision_feedback = state.get("revision_feedback", "")
@@ -2568,6 +2574,11 @@ async def create_pr(state: dict) -> dict:
     if push_payload.get("error"):
         log.error("scm_push failed", error=push_payload["error"])
         print(f"[{_AGENT_ID}] scm_push failed: {push_payload['error']}")
+        detail = str(push_payload.get("detail", "")).strip()
+        message = f"scm_push failed: {push_payload['error']}"
+        if detail:
+            message += f" ({detail})"
+        raise RuntimeError(message)
     else:
         log.debug("scm_push ok", branch=branch_name)
         print(f"[{_AGENT_ID}] scm_push OK: branch={branch_name!r}")

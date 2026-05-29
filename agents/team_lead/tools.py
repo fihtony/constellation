@@ -39,6 +39,17 @@ def _resolve_agent_url(env_var: str, config_key: str, default: str, capability: 
     return ""
 
 
+def _orchestrator_callback_url(task_id: str) -> str:
+    """Build Team Lead's callback URL for child notifications when discoverable."""
+    task_key = str(task_id or "").strip()
+    if not task_key:
+        return ""
+    base_url = _discover_via_registry("team-lead.task.analyze")
+    if not base_url:
+        return ""
+    return f"{base_url.rstrip('/')}/tasks/{task_key}/callbacks"
+
+
 def _capability_definition(capability: str) -> dict[str, Any]:
     try:
         from framework.registry_client import RegistryClient
@@ -83,6 +94,34 @@ def _downstream_timeout_seconds(kind: str) -> int:
         return value if value > 0 else default
     except ValueError:
         return default
+
+
+def _replacement_confirm_seconds() -> float:
+    raw_value = os.environ.get("TEAM_LEAD_CHILD_REPLACEMENT_CONFIRM_SECONDS", "30").strip()
+    if not raw_value:
+        return 30.0
+    try:
+        value = float(raw_value)
+        return value if value >= 0 else 30.0
+    except ValueError:
+        return 30.0
+
+
+def _confirm_child_instance_exited(agent_id: str, task_id: str) -> tuple[bool, list[dict[str, Any]]]:
+    """Wait briefly for a prior child instance to disappear before replacement."""
+    if not task_id:
+        return True, []
+
+    launcher = get_launcher()
+    deadline = time.time() + _replacement_confirm_seconds()
+    latest_live: list[dict[str, Any]] = []
+    while True:
+        latest_live = launcher.find_live_instances(agent_id, task_id)
+        if not latest_live:
+            return True, []
+        if time.time() >= deadline:
+            return False, latest_live
+        time.sleep(1.0)
 
 
 def _derive_launch_task_id(
@@ -772,7 +811,7 @@ class DispatchWebDev(BaseTool):
         **_: Any,
     ) -> ToolResult:
         capability = "web-dev.task.execute"
-        definition = _capability_definition(capability)
+        definition: dict[str, Any] = {}
         meta: dict[str, Any] = {}
         web_dev_url = ""
         launch_info: dict[str, Any] | None = None
@@ -826,6 +865,9 @@ class DispatchWebDev(BaseTool):
             meta["definitionOfDone"] = definition_of_done
         if task_id:
             meta["taskId"] = task_id
+        callback_url = _orchestrator_callback_url(task_id or orchestrator_task_id)
+        if callback_url:
+            meta["orchestratorCallbackUrl"] = callback_url
 
         # Pass execution contract for child agent permission enforcement
         execution_contract = _.get("execution_contract") if isinstance(_, dict) else None
@@ -847,7 +889,7 @@ class DispatchWebDev(BaseTool):
             # Reuse an existing container when one is provided (revision cycles).
             # Per architecture spec: Team Lead must NOT launch a new container for
             # revisions — it sends a new /message:send to the same container.
-            if child_service_url and _is_per_task_definition(definition):
+            if child_service_url:
                 try:
                     result = dispatch_sync(
                         url=child_service_url,
@@ -856,21 +898,38 @@ class DispatchWebDev(BaseTool):
                         metadata=meta,
                         timeout=timeout_seconds,
                     )
-                    agent_id_label = str(definition.get("agent_id") or capability).strip() or capability
                     result = dict(result)
                     result["_launch"] = {
-                        "agentId": agent_id_label,
+                        "agentId": "web-dev",
                         "serviceUrl": child_service_url,
                         "containerName": child_container_name,
                     }
                     launch_info = result["_launch"]
                 except Exception as reuse_exc:
-                    # Container is gone — fall through to launch a fresh one.
+                    confirmed_exited, live_instances = _confirm_child_instance_exited(
+                        "web-dev",
+                        launch_task_id or orchestrator_task_id,
+                    )
+                    if not confirmed_exited:
+                        live_names = [
+                            str(instance.get("container_name") or "").strip()
+                            for instance in live_instances
+                            if str(instance.get("container_name") or "").strip()
+                        ]
+                        return ToolResult(output=json.dumps({
+                            "status": "error",
+                            "message": (
+                                "Existing web-dev container is still live but unreachable; "
+                                "refusing replacement to avoid duplicate instances."
+                            ),
+                            "liveContainers": live_names,
+                        }))
                     print(f"[team-lead] Existing web-dev container unreachable ({reuse_exc}), launching new one.")
                     child_service_url = ""
                     child_container_name = ""
 
             if not child_service_url:
+                definition = _capability_definition(capability)
                 if _is_per_task_definition(definition):
                     result = _dispatch_via_launcher(
                         definition,
@@ -1012,6 +1071,14 @@ class DispatchCodeReview(BaseTool):
                 "type": "object",
                 "description": "Parent-issued execution contract for the Code Review child agent.",
             },
+            "child_service_url": {
+                "type": "string",
+                "description": "Existing CR container URL to reuse for re-review rounds. Optional.",
+            },
+            "child_container_name": {
+                "type": "string",
+                "description": "Container name matching child_service_url. Optional.",
+            },
         },
         "required": [],
     }
@@ -1030,10 +1097,12 @@ class DispatchCodeReview(BaseTool):
         context_manifest_path: str = "",
         orchestrator_task_id: str = "",
         task_id: str = "",
+        child_service_url: str = "",
+        child_container_name: str = "",
         **_: Any,
     ) -> ToolResult:
         capability = "review.code.check"
-        definition = _capability_definition(capability)
+        definition: dict[str, Any] = {}
         meta: dict[str, Any] = {}
         _validate_task_workspace_root(workspace_path, "Code Review")
         if pr_url:
@@ -1058,6 +1127,9 @@ class DispatchCodeReview(BaseTool):
             meta["orchestratorTaskId"] = orchestrator_task_id
         if task_id:
             meta["taskId"] = task_id
+        callback_url = _orchestrator_callback_url(task_id or orchestrator_task_id)
+        if callback_url:
+            meta["orchestratorCallbackUrl"] = callback_url
         execution_contract = _.get("execution_contract") if isinstance(_, dict) else None
         if execution_contract:
             meta["executionContract"] = execution_contract
@@ -1086,7 +1158,48 @@ class DispatchCodeReview(BaseTool):
                 task_id=task_id,
                 workspace_path=workspace_path,
             )
-            if _is_per_task_definition(definition):
+            if child_service_url:
+                try:
+                    _wait_for_agent_ready(child_service_url)
+                    result = dispatch_sync(
+                        url=child_service_url,
+                        capability=capability,
+                        message_parts=[{"text": diff_summary or pr_url}],
+                        metadata=meta,
+                        timeout=timeout_seconds,
+                    )
+                    result = dict(result)
+                    result["_launch"] = {
+                        "agentId": "code-review",
+                        "serviceUrl": child_service_url,
+                        "containerName": child_container_name,
+                    }
+                except Exception:
+                    confirmed_exited, live_instances = _confirm_child_instance_exited(
+                        "code-review",
+                        launch_task_id or orchestrator_task_id,
+                    )
+                    if not confirmed_exited:
+                        live_names = [
+                            str(instance.get("container_name") or "").strip()
+                            for instance in live_instances
+                            if str(instance.get("container_name") or "").strip()
+                        ]
+                        return ToolResult(output=json.dumps({
+                            "verdict": "error",
+                            "message": (
+                                "Existing code-review container is still live but unreachable; "
+                                "refusing replacement to avoid duplicate instances."
+                            ),
+                            "liveContainers": live_names,
+                        }))
+                    child_service_url = ""
+
+            if not child_service_url:
+                definition = _capability_definition(capability)
+            if child_service_url:
+                pass
+            elif _is_per_task_definition(definition):
                 result = _dispatch_via_launcher(
                     definition,
                     capability=capability,
@@ -1094,6 +1207,7 @@ class DispatchCodeReview(BaseTool):
                     message_parts=[{"text": diff_summary or pr_url}],
                     metadata=meta,
                     timeout=timeout_seconds,
+                    preserve_instance=True,
                 )
             else:
                 review_url = _resolve_agent_url("CODE_REVIEW_AGENT_URL", "code_review_agent_url", "http://code-review:8050", capability)
@@ -1110,6 +1224,7 @@ class DispatchCodeReview(BaseTool):
                     timeout=timeout_seconds,
                 )
             task = result.get("task", result)
+            launch_info = result.get("_launch")
             if _task_state(task) != "TASK_STATE_COMPLETED":
                 return ToolResult(output=json.dumps({
                     "verdict": "error",
@@ -1117,6 +1232,13 @@ class DispatchCodeReview(BaseTool):
                 }))
             artifacts = task.get("artifacts", [])
             payload = _first_artifact_json(artifacts) or {"verdict": "unknown"}
+            # Embed launch info so Team Lead can persist the CR session
+            if launch_info:
+                payload["_crSession"] = {
+                    "service_url": launch_info.get("serviceUrl", ""),
+                    "container_name": launch_info.get("containerName", ""),
+                    "agent_id": launch_info.get("agentId", "code-review"),
+                }
             return ToolResult(output=json.dumps(payload))
         except Exception as exc:
             return ToolResult(output=json.dumps({"verdict": "error", "message": str(exc)}))

@@ -92,6 +92,19 @@ code_review_definition = _build_code_review_definition()
 class CodeReviewAgent(BaseAgent):
     """Code Review Agent implementation with graph-first lifecycle."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        import os
+        from framework.lifecycle import PerTaskLifecycleManager
+
+        idle_timeout = float(os.environ.get("CODE_REVIEW_IDLE_TIMEOUT_SECONDS", "1800"))
+        workspace_path = os.environ.get("CONSTELLATION_TASK_WORKSPACE", "")
+        self._lifecycle = PerTaskLifecycleManager(
+            agent_id=self.definition.agent_id,
+            idle_timeout_seconds=idle_timeout,
+            workspace_path=workspace_path,
+        )
+
     async def start(self) -> None:
         await super().start()
         from agents.code_review.tools import register_code_review_tools
@@ -103,6 +116,10 @@ class CodeReviewAgent(BaseAgent):
         from framework.a2a.protocol import Artifact
         from framework.devlog import AgentLogger
         from framework.workflow import RunConfig
+
+        # Cancel any pending idle shutdown — a new task/review round has arrived.
+        self._lifecycle.cancel_idle_timer()
+        self._lifecycle.mark_working()
 
         msg = message.get("message", message)
         metadata = msg.get("metadata", {})
@@ -116,6 +133,11 @@ class CodeReviewAgent(BaseAgent):
                 "orchestratorCallbackUrl": metadata.get("orchestratorCallbackUrl", ""),
             },
         )
+        self._lifecycle.configure_timeout_notification(
+            metadata.get("orchestratorCallbackUrl", ""),
+            orchestrator_task_id=metadata.get("orchestratorTaskId", ""),
+        )
+        self._lifecycle.mark_working(task.id)
 
         # Use the Compass orchestrator task ID as canonical _task_id for AgentLogger
         orchestrator_task_id = metadata.get("orchestratorTaskId", "")
@@ -226,6 +248,9 @@ class CodeReviewAgent(BaseAgent):
                 task_store.fail_task(task.id, str(e))
             finally:
                 loop.close()
+                # Arm the idle-shutdown guard. If Team Lead doesn't ACK
+                # within the timeout, the container will self-exit.
+                self._lifecycle.arm_idle_timer(task.id)
 
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()

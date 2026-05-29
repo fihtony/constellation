@@ -36,6 +36,15 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path.rstrip("/")
 
         if path == "/health":
+            artifact_error = self._artifact_root_access_error()
+            if artifact_error:
+                self._send_json(503, {
+                    "status": "error",
+                    "service": self.agent.definition.agent_id if self.agent else "unknown",
+                    "artifactRootAccessible": False,
+                    "error": artifact_error,
+                })
+                return
             self._send_json(200, {
                 "status": "ok",
                 "service": self.agent.definition.agent_id if self.agent else "unknown",
@@ -98,12 +107,39 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                 self._handle_progress(task_id, body)
                 return
 
+        # POST /tasks/{id}/child-timeout
+        if path.endswith("/child-timeout"):
+            parts = path.split("/")
+            if len(parts) >= 3:
+                task_id = parts[2]
+                body = self._read_json_body()
+                if body is None:
+                    return
+                self._handle_child_timeout(task_id, body)
+                return
+
         # POST /tasks/{id}/ack
         if path.endswith("/ack"):
             parts = path.split("/")
             if len(parts) >= 3:
                 task_id = parts[2]
                 self._handle_ack(task_id)
+                return
+
+        # POST /tasks/{id}/ping
+        if path.endswith("/ping"):
+            parts = path.split("/")
+            if len(parts) >= 3:
+                task_id = parts[2]
+                self._handle_ping(task_id)
+                return
+
+        # POST /tasks/{id}/terminate
+        if path.endswith("/terminate"):
+            parts = path.split("/")
+            if len(parts) >= 3:
+                task_id = parts[2]
+                self._handle_terminate(task_id)
                 return
 
         # POST /tasks/{id}/resume
@@ -130,6 +166,21 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             card = json.load(fh)
         text = json.dumps(card).replace("__ADVERTISED_URL__", self.advertised_url)
         self._send_json(200, json.loads(text))
+
+    def _artifact_root_access_error(self) -> str:
+        artifact_path = (
+            os.environ.get("CONSTELLATION_TASK_WORKSPACE", "").strip()
+            or os.environ.get("ARTIFACT_ROOT", "").strip()
+        )
+        if not artifact_path:
+            return ""
+        try:
+            os.listdir(artifact_path)
+        except OSError as exc:
+            return f"Artifact workspace inaccessible: {artifact_path}: {exc}"
+        if not os.access(artifact_path, os.R_OK | os.W_OK | os.X_OK):
+            return f"Artifact workspace not readable/writable: {artifact_path}"
+        return ""
 
     def _handle_message_send(self, body: dict) -> None:
         import asyncio
@@ -194,6 +245,36 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         print(f"[{agent_id}] Progress for task {task_id}: {step}")
         self._send_json(200, {"status": "ok"})
 
+    def _handle_child_timeout(self, task_id: str, body: dict) -> None:
+        agent_id = self.agent.definition.agent_id if self.agent else "unknown"
+        child_agent_id = body.get("childAgentId", "")
+        child_task_id = body.get("childTaskId", "")
+        exit_code = body.get("exitCode", "")
+        try:
+            from framework.devlog import AgentLogger
+
+            AgentLogger(task_id=task_id, agent_name=agent_id).warn(
+                "[A2A] ← child-timeout",
+                child_agent_id=child_agent_id,
+                child_task_id=child_task_id,
+                exit_code=exit_code,
+            )
+        except Exception:
+            pass
+
+        task_store = getattr(getattr(self.agent, "services", None), "task_store", None)
+        if task_store is not None:
+            try:
+                task_store.update_metadata(task_id, {"last_child_timeout": body})
+            except Exception:
+                pass
+
+        print(
+            f"[{agent_id}] Child timeout reported for task {task_id}: "
+            f"child_agent={child_agent_id} child_task={child_task_id} exit_code={exit_code}"
+        )
+        self._send_json(200, {"status": "ok"})
+
     def _handle_ack(self, task_id: str) -> None:
         agent_id = self.agent.definition.agent_id if self.agent else "unknown"
         try:
@@ -203,7 +284,38 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
         print(f"[{agent_id}] ACK received for task {task_id}")
+
+        # Delegate to lifecycle manager if available
+        lifecycle = getattr(self.agent, "_lifecycle", None)
+        if lifecycle is not None:
+            result = lifecycle.handle_ack(task_id)
+            self._send_json(200, result)
+            return
         self._send_json(200, {"status": "ok"})
+
+    def _handle_ping(self, task_id: str) -> None:
+        agent_id = self.agent.definition.agent_id if self.agent else "unknown"
+        print(f"[{agent_id}] Ping received for task {task_id}")
+
+        # Delegate to lifecycle manager if available
+        lifecycle = getattr(self.agent, "_lifecycle", None)
+        if lifecycle is not None:
+            result = lifecycle.handle_ping(task_id)
+            self._send_json(200, result)
+            return
+        self._send_json(200, {"status": "ok"})
+
+    def _handle_terminate(self, task_id: str) -> None:
+        agent_id = self.agent.definition.agent_id if self.agent else "unknown"
+        print(f"[{agent_id}] Terminate received for task {task_id}")
+
+        # Delegate to lifecycle manager if available
+        lifecycle = getattr(self.agent, "_lifecycle", None)
+        if lifecycle is not None:
+            result = lifecycle.handle_terminate(task_id)
+            self._send_json(200, result)
+            return
+        self._send_json(200, {"status": "ok", "message": "no lifecycle manager"})
 
     def _handle_resume(self, task_id: str, body: dict) -> None:
         """Resume a paused (INPUT_REQUIRED) task with user-provided input."""

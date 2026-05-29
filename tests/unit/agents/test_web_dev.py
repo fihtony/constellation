@@ -748,6 +748,40 @@ class TestWebDevNodes:
         assert result["pr_title"] == "Add login page"
         assert result["changes_made"] == ["package.json", "src/App.tsx", "src/login.py"]
 
+    async def test_create_pr_revision_mode_raises_when_push_fails(self):
+        from unittest.mock import patch
+
+        state = {
+            "_runtime": object(),
+            "revision_mode": True,
+            "existing_pr_url": "https://github.com/org/repo/pull/42",
+            "existing_pr_number": 42,
+            "branch_name": "feature/login",
+            "repo_path": "/tmp/repo",
+            "repo_url": "https://github.com/org/repo",
+            "jira_context": {"key": "ABC-123"},
+            "changes_made": ["src/login.py"],
+            "revision_feedback": "Address review comments",
+        }
+
+        def _boundary(_state, tool_name, _args):
+            if tool_name == "scm_push":
+                return {"error": "Push failed", "detail": "stale info"}
+            raise AssertionError(f"unexpected boundary tool after push failure: {tool_name}")
+
+        with patch("agents.web_dev.nodes._check_pr_status_conflict", return_value={"conflict": False}), patch(
+            "agents.web_dev.nodes._git_commit_all_pending",
+            return_value=["src/login.py"],
+        ), patch(
+            "agents.web_dev.nodes._git_branch_changed_files",
+            return_value=["src/login.py"],
+        ), patch(
+            "agents.web_dev.nodes._call_boundary_tool",
+            side_effect=_boundary,
+        ):
+            with pytest.raises(RuntimeError, match="Revision push failed: Push failed"):
+                await create_pr(state)
+
     async def test_report_result(self):
         state = {
             "pr_url": "https://pr/1",

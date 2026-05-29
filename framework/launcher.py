@@ -373,6 +373,38 @@ class Launcher:
     def destroy_instance(self, agent_id: str, container_name: str) -> None:
         self._request("DELETE", f"/v1.43/containers/{quote(container_name, safe='')}?force=1")
 
+    def find_live_instances(self, agent_id: str, task_id: str = "") -> list[dict]:
+        """Find running containers for a given agent_id (and optionally task_id).
+
+        Returns a list of dicts with container_name, service_url, task_id.
+        Used for duplicate instance prevention.
+        """
+        filters = {"label": [f"constellation.agent_id={agent_id}"], "status": ["running"]}
+        if task_id:
+            filters["label"].append(f"constellation.task_id={task_id}")
+        filters_json = json.dumps(filters)
+        try:
+            status, raw = self._request_raw(
+                "GET",
+                f"/v1.43/containers/json?filters={quote(filters_json, safe='')}",
+            )
+            if status >= 400 or not raw:
+                return []
+            containers = json.loads(raw)
+            results = []
+            for c in containers:
+                labels = c.get("Labels") or {}
+                names = c.get("Names") or []
+                name = names[0].lstrip("/") if names else ""
+                results.append({
+                    "container_name": name,
+                    "task_id": labels.get("constellation.task_id", ""),
+                    "agent_id": labels.get("constellation.agent_id", ""),
+                })
+            return results
+        except Exception:
+            return []
+
     def _socket_group_add(self, socket_path: str) -> list[str]:
         try:
             socket_gid = os.stat(socket_path).st_gid

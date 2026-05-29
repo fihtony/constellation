@@ -46,7 +46,7 @@ def _get_adapter():
         skills_registry=SkillsRegistry(),
         plugin_manager=PluginManager(),
         checkpoint_service=InMemoryCheckpointer(),
-        runtime=get_runtime("claude-code", model=os.environ.get("OPENAI_MODEL", "claude-haiku-4-5-20251001")),
+        runtime=get_runtime(),
         registry_client=None,
         task_store=InMemoryTaskStore(),
     )
