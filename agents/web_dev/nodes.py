@@ -155,6 +155,29 @@ def _tail_text(text: str, limit: int = 600) -> str:
     return normalized[-limit:]
 
 
+_NON_ACTIONABLE_REVIEW_CATEGORIES = {"review-process", "large-change"}
+_NON_ACTIONABLE_REVIEW_PHRASES = (
+    "diff was truncated",
+    "truncated in diff",
+    "not fully visible",
+    "review focused on visible portion only",
+    "single-file change is very large",
+)
+
+
+def _is_actionable_review_comment(comment: dict[str, Any]) -> bool:
+    """Return True when a code-review comment can be acted on by the dev agent."""
+    category = str(comment.get("category", "")).strip().lower()
+    if category in _NON_ACTIONABLE_REVIEW_CATEGORIES:
+        return False
+
+    combined = " ".join(
+        str(comment.get(key, "")).strip().lower()
+        for key in ("message", "suggestion")
+    )
+    return not any(phrase in combined for phrase in _NON_ACTIONABLE_REVIEW_PHRASES)
+
+
 def _git_worktree_changed_files(repo_path: str) -> list[str]:
     """Return tracked/untracked worktree files from git status."""
     if not repo_path or not os.path.isdir(repo_path):
@@ -570,6 +593,8 @@ async def setup_workspace(state: dict) -> dict:
     repo_path = state.get("repo_path", "")
     workspace_path = state.get("workspace_path", "")
     branch_name = state.get("branch_name", "")
+    existing_branch = state.get("existing_branch", "")
+    revision_mode = bool(state.get("revision_mode", False))
     task_id = state.get("_task_id", "unknown")
     log.debug("setup_workspace", repo_path=repo_path)
     print(f"[{_AGENT_ID}] setup_workspace: repo_path={repo_path!r} workspace_path={workspace_path!r}")
@@ -584,11 +609,19 @@ async def setup_workspace(state: dict) -> dict:
     if not repo_path:
         repo_path = os.path.join(workspace_path, "repo")
 
+    if revision_mode:
+        branch_name = existing_branch or branch_name
+
     # Fail fast if repo does not exist — Team Lead must have cloned it first
     if not os.path.isdir(repo_path):
         raise RuntimeError(
             f"[{_AGENT_ID}] Repo not found at {repo_path!r}. "
             "Team Lead must clone the repo before dispatching to Web Dev."
+        )
+
+    if revision_mode and not branch_name:
+        raise RuntimeError(
+            f"[{_AGENT_ID}] Revision mode requires an existing branch name to reuse."
         )
 
     # Derive branch name: use provided value, then LLM, then Jira-key fallback
@@ -635,7 +668,7 @@ async def setup_workspace(state: dict) -> dict:
 
     # -- Check remote branches and open PR source branches for conflicts; add _<n> suffix when taken --
     # Must not delete or alter existing remote branches or PRs.
-    if branch_name and repo_url and not local_branch_exists:
+    if branch_name and repo_url and not local_branch_exists and not revision_mode:
         remote_result = _call_boundary_tool(state, "scm_list_branches", {"repo_url": repo_url})
         remote_branch_names = {
             candidate
@@ -672,29 +705,64 @@ async def setup_workspace(state: dict) -> dict:
         import subprocess
         from framework.env_utils import build_isolated_git_env
         git_env = build_isolated_git_env("web-dev-setup")
-        r = subprocess.run(
-            ["git", "checkout", "-b", branch_name],
-            cwd=repo_path, env=git_env,
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode == 0:
-            branch_created = True
-            print(f"[{_AGENT_ID}] setup_workspace: created branch {branch_name!r}")
+        if revision_mode:
+            if local_branch_exists:
+                r = subprocess.run(
+                    ["git", "checkout", branch_name],
+                    cwd=repo_path, env=git_env,
+                    capture_output=True, text=True, timeout=30,
+                )
+                if r.returncode != 0:
+                    raise RuntimeError(
+                        f"[{_AGENT_ID}] Failed to switch to existing branch {branch_name!r}: {r.stderr.strip()[:200]}"
+                    )
+                branch_created = True
+                print(f"[{_AGENT_ID}] setup_workspace: reusing existing branch {branch_name!r}")
+            else:
+                fetch_result = subprocess.run(
+                    ["git", "fetch", "origin", branch_name],
+                    cwd=repo_path, env=git_env,
+                    capture_output=True, text=True, timeout=60,
+                )
+                if fetch_result.returncode != 0:
+                    raise RuntimeError(
+                        f"[{_AGENT_ID}] Revision branch {branch_name!r} is missing locally and could not be fetched: {fetch_result.stderr.strip()[:200]}"
+                    )
+                checkout_result = subprocess.run(
+                    ["git", "checkout", "-B", branch_name, f"origin/{branch_name}"],
+                    cwd=repo_path, env=git_env,
+                    capture_output=True, text=True, timeout=30,
+                )
+                if checkout_result.returncode != 0:
+                    raise RuntimeError(
+                        f"[{_AGENT_ID}] Failed to track existing revision branch {branch_name!r}: {checkout_result.stderr.strip()[:200]}"
+                    )
+                branch_created = True
+                print(f"[{_AGENT_ID}] setup_workspace: fetched and reused branch {branch_name!r}")
         else:
-            # Branch might already exist — try switching to it
-            r2 = subprocess.run(
-                ["git", "checkout", branch_name],
+            r = subprocess.run(
+                ["git", "checkout", "-b", branch_name],
                 cwd=repo_path, env=git_env,
                 capture_output=True, text=True, timeout=30,
             )
-            if r2.returncode == 0:
+            if r.returncode == 0:
                 branch_created = True
-                print(f"[{_AGENT_ID}] setup_workspace: switched to existing branch {branch_name!r}")
+                print(f"[{_AGENT_ID}] setup_workspace: created branch {branch_name!r}")
             else:
-                print(f"[{_AGENT_ID}] setup_workspace: git checkout failed: {r2.stderr.strip()[:200]}")
-                raise RuntimeError(
-                    f"[{_AGENT_ID}] Failed to create/switch branch {branch_name!r}: {r2.stderr.strip()[:200]}"
+                # Branch might already exist — try switching to it
+                r2 = subprocess.run(
+                    ["git", "checkout", branch_name],
+                    cwd=repo_path, env=git_env,
+                    capture_output=True, text=True, timeout=30,
                 )
+                if r2.returncode == 0:
+                    branch_created = True
+                    print(f"[{_AGENT_ID}] setup_workspace: switched to existing branch {branch_name!r}")
+                else:
+                    print(f"[{_AGENT_ID}] setup_workspace: git checkout failed: {r2.stderr.strip()[:200]}")
+                    raise RuntimeError(
+                        f"[{_AGENT_ID}] Failed to create/switch branch {branch_name!r}: {r2.stderr.strip()[:200]}"
+                    )
 
     # Write git setup log
     if workspace_path:
@@ -915,6 +983,23 @@ async def implement_changes(state: dict) -> dict:
         memory_context=state.get("memory_context", ""),
     )
 
+    # Inject coding standards for consistent implementation (same standards used by Code Review)
+    try:
+        from framework.standards_loader import (
+            detect_tech_stack_from_repo,
+            format_standards_for_prompt,
+            load_standards,
+        )
+        tech_stack_detected = state.get("tech_stack") or []
+        if not tech_stack_detected and _repo_path:
+            tech_stack_detected = detect_tech_stack_from_repo(_repo_path)
+        std_rules = load_standards(tech_stack=tech_stack_detected, agent_role="development")
+        std_text = format_standards_for_prompt(std_rules, agent_role="development")
+        if std_text:
+            prompt += f"\n\n{std_text}\n"
+    except Exception:
+        pass
+
     # Use Claude Code native tools (Bash, Read, Write, Glob, Grep) — no constellation
     # MCP bridge needed.  With cwd=repo_path, all relative paths resolve correctly.
     repo_path = state.get("repo_path", "")
@@ -1007,9 +1092,11 @@ async def run_tests(state: dict) -> dict:
     log.node("run_tests")
     runtime = state.get("_runtime")
     test_cycles = state.get("test_cycles", 0) + 1
+    build_cycles = state.get("build_cycles", 0)
     max_test_cycles = state.get("max_test_cycles") or int(
         os.environ.get("WEB_DEV_MAX_TEST_CYCLES", "3")
     )
+    max_build_cycles = int(os.environ.get("WEB_DEV_MAX_BUILD_RETRIES", "3"))
     log.info("run_tests started", cycle=test_cycles, max_cycles=max_test_cycles)
 
     if not runtime:
@@ -1034,6 +1121,15 @@ async def run_tests(state: dict) -> dict:
     install_ok = data.get("install_ok", True)
     build_ok = data.get("build_ok", False)
     test_ok = data.get("test_ok", False)
+
+    # Track build failures separately
+    if not build_ok:
+        build_cycles += 1
+        if build_cycles >= max_build_cycles:
+            raise RuntimeError(
+                f"Build failed after {build_cycles} retries; cannot proceed."
+            )
+
     test_passed = int(failed) == 0 and install_ok and build_ok and test_ok
     command_summaries = _summarize_validation_commands(data)
     log.info("run_tests result", passed=data.get("passed", 0), failed=failed,
@@ -1071,6 +1167,7 @@ async def run_tests(state: dict) -> dict:
             "test_results": data,
             "test_output": data.get("output", ""),
             "test_cycles": test_cycles,
+            "build_cycles": build_cycles,
             "test_status": "pass",
             "route": "pass",
         }
@@ -1085,6 +1182,7 @@ async def run_tests(state: dict) -> dict:
         "test_results": data,
         "test_output": data.get("output", ""),
         "test_cycles": test_cycles,
+        "build_cycles": build_cycles,
         "test_status": "fail",
         "route": "fail",
     }
@@ -1129,6 +1227,8 @@ async def fix_tests(state: dict) -> dict:
         "fix_attempted": True,
         "fix_summary": result.summary,
         "agentic_success": result.success,
+        "test_cycles": 0,
+        "build_cycles": 0,
     }
 
 
@@ -1217,6 +1317,7 @@ async def self_assess(state: dict) -> dict:
     ac_str = json.dumps(acceptance_criteria[:5], ensure_ascii=False)
     if len(ac_str) > 3000:
         ac_str = ac_str[:3000] + "...]"
+    acceptance_criteria_count = len(acceptance_criteria) if isinstance(acceptance_criteria, list) else 0
 
     # Derive changed files from the actual cloned repo's git status when
     # changes_made is empty (native tool runs don't track individual writes).
@@ -1237,6 +1338,36 @@ async def self_assess(state: dict) -> dict:
             except Exception:
                 pass
 
+    # Load Code Review comments for revision mode self-assessment
+    cr_comments_text = ""
+    revision_feedback = state.get("revision_feedback", "")
+    review_report_path = state.get("review_report_path", "")
+    if revision_feedback and workspace_path:
+        # Try to load structured review report for detailed issue checking
+        if review_report_path:
+            report_full_path = review_report_path
+            if not os.path.isabs(report_full_path):
+                report_full_path = os.path.join(workspace_path, report_full_path)
+            if os.path.isfile(report_full_path):
+                try:
+                    with open(report_full_path, encoding="utf-8") as _f:
+                        review_data = json.load(_f)
+                    report_body = review_data.get("data", review_data)
+                    comments = report_body.get("all_comments", []) or report_body.get("comments", [])
+                    cr_lines = []
+                    for c in comments[:15]:
+                        if not _is_actionable_review_comment(c):
+                            continue
+                        sev = c.get("severity", "info")
+                        msg = c.get("message", "")
+                        file_ref = c.get("file", "")
+                        cr_lines.append(f"- [{sev}] {file_ref}: {msg}" if file_ref else f"- [{sev}] {msg}")
+                    cr_comments_text = "\n".join(cr_lines)
+                except Exception:
+                    pass
+        if not cr_comments_text and revision_feedback:
+            cr_comments_text = revision_feedback
+
     prompt = SELF_ASSESS_TEMPLATE.format(
         acceptance_criteria=ac_str,
         design_context=json.dumps(design_ctx, ensure_ascii=False)[:800] if design_ctx else "N/A (not a UI task)",
@@ -1247,25 +1378,87 @@ async def self_assess(state: dict) -> dict:
         changed_files="\n".join(changed_files_list) or "unknown",
     )
 
-    result = runtime.run(
-        prompt, system_prompt=SELF_ASSESS_SYSTEM,
-        max_tokens=4096,
-        plugin_manager=state.get("_plugin_manager"),
-        cwd=state.get("repo_path") or None,
-    )
+    # Inject coding standards for self-assessment evaluation
+    try:
+        from framework.standards_loader import (
+            detect_tech_stack_from_repo,
+            format_standards_for_prompt,
+            load_standards,
+        )
+        ts = state.get("tech_stack") or []
+        if not ts and state.get("repo_path"):
+            ts = detect_tech_stack_from_repo(state["repo_path"])
+        std_rules = load_standards(tech_stack=ts, agent_role="development")
+        std_text = format_standards_for_prompt(std_rules, agent_role="development")
+        if std_text:
+            prompt += f"\n\n{std_text}\n"
+    except Exception:
+        pass
 
-    raw_response = result.get("raw_response", "")
-    print(f"[{_AGENT_ID}] self_assess raw_response (first 500 chars): {raw_response[:500]!r}")
-    data = _safe_json(raw_response, fallback={})
-    if not data:
-        print(f"[{_AGENT_ID}] self_assess _safe_json returned empty — raw_response type={type(raw_response).__name__}, len={len(raw_response) if raw_response else 0}")
+    # Append CR comments section for revision-mode assessment
+    if cr_comments_text:
+        prompt += f"""
 
-    if not isinstance(data, dict):
-        data = {}
-    data.setdefault("criteria_checks", [])
-    data.setdefault("component_checks", [])
-    data.setdefault("gaps", [])
-    data.setdefault("summary", "")
+## Code Review Issues (MUST verify all are fixed):
+
+{cr_comments_text}
+
+IMPORTANT: For each high/critical code review issue listed above, verify the fix
+is present in the changed files. Add a "cr_issues_fixed" field to your response
+indicating whether ALL high/critical CR issues are resolved (true/false).
+If any high/critical issue is NOT fixed, set verdict to "fail" and list
+the unresolved issues in gaps.
+"""
+
+    from framework.validation_gates import validate_self_assessment
+
+    gate_result = None
+    data: dict[str, Any] = {}
+    max_schema_attempts = 2
+    for schema_attempt in range(1, max_schema_attempts + 1):
+        attempt_prompt = prompt
+        if gate_result and gate_result.feedback:
+            attempt_prompt += f"""
+
+IMPORTANT: Your previous self-assessment response was invalid.
+Return valid JSON only, and correct this validation feedback:
+{gate_result.feedback}
+"""
+
+        result = runtime.run(
+            attempt_prompt,
+            system_prompt=SELF_ASSESS_SYSTEM,
+            max_tokens=4096,
+            plugin_manager=state.get("_plugin_manager"),
+            cwd=state.get("repo_path") or None,
+        )
+
+        raw_response = result.get("raw_response", "")
+        print(f"[{_AGENT_ID}] self_assess raw_response (first 500 chars): {raw_response[:500]!r}")
+        parsed = _safe_json(raw_response, fallback={})
+        if not parsed:
+            print(f"[{_AGENT_ID}] self_assess _safe_json returned empty — raw_response type={type(raw_response).__name__}, len={len(raw_response) if raw_response else 0}")
+
+        data = parsed if isinstance(parsed, dict) else {}
+        data.setdefault("criteria_checks", [])
+        data.setdefault("component_checks", [])
+        data.setdefault("gaps", [])
+        data.setdefault("summary", "")
+
+        gate_result = validate_self_assessment(data, acceptance_criteria_count)
+        if gate_result.passed:
+            break
+        log.warn("validate_self_assessment gate", feedback=gate_result.feedback, schema_attempt=schema_attempt)
+    else:
+        feedback = gate_result.feedback if gate_result else "Self-assessment output was invalid."
+        data = {
+            "score": 0.0,
+            "verdict": "fail",
+            "criteria_checks": data.get("criteria_checks", []) if isinstance(data, dict) else [],
+            "component_checks": data.get("component_checks", []) if isinstance(data, dict) else [],
+            "gaps": [feedback],
+            "summary": feedback,
+        }
 
     deterministic_gaps: list[str] = []
     if _is_screenshot_required(state):
@@ -1296,13 +1489,6 @@ async def self_assess(state: dict) -> dict:
     score = float(data.get("score", 0) or 0)
     verdict = data.get("verdict", "fail")
     gaps = data.get("gaps", [])
-
-    # Validation gate: structural check on self-assessment output
-    from framework.validation_gates import validate_self_assessment
-    acceptance_criteria_count = len(acceptance_criteria) if isinstance(acceptance_criteria, list) else 0
-    gate_result = validate_self_assessment(data, acceptance_criteria_count)
-    if not gate_result.passed:
-        log.warn("validate_self_assessment gate", feedback=gate_result.feedback)
 
     print(f"[{_AGENT_ID}] self_assess result: score={score} verdict={verdict} gaps={len(gaps)}")
 
@@ -1398,6 +1584,8 @@ async def fix_gaps(state: dict) -> dict:
         "fix_gaps_attempted": True,
         "fix_gaps_summary": result.summary,
         "agentic_success": result.success,
+        "test_cycles": 0,
+        "build_cycles": 0,
     }
 
 
@@ -1561,8 +1749,9 @@ async def capture_screenshot(state: dict) -> dict:
 
     # Use first detected route for desktop/mobile pair
     _primary_route, _feature_slug = _detected_routes[0] if _detected_routes else ("/", "app")
-    desktop_png = os.path.join(screenshot_dir, f"{_feature_slug}-desktop.png")
-    mobile_png = os.path.join(screenshot_dir, f"{_feature_slug}-mobile.png")
+    _round = state.get("revision_round", state.get("revision_count", 0) + 1) or 1
+    desktop_png = os.path.join(screenshot_dir, f"{_feature_slug}-desktop-{_round}.png")
+    mobile_png = os.path.join(screenshot_dir, f"{_feature_slug}-mobile-{_round}.png")
 
     # Pick an ephemeral port to avoid conflicts with any server started by run_tests.
     def _free_port(preferred: int = 5179) -> int:
@@ -2083,6 +2272,89 @@ def _load_pr_description_template() -> str:
         return ""
 
 
+def _check_pr_status_conflict(state: dict, repo_url: str, pr_number: int) -> dict[str, Any]:
+    """Check for PR status conflicts (merged, closed, or conflicting).
+
+    Returns a dict with keys:
+      - conflict: bool (True if a conflict was detected)
+      - conflict_type: str (merged, closed, has_conflicts, none)
+      - message: str (human-readable explanation)
+    """
+    if not repo_url or not pr_number:
+        return {"conflict": False, "conflict_type": "none", "message": ""}
+
+    pr_info = _call_boundary_tool(state, "scm_get_pr_info", {
+        "repo_url": repo_url,
+        "pr_number": int(pr_number),
+        "task_id": state.get("_task_id", ""),
+    })
+    if pr_info.get("error"):
+        return {"conflict": False, "conflict_type": "none", "message": f"Could not check PR status: {pr_info.get('error')}"}
+
+    pr_state = pr_info.get("state", "").lower()
+    if pr_state == "merged":
+        return {
+            "conflict": True,
+            "conflict_type": "merged",
+            "message": f"PR #{pr_number} has already been merged externally.",
+        }
+    elif pr_state == "closed":
+        return {
+            "conflict": True,
+            "conflict_type": "closed",
+            "message": f"PR #{pr_number} has been closed externally.",
+        }
+
+    # Check for merge conflicts via mergeable state if available
+    mergeable = pr_info.get("mergeable")
+    if mergeable is False:
+        return {
+            "conflict": True,
+            "conflict_type": "has_conflicts",
+            "message": f"PR #{pr_number} has merge conflicts with the target branch.",
+        }
+
+    return {"conflict": False, "conflict_type": "none", "message": ""}
+
+
+def _attempt_rebase(repo_path: str, base_branch: str = "main") -> dict[str, Any]:
+    """Attempt to rebase the current branch onto the target branch.
+
+    Returns {"success": bool, "message": str}.
+    """
+    if not repo_path or not os.path.isdir(repo_path):
+        return {"success": False, "message": "repo_path not available"}
+    try:
+        from framework.env_utils import build_isolated_git_env
+        git_env = build_isolated_git_env(scope="web-dev-rebase")
+
+        # Fetch latest
+        subprocess.run(
+            ["git", "fetch", "origin", base_branch],
+            cwd=repo_path, env=git_env,
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+
+        # Try rebase
+        result = subprocess.run(
+            ["git", "rebase", f"origin/{base_branch}"],
+            cwd=repo_path, env=git_env,
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        if result.returncode == 0:
+            return {"success": True, "message": "Rebase successful"}
+
+        # Abort failed rebase
+        subprocess.run(
+            ["git", "rebase", "--abort"],
+            cwd=repo_path, env=git_env,
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        return {"success": False, "message": f"Rebase failed: {result.stderr.strip()[:200]}"}
+    except Exception as exc:
+        return {"success": False, "message": f"Rebase error: {exc}"}
+
+
 async def create_pr(state: dict) -> dict:
     """Generate a PR description and create the pull request via SCM tools."""
     runtime = state.get("_runtime")
@@ -2095,6 +2367,123 @@ async def create_pr(state: dict) -> dict:
             "pr_number": 0,
             "pr_title": "Implement changes",
             "commit_hash": "",
+        }
+
+    # --- Revision mode: push new commits + add PR comment, skip PR creation ---
+    revision_mode = state.get("revision_mode", False)
+    existing_pr_url = state.get("existing_pr_url", "")
+    existing_pr_number = state.get("existing_pr_number", 0)
+    if revision_mode and existing_pr_url and existing_pr_number:
+        repo_path = state.get("repo_path", "")
+        branch_name = state.get("branch_name", "feature/task")
+        jira_ctx = state.get("jira_context", {})
+        jira_key = (
+            jira_ctx.get("key") or jira_ctx.get("ticket_key") or ""
+            if isinstance(jira_ctx, dict) else ""
+        )
+        task_id = state.get("_task_id", "")
+
+        # Check PR status conflicts before pushing
+        pr_conflict = _check_pr_status_conflict(
+            state, state.get("repo_url", ""), int(existing_pr_number)
+        )
+        if pr_conflict.get("conflict"):
+            conflict_type = pr_conflict["conflict_type"]
+            conflict_msg = pr_conflict["message"]
+            log.warn("PR status conflict detected", type=conflict_type, message=conflict_msg)
+            if conflict_type == "merged":
+                # PR already merged externally — report as success
+                return {
+                    "pr_url": existing_pr_url,
+                    "pr_number": int(existing_pr_number),
+                    "pr_title": state.get("pr_title", ""),
+                    "commit_hash": "",
+                    "pr_conflict": conflict_type,
+                    "pr_conflict_message": conflict_msg,
+                }
+            elif conflict_type == "closed":
+                # PR closed externally — escalate to Team Lead
+                raise RuntimeError(f"PR conflict: {conflict_msg}")
+            elif conflict_type == "has_conflicts":
+                # Attempt rebase (max 1 attempt)
+                rebase_result = _attempt_rebase(repo_path, "main")
+                if not rebase_result["success"]:
+                    raise RuntimeError(
+                        f"PR has merge conflicts and rebase failed: {rebase_result['message']}"
+                    )
+                log.info("rebase successful after conflict detection")
+
+        committed_files = _git_commit_all_pending(repo_path, jira_key or "task")
+        existing_changes = state.get("changes_made", [])
+        branch_changes = _git_branch_changed_files(repo_path)
+        all_changes = sorted(set(existing_changes) | set(committed_files) | set(branch_changes))
+
+        # Push commits to existing branch
+        log.info("revision mode: pushing to existing branch", branch=branch_name)
+        push_payload = _call_boundary_tool(
+            state, "scm_push", {"repo_path": repo_path, "branch": branch_name, "task_id": task_id}
+        )
+        if push_payload.get("error"):
+            log.error("scm_push failed in revision mode", error=push_payload["error"])
+
+        # Add PR comment with revision summary
+        revision_feedback = state.get("revision_feedback", "")
+        test_summary = ""
+        test_results = state.get("test_results") or state.get("test_output", "")
+        if isinstance(test_results, dict):
+            test_summary = f"\n\nTest results: {'PASS' if test_results.get('passed') else 'FAIL'}"
+        elif test_results:
+            test_summary = f"\n\nTest results: {str(test_results)[:500]}"
+        comment_body = (
+            f"**Revision update** (round {state.get('revision_round', state.get('revision_count', 1))})\n\n"
+            f"Changes addressed:\n{revision_feedback[:2000]}\n\n"
+            f"Modified files: {', '.join(all_changes[:15]) or 'various files'}"
+            f"{test_summary}"
+        )
+        _call_boundary_tool(
+            state, "scm_add_pr_comment",
+            {
+                "repo_url": state.get("repo_url", ""),
+                "pr_number": int(existing_pr_number),
+                "comment": comment_body,
+                "task_id": task_id,
+            },
+        )
+        log.info("revision mode: PR comment added", pr_number=existing_pr_number)
+
+        # Upload revision screenshots as PR comment (not description)
+        _screenshots = state.get("screenshots", [])
+        _png_screenshots = [s for s in _screenshots if s.endswith(".png") and os.path.isfile(s)]
+        _screenshot_uploaded = False
+        if _png_screenshots:
+            screenshot_entries = []
+            for _png in _png_screenshots:
+                _fname = os.path.basename(_png)
+                _label = "Desktop" if "desktop" in _png.lower() else "Mobile"
+                _upload_result = _call_boundary_tool(
+                    state, "scm_upload_pr_image",
+                    {"repo_url": state.get("repo_url", ""), "pr_number": int(existing_pr_number),
+                     "image_path": _png, "task_id": task_id},
+                )
+                _cdn_url = _upload_result.get("image_url", "")
+                if _cdn_url:
+                    screenshot_entries.append(f"**{_label}**\n\n![]({_cdn_url})")
+            if screenshot_entries:
+                _call_boundary_tool(
+                    state, "scm_add_pr_comment",
+                    {"repo_url": state.get("repo_url", ""), "pr_number": int(existing_pr_number),
+                     "comment": f"**Revision screenshots (round {state.get('revision_round', state.get('revision_count', 1))})**\n\n" + "\n\n".join(screenshot_entries),
+                     "task_id": task_id},
+                )
+                _screenshot_uploaded = True
+
+        return {
+            "pr_url": existing_pr_url,
+            "pr_number": int(existing_pr_number),
+            "pr_title": state.get("pr_title", ""),
+            "commit_hash": "",
+            "screenshot_included": state.get("screenshot_captured", False),
+            "screenshot_uploaded": _screenshot_uploaded,
         }
 
     screenshot_required = _is_screenshot_required(state)

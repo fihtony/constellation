@@ -32,6 +32,46 @@ from agents.web_dev.nodes import (
     pause_for_user_input,
 )
 
+
+# ---------------------------------------------------------------------------
+# Idle-timeout shutdown guard
+#
+# Web Dev containers are per-task (AutoRemove=true). They should exit after
+# completing a task and staying idle for a configurable period.  This prevents
+# orphaned containers from accumulating if Team Lead forgets to destroy them.
+# ---------------------------------------------------------------------------
+
+class _IdleShutdownGuard:
+    """Schedule a graceful container shutdown after an idle period."""
+
+    def __init__(self, timeout_seconds: float) -> None:
+        self._timeout = timeout_seconds
+        self._timer: threading.Timer | None = None
+        self._lock = threading.Lock()
+
+    def cancel(self) -> None:
+        """Cancel any pending shutdown (call when a new task arrives)."""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+
+    def arm(self) -> None:
+        """Arm the timer (call when a task finishes)."""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self._timeout, self._shutdown)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _shutdown(self) -> None:
+        print(
+            f"[web-dev] Idle timeout ({int(self._timeout)}s) reached "
+            "with no pending tasks — shutting down container."
+        )
+        os._exit(0)
+
 # ---------------------------------------------------------------------------
 # Workflow definition
 # ---------------------------------------------------------------------------
@@ -104,6 +144,11 @@ web_dev_definition = _build_web_dev_definition()
 class WebDevAgent(BaseAgent):
     """Web Dev Agent implementation with graph-first lifecycle."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        idle_timeout = float(os.environ.get("WEB_DEV_IDLE_TIMEOUT_SECONDS", "600"))
+        self._idle_guard = _IdleShutdownGuard(idle_timeout)
+
     async def start(self) -> None:
         """Initialize agent and register boundary tools."""
         await super().start()
@@ -116,6 +161,9 @@ class WebDevAgent(BaseAgent):
     async def handle_message(self, message: dict) -> dict:
         from framework.a2a.protocol import Artifact
         from framework.workflow import RunConfig
+
+        # Cancel any pending idle shutdown — a new task has arrived.
+        self._idle_guard.cancel()
 
         msg = message.get("message", message)
         parts = msg.get("parts", [])
@@ -168,6 +216,13 @@ class WebDevAgent(BaseAgent):
             "task_type": metadata.get("taskType", "general"),
             "analysis": metadata.get("analysis", ""),
             "revision_feedback": metadata.get("revisionFeedback", ""),
+            "review_report_path": metadata.get("reviewReportPath", ""),
+            "branch_name": metadata.get("branchName", ""),
+            "existing_branch": metadata.get("existingBranch", ""),
+            "revision_mode": metadata.get("revisionMode", False),
+            "revision_round": metadata.get("revisionRound", 0),
+            "existing_pr_url": metadata.get("existingPrUrl", ""),
+            "existing_pr_number": metadata.get("existingPrNumber", 0),
             "definition_of_done": metadata.get("definitionOfDone", {}),
             "execution_contract": metadata.get("executionContract"),
             "test_cycles": 0,
@@ -267,6 +322,10 @@ class WebDevAgent(BaseAgent):
                 task_store.fail_task(task.id, str(e))
             finally:
                 loop.close()
+                # Arm the idle-shutdown guard. If Team Lead doesn't send a new
+                # task (revision) or destroy this container within the timeout,
+                # the container will exit on its own — preventing orphaned containers.
+                self._idle_guard.arm()
 
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()
@@ -352,6 +411,11 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                 "stitch_screen_name": {"type": "string"},
                 "orchestrator_task_id": {"type": "string"},
                 "revision_feedback": {"type": "string"},
+                "review_report_path": {"type": "string"},
+                "branch_name": {"type": "string"},
+                "revision_mode": {"type": "boolean"},
+                "existing_pr_url": {"type": "string"},
+                "existing_pr_number": {"type": "integer"},
                 "definition_of_done": {"type": "object"},
                 "execution_contract": {"type": "object"},
             },
@@ -374,6 +438,11 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
             stitch_screen_name: str = "",
             orchestrator_task_id: str = "",
             revision_feedback: str = "",
+            review_report_path: str = "",
+            branch_name: str = "",
+            revision_mode: bool = False,
+            existing_pr_url: str = "",
+            existing_pr_number: int = 0,
             definition_of_done=None,
             **kw,
         ) -> ToolResult:
@@ -399,6 +468,11 @@ def _register_web_dev_dispatch(web_dev_agent: "WebDevAgent") -> None:
                                 "stitchScreenName": stitch_screen_name,
                                 "orchestratorTaskId": orchestrator_task_id,
                                 "revisionFeedback": revision_feedback,
+                                "reviewReportPath": review_report_path,
+                                "branchName": branch_name,
+                                "revisionMode": revision_mode,
+                                "existingPrUrl": existing_pr_url,
+                                "existingPrNumber": existing_pr_number,
                                 "definitionOfDone": definition_of_done or {},
                             },
                         }

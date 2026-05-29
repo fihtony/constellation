@@ -687,6 +687,41 @@ class TestDispatchDevAgentValidation:
         assert captured["changed_files"] == ["src/App.jsx"]
         assert result["route"] == "approved"
 
+    async def test_review_result_escalates_manual_review_required(self, monkeypatch):
+        from agents.team_lead.nodes import review_result
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                assert name == "dispatch_code_review"
+                return json.dumps({
+                    "verdict": "rejected",
+                    "summary": "Manual review required for large PR",
+                    "manual_review_required": True,
+                })
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await review_result(
+            {
+                "_task_id": "task-123",
+                "pr_url": "https://github.com/org/repo/pull/85",
+                "pr_number": 85,
+                "repo_url": "https://github.com/org/repo",
+                "dev_result": {
+                    "summary": "done",
+                    "prNumber": 85,
+                    "repoUrl": "https://github.com/org/repo",
+                },
+                "analysis_summary": "Implement a large refactor",
+                "workspace_path": "/tmp/workspace",
+                "revision_count": 0,
+                "max_revisions": 3,
+            }
+        )
+
+        assert result["manual_review_required"] is True
+        assert result["route"] == "need_user_input"
+
     async def test_validate_readiness_routes_to_missing_info_for_retryable_context(self, tmp_path):
         from agents.team_lead.nodes import validate_readiness
 
@@ -764,6 +799,7 @@ class TestDispatchDevAgentValidation:
         assert result["dev_agent_session"] == {}
 
     async def test_request_revision_acknowledges_and_cleans_dev_agent(self, monkeypatch):
+        """request_revision should NOT ACK or destroy the dev agent (container reuse)."""
         from agents.team_lead.nodes import request_revision
 
         captured = {"ack": [], "destroy": []}
@@ -792,11 +828,104 @@ class TestDispatchDevAgentValidation:
             },
         })
 
-        assert captured["ack"] == [("http://web-dev-task-1:8050", "task-web-dev-1")]
-        assert captured["destroy"] == [("web-dev", "web-dev-task-1")]
-        assert result["dev_agent_acknowledged"] is True
-        assert result["dev_agent_cleaned_up"] is True
-        assert result["dev_agent_session"] == {}
+        # No ACK or cleanup during revision — container is reused
+        assert captured["ack"] == []
+        assert captured["destroy"] == []
+        assert "dev_agent_acknowledged" not in result
+        assert "dev_agent_cleaned_up" not in result
+
+    async def test_request_revision_posts_jira_and_inline_pr_comments(self, monkeypatch):
+        from agents.team_lead.nodes import request_revision
+
+        calls = []
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                calls.append((name, args))
+                return json.dumps({"ok": True})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        await request_revision({
+            "_task_id": "task-team-lead",
+            "jira_key": "CSTL-1",
+            "pr_url": "https://github.com/fihtony/english-study-hub/pull/93",
+            "pr_number": 93,
+            "repo_url": "https://github.com/fihtony/english-study-hub",
+            "review_result": {
+                "summary": "Fix review findings",
+                "comments": [
+                    {
+                        "severity": "high",
+                        "message": "Use dynamic year.",
+                        "file": "src/components/Footer.jsx",
+                        "line": 5,
+                    },
+                    {
+                        "severity": "medium",
+                        "message": "Replace dead links.",
+                        "file": "src/components/Hero.jsx",
+                        "line": 22,
+                    },
+                ],
+            },
+        })
+
+        assert calls[0][0] == "jira_comment"
+        assert calls[0][1]["ticket_key"] == "CSTL-1"
+        assert calls[1][0] == "scm_add_pr_inline_comment"
+        assert calls[1][1]["repo_url"] == "https://github.com/fihtony/english-study-hub"
+        assert calls[1][1]["pr_number"] == 93
+        assert calls[1][1]["file_path"] == "src/components/Footer.jsx"
+        assert calls[2][0] == "scm_add_pr_inline_comment"
+        assert calls[2][1]["file_path"] == "src/components/Hero.jsx"
+
+    def test_team_lead_inline_comment_tool_dispatches_via_a2a(self, monkeypatch):
+        from agents.team_lead.tools import SCMAddPRInlineComment
+
+        captured = {}
+
+        def fake_dispatch_sync(url, capability, message_parts, metadata, timeout=120):
+            captured.update({
+                "url": url,
+                "capability": capability,
+                "message_parts": message_parts,
+                "metadata": metadata,
+                "timeout": timeout,
+            })
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"parts": [{"text": json.dumps({"ok": True, "fallback": False})}]}],
+                }
+            }
+
+        monkeypatch.setattr("agents.team_lead.tools._resolve_agent_url", lambda *args: "http://scm:8020")
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", fake_dispatch_sync)
+
+        result = SCMAddPRInlineComment().execute_sync(
+            repo_url="https://github.com/fihtony/english-study-hub",
+            pr_number=93,
+            file_path="src/App.jsx",
+            line=17,
+            comment="[HIGH] Fix this.",
+            commit_id="abc123",
+            task_id="task-team-lead",
+        )
+
+        assert json.loads(result.output) == {"ok": True, "fallback": False}
+        assert captured["url"] == "http://scm:8020"
+        assert captured["capability"] == "scm.pr.comment.inline"
+        assert captured["message_parts"] == [{"text": "[HIGH] Fix this."}]
+        assert captured["metadata"] == {
+            "repoUrl": "https://github.com/fihtony/english-study-hub",
+            "prNumber": 93,
+            "filePath": "src/App.jsx",
+            "line": 17,
+            "comment": "[HIGH] Fix this.",
+            "commitId": "abc123",
+            "taskId": "task-team-lead",
+        }
 
     def test_callback_propagates_screenshot_evidence(self, monkeypatch):
         from agents.team_lead.agent import _send_callback
@@ -1027,19 +1156,56 @@ class TestTeamLeadTools:
 
         payload = json.loads(result.output)
         assert payload["status"] == "completed"
-        assert payload["prNumber"] == 2
-        assert payload["repoUrl"] == "https://example.test/org/repo.git"
-        assert payload["changedFiles"] == ["src/App.jsx"]
-        assert payload["screenshotIncluded"] is True
-        assert payload["screenshotUploaded"] is True
-        assert payload["childServiceUrl"] == "http://launched-web-dev:8050"
-        assert payload["childContainerName"] == "web-dev-task-1234"
-        assert payload["childAgentId"] == "web-dev"
-        assert calls["launch"][0][1] == "task-123"
-        assert calls["dispatch"][0]["url"] == "http://launched-web-dev:8050"
-        assert calls["dispatch"][0]["timeout"] == 3600
-        assert calls["dispatch"][0]["metadata"]["orchestratorTaskId"] == "task-123"
-        assert calls["destroy"] == []
+
+    def test_dispatch_web_dev_propagates_revision_metadata(self, monkeypatch):
+        from agents.team_lead.tools import DispatchWebDev
+
+        calls = []
+
+        class StubRegistryClient:
+            def discover(self, capability):
+                return "http://web-dev:8050"
+
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+
+        def _dispatch_sync(**kwargs):
+            calls.append(kwargs)
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"parts": [{"text": "done"}], "metadata": {}}],
+                }
+            }
+
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
+
+        DispatchWebDev().execute_sync(
+            task_description="Apply requested revision",
+            repo_url="https://github.com/org/repo",
+            repo_path="/tmp/workspace/scm/repo",
+            branch_name="feature/proj-1-task",
+            workspace_path="/tmp/workspace",
+            revision_feedback="Fix the review findings",
+            review_report_path="code-review/review-report-1.json",
+            revision_mode=True,
+            revision_round=2,
+            existing_pr_url="https://github.com/org/repo/pull/42",
+            existing_pr_number=42,
+            existing_branch="feature/proj-1-task",
+            orchestrator_task_id="task-123",
+        )
+
+        metadata = calls[0]["metadata"]
+        assert metadata["revisionFeedback"] == "Fix the review findings"
+        assert metadata["reviewReportPath"] == "code-review/review-report-1.json"
+        assert metadata["revisionMode"] is True
+        assert metadata["revisionRound"] == 2
+        assert metadata["existingPrUrl"] == "https://github.com/org/repo/pull/42"
+        assert metadata["existingPrNumber"] == 42
+        assert metadata["existingBranch"] == "feature/proj-1-task"
 
     def test_dispatch_web_dev_uses_configurable_timeout(self, monkeypatch):
         from agents.team_lead.tools import DispatchWebDev
@@ -1223,3 +1389,14 @@ class TestTeamLeadTools:
         )
 
         assert calls["launch"] == ["task-39c4f352bb20"]
+
+    def test_dispatch_code_review_rejects_artifact_root_workspace(self, monkeypatch):
+        from agents.team_lead.tools import DispatchCodeReview
+
+        monkeypatch.setenv("ARTIFACT_ROOT", "/app/artifacts")
+
+        with pytest.raises(ValueError, match="single task workspace root"):
+            DispatchCodeReview().execute_sync(
+                pr_url="https://example.test/pr/1",
+                workspace_path="/app/artifacts",
+            )

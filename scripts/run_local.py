@@ -25,7 +25,7 @@ from framework.skills import SkillsRegistry
 from framework.plugin import PluginManager
 from framework.agent import AgentServices
 from framework.task_store import InMemoryTaskStore
-from framework.config import load_agent_config
+from framework.config import load_agent_config, validate_startup_config
 from framework.env_utils import load_agent_environment
 from framework.launcher import get_launcher
 from framework.registry_client import RegistryClient
@@ -61,6 +61,19 @@ def create_services(
     runtime_env_required = bool(bootstrap_config.get("runtime_env_required", False))
 
     load_agent_environment(PROJECT_ROOT, agent_id, include_runtime_env=runtime_env_required)
+
+    # Startup consistency check — fail fast on misconfiguration.
+    # Skip credential checks for boundary agents that don't need the shared runtime.
+    try:
+        warnings = validate_startup_config(
+            skip_credential_check=not runtime_env_required,
+            agent_id=agent_id,
+        )
+        for w in warnings:
+            print(f"[{agent_id}] WARNING: {w}")
+    except Exception as exc:  # ConfigValidationError
+        print(f"[{agent_id}] STARTUP VALIDATION FAILED: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     skills_registry = SkillsRegistry(skills_dir)
     skills_registry.load_all()

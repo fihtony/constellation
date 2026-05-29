@@ -14,6 +14,7 @@ RUN apt-get update \
 COPY framework/ /app/framework/
 COPY agents/__init__.py /app/agents/__init__.py
 COPY agents/compass/ /app/agents/compass/
+COPY agents/log_store/ /app/agents/log_store/
 RUN mkdir -p /app/config/permissions /app/config/rules /app/config/workflows
 COPY config/constellation.yaml /app/config/constellation.yaml
 COPY config/rules/ /app/config/rules/
@@ -24,8 +25,7 @@ COPY scripts/run_local.py /app/scripts/run_local.py
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
-    ARTIFACT_ROOT=/app/artifacts \
-    AGENT_RUNTIME=claude-code
+    ARTIFACT_ROOT=/app/artifacts
 
 LABEL constellation.agent_id="compass"
 LABEL constellation.agent_name="Compass Agent"

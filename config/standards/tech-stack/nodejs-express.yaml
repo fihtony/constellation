@@ -1,0 +1,57 @@
+# Node.js Express tech stack standards
+id: nodejs-express-standard
+name: "Node.js Express Project Standard"
+version: "1.0.0"
+applies_to:
+  - development
+  - code-review
+tech_stack:
+  - nodejs
+  - express
+  - node
+
+rules:
+  - id: express-helmet
+    severity: high
+    category: security
+    description: "Use helmet middleware for security headers in all Express applications"
+  - id: express-rate-limit
+    severity: high
+    category: security
+    description: "Apply express-rate-limit middleware to prevent abuse on public endpoints"
+  - id: express-validation
+    severity: high
+    category: express
+    description: "Validate all request bodies, params, and query strings with joi, zod, or express-validator"
+  - id: express-async-errors
+    severity: high
+    category: express
+    description: "Use express-async-errors or wrap async handlers to catch unhandled rejections"
+  - id: express-error-middleware
+    severity: high
+    category: express
+    description: "Implement centralized error handling middleware; never expose stack traces in production"
+  - id: node-env-config
+    severity: high
+    category: nodejs
+    description: "Use dotenv or config package for environment-specific configuration; validate required env vars at startup"
+  - id: node-no-eval
+    severity: critical
+    category: security
+    description: "Never use eval(), Function(), or vm.runInContext with user input"
+  - id: node-sql-injection
+    severity: critical
+    category: security
+    description: "Use parameterized queries with your ORM (Sequelize, Prisma, TypeORM); never concatenate SQL"
+  - id: node-jest-tests
+    severity: medium
+    category: testing
+    description: "Use Jest for unit tests; test all middleware and route handlers"
+  - id: node-supertest-integration
+    severity: medium
+    category: testing
+    description: "Use supertest for API integration tests; cover all HTTP methods and error cases"
+  - id: node-no-sync-io
+    severity: medium
+    category: nodejs
+    description: "Avoid synchronous I/O (fs.readFileSync, etc.) in request handlers; use async alternatives"

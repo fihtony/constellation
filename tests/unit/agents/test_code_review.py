@@ -13,6 +13,7 @@ from agents.code_review.nodes import (
     review_security,
     review_tests,
     review_requirements,
+    review_ui_design,
     generate_report,
     _parse_issue_list,
 )
@@ -226,6 +227,16 @@ class TestLoadPrContext:
         assert result["changed_files"] == []
         assert result["pr_description"] == ""
 
+    async def test_rejects_shared_artifact_root_workspace(self, monkeypatch):
+        monkeypatch.setenv("ARTIFACT_ROOT", "/app/artifacts")
+
+        with pytest.raises(RuntimeError, match="single task workspace root"):
+            await load_pr_context({
+                "metadata": {
+                    "workspacePath": "/app/artifacts",
+                }
+            })
+
     async def test_writes_review_start_checkpoint(self, tmp_path):
         state = {
             "metadata": {
@@ -238,10 +249,11 @@ class TestLoadPrContext:
 
         await load_pr_context(state)
 
-        checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-start.json"
+        checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-start-1.json"
         assert checkpoint_file.exists()
 
-    async def test_loads_workspace_boundary_artifacts_and_latest_self_assessment(self, tmp_path):
+    async def test_loads_workspace_boundary_artifacts_and_latest_self_assessment(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CODE_REVIEW_INPUT_WAIT_SECONDS", "0")
         workspace_path = tmp_path / "task-123"
         jira_dir = workspace_path / "jira" / "PROJ-123"
         jira_dir.mkdir(parents=True)
@@ -293,7 +305,7 @@ class TestLoadPrContext:
         assert "web-dev/pr-evidence.json" in result["checked_artifacts"]
         assert "web-dev/self-assessment-2.json" in result["checked_artifacts"]
         assert all(not path.startswith("code-review/") for path in result["checked_artifacts"])
-        assert (workspace_path / "code-review" / "review-checkpoints" / "review-start.json").exists()
+        assert (workspace_path / "code-review" / "review-checkpoints" / "review-start-1.json").exists()
 
     async def test_forwards_parent_supplied_child_permissions_to_scm_fallbacks(self, monkeypatch):
         captured: list[dict] = []
@@ -578,6 +590,64 @@ class TestReviewRequirements:
         result = await review_requirements(state)
         assert len(result["requirement_gaps"]) == 1
 
+    async def test_requirement_review_includes_standards_and_previous_issue_context(self):
+        captured = {}
+
+        class _Runtime:
+            def run(self, prompt, **kw):
+                captured["prompt"] = prompt
+                return {"raw_response": "[]"}
+
+        state = {
+            "_runtime": _Runtime(),
+            "pr_diff": "+ code",
+            "original_requirements": "AC-1: keep login secure",
+            "standards_text": "STANDARD BLOCK",
+            "previous_issues": [{
+                "severity": "high",
+                "file": "src/auth.ts",
+                "message": "Token persisted insecurely",
+            }],
+        }
+
+        await review_requirements(state)
+
+        assert "STANDARD BLOCK" in captured["prompt"]
+        assert "must validate these first before the full review" in captured["prompt"]
+
+
+class TestReviewUiDesign:
+
+    async def test_ui_review_includes_standards_and_previous_issue_context(self):
+        captured = {}
+
+        class _Runtime:
+            def run(self, prompt, **kw):
+                captured["prompt"] = prompt
+                return {"raw_response": "[]"}
+
+        state = {
+            "_runtime": _Runtime(),
+            "pr_diff": "+ <div className=\"hero\" />",
+            "changed_files": ["src/Hero.tsx"],
+            "pr_description": "Update UI layout",
+            "standards_text": "STANDARD BLOCK",
+            "previous_issues": [{
+                "severity": "critical",
+                "file": "src/Hero.tsx",
+                "message": "Primary CTA missing",
+            }],
+            "design_context": {
+                "spec_markdown": "# Hero",
+                "design_html": "<main>hero</main>",
+            },
+        }
+
+        await review_ui_design(state)
+
+        assert "STANDARD BLOCK" in captured["prompt"]
+        assert "must validate these first before the full review" in captured["prompt"]
+
 
 class TestGenerateReport:
 
@@ -668,7 +738,7 @@ class TestGenerateReport:
 
         result = await generate_report(state)
 
-        checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-summary.json"
+        checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-summary-1.json"
         assert checkpoint_file.exists()
         assert "jira/PROJ-123/ticket.json" in result["checked_artifacts"]
         assert "ui-design/stitch/DESIGN.md" in result["checked_artifacts"]
@@ -692,6 +762,20 @@ class TestGenerateReport:
 
         assert result["verdict"] == "rejected"
         assert result["severity_levels"]["high"] == 1
+
+    async def test_large_single_file_change_adds_warning(self):
+        large_hunk = "\n".join(["+ line"] * 2001)
+        state = {
+            "quality_issues": [],
+            "security_issues": [],
+            "test_issues": [],
+            "requirement_gaps": [],
+            "pr_diff": "diff --git a/src/Big.ts b/src/Big.ts\n--- a/src/Big.ts\n+++ b/src/Big.ts\n" + large_hunk,
+        }
+
+        result = await generate_report(state)
+
+        assert any(issue.get("category") == "large-change" for issue in result["all_comments"])
 
 
 class TestCodeReviewWorkflowExecution:

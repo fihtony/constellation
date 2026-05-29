@@ -184,12 +184,13 @@ class OfficeAgent(BaseAgent):
         from framework.execution_contract import resolve_execution_contract_permission_set
         from framework.permissions import PermissionEngine
         try:
-            _contract, permission_set = resolve_execution_contract_permission_set(
+            contract, permission_set = resolve_execution_contract_permission_set(
                 self.definition.permission_profile,
                 exec_contract,
             )
             self._permission_engine = PermissionEngine(permission_set)
         except Exception as exc:
+            _append_office_log(canonical_task_id, "invalid execution contract", level="ERROR", error=str(exc))
             task_store.fail_task(canonical_task_id, f"Invalid executionContract metadata: {exc}")
             return task_store.get_task_dict(canonical_task_id)
 
@@ -291,6 +292,7 @@ class OfficeAgent(BaseAgent):
                     _send_callback(callback_url, canonical_task_id, result)
             except Exception as exc:
                 logger.exception(f"Office workflow failed: {exc}")
+                _append_office_log(log_task_id, "office workflow failed", level="ERROR", error=str(exc))
                 task_store.fail_task(canonical_task_id, str(exc))
             finally:
                 loop.close()

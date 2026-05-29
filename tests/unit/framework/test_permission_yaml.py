@@ -98,6 +98,21 @@ def test_permission_engine_from_yaml_development_config():
     assert engine.check_scm_write()
 
 
+def test_permission_engine_from_yaml_web_dev_config_allows_jira_list_comments():
+    """The real web-dev permission profile should allow jira_list_comments."""
+    from framework.permissions import PermissionEngine
+
+    config_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "config", "permissions", "web-dev.yaml"
+    )
+    config_path = os.path.normpath(config_path)
+    if not os.path.exists(config_path):
+        pytest.skip("web-dev.yaml not found")
+
+    engine = PermissionEngine.from_yaml(config_path)
+    assert engine.check_tool("jira_list_comments")
+
+
 def test_permission_engine_from_yaml_missing_file():
     """from_yaml() raises FileNotFoundError for a missing path."""
     from framework.permissions import PermissionEngine

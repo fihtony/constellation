@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from shutil import which
 from typing import Any
 
 
@@ -93,6 +94,10 @@ _ENV_OVERRIDES: dict[str, str] = {
     "OPENAI_MODEL": "runtime.model",
     "REGISTRY_URL": "registry.url",
     "CONTAINER_RUNTIME": "container.runtime",
+    # --- boundary backend selectors (global, placed in config/.env) ---
+    "JIRA_BACKEND": "boundary.jira.backend",
+    "SCM_BACKEND": "boundary.scm.backend",
+    "UI_DESIGN_DEFAULT_PROVIDER": "boundary.ui_design.default_provider",
     # --- CONSTELLATION-prefixed (higher priority) ---
     "CONSTELLATION_RUNTIME_BACKEND": "runtime.backend",
     "CONSTELLATION_RUNTIME_MODEL": "runtime.model",
@@ -261,3 +266,261 @@ def build_agent_definition_from_config(
         "config": data,
         "launch_spec": data.get("launch_spec") or data.get("launchSpec"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Boundary config helpers
+# ---------------------------------------------------------------------------
+
+def get_boundary_backend(
+    domain: str,
+    project_root: str | Path | None = None,
+) -> str:
+    """Return the configured backend for a boundary domain.
+
+    Resolution order (last-write-wins):
+    1. ``config/constellation.yaml``  boundary.<domain>.backend  (or default_provider)
+    2. Environment variable (``JIRA_BACKEND``, ``SCM_BACKEND``, ``UI_DESIGN_DEFAULT_PROVIDER``)
+
+    Parameters
+    ----------
+    domain:
+        One of ``'jira'``, ``'scm'``, ``'ui_design'``.
+    """
+    cfg = load_global_config(project_root)
+    key_map = {
+        "jira": ("boundary.jira.backend", "mcp"),
+        "scm": ("boundary.scm.backend", "github-mcp"),
+        "ui_design": ("boundary.ui_design.default_provider", "stitch"),
+    }
+    if domain not in key_map:
+        raise ValueError(f"Unknown boundary domain: {domain!r}. Expected: jira, scm, ui_design")
+    config_path, default = key_map[domain]
+    return cfg.get(config_path, default)
+
+
+# ---------------------------------------------------------------------------
+# Startup validation
+# ---------------------------------------------------------------------------
+
+class ConfigValidationError(Exception):
+    """Raised when startup configuration is inconsistent or incomplete."""
+
+
+# Supported values for global selectors. Keep this in sync with
+# config/constellation.yaml comments and config/.env.example.
+_SUPPORTED_SELECTOR_VALUES: dict[str, tuple[str, ...]] = {
+    "JIRA_BACKEND": ("mcp", "rest"),
+    "SCM_BACKEND": ("bitbucket", "github-rest", "github-mcp"),
+    "UI_DESIGN_DEFAULT_PROVIDER": ("stitch", "figma"),
+    "AGENT_RUNTIME": ("claude-code", "copilot-cli", "codex-cli", "connect-agent"),
+    "CONTAINER_RUNTIME": ("docker", "rancher"),
+}
+
+_RUNTIME_EXECUTABLES: dict[str, tuple[str, ...]] = {
+    "claude-code": ("claude", "claude-code"),
+    "copilot-cli": ("copilot-cli", "gh"),
+    "codex-cli": ("codex", "codex-cli"),
+}
+
+
+# Keys that are global deployment selectors and must NOT be redefined in
+# agent-level .env files.
+_SHARED_SELECTOR_KEYS: frozenset[str] = frozenset({
+    "JIRA_BACKEND",
+    "SCM_BACKEND",
+    "UI_DESIGN_DEFAULT_PROVIDER",
+    "AGENT_RUNTIME",
+    "AGENT_MODEL",
+    "CONTAINER_RUNTIME",
+})
+
+
+def _check_agent_env_leakage(
+    agent_id: str,
+    project_root: Path,
+) -> list[str]:
+    """Return warnings for shared selector keys found in an agent-level .env file."""
+    agent_dir = agent_id.replace("-", "_")
+    agent_env = project_root / "agents" / agent_dir / ".env"
+    if not agent_env.is_file():
+        return []
+    warnings: list[str] = []
+    with open(agent_env, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip()
+            if key in _SHARED_SELECTOR_KEYS:
+                warnings.append(
+                    f"Shared selector key {key!r} is defined in agents/{agent_dir}/.env "
+                    f"but should only be in config/.env. Remove it from the agent-level "
+                    f"file to avoid configuration conflicts."
+                )
+    return warnings
+
+
+def _runtime_executable_available(runtime: str) -> bool:
+    """Return True when the configured runtime has a matching executable in PATH."""
+    candidates = _RUNTIME_EXECUTABLES.get(runtime, ())
+    if not candidates:
+        return True
+    return any(which(candidate) for candidate in candidates)
+
+
+def validate_startup_config(
+    project_root: str | Path | None = None,
+    *,
+    skip_credential_check: bool = False,
+    agent_id: str | None = None,
+) -> list[str]:
+    """Validate the merged configuration for consistency.
+
+    Performs fail-fast checks so misconfiguration is caught at startup rather
+    than at first runtime call.
+
+    Parameters
+    ----------
+    project_root:
+        Project root directory.  Auto-detected if not provided.
+    skip_credential_check:
+        When True, skip checks that require credentials to be present in the
+        environment (useful for boundary agents that don't use shared runtime).
+    agent_id:
+        When provided, also checks the agent-level .env for leaked shared
+        selector keys and returns warnings for each one found.
+
+    Returns
+    -------
+    list[str]
+        Empty list on success.  Non-empty list of warning strings for
+        non-fatal issues (e.g., optional providers missing credentials).
+
+    Raises
+    ------
+    ConfigValidationError
+        On fatal configuration errors (conflicting backend/URL, missing
+        required credentials).
+    """
+    cfg = load_global_config(project_root)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # ------------------------------------------------------------------
+    # Shared selector values
+    # ------------------------------------------------------------------
+    jira_backend = str(cfg.get("boundary.jira.backend", "mcp")).strip().lower()
+    if jira_backend not in _SUPPORTED_SELECTOR_VALUES["JIRA_BACKEND"]:
+        errors.append(
+            f"JIRA_BACKEND={jira_backend!r} is not valid. "
+            "Supported values: mcp | rest."
+        )
+
+    scm_backend = str(cfg.get("boundary.scm.backend", "github-mcp")).strip().lower()
+    if scm_backend not in _SUPPORTED_SELECTOR_VALUES["SCM_BACKEND"]:
+        errors.append(
+            f"SCM_BACKEND={scm_backend!r} is not valid. "
+            "Supported values: bitbucket | github-rest | github-mcp."
+        )
+
+    ui_provider = str(cfg.get("boundary.ui_design.default_provider", "stitch")).strip().lower()
+    if ui_provider not in _SUPPORTED_SELECTOR_VALUES["UI_DESIGN_DEFAULT_PROVIDER"]:
+        errors.append(
+            f"UI_DESIGN_DEFAULT_PROVIDER={ui_provider!r} is not valid. "
+            "Supported values: stitch | figma."
+        )
+
+    runtime = str(cfg.get("runtime.backend", "claude-code")).strip().lower()
+    if runtime not in _SUPPORTED_SELECTOR_VALUES["AGENT_RUNTIME"]:
+        errors.append(
+            f"AGENT_RUNTIME={runtime!r} is not valid. "
+            "Supported values: claude-code | copilot-cli | codex-cli | connect-agent."
+        )
+
+    # ------------------------------------------------------------------
+    # SCM backend vs URL consistency
+    # ------------------------------------------------------------------
+    scm_base_url = os.environ.get("SCM_BASE_URL", "").lower().strip()
+
+    if scm_base_url:
+        if scm_backend == "bitbucket" and "github.com" in scm_base_url:
+            errors.append(
+                f"SCM_BACKEND=bitbucket but SCM_BASE_URL points to GitHub ({scm_base_url!r}). "
+                "Set SCM_BACKEND=github-rest or github-mcp, or correct SCM_BASE_URL."
+            )
+        if scm_backend in ("github-rest", "github-mcp") and any(
+            pat in scm_base_url for pat in ("bitbucket.", ".bitbucket.")
+        ):
+            errors.append(
+                f"SCM_BACKEND={scm_backend!r} but SCM_BASE_URL points to Bitbucket ({scm_base_url!r}). "
+                "Set SCM_BACKEND=bitbucket, or correct SCM_BASE_URL."
+            )
+
+    # ------------------------------------------------------------------
+    # UI Design provider vs credentials
+    # ------------------------------------------------------------------
+    if not skip_credential_check:
+        if ui_provider == "figma" and not os.environ.get("FIGMA_TOKEN", "").strip():
+            errors.append(
+                "UI_DESIGN_DEFAULT_PROVIDER=figma but FIGMA_TOKEN is not set. "
+                "Set FIGMA_TOKEN in agents/ui_design/.env."
+            )
+        if ui_provider == "stitch" and not os.environ.get("STITCH_API_KEY", "").strip():
+            warnings.append(
+                "UI_DESIGN_DEFAULT_PROVIDER=stitch but STITCH_API_KEY is not set. "
+                "Set STITCH_API_KEY in agents/ui_design/.env if you use UI design capabilities."
+            )
+
+    # ------------------------------------------------------------------
+    # Agentic runtime vs credentials
+    # ------------------------------------------------------------------
+    if not skip_credential_check:
+        if runtime in _RUNTIME_EXECUTABLES and not _runtime_executable_available(runtime):
+            candidates = " | ".join(_RUNTIME_EXECUTABLES[runtime])
+            errors.append(
+                f"AGENT_RUNTIME={runtime!r} but no matching executable is available in PATH "
+                f"({candidates}). Install the runtime CLI in the host/container image, "
+                "or switch AGENT_RUNTIME to a runtime that is installed."
+            )
+        if runtime == "claude-code":
+            if not os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip():
+                errors.append(
+                    "AGENT_RUNTIME=claude-code but ANTHROPIC_AUTH_TOKEN is not set. "
+                    "Set ANTHROPIC_AUTH_TOKEN in config/.env."
+                )
+        elif runtime == "connect-agent":
+            # CONNECT_AGENT_URL has a valid runtime default, so missing is only a warning
+            if not os.environ.get("CONNECT_AGENT_URL", "").strip():
+                warnings.append(
+                    "AGENT_RUNTIME=connect-agent and CONNECT_AGENT_URL is not set; "
+                    "runtime default will be used (http://localhost:1288 or container equivalent)."
+                )
+        elif runtime == "copilot-cli":
+            if not os.environ.get("COPILOT_GITHUB_TOKEN", "").strip():
+                errors.append(
+                    "AGENT_RUNTIME=copilot-cli but COPILOT_GITHUB_TOKEN is not set. "
+                    "Set COPILOT_GITHUB_TOKEN in config/.env."
+                )
+
+    # ------------------------------------------------------------------
+    # Container runtime
+    # ------------------------------------------------------------------
+    container_runtime = cfg.get("container.runtime", "docker")
+    if container_runtime not in ("docker", "rancher"):
+        errors.append(
+            f"CONTAINER_RUNTIME={container_runtime!r} is not valid. "
+            "Supported values: docker | rancher."
+        )
+
+    # ------------------------------------------------------------------
+    # Shared selector leakage in agent-level .env
+    # ------------------------------------------------------------------
+    if agent_id:
+        root = Path(project_root) if project_root else _find_project_root()
+        warnings.extend(_check_agent_env_leakage(agent_id, root))
+
+    if errors:
+        raise ConfigValidationError("\n".join(errors))
+
+    return warnings

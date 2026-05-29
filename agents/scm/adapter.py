@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import time
+from urllib.parse import urlparse
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 from framework.boundary_permissions import branch_scope, enforce_boundary_permission
@@ -29,6 +30,19 @@ scm_definition = AgentDefinition(
     workflow=None,
     tools=[],
 )
+
+
+def _parse_repo_coordinates(repo_url: str) -> tuple[str, str]:
+    parsed = urlparse(repo_url)
+    if "bitbucket" in parsed.netloc.lower():
+        from agents.scm.client import _parse_bb_project_repo
+
+        _, project, repo = _parse_bb_project_repo(repo_url)
+        return project, repo
+    path_parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(path_parts) >= 2:
+        return path_parts[0], path_parts[1].rstrip(".git")
+    return "", ""
 
 
 def _is_retryable_clone_dir_error(stderr_text: str) -> bool:
@@ -61,6 +75,12 @@ _SCM_CAPABILITY_RULES: dict[str, dict[str, object]] = {
     "scm.pr.diff": {"tools": ["scm_get_pr_diff"], "action": "pr.get"},
     "scm.pr.comment": {
         "tools": ["scm_add_pr_comment"],
+        "action": "pr.comment",
+        "requires_scm_write": True,
+        "scope": "self",
+    },
+    "scm.pr.comment.inline": {
+        "tools": ["scm_add_pr_inline_comment"],
         "action": "pr.comment",
         "requires_scm_write": True,
         "scope": "self",
@@ -136,9 +156,9 @@ class SCMAgentAdapter(BaseAgent):
     def _get_client(self):
         if self._scm_client:
             return self._scm_client
-        from agents.scm.client import create_scm_client
+        from agents.scm.client import create_scm_client, _get_scm_backend_from_config
         base_url = os.environ.get("SCM_BASE_URL", "")
-        backend = os.environ.get("SCM_BACKEND", "")
+        backend = _get_scm_backend_from_config()
         # Auto-select github-mcp for GitHub URLs when no explicit backend is set
         if not backend and "github" in base_url.lower():
             backend = "github-mcp"
@@ -188,6 +208,10 @@ class SCMAgentAdapter(BaseAgent):
             if "/" in text:
                 parts = text.strip().split("/", 1)
                 project, repo = parts[0], parts[1]
+            else:
+                project, repo = _parse_repo_coordinates(
+                    str(meta.get("repoUrl") or meta.get("repo_url") or "")
+                )
 
         if capability in ("scm.repo.inspect", "scm.repo.get"):
             data, status = client.get_repo(project, repo)
@@ -271,6 +295,27 @@ class SCMAgentAdapter(BaseAgent):
             comment_text = meta.get("comment") or text.strip()
             data, status = client.add_pr_comment(project, repo, pr_id, comment_text)
             return {"comment": data, "status": status}
+
+        if capability == "scm.pr.comment.inline":
+            pr_id = meta.get("prId") or meta.get("prNumber") or ""
+            comment_text = meta.get("comment") or text.strip()
+            file_path = meta.get("filePath") or meta.get("file_path") or ""
+            line = meta.get("line") or 0
+            commit_id = meta.get("commitId") or meta.get("commit_id") or ""
+            data, status = client.add_pr_inline_comment(
+                project,
+                repo,
+                pr_id,
+                file_path,
+                int(line or 0),
+                comment_text,
+                commit_id=commit_id,
+            )
+            return {
+                "comment": data,
+                "status": status,
+                "fallback": bool(data.get("fallback", False)) if isinstance(data, dict) else False,
+            }
 
         if capability == "scm.pr.image.upload":
             pr_id = meta.get("prId") or meta.get("prNumber") or 0

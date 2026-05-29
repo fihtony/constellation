@@ -102,6 +102,40 @@ def _derive_launch_task_id(
     return ""
 
 
+def _validate_task_workspace_root(workspace_path: str, agent_name: str) -> None:
+    workspace = (workspace_path or "").strip()
+    if not workspace:
+        return
+    artifact_root = os.path.abspath(os.environ.get("ARTIFACT_ROOT", "artifacts"))
+    if os.path.abspath(workspace) == artifact_root:
+        raise ValueError(
+            f"{agent_name} requires a single task workspace root, not the shared ARTIFACT_ROOT directory"
+        )
+
+
+def _dispatch_boundary_capability(
+    *,
+    url: str,
+    capability: str,
+    text: str,
+    metadata: dict[str, Any],
+    timeout: int = 120,
+) -> dict[str, Any]:
+    from framework.a2a.client import dispatch_sync
+
+    result = dispatch_sync(
+        url=url,
+        capability=capability,
+        message_parts=[{"text": text}],
+        metadata=metadata,
+        timeout=timeout,
+    )
+    task = result.get("task", result)
+    if _task_state(task) != "TASK_STATE_COMPLETED":
+        return {"error": _task_error(task, f"{capability} failed")}
+    return _first_artifact_json(task.get("artifacts", []))
+
+
 def _dispatch_via_launcher(
     definition: dict[str, Any],
     *,
@@ -387,6 +421,198 @@ class CloneRepo(BaseTool):
 
 
 # ---------------------------------------------------------------------------
+# Tool: jira_comment
+# ---------------------------------------------------------------------------
+
+class JiraComment(BaseTool):
+    """Add a Jira comment via the Jira boundary agent."""
+
+    name = "jira_comment"
+    description = "Add a comment to a Jira ticket via the Jira Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "ticket_key": {
+                "type": "string",
+                "description": "Jira ticket key, e.g. PROJ-123.",
+            },
+            "comment": {
+                "type": "string",
+                "description": "Comment body to add to the ticket.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Caller task ID for log correlation (optional).",
+            },
+        },
+        "required": ["ticket_key", "comment"],
+    }
+
+    def execute_sync(
+        self,
+        ticket_key: str = "",
+        comment: str = "",
+        task_id: str = "",
+        **_: Any,
+    ) -> ToolResult:
+        jira_url = _resolve_agent_url("JIRA_AGENT_URL", "jira_agent_url", "http://jira:8010", "jira.comment.add")
+        if not jira_url:
+            return ToolResult(output=json.dumps({"error": "No registered Jira instance was found in the registry.", "ticketKey": ticket_key}))
+        try:
+            metadata: dict[str, Any] = {"ticketKey": ticket_key, "comment": comment}
+            if task_id:
+                metadata["taskId"] = task_id
+            payload = _dispatch_boundary_capability(
+                url=jira_url,
+                capability="jira.comment.add",
+                text=comment,
+                metadata=metadata,
+            )
+            return ToolResult(output=json.dumps(payload))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"error": str(exc), "ticketKey": ticket_key}))
+
+
+# ---------------------------------------------------------------------------
+# Tool: jira_transition
+# ---------------------------------------------------------------------------
+
+class JiraTransition(BaseTool):
+    """Transition a Jira ticket via the Jira boundary agent."""
+
+    name = "jira_transition"
+    description = "Transition a Jira ticket to a new status via the Jira Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "ticket_key": {
+                "type": "string",
+                "description": "Jira ticket key, e.g. PROJ-123.",
+            },
+            "transition_name": {
+                "type": "string",
+                "description": "Human-readable transition name.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Caller task ID for log correlation (optional).",
+            },
+        },
+        "required": ["ticket_key", "transition_name"],
+    }
+
+    def execute_sync(
+        self,
+        ticket_key: str = "",
+        transition_name: str = "",
+        task_id: str = "",
+        **_: Any,
+    ) -> ToolResult:
+        jira_url = _resolve_agent_url("JIRA_AGENT_URL", "jira_agent_url", "http://jira:8010", "jira.ticket.transition")
+        if not jira_url:
+            return ToolResult(output=json.dumps({"error": "No registered Jira instance was found in the registry.", "ticketKey": ticket_key}))
+        try:
+            metadata: dict[str, Any] = {"ticketKey": ticket_key, "transitionName": transition_name}
+            if task_id:
+                metadata["taskId"] = task_id
+            payload = _dispatch_boundary_capability(
+                url=jira_url,
+                capability="jira.ticket.transition",
+                text=transition_name,
+                metadata=metadata,
+            )
+            return ToolResult(output=json.dumps(payload))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"error": str(exc), "ticketKey": ticket_key}))
+
+
+# ---------------------------------------------------------------------------
+# Tool: scm_add_pr_inline_comment
+# ---------------------------------------------------------------------------
+
+class SCMAddPRInlineComment(BaseTool):
+    """Post an inline PR review comment via the SCM boundary agent."""
+
+    name = "scm_add_pr_inline_comment"
+    description = "Post an inline review comment on a PR diff line via the SCM Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {
+                "type": "string",
+                "description": "Full repository URL.",
+            },
+            "pr_number": {
+                "type": "integer",
+                "description": "Pull request number.",
+            },
+            "file_path": {
+                "type": "string",
+                "description": "Path of the file to comment on (relative to repo root).",
+            },
+            "line": {
+                "type": "integer",
+                "description": "Line number in the file to comment on.",
+            },
+            "comment": {
+                "type": "string",
+                "description": "Markdown comment body.",
+            },
+            "commit_id": {
+                "type": "string",
+                "description": "Commit SHA to attach comment to (optional).",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Caller task ID for log correlation (optional).",
+            },
+        },
+        "required": ["repo_url", "pr_number", "file_path", "line", "comment"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        pr_number: int = 0,
+        file_path: str = "",
+        line: int = 0,
+        comment: str = "",
+        commit_id: str = "",
+        task_id: str = "",
+        **_: Any,
+    ) -> ToolResult:
+        scm_url = _resolve_agent_url(
+            "SCM_AGENT_URL",
+            "scm_agent_url",
+            "http://scm:8020",
+            "scm.pr.comment.inline",
+        )
+        if not scm_url:
+            return ToolResult(output=json.dumps({"error": "No registered SCM instance was found in the registry.", "repoUrl": repo_url, "prNumber": pr_number}))
+        try:
+            metadata: dict[str, Any] = {
+                "repoUrl": repo_url,
+                "prNumber": pr_number,
+                "filePath": file_path,
+                "line": line,
+                "comment": comment,
+            }
+            if commit_id:
+                metadata["commitId"] = commit_id
+            if task_id:
+                metadata["taskId"] = task_id
+            payload = _dispatch_boundary_capability(
+                url=scm_url,
+                capability="scm.pr.comment.inline",
+                text=comment,
+                metadata=metadata,
+            )
+            return ToolResult(output=json.dumps(payload))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"error": str(exc), "repoUrl": repo_url, "prNumber": pr_number}))
+
+
+# ---------------------------------------------------------------------------
 # Tool: dispatch_web_dev
 # ---------------------------------------------------------------------------
 
@@ -469,6 +695,30 @@ class DispatchWebDev(BaseTool):
                 "type": "string",
                 "description": "Code review rejection reason for revision. Optional.",
             },
+            "review_report_path": {
+                "type": "string",
+                "description": "Relative path to the prior code review report for revision mode. Optional.",
+            },
+            "revision_mode": {
+                "type": "boolean",
+                "description": "Whether the child task is a revision against an existing PR.",
+            },
+            "revision_round": {
+                "type": "integer",
+                "description": "Current revision round number (1-based when revising). Optional.",
+            },
+            "existing_pr_url": {
+                "type": "string",
+                "description": "Existing PR URL to update during revision mode. Optional.",
+            },
+            "existing_pr_number": {
+                "type": "integer",
+                "description": "Existing PR number to update during revision mode. Optional.",
+            },
+            "existing_branch": {
+                "type": "string",
+                "description": "Existing branch name to reuse during revision mode. Optional.",
+            },
             "definition_of_done": {
                 "type": "object",
                 "description": "Acceptance gate criteria (build, tests, PR, screenshot). Optional.",
@@ -476,6 +726,14 @@ class DispatchWebDev(BaseTool):
             "execution_contract": {
                 "type": "object",
                 "description": "Parent-issued execution contract for the Web Dev child agent.",
+            },
+            "child_service_url": {
+                "type": "string",
+                "description": "Existing container service URL to reuse for a revision dispatch (avoids launching a new container). Optional.",
+            },
+            "child_container_name": {
+                "type": "string",
+                "description": "Existing container name matching child_service_url. Returned unchanged in response so dev_agent_session stays consistent. Optional.",
             },
         },
         "required": ["task_description"],
@@ -501,8 +759,16 @@ class DispatchWebDev(BaseTool):
         stitch_screen_name: str = "",
         orchestrator_task_id: str = "",
         revision_feedback: str = "",
+        review_report_path: str = "",
+        revision_mode: bool = False,
+        revision_round: int = 0,
+        existing_pr_url: str = "",
+        existing_pr_number: int = 0,
+        existing_branch: str = "",
         definition_of_done: dict | None = None,
         task_id: str = "",
+        child_service_url: str = "",
+        child_container_name: str = "",
         **_: Any,
     ) -> ToolResult:
         capability = "web-dev.task.execute"
@@ -544,6 +810,18 @@ class DispatchWebDev(BaseTool):
             meta["orchestratorTaskId"] = orchestrator_task_id
         if revision_feedback:
             meta["revisionFeedback"] = revision_feedback
+        if review_report_path:
+            meta["reviewReportPath"] = review_report_path
+        if revision_mode:
+            meta["revisionMode"] = True
+        if revision_round:
+            meta["revisionRound"] = revision_round
+        if existing_pr_url:
+            meta["existingPrUrl"] = existing_pr_url
+        if existing_pr_number:
+            meta["existingPrNumber"] = existing_pr_number
+        if existing_branch:
+            meta["existingBranch"] = existing_branch
         if definition_of_done:
             meta["definitionOfDone"] = definition_of_done
         if task_id:
@@ -557,6 +835,7 @@ class DispatchWebDev(BaseTool):
         if isinstance(permissions, dict):
             meta["permissions"] = permissions
 
+        new_launch = False  # True only when we create a fresh container (destroy on error)
         try:
             from framework.a2a.client import dispatch_sync
             timeout_seconds = _downstream_timeout_seconds("web_dev")
@@ -565,36 +844,65 @@ class DispatchWebDev(BaseTool):
                 task_id=task_id,
                 workspace_path=workspace_path,
             )
-            if _is_per_task_definition(definition):
-                result = _dispatch_via_launcher(
-                    definition,
-                    capability=capability,
-                    launch_task_id=launch_task_id or "web-dev-task",
-                    message_parts=[{"text": task_description}],
-                    metadata=meta,
-                    timeout=timeout_seconds,
-                    preserve_instance=True,
-                )
-                if isinstance(result, dict) and isinstance(result.get("_launch"), dict):
-                    launch_info = dict(result["_launch"])
-            else:
-                web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", capability)
-                if not web_dev_url:
-                    return ToolResult(output=json.dumps({
-                        "status": "error",
-                        "message": "No registered Web Dev instance was found in the registry.",
-                    }))
-                result = dispatch_sync(
-                    url=web_dev_url,
-                    capability=capability,
-                    message_parts=[{"text": task_description}],
-                    metadata=meta,
-                    timeout=timeout_seconds,
-                )
+            # Reuse an existing container when one is provided (revision cycles).
+            # Per architecture spec: Team Lead must NOT launch a new container for
+            # revisions — it sends a new /message:send to the same container.
+            if child_service_url and _is_per_task_definition(definition):
+                try:
+                    result = dispatch_sync(
+                        url=child_service_url,
+                        capability=capability,
+                        message_parts=[{"text": task_description}],
+                        metadata=meta,
+                        timeout=timeout_seconds,
+                    )
+                    agent_id_label = str(definition.get("agent_id") or capability).strip() or capability
+                    result = dict(result)
+                    result["_launch"] = {
+                        "agentId": agent_id_label,
+                        "serviceUrl": child_service_url,
+                        "containerName": child_container_name,
+                    }
+                    launch_info = result["_launch"]
+                except Exception as reuse_exc:
+                    # Container is gone — fall through to launch a fresh one.
+                    print(f"[team-lead] Existing web-dev container unreachable ({reuse_exc}), launching new one.")
+                    child_service_url = ""
+                    child_container_name = ""
+
+            if not child_service_url:
+                if _is_per_task_definition(definition):
+                    result = _dispatch_via_launcher(
+                        definition,
+                        capability=capability,
+                        launch_task_id=launch_task_id or "web-dev-task",
+                        message_parts=[{"text": task_description}],
+                        metadata=meta,
+                        timeout=timeout_seconds,
+                        preserve_instance=True,
+                    )
+                    new_launch = True
+                    if isinstance(result, dict) and isinstance(result.get("_launch"), dict):
+                        launch_info = dict(result["_launch"])
+                else:
+                    web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", capability)
+                    if not web_dev_url:
+                        return ToolResult(output=json.dumps({
+                            "status": "error",
+                            "message": "No registered Web Dev instance was found in the registry.",
+                        }))
+                    result = dispatch_sync(
+                        url=web_dev_url,
+                        capability=capability,
+                        message_parts=[{"text": task_description}],
+                        metadata=meta,
+                        timeout=timeout_seconds,
+                    )
             task = result.get("task", result)
             task_state = _task_state(task)
             if task_state != "TASK_STATE_COMPLETED":
-                _destroy_launch_instance(launch_info)
+                if new_launch:
+                    _destroy_launch_instance(launch_info)
                 return ToolResult(output=json.dumps({
                     "status": "error",
                     "state": task_state,
@@ -640,7 +948,8 @@ class DispatchWebDev(BaseTool):
                 payload["childAgentId"] = child_agent_id
             return ToolResult(output=json.dumps(payload))
         except Exception as exc:
-            _destroy_launch_instance(launch_info)
+            if new_launch:
+                _destroy_launch_instance(launch_info)
             return ToolResult(output=json.dumps({"status": "error", "message": str(exc)}))
 
 
@@ -726,6 +1035,7 @@ class DispatchCodeReview(BaseTool):
         capability = "review.code.check"
         definition = _capability_definition(capability)
         meta: dict[str, Any] = {}
+        _validate_task_workspace_root(workspace_path, "Code Review")
         if pr_url:
             meta["prUrl"] = pr_url
         if pr_number:
@@ -754,6 +1064,19 @@ class DispatchCodeReview(BaseTool):
         permissions = _.get("permissions") if isinstance(_, dict) else None
         if isinstance(permissions, dict):
             meta["permissions"] = permissions
+        # Pass through fields needed by CR agent (§12.1)
+        _repo_path = _.get("repo_path", "") if isinstance(_, dict) else ""
+        if _repo_path:
+            meta["repoPath"] = _repo_path
+        _review_round = _.get("review_round") if isinstance(_, dict) else None
+        if _review_round:
+            meta["reviewRound"] = _review_round
+        _prev_review = _.get("previous_review_path") if isinstance(_, dict) else None
+        if _prev_review:
+            meta["previousReviewPath"] = _prev_review
+        _tech_stack = _.get("tech_stack") if isinstance(_, dict) else None
+        if _tech_stack:
+            meta["techStack"] = _tech_stack
 
         try:
             from framework.a2a.client import dispatch_sync
@@ -842,6 +1165,9 @@ _TOOLS = [
     FetchJiraTicket(),
     FetchDesign(),
     CloneRepo(),
+    JiraComment(),
+    JiraTransition(),
+    SCMAddPRInlineComment(),
     DispatchWebDev(),
     DispatchCodeReview(),
     RequestClarification(),

@@ -35,8 +35,7 @@ COPY scripts/run_local.py /app/scripts/run_local.py
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
-    ARTIFACT_ROOT=/app/artifacts \
-    AGENT_RUNTIME=claude-code
+    ARTIFACT_ROOT=/app/artifacts
 
 LABEL constellation.agent_id="office"
 LABEL constellation.agent_name="Office Agent"

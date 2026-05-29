@@ -14,6 +14,22 @@ _ISOLATED_RUNTIME_ROOT = os.path.join(tempfile.gettempdir(), "constellation-runt
 _RUNTIME_ENV_FILENAMES = (".runtime.env", ".env")
 
 
+def _normalize_env_value(raw_value: str) -> str:
+    """Normalize a .env value, stripping quotes and trailing inline comments."""
+    value = raw_value.strip()
+    if not value:
+        return ""
+
+    quote = value[0]
+    if quote in {'"', "'"}:
+        if len(value) >= 2 and value[-1] == quote:
+            return value[1:-1]
+        return value.strip(quote)
+
+    value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+    return value
+
+
 def _parse_env_file(path: str) -> dict[str, str]:
     """Parse a simple KEY=VALUE .env file (ignoring comments)."""
     values: dict[str, str] = {}
@@ -26,7 +42,7 @@ def _parse_env_file(path: str) -> dict[str, str]:
                 continue
             key, value = line.split("=", 1)
             key = key.strip()
-            value = value.strip().strip('"').strip("'")
+            value = _normalize_env_value(value)
             if key:
                 values[key] = value
     return values
@@ -88,8 +104,39 @@ def default_openai_base_url() -> str:
     return f"http://{host}:1288/v1"
 
 
+def resolve_connect_agent_url() -> str:
+    """Resolve the Connect Agent base URL (without /v1 suffix).
+
+    Resolution order:
+    1. ``CONNECT_AGENT_URL`` — primary, canonical config key
+    2. ``OPENAI_BASE_URL`` — compatibility alias (strips trailing /v1 if present)
+    3. runtime default based on container detection
+    """
+    explicit = os.environ.get("CONNECT_AGENT_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    # Compatibility alias — honour legacy OPENAI_BASE_URL
+    openai_url = os.environ.get("OPENAI_BASE_URL", "").strip()
+    if openai_url:
+        url = openai_url.rstrip("/")
+        # Strip trailing /v1 so callers get a clean base URL
+        if url.endswith("/v1"):
+            url = url[:-3]
+        return url
+    return default_openai_base_url().rstrip("/v1").rstrip("/")
+
+
 def resolve_openai_base_url() -> str:
-    """Resolve the OpenAI-compatible API base URL."""
+    """Resolve the OpenAI-compatible API base URL (with /v1 suffix).
+
+    Uses ``CONNECT_AGENT_URL`` as the primary source (appending /v1 if
+    needed), falling back to ``OPENAI_BASE_URL`` for compatibility, then the
+    runtime-detected default.
+    """
+    connect_url = os.environ.get("CONNECT_AGENT_URL", "").strip()
+    if connect_url:
+        base = connect_url.rstrip("/")
+        return base if base.endswith("/v1") else f"{base}/v1"
     explicit = os.environ.get("OPENAI_BASE_URL", "").strip()
     if explicit:
         return explicit.rstrip("/")

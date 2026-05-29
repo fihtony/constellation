@@ -1,0 +1,41 @@
+# Company security standard — enterprise security requirements beyond OWASP baseline.
+id: company-security-standard
+name: "Company Security Standard"
+version: "1.0.0"
+applies_to:
+  - development
+  - code-review
+
+rules:
+  - id: auth-httponly-cookies
+    severity: high
+    category: security
+    description: "Authentication tokens must be stored in httpOnly cookies, not localStorage or sessionStorage"
+  - id: cors-strict-origin
+    severity: high
+    category: security
+    description: "CORS must use specific origins; avoid wildcard '*' in production"
+  - id: csp-headers-required
+    severity: medium
+    category: security
+    description: "Content-Security-Policy headers must be configured for all web applications"
+  - id: rate-limiting-api
+    severity: high
+    category: security
+    description: "All public API endpoints must implement rate limiting"
+  - id: no-sensitive-data-in-logs
+    severity: critical
+    category: security
+    description: "Never log PII, credentials, tokens, or session IDs; use structured logging with redaction"
+  - id: dependency-audit
+    severity: medium
+    category: security
+    description: "Run dependency audit before PR; no known high/critical CVEs allowed"
+  - id: xss-output-encoding
+    severity: high
+    category: security
+    description: "All user-generated content must be output-encoded; use framework-provided sanitization (DOMPurify, React JSX escaping)"
+  - id: csrf-protection
+    severity: high
+    category: security
+    description: "All state-changing operations must have CSRF protection (tokens, SameSite cookies, or framework middleware)"

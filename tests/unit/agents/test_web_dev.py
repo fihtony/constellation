@@ -254,6 +254,119 @@ class TestScreenshotRenderChecks:
         with pytest.raises(RuntimeError, match="self_assess failed after 3 cycles"):
             await self_assess(state)
 
+    async def test_self_assess_retries_invalid_schema_same_cycle(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        class _MockRuntime:
+            def __init__(self):
+                self.calls = 0
+                self.prompts = []
+
+            def run(self, prompt, **kw):
+                self.calls += 1
+                self.prompts.append(prompt)
+                if self.calls == 1:
+                    return {"raw_response": json.dumps({"summary": "", "gaps": []})}
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 0.95,
+                            "verdict": "pass",
+                            "gaps": [],
+                            "component_checks": [],
+                            "criteria_checks": [],
+                            "summary": "Looks good.",
+                        }
+                    )
+                }
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/App.jsx"],
+            "implementation_summary": "Implemented the page.",
+            "test_results": {"passed": 4, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        assert runtime.calls == 2
+        assert result["assess_cycles"] == 1
+        assert result["route"] == "pass"
+        assert "previous self-assessment response was invalid" in runtime.prompts[1]
+
+    async def test_self_assess_filters_non_actionable_review_comments(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        report_path = tmp_path / "review-report.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "comments": [
+                        {
+                            "severity": "high",
+                            "file": "src/pages/__tests__/PracticeQuizPage.test.jsx",
+                            "message": "Test file content is truncated in diff - actual test assertions not fully visible for review.",
+                        },
+                        {
+                            "severity": "medium",
+                            "file": "src/pages/PracticeQuizPage.jsx",
+                            "message": "Real actionable issue.",
+                        },
+                        {
+                            "severity": "low",
+                            "category": "large-change",
+                            "message": "Single-file change is very large.",
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        class _MockRuntime:
+            def __init__(self):
+                self.prompt = ""
+
+            def run(self, prompt, **kw):
+                self.prompt = prompt
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 0.95,
+                            "verdict": "pass",
+                            "gaps": [],
+                            "component_checks": [],
+                            "criteria_checks": [],
+                            "summary": "Looks good.",
+                        }
+                    )
+                }
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "review_report_path": "review-report.json",
+            "revision_feedback": "please address review comments",
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/pages/PracticeQuizPage.jsx"],
+            "implementation_summary": "Adjusted the page.",
+            "test_results": {"passed": 4, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        assert result["route"] == "pass"
+        assert "Real actionable issue." in runtime.prompt
+        assert "truncated in diff" not in runtime.prompt
+        assert "Single-file change is very large." not in runtime.prompt
+
 
 class TestWebDevNodes:
 
@@ -388,6 +501,53 @@ class TestWebDevNodes:
         with patch("agents.web_dev.nodes._call_boundary_tool", side_effect=_boundary):
             result = await setup_workspace(state)
         assert result["branch_name"] == "feature/CSTL-1-landing-page_2"
+
+    async def test_setup_workspace_revision_mode_reuses_existing_branch(self, tmp_path):
+        import subprocess
+        from unittest.mock import patch
+
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        subprocess.run(["git", "init", repo_path], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.email", "test@test.com"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.name", "Test"],
+                       check=True, capture_output=True)
+        (tmp_path / "repo" / "README.md").write_text("hi")
+        subprocess.run(["git", "-C", repo_path, "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "commit", "-m", "init"],
+                       check=True, capture_output=True)
+        default_branch = subprocess.run(
+            ["git", "-C", repo_path, "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", repo_path, "checkout", "-b", "feature/reuse-me"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "checkout", default_branch],
+                       check=True, capture_output=True)
+
+        state = {
+            "_task_id": "t-3",
+            "repo_url": "https://github.com/org/repo",
+            "repo_path": repo_path,
+            "workspace_path": str(tmp_path),
+            "revision_mode": True,
+            "existing_branch": "feature/reuse-me",
+        }
+
+        with patch("agents.web_dev.nodes._call_boundary_tool", side_effect=AssertionError("revision mode should not query remote branch conflicts")):
+            result = await setup_workspace(state)
+
+        current_branch = subprocess.run(
+            ["git", "-C", repo_path, "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert result["branch_name"] == "feature/reuse-me"
+        assert current_branch == "feature/reuse-me"
 
     async def test_analyze_task_uses_analysis(self):
         state = {"analysis": "Implement login feature", "user_request": "Add login"}

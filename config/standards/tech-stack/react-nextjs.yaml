@@ -1,0 +1,73 @@
+# React + Next.js tech stack standards
+id: react-nextjs-standard
+name: "React + Next.js Project Standard"
+version: "1.0.0"
+applies_to:
+  - development
+  - code-review
+tech_stack:
+  - react
+  - nextjs
+  - typescript
+
+rules:
+  - id: react-functional-components
+    severity: medium
+    category: react
+    description: "Prefer functional components with hooks over class components"
+  - id: react-strict-typescript
+    severity: high
+    category: react
+    description: "Use strict TypeScript configuration; avoid 'any' type"
+  - id: react-no-prop-drilling
+    severity: medium
+    category: react
+    description: "Avoid prop drilling beyond 2 levels; use Context, Zustand, or Jotai for shared state"
+  - id: nextjs-server-components
+    severity: medium
+    category: nextjs
+    description: "Use React Server Components where possible (App Router); mark client components explicitly with 'use client'"
+  - id: nextjs-api-validation
+    severity: high
+    category: nextjs
+    description: "API routes must validate inputs with zod, yup, or equivalent schema validation"
+  - id: nextjs-no-unnecessary-client
+    severity: medium
+    category: nextjs
+    description: "Do not use 'use client' unless the component needs browser APIs, event handlers, or React hooks"
+  - id: nextjs-image-optimization
+    severity: low
+    category: nextjs
+    description: "Use next/image for image optimization instead of plain <img> tags"
+  - id: nextjs-link-component
+    severity: low
+    category: nextjs
+    description: "Use next/link for internal navigation instead of <a> tags"
+  - id: react-testing-library
+    severity: medium
+    category: testing
+    description: "Use @testing-library/react for component tests; prefer user-event over fireEvent"
+  - id: react-unit-test-hooks
+    severity: medium
+    category: testing
+    description: "Custom hooks must have dedicated unit tests using renderHook"
+  - id: react-e2e-playwright
+    severity: low
+    category: testing
+    description: "E2E tests should use Playwright for cross-browser testing"
+  - id: react-min-coverage
+    severity: medium
+    category: testing
+    description: "Maintain minimum 80% test coverage for utilities, hooks, and API routes"
+  - id: react-xss-dompurify
+    severity: high
+    category: security
+    description: "Sanitize user-generated HTML content with DOMPurify before rendering with dangerouslySetInnerHTML"
+  - id: nextjs-csrf
+    severity: high
+    category: security
+    description: "Use Next.js built-in CSRF protection or middleware for state-changing API routes"
+  - id: nextjs-auth-middleware
+    severity: high
+    category: security
+    description: "Use middleware.ts for route protection; never rely solely on client-side auth checks"

@@ -1,0 +1,60 @@
+# Base security standards — OWASP Top 10 baseline.
+# Applied to ALL projects regardless of tech stack.
+id: security-base
+name: "Security Baseline (OWASP)"
+version: "1.0.0"
+applies_to:
+  - development
+  - code-review
+
+rules:
+  - id: owasp-a01-broken-access-control
+    severity: critical
+    category: security
+    description: "Enforce least privilege; deny by default; validate access on every request"
+    owasp_ref: "A01:2021"
+  - id: owasp-a02-cryptographic-failures
+    severity: high
+    category: security
+    description: "Use strong encryption (AES-256, RSA-2048+); no deprecated algorithms (MD5, SHA1 for passwords); no plaintext sensitive data transmission"
+    owasp_ref: "A02:2021"
+  - id: owasp-a03-injection
+    severity: critical
+    category: security
+    description: "Use parameterized queries; validate/sanitize all user input; avoid eval/exec with user data"
+    owasp_ref: "A03:2021"
+  - id: owasp-a04-insecure-design
+    severity: high
+    category: security
+    description: "Apply threat modeling; use secure design patterns; validate business logic at server side"
+    owasp_ref: "A04:2021"
+  - id: owasp-a05-security-misconfiguration
+    severity: high
+    category: security
+    description: "Remove default credentials; disable unnecessary features; keep security headers configured"
+    owasp_ref: "A05:2021"
+  - id: owasp-a06-vulnerable-components
+    severity: medium
+    category: security
+    description: "Keep dependencies up to date; remove unused packages; check for known CVEs"
+    owasp_ref: "A06:2021"
+  - id: owasp-a07-auth-failures
+    severity: critical
+    category: security
+    description: "Implement proper authentication; use session management best practices; enforce strong passwords"
+    owasp_ref: "A07:2021"
+  - id: owasp-a08-data-integrity
+    severity: high
+    category: security
+    description: "Verify software and data integrity; use digital signatures; validate CI/CD pipeline integrity"
+    owasp_ref: "A08:2021"
+  - id: owasp-a09-logging-monitoring
+    severity: medium
+    category: security
+    description: "Log security events; implement monitoring and alerting; never log sensitive data (credentials, PII)"
+    owasp_ref: "A09:2021"
+  - id: owasp-a10-ssrf
+    severity: high
+    category: security
+    description: "Validate and sanitize all URLs; restrict outbound network access; use allowlists for remote resource fetching"
+    owasp_ref: "A10:2021"

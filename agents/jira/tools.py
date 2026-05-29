@@ -28,7 +28,8 @@ def _log(task_id: str) -> AgentLogger:
 
 def _get_provider():
     from agents.jira.adapter import _make_provider
-    backend = os.environ.get("JIRA_BACKEND", "rest")
+    from framework.config import get_boundary_backend
+    backend = get_boundary_backend("jira")
     return _make_provider(backend)
 
 

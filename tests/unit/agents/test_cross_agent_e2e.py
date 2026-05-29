@@ -113,6 +113,12 @@ class TestConfigSingleSource:
         result = build_agent_definition_from_config("team-lead")
         assert result.get("permission_profile") == "team-lead"
 
+    def test_build_team_lead_includes_inline_review_tool(self):
+        from framework.config import build_agent_definition_from_config
+
+        result = build_agent_definition_from_config("team-lead")
+        assert "scm_add_pr_inline_comment" in result.get("tools", [])
+
     def test_build_includes_tools_from_yaml(self):
         from framework.config import build_agent_definition_from_config
 

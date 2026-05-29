@@ -28,6 +28,19 @@ _GITHUB_HOST_RE = re.compile(r"github\.com", re.IGNORECASE)
 GITHUB_API_BASE = "https://api.github.com"
 
 
+def _get_scm_backend_from_config() -> str:
+    """Read the SCM backend from the unified config (boundary.scm.backend).
+
+    Falls back to the raw SCM_BACKEND env var for backward compatibility,
+    then returns an empty string if neither is set (let the caller auto-detect).
+    """
+    try:
+        from framework.config import get_boundary_backend
+        return get_boundary_backend("scm").lower().strip()
+    except Exception:
+        return os.environ.get("SCM_BACKEND", "").lower().strip()
+
+
 def _detect_provider(base_url: str) -> str:
     """Auto-detect SCM provider from base URL."""
     host = urlparse(base_url).netloc.lower()
@@ -309,6 +322,57 @@ class BitbucketClient:
             )
             return data, "ok"
         except HTTPError as exc:
+            return {}, f"HTTP {exc.code}"
+        except Exception as exc:
+            return {}, str(exc)
+
+    def add_pr_inline_comment(
+        self,
+        project: str,
+        repo: str,
+        pr_id: str | int,
+        file_path: str,
+        line: int,
+        body: str,
+        commit_id: str = "",
+        side: str = "RIGHT",
+        timeout: int = 15,
+    ) -> tuple[dict, str]:
+        """Add an inline PR comment in Bitbucket Server, falling back to a general comment.
+
+        Bitbucket Server stores inline PR comments under the same comments API
+        using an anchor payload that targets the destination file and line.
+        """
+        del commit_id, side
+        payload = {
+            "text": body,
+            "anchor": {
+                "path": file_path,
+                "line": line,
+                "lineType": "ADDED",
+                "fileType": "TO",
+            },
+        }
+        try:
+            data = self._post(
+                f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments",
+                payload,
+                timeout=timeout,
+            )
+            return {
+                "id": data.get("id"),
+                "body": body,
+                "path": file_path,
+                "line": line,
+                "fallback": False,
+            }, "ok"
+        except HTTPError as exc:
+            if exc.code == 400:
+                fallback_body = f"**{file_path}:{line}**\n\n{body}"
+                result, status = self.add_pr_comment(project, repo, pr_id, fallback_body, timeout)
+                if status == "ok":
+                    result = {**result, "path": file_path, "line": line, "fallback": True}
+                return result, status
             return {}, f"HTTP {exc.code}"
         except Exception as exc:
             return {}, str(exc)
@@ -651,6 +715,76 @@ class GitHubClient:
         except Exception as exc:
             return {}, str(exc)
 
+    def add_pr_inline_comment(
+        self,
+        owner: str,
+        repo: str,
+        pr_id: str | int,
+        file_path: str,
+        line: int,
+        body: str,
+        commit_id: str = "",
+        side: str = "RIGHT",
+        timeout: int = 15,
+    ) -> tuple[dict, str]:
+        """Add an inline review comment to a specific file and line in a PR.
+
+        Uses the GitHub Pull Request Review Comments API:
+        POST /repos/{owner}/{repo}/pulls/{pr_id}/comments
+
+        If commit_id is not provided, the comment targets the HEAD commit
+        of the PR (fetched automatically).
+
+        Falls back to a regular PR comment if the inline comment API fails
+        (e.g. the file/line is not part of the diff).
+        """
+        # Resolve commit_id if not provided
+        if not commit_id:
+            try:
+                info_status, info_body = self._request(
+                    "GET", f"repos/{owner}/{repo}/pulls/{pr_id}", timeout=timeout
+                )
+                if info_status == 200 and isinstance(info_body, dict):
+                    commit_id = info_body.get("head", {}).get("sha", "")
+            except Exception:
+                pass
+
+        payload: dict = {
+            "body": body,
+            "path": file_path,
+            "line": line,
+            "side": side,
+        }
+        if commit_id:
+            payload["commit_id"] = commit_id
+
+        try:
+            status, resp = self._request(
+                "POST",
+                f"repos/{owner}/{repo}/pulls/{pr_id}/comments",
+                payload,
+                timeout=timeout,
+            )
+            if status in (200, 201):
+                return {
+                    "id": resp.get("id"),
+                    "body": body,
+                    "path": file_path,
+                    "line": line,
+                    "fallback": False,
+                }, "ok"
+            # GitHub returns 422 if line is not part of the diff
+            if status == 422:
+                # Fallback: post as regular comment with file/line context
+                fallback_body = f"**{file_path}:{line}**\n\n{body}"
+                result, comment_status = self.add_pr_comment(owner, repo, pr_id, fallback_body, timeout)
+                if comment_status == "ok":
+                    result = {**result, "path": file_path, "line": line, "fallback": True}
+                return result, comment_status
+            return resp if isinstance(resp, dict) else {}, f"http_{status}"
+        except Exception as exc:
+            return {}, str(exc)
+
     def update_pr(
         self,
         owner: str,
@@ -914,7 +1048,7 @@ def create_scm_client(
     """
     resolved_backend = (
         backend
-        or os.environ.get("SCM_BACKEND", "").lower().strip()
+        or _get_scm_backend_from_config()
         or _detect_provider(base_url)
     )
 

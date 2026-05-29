@@ -1,0 +1,53 @@
+# Java Spring Boot tech stack standards
+id: java-spring-standard
+name: "Java Spring Boot Project Standard"
+version: "1.0.0"
+applies_to:
+  - development
+  - code-review
+tech_stack:
+  - java
+  - spring
+  - spring-boot
+
+rules:
+  - id: spring-constructor-injection
+    severity: medium
+    category: spring
+    description: "Prefer constructor injection over field injection; use @RequiredArgsConstructor with Lombok"
+  - id: spring-dto-validation
+    severity: high
+    category: spring
+    description: "Use @Valid and Bean Validation (JSR-380) annotations on all request DTOs"
+  - id: spring-exception-handler
+    severity: high
+    category: spring
+    description: "Use @ControllerAdvice with @ExceptionHandler for consistent error responses"
+  - id: spring-security-config
+    severity: critical
+    category: security
+    description: "Configure Spring Security with method-level authorization; avoid permitAll on sensitive endpoints"
+  - id: spring-sql-injection
+    severity: critical
+    category: security
+    description: "Use JPA/Hibernate parameterized queries or Spring Data repository methods; never concatenate SQL strings"
+  - id: spring-actuator-security
+    severity: high
+    category: security
+    description: "Secure Spring Actuator endpoints; expose only health and info in production"
+  - id: spring-test-slices
+    severity: medium
+    category: testing
+    description: "Use test slices (@WebMvcTest, @DataJpaTest) for focused unit tests; avoid loading full context"
+  - id: spring-integration-test
+    severity: medium
+    category: testing
+    description: "Include integration tests with @SpringBootTest for critical API flows"
+  - id: spring-transaction-management
+    severity: high
+    category: spring
+    description: "Annotate service methods with @Transactional; be explicit about propagation and rollback"
+  - id: spring-logging-slf4j
+    severity: low
+    category: spring
+    description: "Use SLF4J with structured logging; never use System.out.println"

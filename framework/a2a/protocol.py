@@ -7,10 +7,15 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 from framework.errors import InvalidTransitionError
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class TaskState(str, Enum):
@@ -92,6 +97,12 @@ class Task:
     status: TaskStatus = field(default_factory=TaskStatus)
     artifacts: list[Artifact] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
+    created_at: str = field(default_factory=_utcnow_iso)
+    updated_at: str = field(default_factory=_utcnow_iso)
+
+    def touch(self) -> None:
+        """Update ``updated_at`` to the current time."""
+        self.updated_at = _utcnow_iso()
 
     def transition(self, target: TaskState, message: Message | None = None) -> None:
         """Transition to a new state with optional status message."""
@@ -99,6 +110,7 @@ class Task:
         self.status.state = target
         if message:
             self.status.message = message
+        self.touch()
 
     def to_dict(self) -> dict:
         """Serialize to the A2A wire format."""
@@ -123,6 +135,8 @@ class Task:
                     for a in self.artifacts
                 ],
                 "metadata": self.metadata,
+                "createdAt": self.created_at,
+                "updatedAt": self.updated_at,
             }
         }
 
@@ -154,4 +168,6 @@ class Task:
             status=status,
             artifacts=artifacts,
             metadata=td.get("metadata", {}),
+            created_at=td.get("createdAt") or _utcnow_iso(),
+            updated_at=td.get("updatedAt") or _utcnow_iso(),
         )

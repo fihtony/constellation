@@ -34,6 +34,30 @@ _WEB_DEV_AGENT_ID: str = _load_agent_cfg("web-dev").get("agent_id", "web-dev")
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+def _run_review_with_retry(runtime, prompt: str, system_prompt: str, max_tokens: int = 2048,
+                           plugin_manager=None, max_retries: int = 2) -> dict:
+    """Run an LLM review call with retry on timeout/error (§10.2)."""
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            result = runtime.run(prompt, system_prompt=system_prompt, max_tokens=max_tokens,
+                                 plugin_manager=plugin_manager)
+            if result and result.get("raw_response"):
+                return result
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                import time as _t
+                _t.sleep(1)
+                continue
+            break
+    # Return empty result on exhaustion
+    if last_exc:
+        return {"raw_response": "", "error": str(last_exc), "skipped": True}
+    return {"raw_response": "", "skipped": True}
+
+
 def _parse_issue_list(text: str) -> list[dict]:
     """Extract a JSON array of issue objects from LLM response text.
 
@@ -112,6 +136,68 @@ def _review_input_attempts() -> int:
     return max(1, int(wait_seconds / poll_seconds) + 1)
 
 
+def _validate_workspace_path(workspace_path: str) -> None:
+    workspace = (workspace_path or "").strip()
+    if not workspace:
+        return
+    artifact_root = os.path.abspath(os.environ.get("ARTIFACT_ROOT", "artifacts"))
+    if os.path.abspath(workspace) == artifact_root:
+        raise RuntimeError(
+            "workspacePath must point to a single task workspace root, not ARTIFACT_ROOT"
+        )
+
+
+def _build_standards_section(state: dict) -> str:
+    standards_text = state.get("standards_text", "")
+    return f"\n\n{standards_text}\n" if standards_text else ""
+
+
+def _build_previous_issues_section(state: dict) -> str:
+    previous_issues = state.get("previous_issues", [])
+    if not previous_issues:
+        return ""
+    high_crit = [issue for issue in previous_issues if issue.get("severity") in ("high", "critical")]
+    if not high_crit:
+        return ""
+    lines = [
+        f"- [{issue.get('severity')}] {issue.get('file', 'unknown')}: {issue.get('message', '')}"
+        for issue in high_crit[:10]
+    ]
+    return (
+        "\n\nPREVIOUS ROUND HIGH/CRITICAL ISSUES (must validate these first before the full review):\n"
+        "First verify whether each item below is fixed in the current PR. "
+        "After that validation, perform a full review of the current PR and report any new issues.\n"
+        + "\n".join(lines)
+    )
+
+
+def _detect_large_changed_files(pr_diff: str, threshold: int = 2000) -> list[dict[str, Any]]:
+    if not pr_diff:
+        return []
+
+    counts: dict[str, int] = {}
+    current_file = ""
+    for line in pr_diff.splitlines():
+        if line.startswith("diff --git "):
+            match = re.match(r"diff --git a/(.+?) b/(.+)", line)
+            if match:
+                current_file = match.group(2)
+                counts.setdefault(current_file, 0)
+            else:
+                current_file = ""
+            continue
+        if not current_file:
+            continue
+        if (line.startswith("+") or line.startswith("-")) and not line.startswith(("+++", "---")):
+            counts[current_file] = counts.get(current_file, 0) + 1
+
+    return [
+        {"file": file_path, "changed_lines": changed_lines}
+        for file_path, changed_lines in counts.items()
+        if changed_lines > threshold
+    ]
+
+
 def _child_permissions(state: dict) -> dict[str, Any] | None:
     metadata = state.get("metadata", {})
     permissions = metadata.get("permissions")
@@ -166,6 +252,84 @@ def _parse_pr_number(pr_url: str, pr_number: Any) -> int:
     return 0
 
 
+def _get_review_round(state: dict) -> int:
+    """Determine the current review round from metadata or auto-detect from existing reports."""
+    metadata = state.get("metadata", {})
+    explicit_round = metadata.get("reviewRound") or metadata.get("review_round")
+    if explicit_round:
+        try:
+            return max(1, int(explicit_round))
+        except (TypeError, ValueError):
+            pass
+
+    # Auto-detect from existing review-report-<n>.json files
+    workspace_path = metadata.get("workspacePath") or state.get("workspace_path") or ""
+    if workspace_path:
+        review_dir = os.path.join(workspace_path, "code-review")
+        if os.path.isdir(review_dir):
+            existing = [
+                name for name in os.listdir(review_dir)
+                if re.fullmatch(r"review-report-\d+\.json", name)
+            ]
+            if existing:
+                rounds = [int(re.search(r"(\d+)", n).group(1)) for n in existing]
+                return max(rounds) + 1
+    return 1
+
+
+def _persist_diff_to_workspace(workspace_path: str, pr_number: int, review_round: int, diff_text: str, base_sha: str = "", head_sha: str = "") -> str:
+    """Persist PR diff to scm/<pr_number>-<round>/diff.patch and return the relative path."""
+    if not workspace_path or not diff_text:
+        return ""
+    diff_dir = os.path.join(workspace_path, "scm", f"{pr_number}-{review_round}")
+    os.makedirs(diff_dir, exist_ok=True)
+    diff_file = os.path.join(diff_dir, "diff.patch")
+    meta_file = os.path.join(diff_dir, "meta.json")
+    with open(diff_file, "w", encoding="utf-8") as fh:
+        fh.write(diff_text)
+    import time as _time
+    with open(meta_file, "w", encoding="utf-8") as fh:
+        json.dump({
+            "pr_number": pr_number,
+            "round": review_round,
+            "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "diff_size_bytes": len(diff_text.encode("utf-8")),
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+        }, fh, ensure_ascii=False, indent=2)
+    return f"scm/{pr_number}-{review_round}/diff.patch"
+
+
+def _append_agent_log(workspace_path: str, entry: dict) -> None:
+    """Append a JSON-lines entry to code-review/agent.log."""
+    if not workspace_path:
+        return
+    review_dir = os.path.join(workspace_path, "code-review")
+    os.makedirs(review_dir, exist_ok=True)
+    log_file = os.path.join(review_dir, "agent.log")
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    with open(log_file, "a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def _load_previous_review(workspace_path: str, current_round: int) -> list[dict]:
+    """Load issues from the previous round's review report for comparison."""
+    if current_round <= 1 or not workspace_path:
+        return []
+    prev_report_path = os.path.join(
+        workspace_path, "code-review", f"review-report-{current_round - 1}.json"
+    )
+    if not os.path.isfile(prev_report_path):
+        return []
+    try:
+        with open(prev_report_path, encoding="utf-8") as fh:
+            report = json.load(fh)
+        data = report.get("data", report)  # backward compat for old nested format
+        return data.get("comments", []) or data.get("all_comments", []) or []
+    except Exception:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Node implementations
 # ---------------------------------------------------------------------------
@@ -202,6 +366,7 @@ async def load_pr_context(state: dict) -> dict:
         or state.get("context_manifest_path")
         or ""
     )
+    _validate_workspace_path(workspace_path)
     permissions = _child_permissions(state)
 
     if workspace_path:
@@ -307,6 +472,13 @@ async def load_pr_context(state: dict) -> dict:
                 commit_messages = commit_messages or [
                     commit.get("message", "") for commit in info_payload.get("commits", []) if commit.get("message")
                 ]
+                # Extract SHAs for diff metadata
+                head_info = info_payload.get("head", {})
+                base_info = info_payload.get("base", {})
+                if isinstance(head_info, dict):
+                    state.setdefault("head_sha", head_info.get("sha", ""))
+                if isinstance(base_info, dict):
+                    state.setdefault("base_sha", base_info.get("sha", ""))
         except Exception as exc:
             log.warn("scm_get_pr_info fallback failed", error=str(exc))
 
@@ -408,43 +580,73 @@ async def load_pr_context(state: dict) -> dict:
         elif desc:
             original_requirements = desc
 
-    # Write review start log
+    # Determine review round
+    review_round = _get_review_round(state)
+
+    # Persist diff to workspace as scm/<pr>-<round>/diff.patch
+    diff_source = ""
+    if pr_diff and workspace_path and pr_number:
+        diff_source = _persist_diff_to_workspace(
+            workspace_path, pr_number, review_round, pr_diff,
+            base_sha=state.get("base_sha", ""),
+            head_sha=state.get("head_sha", ""),
+        )
+        _record_checked_artifact(checked_artifacts, workspace_path,
+                                 os.path.join(workspace_path, diff_source) if diff_source else "")
+
+    # Load previous round issues for comparison (round 2+)
+    previous_issues = _load_previous_review(workspace_path, review_round)
+
+    # Read repo_path for source context (read-only)
+    repo_path = metadata.get("repoPath") or metadata.get("repo_path") or ""
+    if not repo_path and workspace_path:
+        # Auto-detect repo under scm/ directory
+        scm_dir = os.path.join(workspace_path, "scm")
+        if os.path.isdir(scm_dir):
+            for entry in sorted(os.listdir(scm_dir)):
+                candidate = os.path.join(scm_dir, entry)
+                if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, ".git")):
+                    repo_path = candidate
+                    break
+
+    # Write review start log (agent.log + checkpoint)
     if workspace_path:
         review_dir = os.path.join(workspace_path, "code-review")
         checkpoints_dir = os.path.join(review_dir, "review-checkpoints")
         os.makedirs(review_dir, exist_ok=True)
         os.makedirs(checkpoints_dir, exist_ok=True)
         try:
-            log_file = os.path.join(review_dir, "task-log.json")
-            with open(log_file, "w", encoding="utf-8") as fh:
-                json.dump({
-                    "metadata": {
-                        "agent_id": "code-review",
-                        "step": "load_pr_context",
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    },
-                    "data": {
-                        "pr_url": metadata.get("prUrl", ""),
-                        "changed_files_count": len(changed_files) if isinstance(changed_files, list) else 0,
-                        "has_jira_context": bool(jira_context),
-                        "has_design_context": bool(design_context),
-                        "checked_artifacts": checked_artifacts,
-                    },
-                }, fh, ensure_ascii=False, indent=2)
+            _append_agent_log(workspace_path, {
+                "event": "review_started",
+                "round": review_round,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "pr_url": metadata.get("prUrl", ""),
+                "pr_number": pr_number,
+                "repo_path": repo_path,
+                "diff_source": diff_source,
+                "changed_files_count": len(changed_files) if isinstance(changed_files, list) else 0,
+                "has_jira_context": bool(jira_context),
+                "has_design_context": bool(design_context),
+                "previous_issues_count": len(previous_issues),
+            })
 
-            checkpoint_file = os.path.join(checkpoints_dir, "review-start.json")
+            checkpoint_file = os.path.join(checkpoints_dir, f"review-start-{review_round}.json")
             with open(checkpoint_file, "w", encoding="utf-8") as fh:
                 json.dump({
                     "checkpoint_id": "CP_REVIEW_STARTED",
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "agent_id": "code-review",
+                    "round": review_round,
                     "state": {
                         "pr_url": metadata.get("prUrl", ""),
                         "workspace_path": workspace_path,
+                        "repo_path": repo_path,
+                        "diff_source": diff_source,
                         "context_manifest_path": context_manifest_path,
                         "has_jira_context": bool(jira_context),
                         "has_design_context": bool(design_context),
                         "checked_artifacts": checked_artifacts,
+                        "previous_issues_count": len(previous_issues),
                     },
                 }, fh, ensure_ascii=False, indent=2)
         except OSError:
@@ -456,7 +658,39 @@ async def load_pr_context(state: dict) -> dict:
         changed_files=len(changed_files) if isinstance(changed_files, list) else 0,
         checked_artifacts=len(checked_artifacts),
         has_diff=bool(pr_diff),
+        review_round=review_round,
+        repo_path=repo_path,
     )
+
+    # Diff truncation for large PRs (§5.4)
+    _MAX_DIFF_BYTES = 100 * 1024  # 100KB
+    _MAX_CHANGED_FILES = 50
+    diff_truncated = False
+    manual_review_required = False
+    if pr_diff and len(pr_diff.encode("utf-8", errors="replace")) > _MAX_DIFF_BYTES:
+        pr_diff = pr_diff[:_MAX_DIFF_BYTES] + "\n\n... [DIFF TRUNCATED — exceeds 100KB] ..."
+        diff_truncated = True
+        # Append changed files list for focused review (§5.4 degraded mode)
+        if changed_files:
+            pr_diff += "\n\nChanged files (focus review on these):\n" + "\n".join(f"- {f}" for f in changed_files[:50])
+    if isinstance(changed_files, list) and len(changed_files) > _MAX_CHANGED_FILES:
+        manual_review_required = True
+
+    # Load coding standards for review context
+    standards_text = ""
+    try:
+        from framework.standards_loader import (
+            detect_tech_stack_from_repo,
+            format_standards_for_prompt,
+            load_standards,
+        )
+        tech_stack = metadata.get("tech_stack") or []
+        if not tech_stack and repo_path:
+            tech_stack = detect_tech_stack_from_repo(repo_path)
+        rules = load_standards(tech_stack=tech_stack, agent_role="code-review")
+        standards_text = format_standards_for_prompt(rules, agent_role="code-review")
+    except Exception:
+        pass
 
     return {
         "pr_diff": pr_diff,
@@ -473,6 +707,13 @@ async def load_pr_context(state: dict) -> dict:
         "pr_number": pr_number,
         "checked_artifacts": checked_artifacts,
         "review_input_issues": review_input_issues,
+        "review_round": review_round,
+        "repo_path": repo_path,
+        "diff_source": diff_source,
+        "previous_issues": previous_issues,
+        "diff_truncated": diff_truncated,
+        "manual_review_required": manual_review_required,
+        "standards_text": standards_text,
     }
 
 
@@ -488,12 +729,19 @@ async def review_quality(state: dict) -> dict:
 
     from agents.code_review.prompts import QUALITY_SYSTEM, QUALITY_TEMPLATE
 
+    standards_section = _build_standards_section(state)
+    prev_issues_text = _build_previous_issues_section(state)
+
     prompt = QUALITY_TEMPLATE.format(
         pr_description=state.get("pr_description", "N/A"),
         changed_files=", ".join(state.get("changed_files", [])) or "N/A",
         pr_diff=state.get("pr_diff", ""),
     )
-    result = runtime.run(prompt, system_prompt=QUALITY_SYSTEM, max_tokens=2048,
+    if standards_section:
+        prompt += standards_section
+    if prev_issues_text:
+        prompt += prev_issues_text
+    result = _run_review_with_retry(runtime, prompt, system_prompt=QUALITY_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
     log.info("quality review complete", issues=len(issues))
@@ -513,12 +761,19 @@ async def review_security(state: dict) -> dict:
 
     from agents.code_review.prompts import SECURITY_SYSTEM, SECURITY_TEMPLATE
 
+    standards_section = _build_standards_section(state)
+    prev_issues_text = _build_previous_issues_section(state)
+
     prompt = SECURITY_TEMPLATE.format(
         pr_description=state.get("pr_description", "N/A"),
         changed_files=", ".join(state.get("changed_files", [])) or "N/A",
         pr_diff=state.get("pr_diff", ""),
     )
-    result = runtime.run(prompt, system_prompt=SECURITY_SYSTEM, max_tokens=2048,
+    if standards_section:
+        prompt += standards_section
+    if prev_issues_text:
+        prompt += prev_issues_text
+    result = _run_review_with_retry(runtime, prompt, system_prompt=SECURITY_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
     log.info("security review complete", issues=len(issues))
@@ -538,12 +793,19 @@ async def review_tests(state: dict) -> dict:
 
     from agents.code_review.prompts import TESTS_SYSTEM, TESTS_TEMPLATE
 
+    standards_section = _build_standards_section(state)
+    prev_issues_text = _build_previous_issues_section(state)
+
     prompt = TESTS_TEMPLATE.format(
         pr_description=state.get("pr_description", "N/A"),
         changed_files=", ".join(state.get("changed_files", [])) or "N/A",
         pr_diff=state.get("pr_diff", ""),
     )
-    result = runtime.run(prompt, system_prompt=TESTS_SYSTEM, max_tokens=2048,
+    if standards_section:
+        prompt += standards_section
+    if prev_issues_text:
+        prompt += prev_issues_text
+    result = _run_review_with_retry(runtime, prompt, system_prompt=TESTS_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
     log.info("test review complete", issues=len(issues))
@@ -569,6 +831,8 @@ async def review_requirements(state: dict) -> dict:
     from agents.code_review.prompts import REQUIREMENTS_SYSTEM, REQUIREMENTS_TEMPLATE
 
     jira_ctx = state.get("jira_context", {})
+    standards_section = _build_standards_section(state)
+    prev_issues_text = _build_previous_issues_section(state)
     prompt = REQUIREMENTS_TEMPLATE.format(
         original_requirements=original_requirements,
         jira_context=json.dumps(jira_ctx, ensure_ascii=False) if jira_ctx else "N/A",
@@ -576,7 +840,11 @@ async def review_requirements(state: dict) -> dict:
         changed_files=", ".join(state.get("changed_files", [])) or "N/A",
         pr_diff=state.get("pr_diff", ""),
     )
-    result = runtime.run(prompt, system_prompt=REQUIREMENTS_SYSTEM, max_tokens=2048,
+    if standards_section:
+        prompt += standards_section
+    if prev_issues_text:
+        prompt += prev_issues_text
+    result = _run_review_with_retry(runtime, prompt, system_prompt=REQUIREMENTS_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
     log.info("requirements review complete", issues=len(issues))
@@ -646,6 +914,8 @@ async def review_ui_design(state: dict) -> dict:
         # No design reference available — skip UI review silently
         return {"ui_issues": []}
 
+    standards_section = _build_standards_section(state)
+    prev_issues_text = _build_previous_issues_section(state)
     prompt = UI_DESIGN_TEMPLATE.format(
         pr_description=pr_description or "N/A",
         changed_files=", ".join(changed_files) or "N/A",
@@ -653,7 +923,11 @@ async def review_ui_design(state: dict) -> dict:
         design_html=design_html[:4000] if design_html else "N/A",
         pr_diff=state.get("pr_diff", ""),
     )
-    result = runtime.run(prompt, system_prompt=UI_DESIGN_SYSTEM, max_tokens=2048,
+    if standards_section:
+        prompt += standards_section
+    if prev_issues_text:
+        prompt += prev_issues_text
+    result = _run_review_with_retry(runtime, prompt, system_prompt=UI_DESIGN_SYSTEM, max_tokens=2048,
                          plugin_manager=state.get("_plugin_manager"))
     issues = _parse_issue_list(result.get("raw_response", ""))
     log.info("UI review complete", issues=len(issues), has_design_spec=bool(design_spec), has_design_html=bool(design_html))
@@ -687,6 +961,38 @@ async def generate_report(state: dict) -> dict:
 
     verdict = "approved" if (critical == 0 and high == 0) else "rejected"
 
+    # Handle large PR escalation (>50 files → manual_review_required)
+    manual_review_required = state.get("manual_review_required", False)
+    diff_truncated = state.get("diff_truncated", False)
+    if manual_review_required:
+        all_comments.append({
+            "severity": "high",
+            "category": "review-process",
+            "message": "PR exceeds 50 changed files — automatic review cannot provide reliable coverage. Manual review required.",
+            "suggestion": "Split this PR into smaller, focused PRs or request human reviewer escalation.",
+        })
+        verdict = "rejected"
+        high += 1
+    if diff_truncated and not manual_review_required:
+        all_comments.append({
+            "severity": "medium",
+            "category": "review-process",
+            "message": "Diff was truncated (>100KB). Review focused on visible portion only.",
+            "suggestion": "Consider splitting large changes for more thorough automated review.",
+        })
+        medium += 1
+
+    large_changed_files = _detect_large_changed_files(state.get("pr_diff", ""))
+    for entry in large_changed_files[:5]:
+        all_comments.append({
+            "severity": "low",
+            "category": "large-change",
+            "file": entry["file"],
+            "message": f"Single-file change is very large ({entry['changed_lines']} changed lines).",
+            "suggestion": "Split this file change into smaller logical steps when possible.",
+        })
+        low += 1
+
     # Validation gate: verify review report structure
     from framework.validation_gates import validate_review_verdict
     gate_result = validate_review_verdict({
@@ -703,55 +1009,115 @@ async def generate_report(state: dict) -> dict:
         else:
             print(f"[{_AGENT_ID}] validate_review_verdict gate warning: {gate_result.feedback}")
 
-    summary_parts = [
-        f"Review complete: {len(all_comments)} issue(s) found ({len(ui_issues)} UI design).",
-        f"Critical: {critical}, High: {high}, Medium: {medium}, Low: {low}.",
-        f"Verdict: {verdict}.",
-    ]
+    report_summary = (
+        f"Review complete: {len(all_comments)} issue(s) found. "
+        f"Critical: {critical}, High: {high}, Medium: {medium}, Low: {low}. "
+        f"Verdict: {verdict}."
+    )
+
+    # Separate UI design issues into structured section
+    ui_design_review = None
+    if ui_issues:
+        ui_design_review = {
+            "components_checked": list({c.get("file", "unknown") for c in ui_issues}),
+            "design_fidelity_issues": ui_issues,
+        }
 
     report = {
         "verdict": verdict,
-        "all_comments": all_comments,
+        "summary": report_summary,
+        "comments": all_comments,
         "severity_levels": {
             "critical": critical,
             "high": high,
             "medium": medium,
             "low": low,
         },
+        "ui_design_review": ui_design_review,
+        "manual_review_required": manual_review_required,
+        "diff_truncated": diff_truncated,
         "checked_artifacts": list(state.get("checked_artifacts", [])),
     }
 
-    # Write review report to workspace
+    # Write review report to workspace (round-suffixed)
     workspace_path = state.get("workspace_path", "")
+    review_round = state.get("review_round", 1)
+    repo_path = state.get("repo_path", "")
+    diff_source = state.get("diff_source", "")
+
+    # For round 2+, annotate issues as fixed/new/persisting
+    previous_issues = state.get("previous_issues", [])
+    if previous_issues and all_comments:
+        def _issue_fingerprint(c: dict) -> str:
+            """Build a fingerprint from file + category + severity for fuzzy matching."""
+            return f"{c.get('file', '')}|{c.get('category', '')}|{c.get('severity', '')}".lower()
+
+        _prev_msgs = {c.get("message", "").strip().lower() for c in previous_issues if c.get("message")}
+        _prev_fingerprints = {_issue_fingerprint(c) for c in previous_issues}
+        for comment in all_comments:
+            msg_lower = comment.get("message", "").strip().lower()
+            fp = _issue_fingerprint(comment)
+            if msg_lower in _prev_msgs or (fp and fp in _prev_fingerprints):
+                comment["issue_status"] = "persisting_issue"
+            else:
+                comment["issue_status"] = "new_issue"
+        # Mark fixed issues from previous round
+        _current_msgs = {c.get("message", "").strip().lower() for c in all_comments if c.get("message")}
+        _current_fingerprints = {_issue_fingerprint(c) for c in all_comments}
+        fixed_issues = [
+            {**prev, "issue_status": "fixed_from_previous"}
+            for prev in previous_issues
+            if (prev.get("message", "").strip().lower() not in _current_msgs
+                and _issue_fingerprint(prev) not in _current_fingerprints)
+        ]
+        report["fixed_from_previous"] = fixed_issues
+
     if workspace_path:
         review_dir = os.path.join(workspace_path, "code-review")
         checkpoints_dir = os.path.join(review_dir, "review-checkpoints")
         os.makedirs(review_dir, exist_ok=True)
         os.makedirs(checkpoints_dir, exist_ok=True)
         try:
-            report_file = os.path.join(review_dir, "review-report.json")
+            report_file = os.path.join(review_dir, f"review-report-{review_round}.json")
             with open(report_file, "w", encoding="utf-8") as fh:
                 json.dump({
                     "metadata": {
                         "agent_id": "code-review",
-                        "step": "generate_report",
+                        "round": review_round,
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "pr_url": state.get("pr_url", ""),
+                        "pr_number": state.get("pr_number", 0),
+                        "diff_source": diff_source,
+                        "repo_path": repo_path,
                     },
-                    "data": report,
+                    **report,
                 }, fh, ensure_ascii=False, indent=2)
 
-            checkpoint_file = os.path.join(checkpoints_dir, "review-summary.json")
+            checkpoint_file = os.path.join(checkpoints_dir, f"review-summary-{review_round}.json")
             with open(checkpoint_file, "w", encoding="utf-8") as fh:
                 json.dump({
                     "checkpoint_id": "CP_REVIEW_SUMMARIZED",
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "agent_id": "code-review",
+                    "round": review_round,
                     "state": {
                         "verdict": verdict,
                         "severity_levels": report["severity_levels"],
                         "checked_artifacts": report["checked_artifacts"],
+                        "fixed_from_previous": len(report.get("fixed_from_previous", [])),
                     },
                 }, fh, ensure_ascii=False, indent=2)
+
+            # Append to agent.log
+            _append_agent_log(workspace_path, {
+                "event": "review_completed",
+                "round": review_round,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "verdict": verdict,
+                "severity_levels": report["severity_levels"],
+                "total_issues": len(all_comments),
+                "fixed_from_previous": len(report.get("fixed_from_previous", [])),
+            })
         except OSError:
             pass
 
@@ -759,8 +1125,9 @@ async def generate_report(state: dict) -> dict:
 
     return {
         "verdict": verdict,
-        "all_comments": all_comments,
-        "report_summary": " ".join(summary_parts),
+        "comments": all_comments,
+        "all_comments": all_comments,  # backward compat alias
+        "report_summary": report_summary,
         "severity_levels": report["severity_levels"],
         "checked_artifacts": report["checked_artifacts"],
     }

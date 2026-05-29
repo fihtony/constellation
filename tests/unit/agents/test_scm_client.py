@@ -68,6 +68,18 @@ class TestParseProjectRepoClassMethod:
         assert repo == "web-ui-test"
 
 
+class TestScmToolRepoParsing:
+    def test_parse_repo_coordinates_supports_bitbucket_project_urls(self):
+        from agents.scm.tools import _parse_repo_coordinates
+
+        project, repo = _parse_repo_coordinates(
+            "https://bitbucket.example.com/projects/PROJ/repos/web-ui-test/browse"
+        )
+
+        assert project == "PROJ"
+        assert repo == "web-ui-test"
+
+
 class TestScmAdapterCloneBehavior:
     def test_build_auth_header_returns_empty_when_token_missing(self, monkeypatch):
         monkeypatch.delenv("SCM_TOKEN", raising=False)
@@ -144,6 +156,7 @@ class TestScmAdapterPrEvidenceCapabilities:
 
         assert "scm.pr.info" in capabilities
         assert "scm.pr.diff" in capabilities
+        assert "scm.pr.comment.inline" in capabilities
 
     def test_dispatch_get_pr_diff_calls_client(self):
         calls = {}
@@ -178,10 +191,52 @@ class TestScmAdapterPrEvidenceCapabilities:
             "changed_files": [{"filename": "app.py"}],
             "status": "ok",
         }
+
+    def test_dispatch_inline_pr_comment_calls_client(self):
+        calls = {}
+
+        class FakeClient:
+            def add_pr_inline_comment(self, owner, repo, pr_id, file_path, line, comment, commit_id=""):
+                calls.update({
+                    "owner": owner,
+                    "repo": repo,
+                    "pr_id": pr_id,
+                    "file_path": file_path,
+                    "line": line,
+                    "comment": comment,
+                    "commit_id": commit_id,
+                })
+                return {"id": 321, "fallback": False}, "ok"
+
+        adapter = object.__new__(SCMAgentAdapter)
+        adapter._get_client = lambda: FakeClient()  # type: ignore[attr-defined]
+
+        result = adapter._dispatch(
+            "scm.pr.comment.inline",
+            "",
+            {"metadata": {
+                "repoUrl": "https://github.com/org/repo",
+                "prNumber": 42,
+                "filePath": "src/App.jsx",
+                "line": 17,
+                "comment": "[HIGH] Fix this.",
+                "commitId": "abc123",
+            }},
+        )
+
+        assert result == {
+            "comment": {"id": 321, "fallback": False},
+            "status": "ok",
+            "fallback": False,
+        }
         assert calls == {
             "owner": "org",
             "repo": "repo",
             "pr_id": 42,
+            "file_path": "src/App.jsx",
+            "line": 17,
+            "comment": "[HIGH] Fix this.",
+            "commit_id": "abc123",
         }
 
     def test_dispatch_get_pr_info_calls_client(self):
@@ -480,6 +535,66 @@ class TestGitHubMCPProviderPrEvidenceCompatibility:
             "body": "Updated body",
             "title": "Updated title",
             "timeout": 30,
+        }
+
+    def test_add_pr_inline_comment_delegates_to_rest_client(self, monkeypatch):
+        calls = {}
+
+        class FakeGitHubClient:
+            def __init__(self, token=""):
+                calls["token"] = token
+
+            def add_pr_inline_comment(
+                self,
+                owner,
+                repo,
+                pr_id,
+                file_path,
+                line,
+                body,
+                commit_id="",
+                side="RIGHT",
+                timeout=20,
+            ):
+                calls.update({
+                    "owner": owner,
+                    "repo": repo,
+                    "pr_id": pr_id,
+                    "file_path": file_path,
+                    "line": line,
+                    "body": body,
+                    "commit_id": commit_id,
+                    "side": side,
+                    "timeout": timeout,
+                })
+                return {"id": 99, "fallback": False}, "ok"
+
+        monkeypatch.setattr("agents.scm.client.GitHubClient", FakeGitHubClient)
+
+        data, status = GitHubMCPProvider(token="token-123").add_pr_inline_comment(
+            "org",
+            "repo",
+            42,
+            "src/app.ts",
+            17,
+            "Please fix this",
+            commit_id="abc123",
+            timeout=25,
+        )
+
+        assert status == "ok"
+        assert data == {"id": 99, "fallback": False}
+        assert calls == {
+            "token": "token-123",
+            "owner": "org",
+            "repo": "repo",
+            "pr_id": 42,
+            "file_path": "src/app.ts",
+            "line": 17,
+            "body": "Please fix this",
+            "commit_id": "abc123",
+            "side": "RIGHT",
+            "timeout": 25,
         }
 
     def test_upload_issue_image_delegates_to_rest_client(self, monkeypatch, tmp_path):

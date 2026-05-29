@@ -1,0 +1,56 @@
+# Android Kotlin tech stack standards
+id: android-kotlin-standard
+name: "Android Kotlin Project Standard"
+version: "1.0.0"
+applies_to:
+  - development
+  - code-review
+tech_stack:
+  - android
+  - kotlin
+
+rules:
+  - id: kotlin-null-safety
+    severity: high
+    category: kotlin
+    description: "Prefer non-nullable types; use safe calls (?.) and let/also for null handling; avoid !! operator"
+  - id: kotlin-coroutines
+    severity: medium
+    category: kotlin
+    description: "Use Kotlin coroutines for async operations; avoid Thread/AsyncTask"
+  - id: kotlin-data-classes
+    severity: low
+    category: kotlin
+    description: "Use data classes for DTOs and value objects"
+  - id: android-viewmodel-scope
+    severity: high
+    category: android
+    description: "Use viewModelScope for coroutines in ViewModels; handle lifecycle properly"
+  - id: android-compose-state
+    severity: medium
+    category: android
+    description: "Use remember and mutableStateOf for Compose state; avoid unnecessary recompositions"
+  - id: android-room-migration
+    severity: high
+    category: android
+    description: "Room database schema changes must include proper migrations"
+  - id: android-proguard-rules
+    severity: medium
+    category: android
+    description: "Update ProGuard/R8 rules when adding new libraries with reflection"
+  - id: android-min-sdk-compat
+    severity: high
+    category: android
+    description: "All APIs used must be compatible with declared minSdkVersion or wrapped with version checks"
+  - id: android-unit-test
+    severity: medium
+    category: testing
+    description: "ViewModel and Repository layers must have unit tests with MockK or Mockito"
+  - id: android-instrumented-test
+    severity: low
+    category: testing
+    description: "Critical user flows should have instrumented tests with Espresso or Compose test"
+  - id: android-no-hardcoded-keys
+    severity: critical
+    category: security
+    description: "Never hardcode API keys in Kotlin/Java source; use BuildConfig fields from local.properties or encrypted secrets"

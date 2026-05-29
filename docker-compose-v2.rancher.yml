@@ -36,9 +36,7 @@ services:
       HOST: 0.0.0.0
       PORT: 8000
       REGISTRY_URL: http://registry:9000
-      AGENT_RUNTIME: claude-code
       ARTIFACT_ROOT: /app/artifacts
-      CONTAINER_RUNTIME: rancher
       DYNAMIC_AGENT_NETWORK: constellation-v2-network
       DOCKER_SOCKET: /var/run/docker.sock
     labels:
@@ -72,9 +70,7 @@ services:
       HOST: 0.0.0.0
       PORT: 8030
       REGISTRY_URL: http://registry:9000
-      AGENT_RUNTIME: claude-code
       ARTIFACT_ROOT: /app/artifacts
-      CONTAINER_RUNTIME: rancher
       DYNAMIC_AGENT_NETWORK: constellation-v2-network
       DOCKER_SOCKET: /var/run/docker.sock
     labels:

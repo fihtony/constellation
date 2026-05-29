@@ -1,0 +1,40 @@
+# Company review standard — defines the code review process and criteria.
+id: company-review-standard
+name: "Company Review Standard"
+version: "1.0.0"
+applies_to:
+  - code-review
+
+rules:
+  - id: review-pr-size-limit
+    severity: medium
+    category: review-process
+    description: "PRs exceeding 50 files require manual review escalation; single file changes over 2000 lines should be split"
+  - id: review-test-coverage
+    severity: high
+    category: review-testing
+    description: "New features must include unit tests; minimum coverage for changed code is 70%"
+  - id: review-no-commented-code
+    severity: low
+    category: review-quality
+    description: "Remove commented-out code blocks; use version control for history"
+  - id: review-api-documentation
+    severity: medium
+    category: review-quality
+    description: "Public API endpoints must have documentation (OpenAPI/JSDoc/docstring)"
+  - id: review-error-messages
+    severity: medium
+    category: review-quality
+    description: "Error messages must be user-friendly and not expose internal details or stack traces"
+  - id: review-accessibility
+    severity: medium
+    category: review-ui
+    description: "UI components must meet WCAG 2.1 AA standards: proper ARIA labels, keyboard navigation, color contrast"
+  - id: review-responsive-design
+    severity: medium
+    category: review-ui
+    description: "UI implementations must work on desktop (>1024px) and mobile (<768px) viewports"
+  - id: review-i18n-ready
+    severity: low
+    category: review-quality
+    description: "User-facing strings should be extractable for internationalization"

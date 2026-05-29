@@ -1,0 +1,56 @@
+# Python FastAPI tech stack standards
+id: python-fastapi-standard
+name: "Python FastAPI Project Standard"
+version: "1.0.0"
+applies_to:
+  - development
+  - code-review
+tech_stack:
+  - python
+  - fastapi
+
+rules:
+  - id: fastapi-pydantic-models
+    severity: high
+    category: fastapi
+    description: "Use Pydantic models for all request/response schemas; validate inputs at the boundary"
+  - id: fastapi-async-endpoints
+    severity: medium
+    category: fastapi
+    description: "Use async def for I/O-bound endpoints; use sync def for CPU-bound work"
+  - id: fastapi-dependency-injection
+    severity: medium
+    category: fastapi
+    description: "Use FastAPI Depends() for shared logic (auth, DB sessions, rate limiting)"
+  - id: fastapi-error-handling
+    severity: high
+    category: fastapi
+    description: "Use HTTPException with appropriate status codes; implement custom exception handlers"
+  - id: python-type-hints
+    severity: medium
+    category: python
+    description: "Use type hints for all function signatures and return values"
+  - id: python-no-bare-except
+    severity: high
+    category: python
+    description: "Never use bare except; always catch specific exception types"
+  - id: python-sql-parameterized
+    severity: critical
+    category: security
+    description: "Use SQLAlchemy ORM or parameterized queries; never use f-strings for SQL"
+  - id: python-secrets-env
+    severity: critical
+    category: security
+    description: "Load secrets from environment variables or secret managers; never hardcode"
+  - id: python-pytest-fixtures
+    severity: medium
+    category: testing
+    description: "Use pytest fixtures for test setup; prefer conftest.py for shared fixtures"
+  - id: python-test-coverage
+    severity: medium
+    category: testing
+    description: "Maintain minimum 80% test coverage; all API endpoints must have integration tests"
+  - id: python-alembic-migrations
+    severity: high
+    category: python
+    description: "Database schema changes must use Alembic migrations; never modify schemas manually"
