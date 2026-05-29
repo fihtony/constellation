@@ -69,19 +69,49 @@ def _serialize_ui_task(task) -> dict:
     metadata = getattr(task, "metadata", {}) or {}
     status_state = getattr(getattr(task, "status", None), "state", None)
     status_value = getattr(status_state, "value", str(status_state)) if status_state else ""
+    created_at = getattr(task, "created_at", "") or ""
+    updated_at = getattr(task, "updated_at", "") or ""
+    completed_at = updated_at if status_value in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED"} else ""
+    elapsed_ms = 0
+    if created_at and updated_at:
+        try:
+            elapsed_ms = max(
+                0,
+                int(
+                    (
+                        datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                        - datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    ).total_seconds()
+                    * 1000
+                ),
+            )
+        except ValueError:
+            elapsed_ms = 0
+    status_kind = _ui_status_kind(task)
     return {
         "task_id": task.id,
-        "status": _ui_status_kind(task),
+        "id": task.id,
+        "status": status_kind,
+        "statusKind": status_kind,
         "statusState": status_value,
         "summary": _task_summary(task),
+        "user_request": _task_user_request(task),
         "userRequest": _task_user_request(task),
-        "createdAt": getattr(task, "created_at", "") or "",
-        "updatedAt": getattr(task, "updated_at", "") or "",
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "created_at": created_at,
+        "started_at": created_at,
+        "updated_at": updated_at,
+        "completed_at": completed_at,
+        "elapsed_ms": elapsed_ms,
         "agent": metadata.get("agentId", ""),
         "taskType": metadata.get("task_type", metadata.get("taskType", "general")),
+        "task_type": metadata.get("task_type", metadata.get("taskType", "general")),
         "chatHistory": list(metadata.get("chat_history") or []),
         "currentMajorStep": metadata.get("current_major_step", ""),
+        "current_major_step": metadata.get("current_major_step", ""),
         "progressSteps": list(metadata.get("progress_steps") or []),
+        "progress_steps": list(metadata.get("progress_steps") or []),
     }
 
 
@@ -183,10 +213,11 @@ def get_task_detail(task_id: str, task_store) -> dict:
     payload["statusMessage"] = (
         task.status.message.text() if getattr(task.status, "message", None) else ""
     )
+    payload["metadata"] = getattr(task, "metadata", {}) or {}
     return {
         "status": 200,
         "headers": {"Content-Type": "application/json"},
-        "body": payload,
+        "body": {"task": payload, **payload},
     }
 
 
@@ -269,11 +300,16 @@ def _ui_events_generator(task_store, *, poll_interval: float = 1.0,
             if prev != sig:
                 last_signatures[task.id] = sig
                 kind = _ui_status_kind(task)
-                event_name = {
-                    "completed": "task.completed",
-                    "failed":    "task.failed",
-                    "waiting":   "task.input_required",
-                }.get(kind, "task.updated")
+                previous_state = str(prev[1])
+                current_state = str(getattr(getattr(task, "status", None), "state", ""))
+                if previous_state == "TASK_STATE_INPUT_REQUIRED" and current_state == "TASK_STATE_WORKING":
+                    event_name = "task.resumed"
+                else:
+                    event_name = {
+                        "completed": "task.completed",
+                        "failed": "task.failed",
+                        "waiting": "task.input_required",
+                    }.get(kind, "task.updated")
                 yield _sse_format(event_name, _serialize_ui_task(task))
         # No deletion events for now.
         # Heartbeat keeps the connection alive through proxies.

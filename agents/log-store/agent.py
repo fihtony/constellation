@@ -140,8 +140,12 @@ class LogStoreAgent:
             if key in seen:
                 continue
             seen.add(key)
-            merged.append(entry)
-        return sorted(merged, key=lambda item: item.get("timestamp", ""))
+            merged.append({**entry, "task_id": task_id})
+
+        ordered = sorted(merged, key=lambda item: item.get("timestamp", ""))
+        for index, entry in enumerate(ordered, start=1):
+            entry.setdefault("sequence", index)
+        return ordered
 
     @staticmethod
     def _format_sse(event: str, payload: dict) -> str:

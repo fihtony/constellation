@@ -395,6 +395,25 @@ def _append_chat_entry(
     task_store.update_metadata(task_id, {"chat_history": history})
 
 
+def _record_major_step(task_store, task_id: str, *, text: str, agent: str = "compass") -> None:
+    if not text:
+        return
+    task = task_store.get_task(task_id)
+    if task is None:
+        return
+
+    metadata = task.metadata or {}
+    steps = list(metadata.get("progress_steps") or [])
+    steps.append({"text": text, "agent": agent, "ts": _chat_entry_timestamp()})
+    task_store.update_metadata(
+        task_id,
+        {
+            "current_major_step": text,
+            "progress_steps": steps,
+        },
+    )
+
+
 def _log_store_url() -> str:
     return (
         os.environ.get("LOG_STORE_URL")
@@ -469,6 +488,12 @@ class CompassAgent(BaseAgent):
                 question=final_message or "Team Lead requested clarification.",
                 interrupt_metadata={"teamLeadTaskId": team_lead_task_id, "task_type": "development"},
             )
+            _record_major_step(
+                task_store,
+                task_id,
+                text="Waiting for clarification from user",
+                agent="team-lead",
+            )
             _append_chat_entry(
                 task_store,
                 task_id,
@@ -483,6 +508,12 @@ class CompassAgent(BaseAgent):
         if status != "completed":
             task_store.set_artifacts(task_id, artifacts)
             task_store.fail_task(task_id, final_message)
+            _record_major_step(
+                task_store,
+                task_id,
+                text="Development task failed",
+                agent="team-lead",
+            )
             _append_chat_entry(
                 task_store,
                 task_id,
@@ -495,6 +526,12 @@ class CompassAgent(BaseAgent):
             return
 
         task_store.complete_task(task_id, artifacts=artifacts, message=final_message)
+        _record_major_step(
+            task_store,
+            task_id,
+            text="Development task completed",
+            agent="team-lead",
+        )
         _append_chat_entry(
             task_store,
             task_id,
@@ -534,16 +571,19 @@ class CompassAgent(BaseAgent):
                 "user_request": user_text,
                 "userRequest": user_text,
                 "chat_history": [],
+                "progress_steps": [],
+                "current_major_step": "Request received by Compass",
             },
         )
+        _aid = self.definition.agent_id
         _append_chat_entry(task_store, task.id, role="USER", text=user_text)
+        _record_major_step(task_store, task.id, text="Request received by Compass", agent=_aid)
 
         runtime = self.services.runtime or get_runtime()
         registry = get_registry()
 
         # --- Classify ---
         task_type = _classify_request(user_text, runtime)
-        _aid = self.definition.agent_id
         print(f"[{_aid}] task_type={task_type!r} request={user_text[:120]!r}")
 
         # --- Workspace path: {ARTIFACT_ROOT}/{task_id}/
@@ -570,6 +610,7 @@ class CompassAgent(BaseAgent):
                 },
             )
             response_text = _development_start_message(jira_key)
+            _record_major_step(task_store, task.id, text="Development task running in background", agent=_aid)
             _append_chat_entry(task_store, task.id, role="COMPASS", text=response_text)
             ui_update = {
                 "task_id": task.id,
@@ -608,6 +649,7 @@ class CompassAgent(BaseAgent):
                     question=question,
                     interrupt_metadata={"kind": "office_output_mode", "office_request": office_request},
                 )
+                _record_major_step(task_store, task.id, text="Waiting for output mode selection", agent=_aid)
                 _append_chat_entry(
                     task_store,
                     task.id,
@@ -633,6 +675,12 @@ class CompassAgent(BaseAgent):
 
             dispatch_data = _dispatch_office_request(task.id, user_text, office_request, registry, log)
             response_text = dispatch_data.get("message") or f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
+            _record_major_step(
+                task_store,
+                task.id,
+                text="Office task completed" if str(dispatch_data.get("status") or "").strip().lower() == "completed" else "Office task returned a terminal result",
+                agent="office",
+            )
 
         else:
             # General conversational task — use LLM for a direct answer
@@ -646,6 +694,7 @@ class CompassAgent(BaseAgent):
                 timeout=120,
             )
             response_text = agentic_result.summary or "I can help you with that."
+            _record_major_step(task_store, task.id, text="Direct Compass response prepared", agent=_aid)
 
         response_tone = "normal"
         if task_type == "office":
@@ -728,6 +777,7 @@ class CompassAgent(BaseAgent):
                 question=question,
                 interrupt_metadata={"kind": "office_output_mode", "office_request": office_request},
             )
+            _record_major_step(task_store, task_id, text="Waiting for output mode selection", agent=self.definition.agent_id)
             _append_chat_entry(
                 task_store,
                 task_id,
@@ -750,6 +800,12 @@ class CompassAgent(BaseAgent):
         office_request["output_mode"] = output_mode
         task_store.update_metadata(task_id, {"office_request": office_request})
         task_store.resume_task(task_id)
+        _record_major_step(
+            task_store,
+            task_id,
+            text=f"Resumed with output mode: {output_mode}",
+            agent=self.definition.agent_id,
+        )
         log.info("office output mode selected", output_mode=output_mode)
 
         user_text = str(metadata.get("user_request") or "")
@@ -763,6 +819,12 @@ class CompassAgent(BaseAgent):
             metadata={"agentId": self.definition.agent_id},
         )]
         task_store.complete_task(task_id, artifacts=artifacts, message=response_text)
+        _record_major_step(
+            task_store,
+            task_id,
+            text="Office task completed" if str(dispatch_data.get("status", "unknown")).strip().lower() == "completed" else "Office task returned a terminal result",
+            agent="office",
+        )
         _append_chat_entry(
             task_store,
             task_id,
