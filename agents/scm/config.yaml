@@ -8,9 +8,9 @@ description: "Boundary adapter: repo inspect, branch list/create, PR operations 
 mode: single_turn
 execution_mode: persistent
 
-# runtime and model inherit from global constellation.yaml:
-#   runtime.backend: connect-agent
-#   runtime.model: gpt-5-mini
+# Backend selection is a global deployment selector — configure it in config/.env
+# (SCM_BACKEND=bitbucket|github-rest|github-mcp) or constellation.yaml
+# (boundary.scm.backend). Default: github-mcp (set in constellation.yaml).
 
 port: 8020
 
@@ -28,5 +28,6 @@ capabilities:
   - scm.pr.diff
   - scm.pr.list
   - scm.pr.comment
+  - scm.pr.comment.inline
   - scm.pr.image.upload
   - scm.pr.update

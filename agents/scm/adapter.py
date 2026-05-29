@@ -65,6 +65,12 @@ _SCM_CAPABILITY_RULES: dict[str, dict[str, object]] = {
         "requires_scm_write": True,
         "scope": "self",
     },
+    "scm.pr.comment.inline": {
+        "tools": ["scm_add_pr_inline_comment"],
+        "action": "pr.comment",
+        "requires_scm_write": True,
+        "scope": "self",
+    },
     "scm.pr.image.upload": {
         "tools": ["scm_upload_pr_image"],
         "action": "pr.update",
@@ -136,9 +142,9 @@ class SCMAgentAdapter(BaseAgent):
     def _get_client(self):
         if self._scm_client:
             return self._scm_client
-        from agents.scm.client import create_scm_client
+        from agents.scm.client import create_scm_client, _get_scm_backend_from_config
         base_url = os.environ.get("SCM_BASE_URL", "")
-        backend = os.environ.get("SCM_BACKEND", "")
+        backend = _get_scm_backend_from_config()
         # Auto-select github-mcp for GitHub URLs when no explicit backend is set
         if not backend and "github" in base_url.lower():
             backend = "github-mcp"
@@ -271,6 +277,27 @@ class SCMAgentAdapter(BaseAgent):
             comment_text = meta.get("comment") or text.strip()
             data, status = client.add_pr_comment(project, repo, pr_id, comment_text)
             return {"comment": data, "status": status}
+
+        if capability == "scm.pr.comment.inline":
+            pr_id = meta.get("prId") or meta.get("prNumber") or ""
+            comment_text = meta.get("comment") or text.strip()
+            file_path = meta.get("filePath") or meta.get("file_path") or ""
+            line = meta.get("line") or 0
+            commit_id = meta.get("commitId") or meta.get("commit_id") or ""
+            data, status = client.add_pr_inline_comment(
+                project,
+                repo,
+                pr_id,
+                file_path,
+                int(line or 0),
+                comment_text,
+                commit_id=commit_id,
+            )
+            return {
+                "comment": data,
+                "status": status,
+                "fallback": bool(data.get("fallback", False)) if isinstance(data, dict) else False,
+            }
 
         if capability == "scm.pr.image.upload":
             pr_id = meta.get("prId") or meta.get("prNumber") or 0

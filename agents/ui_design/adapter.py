@@ -145,6 +145,10 @@ class UIDesignAgentAdapter(BaseAgent):
             url = meta.get("designUrl") or text.strip()
             if "figma.com" in url.lower():
                 return self._dispatch_figma("figma.file.fetch", url, meta)
+            # No clear URL signal — use the configured default provider
+            default_provider = self._get_default_provider()
+            if default_provider == "figma":
+                return self._dispatch_figma("figma.file.fetch", url, meta)
             return self._dispatch_stitch("stitch.screen.fetch", url, meta)
         if "figma.com" in text.lower():
             return self._dispatch_figma("figma.file.fetch", text, meta)
@@ -153,6 +157,15 @@ class UIDesignAgentAdapter(BaseAgent):
     # ------------------------------------------------------------------
     # Figma REST
     # ------------------------------------------------------------------
+
+    def _get_default_provider(self) -> str:
+        """Return the configured default provider (stitch | figma).
+
+        Resolution order: config loader (boundary.ui_design.default_provider)
+        → hardcoded default 'stitch'.
+        """
+        from framework.config import get_boundary_backend
+        return get_boundary_backend("ui_design")
 
     def _get_figma(self):
         if self._figma_client:

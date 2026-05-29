@@ -7,8 +7,18 @@ project:
 
 # Default runtime backend for all agents
 runtime:
-  backend: claude-code
-  model: claude-haiku-4-5-20251001
+  backend: claude-code              # claude-code | copilot-cli | codex-cli | connect-agent
+  model: claude-haiku-4-5-20251001  # generic fallback model
+
+# Boundary agent backend selection (system defaults)
+# Override any of these in config/.env without changing this file.
+boundary:
+  jira:
+    backend: mcp            # mcp | rest
+  scm:
+    backend: github-mcp     # bitbucket | github-rest | github-mcp
+  ui_design:
+    default_provider: stitch  # stitch | figma
 
 # Agent launch specifications
 agents:

@@ -18,6 +18,13 @@ def project_dir(tmp_path):
         runtime:
           backend: claude-code
           model: claude-haiku-4-5-20251001
+        boundary:
+          jira:
+            backend: mcp
+          scm:
+            backend: github-mcp
+          ui_design:
+            default_provider: stitch
         skills:
           directory: skills
         data:
@@ -257,3 +264,287 @@ class TestConstellationConfig:
         data = cfg.to_dict()
         data["new_key"] = "value"
         assert "new_key" not in cfg.data
+
+
+# ---------------------------------------------------------------------------
+# Boundary config tests
+# ---------------------------------------------------------------------------
+
+class TestBoundaryDefaults:
+    """boundary.* section is present in the YAML and readable via config loader."""
+
+    def test_jira_default_backend(self, project_dir):
+        from framework.config import load_global_config
+
+        cfg = load_global_config(project_dir)
+        assert cfg.get("boundary.jira.backend") == "mcp"
+
+    def test_scm_default_backend(self, project_dir):
+        from framework.config import load_global_config
+
+        cfg = load_global_config(project_dir)
+        assert cfg.get("boundary.scm.backend") == "github-mcp"
+
+    def test_ui_design_default_provider(self, project_dir):
+        from framework.config import load_global_config
+
+        cfg = load_global_config(project_dir)
+        assert cfg.get("boundary.ui_design.default_provider") == "stitch"
+
+
+class TestBoundaryEnvOverrides:
+    """Environment variables override boundary defaults from YAML."""
+
+    def test_jira_backend_env_override(self, project_dir, monkeypatch):
+        from framework.config import load_global_config
+
+        monkeypatch.setenv("JIRA_BACKEND", "rest")
+        cfg = load_global_config(project_dir)
+        assert cfg.get("boundary.jira.backend") == "rest"
+
+    def test_scm_backend_env_override(self, project_dir, monkeypatch):
+        from framework.config import load_global_config
+
+        monkeypatch.setenv("SCM_BACKEND", "bitbucket")
+        cfg = load_global_config(project_dir)
+        assert cfg.get("boundary.scm.backend") == "bitbucket"
+
+    def test_ui_design_provider_env_override(self, project_dir, monkeypatch):
+        from framework.config import load_global_config
+
+        monkeypatch.setenv("UI_DESIGN_DEFAULT_PROVIDER", "figma")
+        cfg = load_global_config(project_dir)
+        assert cfg.get("boundary.ui_design.default_provider") == "figma"
+
+
+class TestGetBoundaryBackend:
+    """get_boundary_backend() returns correct values with YAML defaults and env overrides."""
+
+    def test_jira_default(self, project_dir):
+        from framework.config import get_boundary_backend
+
+        result = get_boundary_backend("jira", project_dir)
+        assert result == "mcp"
+
+    def test_scm_default(self, project_dir):
+        from framework.config import get_boundary_backend
+
+        result = get_boundary_backend("scm", project_dir)
+        assert result == "github-mcp"
+
+    def test_ui_design_default(self, project_dir):
+        from framework.config import get_boundary_backend
+
+        result = get_boundary_backend("ui_design", project_dir)
+        assert result == "stitch"
+
+    def test_jira_env_override(self, project_dir, monkeypatch):
+        from framework.config import get_boundary_backend
+
+        monkeypatch.setenv("JIRA_BACKEND", "rest")
+        result = get_boundary_backend("jira", project_dir)
+        assert result == "rest"
+
+    def test_scm_env_override(self, project_dir, monkeypatch):
+        from framework.config import get_boundary_backend
+
+        monkeypatch.setenv("SCM_BACKEND", "github-rest")
+        result = get_boundary_backend("scm", project_dir)
+        assert result == "github-rest"
+
+    def test_unknown_domain_raises(self, project_dir):
+        from framework.config import get_boundary_backend
+
+        with pytest.raises(ValueError, match="Unknown boundary domain"):
+            get_boundary_backend("unknown_domain", project_dir)
+
+    def test_fallback_when_boundary_section_absent(self, tmp_path):
+        """When constellation.yaml has no boundary section, use hardcoded defaults."""
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "constellation.yaml").write_text(
+            "project:\n  name: test\nruntime:\n  backend: claude-code\n"
+        )
+        from framework.config import get_boundary_backend
+
+        assert get_boundary_backend("jira", tmp_path) == "mcp"
+        assert get_boundary_backend("scm", tmp_path) == "github-mcp"
+        assert get_boundary_backend("ui_design", tmp_path) == "stitch"
+
+
+# ---------------------------------------------------------------------------
+# validate_startup_config tests
+# ---------------------------------------------------------------------------
+
+class TestValidateStartupConfig:
+    """validate_startup_config() enforces consistency rules."""
+
+    def test_valid_default_config_passes(self, project_dir, monkeypatch):
+        """Default config (claude-code + docker + mcp jira + github-mcp scm + stitch) passes."""
+        from framework.config import validate_startup_config
+
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-token")
+        # No SCM_BASE_URL set — so no URL/backend conflict check
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        warnings = validate_startup_config(project_dir)
+        # stitch without STITCH_API_KEY → warning only
+        assert isinstance(warnings, list)
+
+    def test_bitbucket_with_github_url_fails(self, project_dir, monkeypatch):
+        """SCM_BACKEND=bitbucket + GitHub URL should raise ConfigValidationError."""
+        from framework.config import ConfigValidationError, validate_startup_config
+
+        monkeypatch.setenv("SCM_BACKEND", "bitbucket")
+        monkeypatch.setenv("SCM_BASE_URL", "https://github.com/my-org")
+        with pytest.raises(ConfigValidationError, match="SCM_BACKEND=bitbucket"):
+            validate_startup_config(project_dir, skip_credential_check=True)
+
+    def test_github_rest_with_bitbucket_url_fails(self, project_dir, monkeypatch):
+        """SCM_BACKEND=github-rest + Bitbucket URL should raise ConfigValidationError."""
+        from framework.config import ConfigValidationError, validate_startup_config
+
+        monkeypatch.setenv("SCM_BACKEND", "github-rest")
+        monkeypatch.setenv("SCM_BASE_URL", "https://bitbucket.my-company.com")
+        with pytest.raises(ConfigValidationError, match="SCM_BACKEND="):
+            validate_startup_config(project_dir, skip_credential_check=True)
+
+    def test_figma_provider_without_token_fails(self, project_dir, monkeypatch):
+        """UI_DESIGN_DEFAULT_PROVIDER=figma without FIGMA_TOKEN should fail."""
+        from framework.config import ConfigValidationError, validate_startup_config
+
+        monkeypatch.setenv("UI_DESIGN_DEFAULT_PROVIDER", "figma")
+        monkeypatch.delenv("FIGMA_TOKEN", raising=False)
+        with pytest.raises(ConfigValidationError, match="FIGMA_TOKEN"):
+            validate_startup_config(project_dir)
+
+    def test_figma_provider_with_token_passes(self, project_dir, monkeypatch):
+        """UI_DESIGN_DEFAULT_PROVIDER=figma with FIGMA_TOKEN set should pass."""
+        from framework.config import validate_startup_config
+
+        monkeypatch.setenv("UI_DESIGN_DEFAULT_PROVIDER", "figma")
+        monkeypatch.setenv("FIGMA_TOKEN", "figd_test_token")
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-token")
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        warnings = validate_startup_config(project_dir)
+        assert isinstance(warnings, list)
+        # No error for figma with token
+        assert not any("FIGMA_TOKEN" in w for w in warnings)
+
+    def test_stitch_without_api_key_is_warning_not_error(self, project_dir, monkeypatch):
+        """stitch provider without STITCH_API_KEY should warn, not fail."""
+        from framework.config import validate_startup_config
+
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-token")
+        monkeypatch.delenv("STITCH_API_KEY", raising=False)
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        warnings = validate_startup_config(project_dir)
+        assert any("STITCH_API_KEY" in w for w in warnings)
+
+    def test_claude_code_without_token_fails(self, project_dir, monkeypatch):
+        """AGENT_RUNTIME=claude-code without ANTHROPIC_AUTH_TOKEN should fail."""
+        from framework.config import ConfigValidationError, validate_startup_config
+
+        monkeypatch.setenv("AGENT_RUNTIME", "claude-code")
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        with pytest.raises(ConfigValidationError, match="ANTHROPIC_AUTH_TOKEN"):
+            validate_startup_config(project_dir)
+
+    def test_connect_agent_without_url_is_warning(self, project_dir, monkeypatch):
+        """AGENT_RUNTIME=connect-agent without CONNECT_AGENT_URL should warn."""
+        from framework.config import validate_startup_config
+
+        monkeypatch.setenv("AGENT_RUNTIME", "connect-agent")
+        monkeypatch.delenv("CONNECT_AGENT_URL", raising=False)
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        warnings = validate_startup_config(project_dir)
+        assert any("CONNECT_AGENT_URL" in w for w in warnings)
+
+    def test_copilot_cli_without_token_fails(self, project_dir, monkeypatch):
+        """AGENT_RUNTIME=copilot-cli without COPILOT_GITHUB_TOKEN should fail."""
+        from framework.config import ConfigValidationError, validate_startup_config
+
+        monkeypatch.setenv("AGENT_RUNTIME", "copilot-cli")
+        monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        with pytest.raises(ConfigValidationError, match="COPILOT_GITHUB_TOKEN"):
+            validate_startup_config(project_dir)
+
+    def test_invalid_container_runtime_fails(self, project_dir, monkeypatch):
+        """CONTAINER_RUNTIME=unknown should fail."""
+        from framework.config import ConfigValidationError, validate_startup_config
+
+        monkeypatch.setenv("CONTAINER_RUNTIME", "kubernetes")
+        monkeypatch.setenv("AGENT_RUNTIME", "connect-agent")
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        with pytest.raises(ConfigValidationError, match="CONTAINER_RUNTIME="):
+            validate_startup_config(project_dir)
+
+    def test_skip_credential_check_bypasses_token_checks(self, project_dir, monkeypatch):
+        """skip_credential_check=True skips all credential-related checks."""
+        from framework.config import validate_startup_config
+
+        monkeypatch.setenv("AGENT_RUNTIME", "claude-code")
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        # Should NOT raise even though ANTHROPIC_AUTH_TOKEN is missing
+        warnings = validate_startup_config(project_dir, skip_credential_check=True)
+        assert isinstance(warnings, list)
+
+
+class TestSharedSelectorLeakageCheck:
+    """_check_agent_env_leakage() warns when shared selectors appear in agent .env."""
+
+    def test_warns_when_shared_key_in_agent_env(self, tmp_path):
+        """If JIRA_BACKEND is in agents/jira/.env, a warning is produced."""
+        from framework.config import _check_agent_env_leakage
+
+        agent_env = tmp_path / "agents" / "jira" / ".env"
+        agent_env.parent.mkdir(parents=True)
+        agent_env.write_text("JIRA_BASE_URL=https://example.atlassian.net\nJIRA_BACKEND=rest\n")
+
+        warnings = _check_agent_env_leakage("jira", tmp_path)
+        assert len(warnings) == 1
+        assert "JIRA_BACKEND" in warnings[0]
+
+    def test_no_warning_when_only_local_keys(self, tmp_path):
+        """Agent .env with only local keys produces no warnings."""
+        from framework.config import _check_agent_env_leakage
+
+        agent_env = tmp_path / "agents" / "jira" / ".env"
+        agent_env.parent.mkdir(parents=True)
+        agent_env.write_text("JIRA_BASE_URL=https://example.atlassian.net\nJIRA_TOKEN=secret\n")
+
+        warnings = _check_agent_env_leakage("jira", tmp_path)
+        assert warnings == []
+
+    def test_no_warning_when_env_file_absent(self, tmp_path):
+        """Missing agent .env produces no warnings."""
+        from framework.config import _check_agent_env_leakage
+
+        warnings = _check_agent_env_leakage("jira", tmp_path)
+        assert warnings == []
+
+    def test_validate_startup_config_with_agent_id_checks_leakage(self, project_dir, monkeypatch, tmp_path):
+        """validate_startup_config with agent_id warns on shared key in agent .env."""
+        from framework.config import validate_startup_config
+
+        # Create an agent .env with a shared selector key
+        agent_env = project_dir / "agents" / "jira" / ".env"
+        agent_env.parent.mkdir(parents=True, exist_ok=True)
+        agent_env.write_text("JIRA_BASE_URL=https://x.atlassian.net\nJIRA_BACKEND=rest\n")
+
+        monkeypatch.setenv("AGENT_RUNTIME", "connect-agent")
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        warnings = validate_startup_config(project_dir, skip_credential_check=True, agent_id="jira")
+        assert any("JIRA_BACKEND" in w for w in warnings)
+
+    def test_validate_startup_config_without_agent_id_skips_leakage(self, project_dir, monkeypatch):
+        """validate_startup_config without agent_id does not check leakage."""
+        from framework.config import validate_startup_config
+
+        monkeypatch.setenv("AGENT_RUNTIME", "connect-agent")
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        # Should not raise even if no agent-level checks
+        warnings = validate_startup_config(project_dir, skip_credential_check=True)
+        assert isinstance(warnings, list)

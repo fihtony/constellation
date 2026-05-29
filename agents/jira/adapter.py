@@ -130,7 +130,12 @@ class JiraAgentAdapter(BaseAgent):
     ):
         super().__init__(definition, services)
         self._provider = jira_provider
-        self._backend = jira_backend or os.environ.get("JIRA_BACKEND", "mcp")
+        # Priority: explicit arg → config loader (boundary.jira.backend) → hardcoded default
+        if jira_backend:
+            self._backend = jira_backend
+        else:
+            from framework.config import get_boundary_backend
+            self._backend = get_boundary_backend("jira")
 
     async def start(self) -> None:
         await super().start()

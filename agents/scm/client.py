@@ -28,6 +28,19 @@ _GITHUB_HOST_RE = re.compile(r"github\.com", re.IGNORECASE)
 GITHUB_API_BASE = "https://api.github.com"
 
 
+def _get_scm_backend_from_config() -> str:
+    """Read the SCM backend from the unified config (boundary.scm.backend).
+
+    Falls back to the raw SCM_BACKEND env var for backward compatibility,
+    then returns an empty string if neither is set (let the caller auto-detect).
+    """
+    try:
+        from framework.config import get_boundary_backend
+        return get_boundary_backend("scm").lower().strip()
+    except Exception:
+        return os.environ.get("SCM_BACKEND", "").lower().strip()
+
+
 def _detect_provider(base_url: str) -> str:
     """Auto-detect SCM provider from base URL."""
     host = urlparse(base_url).netloc.lower()
@@ -1035,7 +1048,7 @@ def create_scm_client(
     """
     resolved_backend = (
         backend
-        or os.environ.get("SCM_BACKEND", "").lower().strip()
+        or _get_scm_backend_from_config()
         or _detect_provider(base_url)
     )
 

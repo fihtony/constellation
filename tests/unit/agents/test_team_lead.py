@@ -834,6 +834,99 @@ class TestDispatchDevAgentValidation:
         assert "dev_agent_acknowledged" not in result
         assert "dev_agent_cleaned_up" not in result
 
+    async def test_request_revision_posts_jira_and_inline_pr_comments(self, monkeypatch):
+        from agents.team_lead.nodes import request_revision
+
+        calls = []
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                calls.append((name, args))
+                return json.dumps({"ok": True})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        await request_revision({
+            "_task_id": "task-team-lead",
+            "jira_key": "CSTL-1",
+            "pr_url": "https://github.com/fihtony/english-study-hub/pull/93",
+            "pr_number": 93,
+            "repo_url": "https://github.com/fihtony/english-study-hub",
+            "review_result": {
+                "summary": "Fix review findings",
+                "comments": [
+                    {
+                        "severity": "high",
+                        "message": "Use dynamic year.",
+                        "file": "src/components/Footer.jsx",
+                        "line": 5,
+                    },
+                    {
+                        "severity": "medium",
+                        "message": "Replace dead links.",
+                        "file": "src/components/Hero.jsx",
+                        "line": 22,
+                    },
+                ],
+            },
+        })
+
+        assert calls[0][0] == "jira_comment"
+        assert calls[0][1]["ticket_key"] == "CSTL-1"
+        assert calls[1][0] == "scm_add_pr_inline_comment"
+        assert calls[1][1]["repo_url"] == "https://github.com/fihtony/english-study-hub"
+        assert calls[1][1]["pr_number"] == 93
+        assert calls[1][1]["file_path"] == "src/components/Footer.jsx"
+        assert calls[2][0] == "scm_add_pr_inline_comment"
+        assert calls[2][1]["file_path"] == "src/components/Hero.jsx"
+
+    def test_team_lead_inline_comment_tool_dispatches_via_a2a(self, monkeypatch):
+        from agents.team_lead.tools import SCMAddPRInlineComment
+
+        captured = {}
+
+        def fake_dispatch_sync(url, capability, message_parts, metadata, timeout=120):
+            captured.update({
+                "url": url,
+                "capability": capability,
+                "message_parts": message_parts,
+                "metadata": metadata,
+                "timeout": timeout,
+            })
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"parts": [{"text": json.dumps({"ok": True, "fallback": False})}]}],
+                }
+            }
+
+        monkeypatch.setattr("agents.team_lead.tools._resolve_agent_url", lambda *args: "http://scm:8020")
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", fake_dispatch_sync)
+
+        result = SCMAddPRInlineComment().execute_sync(
+            repo_url="https://github.com/fihtony/english-study-hub",
+            pr_number=93,
+            file_path="src/App.jsx",
+            line=17,
+            comment="[HIGH] Fix this.",
+            commit_id="abc123",
+            task_id="task-team-lead",
+        )
+
+        assert json.loads(result.output) == {"ok": True, "fallback": False}
+        assert captured["url"] == "http://scm:8020"
+        assert captured["capability"] == "scm.pr.comment.inline"
+        assert captured["message_parts"] == [{"text": "[HIGH] Fix this."}]
+        assert captured["metadata"] == {
+            "repoUrl": "https://github.com/fihtony/english-study-hub",
+            "prNumber": 93,
+            "filePath": "src/App.jsx",
+            "line": 17,
+            "comment": "[HIGH] Fix this.",
+            "commitId": "abc123",
+            "taskId": "task-team-lead",
+        }
+
     def test_callback_propagates_screenshot_evidence(self, monkeypatch):
         from agents.team_lead.agent import _send_callback
 

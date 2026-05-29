@@ -156,6 +156,7 @@ class TestScmAdapterPrEvidenceCapabilities:
 
         assert "scm.pr.info" in capabilities
         assert "scm.pr.diff" in capabilities
+        assert "scm.pr.comment.inline" in capabilities
 
     def test_dispatch_get_pr_diff_calls_client(self):
         calls = {}
@@ -190,10 +191,53 @@ class TestScmAdapterPrEvidenceCapabilities:
             "changed_files": [{"filename": "app.py"}],
             "status": "ok",
         }
+
+    def test_dispatch_inline_pr_comment_calls_client(self):
+        calls = {}
+
+        class FakeClient:
+            def add_pr_inline_comment(self, owner, repo, pr_id, file_path, line, comment, commit_id=""):
+                calls.update({
+                    "owner": owner,
+                    "repo": repo,
+                    "pr_id": pr_id,
+                    "file_path": file_path,
+                    "line": line,
+                    "comment": comment,
+                    "commit_id": commit_id,
+                })
+                return {"id": 321, "fallback": False}, "ok"
+
+        adapter = object.__new__(SCMAgentAdapter)
+        adapter._get_client = lambda: FakeClient()  # type: ignore[attr-defined]
+
+        result = adapter._dispatch(
+            "scm.pr.comment.inline",
+            "",
+            {"metadata": {
+                "project": "org",
+                "repo": "repo",
+                "prNumber": 42,
+                "filePath": "src/App.jsx",
+                "line": 17,
+                "comment": "[HIGH] Fix this.",
+                "commitId": "abc123",
+            }},
+        )
+
+        assert result == {
+            "comment": {"id": 321, "fallback": False},
+            "status": "ok",
+            "fallback": False,
+        }
         assert calls == {
             "owner": "org",
             "repo": "repo",
             "pr_id": 42,
+            "file_path": "src/App.jsx",
+            "line": 17,
+            "comment": "[HIGH] Fix this.",
+            "commit_id": "abc123",
         }
 
     def test_dispatch_get_pr_info_calls_client(self):

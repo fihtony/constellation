@@ -113,6 +113,29 @@ def _validate_task_workspace_root(workspace_path: str, agent_name: str) -> None:
         )
 
 
+def _dispatch_boundary_capability(
+    *,
+    url: str,
+    capability: str,
+    text: str,
+    metadata: dict[str, Any],
+    timeout: int = 120,
+) -> dict[str, Any]:
+    from framework.a2a.client import dispatch_sync
+
+    result = dispatch_sync(
+        url=url,
+        capability=capability,
+        message_parts=[{"text": text}],
+        metadata=metadata,
+        timeout=timeout,
+    )
+    task = result.get("task", result)
+    if _task_state(task) != "TASK_STATE_COMPLETED":
+        return {"error": _task_error(task, f"{capability} failed")}
+    return _first_artifact_json(task.get("artifacts", []))
+
+
 def _dispatch_via_launcher(
     definition: dict[str, Any],
     *,
@@ -395,6 +418,198 @@ class CloneRepo(BaseTool):
                 "repoUrl": repo_url,
                 "targetPath": target_path,
             }))
+
+
+# ---------------------------------------------------------------------------
+# Tool: jira_comment
+# ---------------------------------------------------------------------------
+
+class JiraComment(BaseTool):
+    """Add a Jira comment via the Jira boundary agent."""
+
+    name = "jira_comment"
+    description = "Add a comment to a Jira ticket via the Jira Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "ticket_key": {
+                "type": "string",
+                "description": "Jira ticket key, e.g. PROJ-123.",
+            },
+            "comment": {
+                "type": "string",
+                "description": "Comment body to add to the ticket.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Caller task ID for log correlation (optional).",
+            },
+        },
+        "required": ["ticket_key", "comment"],
+    }
+
+    def execute_sync(
+        self,
+        ticket_key: str = "",
+        comment: str = "",
+        task_id: str = "",
+        **_: Any,
+    ) -> ToolResult:
+        jira_url = _resolve_agent_url("JIRA_AGENT_URL", "jira_agent_url", "http://jira:8010", "jira.comment.add")
+        if not jira_url:
+            return ToolResult(output=json.dumps({"error": "No registered Jira instance was found in the registry.", "ticketKey": ticket_key}))
+        try:
+            metadata: dict[str, Any] = {"ticketKey": ticket_key, "comment": comment}
+            if task_id:
+                metadata["taskId"] = task_id
+            payload = _dispatch_boundary_capability(
+                url=jira_url,
+                capability="jira.comment.add",
+                text=comment,
+                metadata=metadata,
+            )
+            return ToolResult(output=json.dumps(payload))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"error": str(exc), "ticketKey": ticket_key}))
+
+
+# ---------------------------------------------------------------------------
+# Tool: jira_transition
+# ---------------------------------------------------------------------------
+
+class JiraTransition(BaseTool):
+    """Transition a Jira ticket via the Jira boundary agent."""
+
+    name = "jira_transition"
+    description = "Transition a Jira ticket to a new status via the Jira Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "ticket_key": {
+                "type": "string",
+                "description": "Jira ticket key, e.g. PROJ-123.",
+            },
+            "transition_name": {
+                "type": "string",
+                "description": "Human-readable transition name.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Caller task ID for log correlation (optional).",
+            },
+        },
+        "required": ["ticket_key", "transition_name"],
+    }
+
+    def execute_sync(
+        self,
+        ticket_key: str = "",
+        transition_name: str = "",
+        task_id: str = "",
+        **_: Any,
+    ) -> ToolResult:
+        jira_url = _resolve_agent_url("JIRA_AGENT_URL", "jira_agent_url", "http://jira:8010", "jira.ticket.transition")
+        if not jira_url:
+            return ToolResult(output=json.dumps({"error": "No registered Jira instance was found in the registry.", "ticketKey": ticket_key}))
+        try:
+            metadata: dict[str, Any] = {"ticketKey": ticket_key, "transitionName": transition_name}
+            if task_id:
+                metadata["taskId"] = task_id
+            payload = _dispatch_boundary_capability(
+                url=jira_url,
+                capability="jira.ticket.transition",
+                text=transition_name,
+                metadata=metadata,
+            )
+            return ToolResult(output=json.dumps(payload))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"error": str(exc), "ticketKey": ticket_key}))
+
+
+# ---------------------------------------------------------------------------
+# Tool: scm_add_pr_inline_comment
+# ---------------------------------------------------------------------------
+
+class SCMAddPRInlineComment(BaseTool):
+    """Post an inline PR review comment via the SCM boundary agent."""
+
+    name = "scm_add_pr_inline_comment"
+    description = "Post an inline review comment on a PR diff line via the SCM Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {
+                "type": "string",
+                "description": "Full repository URL.",
+            },
+            "pr_number": {
+                "type": "integer",
+                "description": "Pull request number.",
+            },
+            "file_path": {
+                "type": "string",
+                "description": "Path of the file to comment on (relative to repo root).",
+            },
+            "line": {
+                "type": "integer",
+                "description": "Line number in the file to comment on.",
+            },
+            "comment": {
+                "type": "string",
+                "description": "Markdown comment body.",
+            },
+            "commit_id": {
+                "type": "string",
+                "description": "Commit SHA to attach comment to (optional).",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Caller task ID for log correlation (optional).",
+            },
+        },
+        "required": ["repo_url", "pr_number", "file_path", "line", "comment"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        pr_number: int = 0,
+        file_path: str = "",
+        line: int = 0,
+        comment: str = "",
+        commit_id: str = "",
+        task_id: str = "",
+        **_: Any,
+    ) -> ToolResult:
+        scm_url = _resolve_agent_url(
+            "SCM_AGENT_URL",
+            "scm_agent_url",
+            "http://scm:8020",
+            "scm.pr.comment.inline",
+        )
+        if not scm_url:
+            return ToolResult(output=json.dumps({"error": "No registered SCM instance was found in the registry.", "repoUrl": repo_url, "prNumber": pr_number}))
+        try:
+            metadata: dict[str, Any] = {
+                "repoUrl": repo_url,
+                "prNumber": pr_number,
+                "filePath": file_path,
+                "line": line,
+                "comment": comment,
+            }
+            if commit_id:
+                metadata["commitId"] = commit_id
+            if task_id:
+                metadata["taskId"] = task_id
+            payload = _dispatch_boundary_capability(
+                url=scm_url,
+                capability="scm.pr.comment.inline",
+                text=comment,
+                metadata=metadata,
+            )
+            return ToolResult(output=json.dumps(payload))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"error": str(exc), "repoUrl": repo_url, "prNumber": pr_number}))
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +1124,9 @@ _TOOLS = [
     FetchJiraTicket(),
     FetchDesign(),
     CloneRepo(),
+    JiraComment(),
+    JiraTransition(),
+    SCMAddPRInlineComment(),
     DispatchWebDev(),
     DispatchCodeReview(),
     RequestClarification(),
