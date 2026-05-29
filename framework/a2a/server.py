@@ -251,6 +251,35 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         headers = dict(response.get("headers") or {})
         body = response.get("body", "")
 
+        # Streaming (SSE): body is a generator/iterator and Content-Type is text/event-stream
+        ctype = str(headers.get("Content-Type", "")).lower()
+        is_streaming = ctype.startswith("text/event-stream") and hasattr(body, "__iter__") and not isinstance(
+            body, (str, bytes, dict, list)
+        )
+        if is_streaming:
+            headers.setdefault("Content-Type", "text/event-stream; charset=utf-8")
+            headers["Cache-Control"] = "no-cache"
+            headers["Connection"] = "keep-alive"
+            headers["X-Accel-Buffering"] = "no"
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            try:
+                for chunk in body:
+                    if chunk is None:
+                        continue
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8")
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+            except Exception as exc:
+                print(f"[a2a-sse] stream aborted: {exc}")
+            return
+
         if isinstance(body, (dict, list)):
             payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
             headers.setdefault("Content-Type", "application/json; charset=utf-8")

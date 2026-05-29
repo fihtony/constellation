@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import time
+from typing import Iterable
 
 from framework.agent import AgentDefinition, AgentMode, ExecutionMode
 from agents.log_store.log_aggregator import LogAggregator
@@ -51,14 +53,14 @@ class LogStoreAgent:
 
     async def get_logs(self, task_id: str) -> dict:
         """Return logs for a task."""
-        return {"task_id": task_id, "logs": self._logs.get(task_id, [])}
+        return {"task_id": task_id, "logs": self.get_logs_sync(task_id)}
 
     async def health(self) -> dict:
         return {"status": "ok", "service": "log-store"}
 
     def get_logs_sync(self, task_id: str) -> list[dict]:
         """Synchronous get logs for API."""
-        return self._logs.get(task_id, [])
+        return self._merged_logs(task_id)
 
     def add_log_sync(self, task_id: str, log_entry: dict) -> None:
         """Synchronous add log for API."""
@@ -74,3 +76,73 @@ class LogStoreAgent:
         """Return API instance for REST endpoints."""
         from agents.log_store.api import LogStoreAPI
         return LogStoreAPI(self)
+
+    def serve_ui(self, path: str) -> dict:
+        """Serve REST and SSE log endpoints for Compass UI consumption."""
+        if path.startswith("/logs/stream/"):
+            task_id = path[len("/logs/stream/"):]
+            return {
+                "status": 200,
+                "headers": {"Content-Type": "text/event-stream; charset=utf-8"},
+                "body": self.stream_logs(task_id),
+            }
+        if path.startswith("/logs/"):
+            task_id = path[len("/logs/"):]
+            return {
+                "status": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": {"task_id": task_id, "logs": self.get_logs_sync(task_id)},
+            }
+        return {"status": 404, "body": "Not found"}
+
+    def stream_logs(
+        self,
+        task_id: str,
+        *,
+        poll_interval: float = 1.0,
+        max_iterations: int | None = None,
+    ) -> Iterable[str]:
+        """Yield SSE chunks for appended log entries.
+
+        ``max_iterations`` exists so unit tests can exhaust the generator.
+        """
+        previous = self._merged_logs(task_id)
+        for entry in previous:
+            yield self._format_sse("log.appended", entry)
+        yield ": connected\n\n"
+
+        iterations = 0
+        while True:
+            if max_iterations is not None and iterations >= max_iterations:
+                return
+            iterations += 1
+            time.sleep(poll_interval)
+            current = self._merged_logs(task_id)
+            if len(current) > len(previous):
+                for entry in current[len(previous):]:
+                    yield self._format_sse("log.appended", entry)
+            previous = current
+            yield ": heartbeat\n\n"
+
+    def _merged_logs(self, task_id: str) -> list[dict]:
+        memory_logs = list(self._logs.get(task_id, []))
+        filesystem_logs = self.aggregate_from_filesystem(task_id)
+
+        merged: list[dict] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for entry in [*filesystem_logs, *memory_logs]:
+            key = (
+                str(entry.get("timestamp", "")),
+                str(entry.get("level", "")),
+                str(entry.get("agent", "")),
+                str(entry.get("message", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(entry)
+        return sorted(merged, key=lambda item: item.get("timestamp", ""))
+
+    @staticmethod
+    def _format_sse(event: str, payload: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"

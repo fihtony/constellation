@@ -145,7 +145,13 @@ class InMemoryTaskStore(TaskStore):
         metadata: dict | None = None,
         task_id: str | None = None,
     ) -> Task:
-        task = Task(id=task_id or f"task-{uuid.uuid4().hex[:12]}", metadata={"agentId": agent_id, **(metadata or {})})
+        now = _now_iso()
+        task = Task(
+            id=task_id or f"task-{uuid.uuid4().hex[:12]}",
+            metadata={"agentId": agent_id, **(metadata or {})},
+            created_at=now,
+            updated_at=now,
+        )
         task.status = TaskStatus(state=TaskState.WORKING)
         with self._lock:
             self._tasks[task.id] = task
@@ -176,18 +182,21 @@ class InMemoryTaskStore(TaskStore):
             task = self._tasks.get(task_id)
             if task:
                 task.artifacts.append(artifact)
+                task.touch()
 
     def set_artifacts(self, task_id: str, artifacts: list[Artifact]) -> None:
         with self._lock:
             task = self._tasks.get(task_id)
             if task:
                 task.artifacts = list(artifacts)
+                task.touch()
 
     def update_metadata(self, task_id: str, delta: dict) -> None:
         with self._lock:
             task = self._tasks.get(task_id)
             if task:
                 task.metadata.update(delta)
+                task.touch()
 
     def list_tasks(
         self,
@@ -203,6 +212,8 @@ class InMemoryTaskStore(TaskStore):
                 tasks = list(self._tasks.values())
             if state:
                 tasks = [t for t in tasks if t.status.state == state]
+            # Newest first by created_at; fall back to id ordering for ties
+            tasks.sort(key=lambda t: (t.created_at or "", t.id), reverse=True)
             return tasks[:limit]
 
 
@@ -250,9 +261,14 @@ class SqliteTaskStore(TaskStore):
         metadata: dict | None = None,
         task_id: str | None = None,
     ) -> Task:
-        task = Task(id=task_id or f"task-{uuid.uuid4().hex[:12]}", metadata={"agentId": agent_id, **(metadata or {})})
-        task.status = TaskStatus(state=TaskState.WORKING)
         now = _now_iso()
+        task = Task(
+            id=task_id or f"task-{uuid.uuid4().hex[:12]}",
+            metadata={"agentId": agent_id, **(metadata or {})},
+            created_at=now,
+            updated_at=now,
+        )
+        task.status = TaskStatus(state=TaskState.WORKING)
         with self._lock:
             conn = self._conn()
             try:
@@ -279,15 +295,20 @@ class SqliteTaskStore(TaskStore):
             conn = self._conn()
             try:
                 row = conn.execute(
-                    "SELECT id, state, status_message, artifacts, metadata FROM tasks WHERE id = ?",
+                    "SELECT id, state, status_message, artifacts, metadata, created_at, updated_at FROM tasks WHERE id = ?",
                     (task_id,),
                 ).fetchone()
             finally:
                 conn.close()
         if row is None:
             return None
-        task_id_val, state_val, status_msg, artifacts_json, metadata_json = row
-        task = Task(id=task_id_val, metadata=json.loads(metadata_json))
+        task_id_val, state_val, status_msg, artifacts_json, metadata_json, created_at, updated_at = row
+        task = Task(
+            id=task_id_val,
+            metadata=json.loads(metadata_json),
+            created_at=created_at or _now_iso(),
+            updated_at=updated_at or _now_iso(),
+        )
         task.status = TaskStatus(state=TaskState(state_val))
         if status_msg:
             task.status.message = Message(parts=[{"text": status_msg}])
@@ -405,15 +426,20 @@ class SqliteTaskStore(TaskStore):
             conn = self._conn()
             try:
                 rows = conn.execute(
-                    f"SELECT id, state, status_message, artifacts, metadata FROM tasks{where} ORDER BY created_at DESC LIMIT ?",
+                    f"SELECT id, state, status_message, artifacts, metadata, created_at, updated_at FROM tasks{where} ORDER BY created_at DESC LIMIT ?",
                     params,
                 ).fetchall()
             finally:
                 conn.close()
 
         tasks = []
-        for task_id_val, state_val, status_msg, arts_json, meta_json in rows:
-            task = Task(id=task_id_val, metadata=json.loads(meta_json))
+        for task_id_val, state_val, status_msg, arts_json, meta_json, created_at, updated_at in rows:
+            task = Task(
+                id=task_id_val,
+                metadata=json.loads(meta_json),
+                created_at=created_at or _now_iso(),
+                updated_at=updated_at or _now_iso(),
+            )
             task.status = TaskStatus(state=TaskState(state_val))
             if status_msg:
                 task.status.message = Message(parts=[{"text": status_msg}])
