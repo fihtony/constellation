@@ -102,7 +102,7 @@ class CloneRepo(BaseTool):
         "required": ["repo_url", "target_path"],
     }
 
-    def execute_sync(self, repo_url: str = "", target_path: str = "", task_id: str = "") -> ToolResult:
+    def execute_sync(self, repo_url: str = "", target_path: str = "", task_id: str = "", **_kwargs) -> ToolResult:
         log = _log(task_id)
         log.info("clone_repo called", repo_url=repo_url, target_path=target_path)
         adapter = _get_adapter()
@@ -131,7 +131,7 @@ class SCMListBranches(BaseTool):
         "required": ["repo_url"],
     }
 
-    def execute_sync(self, repo_url: str = "", task_id: str = "") -> ToolResult:
+    def execute_sync(self, repo_url: str = "", task_id: str = "", **_kwargs) -> ToolResult:
         log = _log(task_id)
         log.debug("scm_list_branches called", repo_url=repo_url)
         adapter = _get_adapter()
@@ -157,7 +157,7 @@ class SCMListPRs(BaseTool):
         "required": ["repo_url"],
     }
 
-    def execute_sync(self, repo_url: str = "", state: str = "open", task_id: str = "") -> ToolResult:
+    def execute_sync(self, repo_url: str = "", state: str = "open", task_id: str = "", **_kwargs) -> ToolResult:
         log = _log(task_id)
         log.debug("scm_list_prs called", repo_url=repo_url, state=state)
         adapter = _get_adapter()
@@ -183,7 +183,7 @@ class SCMPush(BaseTool):
         "required": ["repo_path", "branch"],
     }
 
-    def execute_sync(self, repo_path: str = "", branch: str = "", task_id: str = "") -> ToolResult:
+    def execute_sync(self, repo_path: str = "", branch: str = "", task_id: str = "", **_kwargs) -> ToolResult:
         log = _log(task_id)
         log.info("scm_push called", repo_path=repo_path, branch=branch)
         adapter = _get_adapter()
@@ -222,6 +222,7 @@ class SCMCreatePR(BaseTool):
         title: str = "",
         description: str = "",
         task_id: str = "",
+        **_kwargs,
     ) -> ToolResult:
         log = _log(task_id)
         log.info("scm_create_pr called",
@@ -285,6 +286,7 @@ class SCMAddPRComment(BaseTool):
         pr_number: int = 0,
         comment: str = "",
         task_id: str = "",
+        **_kwargs,
     ) -> ToolResult:
         log = _log(task_id)
         log.info("scm_add_pr_comment called", repo_url=repo_url, pr_number=pr_number)
@@ -334,6 +336,7 @@ class SCMAddPRInlineComment(BaseTool):
         comment: str = "",
         commit_id: str = "",
         task_id: str = "",
+        **_kwargs,
     ) -> ToolResult:
         log = _log(task_id)
         log.info("scm_add_pr_inline_comment called",
@@ -391,6 +394,7 @@ class SCMUploadPRImage(BaseTool):
         image_path: str = "",
         filename: str = "",
         task_id: str = "",
+        **_kwargs,
     ) -> ToolResult:
         from agents.scm.tools import _parse_repo_coordinates
         import os as _os
@@ -447,6 +451,7 @@ class SCMUpdatePR(BaseTool):
         description: str = "",
         title: str = "",
         task_id: str = "",
+        **_kwargs,
     ) -> ToolResult:
         log = _log(task_id)
         log.info("scm_update_pr called", repo_url=repo_url, pr_number=pr_number)
@@ -489,6 +494,7 @@ class SCMGetPRDiff(BaseTool):
         repo_url: str = "",
         pr_number: int = 0,
         task_id: str = "",
+        **_kwargs,
     ) -> ToolResult:
         log = _log(task_id)
         log.info("scm_get_pr_diff called", repo_url=repo_url, pr_number=pr_number)
@@ -530,6 +536,7 @@ class SCMGetPRInfo(BaseTool):
         repo_url: str = "",
         pr_number: int = 0,
         task_id: str = "",
+        **_kwargs,
     ) -> ToolResult:
         log = _log(task_id)
         log.info("scm_get_pr_info called", repo_url=repo_url, pr_number=pr_number)

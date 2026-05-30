@@ -91,7 +91,7 @@ class FetchJiraTicket(BaseTool):
         "required": ["ticket_key"],
     }
 
-    def execute_sync(self, ticket_key: str = "", task_id: str = "", workspace_path: str = "") -> ToolResult:
+    def execute_sync(self, ticket_key: str = "", task_id: str = "", workspace_path: str = "", **_kwargs) -> ToolResult:
         return ToolResult(output=json.dumps(_fetch_jira_ticket_payload(
             ticket_key=ticket_key,
             task_id=task_id,
@@ -112,7 +112,7 @@ class JiraTransition(BaseTool):
         "required": ["ticket_key", "transition_name"],
     }
 
-    def execute_sync(self, ticket_key: str = "", transition_name: str = "", task_id: str = "") -> ToolResult:
+    def execute_sync(self, ticket_key: str = "", transition_name: str = "", task_id: str = "", **_kwargs) -> ToolResult:
         log = _log(task_id)
         log.info("jira_transition called", ticket_key=ticket_key, transition=transition_name)
         data, status = _get_provider().transition_issue(ticket_key, transition_name)
@@ -133,7 +133,7 @@ class JiraComment(BaseTool):
         "required": ["ticket_key", "comment"],
     }
 
-    def execute_sync(self, ticket_key: str = "", comment: str = "", task_id: str = "") -> ToolResult:
+    def execute_sync(self, ticket_key: str = "", comment: str = "", task_id: str = "", **_kwargs) -> ToolResult:
         log = _log(task_id)
         comment_preview = (comment[:200] + "...") if len(comment) > 200 else comment
         log.info("jira_comment called", ticket_key=ticket_key, comment_len=len(comment))
@@ -157,7 +157,7 @@ class JiraUpdate(BaseTool):
         "required": ["ticket_key"],
     }
 
-    def execute_sync(self, ticket_key: str = "", fields: dict | None = None, task_id: str = "") -> ToolResult:
+    def execute_sync(self, ticket_key: str = "", fields: dict | None = None, task_id: str = "", **_kwargs) -> ToolResult:
         log = _log(task_id)
         log.info("jira_update called", ticket_key=ticket_key, fields=list((fields or {}).keys()))
         data, status = _get_provider().update_issue_fields(ticket_key, fields or {})
@@ -177,7 +177,7 @@ class JiraListTransitions(BaseTool):
         "required": ["ticket_key"],
     }
 
-    def execute_sync(self, ticket_key: str = "", task_id: str = "") -> ToolResult:
+    def execute_sync(self, ticket_key: str = "", task_id: str = "", **_kwargs) -> ToolResult:
         log = _log(task_id)
         log.debug("jira_list_transitions called", ticket_key=ticket_key)
         data, status = _get_provider().get_transitions(ticket_key)
@@ -196,7 +196,7 @@ class JiraGetTokenUser(BaseTool):
         "required": [],
     }
 
-    def execute_sync(self, task_id: str = "") -> ToolResult:
+    def execute_sync(self, task_id: str = "", **_kwargs) -> ToolResult:
         log = _log(task_id)
         log.debug("jira_get_token_user called")
         data, status = _get_provider().get_myself()
@@ -216,7 +216,7 @@ class JiraListComments(BaseTool):
         "required": ["ticket_key"],
     }
 
-    def execute_sync(self, ticket_key: str = "", task_id: str = "") -> ToolResult:
+    def execute_sync(self, ticket_key: str = "", task_id: str = "", **_kwargs) -> ToolResult:
         log = _log(task_id)
         log.debug("jira_list_comments called", ticket_key=ticket_key)
         data, status = _get_provider().list_comments(ticket_key)
@@ -244,6 +244,7 @@ class JiraSearch(BaseTool):
         max_results: int = 10,
         fields: list | None = None,
         task_id: str = "",
+        **_kwargs,
     ) -> ToolResult:
         log = _log(task_id)
         log.info("jira_search called", jql_len=len(jql), max_results=max_results)
@@ -287,6 +288,7 @@ class JiraGetSprint(BaseTool):
         board_id: str = "",
         ticket_key: str = "",
         task_id: str = "",
+        **_kwargs,
     ) -> ToolResult:
         log = _log(task_id)
         log.info("jira_get_sprint called", board_id=board_id, ticket_key=ticket_key)
@@ -315,6 +317,7 @@ class JiraLinkIssue(BaseTool):
         linked_key: str = "",
         link_type: str = "",
         task_id: str = "",
+        **_kwargs,
     ) -> ToolResult:
         log = _log(task_id)
         log.info(
