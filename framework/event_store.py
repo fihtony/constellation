@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from framework.sqlite_utils import connect_sqlite
+
 
 @dataclass
 class AgentEvent:
@@ -117,7 +119,7 @@ class SqliteEventStore(EventStore):
         self._init_db()
 
     def _init_db(self) -> None:
-        conn = sqlite3.connect(self._db_path)
+        conn = connect_sqlite(self._db_path)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY,
@@ -153,7 +155,7 @@ class SqliteEventStore(EventStore):
             author=author,
             metadata=metadata or {},
         )
-        conn = sqlite3.connect(self._db_path)
+        conn = connect_sqlite(self._db_path)
         conn.execute(
             "INSERT INTO events (id, timestamp, session_id, agent_id, event_type, author, content, metadata) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -175,7 +177,7 @@ class SqliteEventStore(EventStore):
         since: str | None = None,
         limit: int = 100,
     ) -> list[AgentEvent]:
-        conn = sqlite3.connect(self._db_path)
+        conn = connect_sqlite(self._db_path)
         sql = "SELECT * FROM events WHERE session_id = ?"
         params: list[Any] = [session_id]
         if event_type:
