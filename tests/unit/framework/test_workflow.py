@@ -1,8 +1,10 @@
 """Tests for framework.workflow — Workflow engine."""
+from pathlib import Path
+
 import pytest
 
 from framework.errors import InterruptSignal, MaxStepsExceeded
-from framework.checkpoint import InMemoryCheckpointer
+from framework.checkpoint import InMemoryCheckpointer, SqliteCheckpointer
 from framework.workflow import END, START, RunConfig, Workflow, interrupt
 
 
@@ -42,6 +44,29 @@ async def ask_user(state):
 
 async def use_ticket(state):
     return {"result": f"Working on {state['jira_key']}"}
+
+
+async def use_ephemeral_runtime(state):
+    if "_resume_value" not in state:
+        interrupt("Need confirmation")
+    return {
+        "answer": state["_resume_value"],
+        "runtime_type": type(state["_runtime"]).__name__,
+    }
+
+
+class _NonSerializableRuntime:
+    pass
+
+
+async def interrupt_then_use_runtime(state):
+    if "_resume_value" not in state:
+        interrupt("Continue?")
+    runtime = state.get("_runtime")
+    return {
+        "runtime_name": type(runtime).__name__ if runtime is not None else "",
+        "answer": state.get("_resume_value", ""),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +210,61 @@ class TestWorkflowCheckpoint:
         assert saved is not None
         assert saved["state"]["a"] is True
         assert saved["state"]["b"] is True
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_state_survives_sqlite_checkpoint_resume(self, tmp_path: Path):
+        checkpoint = SqliteCheckpointer(db_path=str(tmp_path / "checkpoints.db"))
+
+        wf = Workflow(name="ephemeral_resume", edges=[
+            (START, use_ephemeral_runtime, END),
+        ])
+        compiled = wf.compile()
+        runtime_sentinel = object()
+        config = RunConfig(
+            session_id="s2",
+            thread_id="t2",
+            checkpoint_service=checkpoint,
+            ephemeral_state={"_runtime": runtime_sentinel},
+        )
+
+        with pytest.raises(InterruptSignal):
+            await compiled.invoke({}, config)
+
+        saved = await checkpoint.load("s2", "t2")
+        assert saved is not None
+        assert "_runtime" not in saved["state"]
+
+        result = await compiled.resume(config, "confirmed")
+
+        assert result["answer"] == "confirmed"
+        assert result["runtime_type"] == "object"
+
+    @pytest.mark.asyncio
+    async def test_sqlite_checkpoint_drops_non_json_state_and_restores_ephemeral_context(self, tmp_path):
+        checkpoint = SqliteCheckpointer(db_path=str(tmp_path / "checkpoints.db"))
+        runtime = _NonSerializableRuntime()
+
+        wf = Workflow(name="runtime_checkpoint", edges=[
+            (START, interrupt_then_use_runtime, END),
+        ])
+        compiled = wf.compile()
+        config = RunConfig(
+            session_id="s-runtime",
+            thread_id="t-runtime",
+            checkpoint_service=checkpoint,
+            ephemeral_state={"_runtime": runtime},
+        )
+
+        with pytest.raises(InterruptSignal):
+            await compiled.invoke({"_runtime": runtime, "input": "test"}, config)
+
+        saved = await checkpoint.load("s-runtime", "t-runtime")
+        assert saved is not None
+        assert "_runtime" not in saved["state"]
+
+        result = await compiled.resume(config, "go")
+        assert result["runtime_name"] == "_NonSerializableRuntime"
+        assert result["answer"] == "go"
 
 
 # ---------------------------------------------------------------------------

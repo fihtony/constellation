@@ -124,6 +124,13 @@ team_lead_definition = _build_team_lead_definition()
 class TeamLeadAgent(BaseAgent):
     """Team Lead Agent — graph-first with ReAct-inside-nodes."""
 
+    def _workflow_ephemeral_state(self) -> dict[str, Any]:
+        return {
+            "_runtime": self.services.runtime,
+            "_skills_registry": self.skills_registry,
+            "_plugin_manager": self.plugin_manager,
+        }
+
     async def start(self) -> None:
         await super().start()
         _register_team_lead_dispatch(self)
@@ -164,6 +171,8 @@ class TeamLeadAgent(BaseAgent):
             else:
                 workspace_path = os.path.join(artifact_root, f"tl-{task.id[:8]}")
 
+        ephemeral_state = self._workflow_ephemeral_state()
+
         state = {
             "user_request": user_text,
             "jira_key": meta.get("jiraKey", ""),
@@ -179,9 +188,6 @@ class TeamLeadAgent(BaseAgent):
             # All agents in this workflow log under {ARTIFACT_ROOT}/{_task_id}/
             "_task_id": orchestrator_task_id or task.id,
             "_agent_id": self.definition.agent_id,
-            "_runtime": self.services.runtime,
-            "_skills_registry": self.skills_registry,
-            "_plugin_manager": self.plugin_manager,
         }
 
         # Run workflow in background thread
@@ -196,6 +202,7 @@ class TeamLeadAgent(BaseAgent):
                     task.id,
                     max_steps=50,
                     timeout_seconds=3600,
+                    ephemeral_state=ephemeral_state,
                 )
                 result = loop.run_until_complete(
                     self._compiled_workflow.invoke(state, config)
@@ -269,7 +276,12 @@ class TeamLeadAgent(BaseAgent):
         task_store.resume_task(task_id)
 
         if self._compiled_workflow and self.checkpoint_service:
-            config = self._build_run_config(task_id, max_steps=50, timeout_seconds=3600)
+            config = self._build_run_config(
+                task_id,
+                max_steps=50,
+                timeout_seconds=3600,
+                ephemeral_state=self._workflow_ephemeral_state(),
+            )
             try:
                 result = await self._compiled_workflow.resume(config, resume_value)
                 summary = (

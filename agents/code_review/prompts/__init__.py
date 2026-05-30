@@ -26,6 +26,18 @@ Return a JSON array of issue objects. Each object must have:
 - "message": clear description of the issue
 - "suggestion": concrete fix recommendation
 
+Optional field:
+- "blocking": true | false
+
+Severity guidance:
+- critical: confirmed exploitable security issue, data loss/corruption risk, auth bypass, or a clear production-breaking defect.
+- high: serious issue likely to break a required user flow, violate a hard requirement, or leave a core UI/UX path unusable.
+- medium: meaningful but non-blocking issue that should be fixed soon.
+- low: minor issue, maintainability note, or non-blocking suggestion.
+
+Prefer medium over high for naming, maintainability, missing non-critical tests, duplication, or small UI fidelity gaps.
+Set "blocking": true only when the issue should stop merge/review approval.
+
 Return [] if no issues are found.
 Return ONLY the JSON array — no markdown fences, no prose."""
 
@@ -37,7 +49,9 @@ QUALITY_SYSTEM = (
     "You are a senior code reviewer evaluating code quality, readability, "
     "maintainability, naming conventions, error handling, and adherence to "
     "language-specific best practices. "
-    "Be objective and specific. Cite file names and line numbers where possible."
+   "Be objective and specific. Cite file names and line numbers where possible. "
+   "Use high severity sparingly: only for correctness or reliability defects that are likely to break behavior. "
+   "Naming, style, maintainability, and non-blocking refactors should usually be medium or low."
 )
 
 QUALITY_TEMPLATE = """\
@@ -64,7 +78,8 @@ SECURITY_SYSTEM = (
     "XSS, insecure deserialization, using components with known vulnerabilities, "
     "and insufficient logging. "
     "Flag hardcoded credentials, unvalidated user input, missing input sanitization, "
-    "and insecure direct object references."
+   "and insecure direct object references. "
+   "Critical and high security issues are merge-blocking and should set blocking=true."
 )
 
 SECURITY_TEMPLATE = """\
@@ -89,7 +104,9 @@ Add a "owasp" field to each issue (e.g. "A03:2021 Injection") when applicable.
 TESTS_SYSTEM = (
     "You are a QA engineer reviewing test coverage and test quality. "
     "Identify missing unit tests, integration tests, and edge cases. "
-    "Flag tests that are too brittle, use magic numbers, or do not assert anything meaningful."
+   "Flag tests that are too brittle, use magic numbers, or do not assert anything meaningful. "
+   "Missing tests are usually medium severity; use high only when an untested critical path creates substantial regression risk. "
+   "Set blocking=true only when the test gap should block merge."
 )
 
 TESTS_TEMPLATE = """\
@@ -112,7 +129,9 @@ Diff:
 REQUIREMENTS_SYSTEM = (
     "You are a product engineer verifying that the implementation correctly "
     "satisfies the specified requirements and acceptance criteria. "
-    "Compare the diff against the requirements and flag any gaps or regressions."
+   "Compare the diff against the requirements and flag any gaps or regressions. "
+   "Missing mandatory acceptance criteria or clear user-facing regressions should set blocking=true. "
+   "Do not mark purely visual or design-token differences (colors, typography, spacing, token naming) as blocking in requirements review; those belong to UI review unless they make the feature unusable or violate an explicit acceptance criterion."
 )
 
 REQUIREMENTS_TEMPLATE = """\
@@ -145,7 +164,9 @@ UI_DESIGN_SYSTEM = (
     "accessibility, and visual quality. You have access to the original design specification "
     "and the implemented code diff. Evaluate whether the implementation faithfully reproduces "
     "the design — checking icons, typography, colors, layout, spacing, and component structure. "
-    "Be specific: cite file names and exact CSS property values where possible."
+   "Be specific: cite file names and exact CSS property values where possible. "
+   "Use high severity only for core UI breakage such as missing components, broken icon rendering, or broken viewport/footer layout. "
+   "Spacing, color, and typography deviations should usually be medium or low unless they make the screen unusable."
 )
 
 UI_DESIGN_TEMPLATE = """\

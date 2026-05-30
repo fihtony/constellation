@@ -124,6 +124,7 @@ class BaseAgent:
 
         self._compiled_workflow = None
         self._permission_engine: Any = None  # Loaded in start()
+        self._registry_instance: dict[str, Any] = {}
 
     # -- Lifecycle -----------------------------------------------------------
 
@@ -136,6 +137,7 @@ class BaseAgent:
 
     async def stop(self) -> None:
         """Graceful shutdown hook (override in subclasses if needed)."""
+        self._update_registry_instance(status="exited", current_task_id=None)
 
     # -- A2A interface (to be implemented by subclasses) ---------------------
 
@@ -263,6 +265,7 @@ class BaseAgent:
         *,
         max_steps: int = 50,
         timeout_seconds: int = 900,
+        ephemeral_state: dict | None = None,
     ) -> "Any":
         """Build a standard RunConfig for workflow invocation.
 
@@ -271,6 +274,15 @@ class BaseAgent:
         """
         from framework.workflow import RunConfig
 
+        runtime_state = {
+            "_runtime": self.services.runtime,
+            "_skills_registry": self.skills_registry,
+            "_plugin_manager": self.plugin_manager,
+            "_agent_id": self.definition.agent_id,
+        }
+        if ephemeral_state:
+            runtime_state.update(ephemeral_state)
+
         return RunConfig(
             session_id=task_id,
             thread_id=task_id,
@@ -278,6 +290,7 @@ class BaseAgent:
             event_store=self.event_store,
             plugin_manager=self.plugin_manager,
             permission_engine=self._permission_engine,
+            ephemeral_state=runtime_state,
             max_steps=max_steps,
             timeout_seconds=timeout_seconds,
         )
@@ -325,14 +338,38 @@ class BaseAgent:
 
             if not service_url or effective_port <= 0:
                 return
-            client.register_instance(
+            instance = client.register_instance(
                 agent_id,
                 service_url=service_url,
                 port=effective_port,
                 container_id=os.environ.get("CONTAINER_ID", "").strip(),
             )
+            instance_id = ""
+            if isinstance(instance, dict):
+                instance_id = str(instance.get("instance_id") or instance.get("instanceId") or "").strip()
+            self._registry_instance = {
+                "agent_id": agent_id,
+                "instance_id": instance_id,
+                "service_url": service_url,
+                "port": effective_port,
+            }
+            lifecycle = getattr(self, "_lifecycle", None)
+            if lifecycle is not None and hasattr(lifecycle, "configure_registry_updater"):
+                lifecycle.configure_registry_updater(self._update_registry_instance)
         except Exception as exc:  # noqa: BLE001
             print(f"[{self.definition.agent_id}] Registry instance registration failed: {exc}")
+
+    def _update_registry_instance(self, **fields: Any) -> None:
+        """Best-effort update for the current live instance in Registry."""
+        client = self.services.registry_client
+        agent_id = str(self._registry_instance.get("agent_id") or "").strip()
+        instance_id = str(self._registry_instance.get("instance_id") or "").strip()
+        if client is None or not agent_id or not instance_id or not fields:
+            return
+        try:
+            client.update_instance(agent_id, instance_id, **fields)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{self.definition.agent_id}] Registry instance update failed: {exc}")
 
     # -- Memory helpers -------------------------------------------------------
 

@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from framework.a2a.protocol import Artifact, Task, TaskState, TaskStatus, Message
+from framework.sqlite_utils import connect_sqlite
 
 
 def _now_iso() -> str:
@@ -230,7 +231,7 @@ class SqliteTaskStore(TaskStore):
         self._init_db()
 
     def _init_db(self) -> None:
-        conn = sqlite3.connect(self._db_path)
+        conn = connect_sqlite(self._db_path)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -253,7 +254,7 @@ class SqliteTaskStore(TaskStore):
         conn.close()
 
     def _conn(self) -> sqlite3.Connection:
-        return sqlite3.connect(self._db_path)
+        return connect_sqlite(self._db_path)
 
     def create_task(
         self,

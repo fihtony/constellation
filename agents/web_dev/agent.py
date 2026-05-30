@@ -41,36 +41,7 @@ from agents.web_dev.nodes import (
 # orphaned containers from accumulating if Team Lead forgets to destroy them.
 # ---------------------------------------------------------------------------
 
-class _IdleShutdownGuard:
-    """Schedule a graceful container shutdown after an idle period."""
-
-    def __init__(self, timeout_seconds: float) -> None:
-        self._timeout = timeout_seconds
-        self._timer: threading.Timer | None = None
-        self._lock = threading.Lock()
-
-    def cancel(self) -> None:
-        """Cancel any pending shutdown (call when a new task arrives)."""
-        with self._lock:
-            if self._timer is not None:
-                self._timer.cancel()
-                self._timer = None
-
-    def arm(self) -> None:
-        """Arm the timer (call when a task finishes)."""
-        with self._lock:
-            if self._timer is not None:
-                self._timer.cancel()
-            self._timer = threading.Timer(self._timeout, self._shutdown)
-            self._timer.daemon = True
-            self._timer.start()
-
-    def _shutdown(self) -> None:
-        print(
-            f"[web-dev] Idle timeout ({int(self._timeout)}s) reached "
-            "with no pending tasks — shutting down container."
-        )
-        os._exit(0)
+# Legacy _IdleShutdownGuard removed — now uses framework.lifecycle.PerTaskLifecycleManager
 
 # ---------------------------------------------------------------------------
 # Workflow definition
@@ -146,8 +117,15 @@ class WebDevAgent(BaseAgent):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        idle_timeout = float(os.environ.get("WEB_DEV_IDLE_TIMEOUT_SECONDS", "600"))
-        self._idle_guard = _IdleShutdownGuard(idle_timeout)
+        from framework.lifecycle import PerTaskLifecycleManager
+
+        idle_timeout = float(os.environ.get("WEB_DEV_IDLE_TIMEOUT_SECONDS", "1800"))
+        workspace_path = os.environ.get("CONSTELLATION_TASK_WORKSPACE", "")
+        self._lifecycle = PerTaskLifecycleManager(
+            agent_id=self.definition.agent_id,
+            idle_timeout_seconds=idle_timeout,
+            workspace_path=workspace_path,
+        )
 
     async def start(self) -> None:
         """Initialize agent and register boundary tools."""
@@ -163,7 +141,8 @@ class WebDevAgent(BaseAgent):
         from framework.workflow import RunConfig
 
         # Cancel any pending idle shutdown — a new task has arrived.
-        self._idle_guard.cancel()
+        self._lifecycle.cancel_idle_timer()
+        self._lifecycle.mark_working()
 
         msg = message.get("message", message)
         parts = msg.get("parts", [])
@@ -179,6 +158,11 @@ class WebDevAgent(BaseAgent):
                 "orchestratorCallbackUrl": metadata.get("orchestratorCallbackUrl", ""),
             },
         )
+        self._lifecycle.configure_timeout_notification(
+            metadata.get("orchestratorCallbackUrl", ""),
+            orchestrator_task_id=metadata.get("orchestratorTaskId", ""),
+        )
+        self._lifecycle.mark_working(task.id)
 
         # Use the Compass orchestrator task ID as the canonical _task_id so
         # AgentLogger writes to {ARTIFACT_ROOT}/{compass_task_id}/web-dev/agent.log
@@ -188,9 +172,6 @@ class WebDevAgent(BaseAgent):
 
         state = {
             "_task_id": canonical_task_id,
-            "_runtime": self.services.runtime,
-            "_skills_registry": self.skills_registry,
-            "_plugin_manager": self.plugin_manager,
             "user_request": user_text,
             "repo_url": metadata.get("repoUrl", ""),
             "repo_path": metadata.get("repoPath", ""),
@@ -323,9 +304,9 @@ class WebDevAgent(BaseAgent):
             finally:
                 loop.close()
                 # Arm the idle-shutdown guard. If Team Lead doesn't send a new
-                # task (revision) or destroy this container within the timeout,
+                # task (revision) or ACK this agent within the timeout,
                 # the container will exit on its own — preventing orphaned containers.
-                self._idle_guard.arm()
+                self._lifecycle.arm_idle_timer(task.id)
 
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()

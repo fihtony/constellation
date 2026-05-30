@@ -514,17 +514,54 @@ class SCMAgentAdapter(BaseAgent):
 
             # Auth via http.extraHeader — credentials are NEVER in the remote URL
             auth_header = self._build_auth_header(remote_url) if remote_url else ""
-            cmd = ["git", "-C", repo_path]
+            git_cmd = ["git", "-C", repo_path]
             if auth_header:
-                cmd += ["-c", f"http.extraHeader={auth_header}"]
+                git_cmd += ["-c", f"http.extraHeader={auth_header}"]
             ca_bundle = os.environ.get("SCM_CA_BUNDLE", "")
             if ca_bundle and os.path.isfile(ca_bundle):
-                cmd += ["-c", f"http.sslCAInfo={ca_bundle}"]
-            cmd += ["push", "--force-with-lease", "-u", "origin", branch]
+                git_cmd += ["-c", f"http.sslCAInfo={ca_bundle}"]
 
             # build_isolated_git_env sets isolated HOME, GIT_CONFIG_GLOBAL, and
             # GIT_CONFIG_NOSYSTEM=1 so macOS Keychain / host ~/.gitconfig are never used.
             git_env = build_isolated_git_env(scope="scm-push")
+
+            # The local clone only fetches main by default. When a remote feature
+            # branch already exists, refresh its tracking ref before using
+            # --force-with-lease so revision pushes do not fail on stale/missing
+            # remote branch state.
+            remote_branch = subprocess.run(
+                git_cmd + ["ls-remote", "--exit-code", "--heads", "origin", branch],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=git_env,
+            )
+            remote_branch_oid = ""
+            if remote_branch.returncode == 0 and remote_branch.stdout.strip():
+                remote_branch_oid = remote_branch.stdout.strip().split()[0]
+                branch_ref = f"refs/heads/{branch}"
+                tracking_ref = f"refs/remotes/origin/{branch}"
+                fetch_result = subprocess.run(
+                    git_cmd + ["fetch", "origin", f"+{branch_ref}:{tracking_ref}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    env=git_env,
+                )
+                if fetch_result.returncode != 0:
+                    stderr_safe = fetch_result.stderr.strip()[:400]
+                    return {
+                        "pushed": False,
+                        "error": "Push preparation failed — unable to sync remote branch state.",
+                        "detail": stderr_safe,
+                        "status": "push_prepare_failed",
+                    }
+
+            lease_arg = "--force-with-lease"
+            if remote_branch_oid:
+                lease_arg = f"--force-with-lease=refs/heads/{branch}:{remote_branch_oid}"
+
+            cmd = git_cmd + ["push", lease_arg, "-u", "origin", branch]
 
             print(f"[scm] Pushing branch {branch} in {repo_path}")
             result = subprocess.run(
@@ -535,7 +572,7 @@ class SCMAgentAdapter(BaseAgent):
                 stderr_safe = result.stderr.strip()[:400]
                 return {
                     "pushed": False,
-                    "error": "Push failed — check SCM_TOKEN and SCM_USERNAME.",
+                    "error": "Push failed.",
                     "detail": stderr_safe,
                     "status": "push_failed",
                 }

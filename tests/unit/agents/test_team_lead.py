@@ -32,6 +32,17 @@ def _mock_runtime(summary="PR created.", success=True):
     return runtime
 
 
+@pytest.fixture(autouse=True)
+def _clear_child_session_cache():
+    from agents.team_lead import nodes as tl_nodes
+
+    with tl_nodes._CHILD_SESSION_CACHE_LOCK:
+        tl_nodes._CHILD_SESSION_CACHE.clear()
+    yield
+    with tl_nodes._CHILD_SESSION_CACHE_LOCK:
+        tl_nodes._CHILD_SESSION_CACHE.clear()
+
+
 class TestTeamLeadDefinition:
     def test_agent_id(self):
         assert team_lead_definition.agent_id == "team-lead"
@@ -581,6 +592,194 @@ class TestDispatchDevAgentValidation:
             "agent_id": "web-dev",
         }
 
+    async def test_dispatch_dev_agent_reuses_detected_live_instance_with_launch_spec_port(self, monkeypatch):
+        from agents.team_lead.nodes import dispatch_dev_agent
+
+        captured: dict[str, object] = {}
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "web-dev"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                assert name == "dispatch_web_dev"
+                captured.update(args)
+                return json.dumps({
+                    "status": "completed",
+                    "summary": "done",
+                    "prUrl": "https://github.com/org/repo/pull/1",
+                    "branch": "feature/ui",
+                    "jiraInReview": True,
+                    "screenshotIncluded": True,
+                    "screenshotUploaded": True,
+                })
+
+        class StubLauncher:
+            def find_live_instances(self, agent_id, task_id):
+                assert agent_id == "web-dev"
+                assert task_id == "task-123"
+                return [{
+                    "container_name": "web-dev-task-123-live",
+                    "task_id": "task-123",
+                    "agent_id": "web-dev",
+                }]
+
+        class StubRegistryClient:
+            def get_capability_definition(self, capability):
+                assert capability == "web-dev.task.execute"
+                return {"launch_spec": {"port": 8050}}
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+        monkeypatch.setattr("framework.launcher.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+
+        await dispatch_dev_agent(
+            {
+                "_task_id": "task-123",
+                "user_request": "Implement UI",
+                "analysis_summary": "Implement a UI page",
+                "workspace_path": "/tmp/workspace",
+                "plan": {
+                    "definition_of_done": {
+                        "pr_required": True,
+                        "jira_state_management": False,
+                        "screenshot_required": False,
+                    }
+                },
+            }
+        )
+
+        assert captured["child_service_url"] == "http://web-dev-task-123-live:8050"
+        assert captured["child_container_name"] == "web-dev-task-123-live"
+
+    async def test_dispatch_dev_agent_reuses_cached_child_session_without_live_lookup(self, monkeypatch):
+        from agents.team_lead import nodes as tl_nodes
+
+        captured: dict[str, object] = {}
+        tl_nodes._clear_cached_child_sessions("task-123")
+        tl_nodes._cache_child_session(
+            "task-123",
+            "web-dev",
+            {
+                "task_id": "task-web-dev-1",
+                "service_url": "http://web-dev-task-1:8050",
+                "container_name": "web-dev-task-1",
+                "agent_id": "web-dev",
+            },
+        )
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "web-dev"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                assert name == "dispatch_web_dev"
+                captured.update(args)
+                return json.dumps({
+                    "status": "completed",
+                    "summary": "done",
+                    "prUrl": "https://github.com/org/repo/pull/1",
+                    "branch": "feature/ui",
+                    "jiraInReview": True,
+                    "screenshotIncluded": False,
+                    "screenshotUploaded": False,
+                    "childTaskId": "task-web-dev-1",
+                    "childServiceUrl": "http://web-dev-task-1:8050",
+                    "childContainerName": "web-dev-task-1",
+                    "childAgentId": "web-dev",
+                })
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+        monkeypatch.setattr(
+            "agents.team_lead.nodes._reuse_live_child_session",
+            lambda **_: (_ for _ in ()).throw(AssertionError("live lookup should not run")),
+        )
+
+        result = await tl_nodes.dispatch_dev_agent(
+            {
+                "_task_id": "task-123",
+                "user_request": "Implement UI",
+                "analysis_summary": "Implement a UI page",
+                "workspace_path": "/tmp/workspace",
+                "plan": {
+                    "definition_of_done": {
+                        "pr_required": True,
+                        "jira_state_management": False,
+                        "screenshot_required": False,
+                    }
+                },
+            }
+        )
+
+        assert captured["child_service_url"] == "http://web-dev-task-1:8050"
+        assert result["dev_agent_session"]["service_url"] == "http://web-dev-task-1:8050"
+        tl_nodes._clear_cached_child_sessions("task-123")
+
+    async def test_dispatch_dev_agent_sends_keepalive_to_waiting_cr_session(self, monkeypatch):
+        from agents.team_lead.nodes import dispatch_dev_agent
+
+        ping_calls: list[tuple[str, str, int]] = []
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "web-dev"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                assert name == "dispatch_web_dev"
+                time.sleep(0.08)
+                return json.dumps({
+                    "status": "completed",
+                    "summary": "done",
+                    "prUrl": "https://github.com/org/repo/pull/1",
+                    "branch": "feature/ui",
+                    "jiraInReview": True,
+                    "screenshotIncluded": True,
+                    "screenshotUploaded": True,
+                })
+
+        async def fake_send_ping(self, base_url, task_id, estimated_remaining_wait_seconds=0):
+            ping_calls.append((base_url, task_id, estimated_remaining_wait_seconds))
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+        monkeypatch.setattr("framework.a2a.client.A2AClient.send_ping", fake_send_ping)
+        monkeypatch.setenv("TEAM_LEAD_CHILD_KEEPALIVE_INTERVAL_SECONDS", "0.02")
+
+        await dispatch_dev_agent(
+            {
+                "_task_id": "task-123",
+                "user_request": "Implement UI",
+                "analysis_summary": "Implement a UI page",
+                "workspace_path": "/tmp/workspace",
+                "cr_agent_session": {
+                    "task_id": "cr-task-1",
+                    "service_url": "http://code-review-task-1:8060",
+                    "container_name": "code-review-task-1",
+                    "agent_id": "code-review",
+                },
+                "plan": {
+                    "definition_of_done": {
+                        "pr_required": True,
+                        "jira_state_management": False,
+                        "screenshot_required": False,
+                    }
+                },
+            }
+        )
+
+        assert any(call[:2] == ("http://code-review-task-1:8060", "cr-task-1") for call in ping_calls)
+
     async def test_review_result_passes_master_task_id_to_code_review(self, monkeypatch):
         from agents.team_lead.nodes import review_result
 
@@ -612,6 +811,146 @@ class TestDispatchDevAgentValidation:
         assert captured["repo_url"] == "https://github.com/org/repo"
         assert captured["pr_number"] == 1
         assert result["route"] == "approved"
+
+    async def test_review_result_reuses_detected_live_cr_instance_with_launch_spec_port(self, monkeypatch):
+        from agents.team_lead.nodes import review_result
+
+        captured: dict[str, object] = {}
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                assert name == "dispatch_code_review"
+                captured.update(args)
+                return json.dumps({"verdict": "approved", "summary": "ok"})
+
+        class StubLauncher:
+            def find_live_instances(self, agent_id, task_id):
+                assert agent_id == "code-review"
+                assert task_id == "task-123"
+                return [{
+                    "container_name": "code-review-task-123-live",
+                    "task_id": "task-123",
+                    "agent_id": "code-review",
+                }]
+
+        class StubRegistryClient:
+            def get_capability_definition(self, capability):
+                assert capability == "review.code.check"
+                return {"launch_spec": {"port": 8060}}
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+        monkeypatch.setattr("framework.launcher.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+
+        result = await review_result(
+            {
+                "_task_id": "task-123",
+                "pr_url": "https://github.com/org/repo/pull/1",
+                "pr_number": 1,
+                "repo_url": "https://github.com/org/repo",
+                "dev_result": {"summary": "done", "prNumber": 1},
+                "analysis_summary": "Implement CSTL-1",
+                "workspace_path": "/tmp/workspace",
+            }
+        )
+
+        assert captured["child_service_url"] == "http://code-review-task-123-live:8060"
+        assert captured["child_container_name"] == "code-review-task-123-live"
+        assert result["route"] == "approved"
+
+    async def test_review_result_reuses_cached_cr_session_without_live_lookup(self, monkeypatch):
+        from agents.team_lead import nodes as tl_nodes
+
+        captured: dict[str, object] = {}
+        tl_nodes._clear_cached_child_sessions("task-123")
+        tl_nodes._cache_child_session(
+            "task-123",
+            "code-review",
+            {
+                "task_id": "task-code-review-1",
+                "service_url": "http://code-review-task-1:8060",
+                "container_name": "code-review-task-1",
+                "agent_id": "code-review",
+            },
+        )
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                assert name == "dispatch_code_review"
+                captured.update(args)
+                return json.dumps({
+                    "verdict": "approved",
+                    "summary": "ok",
+                    "_crSession": {
+                        "service_url": "http://code-review-task-1:8060",
+                        "container_name": "code-review-task-1",
+                        "agent_id": "code-review",
+                    },
+                })
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+        monkeypatch.setattr(
+            "agents.team_lead.nodes._reuse_live_child_session",
+            lambda **_: (_ for _ in ()).throw(AssertionError("live lookup should not run")),
+        )
+
+        result = await tl_nodes.review_result(
+            {
+                "_task_id": "task-123",
+                "pr_url": "https://github.com/org/repo/pull/1",
+                "pr_number": 1,
+                "repo_url": "https://github.com/org/repo",
+                "dev_result": {"summary": "done", "prNumber": 1},
+                "analysis_summary": "Implement CSTL-1",
+                "workspace_path": "/tmp/workspace",
+            }
+        )
+
+        assert captured["child_service_url"] == "http://code-review-task-1:8060"
+        assert result["cr_agent_session"]["service_url"] == "http://code-review-task-1:8060"
+        tl_nodes._clear_cached_child_sessions("task-123")
+
+    async def test_review_result_sends_keepalive_to_waiting_dev_session(self, monkeypatch):
+        from agents.team_lead.nodes import review_result
+
+        ping_calls: list[tuple[str, str, int]] = []
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                assert name == "dispatch_code_review"
+                time.sleep(0.08)
+                return json.dumps({"verdict": "approved", "summary": "ok"})
+
+        async def fake_send_ping(self, base_url, task_id, estimated_remaining_wait_seconds=0):
+            ping_calls.append((base_url, task_id, estimated_remaining_wait_seconds))
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+        monkeypatch.setattr("framework.a2a.client.A2AClient.send_ping", fake_send_ping)
+        monkeypatch.setenv("TEAM_LEAD_CHILD_KEEPALIVE_INTERVAL_SECONDS", "0.02")
+
+        result = await review_result(
+            {
+                "_task_id": "task-123",
+                "pr_url": "https://github.com/org/repo/pull/1",
+                "pr_number": 1,
+                "repo_url": "https://github.com/org/repo",
+                "dev_result": {"summary": "done", "prNumber": 1},
+                "dev_agent_session": {
+                    "task_id": "web-dev-task-1",
+                    "service_url": "http://web-dev-task-1:8050",
+                    "container_name": "web-dev-task-1",
+                    "agent_id": "web-dev",
+                },
+                "analysis_summary": "Implement CSTL-1",
+                "workspace_path": "/tmp/workspace",
+            }
+        )
+
+        assert result["route"] == "approved"
+        assert any(call[:2] == ("http://web-dev-task-1:8050", "web-dev-task-1") for call in ping_calls)
 
     async def test_review_result_passes_child_permissions_not_parent_snapshot(self, monkeypatch):
         from agents.team_lead.nodes import review_result
@@ -764,7 +1103,7 @@ class TestDispatchDevAgentValidation:
 
         captured = {"ack": [], "destroy": []}
 
-        async def fake_send_ack(self, base_url, task_id):
+        async def fake_send_ack(self, base_url, task_id, exit_reason="task_completed_success", orchestrator_task_id=""):
             captured["ack"].append((base_url, task_id))
 
         class StubLauncher:
@@ -790,13 +1129,28 @@ class TestDispatchDevAgentValidation:
                 "container_name": "web-dev-task-1",
                 "agent_id": "web-dev",
             },
+            "cr_agent_session": {
+                "task_id": "task-code-review-1",
+                "service_url": "http://code-review-task-1:8060",
+                "container_name": "code-review-task-1",
+                "agent_id": "code-review",
+            },
         })
 
-        assert captured["ack"] == [("http://web-dev-task-1:8050", "task-web-dev-1")]
-        assert captured["destroy"] == [("web-dev", "web-dev-task-1")]
+        assert captured["ack"] == [
+            ("http://web-dev-task-1:8050", "task-web-dev-1"),
+            ("http://code-review-task-1:8060", "task-code-review-1"),
+        ]
+        assert captured["destroy"] == [
+            ("web-dev", "web-dev-task-1"),
+            ("code-review", "code-review-task-1"),
+        ]
         assert result["dev_agent_acknowledged"] is True
         assert result["dev_agent_cleaned_up"] is True
+        assert result["cr_agent_acknowledged"] is True
+        assert result["cr_agent_cleaned_up"] is True
         assert result["dev_agent_session"] == {}
+        assert result["cr_agent_session"] == {}
 
     async def test_request_revision_acknowledges_and_cleans_dev_agent(self, monkeypatch):
         """request_revision should NOT ACK or destroy the dev agent (container reuse)."""
@@ -804,7 +1158,7 @@ class TestDispatchDevAgentValidation:
 
         captured = {"ack": [], "destroy": []}
 
-        async def fake_send_ack(self, base_url, task_id):
+        async def fake_send_ack(self, base_url, task_id, exit_reason="task_completed_success", orchestrator_task_id=""):
             captured["ack"].append((base_url, task_id))
 
         class StubLauncher:
@@ -1334,7 +1688,11 @@ class TestTeamLeadTools:
         assert calls["dispatch"][0]["url"] == "http://launched-code-review:8060"
         assert calls["dispatch"][0]["metadata"]["orchestratorTaskId"] == "task-123"
         assert calls["dispatch"][0]["metadata"]["workspacePath"] == "/tmp/workspace"
-        assert calls["destroy"] == [("code-review", "code-review-task-1234")]
+        # Container is preserved (not destroyed) — lifecycle manager handles exit
+        assert calls["destroy"] == []
+        # Container info is embedded so Team Lead can track the CR session
+        assert payload["_crSession"]["task_id"] == "task-review-1"
+        assert payload["_crSession"]["service_url"] == "http://launched-code-review:8060"
 
     def test_dispatch_code_review_derives_launch_task_id_from_workspace_path(self, monkeypatch):
         from agents.team_lead.tools import DispatchCodeReview

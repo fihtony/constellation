@@ -152,3 +152,9 @@ class TestA2AResumeEndpoint:
         from framework.a2a.server import A2ARequestHandler
         # Verify the handler has _handle_resume method
         assert hasattr(A2ARequestHandler, "_handle_resume")
+
+    def test_child_timeout_path_routing(self):
+        """Smoke test that /tasks/{id}/child-timeout is recognized in do_POST."""
+        from framework.a2a.server import A2ARequestHandler
+
+        assert hasattr(A2ARequestHandler, "_handle_child_timeout")

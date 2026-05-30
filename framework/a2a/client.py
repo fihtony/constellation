@@ -103,9 +103,43 @@ class A2AClient:
         """POST a callback notification to the orchestrator."""
         self._http_post(callback_url, payload)
 
-    async def send_ack(self, base_url: str, task_id: str) -> None:
-        """POST /tasks/{task_id}/ack to acknowledge task completion."""
+    async def send_ack(
+        self,
+        base_url: str,
+        task_id: str,
+        exit_reason: str = "task_completed_success",
+        orchestrator_task_id: str = "",
+    ) -> None:
+        """POST /tasks/{task_id}/ack to acknowledge task completion.
+
+        Args:
+            base_url: Child agent base URL.
+            task_id: The child task ID to acknowledge.
+            exit_reason: One of: task_completed_success, task_completed_failure,
+                max_reviews_reached, dev_failed_max_retries.
+            orchestrator_task_id: Parent orchestrator task ID for traceability.
+        """
+        import time
+
         url = f"{base_url.rstrip('/')}/tasks/{task_id}/ack"
+        body = {
+            "orchestratorTaskId": orchestrator_task_id,
+            "exitReason": exit_reason,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        self._http_post(url, body)
+
+    async def send_ping(self, base_url: str, task_id: str, estimated_remaining_wait_seconds: int = 0) -> None:
+        """POST /tasks/{task_id}/ping to keep child agent alive."""
+        url = f"{base_url.rstrip('/')}/tasks/{task_id}/ping"
+        body: dict = {}
+        if estimated_remaining_wait_seconds > 0:
+            body["estimatedRemainingWaitSeconds"] = estimated_remaining_wait_seconds
+        self._http_post(url, body)
+
+    async def send_terminate(self, base_url: str, task_id: str) -> None:
+        """POST /tasks/{task_id}/terminate to force child agent shutdown."""
+        url = f"{base_url.rstrip('/')}/tasks/{task_id}/terminate"
         self._http_post(url, {})
 
     # -- Internal helpers ---------------------------------------------------

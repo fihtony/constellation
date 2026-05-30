@@ -265,6 +265,14 @@ class RegistryClient:
             payload={"heartbeat": True},
         )
 
+    def update_instance(self, agent_id: str, instance_id: str, **fields: Any) -> dict:
+        """Update mutable fields for an existing instance."""
+        return self._request_json(
+            "PUT",
+            f"/agents/{quote(agent_id, safe='')}/instances/{quote(instance_id, safe='')}",
+            payload=fields,
+        )
+
     def invalidate(self, capability: str | None = None) -> None:
         """Invalidate the cache for a single capability (or all)."""
         with self._lock:

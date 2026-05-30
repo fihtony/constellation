@@ -148,6 +148,45 @@ class TestScmAdapterCloneBehavior:
         assert result["status"] == "ok"
         assert calls["count"] == 2
 
+    def test_handle_push_fetches_remote_branch_before_force_with_lease(self, monkeypatch):
+        calls = []
+
+        monkeypatch.setattr("agents.scm.adapter.build_isolated_git_env", lambda scope: {})
+
+        def _run(cmd, capture_output=True, text=True, timeout=0, env=None):
+            calls.append(cmd)
+            if cmd[-3:] == ["remote", "get-url", "origin"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="https://github.com/org/repo\n", stderr="")
+            if "ls-remote" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout="abc123\trefs/heads/feature/test\n",
+                    stderr="",
+                )
+            if "fetch" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "push" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            raise AssertionError(f"unexpected git command: {cmd}")
+
+        monkeypatch.setattr("agents.scm.adapter.subprocess.run", _run)
+
+        adapter = object.__new__(SCMAgentAdapter)
+        monkeypatch.setattr(adapter, "_build_auth_header", lambda url: "Authorization: Basic token")
+
+        result = adapter._handle_push({"repoPath": "/tmp/repo", "branch": "feature/test"})
+
+        assert result == {"pushed": True, "branch": "feature/test", "status": "ok"}
+        assert any(
+            cmd[-3:] == ["fetch", "origin", "+refs/heads/feature/test:refs/remotes/origin/feature/test"]
+            for cmd in calls
+        )
+        assert any(
+            "push" in cmd and "--force-with-lease=refs/heads/feature/test:abc123" in cmd
+            for cmd in calls
+        )
+
 
 class TestScmAdapterPrEvidenceCapabilities:
     def test_scm_config_advertises_pr_evidence_capabilities(self):

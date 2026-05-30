@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import json
 from typing import Any, Callable, Union
 
 from framework.errors import InterruptSignal, MaxStepsExceeded
@@ -64,8 +65,64 @@ class RunConfig:
     event_store: Any = None         # EventStore
     plugin_manager: Any = None      # PluginManager
     permission_engine: Any = None   # PermissionEngine (bound to global ToolRegistry)
+    ephemeral_state: dict = field(default_factory=dict)
     max_steps: int = 100
     timeout_seconds: int = 3600
+
+
+_DROP_FROM_CHECKPOINT = object()
+
+
+def _json_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            safe_item = _json_safe_value(item)
+            if safe_item is _DROP_FROM_CHECKPOINT:
+                continue
+            safe[str(key)] = safe_item
+        return safe
+    if isinstance(value, (list, tuple, set)):
+        safe_items = []
+        for item in value:
+            safe_item = _json_safe_value(item)
+            if safe_item is _DROP_FROM_CHECKPOINT:
+                continue
+            safe_items.append(safe_item)
+        return safe_items
+    if hasattr(value, "value") and not callable(getattr(value, "value")):
+        safe_item = _json_safe_value(getattr(value, "value"))
+        if safe_item is not _DROP_FROM_CHECKPOINT:
+            return safe_item
+    if hasattr(value, "as_posix") and callable(getattr(value, "as_posix")):
+        return value.as_posix()
+    try:
+        json.dumps(value)
+    except TypeError:
+        return _DROP_FROM_CHECKPOINT
+    return value
+
+
+def _checkpoint_state(state: dict) -> dict:
+    safe_state = _json_safe_value(state)
+    return safe_state if isinstance(safe_state, dict) else {}
+
+
+def _restore_checkpoint_state(
+    saved_state: dict,
+    initial_state: dict | None = None,
+    ephemeral_state: dict | None = None,
+) -> dict:
+    restored: dict[str, Any] = {}
+    if isinstance(initial_state, dict):
+        restored.update(initial_state)
+    if isinstance(saved_state, dict):
+        restored.update(saved_state)
+    if isinstance(ephemeral_state, dict):
+        restored.update(ephemeral_state)
+    return restored
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +217,7 @@ class WorkflowRunner:
     async def run(self, state: dict) -> dict:
         """Execute from START until END or interrupt."""
         current_node = START
+        state = _restore_checkpoint_state({}, state, self.config.ephemeral_state)
 
         # Bind PermissionEngine to the global ToolRegistry so that all tool
         # calls made during this workflow run are permission-checked.
@@ -173,7 +231,11 @@ class WorkflowRunner:
                 self.config.session_id, self.config.thread_id,
             )
             if saved:
-                state = saved["state"]
+                state = _restore_checkpoint_state(
+                    saved.get("state", {}),
+                    state,
+                    self.config.ephemeral_state,
+                )
                 current_node = saved["next_node"]
 
         try:
@@ -200,7 +262,11 @@ class WorkflowRunner:
                         await self.config.checkpoint_service.save(
                             self.config.session_id,
                             self.config.thread_id,
-                            {"state": state, "next_node": current_node, "interrupt": sig.question},
+                            {
+                                "state": _checkpoint_state(state),
+                                "next_node": current_node,
+                                "interrupt": sig.question,
+                            },
                         )
                     raise
 
@@ -234,7 +300,7 @@ class WorkflowRunner:
                     await self.config.checkpoint_service.save(
                         self.config.session_id,
                         self.config.thread_id,
-                        {"state": state, "next_node": current_node},
+                        {"state": _checkpoint_state(state), "next_node": current_node},
                     )
         finally:
             # Clean up permission engine binding to avoid global state leaking.
@@ -261,7 +327,10 @@ class WorkflowRunner:
             from framework.tools.registry import get_registry
             get_registry().set_permission_engine(self.config.permission_engine)
 
-        state = saved["state"]
+        state = _restore_checkpoint_state(
+            saved.get("state", {}),
+            ephemeral_state=self.config.ephemeral_state,
+        )
         state["_resume_value"] = resume_value
         # Re-enter at the same node that interrupted
         current_node = saved["next_node"]
@@ -284,7 +353,7 @@ class WorkflowRunner:
             if self.config.checkpoint_service:
                 await self.config.checkpoint_service.save(
                     self.config.session_id, self.config.thread_id,
-                    {"state": state, "next_node": next_node},
+                    {"state": _checkpoint_state(state), "next_node": next_node},
                 )
 
             # Continue normal execution
@@ -328,7 +397,11 @@ class WorkflowRunner:
                 if self.config.checkpoint_service:
                     await self.config.checkpoint_service.save(
                         self.config.session_id, self.config.thread_id,
-                        {"state": state, "next_node": current_node, "interrupt": sig.question},
+                        {
+                            "state": _checkpoint_state(state),
+                            "next_node": current_node,
+                            "interrupt": sig.question,
+                        },
                     )
                 raise
 
@@ -354,7 +427,7 @@ class WorkflowRunner:
             if self.config.checkpoint_service:
                 await self.config.checkpoint_service.save(
                     self.config.session_id, self.config.thread_id,
-                    {"state": state, "next_node": current_node},
+                    {"state": _checkpoint_state(state), "next_node": current_node},
                 )
 
         return state

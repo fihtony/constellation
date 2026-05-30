@@ -31,6 +31,7 @@ def _build_services(registry_client: MagicMock) -> AgentServices:
 
 async def test_base_agent_start_registers_live_instance(monkeypatch):
     registry_client = MagicMock()
+    registry_client.register_instance.return_value = {"instance_id": "inst-123"}
     agent = _DummyAgent(
         AgentDefinition(
             agent_id="team-lead",
@@ -78,3 +79,69 @@ async def test_base_agent_start_registers_live_instance(monkeypatch):
         port=8030,
         container_id="container-123",
     )
+    assert agent._registry_instance["instance_id"] == "inst-123"
+
+
+async def test_base_agent_stop_updates_registry_instance_status(monkeypatch):
+    registry_client = MagicMock()
+    registry_client.register_instance.return_value = {"instance_id": "inst-123"}
+    agent = _DummyAgent(
+        AgentDefinition(
+            agent_id="team-lead",
+            name="Team Lead Agent",
+            description="test",
+            execution_mode=ExecutionMode.PERSISTENT,
+        ),
+        _build_services(registry_client),
+    )
+
+    monkeypatch.setenv("AGENT_ID", "team-lead")
+    monkeypatch.setenv("PORT", "8030")
+    monkeypatch.setenv("ADVERTISED_BASE_URL", "http://team-lead:8030")
+
+    class _FakeConfig:
+        def to_dict(self):
+            return {
+                "agent_id": "team-lead",
+                "name": "Team Lead Agent",
+                "description": "test",
+                "version": "1.0.0",
+                "port": 8030,
+                "execution_mode": "persistent",
+                "capabilities": ["team-lead.task.execute"],
+            }
+
+    import framework.config as config_module
+
+    monkeypatch.setattr(config_module, "load_agent_config", lambda *_args, **_kwargs: _FakeConfig())
+
+    await agent.start()
+    await agent.stop()
+
+    registry_client.update_instance.assert_called_with(
+        "team-lead",
+        "inst-123",
+        status="exited",
+        current_task_id=None,
+    )
+
+
+def test_build_run_config_includes_runtime_ephemeral_state():
+    registry_client = MagicMock()
+    agent = _DummyAgent(
+        AgentDefinition(
+            agent_id="team-lead",
+            name="Team Lead Agent",
+            description="test",
+            execution_mode=ExecutionMode.PERSISTENT,
+        ),
+        _build_services(registry_client),
+    )
+
+    config = agent._build_run_config("task-1", ephemeral_state={"custom": "value"})
+
+    assert config.ephemeral_state["_runtime"] is agent.services.runtime
+    assert config.ephemeral_state["_skills_registry"] is agent.skills_registry
+    assert config.ephemeral_state["_plugin_manager"] is agent.plugin_manager
+    assert config.ephemeral_state["_agent_id"] == "team-lead"
+    assert config.ephemeral_state["custom"] == "value"

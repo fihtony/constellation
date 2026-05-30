@@ -8,9 +8,11 @@ for single-shot LLM calls or bounded ReAct; the graph controls the macro flow.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path as _Path
 from typing import Any
@@ -23,14 +25,220 @@ _AGENT_ID: str = _load_agent_cfg(
     _Path(__file__).parent.name.replace("_", "-")
 ).get("agent_id", _Path(__file__).parent.name.replace("_", "-"))
 
+_CHILD_SESSION_CACHE_LOCK = threading.Lock()
+_CHILD_SESSION_CACHE: dict[str, dict[str, dict[str, str]]] = {}
+
 
 def _logger(state: dict) -> AgentLogger:
     """Return an AgentLogger for this agent using the task_id stored in state."""
     return AgentLogger(state.get("_task_id", ""), _AGENT_ID)
 
 
+def _normalize_child_session(session: Any, default_agent_id: str) -> dict[str, str]:
+    if not isinstance(session, dict):
+        return {}
+
+    normalized = {
+        "task_id": str(session.get("task_id") or "").strip(),
+        "service_url": str(session.get("service_url") or "").strip(),
+        "container_name": str(session.get("container_name") or "").strip(),
+        "agent_id": str(session.get("agent_id") or default_agent_id).strip() or default_agent_id,
+    }
+    return normalized if any(normalized.values()) else {}
+
+
+def _get_cached_child_session(orchestrator_task_id: str, child_agent_id: str) -> dict[str, str]:
+    task_key = str(orchestrator_task_id or "").strip()
+    agent_key = str(child_agent_id or "").strip()
+    if not task_key or not agent_key:
+        return {}
+    with _CHILD_SESSION_CACHE_LOCK:
+        cached = (_CHILD_SESSION_CACHE.get(task_key) or {}).get(agent_key)
+        return dict(cached) if isinstance(cached, dict) else {}
+
+
+def _cache_child_session(orchestrator_task_id: str, child_agent_id: str, session: Any) -> dict[str, str]:
+    task_key = str(orchestrator_task_id or "").strip()
+    agent_key = str(child_agent_id or "").strip()
+    normalized = _normalize_child_session(session, agent_key or "unknown-agent")
+    if not task_key or not agent_key or not normalized:
+        return {}
+    with _CHILD_SESSION_CACHE_LOCK:
+        _CHILD_SESSION_CACHE.setdefault(task_key, {})[agent_key] = dict(normalized)
+    return normalized
+
+
+def _clear_cached_child_sessions(orchestrator_task_id: str, child_agent_id: str = "") -> None:
+    task_key = str(orchestrator_task_id or "").strip()
+    agent_key = str(child_agent_id or "").strip()
+    if not task_key:
+        return
+    with _CHILD_SESSION_CACHE_LOCK:
+        if agent_key:
+            agent_sessions = _CHILD_SESSION_CACHE.get(task_key) or {}
+            agent_sessions.pop(agent_key, None)
+            if not agent_sessions:
+                _CHILD_SESSION_CACHE.pop(task_key, None)
+            return
+        _CHILD_SESSION_CACHE.pop(task_key, None)
+
+
+def _capability_launch_port(capability: str, default_port: int = 8000) -> int:
+    """Return the configured per-task port for a capability."""
+    try:
+        from framework.registry_client import RegistryClient
+
+        definition = RegistryClient.from_config().get_capability_definition(capability) or {}
+        launch_spec = definition.get("launch_spec") or definition.get("launchSpec") or {}
+        raw_port = launch_spec.get("port", default_port)
+        port = int(raw_port)
+        return port if port > 0 else default_port
+    except Exception:
+        return default_port
+
+
+def _reuse_live_child_session(
+    *,
+    agent_id: str,
+    capability: str,
+    orchestrator_task_id: str,
+    log: AgentLogger,
+) -> dict[str, str]:
+    """Reuse the first live child instance for the orchestrator task when present."""
+    if not orchestrator_task_id:
+        return {}
+
+    try:
+        from framework.launcher import get_launcher
+
+        live_instances = get_launcher().find_live_instances(agent_id, orchestrator_task_id)
+    except Exception as exc:
+        log.warn(
+            "duplicate instance check failed (non-fatal)",
+            agent_id=agent_id,
+            task_id=orchestrator_task_id,
+            error=str(exc),
+        )
+        return {}
+
+    if not live_instances:
+        return {}
+
+    container_names = [str(item.get("container_name") or "").strip() for item in live_instances]
+    first_container = next((name for name in container_names if name), "")
+    if not first_container:
+        return {}
+
+    port = _capability_launch_port(capability)
+    service_url = f"http://{first_container}:{port}"
+    log.warn(
+        "duplicate live instance detected",
+        agent_id=agent_id,
+        task_id=orchestrator_task_id,
+        existing_containers=[name for name in container_names if name],
+    )
+    log.info(
+        "reusing detected live instance",
+        agent_id=agent_id,
+        container=first_container,
+        service_url=service_url,
+    )
+    return {
+        "agent_id": agent_id,
+        "container_name": first_container,
+        "service_url": service_url,
+    }
+
+
+def _keepalive_interval_seconds() -> float:
+    raw_value = str(os.environ.get("TEAM_LEAD_CHILD_KEEPALIVE_INTERVAL_SECONDS", "240")).strip()
+    try:
+        interval = float(raw_value)
+        return interval if interval > 0 else 240.0
+    except ValueError:
+        return 240.0
+
+
+@contextmanager
+def _keep_child_sessions_alive(
+    log: AgentLogger,
+    sessions: list[dict[str, Any] | None],
+    *,
+    estimated_remaining_wait_seconds: int = 900,
+):
+    """Ping waiting child sessions while Team Lead blocks on downstream work."""
+    keepalive_targets: list[dict[str, str]] = []
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        base_url = str(session.get("service_url") or "").strip()
+        task_id = str(session.get("task_id") or "").strip()
+        if not base_url or not task_id:
+            continue
+        keepalive_targets.append(
+            {
+                "agent_id": str(session.get("agent_id") or "unknown-agent").strip() or "unknown-agent",
+                "service_url": base_url,
+                "task_id": task_id,
+            }
+        )
+
+    if not keepalive_targets:
+        yield
+        return
+
+    stop_event = threading.Event()
+    interval_seconds = _keepalive_interval_seconds()
+
+    def _run_keepalive_loop() -> None:
+        import asyncio
+
+        from framework.a2a.client import A2AClient
+
+        while not stop_event.wait(interval_seconds):
+            for target in keepalive_targets:
+                try:
+                    asyncio.run(
+                        A2AClient(timeout=10).send_ping(
+                            target["service_url"],
+                            target["task_id"],
+                            estimated_remaining_wait_seconds=estimated_remaining_wait_seconds,
+                        )
+                    )
+                    log.a2a(
+                        "→",
+                        target["agent_id"],
+                        action="ping",
+                        child_task_id=target["task_id"],
+                    )
+                except Exception as exc:
+                    log.warn(
+                        "child keepalive ping failed",
+                        agent_id=target["agent_id"],
+                        child_task_id=target["task_id"],
+                        error=str(exc),
+                    )
+
+    worker = threading.Thread(target=_run_keepalive_loop, daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        worker.join(timeout=1.0)
+
+
 async def _ack_and_cleanup_dev_agent(state: dict) -> dict[str, Any]:
-    """Acknowledge the current Web Dev child task and tear down any per-task instance."""
+    """Acknowledge the current Web Dev child task and tear down any per-task instance.
+
+    Also sends ACK to the Code Review agent if a session exists.
+    Per Section 17: ACK is sent to both Dev and CR simultaneously.
+    Container destroy is best-effort after ACK — agents should self-exit on ACK.
+    """
+    log = _logger(state)
+    result: dict[str, Any] = {}
+
+    # --- Dev Agent ACK + cleanup ---
     session = state.get("dev_agent_session") or {}
     if not isinstance(session, dict):
         session = {}
@@ -39,38 +247,85 @@ async def _ack_and_cleanup_dev_agent(state: dict) -> dict[str, Any]:
     child_service_url = str(session.get("service_url") or "").strip()
     child_container_name = str(session.get("container_name") or "").strip()
     child_agent_id = str(session.get("agent_id") or "web-dev").strip() or "web-dev"
-    if not child_task_id and not child_container_name:
-        return {}
 
-    log = _logger(state)
-    acknowledged = False
-    cleaned_up = False
+    dev_acknowledged = False
+    dev_cleaned_up = False
 
     if child_task_id and child_service_url:
         try:
             from framework.a2a.client import A2AClient
 
-            await A2AClient(timeout=10).send_ack(child_service_url, child_task_id)
-            acknowledged = True
+            await A2AClient(timeout=10).send_ack(
+                child_service_url,
+                child_task_id,
+                exit_reason="task_completed_success",
+                orchestrator_task_id=state.get("_task_id", ""),
+            )
+            dev_acknowledged = True
             log.a2a("→", child_agent_id, action="ack", child_task_id=child_task_id)
         except Exception as exc:
             log.warn("dev agent ack failed", error=str(exc), child_task_id=child_task_id)
 
+    # Best-effort container cleanup after ACK (agent should self-exit, but safety net)
     if child_container_name:
         try:
             from framework.launcher import get_launcher
 
             get_launcher().destroy_instance(child_agent_id, child_container_name)
-            cleaned_up = True
+            dev_cleaned_up = True
             log.info("dev agent instance destroyed", agent_id=child_agent_id, container_name=child_container_name)
         except Exception as exc:
-            log.warn("dev agent cleanup failed", error=str(exc), container_name=child_container_name)
+            log.warn("dev agent cleanup failed (agent may have already exited)", error=str(exc), container_name=child_container_name)
 
-    return {
-        "dev_agent_acknowledged": acknowledged,
-        "dev_agent_cleaned_up": cleaned_up,
-        "dev_agent_session": {},
-    }
+    result["dev_agent_acknowledged"] = dev_acknowledged
+    result["dev_agent_cleaned_up"] = dev_cleaned_up
+    result["dev_agent_session"] = {}
+    _clear_cached_child_sessions(state.get("_task_id", ""), child_agent_id)
+
+    # --- CR Agent ACK + cleanup ---
+    cr_session = state.get("cr_agent_session") or {}
+    if not isinstance(cr_session, dict):
+        cr_session = {}
+
+    cr_task_id = str(cr_session.get("task_id") or "").strip()
+    cr_service_url = str(cr_session.get("service_url") or "").strip()
+    cr_container_name = str(cr_session.get("container_name") or "").strip()
+    cr_agent_id = str(cr_session.get("agent_id") or "code-review").strip() or "code-review"
+
+    cr_acknowledged = False
+    cr_cleaned_up = False
+
+    if cr_task_id and cr_service_url:
+        try:
+            from framework.a2a.client import A2AClient
+
+            await A2AClient(timeout=10).send_ack(
+                cr_service_url,
+                cr_task_id,
+                exit_reason="task_completed_success",
+                orchestrator_task_id=state.get("_task_id", ""),
+            )
+            cr_acknowledged = True
+            log.a2a("→", cr_agent_id, action="ack", child_task_id=cr_task_id)
+        except Exception as exc:
+            log.warn("cr agent ack failed", error=str(exc), child_task_id=cr_task_id)
+
+    if cr_container_name:
+        try:
+            from framework.launcher import get_launcher
+
+            get_launcher().destroy_instance(cr_agent_id, cr_container_name)
+            cr_cleaned_up = True
+            log.info("cr agent instance destroyed", agent_id=cr_agent_id, container_name=cr_container_name)
+        except Exception as exc:
+            log.warn("cr agent cleanup failed (agent may have already exited)", error=str(exc), container_name=cr_container_name)
+
+    result["cr_agent_acknowledged"] = cr_acknowledged
+    result["cr_agent_cleaned_up"] = cr_cleaned_up
+    result["cr_agent_session"] = {}
+    _clear_cached_child_sessions(state.get("_task_id", ""), cr_agent_id)
+
+    return result
 
 
 def _safe_json(text: str, fallback: Any = None) -> Any:
@@ -876,12 +1131,35 @@ async def dispatch_dev_agent(state: dict) -> dict:
         raise RuntimeError(f"Cannot dispatch Web Dev without a valid execution contract: {exc}") from exc
 
     try:
+        orchestrator_task_id = str(state.get("_task_id", "")).strip()
         # For revision cycles, reuse the existing container instead of launching a new one.
         # Per architecture spec: "Team Lead reuses the same dev-agent container (same service
         # URL, new task ID via POST /message:send). It does NOT launch a new container."
-        existing_session = state.get("dev_agent_session") or {}
+        existing_session = _normalize_child_session(state.get("dev_agent_session"), "web-dev")
+        if not existing_session:
+            existing_session = _get_cached_child_session(orchestrator_task_id, "web-dev")
+            if existing_session:
+                log.info(
+                    "using cached web-dev child session",
+                    child_task_id=existing_session.get("task_id", ""),
+                    service_url=existing_session.get("service_url", ""),
+                )
         existing_service_url = str(existing_session.get("service_url") or "").strip()
         existing_container_name = str(existing_session.get("container_name") or "").strip()
+
+        # Duplicate instance prevention: ensure no other live container exists
+        # for the same orchestratorTaskId to prevent resource leaks.
+        if not existing_service_url:
+            live_session = _reuse_live_child_session(
+                agent_id="web-dev",
+                capability="web-dev.task.execute",
+                orchestrator_task_id=orchestrator_task_id,
+                log=log,
+            )
+            if live_session:
+                _cache_child_session(orchestrator_task_id, "web-dev", live_session)
+            existing_service_url = live_session.get("service_url", "")
+            existing_container_name = live_session.get("container_name", "")
 
         dispatch_args = {
                 "task_description": task_description,
@@ -900,7 +1178,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
                 "design_md_path": state.get("design_md_path", ""),
                 "tech_stack": state.get("tech_stack") or [],
                 "stitch_screen_name": state.get("stitch_screen_name", ""),
-                "orchestrator_task_id": state.get("_task_id", ""),
+                "orchestrator_task_id": orchestrator_task_id,
                 "revision_feedback": revision_feedback,
                 "review_report_path": state.get("review_report_path", ""),
                 "revision_mode": bool(revision_feedback),
@@ -920,10 +1198,11 @@ async def dispatch_dev_agent(state: dict) -> dict:
         if existing_service_url:
             log.info("reusing existing web-dev container for revision",
                      service_url=existing_service_url, container=existing_container_name)
-        result_str = registry.execute_sync(
-            "dispatch_web_dev",
-            dispatch_args,
-        )
+        with _keep_child_sessions_alive(log, [state.get("cr_agent_session")]):
+            result_str = registry.execute_sync(
+                "dispatch_web_dev",
+                dispatch_args,
+            )
         payload = json.loads(result_str) if result_str else {}
     except Exception as exc:
         log.error("dev dispatch failed", error=str(exc))
@@ -993,15 +1272,21 @@ async def dispatch_dev_agent(state: dict) -> dict:
     if payload.get("error"):
         print(f"[{_AGENT_ID}] Dev dispatch error detail: {payload['error']}")
 
-    return {
-        "dev_dispatched": True,
-        "dev_result": payload,
-        "dev_agent_session": {
+    next_dev_session = _cache_child_session(
+        orchestrator_task_id,
+        "web-dev",
+        {
             "task_id": str(payload.get("childTaskId") or "").strip(),
             "service_url": str(payload.get("childServiceUrl") or "").strip(),
             "container_name": str(payload.get("childContainerName") or "").strip(),
             "agent_id": str(payload.get("childAgentId") or "web-dev").strip() or "web-dev",
         },
+    )
+
+    return {
+        "dev_dispatched": True,
+        "dev_result": payload,
+        "dev_agent_session": next_dev_session or existing_session,
         "pr_url": pr_url,
         "pr_number": payload.get("prNumber") or payload.get("pr_number") or 0,
         "branch_name": branch_name,
@@ -1025,6 +1310,7 @@ async def review_result(state: dict) -> dict:
     from framework.tools.registry import get_registry
 
     registry = get_registry()
+    log = _logger(state)
     pr_url = state.get("pr_url", "")
     dev_result = state.get("dev_result", {})
 
@@ -1059,6 +1345,30 @@ async def review_result(state: dict) -> dict:
         raise RuntimeError(f"Cannot dispatch Code Review without a valid execution contract: {exc}") from exc
 
     try:
+        orchestrator_task_id = str(state.get("_task_id", "")).strip()
+        existing_cr_session = _normalize_child_session(state.get("cr_agent_session"), "code-review")
+        if not existing_cr_session:
+            existing_cr_session = _get_cached_child_session(orchestrator_task_id, "code-review")
+            if existing_cr_session:
+                log.info(
+                    "using cached code-review child session",
+                    child_task_id=existing_cr_session.get("task_id", ""),
+                    service_url=existing_cr_session.get("service_url", ""),
+                )
+        existing_cr_service_url = str(existing_cr_session.get("service_url") or "").strip()
+        existing_cr_container_name = str(existing_cr_session.get("container_name") or "").strip()
+        if not existing_cr_service_url:
+            live_cr_session = _reuse_live_child_session(
+                agent_id="code-review",
+                capability="review.code.check",
+                orchestrator_task_id=orchestrator_task_id,
+                log=log,
+            )
+            if live_cr_session:
+                _cache_child_session(orchestrator_task_id, "code-review", live_cr_session)
+            existing_cr_service_url = live_cr_session.get("service_url", "")
+            existing_cr_container_name = live_cr_session.get("container_name", "")
+
         review_repo_url = (
             state.get("repo_url", "")
             or dev_result.get("repoUrl", "")
@@ -1069,36 +1379,51 @@ async def review_result(state: dict) -> dict:
             or dev_result.get("changed_files")
             or []
         )
-        result_str = registry.execute_sync(
-            "dispatch_code_review",
-            {
-                "pr_url": pr_url,
-                "pr_number": state.get("pr_number") or dev_result.get("prNumber") or dev_result.get("pr_number") or 0,
-                "repo_url": review_repo_url,
-                "changed_files": review_changed_files,
-                "diff_summary": dev_result.get("summary", ""),
-                "requirements": state.get("analysis_summary", "") or state.get("user_request", ""),
-                "jira_context": state.get("jira_context", {}),
-                "design_context": state.get("design_context"),
-                "workspace_path": state.get("workspace_path", ""),
-                "context_manifest_path": state.get("context_manifest_path", ""),
-                "orchestrator_task_id": state.get("_task_id", ""),
-                "task_id": state.get("_task_id", ""),
-                "execution_contract": review_contract,
-                "permissions": review_permissions,
-                "repo_path": state.get("repo_path", ""),
-                "review_round": state.get("revision_count", 0) + 1,
-                "previous_review_path": (
-                    f"code-review/review-report-{state.get('revision_count', 0)}.json"
-                    if state.get("revision_count", 0) > 0 else None
-                ),
-                "tech_stack": state.get("tech_stack") or [],
-            },
-        )
+        with _keep_child_sessions_alive(log, [state.get("dev_agent_session")]):
+            result_str = registry.execute_sync(
+                "dispatch_code_review",
+                {
+                    "pr_url": pr_url,
+                    "pr_number": state.get("pr_number") or dev_result.get("prNumber") or dev_result.get("pr_number") or 0,
+                    "repo_url": review_repo_url,
+                    "changed_files": review_changed_files,
+                    "diff_summary": dev_result.get("summary", ""),
+                    "requirements": state.get("analysis_summary", "") or state.get("user_request", ""),
+                    "jira_context": state.get("jira_context", {}),
+                    "design_context": state.get("design_context"),
+                    "workspace_path": state.get("workspace_path", ""),
+                    "context_manifest_path": state.get("context_manifest_path", ""),
+                    "orchestrator_task_id": orchestrator_task_id,
+                    "task_id": orchestrator_task_id,
+                    "execution_contract": review_contract,
+                    "permissions": review_permissions,
+                    "repo_path": state.get("repo_path", ""),
+                    "review_round": state.get("revision_count", 0) + 1,
+                    "previous_review_path": (
+                        f"code-review/review-report-{state.get('revision_count', 0)}.json"
+                        if state.get("revision_count", 0) > 0 else None
+                    ),
+                    "tech_stack": state.get("tech_stack") or [],
+                    # Reuse existing CR container for re-review rounds.
+                    "child_service_url": existing_cr_service_url,
+                    "child_container_name": existing_cr_container_name,
+                },
+            )
         payload = json.loads(result_str) if result_str else {}
     except Exception as exc:
         print(f"[{_AGENT_ID}] Code review dispatch failed: {exc}")
         payload = {"verdict": "error", "message": str(exc)}
+
+    # Persist CR session from the dispatch result so we can reuse the container
+    cr_session = {}
+    cr_launch = payload.pop("_crSession", None)
+    if isinstance(cr_launch, dict) and cr_launch.get("service_url"):
+        cr_session = _cache_child_session(orchestrator_task_id, "code-review", {
+            "task_id": cr_launch.get("task_id", ""),
+            "service_url": cr_launch.get("service_url", ""),
+            "container_name": cr_launch.get("container_name", ""),
+            "agent_id": cr_launch.get("agent_id", "code-review"),
+        })
 
     verdict = payload.get("verdict", "rejected")
     revision_count = state.get("revision_count", 0)
@@ -1118,6 +1443,8 @@ async def review_result(state: dict) -> dict:
         "review_verdict": verdict,
         "manual_review_required": manual_review_required,
         "route": route,
+        # Persist CR agent session for container reuse on next review round
+        **({"cr_agent_session": cr_session} if cr_session else {}),
     }
 
 
