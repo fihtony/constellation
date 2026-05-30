@@ -76,6 +76,12 @@ class TestCompassUITemplates:
         assert "Next Action" in html
         assert "detail-section" in html
         assert "Request Summary" in html
+        assert "detail-type-pill" in html
+
+    def test_render_ui_keeps_task_type_visible_in_list_and_detail(self):
+        html = render_compass_ui()
+        assert "task-type" in html
+        assert "detail-type-pill" in html
 
     def test_render_ui_contains_responsive_breakpoints(self):
         html = render_compass_ui()

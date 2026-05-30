@@ -141,6 +141,11 @@ body {
   display: flex;
   flex-direction: column;
 }
+/* Clean scrollbars */
+.panel-body::-webkit-scrollbar { width: 5px; }
+.panel-body::-webkit-scrollbar-track { background: transparent; }
+.panel-body::-webkit-scrollbar-thumb { background: rgba(127,195,209,0.15); border-radius: 999px; }
+.panel-body::-webkit-scrollbar-thumb:hover { background: rgba(127,195,209,0.25); }
 #task-list-panel .panel-body { padding: 12px; overflow-y: auto; }
 .tasks-overview-strip {
   display: grid;
@@ -190,11 +195,11 @@ body {
   font-size: 12px;
   line-height: 1.55;
 }
-.task-list { display: flex; flex-direction: column; gap: 8px; }
+.task-list { display: flex; flex-direction: column; gap: 6px; }
 .task-item {
   position: relative;
-  padding: 12px;
-  border-radius: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
   border: none;
   background: rgba(15, 25, 36, 0.7);
   cursor: pointer;
@@ -212,7 +217,7 @@ body {
   justify-content: space-between;
   gap: 10px;
 }
-.task-title { font-size: 12px; font-weight: 700; letter-spacing: 0.02em; }
+.task-title { font-size: 12px; font-weight: 700; letter-spacing: 0.02em; line-height: 1.4; }
 .task-type {
   padding: 3px 8px;
   border-radius: 999px;
@@ -222,24 +227,24 @@ body {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+  flex-shrink: 0;
 }
-.task-note { margin-top: 6px; font-size: 11px; line-height: 1.55; color: var(--muted); }
-.task-tag-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.task-note { margin-top: 5px; font-size: 11px; line-height: 1.5; color: var(--muted); }
+.task-tag-row { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
 .task-step-preview {
-  margin-top: 8px;
-  padding-top: 8px;
+  margin-top: 6px;
+  padding-top: 6px;
   border-top: 1px solid rgba(154,176,196,0.1);
-  font-size: 11px;
-  line-height: 1.5;
-  color: #c8d8e4;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--muted);
 }
 .task-step-preview span {
   display: block;
-  margin-bottom: 3px;
-  color: var(--muted);
+  margin-bottom: 2px;
   font-size: 10px;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 .status-pill {
@@ -300,7 +305,7 @@ body {
   padding-right: 4px;
 }
 .bubble {
-  max-width: 88%;
+  max-width: 90%;
   padding: 10px 14px;
   border-radius: 16px;
   border: 1px solid var(--line);
@@ -312,13 +317,14 @@ body {
 .bubble .bubble-label {
   font-size: 10px;
   font-weight: 700;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted);
-  margin-bottom: 4px;
+  margin-bottom: 6px;
 }
-.bubble.user { margin-left: auto; background: #74b8c6; border-color: transparent; color: #071218; }
-.bubble.user .bubble-label { color: #163743; }
+.bubble.user .bubble-label { color: rgba(6, 18, 27, 0.7); }
+.bubble.user { margin-left: auto; background: var(--accent); border-color: transparent; color: #06121b; }
+.bubble.agent { border-left: 3px solid var(--accent); }
 .bubble.waiting { border-left: 4px solid var(--wait-ink); background: var(--wait-bg); }
 .bubble.failed  { border-left: 4px solid var(--error-ink); background: var(--error-bg); }
 .bubble.completed { border-left: 4px solid var(--ok-ink); background: var(--ok-bg); }
@@ -376,14 +382,84 @@ body {
   border-top: 1px solid rgba(154, 176, 196, 0.08);
 }
 .detail-card.spotlight {
-  padding: 16px;
+  padding: 18px 20px;
   border-radius: 16px;
   border: none;
   background:
-    linear-gradient(135deg, rgba(127, 195, 209, 0.12) 0%, transparent 50%),
-    linear-gradient(180deg, rgba(15, 26, 38, 0.95), rgba(12, 21, 32, 0.9));
+    linear-gradient(135deg, rgba(127, 195, 209, 0.14) 0%, transparent 40%),
+    linear-gradient(180deg, rgba(15, 26, 38, 0.98), rgba(12, 21, 32, 0.95));
+  box-shadow: 0 2px 12px rgba(0,0,0,0.25);
 }
-.detail-card h4 { margin-top: 6px; font-size: 17px; letter-spacing: -0.01em; }
+.detail-card.spotlight .kicker {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+.detail-card.spotlight .status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  margin-top: 4px;
+  margin-bottom: 10px;
+}
+.detail-card.spotlight .status-pill::before {
+  content: "";
+  width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+}
+.detail-card.spotlight .status-pill.active   { background: var(--progress-bg); color: var(--progress-ink); }
+.detail-card.spotlight .status-pill.waiting  { background: var(--wait-bg);     color: var(--wait-ink); }
+.detail-card.spotlight .status-pill.completed{ background: var(--ok-bg);       color: var(--ok-ink); }
+.detail-card.spotlight .status-pill.failed   { background: var(--error-bg);    color: var(--error-ink); }
+.detail-badge-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.detail-type-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(127, 195, 209, 0.08);
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-top: 4px;
+  margin-bottom: 10px;
+}
+.detail-card.spotlight h4 { margin-top: 4px; font-size: 18px; letter-spacing: -0.01em; font-weight: 700; color: var(--ink); }
+.detail-card.spotlight .detail-section {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(154, 176, 196, 0.1);
+}
+.detail-card.spotlight .detail-section:first-of-type { margin-top: 12px; }
+.detail-card.spotlight .detail-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.detail-card.spotlight .detail-value {
+  font-size: 13px;
+  line-height: 1.5;
+}
+.detail-card.spotlight .detail-value.action-hint {
+  color: var(--accent-strong);
+  font-weight: 600;
+}
 .detail-section {
   margin-top: 12px;
   padding-top: 12px;
@@ -488,25 +564,28 @@ body {
   line-height: 1.55;
 }
 .phase-banner {
-  margin-top: 12px;
-  padding: 12px 14px;
-  border-radius: 14px;
-  background: linear-gradient(180deg, rgba(15, 26, 38, 0.84), rgba(11, 20, 30, 0.72));
-  border: 1px solid rgba(127,195,209,0.10);
+  margin-top: 14px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, rgba(127,195,209,0.12) 0%, rgba(127,195,209,0.04) 100%);
+  border: 1px solid rgba(127,195,209,0.15);
+  box-shadow: inset 0 1px 0 rgba(127,195,209,0.1);
 }
 .phase-banner-label {
   display: block;
-  color: var(--muted);
-  font-size: 10px;
+  color: var(--accent);
+  font-size: 9px;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
 }
 .phase-banner strong {
   display: block;
   margin-top: 6px;
   font-size: 16px;
+  font-weight: 700;
   color: var(--ink);
+  letter-spacing: -0.01em;
 }
 .phase-banner span:last-child {
   display: block;
@@ -677,23 +756,27 @@ body {
 }
 .log-line {
   display: grid;
-  grid-template-columns: 70px 42px 64px 1fr;
-  gap: 8px;
-  padding: 7px 0;
-  border-bottom: 1px solid rgba(255,255,255,0.06);
+  grid-template-columns: 60px 50px 56px 1fr;
+  gap: 6px;
+  padding: 6px 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
   font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
-  font-size: 10.5px;
-  line-height: 1.4;
+  font-size: 10px;
+  line-height: 1.5;
   color: #d7e5ec;
+  transition: background 0.1s ease;
 }
+.log-line:hover { background: rgba(127,195,209,0.05); }
 .log-ts {
   color: var(--muted);
-  font-size: 9.5px;
+  font-size: 9px;
   display: flex;
   flex-direction: column;
   gap: 1px;
   line-height: 1.2;
 }
+.log-date { font-weight: 600; color: var(--muted); }
+.log-time { color: #6a8299; }
 .log-date,
 .log-time {
   white-space: nowrap;
@@ -718,11 +801,19 @@ body {
 }
 .log-msg { word-break: break-word; }
 .log-line:last-child { border-bottom: none; }
-.log-level { font-size: 9px; font-weight: 700; letter-spacing: 0.06em; padding: 2px 6px; border-radius: 4px; text-align: center; }
-.log-level.ERROR { background: rgba(239, 68, 68, 0.25); color: #ff9191; }
-.log-level.WARN  { background: rgba(245, 158, 11, 0.2); color: #ffd36f; }
-.log-level.INFO  { background: rgba(127, 195, 209, 0.15); color: #b2dbe3; }
-.log-level.DEBUG { background: rgba(147, 166, 182, 0.1); color: #93a6b6; }
+.log-level {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-align: center;
+  text-transform: uppercase;
+}
+.log-level.ERROR { background: rgba(239, 68, 68, 0.3); color: #ff9191; border: 1px solid rgba(239,68,68,0.4); }
+.log-level.WARN  { background: rgba(245, 158, 11, 0.25); color: #ffd36f; border: 1px solid rgba(245,158,11,0.3); }
+.log-level.INFO  { background: rgba(127, 195, 209, 0.18); color: #b2dbe3; border: 1px solid rgba(127,195,209,0.2); }
+.log-level.DEBUG { background: rgba(147, 166, 182, 0.12); color: #93a6b6; }
 .empty-state {
   padding: 22px;
   color: var(--muted);
@@ -1194,7 +1285,10 @@ _INLINE_JS = r"""
     root.innerHTML = `
       <div class="detail-card spotlight" id="task-spotlight">
         <div class="kicker">Task Spotlight</div>
-        <span class="status-pill ${esc(kind)}">${esc(statusLabel(kind))}</span>
+        <div class="detail-badge-row">
+          <span class="status-pill ${esc(kind)}">${esc(statusLabel(kind))}</span>
+          <span class="detail-type-pill">${esc((t.taskType || t.task_type || 'general').replace(/_/g, ' '))}</span>
+        </div>
         <h4>${esc(taskTitle)}</h4>
         <div class="detail-section">
           <span class="detail-label">${kind === 'waiting' ? 'Action Required' : kind === 'failed' ? 'Blocked' : kind === 'completed' ? 'Ready for Review' : 'Currently Running'}</span>
@@ -1203,7 +1297,7 @@ _INLINE_JS = r"""
         <div class="detail-section detail-inline-grid">
           <div>
             <span class="detail-label">Next Action</span>
-            <div class="detail-value">${esc(nextAction)}</div>
+            <div class="detail-value action-hint">${esc(nextAction)}</div>
           </div>
           <div>
             <span class="detail-label">Current Focus</span>

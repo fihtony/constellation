@@ -1,0 +1,93 @@
+- generic [ref=e2]:
+  - complementary [ref=e3]:
+    - generic [ref=e4]:
+      - generic [ref=e5]: Compass Agent
+      - heading "Task List" [level=3] [ref=e6]
+      - paragraph [ref=e7]: Prioritize tasks that need input first, then monitor active execution.
+    - generic [ref=e8]:
+      - generic [ref=e9]:
+        - generic [ref=e10]:
+          - strong [ref=e11]: "0"
+          - generic [ref=e12]: Needs Attention
+        - generic [ref=e13]:
+          - strong [ref=e14]: "0"
+          - generic [ref=e15]: In Progress
+        - generic [ref=e16]:
+          - strong [ref=e17]: "6"
+          - generic [ref=e18]: Completed
+      - generic [ref=e19]:
+        - generic [ref=e20] [cursor=pointer]:
+          - generic [ref=e21]: New Request
+          - generic [ref=e22]: Start a new Compass task here.
+        - generic [ref=e23] [cursor=pointer]:
+          - generic [ref=e24]:
+            - generic [ref=e25]: Please organize the authorized files in the shared folder into the task workspace.
+            - generic [ref=e26]: office
+          - generic [ref=e28]: Completed
+          - generic [ref=e29]: task-52bcc17e2d37
+          - generic [ref=e30]:
+            - generic [ref=e31]: Current Step
+            - text: Office task completed
+        - generic [ref=e32] [cursor=pointer]:
+          - generic [ref=e33]:
+            - generic [ref=e34]: Please summarize the authorized documents in the shared folder and write the summaries to the task workspace.
+            - generic [ref=e35]: office
+          - generic [ref=e37]: Completed
+          - generic [ref=e38]: task-f3d0458c4d23
+          - generic [ref=e39]:
+            - generic [ref=e40]: Current Step
+            - text: Office task completed
+        - generic [ref=e41] [cursor=pointer]:
+          - generic [ref=e42]:
+            - generic [ref=e43]: Please analyze the authorized spreadsheet in the shared folder and write the result to the task workspace.
+            - generic [ref=e44]: office
+          - generic [ref=e46]: Completed
+          - generic [ref=e47]: task-5c04463a7c55
+          - generic [ref=e48]:
+            - generic [ref=e49]: Current Step
+            - text: Office task completed
+        - generic [ref=e50] [cursor=pointer]:
+          - generic [ref=e51]:
+            - generic [ref=e52]: Please organize the authorized files in the shared folder into the task workspace.
+            - generic [ref=e53]: office
+          - generic [ref=e55]: Completed
+          - generic [ref=e56]: task-cb50aa2be46b
+          - generic [ref=e57]:
+            - generic [ref=e58]: Current Step
+            - text: Office task completed
+        - generic [ref=e59] [cursor=pointer]:
+          - generic [ref=e60]:
+            - generic [ref=e61]: Please summarize the authorized documents in the shared folder and write the summaries to the task workspace.
+            - generic [ref=e62]: office
+          - generic [ref=e64]: Completed
+          - generic [ref=e65]: task-2024c39f01e5
+          - generic [ref=e66]:
+            - generic [ref=e67]: Current Step
+            - text: Office task completed
+        - generic [ref=e68] [cursor=pointer]:
+          - generic [ref=e69]:
+            - generic [ref=e70]: Please analyze the authorized spreadsheet in the shared folder and write the result to the task workspace.
+            - generic [ref=e71]: office
+          - generic [ref=e73]: Completed
+          - generic [ref=e74]: task-ebdfc9a2ae2f
+          - generic [ref=e75]:
+            - generic [ref=e76]: Current Step
+            - text: Office task completed
+  - generic [ref=e77]:
+    - generic [ref=e78]:
+      - generic [ref=e79]: Task Chat
+      - heading "New Request" [level=3] [ref=e80]
+    - generic [ref=e81]:
+      - generic [ref=e82]:
+        - generic [ref=e83]: Reply Route
+        - generic [ref=e84]: This composer will create a brand-new Compass task.
+      - generic [ref=e86]: Send a request to create a new Compass task.
+      - generic [ref=e88]:
+        - textbox "Describe a new task..." [ref=e89]
+        - button "Create" [ref=e90] [cursor=pointer]
+  - generic [ref=e91]:
+    - generic [ref=e92]:
+      - generic [ref=e93]: Task Info
+      - heading "Overview, Steps, and Logs" [level=3] [ref=e94]
+      - paragraph [ref=e95]: Read the highlighted action first, then use steps and logs for execution context.
+    - generic [ref=e98]: Select a task to view details, or send a new request.
