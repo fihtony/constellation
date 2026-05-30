@@ -179,10 +179,13 @@ class TestScmAdapterCloneBehavior:
 
         assert result == {"pushed": True, "branch": "feature/test", "status": "ok"}
         assert any(
-            cmd[-3:] == ["fetch", "origin", "refs/heads/feature/test:refs/remotes/origin/feature/test"]
+            cmd[-3:] == ["fetch", "origin", "+refs/heads/feature/test:refs/remotes/origin/feature/test"]
             for cmd in calls
         )
-        assert any("push" in cmd and "--force-with-lease" in cmd for cmd in calls)
+        assert any(
+            "push" in cmd and "--force-with-lease=refs/heads/feature/test:abc123" in cmd
+            for cmd in calls
+        )
 
 
 class TestScmAdapterPrEvidenceCapabilities:

@@ -536,11 +536,13 @@ class SCMAgentAdapter(BaseAgent):
                 timeout=30,
                 env=git_env,
             )
+            remote_branch_oid = ""
             if remote_branch.returncode == 0 and remote_branch.stdout.strip():
+                remote_branch_oid = remote_branch.stdout.strip().split()[0]
                 branch_ref = f"refs/heads/{branch}"
                 tracking_ref = f"refs/remotes/origin/{branch}"
                 fetch_result = subprocess.run(
-                    git_cmd + ["fetch", "origin", f"{branch_ref}:{tracking_ref}"],
+                    git_cmd + ["fetch", "origin", f"+{branch_ref}:{tracking_ref}"],
                     capture_output=True,
                     text=True,
                     timeout=60,
@@ -555,7 +557,11 @@ class SCMAgentAdapter(BaseAgent):
                         "status": "push_prepare_failed",
                     }
 
-            cmd = git_cmd + ["push", "--force-with-lease", "-u", "origin", branch]
+            lease_arg = "--force-with-lease"
+            if remote_branch_oid:
+                lease_arg = f"--force-with-lease=refs/heads/{branch}:{remote_branch_oid}"
+
+            cmd = git_cmd + ["push", lease_arg, "-u", "origin", branch]
 
             print(f"[scm] Pushing branch {branch} in {repo_path}")
             result = subprocess.run(
@@ -566,7 +572,7 @@ class SCMAgentAdapter(BaseAgent):
                 stderr_safe = result.stderr.strip()[:400]
                 return {
                     "pushed": False,
-                    "error": "Push failed — check SCM_TOKEN and SCM_USERNAME.",
+                    "error": "Push failed.",
                     "detail": stderr_safe,
                     "status": "push_failed",
                 }

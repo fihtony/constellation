@@ -1232,9 +1232,11 @@ class DispatchCodeReview(BaseTool):
                 }))
             artifacts = task.get("artifacts", [])
             payload = _first_artifact_json(artifacts) or {"verdict": "unknown"}
+            child_task_id = str(task.get("id") or "").strip()
             # Embed launch info so Team Lead can persist the CR session
             if launch_info:
                 payload["_crSession"] = {
+                    "task_id": child_task_id,
                     "service_url": launch_info.get("serviceUrl", ""),
                     "container_name": launch_info.get("containerName", ""),
                     "agent_id": launch_info.get("agentId", "code-review"),

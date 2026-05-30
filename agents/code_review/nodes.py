@@ -221,6 +221,61 @@ def _issues_with_source(issues: Any, source_phase: str) -> list[dict[str, Any]]:
     return tagged
 
 
+def _issue_text_blob(issue: dict[str, Any]) -> str:
+    parts = [
+        str(issue.get("message", "")),
+        str(issue.get("suggestion", "")),
+        str(issue.get("requirement", "")),
+        str(issue.get("category", "")),
+    ]
+    return " ".join(parts).strip().lower()
+
+
+def _is_design_fidelity_only_issue(issue: dict[str, Any]) -> bool:
+    text = _issue_text_blob(issue)
+    if not text:
+        return False
+
+    design_keywords = (
+        "design spec",
+        "design token",
+        "typography",
+        "font",
+        "color",
+        "background",
+        "spacing",
+        "layout",
+        "visual",
+        "text-primary",
+        "text-on-surface",
+        "bg-",
+        "tailwind",
+        "token",
+    )
+    functional_keywords = (
+        "cannot",
+        "unable",
+        "broken",
+        "fails",
+        "missing acceptance",
+        "missing requirement",
+        "user flow",
+        "redirect",
+        "submit",
+        "select",
+        "save",
+        "login",
+        "route",
+        "unusable",
+        "regression",
+        "does not render",
+    )
+
+    return any(keyword in text for keyword in design_keywords) and not any(
+        keyword in text for keyword in functional_keywords
+    )
+
+
 def _issue_blocks_merge(issue: dict[str, Any]) -> bool:
     severity = str(issue.get("severity", "")).strip().lower()
     if severity == "critical":
@@ -228,12 +283,16 @@ def _issue_blocks_merge(issue: dict[str, Any]) -> bool:
     if severity != "high":
         return False
 
+    source_phase = str(issue.get("source_phase", "")).strip().lower()
     if "blocking" in issue:
+        if source_phase == "requirements" and _is_design_fidelity_only_issue(issue):
+            return False
         return _coerce_review_bool(issue.get("blocking"))
 
-    source_phase = str(issue.get("source_phase", "")).strip().lower()
-    if source_phase in {"review-input", "security", "requirements"}:
+    if source_phase in {"review-input", "security"}:
         return True
+    if source_phase == "requirements":
+        return not _is_design_fidelity_only_issue(issue)
     if source_phase == "ui-design":
         return str(issue.get("category", "")).strip().lower() in {
             "icon_rendering",

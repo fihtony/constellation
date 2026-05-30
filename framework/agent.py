@@ -265,6 +265,7 @@ class BaseAgent:
         *,
         max_steps: int = 50,
         timeout_seconds: int = 900,
+        ephemeral_state: dict | None = None,
     ) -> "Any":
         """Build a standard RunConfig for workflow invocation.
 
@@ -273,6 +274,15 @@ class BaseAgent:
         """
         from framework.workflow import RunConfig
 
+        runtime_state = {
+            "_runtime": self.services.runtime,
+            "_skills_registry": self.skills_registry,
+            "_plugin_manager": self.plugin_manager,
+            "_agent_id": self.definition.agent_id,
+        }
+        if ephemeral_state:
+            runtime_state.update(ephemeral_state)
+
         return RunConfig(
             session_id=task_id,
             thread_id=task_id,
@@ -280,6 +290,7 @@ class BaseAgent:
             event_store=self.event_store,
             plugin_manager=self.plugin_manager,
             permission_engine=self._permission_engine,
+            ephemeral_state=runtime_state,
             max_steps=max_steps,
             timeout_seconds=timeout_seconds,
         )

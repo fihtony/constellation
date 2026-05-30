@@ -724,6 +724,41 @@ class TestGenerateReport:
         assert result["verdict"] == "rejected"
         assert result["blocking_issue_count"] == 1
 
+    async def test_high_requirement_design_issue_is_advisory(self):
+        state = {
+            "quality_issues": [],
+            "security_issues": [],
+            "test_issues": [],
+            "requirement_gaps": [{
+                "severity": "high",
+                "blocking": True,
+                "message": "Heading uses text-primary instead of text-on-surface per design spec typography color token guidance.",
+                "suggestion": "Switch the color token to match the design spec.",
+            }],
+        }
+
+        result = await generate_report(state)
+
+        assert result["verdict"] == "approved"
+        assert result["blocking_issue_count"] == 0
+
+    async def test_high_requirement_gap_without_design_only_still_blocks(self):
+        state = {
+            "quality_issues": [],
+            "security_issues": [],
+            "test_issues": [],
+            "requirement_gaps": [{
+                "severity": "high",
+                "message": "Required redirect from '/' to '/quiz' is missing, so users cannot reach the quiz flow.",
+                "suggestion": "Restore the required route redirect.",
+            }],
+        }
+
+        result = await generate_report(state)
+
+        assert result["verdict"] == "rejected"
+        assert result["blocking_issue_count"] == 1
+
     async def test_medium_only_approved(self):
         state = {
             "quality_issues": [{"severity": "medium", "message": "Magic number"}],

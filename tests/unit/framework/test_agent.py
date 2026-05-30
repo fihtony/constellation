@@ -124,3 +124,24 @@ async def test_base_agent_stop_updates_registry_instance_status(monkeypatch):
         status="exited",
         current_task_id=None,
     )
+
+
+def test_build_run_config_includes_runtime_ephemeral_state():
+    registry_client = MagicMock()
+    agent = _DummyAgent(
+        AgentDefinition(
+            agent_id="team-lead",
+            name="Team Lead Agent",
+            description="test",
+            execution_mode=ExecutionMode.PERSISTENT,
+        ),
+        _build_services(registry_client),
+    )
+
+    config = agent._build_run_config("task-1", ephemeral_state={"custom": "value"})
+
+    assert config.ephemeral_state["_runtime"] is agent.services.runtime
+    assert config.ephemeral_state["_skills_registry"] is agent.skills_registry
+    assert config.ephemeral_state["_plugin_manager"] is agent.plugin_manager
+    assert config.ephemeral_state["_agent_id"] == "team-lead"
+    assert config.ephemeral_state["custom"] == "value"

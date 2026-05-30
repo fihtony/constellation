@@ -172,9 +172,6 @@ class WebDevAgent(BaseAgent):
 
         state = {
             "_task_id": canonical_task_id,
-            "_runtime": self.services.runtime,
-            "_skills_registry": self.skills_registry,
-            "_plugin_manager": self.plugin_manager,
             "user_request": user_text,
             "repo_url": metadata.get("repoUrl", ""),
             "repo_path": metadata.get("repoPath", ""),

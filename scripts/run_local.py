@@ -12,19 +12,21 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+from pathlib import Path
 import sys
 
 # Ensure project root is in PYTHONPATH
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from framework.session import InMemorySessionService
-from framework.event_store import InMemoryEventStore
+from framework.a2a.protocol import TaskState
+from framework.session import InMemorySessionService, SqliteSessionService
+from framework.event_store import InMemoryEventStore, SqliteEventStore
 from framework.memory import InMemoryMemoryService
-from framework.checkpoint import InMemoryCheckpointer
+from framework.checkpoint import InMemoryCheckpointer, SqliteCheckpointer
 from framework.skills import SkillsRegistry
 from framework.plugin import PluginManager
 from framework.agent import AgentServices
-from framework.task_store import InMemoryTaskStore
+from framework.task_store import InMemoryTaskStore, SqliteTaskStore
 from framework.config import load_agent_config, validate_startup_config
 from framework.env_utils import load_agent_environment
 from framework.launcher import get_launcher
@@ -33,6 +35,12 @@ from framework.runtime.adapter import get_runtime
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_RECOVERABLE_TASK_STATES = {
+    TaskState.SUBMITTED,
+    TaskState.ROUTING,
+    TaskState.DISPATCHED,
+    TaskState.WORKING,
+}
 
 
 # Agent registry
@@ -46,6 +54,60 @@ AGENTS = {
     "scm": ("agents.scm.adapter", "SCMAgentAdapter", "scm_definition"),
     "ui-design": ("agents.ui_design.adapter", "UIDesignAgentAdapter", "ui_design_definition"),
 }
+
+
+def _uses_persistent_state(config) -> bool:
+    return str(config.get("execution_mode", "per-task") or "per-task").strip().lower() == "persistent"
+
+
+def _state_root_for_agent(agent_id: str, config) -> Path:
+    artifact_root = str(os.environ.get("ARTIFACT_ROOT", "") or "").strip()
+    if artifact_root:
+        base_dir = Path(artifact_root) / ".agent-state"
+    else:
+        configured_data_dir = str(config.get("data.directory", "data") or "data").strip()
+        data_dir = Path(configured_data_dir)
+        if not data_dir.is_absolute():
+            data_dir = Path(PROJECT_ROOT) / data_dir
+        base_dir = data_dir / "agent-state"
+    state_dir = base_dir / agent_id
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir
+
+
+def _recover_orphaned_tasks(agent_id: str, task_store: SqliteTaskStore) -> None:
+    recovered = 0
+    for task in task_store.list_tasks(agent_id=agent_id, limit=10_000):
+        if task.status.state not in _RECOVERABLE_TASK_STATES:
+            continue
+        task_store.update_state(
+            task.id,
+            TaskState.FAILED,
+            "Agent restarted before completing this task; please retry.",
+        )
+        recovered += 1
+    if recovered:
+        print(f"[{agent_id}] Recovered {recovered} interrupted task(s) from persistent state")
+
+
+def _create_state_backends(agent_id: str, config):
+    if not _uses_persistent_state(config):
+        return (
+            InMemorySessionService(),
+            InMemoryEventStore(),
+            InMemoryCheckpointer(),
+            InMemoryTaskStore(),
+        )
+
+    state_dir = _state_root_for_agent(agent_id, config)
+    task_store = SqliteTaskStore(db_path=str(state_dir / "tasks.db"))
+    _recover_orphaned_tasks(agent_id, task_store)
+    return (
+        SqliteSessionService(db_path=str(state_dir / "sessions.db")),
+        SqliteEventStore(db_path=str(state_dir / "events.db")),
+        SqliteCheckpointer(db_path=str(state_dir / "checkpoints.db")),
+        task_store,
+    )
 
 
 def create_services(
@@ -92,16 +154,21 @@ def create_services(
     else:
         print(f"[{agent_id}] Runtime disabled: shared runtime env not required for this agent")
 
+    session_service, event_store, checkpoint_service, task_store = _create_state_backends(
+        agent_id,
+        config,
+    )
+
     return AgentServices(
-        session_service=InMemorySessionService(),
-        event_store=InMemoryEventStore(),
+        session_service=session_service,
+        event_store=event_store,
         memory_service=InMemoryMemoryService(),
         skills_registry=skills_registry,
         plugin_manager=PluginManager(),
-        checkpoint_service=InMemoryCheckpointer(),
+        checkpoint_service=checkpoint_service,
         runtime=runtime,
         registry_client=RegistryClient.from_config(),
-        task_store=InMemoryTaskStore(),
+        task_store=task_store,
         launcher=get_launcher(),
     )
 

@@ -178,6 +178,29 @@ def _is_actionable_review_comment(comment: dict[str, Any]) -> bool:
     return not any(phrase in combined for phrase in _NON_ACTIONABLE_REVIEW_PHRASES)
 
 
+def _review_comment_requires_fix(comment: dict[str, Any]) -> bool:
+    """Return True when a review comment should block revision completion."""
+    if not _is_actionable_review_comment(comment):
+        return False
+
+    try:
+        from agents.code_review.nodes import _issue_blocks_merge
+
+        return bool(_issue_blocks_merge(comment))
+    except Exception:
+        severity = str(comment.get("severity", "")).strip().lower()
+        if severity == "critical":
+            return True
+        if severity != "high":
+            return False
+
+        if str(comment.get("blocking", "")).strip().lower() in {"true", "1", "yes"}:
+            return True
+
+        source_phase = str(comment.get("source_phase", "")).strip().lower()
+        return source_phase in {"review-input", "security", "requirements"}
+
+
 def _git_worktree_changed_files(repo_path: str) -> list[str]:
     """Return tracked/untracked worktree files from git status."""
     if not repo_path or not os.path.isdir(repo_path):
@@ -1355,8 +1378,8 @@ async def self_assess(state: dict) -> dict:
                     report_body = review_data.get("data", review_data)
                     comments = report_body.get("all_comments", []) or report_body.get("comments", [])
                     cr_lines = []
-                    for c in comments[:15]:
-                        if not _is_actionable_review_comment(c):
+                    for c in comments[:20]:
+                        if not _review_comment_requires_fix(c):
                             continue
                         sev = c.get("severity", "info")
                         msg = c.get("message", "")
@@ -1399,15 +1422,16 @@ async def self_assess(state: dict) -> dict:
     if cr_comments_text:
         prompt += f"""
 
-## Code Review Issues (MUST verify all are fixed):
+## Merge-Blocking Code Review Issues (MUST verify all are fixed):
 
 {cr_comments_text}
 
-IMPORTANT: For each high/critical code review issue listed above, verify the fix
-is present in the changed files. Add a "cr_issues_fixed" field to your response
-indicating whether ALL high/critical CR issues are resolved (true/false).
-If any high/critical issue is NOT fixed, set verdict to "fail" and list
-the unresolved issues in gaps.
+IMPORTANT: The list above already excludes advisory comments.
+For each merge-blocking code review issue listed above, verify the fix is
+present in the changed files. Add a "cr_issues_fixed" field to your response
+indicating whether ALL merge-blocking CR issues are resolved (true/false).
+If any merge-blocking issue is NOT fixed, set verdict to "fail" and list the
+unresolved issues in gaps.
 """
 
     from framework.validation_gates import validate_self_assessment

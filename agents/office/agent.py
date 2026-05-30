@@ -225,16 +225,15 @@ class OfficeAgent(BaseAgent):
         )
 
         # Build initial state
+        ephemeral_state = {
+            "_task_logger": log,
+            "_message_metadata": dict(metadata),
+            "_permission_engine": getattr(self, "_permission_engine", None),
+        }
         state: dict[str, Any] = {
             "_task_id": canonical_task_id,
             "_compass_task_id": compass_task_id,
-            "_task_logger": log,
-            "_message_metadata": dict(metadata),
-            "_runtime": self.services.runtime,
-            "_skills_registry": self.skills_registry,
-            "_plugin_manager": self.plugin_manager,
             "_allowed_tools": contract.allowed_tools,
-            "_permission_engine": getattr(self, "_permission_engine", None),
             "required_skills": list(self.definition.skills or []),
             "user_request": user_text,
             "output_mode": output_mode,
@@ -267,7 +266,12 @@ class OfficeAgent(BaseAgent):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                config = self._build_run_config(canonical_task_id, max_steps=50, timeout_seconds=3600)
+                config = self._build_run_config(
+                    canonical_task_id,
+                    max_steps=50,
+                    timeout_seconds=3600,
+                    ephemeral_state=ephemeral_state,
+                )
                 result = loop.run_until_complete(
                     self._compiled_workflow.invoke(state, config)
                 )

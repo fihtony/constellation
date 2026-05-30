@@ -1129,13 +1129,28 @@ class TestDispatchDevAgentValidation:
                 "container_name": "web-dev-task-1",
                 "agent_id": "web-dev",
             },
+            "cr_agent_session": {
+                "task_id": "task-code-review-1",
+                "service_url": "http://code-review-task-1:8060",
+                "container_name": "code-review-task-1",
+                "agent_id": "code-review",
+            },
         })
 
-        assert captured["ack"] == [("http://web-dev-task-1:8050", "task-web-dev-1")]
-        assert captured["destroy"] == [("web-dev", "web-dev-task-1")]
+        assert captured["ack"] == [
+            ("http://web-dev-task-1:8050", "task-web-dev-1"),
+            ("http://code-review-task-1:8060", "task-code-review-1"),
+        ]
+        assert captured["destroy"] == [
+            ("web-dev", "web-dev-task-1"),
+            ("code-review", "code-review-task-1"),
+        ]
         assert result["dev_agent_acknowledged"] is True
         assert result["dev_agent_cleaned_up"] is True
+        assert result["cr_agent_acknowledged"] is True
+        assert result["cr_agent_cleaned_up"] is True
         assert result["dev_agent_session"] == {}
+        assert result["cr_agent_session"] == {}
 
     async def test_request_revision_acknowledges_and_cleans_dev_agent(self, monkeypatch):
         """request_revision should NOT ACK or destroy the dev agent (container reuse)."""
@@ -1676,7 +1691,8 @@ class TestTeamLeadTools:
         # Container is preserved (not destroyed) — lifecycle manager handles exit
         assert calls["destroy"] == []
         # Container info is embedded so Team Lead can track the CR session
-        assert "_crSession" in payload or payload["verdict"] == "approved"
+        assert payload["_crSession"]["task_id"] == "task-review-1"
+        assert payload["_crSession"]["service_url"] == "http://launched-code-review:8060"
 
     def test_dispatch_code_review_derives_launch_task_id_from_workspace_path(self, monkeypatch):
         from agents.team_lead.tools import DispatchCodeReview

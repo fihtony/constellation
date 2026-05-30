@@ -1419,6 +1419,7 @@ async def review_result(state: dict) -> dict:
     cr_launch = payload.pop("_crSession", None)
     if isinstance(cr_launch, dict) and cr_launch.get("service_url"):
         cr_session = _cache_child_session(orchestrator_task_id, "code-review", {
+            "task_id": cr_launch.get("task_id", ""),
             "service_url": cr_launch.get("service_url", ""),
             "container_name": cr_launch.get("container_name", ""),
             "agent_id": cr_launch.get("agent_id", "code-review"),

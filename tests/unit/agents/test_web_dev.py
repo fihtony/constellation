@@ -313,9 +313,23 @@ class TestScreenshotRenderChecks:
                             "message": "Test file content is truncated in diff - actual test assertions not fully visible for review.",
                         },
                         {
+                            "severity": "high",
+                            "blocking": True,
+                            "file": "src/pages/PracticeQuizPage.jsx",
+                            "message": "Blocking review issue.",
+                        },
+                        {
                             "severity": "medium",
                             "file": "src/pages/PracticeQuizPage.jsx",
                             "message": "Real actionable issue.",
+                        },
+                        {
+                            "severity": "high",
+                            "blocking": True,
+                            "source_phase": "requirements",
+                            "file": "src/pages/PracticeQuizPage.jsx",
+                            "message": "Heading uses text-primary instead of text-on-surface per design spec typography color token guidance.",
+                            "suggestion": "Switch the token to match the design spec.",
                         },
                         {
                             "severity": "low",
@@ -363,7 +377,9 @@ class TestScreenshotRenderChecks:
         result = await self_assess(state)
 
         assert result["route"] == "pass"
-        assert "Real actionable issue." in runtime.prompt
+        assert "Blocking review issue." in runtime.prompt
+        assert "Real actionable issue." not in runtime.prompt
+        assert "text-primary instead of text-on-surface" not in runtime.prompt
         assert "truncated in diff" not in runtime.prompt
         assert "Single-file change is very large." not in runtime.prompt
 

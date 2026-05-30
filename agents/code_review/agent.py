@@ -153,9 +153,6 @@ class CodeReviewAgent(BaseAgent):
 
         state = {
             "_task_id": canonical_task_id,
-            "_runtime": self.services.runtime,
-            "_skills_registry": self.skills_registry,
-            "_plugin_manager": self.plugin_manager,
             "pr_url": metadata.get("prUrl", ""),
             "pr_number": metadata.get("prNumber", 0),
             "repo_url": metadata.get("repoUrl", ""),

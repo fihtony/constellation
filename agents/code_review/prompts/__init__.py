@@ -130,7 +130,8 @@ REQUIREMENTS_SYSTEM = (
     "You are a product engineer verifying that the implementation correctly "
     "satisfies the specified requirements and acceptance criteria. "
    "Compare the diff against the requirements and flag any gaps or regressions. "
-   "Missing mandatory acceptance criteria or clear user-facing regressions should set blocking=true."
+   "Missing mandatory acceptance criteria or clear user-facing regressions should set blocking=true. "
+   "Do not mark purely visual or design-token differences (colors, typography, spacing, token naming) as blocking in requirements review; those belong to UI review unless they make the feature unusable or violate an explicit acceptance criterion."
 )
 
 REQUIREMENTS_TEMPLATE = """\
