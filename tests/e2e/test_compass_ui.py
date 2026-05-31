@@ -95,7 +95,7 @@ class TestCompassUILive:
         assert 'id="task-info-panel"' in body
         assert "New Request" in body
         assert "Task List" in body
-        assert "Task Chat" in body
+        assert "Compass Chat" in body
         assert "Task Info" in body
         assert "filter-agent" in body
         assert "filter-level" in body

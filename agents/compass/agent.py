@@ -709,11 +709,19 @@ class CompassAgent(BaseAgent):
         _append_chat_entry(task_store, task.id, role="COMPASS", text=response_text, tone=response_tone)
 
         log.info("task complete", response_len=len(response_text))
+        office_artifact_metadata = {"agentId": _aid}
+        for key in ("summary", "message", "deliveryReportPath", "workspacePath", "status"):
+            value = dispatch_data.get(key)
+            if value not in (None, ""):
+                office_artifact_metadata[key] = value
+        if office_request.get("output_mode"):
+            office_artifact_metadata["outputMode"] = office_request.get("output_mode")
+
         artifacts = [Artifact(
             name="compass-response",
             artifact_type="text/plain",
             parts=[{"text": response_text}],
-            metadata={"agentId": _aid},
+            metadata=office_artifact_metadata,
         )]
         task_store.complete_task(task.id, artifacts=artifacts)
 
@@ -812,11 +820,19 @@ class CompassAgent(BaseAgent):
         dispatch_data = _dispatch_office_request(task_id, user_text, office_request, registry, log)
         response_text = dispatch_data.get("message") or f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
 
+        office_artifact_metadata = {"agentId": self.definition.agent_id}
+        for key in ("summary", "message", "deliveryReportPath", "workspacePath", "status"):
+            value = dispatch_data.get(key)
+            if value not in (None, ""):
+                office_artifact_metadata[key] = value
+        if office_request.get("output_mode"):
+            office_artifact_metadata["outputMode"] = office_request.get("output_mode")
+
         artifacts = [Artifact(
             name="compass-response",
             artifact_type="text/plain",
             parts=[{"text": response_text}],
-            metadata={"agentId": self.definition.agent_id},
+            metadata=office_artifact_metadata,
         )]
         task_store.complete_task(task_id, artifacts=artifacts, message=response_text)
         _record_major_step(
