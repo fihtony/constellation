@@ -15,7 +15,8 @@ class TestUIRoutes:
         result = handle_ui_request("GET", "/ui")
         assert result["status"] == 200
         assert "text/html" in result["headers"]["Content-Type"]
-        assert "Compass Agent" in result["body"]
+        assert "Compass Chat" in result["body"]
+        assert 'id="dashboard"' in result["body"]
 
     def test_get_tasks_returns_json(self, task_store):
         task_store.create_task(
@@ -45,6 +46,53 @@ class TestUIRoutes:
         assert result["status"] == 200
         data = result["body"]
         assert data["task_id"] == task_id
+
+    def test_get_task_detail_includes_artifact_metadata(self, task_store):
+        from framework.a2a.protocol import Artifact
+
+        task = task_store.create_task(agent_id="compass", metadata={"summary": "Test task"})
+        task_store.set_artifacts(
+            task.id,
+            [
+                Artifact(
+                    name="compass-response",
+                    artifact_type="text/plain",
+                    parts=[{"text": "Done"}],
+                    metadata={"prUrl": "https://example.com/pr/1", "branch": "feature/x"},
+                )
+            ],
+        )
+
+        result = handle_ui_request("GET", f"/tasks/{task.id}", task_store=task_store)
+        assert result["status"] == 200
+        data = result["body"]
+        assert data["artifacts"][0]["metadata"]["prUrl"] == "https://example.com/pr/1"
+        assert data["artifacts"][0]["metadata"]["branch"] == "feature/x"
+
+    def test_get_task_detail_includes_office_delivery_metadata(self, task_store):
+        from framework.a2a.protocol import Artifact
+
+        task = task_store.create_task(agent_id="compass", metadata={"summary": "Office task dispatched. Status: completed"})
+        task_store.set_artifacts(
+            task.id,
+            [
+                Artifact(
+                    name="compass-response",
+                    artifact_type="text/plain",
+                    parts=[{"text": "Office task dispatched. Status: completed"}],
+                    metadata={
+                        "summary": "Analysis complete. The report has been written to the workspace.",
+                        "deliveryReportPath": "artifacts/task-1/office/task-report.json",
+                    },
+                )
+            ],
+        )
+
+        result = handle_ui_request("GET", f"/tasks/{task.id}", task_store=task_store)
+        assert result["status"] == 200
+        data = result["body"]
+        assert data["artifacts"][0]["metadata"]["summary"] == "Analysis complete. The report has been written to the workspace."
+        assert data["artifacts"][0]["metadata"]["deliveryReportPath"] == "artifacts/task-1/office/task-report.json"
 
     def test_ui_events_route_exists(self, task_store):
         result = handle_ui_request("GET", "/ui/events", task_store=task_store)

@@ -209,7 +209,12 @@ def get_task_detail(task_id: str, task_store) -> dict:
         return {"status": 404, "body": "Task not found"}
     payload = _serialize_ui_task(task)
     payload["artifacts"] = [
-        {"name": a.name, "type": a.artifact_type, "parts": a.parts}
+        {
+            "name": a.name,
+            "type": a.artifact_type,
+            "parts": a.parts,
+            "metadata": getattr(a, "metadata", {}) or {},
+        }
         for a in getattr(task, "artifacts", [])
     ]
     payload["statusMessage"] = (
