@@ -34,6 +34,7 @@ class TestUIRoutes:
         first = result["body"]["tasks"][0]
         assert "createdAt" in first
         assert "updatedAt" in first
+        assert first["orchestratorTaskId"] == first["task_id"]
         assert first["userRequest"] == "Please summarize this"
         assert first["chatHistory"][0]["text"] == "Please summarize this"
 
@@ -46,6 +47,7 @@ class TestUIRoutes:
         assert result["status"] == 200
         data = result["body"]
         assert data["task_id"] == task_id
+        assert data["orchestratorTaskId"] == task_id
 
     def test_get_task_detail_includes_artifact_metadata(self, task_store):
         from framework.a2a.protocol import Artifact

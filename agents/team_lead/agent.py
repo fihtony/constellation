@@ -35,6 +35,7 @@ from agents.team_lead.nodes import (
     request_revision,
     report_success,
     escalate_to_user,
+    _ack_and_cleanup_dev_agent,
 )
 from agents.team_lead.tools import register_team_lead_tools
 
@@ -115,6 +116,52 @@ def _build_team_lead_definition() -> AgentDefinition:
 
 
 team_lead_definition = _build_team_lead_definition()
+
+
+def _has_child_sessions(state: dict[str, Any] | None) -> bool:
+    if not isinstance(state, dict):
+        return False
+    return bool(state.get("dev_agent_session") or state.get("cr_agent_session"))
+
+
+async def _load_checkpointed_state(agent: "TeamLeadAgent", task_id: str) -> dict[str, Any]:
+    if not task_id or not agent.checkpoint_service:
+        return {}
+
+    try:
+        saved = await agent.checkpoint_service.load(task_id, task_id)
+    except Exception as exc:
+        print(f"[team-lead] Failed to load checkpoint for cleanup of task {task_id}: {exc}")
+        return {}
+
+    state = saved.get("state", {}) if isinstance(saved, dict) else {}
+    return dict(state) if isinstance(state, dict) else {}
+
+
+async def _cleanup_child_agents_after_failure(
+    agent: "TeamLeadAgent",
+    *,
+    task_id: str,
+    orchestrator_task_id: str = "",
+    state: dict[str, Any] | None = None,
+) -> None:
+    cleanup_state: dict[str, Any]
+    if _has_child_sessions(state):
+        cleanup_state = dict(state or {})
+    else:
+        cleanup_state = await _load_checkpointed_state(agent, task_id)
+        if not cleanup_state and isinstance(state, dict):
+            cleanup_state = dict(state)
+
+    cleanup_state.setdefault("_task_id", orchestrator_task_id or task_id)
+
+    try:
+        await _ack_and_cleanup_dev_agent(
+            cleanup_state,
+            exit_reason="task_completed_failure",
+        )
+    except Exception as exc:
+        print(f"[team-lead] Failed to cleanup child agents after workflow failure for task {task_id}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +292,14 @@ class TeamLeadAgent(BaseAgent):
                         callback_url, task.id, sig.question, self.definition.agent_id
                     )
             except Exception as e:
+                loop.run_until_complete(
+                    _cleanup_child_agents_after_failure(
+                        self,
+                        task_id=task.id,
+                        orchestrator_task_id=orchestrator_task_id or task.id,
+                        state=state,
+                    )
+                )
                 task_store.fail_task(task.id, str(e))
             finally:
                 loop.close()
@@ -324,6 +379,11 @@ class TeamLeadAgent(BaseAgent):
                         callback_url, task_id, sig.question, self.definition.agent_id,
                     )
             except Exception as exc:
+                await _cleanup_child_agents_after_failure(
+                    self,
+                    task_id=task_id,
+                    orchestrator_task_id=(task.metadata or {}).get("orchestratorTaskId", "") or task_id,
+                )
                 task_store.fail_task(task_id, str(exc))
 
         return task_store.get_task_dict(task_id)

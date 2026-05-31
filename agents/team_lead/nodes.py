@@ -228,8 +228,12 @@ def _keep_child_sessions_alive(
         worker.join(timeout=1.0)
 
 
-async def _ack_and_cleanup_dev_agent(state: dict) -> dict[str, Any]:
-    """Acknowledge the current Web Dev child task and tear down any per-task instance.
+async def _ack_and_cleanup_dev_agent(
+    state: dict,
+    *,
+    exit_reason: str = "task_completed_success",
+) -> dict[str, Any]:
+    """Acknowledge child tasks and tear down any per-task instances.
 
     Also sends ACK to the Code Review agent if a session exists.
     Per Section 17: ACK is sent to both Dev and CR simultaneously.
@@ -258,7 +262,7 @@ async def _ack_and_cleanup_dev_agent(state: dict) -> dict[str, Any]:
             await A2AClient(timeout=10).send_ack(
                 child_service_url,
                 child_task_id,
-                exit_reason="task_completed_success",
+                exit_reason=exit_reason,
                 orchestrator_task_id=state.get("_task_id", ""),
             )
             dev_acknowledged = True
@@ -302,7 +306,7 @@ async def _ack_and_cleanup_dev_agent(state: dict) -> dict[str, Any]:
             await A2AClient(timeout=10).send_ack(
                 cr_service_url,
                 cr_task_id,
-                exit_reason="task_completed_success",
+                exit_reason=exit_reason,
                 orchestrator_task_id=state.get("_task_id", ""),
             )
             cr_acknowledged = True
