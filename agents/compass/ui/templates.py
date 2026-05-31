@@ -1364,11 +1364,62 @@ _INLINE_JS = r"""
   function fmtTime(iso) {
     return fmtLocalTimestamp(iso);
   }
+  function parseTimestamp(iso) {
+    const value = String(iso || '').trim();
+    if (!value) return null;
+    const match = value.match(
+      /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(?:([zZ])|([+\-])(\d{2}):(\d{2}))?$/,
+    );
+    if (match) {
+      const [
+        ,
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        fraction = '0',
+        zoneToken = '',
+        offsetSign = '',
+        offsetHour = '00',
+        offsetMinute = '00',
+      ] = match;
+      const milliseconds = Number(fraction.padEnd(3, '0').slice(0, 3));
+      if (!zoneToken && !offsetSign) {
+        return new Date(
+          Number(year),
+          Number(month) - 1,
+          Number(day),
+          Number(hour),
+          Number(minute),
+          Number(second),
+          milliseconds,
+        );
+      }
+      const offsetMinutes = zoneToken
+        ? 0
+        : ((offsetSign === '-' ? -1 : 1) * ((Number(offsetHour) * 60) + Number(offsetMinute)));
+      return new Date(
+        Date.UTC(
+          Number(year),
+          Number(month) - 1,
+          Number(day),
+          Number(hour),
+          Number(minute),
+          Number(second),
+          milliseconds,
+        ) - (offsetMinutes * 60 * 1000),
+      );
+    }
+    const parsed = new Date(value);
+    return isNaN(parsed.getTime()) ? null : parsed;
+  }
   function fmtLocalTimestamp(iso) {
     if (!iso) return '--';
     try {
-      const d = new Date(iso);
-      if (isNaN(d.getTime())) return String(iso);
+      const d = parseTimestamp(iso);
+      if (!d) return String(iso);
       const month = String(d.getMonth() + 1).padStart(2, '0');
       const day = String(d.getDate()).padStart(2, '0');
       const hour = String(d.getHours()).padStart(2, '0');
@@ -1382,16 +1433,8 @@ _INLINE_JS = r"""
   function fmtLogTimestamp(iso) {
     if (!iso) return '--';
     try {
-      const d = new Date(iso);
-      if (isNaN(d.getTime())) return String(iso);
-      d.toLocaleString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        month: '2-digit',
-        day: '2-digit',
-        hour12: false,
-      });
+      const d = parseTimestamp(iso);
+      if (!d) return String(iso);
       return fmtLocalTimestamp(iso);
     } catch {
       return String(iso);
@@ -1399,8 +1442,10 @@ _INLINE_JS = r"""
   }
   function elapsedMs(createdIso, updatedIso) {
     if (!createdIso) return '--';
-    const start = new Date(createdIso).getTime();
-    const end = updatedIso ? new Date(updatedIso).getTime() : Date.now();
+    const startDate = parseTimestamp(createdIso);
+    const endDate = updatedIso ? parseTimestamp(updatedIso) : null;
+    const start = startDate ? startDate.getTime() : NaN;
+    const end = endDate ? endDate.getTime() : Date.now();
     if (isNaN(start) || isNaN(end)) return '--';
     return formatDurationMs(Math.max(0, end - start));
   }
@@ -1415,8 +1460,10 @@ _INLINE_JS = r"""
   }
   function durationBetween(startIso, endIso) {
     if (!startIso) return '--';
-    const start = new Date(startIso).getTime();
-    const end = endIso ? new Date(endIso).getTime() : Date.now();
+    const startDate = parseTimestamp(startIso);
+    const endDate = endIso ? parseTimestamp(endIso) : null;
+    const start = startDate ? startDate.getTime() : NaN;
+    const end = endDate ? endDate.getTime() : Date.now();
     if (isNaN(start) || isNaN(end)) return '--';
     return formatDurationMs(Math.max(0, end - start));
   }

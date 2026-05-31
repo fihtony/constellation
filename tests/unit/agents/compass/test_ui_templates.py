@@ -216,9 +216,15 @@ class TestCompassUITemplates:
     def test_render_ui_formats_log_timestamps_in_local_time(self):
         html = render_compass_ui()
         assert "function fmtLogTimestamp" in html
-        assert "hour: '2-digit'" in html
-        assert "minute: '2-digit'" in html
-        assert "month: '2-digit'" in html
+        assert "function parseTimestamp(iso)" in html
+        assert "fraction.padEnd(3, '0').slice(0, 3)" in html
+        assert "if (!zoneToken && !offsetSign) {" in html
+
+    def test_render_ui_normalizes_python_utc_timestamps_for_local_display(self):
+        html = render_compass_ui()
+        assert "Date.UTC(" in html
+        assert "offsetMinutes * 60 * 1000" in html
+        assert "const d = parseTimestamp(iso);" in html
 
     def test_render_ui_has_pending_timeline_marker_hollow_circle(self):
         html = render_compass_ui()
