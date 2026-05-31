@@ -37,13 +37,14 @@ class TestCompassUITemplates:
     def test_render_ui_contains_major_step_digest_copy(self):
         html = render_compass_ui()
         assert "Longer execution detail continues in merged logs." in html
+        assert '<div class="step-digest">' not in html
         assert "step-agent" in html
         assert "Plan" in html
         assert "Self-check" in html
 
     def test_render_ui_uses_compact_log_columns(self):
         html = render_compass_ui()
-        assert "grid-template-columns: 96px 46px 72px 1fr;" in html
+        assert "grid-template-columns: 96px 44px minmax(58px, 72px) 1fr;" in html
 
     def test_render_ui_contains_development_phase_semantics(self):
         html = render_compass_ui()
@@ -52,11 +53,21 @@ class TestCompassUITemplates:
         assert "phase-rail" in html
         assert "Fix" in html
         assert "Workflow Timeline" in html
-        assert "Active Phase" in html
         assert "phase-count" in html
         assert "Show all steps" in html
         assert "Current step only" in html
         assert "phaseExpandedByTask" in html
+
+    def test_render_ui_removes_separate_active_phase_banner(self):
+        html = render_compass_ui()
+        assert "Active Phase" not in html
+        assert 'phase-banner' not in html
+        assert 'const currentPhase = semanticPhases ? (semanticPhases.phases.find(phase => phase.key === semanticPhases.currentKey) || semanticPhases.phases[0]) : null;' not in html
+
+    def test_render_ui_reduces_original_request_title_font_size_by_twenty_percent(self):
+        html = render_compass_ui()
+        assert ".detail-request-title {" in html
+        assert "font-size: 17.6px;" in html
 
     def test_render_ui_supports_generic_timeline_collapse_for_office_tasks(self):
         html = render_compass_ui()
@@ -84,6 +95,7 @@ class TestCompassUITemplates:
         assert 'id="task-spotlight"' in html
         assert "detail-section" in html
         assert "Original Request" in html
+        assert "detail-request-kicker" in html
         assert "Completion Summary" in html
         assert "Error Summary" in html
         assert "Current Owner" not in html
@@ -155,6 +167,8 @@ class TestCompassUITemplates:
         assert "box-shadow: none;" in html
         assert "max-height: 250px;" in html
         assert "min-width: 92px;" in html
+        assert "white-space: normal;" in html
+        assert "overflow-wrap: anywhere;" in html
 
     def test_render_ui_contains_log_toolbar_shell(self):
         html = render_compass_ui()
@@ -235,7 +249,10 @@ class TestCompassUITemplates:
 
     def test_render_ui_uses_task_id_title_and_terminal_summary_helpers(self):
         html = render_compass_ui()
-        assert "const detailTitle = tid;" in html
+        assert 'id="task-info-head-task-id"' in html
+        assert "const orchestratorTaskId = String(t.orchestratorTaskId || t.task_id || t.id || '').trim();" in html
+        assert "const detailTitle = originalRequest || tid;" in html
+        assert "const detailTitleLabel = originalRequest ? 'Original Request' : 'Task';" in html
         assert "function summarizeTaskOutcome(task, kind, currentStep)" in html
         assert "function latestLogField(taskId, fieldNames)" in html
         assert "function latestOfficeResultSummary(taskId)" in html

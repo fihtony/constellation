@@ -93,6 +93,7 @@ def _serialize_ui_task(task) -> dict:
     return {
         "task_id": task.id,
         "id": task.id,
+        "orchestratorTaskId": metadata.get("orchestratorTaskId", task.id),
         "status": status_kind,
         "statusKind": status_kind,
         "statusState": status_value,

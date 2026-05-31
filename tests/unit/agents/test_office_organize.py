@@ -1,5 +1,6 @@
 import pytest, os, tempfile, json
 from agents.office.office_tools import OrganizeFolderTool, WriteWorkspaceTool
+from agents.office import nodes as office_nodes
 
 def test_organize_folder_tool_lists_files(tmp_path):
     """OrganizeFolderTool lists directory contents."""
@@ -37,6 +38,33 @@ def test_write_workspace_in_organize_mode(tmp_path):
     assert result.success, f"write_workspace failed: {result.error}"
     assert (tmp_path / "organization-plan.md").exists()
     del os.environ["OFFICE_WORKSPACE_ROOT"]
+
+
+def test_repair_missing_organize_plan_output_writes_plan_from_raw_output(tmp_path):
+    """Organize delivery repair should persist a missing plan from raw model output."""
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    artifacts_dir = tmp_path / "workspace"
+    artifacts_dir.mkdir()
+
+    repaired = office_nodes._repair_missing_organize_plan_output(
+        validated_paths=[str(source_dir)],
+        output_mode="workspace",
+        artifacts_dir=str(artifacts_dir),
+        raw_output=(
+            "Now let me write the organization plan documenting what was done.\n\n"
+            "# Folder Organization Plan\n\n"
+            "## Discovered Patterns\n"
+            "- Grouped by student\n"
+        ),
+    )
+
+    plan_path = artifacts_dir / "organization-plan.md"
+    assert repaired == str(plan_path)
+    assert plan_path.exists()
+    plan_text = plan_path.read_text(encoding="utf-8")
+    assert plan_text.startswith("# Folder Organization Plan")
+    assert "Now let me write" not in plan_text
 
 
 def test_organize_folder_tool_empty_dir(tmp_path):

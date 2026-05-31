@@ -446,6 +446,50 @@ def _expected_output_paths(
     return expected
 
 
+def _extract_organize_plan_text(raw_output: str) -> str:
+    text = str(raw_output or "").strip()
+    if not text:
+        return ""
+
+    marker = "# Folder Organization Plan"
+    marker_index = text.find(marker)
+    if marker_index >= 0:
+        return text[marker_index:].strip() + "\n"
+
+    heading_match = re.search(r"(?m)^#\s+.+$", text)
+    if heading_match:
+        return text[heading_match.start():].strip() + "\n"
+
+    return text + "\n"
+
+
+def _repair_missing_organize_plan_output(
+    validated_paths: list[str],
+    output_mode: str,
+    artifacts_dir: str,
+    raw_output: str,
+) -> str:
+    if not validated_paths:
+        return ""
+
+    plan_path = _target_output_file(output_mode, validated_paths[0], artifacts_dir, "organization-plan.md")
+    if os.path.exists(plan_path):
+        return ""
+
+    plan_text = _extract_organize_plan_text(raw_output)
+    if not plan_text:
+        return ""
+
+    try:
+        os.makedirs(os.path.dirname(plan_path), exist_ok=True)
+        with open(plan_path, "w", encoding="utf-8") as fh:
+            fh.write(plan_text)
+    except OSError:
+        return ""
+
+    return plan_path
+
+
 def _verify_delivery_paths(expected_paths: list[str], output_mode: str, artifacts_dir: str) -> tuple[bool, list[str]]:
     """Check that all required outputs exist and stay inside the authorized area."""
     errors: list[str] = []
@@ -883,6 +927,16 @@ def execute_office_work(state: dict) -> dict:
                 _task_log(state, "info", "canonicalized summary filenames", repaired_files=len(repaired_paths))
             _ensure_combined_summary_exact_filenames(validated_paths, output_mode, artifacts_dir)
         expected_outputs = _expected_output_paths(capability, validated_paths, output_mode, artifacts_dir)
+        if capability == "organize":
+            repaired_plan_path = _repair_missing_organize_plan_output(
+                validated_paths,
+                output_mode,
+                artifacts_dir,
+                getattr(result, "raw_output", ""),
+            )
+            if repaired_plan_path:
+                logger.info("execute_office_work: synthesized missing organize plan at %s", repaired_plan_path)
+                _task_log(state, "info", "synthesized organize plan output", output_path=repaired_plan_path)
         delivery_ok, delivery_errors = _verify_delivery_paths(expected_outputs, output_mode, artifacts_dir)
         if capability == "organize":
             repaired_paths = _repair_missing_organize_outputs(output_mode, artifacts_dir, validated_paths)

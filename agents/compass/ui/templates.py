@@ -210,6 +210,13 @@ body {
   letter-spacing: 0.12em;
   text-transform: uppercase;
 }
+.panel-head-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
 .panel-note {
   color: var(--muted);
   font-size: 12px;
@@ -527,8 +534,20 @@ body {
   justify-content: space-between;
   gap: 14px;
 }
+.detail-request-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.detail-request-kicker {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
 .detail-request-title {
-  font-size: 20px;
+  font-size: 16px;
   font-weight: 700;
   line-height: 1.35;
   letter-spacing: -0.03em;
@@ -611,6 +630,19 @@ body {
 .detail-head-tag {
   display: inline-flex;
   align-items: center;
+  gap: 10px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.detail-head-task-id {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  color: #dce7ef;
+  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  font-size: 12px;
+  line-height: 1.2;
+  letter-spacing: 0.01em;
 }
 .detail-section {
   margin-top: 12px;
@@ -714,37 +746,6 @@ body {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.55;
-}
-.phase-banner {
-  margin-top: 12px;
-  padding: 12px 14px;
-  border-radius: 11px;
-  background: linear-gradient(135deg, rgba(127,195,209,0.09) 0%, rgba(127,195,209,0.03) 100%);
-  border: 1px solid rgba(127,195,209,0.11);
-  box-shadow: inset 0 1px 0 rgba(127,195,209,0.06);
-}
-.phase-banner-label {
-  display: block;
-  color: var(--accent);
-  font-size: 8px;
-  font-weight: 700;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-.phase-banner strong {
-  display: block;
-  margin-top: 5px;
-  font-size: 15px;
-  font-weight: 700;
-  color: var(--ink);
-  letter-spacing: -0.01em;
-}
-.phase-banner span:last-child {
-  display: block;
-  margin-top: 5px;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.5;
 }
 .phase-rail {
   display: flex;
@@ -1041,7 +1042,7 @@ body {
 }
 .log-line {
   display: grid;
-  grid-template-columns: 96px 46px 72px 1fr;
+  grid-template-columns: 96px 44px minmax(58px, 72px) 1fr;
   gap: 10px;
   padding: 8px 0;
   border-bottom: 1px solid rgba(145, 171, 189, 0.08);
@@ -1075,9 +1076,10 @@ body {
   font-size: 11px;
   font-weight: 600;
   color: var(--accent);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .log-msg { word-break: break-word; color: #d6e2ea; }
 .log-line:last-child { border-bottom: none; }
@@ -1665,13 +1667,29 @@ _INLINE_JS = r"""
     if (statusClass === 'warn') return '!';
     return '';
   }
+  function timelineAgentDetail(agent, detail, fallbackDetail = '') {
+    const owner = String(agent || '').trim();
+    const text = String(detail || '').trim() || String(fallbackDetail || '').trim();
+    if (owner && text) return `${owner}: ${text}`;
+    return text || owner;
+  }
   function timelineHtmlForDevelopment(task, semanticPhases, currentStep, kind, expanded) {
     const currentIndex = semanticPhases.phases.findIndex(phase => phase.key === semanticPhases.currentKey);
     const rows = semanticPhases.phases.map((phase, index) => {
       const statusClass = phaseStateClass(phase, semanticPhases.currentKey, kind);
       const reached = phase.updateCount > 0 || phase.key === semanticPhases.currentKey || (currentIndex >= 0 && index < currentIndex);
       const effectiveClass = reached ? statusClass : 'pending';
-      const ownerMeta = phase.agent ? `<div class="timeline-meta">${esc(phase.agent)}</div>` : '';
+      const rawDetail = phase.key === semanticPhases.currentKey
+        ? String(phase.detail || currentStep || '').trim()
+        : String(phase.detail || '').trim();
+      const detailText = rawDetail && rawDetail !== String(phase.label || '').trim() ? rawDetail : '';
+      const metaText = reached
+        ? timelineAgentDetail(
+            phase.agent,
+            detailText,
+            phase.key === semanticPhases.currentKey ? 'Longer execution detail continues in merged logs.' : '',
+          )
+        : 'Not reached yet.';
       const facts = `
         <div class="timeline-facts">
           <span class="timeline-fact"><span class="timeline-fact-label">Started</span>${esc(phase.startTs ? fmtLocalTimestamp(phase.startTs) : '--')}</span>
@@ -1683,8 +1701,7 @@ _INLINE_JS = r"""
           <div class="timeline-title">${esc(phase.label)}</div>
           ${facts}
         </div>
-        ${ownerMeta}
-        <div class="timeline-meta">${esc(phase.detail || (phase.key === semanticPhases.currentKey ? currentStep : 'Not reached yet.'))}</div>
+        <div class="timeline-meta">${esc(metaText)}</div>
       </div>`;
     }).join('');
     return `<div class="phase-rail" style="display:none">${semanticPhases.phases.map(phase => `<span class="phase-pill${phase.key === semanticPhases.currentKey ? ' current' : ''}">${esc(phase.label)}</span>`).join('')}</div>
@@ -1697,6 +1714,10 @@ _INLINE_JS = r"""
       const currentClass = kind === 'failed' ? 'failed' : ((kind === 'waiting' || kind === 'active') ? 'warn' : 'done');
       const rowClass = current ? `${currentClass} current` : 'done';
       const currentMark = currentClass === 'failed' ? '✕' : (currentClass === 'warn' ? '!' : '✓');
+      const owner = step.agent || ownerOf(task);
+      const metaText = current
+        ? timelineAgentDetail(owner, '', 'Longer execution detail continues in merged logs.')
+        : timelineAgentDetail(owner, '');
       return `<div class="timeline-row ${rowClass}">
         <div class="timeline-mark">${current ? currentMark : '✓'}</div>
         <div class="timeline-headline">
@@ -1706,7 +1727,7 @@ _INLINE_JS = r"""
             <span class="timeline-fact"><span class="timeline-fact-label">Time Spent</span>${esc(step.ts ? durationBetween(step.ts, current ? task.updatedAt : step.ts) : '--')}</span>
           </div>
         </div>
-        <div class="timeline-meta">${esc(step.agent || ownerOf(task))}</div>
+        <div class="timeline-meta">${esc(metaText)}</div>
       </div>`;
     }).join('')}</div>`.replace('timeline-list">', `timeline-list${expanded ? '' : ' collapsed'}">`);
   }
@@ -1847,17 +1868,20 @@ _INLINE_JS = r"""
   function renderDetail() {
     const tid = state.selectedTaskId;
     const root = $('#detail-stack');
+    const taskInfoHeadTaskId = $('#task-info-head-task-id');
     const taskInfoHeadMeta = $('#task-info-head-meta');
     const renderTaskInfoEmpty = (title, body) => (
       `<div class="task-info-empty"><strong>${esc(title)}</strong><p>${esc(body)}</p></div>`
     );
     if (tid === NEW_REQUEST_ID || isOverviewSelection(tid)) {
+      if (taskInfoHeadTaskId) taskInfoHeadTaskId.textContent = '';
       if (taskInfoHeadMeta) taskInfoHeadMeta.innerHTML = '';
       root.innerHTML = renderTaskInfoEmpty('No task selected yet', 'Select a task to view details, or send a new request.');
       return;
     }
     const t = state.tasks[tid];
     if (!t) {
+      if (taskInfoHeadTaskId) taskInfoHeadTaskId.textContent = '';
       if (taskInfoHeadMeta) taskInfoHeadMeta.innerHTML = '';
       root.innerHTML = renderTaskInfoEmpty('Task not loaded', 'The selected task is unavailable right now. Try again after the next refresh.');
       return;
@@ -1869,13 +1893,18 @@ _INLINE_JS = r"""
     const phaseExpanded = !!state.phaseExpandedByTask[tid];
     const taskType = taskTypeOf(t);
     const typeLabel = taskTypeLabel(t);
-    const currentPhase = semanticPhases ? (semanticPhases.phases.find(phase => phase.key === semanticPhases.currentKey) || semanticPhases.phases[0]) : null;
     const hasTimelineToggle = semanticPhases ? semanticPhases.phases.length > 1 : steps.length > 1;
     const timelineBody = semanticPhases
       ? timelineHtmlForDevelopment(t, semanticPhases, currentStep, kind, phaseExpanded)
       : timelineHtmlForGeneric(t, steps, kind, phaseExpanded);
-    const detailTitle = tid;
+    const orchestratorTaskId = String(t.orchestratorTaskId || t.task_id || t.id || '').trim();
+    const originalRequest = String(t.userRequest || t.user_request || '').trim();
+    const detailTitle = originalRequest || tid;
+    const detailTitleLabel = originalRequest ? 'Original Request' : 'Task';
     const outcome = summarizeTaskOutcome(t, kind, currentStep);
+    if (taskInfoHeadTaskId) {
+      taskInfoHeadTaskId.textContent = orchestratorTaskId;
+    }
     if (taskInfoHeadMeta) {
       taskInfoHeadMeta.innerHTML = `<span class="detail-type-pill ${escapeAttr(taskType)}" style="margin-top:0">${esc(typeLabel)}</span>`;
     }
@@ -1883,12 +1912,11 @@ _INLINE_JS = r"""
     root.innerHTML = `
       <div class="detail-card spotlight ${escapeAttr(kind)}" id="task-spotlight">
         <div class="detail-request-row">
-          <div class="detail-request-title">${esc(detailTitle)}</div>
+          <div class="detail-request-copy">
+            <span class="detail-request-kicker">${esc(detailTitleLabel)}</span>
+            <div class="detail-request-title">${esc(detailTitle)}</div>
+          </div>
           <span class="status-pill ${escapeAttr(kind)}">${esc(statusLabel(kind))}</span>
-        </div>
-        <div class="detail-section">
-          <span class="detail-label">Original Request</span>
-          <div class="detail-value" style="color:var(--muted);">${esc(t.userRequest || '')}</div>
         </div>
         ${outcome ? `<div class="detail-section">
           <span class="detail-label">${esc(outcome.label)}</span>
@@ -1900,8 +1928,6 @@ _INLINE_JS = r"""
           <div class="kicker">Workflow Timeline</div>
           ${hasTimelineToggle ? `<button class="workflow-toggle" type="button" id="workflow-toggle">${phaseExpanded ? 'Current step only' : 'Show all steps'}</button>` : ''}
         </div>
-        ${currentPhase ? `<div class="phase-banner"><span class="phase-banner-label">Active Phase</span><strong>${esc(currentPhase.label)}</strong><span>${esc(currentPhase.detail || currentStep || 'Waiting for progress...')}</span></div>` : `<p style="margin-top:8px; font-size:14px; line-height:1.6;">${esc(currentStep || 'Waiting for progress...')}</p>`}
-        <div class="step-digest">Longer execution detail continues in merged logs.</div>
         ${timelineBody}
       </div>
       <div class="detail-card" id="logs-card">
@@ -2190,14 +2216,20 @@ def render_compass_ui(
 
         <section class="panel" id="task-info-panel">
           <div class="panel-head">
-            <strong>Task Info</strong>
+            <div class="panel-head-title">
+              <strong>Task Info</strong>
+              <span class="detail-head-task-id" id="task-info-head-task-id"></span>
+            </div>
             <span class="detail-head-tag" id="task-info-head-meta"></span>
           </div>
           <div class="panel-body">
             <div class="detail-stack" id="detail-stack">
               <div class="detail-card spotlight" id="task-spotlight">
                 <div class="detail-request-row">
-                  <div class="detail-request-title">Select a task</div>
+                  <div class="detail-request-copy">
+                    <span class="detail-request-kicker">Original Request</span>
+                    <div class="detail-request-title">Select a task</div>
+                  </div>
                 </div>
                 <p style="margin-top:8px; font-size:13px; line-height:1.7; color:var(--muted);">
                   Select a task to view the most important status, next action, workflow timeline, and task logs.
