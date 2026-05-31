@@ -559,11 +559,12 @@ body {
   gap: 6px;
   padding: 6px 12px;
   border-radius: 999px;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
   margin-top: 0;
   margin-bottom: 0;
   letter-spacing: 0.06em;
+  white-space: nowrap;
 }
 .detail-card.spotlight .status-pill::before {
   content: "";
@@ -1317,18 +1318,26 @@ _INLINE_JS = r"""
     if (currentStep && !looksGenericSummary(currentStep, kind)) return currentStep;
     return task.task_id || task.id || 'Task';
   }
-  function priorityRank(kind) {
-    return ({ waiting: 0, failed: 1, active: 2, completed: 3 })[kind] ?? 4;
+  function taskSortStamp(task, fallback = '') {
+    return String(
+      (task && (
+        task.createdAt
+        || task.created_at
+        || task.started_at
+        || task.updatedAt
+        || task.updated_at
+      ))
+      || fallback
+      || ''
+    );
   }
   function orderedTaskIds() {
     return [...state.order].sort((a, b) => {
       const ta = state.tasks[a], tb = state.tasks[b];
-      const ra = priorityRank(statusKindOf((ta && (ta.statusState || ta.status)) || ''));
-      const rb = priorityRank(statusKindOf((tb && (tb.statusState || tb.status)) || ''));
-      if (ra !== rb) return ra - rb;
-      const ka = (ta && ta.createdAt) || a;
-      const kb = (tb && tb.createdAt) || b;
-      return ka < kb ? 1 : (ka > kb ? -1 : 0);
+      const ka = taskSortStamp(ta, a);
+      const kb = taskSortStamp(tb, b);
+      if (ka !== kb) return ka < kb ? 1 : -1;
+      return a < b ? 1 : (a > b ? -1 : 0);
     });
   }
   function renderDashboard() {
@@ -1488,8 +1497,10 @@ _INLINE_JS = r"""
     if (!state.order.includes(task.task_id)) state.order.unshift(task.task_id);
     state.order.sort((a, b) => {
       const ta = state.tasks[a], tb = state.tasks[b];
-      const ka = (ta && ta.createdAt) || a, kb = (tb && tb.createdAt) || b;
-      return ka < kb ? 1 : (ka > kb ? -1 : 0);
+      const ka = taskSortStamp(ta, a);
+      const kb = taskSortStamp(tb, b);
+      if (ka !== kb) return ka < kb ? 1 : -1;
+      return a < b ? 1 : (a > b ? -1 : 0);
     });
   }
 

@@ -4,7 +4,7 @@ import asyncio
 import time
 import json
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from agents.team_lead.agent import TeamLeadAgent, team_lead_definition
 from framework.agent import AgentMode, AgentServices, ExecutionMode
 
@@ -133,6 +133,118 @@ class TestTeamLeadAgent:
         if poll["task"]["status"]["state"] == "TASK_STATE_COMPLETED":
             artifacts = poll["task"]["artifacts"]
             assert len(artifacts) > 0
+
+    async def test_handle_message_cleans_up_child_agents_when_workflow_fails(self, monkeypatch):
+        runtime = _mock_runtime()
+        agent = _make_agent(runtime)
+        await agent.start()
+
+        async def _raise_failure(state, config):
+            state["dev_agent_session"] = {
+                "task_id": "dev-task-1",
+                "service_url": "http://web-dev:8050",
+                "container_name": "web-dev-task-1",
+                "agent_id": "web-dev",
+            }
+            state["cr_agent_session"] = {
+                "task_id": "cr-task-1",
+                "service_url": "http://code-review:8060",
+                "container_name": "code-review-task-1",
+                "agent_id": "code-review",
+            }
+            raise RuntimeError("review dispatch exploded")
+
+        cleanup_calls: list[tuple[dict[str, Any], str]] = []
+
+        async def _capture_cleanup(state, *, exit_reason="task_completed_success"):
+            cleanup_calls.append((dict(state), exit_reason))
+            return {}
+
+        monkeypatch.setattr(agent._compiled_workflow, "invoke", _raise_failure)
+        monkeypatch.setattr("agents.team_lead.agent._ack_and_cleanup_dev_agent", _capture_cleanup)
+
+        result = await agent.handle_message({
+            "parts": [{"text": "Implement feature ABC-123"}],
+            "metadata": {"jiraKey": "ABC-123", "orchestratorTaskId": "orch-123"},
+        })
+        task_id = result["task"]["id"]
+
+        poll = None
+        for _ in range(40):
+            poll = await agent.get_task(task_id)
+            if poll["task"]["status"]["state"] == "TASK_STATE_FAILED":
+                break
+            await asyncio.sleep(0.05)
+
+        assert poll is not None
+        assert poll["task"]["status"]["state"] == "TASK_STATE_FAILED"
+        assert cleanup_calls
+        cleanup_state, exit_reason = cleanup_calls[0]
+        assert exit_reason == "task_completed_failure"
+        assert cleanup_state["_task_id"] == "orch-123"
+        assert cleanup_state["dev_agent_session"]["task_id"] == "dev-task-1"
+        assert cleanup_state["cr_agent_session"]["task_id"] == "cr-task-1"
+
+    async def test_resume_task_cleans_up_child_agents_when_resume_fails(self, monkeypatch):
+        from framework.checkpoint import InMemoryCheckpointer
+
+        runtime = _mock_runtime()
+        agent = _make_agent(runtime)
+        checkpointer = InMemoryCheckpointer()
+        agent.checkpoint_service = checkpointer
+        agent.services.checkpoint_service = checkpointer
+        await agent.start()
+
+        async def _raise_failure(config, resume_value):
+            raise RuntimeError("resume review exploded")
+
+        cleanup_calls: list[tuple[dict[str, Any], str]] = []
+
+        async def _capture_cleanup(state, *, exit_reason="task_completed_success"):
+            cleanup_calls.append((dict(state), exit_reason))
+            return {}
+
+        monkeypatch.setattr(agent._compiled_workflow, "resume", _raise_failure)
+        monkeypatch.setattr("agents.team_lead.agent._ack_and_cleanup_dev_agent", _capture_cleanup)
+
+        task = agent.services.task_store.create_task(
+            agent_id="team-lead",
+            metadata={"orchestratorTaskId": "orch-456", "orchestratorCallbackUrl": ""},
+            task_id="task-resume-1",
+        )
+        agent.services.task_store.pause_task(task.id, question="Need input")
+        await checkpointer.save(
+            task.id,
+            task.id,
+            {
+                "state": {
+                    "_task_id": "orch-456",
+                    "dev_agent_session": {
+                        "task_id": "dev-task-2",
+                        "service_url": "http://web-dev:8050",
+                        "container_name": "web-dev-task-2",
+                        "agent_id": "web-dev",
+                    },
+                    "cr_agent_session": {
+                        "task_id": "cr-task-2",
+                        "service_url": "http://code-review:8060",
+                        "container_name": "code-review-task-2",
+                        "agent_id": "code-review",
+                    },
+                },
+                "next_node": "review_result",
+            },
+        )
+
+        poll = await agent.resume_task(task.id, "continue")
+
+        assert poll["task"]["status"]["state"] == "TASK_STATE_FAILED"
+        assert cleanup_calls
+        cleanup_state, exit_reason = cleanup_calls[0]
+        assert exit_reason == "task_completed_failure"
+        assert cleanup_state["_task_id"] == "orch-456"
+        assert cleanup_state["dev_agent_session"]["task_id"] == "dev-task-2"
+        assert cleanup_state["cr_agent_session"]["task_id"] == "cr-task-2"
 
 
 class TestGatherContextFailures:

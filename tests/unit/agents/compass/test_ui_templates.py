@@ -67,7 +67,17 @@ class TestCompassUITemplates:
     def test_render_ui_reduces_original_request_title_font_size_by_twenty_percent(self):
         html = render_compass_ui()
         assert ".detail-request-title {" in html
-        assert "font-size: 17.6px;" in html
+        assert "font-size: 16px;" in html
+        assert "font-size: 22px;" not in html
+
+    def test_render_ui_optimistically_shows_new_requests_before_snapshot_sync(self):
+        html = render_compass_ui()
+        assert "function createOptimisticTask(text)" in html
+        assert "function replaceTaskCollection(tasks)" in html
+        assert "const optimisticTask = createOptimisticTask(text);" in html
+        assert "state.selectedTaskId = optimisticTask.task_id;" in html
+        assert "promoteOptimisticTask(optimisticTask.task_id, newId);" in html
+        assert "replaceTaskCollection(data.tasks || []);" in html
 
     def test_render_ui_supports_generic_timeline_collapse_for_office_tasks(self):
         html = render_compass_ui()
