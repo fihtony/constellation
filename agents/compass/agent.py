@@ -25,6 +25,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
+# Importing framework.devlog early is what activates the default
+# timezone fallback (``config/constellation.yaml:default_tz``), so
+# every subsequent log line and datetime emission is anchored to the
+# right zone even before the agent calls its first AgentLogger.
+from framework import devlog  # noqa: F401
 from agents.compass.ui.routes import handle_ui_request
 from agents.compass.tools import TOOL_NAMES, _should_use_per_task_office_launch, register_compass_tools
 

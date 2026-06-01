@@ -15,6 +15,7 @@ import time
 from typing import Any
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
+from framework import devlog  # noqa: F401  # default-tz side-effect
 from framework.config import build_agent_definition_from_config
 from framework.workflow import Workflow, START, END
 from framework.a2a.protocol import Artifact

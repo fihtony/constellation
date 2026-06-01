@@ -1,18 +1,41 @@
 # Constellation v2 — Docker Compose
 # Orchestrates all agents in the new framework architecture.
 
+# Every service below merges in `config/.env` (gitignored) via the
+# `x-agent-defaults` anchor so values like `TZ=...` propagate without
+# re-declaring `env_file:` per service. Compose still respects any
+# value already set in the shell, so operators can pass `TZ=...` on
+# the command line and it wins.
+#
+# Default timezone precedence (highest → lowest):
+#   1. ``TZ`` already in the shell environment
+#   2. ``TZ=...`` line in ``config/.env`` (loaded via env_file below)
+#   3. ``default_tz: ...`` in ``config/constellation.yaml`` — applied
+#      by ``framework.devlog`` at import time as a final fallback
+#
+# To change the deployment-wide default, edit
+# ``config/constellation.yaml:default_tz``; no other file needs to
+# change. To override per deployment, drop ``TZ=...`` in
+# ``config/.env`` (or export it in the shell before ``docker compose
+# up``).
+
+x-agent-defaults: &agent-defaults
+  env_file:
+    - config/.env
+  restart: unless-stopped
+
 services:
 
   # -----------------------------------------------------------------------
   # Registry — capability definition and live instance tracking (port 9000)
   # -----------------------------------------------------------------------
   registry:
+    <<: *agent-defaults
     image: constellation-v2-registry:latest
     build:
       context: .
       dockerfile: registry/Dockerfile
     environment:
-      TZ: "${TZ:-UTC}"
       REGISTRY_HOST: "0.0.0.0"
       REGISTRY_PORT: "9000"
     ports:
@@ -27,6 +50,7 @@ services:
       - constellation-v2
 
   init-register:
+    <<: *agent-defaults
     image: constellation-v2-init-register:latest
     build:
       context: .
@@ -36,7 +60,6 @@ services:
       registry:
         condition: service_healthy
     environment:
-      TZ: "${TZ:-UTC}"
       REGISTRY_URL: "http://registry:9000"
     restart: "no"
     networks:
@@ -46,6 +69,7 @@ services:
   # Compass Agent — control plane entry point (port 8000)
   # -----------------------------------------------------------------------
   compass:
+    <<: *agent-defaults
     image: constellation-v2-compass:latest
     build:
       context: .
@@ -64,7 +88,6 @@ services:
       ui-design:
         condition: service_healthy
     environment:
-      TZ: "${TZ:-UTC}"
       AGENT_ID: "compass"
       HOST: "0.0.0.0"
       PORT: "8000"
@@ -98,6 +121,7 @@ services:
   # Team Lead Agent — intelligence layer (port 8030)
   # -----------------------------------------------------------------------
   team-lead:
+    <<: *agent-defaults
     image: constellation-v2-team-lead:latest
     build:
       context: .
@@ -108,7 +132,6 @@ services:
       init-register:
         condition: service_completed_successfully
     environment:
-      TZ: "${TZ:-UTC}"
       AGENT_ID: "team-lead"
       HOST: "0.0.0.0"
       PORT: "8030"
@@ -142,6 +165,7 @@ services:
   # Jira Agent — boundary agent (port 8010)
   # -----------------------------------------------------------------------
   jira:
+    <<: *agent-defaults
     image: constellation-v2-jira:latest
     build:
       context: .
@@ -152,7 +176,6 @@ services:
       init-register:
         condition: service_completed_successfully
     environment:
-      TZ: "${TZ:-UTC}"
       AGENT_ID: "jira"
       HOST: "0.0.0.0"
       PORT: "8010"
@@ -180,6 +203,7 @@ services:
   # SCM Agent — boundary agent (port 8020)
   # -----------------------------------------------------------------------
   scm:
+    <<: *agent-defaults
     image: constellation-v2-scm:latest
     build:
       context: .
@@ -190,7 +214,6 @@ services:
       init-register:
         condition: service_completed_successfully
     environment:
-      TZ: "${TZ:-UTC}"
       AGENT_ID: "scm"
       HOST: "0.0.0.0"
       PORT: "8020"
@@ -218,6 +241,7 @@ services:
   # UI Design Agent — boundary agent (port 8040)
   # -----------------------------------------------------------------------
   ui-design:
+    <<: *agent-defaults
     image: constellation-v2-ui-design:latest
     build:
       context: .
@@ -228,7 +252,6 @@ services:
       init-register:
         condition: service_completed_successfully
     environment:
-      TZ: "${TZ:-UTC}"
       AGENT_ID: "ui-design"
       HOST: "0.0.0.0"
       PORT: "8040"
@@ -256,6 +279,7 @@ services:
   # Office Agent — per-task document processing (port 8060)
   # -----------------------------------------------------------------------
   office:
+    <<: *agent-defaults
     profiles:
       - manual
     image: constellation-v2-office:latest
@@ -268,7 +292,6 @@ services:
       init-register:
         condition: service_completed_successfully
     environment:
-      TZ: "${TZ:-UTC}"
       AGENT_ID: "office"
       HOST: "0.0.0.0"
       PORT: "8060"

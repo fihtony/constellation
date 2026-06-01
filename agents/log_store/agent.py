@@ -6,6 +6,7 @@ import time
 from typing import Iterable
 
 from framework.agent import AgentDefinition, AgentMode, ExecutionMode
+from framework import devlog  # noqa: F401  # default-tz side-effect
 from agents.log_store.log_aggregator import LogAggregator
 
 

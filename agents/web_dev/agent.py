@@ -15,6 +15,7 @@ import os
 import threading
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
+from framework import devlog  # noqa: F401  # default-tz side-effect
 from framework.workflow import Workflow, START, END
 from agents.web_dev.nodes import (
     prepare_jira,

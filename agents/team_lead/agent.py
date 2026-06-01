@@ -22,6 +22,7 @@ import threading
 from typing import Any
 
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
+from framework import devlog  # noqa: F401  # default-tz side-effect
 from framework.workflow import Workflow, START, END
 from framework.state import Channel, append_reducer
 from agents.team_lead.nodes import (

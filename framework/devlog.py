@@ -64,7 +64,53 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
+
+
+def _apply_default_timezone() -> None:
+    """Resolve the default timezone from ``config/constellation.yaml``
+    and apply it to ``os.environ['TZ']`` if no override is already set.
+
+    This makes ``config/constellation.yaml:default_tz`` the single
+    source of truth for every agent's wall-clock zone, regardless of
+    how the process is launched (docker compose, ``python -m
+    agents.<x>``, pytest, etc.). Operators can still override per
+    deployment by exporting ``TZ`` in the shell, by setting ``TZ`` in
+    ``config/.env`` (which docker compose forwards to every
+    container), or by setting ``TZ`` in the test environment.
+    """
+    if os.environ.get("TZ"):
+        return  # caller already pinned the zone — defer to them
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except ImportError:  # pragma: no cover - yaml is a hard dep
+        return
+    project_root = Path(__file__).resolve().parent.parent
+    yaml_path = project_root / "config" / "constellation.yaml"
+    if not yaml_path.is_file():
+        return
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except OSError:
+        return
+    default_tz = data.get("default_tz")
+    if not default_tz or not isinstance(default_tz, str):
+        return
+    os.environ["TZ"] = default_tz
+    # POSIX needs an explicit tzset so ``localtime`` reflects the new
+    # zone immediately. ``time.tzset`` is unavailable on Windows; on
+    # Linux/macOS (where our containers run) it is a no-op if the
+    # value did not change.
+    if hasattr(time, "tzset"):
+        try:
+            time.tzset()
+        except OSError:
+            pass
+
+
+_apply_default_timezone()
 
 # ---------------------------------------------------------------------------
 # Log levels

@@ -43,6 +43,7 @@ def project_dir(tmp_path):
         project:
           name: constellation
           version: "2.0.0"
+        default_tz: America/Toronto
         runtime:
           backend: claude-code
           model: claude-haiku-4-5-20251001
@@ -136,6 +137,17 @@ class TestLoadGlobalConfig:
         assert cfg.get("runtime.backend") == "claude-code"
         assert cfg.get("runtime.model") == "claude-haiku-4-5-20251001"
         assert cfg.get("container.runtime") == "docker"
+
+    def test_loads_default_tz(self, project_dir):
+        """The repo-level default timezone is exposed at the top of the
+        merged config so non-container agents (e.g. ``python -m
+        agents.<x>`` without docker) can read it via
+        ``cfg.get("default_tz")`` and pass it through to ``TZ``.
+        """
+        from framework.config import load_global_config
+
+        cfg = load_global_config(project_dir)
+        assert cfg.get("default_tz") == "America/Toronto"
 
     def test_missing_file_returns_empty(self, tmp_path):
         from framework.config import load_global_config
