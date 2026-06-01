@@ -67,8 +67,6 @@ def _is_containerized_process() -> bool:
 def _should_use_per_task_office_launch() -> bool:
     if os.environ.get("CONSTELLATION_FORCE_DIRECT_OFFICE_URL", "").strip().lower() in {"1", "true", "yes"}:
         return False
-    if not _is_containerized_process():
-        return False
     return bool(_office_launch_definition("summarize"))
 
 

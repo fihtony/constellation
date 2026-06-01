@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import urllib.request
 from typing import Any
@@ -14,6 +15,25 @@ from typing import Any
 from framework.launcher import get_launcher
 from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
+
+
+# Per-task agent instances get a process-local unique task_id so the orchestrator
+# can track them across re-review rounds.  The counter resets to 1 on import.
+_REVIEW_TASK_COUNTER_LOCK = threading.Lock()
+_review_task_counter = 0
+
+
+def _next_review_task_id() -> str:
+    """Return the next monotonically-increasing per-task review ID.
+
+    The id is purely a Team-Lead-side handle — the launched code-review instance
+    may assign its own A2A task_id, but the orchestrator's session cache keys on
+    this handle so that the CR container can be reused across review rounds.
+    """
+    global _review_task_counter
+    with _REVIEW_TASK_COUNTER_LOCK:
+        _review_task_counter += 1
+        return f"task-review-{_review_task_counter}"
 
 
 def _discover_via_registry(capability: str) -> str:
@@ -184,6 +204,7 @@ def _dispatch_via_launcher(
     metadata: dict[str, Any],
     timeout: int,
     preserve_instance: bool = False,
+    per_task_agent_task_id: str = "",
 ) -> dict:
     from framework.a2a.client import dispatch_sync
 
@@ -206,6 +227,7 @@ def _dispatch_via_launcher(
                 "agentId": agent_id,
                 "serviceUrl": launch["service_url"],
                 "containerName": launch["container_name"],
+                "perTaskAgentTaskId": per_task_agent_task_id,
             }
         return result
     finally:
@@ -1158,6 +1180,9 @@ class DispatchCodeReview(BaseTool):
                 task_id=task_id,
                 workspace_path=workspace_path,
             )
+            # Per-task code-review instance gets its own session task_id so the
+            # orchestrator can reuse the same container across re-review rounds.
+            per_task_agent_task_id = ""
             if child_service_url:
                 try:
                     _wait_for_agent_ready(child_service_url)
@@ -1173,6 +1198,7 @@ class DispatchCodeReview(BaseTool):
                         "agentId": "code-review",
                         "serviceUrl": child_service_url,
                         "containerName": child_container_name,
+                        "perTaskAgentTaskId": per_task_agent_task_id,
                     }
                 except Exception:
                     confirmed_exited, live_instances = _confirm_child_instance_exited(
@@ -1200,6 +1226,7 @@ class DispatchCodeReview(BaseTool):
             if child_service_url:
                 pass
             elif _is_per_task_definition(definition):
+                per_task_agent_task_id = _next_review_task_id()
                 result = _dispatch_via_launcher(
                     definition,
                     capability=capability,
@@ -1208,6 +1235,7 @@ class DispatchCodeReview(BaseTool):
                     metadata=meta,
                     timeout=timeout_seconds,
                     preserve_instance=True,
+                    per_task_agent_task_id=per_task_agent_task_id,
                 )
             else:
                 review_url = _resolve_agent_url("CODE_REVIEW_AGENT_URL", "code_review_agent_url", "http://code-review:8050", capability)
@@ -1235,8 +1263,15 @@ class DispatchCodeReview(BaseTool):
             child_task_id = str(task.get("id") or "").strip()
             # Embed launch info so Team Lead can persist the CR session
             if launch_info:
+                # Prefer the per-task handle generated at launch time so the
+                # orchestrator can track the CR instance across re-review rounds
+                # even when the A2A response omits the child task id.
+                session_task_id = (
+                    str(launch_info.get("perTaskAgentTaskId") or "").strip()
+                    or child_task_id
+                )
                 payload["_crSession"] = {
-                    "task_id": child_task_id,
+                    "task_id": session_task_id,
                     "service_url": launch_info.get("serviceUrl", ""),
                     "container_name": launch_info.get("containerName", ""),
                     "agent_id": launch_info.get("agentId", "code-review"),

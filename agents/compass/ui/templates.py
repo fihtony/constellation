@@ -628,6 +628,103 @@ body {
   color: var(--accent-strong);
   font-weight: 600;
 }
+/* Markdown-rendered completion summary */
+.markdown-content {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink);
+  word-break: break-word;
+  white-space: normal;
+}
+.markdown-content > p {
+  margin: 0 0 8px 0;
+}
+.markdown-content > p:last-child {
+  margin-bottom: 0;
+}
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3,
+.markdown-content h4,
+.markdown-content h5,
+.markdown-content h6 {
+  margin: 14px 0 6px 0;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+.markdown-content h1:first-child,
+.markdown-content h2:first-child,
+.markdown-content h3:first-child,
+.markdown-content h4:first-child,
+.markdown-content h5:first-child,
+.markdown-content h6:first-child { margin-top: 0; }
+.markdown-content h1 { font-size: 18px; }
+.markdown-content h2 { font-size: 16px; }
+.markdown-content h3 { font-size: 15px; }
+.markdown-content h4 { font-size: 14px; }
+.markdown-content h5,
+.markdown-content h6 { font-size: 13px; color: var(--muted); }
+.markdown-content ul,
+.markdown-content ol {
+  margin: 0 0 8px 0;
+  padding-left: 20px;
+}
+.markdown-content li {
+  margin-bottom: 4px;
+}
+.markdown-content li:last-child { margin-bottom: 0; }
+.markdown-content blockquote {
+  margin: 0 0 8px 0;
+  padding: 6px 12px;
+  border-left: 3px solid var(--accent);
+  background: rgba(147, 198, 208, 0.06);
+  color: var(--muted);
+  border-radius: 0 8px 8px 0;
+}
+.markdown-content code {
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: rgba(127, 195, 209, 0.12);
+  color: var(--accent-strong);
+  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  font-size: 0.92em;
+}
+.markdown-content pre {
+  margin: 0 0 8px 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(9, 16, 23, 0.6);
+  border: 1px solid rgba(145, 171, 189, 0.1);
+  overflow-x: auto;
+}
+.markdown-content pre code {
+  padding: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.5;
+  display: block;
+}
+.markdown-content a {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-decoration-color: rgba(147, 198, 208, 0.32);
+  text-underline-offset: 2px;
+  word-break: break-all;
+}
+.markdown-content a:hover {
+  text-decoration-color: var(--accent-strong);
+}
+.markdown-content strong { font-weight: 700; color: var(--ink); }
+.markdown-content em { font-style: italic; color: var(--ink); }
+.markdown-content del { text-decoration: line-through; color: var(--muted); }
+.markdown-content hr {
+  margin: 12px 0;
+  border: none;
+  border-top: 1px solid rgba(145, 171, 189, 0.1);
+}
 .detail-head-tag {
   display: inline-flex;
   align-items: center;
@@ -1190,6 +1287,101 @@ _INLINE_JS = r"""
     return String(s).replace(/[&<>"']/g, c =>
       ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
   }
+  // Safe markdown → HTML renderer for the completion summary.
+  // Order: extract code first → escape HTML → apply patterns → restore code.
+  function renderMarkdown(text) {
+    if (text === null || text === undefined) return '';
+    const value = String(text);
+    if (!value) return '';
+    const codeBlocks = [];
+    let html = value.replace(/```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```/g, function (m, lang, code) {
+      const idx = codeBlocks.length;
+      codeBlocks.push({ lang: lang || '', code: code || '' });
+      return 'ZQXCB' + idx + 'ZQX';
+    });
+    const inlineCodes = [];
+    html = html.replace(/`([^`\n]+)`/g, function (m, code) {
+      const idx = inlineCodes.length;
+      inlineCodes.push(code);
+      return 'ZQXIC' + idx + 'ZQX';
+    });
+    html = esc(html);
+    html = html.replace(/^[\s]*(?:[-]{3,}|[\*]{3,}|[_]{3,})[\s]*$/gm, '<hr>');
+    html = html.replace(/^######\s+(.*)$/gm, '<h6>$1</h6>');
+    html = html.replace(/^#####\s+(.*)$/gm, '<h5>$1</h5>');
+    html = html.replace(/^####\s+(.*)$/gm, '<h4>$1</h4>');
+    html = html.replace(/^###\s+(.*)$/gm, '<h3>$1</h3>');
+    html = html.replace(/^##\s+(.*)$/gm, '<h2>$1</h2>');
+    html = html.replace(/^#\s+(.*)$/gm, '<h1>$1</h1>');
+    html = html.replace(/((?:^|\n)(?:&gt;\s*.*(?:\n|$))+)/g, function (m) {
+      const inner = m.replace(/^&gt;\s*/gm, '').replace(/\n/g, '<br>').trim();
+      return '\n<blockquote>' + inner + '</blockquote>\n';
+    });
+    html = html.replace(/(^|\n)((?:[-*+]\s+.+\n?)+)/g, function (m, prefix, list) {
+      const items = list.trim().split('\n').map(function (line) {
+        return '<li>' + line.replace(/^[-*+]\s+/, '') + '</li>';
+      }).join('');
+      return prefix + '<ul>' + items + '</ul>';
+    });
+    html = html.replace(/(^|\n)((?:\d+\.\s+.+\n?)+)/g, function (m, prefix, list) {
+      const items = list.trim().split('\n').map(function (line) {
+        return '<li>' + line.replace(/^\d+\.\s+/, '') + '</li>';
+      }).join('');
+      return prefix + '<ol>' + items + '</ol>';
+    });
+    html = html.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
+    html = html.replace(/(^|[^\*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    html = html.replace(/(^|[^_])_([^_\n]+)_/g, '$1<em>$2</em>');
+    html = html.replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+    html = html.replace(/\[([^\]\n]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, function (m, text, url, title) {
+      const safeUrl = sanitizeMarkdownUrl(url);
+      const titleAttr = title ? ' title="' + esc(title) + '"' : '';
+      return '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer"' + titleAttr + '>' + text + '</a>';
+    });
+    html = html.replace(/(?<!["'=a-zA-Z>])(https?:\/\/[^\s<&]+)/g, function (m, url) {
+      const safeUrl = sanitizeMarkdownUrl(url);
+      return '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' + url + '</a>';
+    });
+    html = html.replace(/ZQXCB(\d+)ZQX/g, function (m, idx) {
+      const block = codeBlocks[Number(idx)];
+      if (!block) return '';
+      const langClass = block.lang ? ' class="language-' + esc(block.lang) + '"' : '';
+      return '<pre><code' + langClass + '>' + esc(block.code) + '</code></pre>';
+    });
+    html = html.replace(/ZQXIC(\d+)ZQX/g, function (m, idx) {
+      const code = inlineCodes[Number(idx)];
+      if (code === undefined) return '';
+      return '<code>' + esc(code) + '</code>';
+    });
+    const parts = html.split(/\n{2,}/);
+    html = parts.map(function (part) {
+      const trimmed = part.trim();
+      if (!trimmed) return '';
+      if (/^<(h[1-6]|ul|ol|blockquote|pre|hr|p|table|div|article|section)\b/.test(trimmed)) {
+        return trimmed;
+      }
+      return '<p>' + trimmed.replace(/\n/g, '<br>') + '</p>';
+    }).filter(Boolean).join('\n');
+    return html;
+  }
+  function sanitizeMarkdownUrl(url) {
+    const trimmed = String(url || '').trim();
+    if (!trimmed) return '#';
+    const first = trimmed.charAt(0);
+    if (first === '#' || first === '/' || first === '?') {
+      return esc(trimmed);
+    }
+    const protoMatch = trimmed.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:)/);
+    if (protoMatch) {
+      const proto = protoMatch[1].toLowerCase();
+      if (proto === 'http:' || proto === 'https:' || proto === 'mailto:') {
+        return esc(trimmed);
+      }
+      return '#';
+    }
+    return esc(trimmed);
+  }
   function statusKindOf(st) {
     return ({
       'TASK_STATE_COMPLETED': 'completed',
@@ -1387,14 +1579,23 @@ _INLINE_JS = r"""
       ] = match;
       const milliseconds = Number(fraction.padEnd(3, '0').slice(0, 3));
       if (!zoneToken && !offsetSign) {
+        // Naive timestamp (no Z / no offset). All Python emitters in the
+        // system produce UTC (task_store, lifecycle, a2a client, compass
+        // chat entries, devlog), and the container clock defaults to UTC.
+        // Treating the value as UTC here keeps the displayed local time
+        // correct for users in any timezone. Without this, devlog's
+        // "YYYY-MM-DD HH:MM:SS" lines (e.g. "2026-06-01 12:34:56") would
+        // be re-interpreted as the browser's local clock and leak UTC.
         return new Date(
-          Number(year),
-          Number(month) - 1,
-          Number(day),
-          Number(hour),
-          Number(minute),
-          Number(second),
-          milliseconds,
+          Date.UTC(
+            Number(year),
+            Number(month) - 1,
+            Number(day),
+            Number(hour),
+            Number(minute),
+            Number(second),
+            milliseconds,
+          )
         );
       }
       const offsetMinutes = zoneToken
@@ -1551,12 +1752,45 @@ _INLINE_JS = r"""
     });
   }
 
+  function replaceTaskCollection(tasks) {
+    state.tasks = {};
+    state.order = [];
+    for (const t of (tasks || [])) upsertTask(t);
+  }
+
+  function createOptimisticTask(text) {
+    const optimisticId = '__optimistic_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+    const ts = new Date().toISOString();
+    return {
+      task_id: optimisticId,
+      id: optimisticId,
+      userRequest: text,
+      summary: 'Submitting…',
+      status: 'active',
+      statusState: 'TASK_STATE_SUBMITTED',
+      createdAt: ts,
+      taskType: 'general',
+      optimistic: true,
+      chatHistory: [{ role: 'USER', text, ts, tone: 'normal' }],
+    };
+  }
+
+  function promoteOptimisticTask(optimisticId, newId) {
+    if (!optimisticId || !newId) return;
+    if (optimisticId === newId) return;
+    const existed = Object.prototype.hasOwnProperty.call(state.tasks, optimisticId);
+    if (existed) {
+      delete state.tasks[optimisticId];
+      state.order = state.order.filter(id => id !== optimisticId);
+      if (state.selectedTaskId === optimisticId) state.selectedTaskId = newId;
+    }
+  }
+
   async function loadTasks(autoSelect) {
     try {
       const resp = await fetch('/api/tasks');
       const data = await resp.json();
-      state.tasks = {}; state.order = [];
-      for (const t of (data.tasks || [])) upsertTask(t);
+      replaceTaskCollection(data.tasks || []);
       if (autoSelect && !state.tasks[state.selectedTaskId] && state.selectedTaskId !== NEW_REQUEST_ID && !isOverviewSelection(state.selectedTaskId)) {
         state.selectedTaskId = state.order[0] || NEW_REQUEST_ID;
       }
@@ -1978,7 +2212,7 @@ _INLINE_JS = r"""
         </div>
         ${outcome ? `<div class="detail-section">
           <span class="detail-label">${esc(outcome.label)}</span>
-          <div class="detail-value multiline">${esc(outcome.text)}</div>
+          <div class="detail-value multiline markdown-content">${renderMarkdown(outcome.text)}</div>
         </div>` : ''}
       </div>
       <div class="detail-card">
@@ -2126,8 +2360,7 @@ _INLINE_JS = r"""
       es.addEventListener('task.snapshot', ev => {
         try {
           const data = JSON.parse(ev.data);
-          state.tasks = {}; state.order = [];
-          for (const t of (data.tasks || [])) upsertTask(t);
+          replaceTaskCollection(data.tasks || []);
           renderTaskList(); renderChat(); renderDetail();
         } catch {}
       });
@@ -2152,6 +2385,11 @@ _INLINE_JS = r"""
     const targetTaskId = input.dataset.targetTaskId || '';
     input.value = '';
     if (mode === 'create') {
+      const optimisticTask = createOptimisticTask(text);
+      state.tasks[optimisticTask.task_id] = optimisticTask;
+      if (!state.order.includes(optimisticTask.task_id)) state.order.unshift(optimisticTask.task_id);
+      state.selectedTaskId = optimisticTask.task_id;
+      renderTaskList(); renderChat(); renderDetail();
       const r = await fetch('/message:send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2162,16 +2400,51 @@ _INLINE_JS = r"""
       });
       const data = await r.json();
       const newId = (data.task && data.task.id) || (data.ui_update && data.ui_update.task_id);
-      await loadTasks(false);
-      if (newId) selectTask(newId);
+      if (newId) promoteOptimisticTask(optimisticTask.task_id, newId);
+      // Pull the latest snapshot so the optimistic placeholder is replaced with
+      // the real task before the user sees the final list state.
+      try {
+        const snapResp = await fetch('/api/tasks');
+        const snapData = await snapResp.json();
+        replaceTaskCollection(snapData.tasks || []);
+      } catch (e) { /* fall through to loadTasks */ }
+      if (newId && state.tasks[newId]) {
+        state.selectedTaskId = newId;
+        subscribeLogs(newId);
+      } else {
+        await loadTasks(false);
+      }
+      renderTaskList(); renderChat(); renderDetail();
     } else if (mode === 'resume' && targetTaskId) {
+      const targetTask = state.tasks[targetTaskId];
+      const userMsg = { role: 'USER', text, ts: new Date().toISOString(), tone: 'normal' };
+      if (targetTask) {
+        const history = Array.isArray(targetTask.chatHistory) ? targetTask.chatHistory.slice() : [];
+        history.push(userMsg);
+        targetTask.chatHistory = history;
+        targetTask.statusState = 'TASK_STATE_WORKING';
+        targetTask.status = 'active';
+        renderChat();
+      }
       await fetch(`/tasks/${encodeURIComponent(targetTaskId)}/resume`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ input: text }),
       });
+      // Reload task state but preserve any optimistically-added user messages
+      // that the server may not have processed yet
+      const savedUserMsg = userMsg;
       await loadTasks(false);
-      selectTask(targetTaskId);
+      const refreshedTask = state.tasks[targetTaskId];
+      if (refreshedTask) {
+        const hist = Array.isArray(refreshedTask.chatHistory) ? refreshedTask.chatHistory : [];
+        if (!hist.some(e => e.role === 'USER' && e.text === savedUserMsg.text && e.ts === savedUserMsg.ts)) {
+          hist.push(savedUserMsg);
+          refreshedTask.chatHistory = hist;
+        }
+      }
+      state.selectedTaskId = targetTaskId;
+      renderTaskList(); renderChat(); renderDetail();
     }
   }
 

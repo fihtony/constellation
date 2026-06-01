@@ -142,6 +142,11 @@ class TestCompassUITemplates:
         assert "No task selected yet" in html
         assert "task-info-empty" in html
 
+    def test_render_ui_resume_send_keeps_current_task_selected(self):
+        html = render_compass_ui()
+        assert "state.selectedTaskId = targetTaskId;" in html
+        assert "selectTask(targetTaskId);" not in html
+
     def test_render_ui_dims_non_selected_tasks_like_spec(self):
         html = render_compass_ui()
         assert ".task-list.has-selection .task-item:not(.active)" in html
@@ -226,6 +231,26 @@ class TestCompassUITemplates:
         assert "offsetMinutes * 60 * 1000" in html
         assert "const d = parseTimestamp(iso);" in html
 
+    def test_render_ui_treats_naive_timestamps_as_utc(self):
+        """Devlog emits naive "YYYY-MM-DD HH:MM:SS" in the container's UTC clock.
+        parseTimestamp must interpret that as UTC (not browser-local) so the
+        displayed local time is correct for users in any timezone.
+        """
+        html = render_compass_ui()
+        # The naive branch (no zoneToken, no offsetSign) must call Date.UTC
+        # instead of new Date(year, month, ...) which would be browser-local.
+        idx = html.index("if (!zoneToken && !offsetSign) {")
+        branch = html[idx:idx + 800]
+        assert "Date.UTC(" in branch, (
+            "Naive-timestamp branch in parseTimestamp must use Date.UTC "
+            "so UTC-emitted log lines render in the viewer's local time"
+        )
+        # Make sure the broken form is not present
+        assert "new Date(\n          Number(year)" not in branch
+        assert "new Date(" in branch  # outer Date.UTC wrap is still new Date(...)
+        # Date.UTC must appear at least twice now (offset branch + naive branch)
+        assert html.count("Date.UTC(") >= 2
+
     def test_render_ui_has_pending_timeline_marker_hollow_circle(self):
         html = render_compass_ui()
         assert ".timeline-row.pending .timeline-mark {" in html
@@ -293,3 +318,119 @@ class TestCompassUITemplates:
         html = render_compass_ui()
         assert ".detail-card.spotlight.completed {" in html
         assert ".detail-card.spotlight.failed {" in html
+
+    def test_render_ui_renders_completion_summary_as_markdown(self):
+        """The completion summary should be HTML-rendered via a markdown helper."""
+        html = render_compass_ui()
+        assert "function renderMarkdown(text)" in html
+        assert "function sanitizeMarkdownUrl(url)" in html
+        # Outcome block now uses renderMarkdown, not raw esc
+        assert "renderMarkdown(outcome.text)" in html
+        # CSS class enables markdown styling
+        assert "markdown-content" in html
+
+    def test_render_ui_markdown_supports_bold_italic_and_inline_code(self):
+        html = render_compass_ui()
+        # Bold (must come before italic so ** is not split into two *)
+        assert "\\*\\*([^*\\n]+)\\*\\*" in html
+        assert "<strong>$1</strong>" in html
+        # Italic
+        assert "<em>$2</em>" in html
+        # Inline code extraction happens before HTML escape
+        assert "`([^`\\n]+)`" in html
+        assert "<code>" in html
+
+    def test_render_ui_markdown_supports_headings_lists_and_blockquotes(self):
+        html = render_compass_ui()
+        # Headings # to ######
+        assert "^#\\s+" in html
+        assert "^##\\s+" in html
+        assert "^###\\s+" in html
+        assert "^####\\s+" in html
+        assert "^#####\\s+" in html
+        assert "^######\\s+" in html
+        # Unordered list
+        assert "[-*+]\\s+" in html
+        assert "<ul>" in html
+        assert "<li>" in html
+        # Ordered list
+        assert "\\d+\\.\\s+" in html
+        assert "<ol>" in html
+        # Blockquote
+        assert "&gt;\\s*" in html
+        assert "<blockquote>" in html
+        # Horizontal rule
+        assert "<hr>" in html
+
+    def test_render_ui_markdown_supports_links_and_strikethrough(self):
+        html = render_compass_ui()
+        # Markdown link pattern (escaped brackets in JS regex)
+        assert "\\[([^\\]\\n]+)\\]\\(" in html
+        assert "sanitizeMarkdownUrl(url)" in html
+        # Auto-link bare URLs
+        assert "https?:\\/\\/" in html
+        assert "rel=\"noopener noreferrer\"" in html
+        # Strikethrough
+        assert "~~([^~\\n]+)~~" in html
+        assert "<del>" in html
+
+    def test_render_ui_markdown_handles_fenced_code_blocks(self):
+        html = render_compass_ui()
+        # Fenced code blocks are extracted to placeholders to protect their content
+        assert "```([a-zA-Z0-9_-]*)\\n?([\\s\\S]*?)```" in html
+        # Restored as <pre><code>...</code></pre>
+        assert "<pre><code" in html
+
+    def test_render_ui_markdown_escapes_html_before_applying_patterns(self):
+        """XSS safety: HTML must be escaped before markdown patterns are applied."""
+        html = render_compass_ui()
+        # The escape() call must come BEFORE the inline patterns (bold/italic/etc.)
+        # by appearing earlier in the source than the first <strong> replacement.
+        escape_pos = html.index("html = esc(html);")
+        strong_pos = html.index("<strong>$1</strong>")
+        assert escape_pos != -1, "HTML escape call is missing"
+        assert strong_pos != -1, "Bold replacement is missing"
+        assert escape_pos < strong_pos, (
+            "renderMarkdown must escape HTML before applying markdown patterns"
+        )
+
+    def test_render_ui_markdown_sanitizer_blocks_dangerous_protocols(self):
+        html = render_compass_ui()
+        # The sanitizer whitelists http/https/mailto only
+        assert "proto === 'http:'" in html
+        assert "proto === 'https:'" in html
+        assert "proto === 'mailto:'" in html
+        # Anything else falls back to '#'
+        assert "return '#';" in html
+
+    def test_render_ui_markdown_wraps_remaining_text_in_paragraphs(self):
+        html = render_compass_ui()
+        # Plain text blocks should be wrapped in <p>
+        assert "trimmed.replace(/\\n/g, '<br>')" in html
+        # Block elements are not re-wrapped
+        assert "h[1-6]|ul|ol|blockquote|pre|hr|p" in html
+
+    def test_render_ui_markdown_css_supports_all_rendered_elements(self):
+        """The .markdown-content container must style p, h*, lists, quotes, code, links."""
+        html = render_compass_ui()
+        assert ".markdown-content {" in html
+        assert ".markdown-content > p {" in html
+        assert ".markdown-content h1," in html
+        assert ".markdown-content h2," in html
+        assert ".markdown-content h3," in html
+        assert ".markdown-content h4," in html
+        assert ".markdown-content h5," in html
+        assert ".markdown-content h6 {" in html
+        assert ".markdown-content ul," in html
+        assert ".markdown-content ol {" in html
+        assert ".markdown-content li {" in html
+        assert ".markdown-content blockquote {" in html
+        assert ".markdown-content code {" in html
+        assert ".markdown-content pre {" in html
+        assert ".markdown-content pre code {" in html
+        assert ".markdown-content a {" in html
+        assert ".markdown-content a:hover" in html
+        assert ".markdown-content strong" in html
+        assert ".markdown-content em" in html
+        assert ".markdown-content del" in html
+        assert ".markdown-content hr {" in html

@@ -186,10 +186,25 @@ def _normalize_source_paths(value: object) -> list[str]:
     if not value:
         return []
     if isinstance(value, str):
-        return [value]
-    if isinstance(value, (list, tuple, set)):
-        return [str(item) for item in value if item]
-    return []
+        candidates = [value]
+    elif isinstance(value, (list, tuple, set)):
+        candidates = [str(item) for item in value if item]
+    else:
+        return []
+
+    normalized: list[str] = []
+    for candidate in candidates:
+        sanitized = str(candidate).strip().strip('"\'`').lstrip("([{").rstrip(".,;:!?)]}\"'`")
+        if sanitized and sanitized not in normalized:
+            normalized.append(sanitized)
+    return normalized
+
+
+def _extract_office_paths_from_text(user_text: str) -> list[str]:
+    absolute_paths = re.findall(r'(?:(?<=\s)|^)(/[^\s"\'`]+)', user_text or "")
+    quoted_paths = re.findall(r'["\']([^"\']*[\\/][^"\']+)["\']', user_text or "")
+    paths = [candidate for candidate in absolute_paths + quoted_paths if not candidate.startswith("//")]
+    return _normalize_source_paths(paths)
 
 
 def _normalize_office_capability(value: str, user_text: str = "") -> str:
@@ -221,10 +236,14 @@ def _office_requested_capability(capability: str) -> str:
 
 
 def _extract_office_request(user_text: str, metadata: dict) -> dict:
+    source_paths = _normalize_source_paths(
+        metadata.get("source_paths") or metadata.get("officeTargetPaths") or metadata.get("filePath")
+    )
+    if not source_paths:
+        source_paths = _extract_office_paths_from_text(user_text)
+
     return {
-        "source_paths": _normalize_source_paths(
-            metadata.get("source_paths") or metadata.get("officeTargetPaths") or metadata.get("filePath")
-        ),
+        "source_paths": source_paths,
         "capability": _normalize_office_capability(
             str(metadata.get("capability") or metadata.get("requestedCapability") or ""),
             user_text,
@@ -252,6 +271,48 @@ def _office_callback_url(task_id: str) -> str:
 def _office_delivery_report_path(task_id: str) -> str:
     artifact_root = os.environ.get("ARTIFACT_ROOT", "artifacts/")
     return os.path.join(artifact_root, task_id, "office", "task-report.json")
+
+
+def _office_dispatch_failed(dispatch_data: dict[str, Any]) -> bool:
+    if str(dispatch_data.get("status") or "").strip().lower() in {
+        "error",
+        "failed",
+        "no-capability",
+        "unknown",
+    }:
+        return True
+    # Belt-and-suspenders: if the LLM wrote an error explanation instead of
+    # real output, the office agent may still report status="completed" because
+    # the agentic runtime only checks that *some* response was produced.  Treat
+    # such summaries as failures so the orchestrator surfaces them honestly.
+    summary = str(
+        dispatch_data.get("summary")
+        or dispatch_data.get("message")
+        or ""
+    ).strip()
+    return _summary_indicates_office_failure(summary)
+
+
+_OFFICE_FAILURE_PATTERNS = (
+    "cannot be found or accessed",
+    "does not exist or is not a valid",
+    "error encountered",
+    "i cannot inspect or analyze",
+    "i cannot access",
+    "no such file or directory",
+    "required action",
+    "source file is not accessible",
+    "the path does not exist",
+)
+
+
+def _summary_indicates_office_failure(summary: str) -> bool:
+    if not summary:
+        return False
+    lowered = summary.lower()
+    if lowered.startswith("analysis complete") or lowered.startswith("summarized"):
+        return False
+    return any(needle in lowered for needle in _OFFICE_FAILURE_PATTERNS)
 
 
 def _dispatch_office_request(task_id: str, user_text: str, office_request: dict, registry, log) -> dict:
@@ -331,9 +392,49 @@ def _dispatch_office_request(task_id: str, user_text: str, office_request: dict,
         if os.path.exists(report_path):
             dispatch_data["deliveryVerified"] = True
             dispatch_data["deliveryReportPath"] = report_path
-            log.info("office delivery verified", task_report=report_path)
+            report_success = True
+            try:
+                with open(report_path, encoding="utf-8") as fh:
+                    report_data = json.load(fh)
+                report_success = bool((report_data.get("data") or {}).get("success", True))
+            except Exception as exc:
+                report_success = False
+                dispatch_data["message"] = dispatch_data.get("message") or (
+                    "Office task reported completion but task-report.json could not be read."
+                )
+                log.warn("office delivery report unreadable", task_report=report_path, error=str(exc))
+
+            if report_success:
+                log.info("office delivery verified", task_report=report_path)
+            else:
+                dispatch_data["status"] = "failed"
+                if not dispatch_data.get("summary"):
+                    summary = str((report_data.get("data") or {}).get("summary") or "").strip() if 'report_data' in locals() else ""
+                    if summary:
+                        dispatch_data["summary"] = summary
+                log.warn("office delivery report indicated failure", task_report=report_path)
         else:
             log.warn("office delivery report missing", task_report=report_path)
+            summary = str(dispatch_data.get("summary") or dispatch_data.get("message") or "").strip()
+            dispatch_data["status"] = "failed"
+            failure_reason = "Office task reported completion but did not write task-report.json."
+            dispatch_data["message"] = (
+                f"{summary}\n\n{failure_reason}" if summary else failure_reason
+            )
+
+    # Final guard: if the LLM produced an error explanation instead of real
+    # output, downgrade status even if the office agent claimed success.
+    if (
+        str(dispatch_data.get("status") or "").strip().lower() == "completed"
+        and _summary_indicates_office_failure(
+            str(dispatch_data.get("summary") or dispatch_data.get("message") or "")
+        )
+    ):
+        dispatch_data["status"] = "failed"
+        log.warn(
+            "office summary indicated failure despite completed status",
+            summary_preview=str(dispatch_data.get("summary") or "")[:200],
+        )
 
     log.info("office dispatch complete", status=dispatch_data.get("status", "unknown"))
     return dispatch_data
@@ -598,6 +699,7 @@ class CompassAgent(BaseAgent):
 
         # --- Dispatch ---
         dispatch_data = {}
+        office_request: dict[str, Any] = {}
         if task_type == "development":
             jira_key = _extract_jira_key(user_text)
             log.info("dispatching development task asynchronously", jira_key=jira_key)
@@ -675,10 +777,18 @@ class CompassAgent(BaseAgent):
 
             dispatch_data = _dispatch_office_request(task.id, user_text, office_request, registry, log)
             response_text = dispatch_data.get("message") or f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
+            office_failed = _office_dispatch_failed(dispatch_data)
+            office_status = str(dispatch_data.get("status") or "").strip().lower()
             _record_major_step(
                 task_store,
                 task.id,
-                text="Office task completed" if str(dispatch_data.get("status") or "").strip().lower() == "completed" else "Office task returned a terminal result",
+                text=(
+                    "Office task failed"
+                    if office_failed else
+                    "Office task completed"
+                    if office_status == "completed" else
+                    "Office task returned a terminal result"
+                ),
                 agent="office",
             )
 
@@ -699,7 +809,7 @@ class CompassAgent(BaseAgent):
         response_tone = "normal"
         if task_type == "office":
             office_status = str(dispatch_data.get("status") or "").strip().lower()
-            if office_status in {"error", "failed", "no-capability", "unknown"}:
+            if _office_dispatch_failed(dispatch_data):
                 response_tone = "failed"
             elif office_status in {"completed", "success"}:
                 response_tone = "completed"
@@ -723,19 +833,29 @@ class CompassAgent(BaseAgent):
             parts=[{"text": response_text}],
             metadata=office_artifact_metadata,
         )]
-        task_store.complete_task(task.id, artifacts=artifacts)
+        if task_type == "office" and _office_dispatch_failed(dispatch_data):
+            task_store.set_artifacts(task.id, artifacts)
+            task_store.fail_task(task.id, response_text)
+        else:
+            task_store.complete_task(task.id, artifacts=artifacts)
 
         # Build UI-friendly response with ui_update for frontend rendering
         display_status = dispatch_data.get("status", "unknown") if task_type == "development" else (
             dispatch_data.get("status", "unknown") if task_type == "office" else "completed"
         )
+        # Use office_failed to determine UI style since it correctly captures all failure
+        # states including "no-capability", "error", "failed", and "unknown"
+        ui_style = "failed" if (task_type == "office" and office_failed) else (
+            "failed" if display_status in ("error", "failed", "unknown") else "normal"
+        )
+        current_task = task_store.get_task(task.id)
         ui_update = {
             "task_id": task.id,
-            "task_status": task.status.state.value,
+            "task_status": current_task.status.state.value if current_task else task.status.state.value,
             "chat_message": {
                 "role": "COMPASS",
                 "text": response_text,
-                "style": "failed" if display_status in ("error", "failed", "unknown") else "normal",
+                "style": ui_style,
             }
         }
         return {**task_store.get_task_dict(task.id), "ui_update": ui_update}
@@ -819,6 +939,8 @@ class CompassAgent(BaseAgent):
         user_text = str(metadata.get("user_request") or "")
         dispatch_data = _dispatch_office_request(task_id, user_text, office_request, registry, log)
         response_text = dispatch_data.get("message") or f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
+        office_failed = _office_dispatch_failed(dispatch_data)
+        office_status = str(dispatch_data.get("status") or "").strip().lower()
 
         office_artifact_metadata = {"agentId": self.definition.agent_id}
         for key in ("summary", "message", "deliveryReportPath", "workspacePath", "status"):
@@ -834,11 +956,21 @@ class CompassAgent(BaseAgent):
             parts=[{"text": response_text}],
             metadata=office_artifact_metadata,
         )]
-        task_store.complete_task(task_id, artifacts=artifacts, message=response_text)
+        if office_failed:
+            task_store.set_artifacts(task_id, artifacts)
+            task_store.fail_task(task_id, response_text)
+        else:
+            task_store.complete_task(task_id, artifacts=artifacts, message=response_text)
         _record_major_step(
             task_store,
             task_id,
-            text="Office task completed" if str(dispatch_data.get("status", "unknown")).strip().lower() == "completed" else "Office task returned a terminal result",
+            text=(
+                "Office task failed"
+                if office_failed else
+                "Office task completed"
+                if office_status == "completed" else
+                "Office task returned a terminal result"
+            ),
             agent="office",
         )
         _append_chat_entry(
@@ -846,17 +978,20 @@ class CompassAgent(BaseAgent):
             task_id,
             role="COMPASS",
             text=response_text,
-            tone="failed" if str(dispatch_data.get("status", "unknown")).strip().lower() in {"error", "failed", "unknown", "no-capability"} else "completed",
+            tone="failed" if office_failed else "completed",
         )
 
         display_status = dispatch_data.get("status", "unknown")
+        # Use office_failed to determine UI style since it correctly captures all failure
+        # states including "no-capability", "error", "failed", and "unknown"
+        ui_style = "failed" if office_failed else "normal"
         ui_update = {
             "task_id": task_id,
             "task_status": task_store.get_task(task_id).status.state.value if task_store.get_task(task_id) else "TASK_STATE_COMPLETED",
             "chat_message": {
                 "role": "COMPASS",
                 "text": response_text,
-                "style": "failed" if display_status in ("error", "failed", "unknown") else "normal",
+                "style": ui_style,
             },
         }
         return {**task_store.get_task_dict(task_id), "ui_update": ui_update}

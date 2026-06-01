@@ -286,8 +286,17 @@ def analyze_request(state: dict) -> dict:
     output_mode = state.get("output_mode", "workspace")
     capability = state.get("capability", "summarize")
 
+    workspace_root = _get_workspace_root(state)
+    os.makedirs(workspace_root, exist_ok=True)
+    artifacts_dir = os.path.join(workspace_root, "artifacts")
+    os.makedirs(artifacts_dir, exist_ok=True)
+
     if not source_paths:
-        return {"error": "No source paths found in task. Please provide file or folder paths."}
+        return {
+            "error": "No source paths found in task. Please provide file or folder paths.",
+            "workspace_root": workspace_root,
+            "artifacts_dir": artifacts_dir,
+        }
 
     validated_paths = []
     for p in source_paths:
@@ -302,7 +311,11 @@ def analyze_request(state: dict) -> dict:
         validated_paths = _expand_summarize_sources(validated_paths)
 
     if not validated_paths and capability not in ("summarize", "organize"):
-        return {"error": "No valid paths found under OFFICE_SOURCE_ROOT."}
+        return {
+            "error": "No valid paths found under OFFICE_SOURCE_ROOT.",
+            "workspace_root": workspace_root,
+            "artifacts_dir": artifacts_dir,
+        }
 
     # Directory resource pre-check for organize capability
     if capability == "organize" and validated_paths:
@@ -312,11 +325,6 @@ def analyze_request(state: dict) -> dict:
             limit_error = _check_directory_limits(first_path)
             if limit_error:
                 return limit_error
-
-    workspace_root = _get_workspace_root(state)
-    os.makedirs(workspace_root, exist_ok=True)
-    artifacts_dir = os.path.join(workspace_root, "artifacts")
-    os.makedirs(artifacts_dir, exist_ok=True)
 
     # Check inplace permission
     if output_mode == "inplace":
@@ -428,18 +436,30 @@ def _expected_output_paths(
     output_mode: str,
     artifacts_dir: str,
 ) -> list[str]:
-    """Return the required delivery files for the current office task."""
+    """Return the required delivery files for the current office task.
+
+    A previous version of this helper only registered expected outputs for
+    file paths and silently skipped directories.  That meant directory-shaped
+    inputs (e.g. ``analyze`` against a folder of CSVs) caused delivery
+    verification to pass vacuously with zero checks, which let a failed LLM
+    run report ``status="completed"`` despite never writing any output.  We
+    now register one expected output per source — file or directory — and for
+    ``summarize`` we still require the combined report only when there are
+    multiple distinct file sources.
+    """
     expected: list[str] = []
     if capability == "analyze":
         for path in validated_paths:
-            if os.path.isfile(path):
+            if os.path.isfile(path) or os.path.isdir(path):
                 expected.append(_target_output_path(output_mode, path, artifacts_dir, ".analysis.md"))
     elif capability == "summarize":
+        file_count = 0
         for path in validated_paths:
             if os.path.isfile(path):
                 expected.append(_target_output_path(output_mode, path, artifacts_dir, ".summary.md"))
-        if len([path for path in validated_paths if os.path.isfile(path)]) > 1:
-            base_path = validated_paths[0]
+                file_count += 1
+        if file_count > 1 and validated_paths:
+            base_path = next((p for p in validated_paths if os.path.isfile(p)), validated_paths[0])
             expected.append(_target_output_file(output_mode, base_path, artifacts_dir, "combined-summary.md"))
     elif capability == "organize" and validated_paths:
         expected.append(_target_output_file(output_mode, validated_paths[0], artifacts_dir, "organization-plan.md"))
@@ -834,6 +854,20 @@ def execute_office_work(state: dict) -> dict:
     runtime = state.get("_runtime")
     if not runtime:
         return {"error": "No runtime configured"}
+
+    prior_error = str(state.get("error") or "").strip()
+    if prior_error:
+        logger.error(f"execute_office_work: skipped due to prior validation error — {prior_error}")
+        _task_log(state, "error", "office execution skipped", error=prior_error)
+        return {
+            "summary": prior_error,
+            "success": False,
+            "capability": state.get("capability", "summarize"),
+            "status": "failed",
+            "raw_output": "",
+            "warnings": [prior_error],
+            "error": prior_error,
+        }
 
     capability = state.get("capability", "summarize")
     validated_paths = state.get("validated_paths", [])
