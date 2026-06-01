@@ -8,6 +8,23 @@ The ``ARTIFACT_ROOT`` is resolved from the ``ARTIFACT_ROOT`` environment
 variable (default ``artifacts/``).  When running inside a container the
 host path must be mounted to the same ``ARTIFACT_ROOT`` value.
 
+Log format (plain text, human-readable, UTC ISO with offset):
+
+    2026-06-01T12:34:56+00:00 [INFO ] [team-lead] Starting implementation step=gather_context
+    2026-06-01T12:34:57+00:00 [DEBUG] [team-lead] LLM response received tokens=512
+    2026-06-01T12:34:58+00:00 [WARN ] [jira] Ticket not found key=PROJ-99
+    2026-06-01T12:34:59+00:00 [ERROR] [web-agent] Build failed exit_code=1
+
+All timestamps are emitted in UTC with an explicit ``+00:00`` offset so
+that the Compass UI ``parseTimestamp`` function (in
+``agents/compass/ui/templates.py``) can convert them to the viewer's
+local timezone without ambiguity. The legacy naive ``YYYY-MM-DD
+HH:MM:SS`` format is still accepted by the log aggregator for backward
+compatibility with existing log files, but new lines MUST use the UTC
+ISO form.
+
+Log levels (default DEBUG):
+
 Log format (plain text, human-readable):
 
     2026-05-16 14:30:00 [INFO ] [team-lead] Starting implementation step=gather_context
@@ -46,6 +63,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -71,8 +89,27 @@ _DEFAULT_LEVEL = DEBUG
 # ---------------------------------------------------------------------------
 
 def _ts() -> str:
-    """Return a human-readable local timestamp: ``2026-05-16 14:30:00``."""
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    """Return the local-time ISO-8601 timestamp with explicit offset.
+
+    Example: ``2026-06-01T08:34:56-07:00`` (container TZ = America/Los_Angeles).
+
+    The container's ``TZ`` environment variable determines the wall-clock
+    zone; agents MUST set ``TZ`` in their container definitions
+    (``docker-compose-v2.yml``) so the produced offset is meaningful. The
+    emitted offset is what makes the Compass UI ``parseTimestamp`` able
+    to convert the timestamp to the viewer's local clock without
+    ambiguity: the browser knows the exact instant the line was
+    written, then renders it in whatever timezone the viewer is in.
+
+    The colon in the offset is mandatory: the JS ``parseTimestamp``
+    regex requires ``[+-]HH:MM`` (not ``[+-]HHMM``), which is the form
+    ``datetime.isoformat(timespec="seconds")`` produces.
+    """
+    # ``astimezone()`` with no argument converts a naive ``now()`` to an
+    # aware datetime in the process's local zone (driven by the ``TZ``
+    # environment variable on POSIX, the host clock on Windows). The
+    # resulting ``isoformat(timespec="seconds")`` carries the offset.
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _artifact_root() -> str:

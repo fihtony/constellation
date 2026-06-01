@@ -18,6 +18,7 @@ from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent
 from framework.config import build_agent_definition_from_config
 from framework.workflow import Workflow, START, END
 from framework.a2a.protocol import Artifact
+from framework.devlog import _ts
 
 from agents.office.nodes import (
     receive_task,
@@ -48,7 +49,7 @@ def _append_office_log(task_id: str, message: str, level: str = "INFO ", **kwarg
                 parts.append(f"{key}={rendered!r}")
             extra = " " + " ".join(parts)
         with open(log_path, "a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level}] [office] {message}{extra}\n")
+            fh.write(f"{_ts()} [{level}] [office] {message}{extra}\n")
     except OSError:
         return
 

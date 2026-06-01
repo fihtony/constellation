@@ -21,7 +21,7 @@ COPY agents/scm/config.yaml /app/agents/scm/config.yaml
 COPY agents/ui_design/config.yaml /app/agents/ui_design/config.yaml
 COPY agents/web_dev/config.yaml /app/agents/web_dev/config.yaml
 COPY agents/code_review/config.yaml /app/agents/code_review/config.yaml
-COPY agents/log-store/config.yaml /app/agents/log-store/config.yaml
+COPY agents/log_store/config.yaml /app/agents/log_store/config.yaml
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app

@@ -6,8 +6,15 @@ import re
 from typing import Any
 
 
+# Accepts both the legacy naive "YYYY-MM-DD HH:MM:SS" form (kept for
+# backward compatibility with pre-existing log files) and the new
+# UTC ISO form "YYYY-MM-DDTHH:MM:SS+00:00" (or any other numeric
+# offset) emitted by framework.devlog._ts() since the contract was
+# tightened. Either way the timestamp is anchored to a real
+# timezone-aware instant that the Compass UI's parseTimestamp can
+# convert to the viewer's local clock without ambiguity.
 LOG_LINE_PATTERN = re.compile(
-    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) "
+    r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+\-]\d{2}:?\d{2})?) "
     r"\[(\w+)\s*\] "
     r"\[([\w-]+)\] "
     r"(.+)$"

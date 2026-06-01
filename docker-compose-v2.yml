@@ -12,6 +12,7 @@ services:
       context: .
       dockerfile: registry/Dockerfile
     environment:
+      TZ: "${TZ:-UTC}"
       REGISTRY_HOST: "0.0.0.0"
       REGISTRY_PORT: "9000"
     ports:
@@ -35,6 +36,7 @@ services:
       registry:
         condition: service_healthy
     environment:
+      TZ: "${TZ:-UTC}"
       REGISTRY_URL: "http://registry:9000"
     restart: "no"
     networks:
@@ -62,6 +64,7 @@ services:
       ui-design:
         condition: service_healthy
     environment:
+      TZ: "${TZ:-UTC}"
       AGENT_ID: "compass"
       HOST: "0.0.0.0"
       PORT: "8000"
@@ -105,6 +108,7 @@ services:
       init-register:
         condition: service_completed_successfully
     environment:
+      TZ: "${TZ:-UTC}"
       AGENT_ID: "team-lead"
       HOST: "0.0.0.0"
       PORT: "8030"
@@ -148,6 +152,7 @@ services:
       init-register:
         condition: service_completed_successfully
     environment:
+      TZ: "${TZ:-UTC}"
       AGENT_ID: "jira"
       HOST: "0.0.0.0"
       PORT: "8010"
@@ -185,6 +190,7 @@ services:
       init-register:
         condition: service_completed_successfully
     environment:
+      TZ: "${TZ:-UTC}"
       AGENT_ID: "scm"
       HOST: "0.0.0.0"
       PORT: "8020"
@@ -222,6 +228,7 @@ services:
       init-register:
         condition: service_completed_successfully
     environment:
+      TZ: "${TZ:-UTC}"
       AGENT_ID: "ui-design"
       HOST: "0.0.0.0"
       PORT: "8040"
@@ -261,6 +268,7 @@ services:
       init-register:
         condition: service_completed_successfully
     environment:
+      TZ: "${TZ:-UTC}"
       AGENT_ID: "office"
       HOST: "0.0.0.0"
       PORT: "8060"

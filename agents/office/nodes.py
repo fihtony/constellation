@@ -26,6 +26,7 @@ from agents.office.office_tools import (
     _safe_path_segment,
     collect_organize_file_inventory,
 )
+from framework.devlog import _ts
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,7 @@ def _write_fallback_task_log(state: dict, level: str, message: str, **kwargs: An
                 parts.append(f"{key}={rendered!r}")
             extra = " " + " ".join(parts)
         with open(log_path, "a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level}] [{AGENT_ID}] {message}{extra}\n")
+            fh.write(f"{_ts()} [{level}] [{AGENT_ID}] {message}{extra}\n")
     except OSError:
         return
 
