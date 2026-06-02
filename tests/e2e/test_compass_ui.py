@@ -159,8 +159,21 @@ class TestCompassUILive:
         assert completed_task["statusKind"] == "completed"
         assert completed_task["completed_at"]
         assert completed_task["elapsed_ms"] >= 0
-        assert completed_task["chatHistory"][-2]["role"] == "USER"
+        # The final two chat entries are:
+        #   [-1]  COMPASS — final completion summary (set by the
+        #         background worker once office returns).
+        #   [-2]  COMPASS — intermediate "Office task accepted with output
+        #         mode: workspace" message that the new fire-and-forget
+        #         resume path emits the moment the resume POST returns,
+        #         so the user sees the dispatch acknowledged before
+        #         office actually finishes.  The user's "workspace" reply
+        #         is at [-3] (or earlier).
         assert completed_task["chatHistory"][-1]["role"] == "COMPASS"
+        assert completed_task["chatHistory"][-2]["role"] == "COMPASS"
+        # Find the most recent USER message and verify it is "workspace".
+        user_msgs = [e for e in completed_task["chatHistory"] if e["role"] == "USER"]
+        assert user_msgs, "expected at least one USER message in chatHistory"
+        assert user_msgs[-1]["text"].strip().lower() == "workspace"
 
         logs_payload = _http_get_json(f"{COMPASS_BASE_URL}/logs/{compass_task_id}")
         assert logs_payload["logs"], "expected merged logs for the completed task"
@@ -656,3 +669,313 @@ class TestCompassUIResumeBehavior:
             )
         except Exception:
             pass  # best-effort cleanup
+
+
+class TestCompassResumeConcurrency:
+    """Concurrency & latency contract for the resume path.
+
+    The previous implementation of ``resume_task`` synchronously waited for
+    the office dispatch to finish (up to 60 minutes via ``dispatch_sync``
+    timeout=3600).  That blocked the HTTP request, the browser, and any
+    other in-flight resume — and the user perceived the chat as "stuck in
+    Waiting for Input" for the full duration.
+
+    After the fix, ``resume_task`` returns immediately with WORKING and
+    the actual office work happens in a daemon thread.  The new contract
+    verified here:
+
+    1. ``POST /tasks/{id}/resume`` returns in well under 5 seconds.
+    2. The returned task state is ``TASK_STATE_WORKING`` (not terminal).
+    3. Multiple waiting tasks can be resumed in quick succession; each
+       resume is correctly routed to its own task_id and they all
+       progress in parallel.
+    4. The UI short-poll helper ``pollTaskUntilTerminal`` is exposed in
+       the inline JS so the chat pane updates as soon as the office
+       worker finalizes the task.
+    """
+
+    def test_office_resume_returns_in_under_five_seconds(self) -> None:
+        """POST /resume for an office task must NOT block on the office
+        roundtrip.  It should return in well under 5s with WORKING; the
+        actual completion arrives later via the background worker /
+        callback / short-poll.  This is the regression guard for the
+        5+ minute "stuck in waiting for input" bug.
+        """
+        # Set up a waiting summarize task.
+        create_resp = _http_post(
+            f"{COMPASS_BASE_URL}/message:send",
+            {
+                "message": {
+                    "messageId": "compass-resume-latency",
+                    "role": "ROLE_USER",
+                    "parts": [
+                        {"text": (
+                            f"Please summarize the documents in "
+                            f"{TOOLS_DATA_STLOUIS} folder"
+                        )}
+                    ],
+                    "metadata": {
+                        "capability": "summarize",
+                        "source_paths": [str(TOOLS_DATA_STLOUIS)],
+                    },
+                },
+                "configuration": {"returnImmediately": True},
+            },
+            timeout=60,
+        )
+        task_id = _task_id(create_resp)
+        assert task_id
+        # Spin until we see INPUT_REQUIRED (or skip if the classifier
+        # mis-routes this run).
+        if _task_state(create_resp) != "TASK_STATE_INPUT_REQUIRED":
+            reached_waiting = False
+            for _ in range(30):
+                time.sleep(1)
+                snap = _http_get_json(f"{COMPASS_BASE_URL}/tasks/{task_id}")
+                if _task_state(snap) == "TASK_STATE_INPUT_REQUIRED":
+                    reached_waiting = True
+                    break
+            if not reached_waiting:
+                pytest.skip("Could not place task into INPUT_REQUIRED")
+
+        # The actual latency assertion.
+        start = time.time()
+        resume_resp = _http_post(
+            f"{COMPASS_BASE_URL}/tasks/{task_id}/resume",
+            {"input": "workspace"},
+            timeout=15,  # generous: should complete in < 2s
+        )
+        elapsed = time.time() - start
+        assert elapsed < 5.0, (
+            f"resume POST blocked for {elapsed:.2f}s; "
+            f"expected fire-and-forget return in < 5s"
+        )
+        # Returned state should be WORKING (the office worker is still
+        # running in the background).  It must NOT be terminal.
+        state = _task_state(resume_resp)
+        assert state in {"TASK_STATE_WORKING", "TASK_STATE_SUBMITTED"}, (
+            f"resume returned terminal state {state!r}; expected WORKING. "
+            f"compass is supposed to dispatch in the background."
+        )
+
+    def test_two_concurrent_resumes_route_to_distinct_tasks(self) -> None:
+        """Two office tasks waiting concurrently must each be resumed
+        against its own task_id; the responses must not cross-talk.  This
+        protects against a regression where compass accidentally wires
+        both resumes to the same office container / state slot.
+        """
+        # Create task A.
+        resp_a = _http_post(
+            f"{COMPASS_BASE_URL}/message:send",
+            {
+                "message": {
+                    "messageId": "compass-concurrent-a",
+                    "role": "ROLE_USER",
+                    "parts": [
+                        {"text": f"Please summarize the documents in {TOOLS_DATA_STLOUIS} folder"}
+                    ],
+                    "metadata": {
+                        "capability": "summarize",
+                        "source_paths": [str(TOOLS_DATA_STLOUIS)],
+                    },
+                },
+                "configuration": {"returnImmediately": True},
+            },
+            timeout=60,
+        )
+        tid_a = _task_id(resp_a)
+        # Create task B with a different capability so they're easy to tell apart.
+        resp_b = _http_post(
+            f"{COMPASS_BASE_URL}/message:send",
+            {
+                "message": {
+                    "messageId": "compass-concurrent-b",
+                    "role": "ROLE_USER",
+                    "parts": [
+                        {"text": f"Please analyze the data in {TOOLS_DATA_CSV}"}
+                    ],
+                    "metadata": {
+                        "capability": "analyze",
+                        "source_paths": [str(TOOLS_DATA_CSV)],
+                    },
+                },
+                "configuration": {"returnImmediately": True},
+            },
+            timeout=60,
+        )
+        tid_b = _task_id(resp_b)
+        assert tid_a and tid_b and tid_a != tid_b, (
+            f"distinct task_ids expected, got A={tid_a!r} B={tid_b!r}"
+        )
+
+        # Wait for both to be in INPUT_REQUIRED.
+        for tid in (tid_a, tid_b):
+            for _ in range(30):
+                snap = _http_get_json(f"{COMPASS_BASE_URL}/tasks/{tid}")
+                if _task_state(snap) == "TASK_STATE_INPUT_REQUIRED":
+                    break
+                time.sleep(1)
+            else:
+                pytest.skip(f"Task {tid} did not reach INPUT_REQUIRED")
+
+        # Resume both as close together as possible.
+        resp_a_resumed = _http_post(
+            f"{COMPASS_BASE_URL}/tasks/{tid_a}/resume",
+            {"input": "workspace"},
+            timeout=15,
+        )
+        resp_b_resumed = _http_post(
+            f"{COMPASS_BASE_URL}/tasks/{tid_b}/resume",
+            {"input": "workspace"},
+            timeout=15,
+        )
+        # Each resume response must reference its own task id, not the
+        # other one.  The ui_update field is the cleanest carrier.
+        for label, resp, expected in (
+            ("A", resp_a_resumed, tid_a),
+            ("B", resp_b_resumed, tid_b),
+        ):
+            ui = resp.get("ui_update") or {}
+            assert ui.get("task_id") == expected, (
+                f"Task {label} resume returned ui_update.task_id="
+                f"{ui.get('task_id')!r}, expected {expected!r} — "
+                f"the resume handler is leaking state across tasks."
+            )
+            returned_id = _task_id(resp)
+            assert returned_id == expected, (
+                f"Task {label} resume returned task.id={returned_id!r}, "
+                f"expected {expected!r}"
+            )
+
+    def test_ui_exposes_short_poll_helper(self) -> None:
+        """The UI must embed a fast-poll helper that fires after Send so
+        the chat pane flips to Completed/Failed as soon as the office
+        worker finalizes the state — instead of waiting on the 5s SSE
+        fallback.
+        """
+        body = _http_get_text(f"{COMPASS_BASE_URL}/ui")
+        assert "pollTaskUntilTerminal" in body, (
+            "UI is missing pollTaskUntilTerminal helper — the chat pane "
+            "will stay on 'In Progress' until the 5s SSE fallback ticks."
+        )
+        # Helper must actually short-poll, not just exist.
+        assert "loadTaskDetail" in body
+        assert "setTimeout" in body
+        # The resume branch must wire the poll after the resume POST.
+        # Look for the specific call site marker so the test is
+        # resilient to minor refactors of the sendComposer body.
+        assert "pollTaskUntilTerminal(targetTaskId)" in body, (
+            "sendComposer resume branch does not invoke "
+            "pollTaskUntilTerminal(targetTaskId) — UI won't auto-update."
+        )
+
+    def test_resume_branch_does_not_optimistically_push_user_bubble(self) -> None:
+        """Regression guard for the "workspace shows twice in the chat"
+        bug.  The sendComposer resume branch used to push a USER bubble
+        optimistically AND run a ts-based de-dup check that always
+        failed (client and server timestamps are produced
+        independently), so the user's reply rendered twice for one
+        render tick.  The server already records the resume value as a
+        USER entry in chat_history via ``_append_chat_entry``, so the
+        optimistic push is redundant.  This test enforces that:
+          1. The inline JS no longer contains a "history.push(userMsg)"
+             pattern in the resume branch (the previous optimistic push).
+          2. The server side DOES add a USER entry for the resume value.
+        """
+        body = _http_get_text(f"{COMPASS_BASE_URL}/ui")
+
+        # Locate the resume branch by looking for the resume-mode marker.
+        # We anchor on "else if (mode === 'resume'" so a refactor of the
+        # surrounding code does not break this guard.
+        marker = "else if (mode === 'resume'"
+        assert marker in body, (
+            "sendComposer resume branch marker not found in UI — has the "
+            "UI been refactored? Update this guard's marker accordingly."
+        )
+        branch_start = body.index(marker)
+        # Slice the resume branch generously (the resume branch is ~80
+        # lines in the current implementation).
+        resume_branch = body[branch_start: branch_start + 8000]
+
+        # The optimistic USER-message push has been removed.  The
+        # previous code did ``history.push(userMsg)`` against a local
+        # ``history`` array inside the resume branch.  That pattern
+        # must not reappear — its only job was to produce a duplicate
+        # render, because the server already adds the same entry.
+        forbidden_patterns = (
+            "history.push(userMsg)",  # the old optimistic USER push
+            "savedUserMsg",            # the now-removed re-push scaffolding
+        )
+        for pattern in forbidden_patterns:
+            assert pattern not in resume_branch, (
+                f"sendComposer resume branch still contains {pattern!r} — "
+                f"this is the old optimistic-push / re-push scaffolding that "
+                f"caused 'workspace' to render twice in the chat. The fix "
+                f"is to let loadTasks() pull the server's USER entry."
+            )
+
+        # And the server side MUST add the USER entry.  Walk a real
+        # resume through and assert exactly one USER "workspace" entry
+        # in the server's chat history — no more, no less.
+        create_resp = _http_post(
+            f"{COMPASS_BASE_URL}/message:send",
+            {
+                "message": {
+                    "messageId": "compass-no-dup-bubble",
+                    "role": "ROLE_USER",
+                    "parts": [
+                        {
+                            "text": (
+                                "Please analyze the authorized "
+                                "spreadsheet and write the result to "
+                                "the task workspace."
+                            )
+                        }
+                    ],
+                    "metadata": {
+                        "capability": "analyze",
+                        "source_paths": [str(TOOLS_DATA_CSV)],
+                    },
+                },
+                "configuration": {"returnImmediately": True},
+            },
+            timeout=60,
+        )
+        tid = _task_id(create_resp)
+        assert tid
+        assert _task_state(create_resp) == "TASK_STATE_INPUT_REQUIRED"
+
+        _http_post(
+            f"{COMPASS_BASE_URL}/tasks/{tid}/resume",
+            {"input": "workspace"},
+            timeout=15,
+        )
+
+        # Give the background dispatch a moment to register the resume
+        # value server-side (the response is fire-and-forget but the
+        # chat_history write happens synchronously inside resume_task).
+        final_task = _poll_task(tid)
+        assert _task_state(final_task) in {
+            "TASK_STATE_COMPLETED",
+            "TASK_STATE_FAILED",
+            "TASK_STATE_WORKING",
+        }, final_task
+
+        detail = _http_get_json(f"{COMPASS_BASE_URL}/api/tasks/{tid}")
+        completed = detail.get("task", detail)
+        history = completed.get("chatHistory") or []
+
+        # The server's chat history must contain exactly one USER
+        # "workspace" entry — not zero (server dropped it) and not
+        # two (server doubled it).  This is the single source of truth
+        # the client now trusts instead of layering an optimistic push
+        # on top of it.
+        workspace_user_msgs = [
+            e for e in history
+            if e.get("role") == "USER"
+            and (e.get("text") or "").strip().lower() == "workspace"
+        ]
+        assert len(workspace_user_msgs) == 1, (
+            f"expected exactly 1 USER 'workspace' entry in chatHistory, "
+            f"got {len(workspace_user_msgs)}. Full history: {history!r}"
+        )

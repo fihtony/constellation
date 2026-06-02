@@ -288,9 +288,20 @@ class OfficeAgent(BaseAgent):
                         },
                     )
                 ]
-                if result.get("success", False):
+                if result.get("success", False) and not _result_summary_indicates_failure(result):
                     task_store.complete_task(canonical_task_id, artifacts=artifacts)
                 else:
+                    if result.get("success", False):
+                        # LLM claimed success but its summary still describes a real
+                        # failure (e.g. "the file could not be found").  Treat it as
+                        # a failure so the orchestrator surfaces the error.
+                        logger.warning(
+                            "office agent result claimed success but summary indicates failure: %s",
+                            str(result.get("summary", ""))[:200],
+                        )
+                        result = dict(result)
+                        result["success"] = False
+                        result.setdefault("status", "failed")
                     task_store.fail_task(canonical_task_id, result.get("summary", "Office task failed."))
                     return
 
@@ -311,6 +322,40 @@ class OfficeAgent(BaseAgent):
     async def get_task(self, task_id: str) -> dict:
         """Return real task state from TaskStore."""
         return self.services.task_store.get_task_dict(task_id)
+
+
+_OFFICE_FAILURE_PATTERNS = (
+    "cannot be found or accessed",
+    "could not be found",
+    "does not exist or is not a valid",
+    "error encountered",
+    "i cannot inspect or analyze",
+    "i cannot access",
+    "no such file or directory",
+    "required action",
+    "source file is not accessible",
+    "the path does not exist",
+    "the file does not exist",
+    "file not found",
+    "the requested source file cannot",
+)
+
+
+def _result_summary_indicates_failure(result: dict) -> bool:
+    """Return True when the LLM's summary text describes a real failure
+    even though the agentic runtime marked the run as ``success: True``.
+
+    The agentic runtime only checks that *some* response was produced.  The
+    LLM can therefore happily return "the file could not be found" while the
+    runtime still wraps that text in ``success: True``.  We must downgrade
+    those runs so the orchestrator (and downstream consumers like Compass)
+    sees an honest ``failed`` status.
+    """
+    summary = str(result.get("summary") or result.get("message") or "").strip()
+    if not summary:
+        return False
+    lowered = summary.lower()
+    return any(needle in lowered for needle in _OFFICE_FAILURE_PATTERNS)
 
 
 def _send_callback(callback_url: str, task_id: str, result: dict) -> None:

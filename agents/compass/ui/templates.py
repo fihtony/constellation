@@ -2196,6 +2196,11 @@ _INLINE_JS = r"""
       root.innerHTML = renderTaskInfoEmpty('Task not loaded', 'The selected task is unavailable right now. Try again after the next refresh.');
       return;
     }
+    // Optimistic placeholders are pre-snapshot stand-ins for a task that has
+    // not been observed on the server yet.  Never surface their internal
+    // ``__optimistic_*`` id — show a friendly pending label instead so the
+    // detail panel does not look like the user is looking at a real task.
+    const isOptimisticPlaceholder = t.optimistic === true;
     const kind = statusKindOf(t.statusState || t.status);
     const steps = mergedProgressSignals(t);
     const currentStep = t.currentMajorStep || currentStepFromLogs(t) || (steps.length ? steps[steps.length-1].text : '');
@@ -2213,7 +2218,9 @@ _INLINE_JS = r"""
     const detailTitleLabel = originalRequest ? 'Original Request' : 'Task';
     const outcome = summarizeTaskOutcome(t, kind, currentStep);
     if (taskInfoHeadTaskId) {
-      taskInfoHeadTaskId.textContent = orchestratorTaskId;
+      // Suppress the raw ``__optimistic_*`` id so users never see internal
+      // placeholder state — show "Submitting…" until the real task lands.
+      taskInfoHeadTaskId.textContent = isOptimisticPlaceholder ? 'Submitting…' : orchestratorTaskId;
     }
     if (taskInfoHeadMeta) {
       taskInfoHeadMeta.innerHTML = `<span class="detail-type-pill ${escapeAttr(taskType)}" style="margin-top:0">${esc(typeLabel)}</span>`;
@@ -2395,6 +2402,31 @@ _INLINE_JS = r"""
     }
   }
 
+  // Short-poll a single task until it reaches a terminal state or the
+  // deadline elapses.  Used immediately after a resume POST so the UI flips
+  // from "In Progress" to "Completed" / "Failed" without waiting for the
+  // 5-second SSE fallback.  Maximum total wait is 240s — beyond that the
+  // SSE / fallback polling will pick up the change anyway.
+  async function pollTaskUntilTerminal(tid, opts) {
+    const maxMs = (opts && opts.maxMs) || 240000;
+    const intervalMs = (opts && opts.intervalMs) || 1500;
+    const deadline = Date.now() + maxMs;
+    let ticks = 0;
+    while (Date.now() < deadline) {
+      // loadTaskDetail reuses the existing single-task fetch (no full list
+      // re-render) and writes into the same state.tasks map.
+      await loadTaskDetail(tid);
+      ticks++;
+      const t = state.tasks[tid];
+      const kind = statusKindOf(t && (t.statusState || t.status));
+      if (kind === 'completed' || kind === 'failed') {
+        return { reachedTerminal: true, kind, ticks };
+      }
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+    return { reachedTerminal: false, ticks };
+  }
+
   async function sendComposer() {
     const input = $('#composer-input');
     const text = (input.value || '').trim();
@@ -2404,6 +2436,7 @@ _INLINE_JS = r"""
     input.value = '';
     if (mode === 'create') {
       const optimisticTask = createOptimisticTask(text);
+      const optimisticId = optimisticTask.task_id;
       state.tasks[optimisticTask.task_id] = optimisticTask;
       if (!state.order.includes(optimisticTask.task_id)) state.order.unshift(optimisticTask.task_id);
       state.selectedTaskId = optimisticTask.task_id;
@@ -2426,20 +2459,50 @@ _INLINE_JS = r"""
         const snapData = await snapResp.json();
         replaceTaskCollection(snapData.tasks || []);
       } catch (e) { /* fall through to loadTasks */ }
-      if (newId && state.tasks[newId]) {
+      // Always land on the real task id once we have one — even if the
+      // snapshot is briefly behind.  Falling back to the placeholder leaves
+      // the user staring at ``__optimistic_xxx`` in the detail panel.
+      if (newId) {
+        if (!state.tasks[newId]) await loadTasks(false);
         state.selectedTaskId = newId;
-        subscribeLogs(newId);
+        if (state.tasks[newId]) subscribeLogs(newId);
       } else {
         await loadTasks(false);
+      }
+      // Safety net: if the snapshot wiped out the real task too (e.g. server
+      // hasn't indexed it yet) but the placeholder is still hanging around,
+      // remove it so the UI does not display a stale ``__optimistic_*`` id.
+      if (
+        state.selectedTaskId !== optimisticId
+        && Object.keys(state.tasks).some(id => id.startsWith('__optimistic_'))
+      ) {
+        for (const id of Object.keys(state.tasks)) {
+          if (id.startsWith('__optimistic_')) delete state.tasks[id];
+        }
+        state.order = state.order.filter(id => !id.startsWith('__optimistic_'));
       }
       renderTaskList(); renderChat(); renderDetail();
     } else if (mode === 'resume' && targetTaskId) {
       const targetTask = state.tasks[targetTaskId];
-      const userMsg = { role: 'USER', text, ts: new Date().toISOString(), tone: 'normal' };
       if (targetTask) {
-        const history = Array.isArray(targetTask.chatHistory) ? targetTask.chatHistory.slice() : [];
-        history.push(userMsg);
-        targetTask.chatHistory = history;
+        // Optimistically flip the task-status badge to "In Progress" so the
+        // user sees immediate feedback while the resume POST is in flight.
+        //
+        // We deliberately do NOT push a USER bubble optimistically.  The
+        // server-side ``resume_task`` (compass/agent.py) records the resume
+        // value as a USER entry in the task's ``chat_history`` metadata via
+        // ``_append_chat_entry``, and the ``loadTasks(false)`` call below
+        // pulls that server-authoritative history into the client state.
+        // Pushing a bubble here would render the user's "workspace" (or
+        // similar) reply twice for one render tick: once from the local
+        // optimistic push, and once again when ``loadTasks`` is followed
+        // by a re-push — the previous re-push de-dup used a strict
+        // timestamp-equality check that always failed (client and server
+        // timestamps are produced independently), so the duplicate was
+        // guaranteed to survive until the next ``loadTaskDetail`` tick
+        // cleaned it up.  The resume response is fire-and-forget (returns
+        // in < 1s) so the user-perceived delay of waiting for the server
+        // snapshot to land is negligible.
         targetTask.statusState = 'TASK_STATE_WORKING';
         targetTask.status = 'active';
         renderChat();
@@ -2449,20 +2512,30 @@ _INLINE_JS = r"""
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ input: text }),
       });
-      // Reload task state but preserve any optimistically-added user messages
-      // that the server may not have processed yet
-      const savedUserMsg = userMsg;
+      // ``loadTasks(false)`` is awaited so the server-side ``chat_history``
+      // (which now includes the resume value as a USER entry) is in place
+      // before we re-render.  We do NOT re-push the optimistic message —
+      // the server's record is the authoritative copy and would be a
+      // duplicate if added again.
       await loadTasks(false);
-      const refreshedTask = state.tasks[targetTaskId];
-      if (refreshedTask) {
-        const hist = Array.isArray(refreshedTask.chatHistory) ? refreshedTask.chatHistory : [];
-        if (!hist.some(e => e.role === 'USER' && e.text === savedUserMsg.text && e.ts === savedUserMsg.ts)) {
-          hist.push(savedUserMsg);
-          refreshedTask.chatHistory = hist;
-        }
-      }
       state.selectedTaskId = targetTaskId;
       renderTaskList(); renderChat(); renderDetail();
+      // Fire-and-forget fast-poll: the resume POST returns almost immediately
+      // (compass no longer blocks on the office roundtrip), but the actual
+      // office work still takes seconds-to-minutes to finalize the task
+      // state.  Poll this single task every 1.5s for up to 4 minutes and
+      // re-render the chat / detail pane as soon as it lands.  Without this,
+      // the user sees a stale "In Progress" until the 5s SSE fallback ticks.
+      pollTaskUntilTerminal(targetTaskId).then(async (result) => {
+        if (!result || !result.reachedTerminal) {
+          // Fell off the deadline; SSE / 5s fallback will pick up the change.
+          return;
+        }
+        // Pull the full task list so the task-list badge updates too, not
+        // just the open chat pane.
+        try { await loadTasks(false); } catch (e) { /* fall through */ }
+        renderTaskList(); renderChat(); renderDetail();
+      });
     }
   }
 

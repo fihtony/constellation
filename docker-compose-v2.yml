@@ -92,6 +92,13 @@ services:
       HOST: "0.0.0.0"
       PORT: "8000"
       REGISTRY_URL: "http://registry:9000"
+      # COMPASS_BASE_URL is the callback base that downstream agents
+      # (e.g. office) POST to when their work is done.  It must be
+      # reachable from inside the constellation-v2 docker network so the
+      # per-task office container can reach compass.  In Rancher-managed
+      # deployments override this via env_file or runtime override to use
+      # the externally-routable hostname of the compass service.
+      COMPASS_BASE_URL: "http://compass:8000"
       CONSTELLATION_RUNTIME_ENV_FILE: /app/config/.runtime.env
       ARTIFACT_ROOT: /app/artifacts
       DYNAMIC_AGENT_NETWORK: constellation-v2-network

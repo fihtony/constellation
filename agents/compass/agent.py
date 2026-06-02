@@ -300,6 +300,7 @@ def _office_dispatch_failed(dispatch_data: dict[str, Any]) -> bool:
 
 _OFFICE_FAILURE_PATTERNS = (
     "cannot be found or accessed",
+    "could not be found",
     "does not exist or is not a valid",
     "error encountered",
     "i cannot inspect or analyze",
@@ -308,6 +309,9 @@ _OFFICE_FAILURE_PATTERNS = (
     "required action",
     "source file is not accessible",
     "the path does not exist",
+    "the file does not exist",
+    "file not found",
+    "the requested source file cannot",
 )
 
 
@@ -315,8 +319,6 @@ def _summary_indicates_office_failure(summary: str) -> bool:
     if not summary:
         return False
     lowered = summary.lower()
-    if lowered.startswith("analysis complete") or lowered.startswith("summarized"):
-        return False
     return any(needle in lowered for needle in _OFFICE_FAILURE_PATTERNS)
 
 
@@ -941,9 +943,124 @@ class CompassAgent(BaseAgent):
         )
         log.info("office output mode selected", output_mode=output_mode)
 
+        # Fire-and-forget: spawn a daemon worker to run the actual office
+        # dispatch and finalize the task state.  Returning WORKING immediately
+        # unblocks the HTTP request so the UI can show "In Progress" without
+        # blocking on a 5+ minute office roundtrip.  Mirrors the
+        # `_complete_development_task` pattern used for development tasks
+        # further up in this file.
         user_text = str(metadata.get("user_request") or "")
-        dispatch_data = _dispatch_office_request(task_id, user_text, office_request, registry, log)
-        response_text = dispatch_data.get("message") or f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
+        office_artifact_metadata = {"agentId": self.definition.agent_id, "outputMode": output_mode}
+
+        # Seed a "dispatching" artifact so the chat pane shows progress text
+        # before the background worker finishes.
+        dispatching_text = (
+            f"Office task accepted with output mode: `{output_mode}`. "
+            f"Compass is dispatching the request to the office agent now."
+        )
+        _record_major_step(
+            task_store,
+            task_id,
+            text="Office task dispatching in background",
+            agent=self.definition.agent_id,
+        )
+        _append_chat_entry(
+            task_store,
+            task_id,
+            role="COMPASS",
+            text=dispatching_text,
+            tone="normal",
+        )
+        task_store.set_artifacts(
+            task_id,
+            [Artifact(
+                name="compass-response",
+                artifact_type="text/plain",
+                parts=[{"text": dispatching_text}],
+                metadata=office_artifact_metadata,
+            )],
+        )
+
+        worker = threading.Thread(
+            target=self._complete_office_task,
+            kwargs={
+                "task_id": task_id,
+                "user_text": user_text,
+                "office_request": dict(office_request),
+            },
+            daemon=True,
+            name="compass-office-dispatch",
+        )
+        worker.start()
+        print(
+            f"[{self.definition.agent_id}] office dispatch started in background: "
+            f"task_id={task_id} output_mode={output_mode!r}"
+        )
+
+        ui_update = {
+            "task_id": task_id,
+            "task_status": "TASK_STATE_WORKING",
+            "chat_message": {
+                "role": "COMPASS",
+                "text": dispatching_text,
+                "style": "normal",
+            },
+        }
+        return {**task_store.get_task_dict(task_id), "ui_update": ui_update}
+
+    def _complete_office_task(
+        self,
+        *,
+        task_id: str,
+        user_text: str,
+        office_request: dict,
+    ) -> None:
+        """Background worker: dispatch the office task and finalize task state.
+
+        Runs in a daemon thread spawned by ``resume_task`` (office branch).
+        Mirrors ``_complete_development_task`` for symmetry — both are
+        fire-and-forget workers that block on a synchronous A2A call and then
+        update the task_store with the terminal result.
+
+        Per-task isolation: every argument here is a snapshot of the resume
+        payload captured at enqueue time, so multiple concurrent resumes do
+        not share mutable state.  The ``task_store`` itself is thread-safe.
+        """
+        from framework.a2a.protocol import Artifact
+        from framework.devlog import AgentLogger
+        from framework.tools.registry import get_registry
+
+        register_compass_tools()
+        task_store = self.services.task_store
+        # A task_store lookup failure here means compass was restarted between
+        # the resume POST and this thread running.  In that case there's
+        # nothing to update; log and exit cleanly.
+        if task_store.get_task(task_id) is None:
+            print(f"[compass] _complete_office_task: task {task_id} not found, skipping")
+            return
+
+        log = AgentLogger(task_id=task_id, agent_name=self.definition.agent_id)
+        registry = get_registry()
+
+        try:
+            dispatch_data = _dispatch_office_request(task_id, user_text, office_request, registry, log)
+        except Exception as exc:
+            # The dispatch path is supposed to absorb its own errors, but a
+            # late exception (e.g. launcher socket failure) must not crash the
+            # daemon thread.  Surface it as a failed task and continue.
+            log.error("office dispatch raised in background worker", error=str(exc))
+            print(f"[compass] _complete_office_task: dispatch raised: {exc}")
+            dispatch_data = {"status": "error", "message": str(exc)}
+
+        # Re-check the task exists — a /terminate or restart could have
+        # removed it while dispatch was running.
+        if task_store.get_task(task_id) is None:
+            log.warn("office task disappeared before finalization", task_id=task_id)
+            return
+
+        response_text = dispatch_data.get("message") or (
+            f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
+        )
         office_failed = _office_dispatch_failed(dispatch_data)
         office_status = str(dispatch_data.get("status") or "").strip().lower()
 
@@ -985,21 +1102,12 @@ class CompassAgent(BaseAgent):
             text=response_text,
             tone="failed" if office_failed else "completed",
         )
-
-        display_status = dispatch_data.get("status", "unknown")
-        # Use office_failed to determine UI style since it correctly captures all failure
-        # states including "no-capability", "error", "failed", and "unknown"
-        ui_style = "failed" if office_failed else "normal"
-        ui_update = {
-            "task_id": task_id,
-            "task_status": task_store.get_task(task_id).status.state.value if task_store.get_task(task_id) else "TASK_STATE_COMPLETED",
-            "chat_message": {
-                "role": "COMPASS",
-                "text": response_text,
-                "style": ui_style,
-            },
-        }
-        return {**task_store.get_task_dict(task_id), "ui_update": ui_update}
+        log.info(
+            "office task finalization complete",
+            task_id=task_id,
+            status=office_status,
+            failed=office_failed,
+        )
 
     async def get_task(self, task_id: str) -> dict:
         """Return real task state from TaskStore."""

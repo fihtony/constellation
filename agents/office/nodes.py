@@ -439,28 +439,31 @@ def _expected_output_paths(
 ) -> list[str]:
     """Return the required delivery files for the current office task.
 
-    A previous version of this helper only registered expected outputs for
-    file paths and silently skipped directories.  That meant directory-shaped
-    inputs (e.g. ``analyze`` against a folder of CSVs) caused delivery
-    verification to pass vacuously with zero checks, which let a failed LLM
-    run report ``status="completed"`` despite never writing any output.  We
-    now register one expected output per source — file or directory — and for
-    ``summarize`` we still require the combined report only when there are
-    multiple distinct file sources.
+    A previous version of this helper only registered expected outputs when
+    the validated source existed on disk, and silently skipped directories.
+    That meant directory inputs (e.g. ``analyze`` against a folder of CSVs)
+    and inputs whose files had been mounted but the LLM could not locate
+    (e.g. a typo in the user-supplied path) caused delivery verification to
+    pass vacuously with zero checks.  The LLM could respond with "file not
+    found" and the office task would still report ``success: True``.  We now
+    always register the expected output for every validated source path —
+    missing-source failures can no longer slip through delivery verification.
     """
     expected: list[str] = []
     if capability == "analyze":
         for path in validated_paths:
-            if os.path.isfile(path) or os.path.isdir(path):
-                expected.append(_target_output_path(output_mode, path, artifacts_dir, ".analysis.md"))
+            if not path:
+                continue
+            expected.append(_target_output_path(output_mode, path, artifacts_dir, ".analysis.md"))
     elif capability == "summarize":
         file_count = 0
         for path in validated_paths:
-            if os.path.isfile(path):
-                expected.append(_target_output_path(output_mode, path, artifacts_dir, ".summary.md"))
-                file_count += 1
+            if not path:
+                continue
+            expected.append(_target_output_path(output_mode, path, artifacts_dir, ".summary.md"))
+            file_count += 1
         if file_count > 1 and validated_paths:
-            base_path = next((p for p in validated_paths if os.path.isfile(p)), validated_paths[0])
+            base_path = next((p for p in validated_paths if p), validated_paths[0])
             expected.append(_target_output_file(output_mode, base_path, artifacts_dir, "combined-summary.md"))
     elif capability == "organize" and validated_paths:
         expected.append(_target_output_file(output_mode, validated_paths[0], artifacts_dir, "organization-plan.md"))

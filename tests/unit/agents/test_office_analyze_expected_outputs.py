@@ -54,6 +54,23 @@ def test_expected_output_paths_for_file_analyze_still_works(tmp_path):
     assert expected == [str(artifacts_dir / "sales.csv.analysis.md")]
 
 
+def test_expected_output_paths_for_missing_file_analyze(tmp_path):
+    """A path that does not exist on disk must still register an expected output.
+
+    Without this, a typo in the user-supplied path (``sales_data.cs`` instead
+    of ``sales_data.csv``) would make ``expected_outputs`` empty and let the
+    LLM's "file not found" reply slip through delivery verification as
+    ``success: True``.
+    """
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+    missing_file = tmp_path / "sales_data.cs"  # does not exist
+
+    expected = _expected_output_paths("analyze", [str(missing_file)], "workspace", str(artifacts_dir))
+
+    assert expected == [str(artifacts_dir / "sales_data.cs.analysis.md")]
+
+
 def test_summary_indicates_office_failure_for_cannot_be_found():
     assert _summary_indicates_office_failure(
         "The source file `/app/userdata` cannot be found or accessed."
