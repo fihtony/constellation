@@ -5,6 +5,16 @@ project:
   name: constellation
   version: "2.0.0"
 
+# Default timezone for every agent container. The wall-clock zone every
+# devlog line and every server-emitted timestamp is anchored to. Set
+# this to the IANA name (e.g. ``America/Toronto``) of the deployment's
+# home zone; users in a different zone can override via ``TZ`` in
+# ``config/.env``, which the docker compose file propagates into every
+# service. The same value is mirrored as the fallback in
+# ``docker-compose-v2.yml`` so non-compose runs (e.g. ``python -m
+# agents.<x>``) also pick up the right zone.
+default_tz: America/Toronto
+
 # Default runtime backend for all agents
 runtime:
   backend: claude-code              # claude-code | copilot-cli | codex-cli | connect-agent

@@ -11,6 +11,8 @@ __pycache__/
 .pytest_cache/
 .pytest*
 v1/
+constellation.egg-info/
+.playwright*/
 
 # Session and temporary data (cleared after each run)
 tmp/

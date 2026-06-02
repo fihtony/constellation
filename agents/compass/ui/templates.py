@@ -169,6 +169,15 @@ body {
 .dashboard-card.total span { color: var(--accent-strong); }
 .dashboard-card.waiting strong,
 .dashboard-card.waiting span { color: rgba(212, 152, 36, 0.98); }
+.dashboard-card.waiting {
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+}
+.dashboard-card.waiting:hover {
+  background: rgba(38, 53, 66, 0.92);
+  border-color: rgba(212, 152, 36, 0.42);
+  transform: translateY(-1px);
+}
 .dashboard-card.active strong,
 .dashboard-card.active span { color: rgba(34, 147, 173, 0.98); }
 .dashboard-card.done strong,
@@ -627,6 +636,140 @@ body {
 .detail-card.spotlight .detail-value.action-hint {
   color: var(--accent-strong);
   font-weight: 600;
+}
+/* Markdown-rendered completion summary */
+.markdown-content {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink);
+  word-break: break-word;
+  white-space: normal;
+}
+.markdown-content > p {
+  margin: 0 0 8px 0;
+}
+.markdown-content > p:last-child {
+  margin-bottom: 0;
+}
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3,
+.markdown-content h4,
+.markdown-content h5,
+.markdown-content h6 {
+  margin: 14px 0 6px 0;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+.markdown-content h1:first-child,
+.markdown-content h2:first-child,
+.markdown-content h3:first-child,
+.markdown-content h4:first-child,
+.markdown-content h5:first-child,
+.markdown-content h6:first-child { margin-top: 0; }
+.markdown-content h1 { font-size: 18px; }
+.markdown-content h2 { font-size: 16px; }
+.markdown-content h3 { font-size: 15px; }
+.markdown-content h4 { font-size: 14px; }
+.markdown-content h5,
+.markdown-content h6 { font-size: 13px; color: var(--muted); }
+.markdown-content ul,
+.markdown-content ol {
+  margin: 0 0 8px 0;
+  padding-left: 20px;
+}
+.markdown-content li {
+  margin-bottom: 4px;
+}
+.markdown-content li:last-child { margin-bottom: 0; }
+.markdown-content blockquote {
+  margin: 0 0 8px 0;
+  padding: 6px 12px;
+  border-left: 3px solid var(--accent);
+  background: rgba(147, 198, 208, 0.06);
+  color: var(--muted);
+  border-radius: 0 8px 8px 0;
+}
+.markdown-content code {
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: rgba(127, 195, 209, 0.12);
+  color: var(--accent-strong);
+  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  font-size: 0.92em;
+}
+.markdown-content pre {
+  margin: 0 0 8px 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(9, 16, 23, 0.6);
+  border: 1px solid rgba(145, 171, 189, 0.1);
+  overflow-x: auto;
+}
+.markdown-content pre code {
+  padding: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.5;
+  display: block;
+}
+.markdown-content a {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-decoration-color: rgba(147, 198, 208, 0.32);
+  text-underline-offset: 2px;
+  word-break: break-all;
+}
+.markdown-content a:hover {
+  text-decoration-color: var(--accent-strong);
+}
+.markdown-content strong { font-weight: 700; color: var(--ink); }
+.markdown-content em { font-style: italic; color: var(--ink); }
+.markdown-content del { text-decoration: line-through; color: var(--muted); }
+.markdown-content hr {
+  margin: 12px 0;
+  border: none;
+  border-top: 1px solid rgba(145, 171, 189, 0.1);
+}
+.markdown-content table.markdown-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  border: 1px solid rgba(145, 171, 189, 0.14);
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(8, 14, 22, 0.42);
+  table-layout: auto;
+}
+.markdown-content table.markdown-table thead {
+  background: rgba(147, 198, 208, 0.10);
+}
+.markdown-content table.markdown-table th {
+  padding: 8px 12px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--ink);
+  border-bottom: 1px solid rgba(145, 171, 189, 0.22);
+  white-space: normal;
+  word-break: break-word;
+}
+.markdown-content table.markdown-table td {
+  padding: 6px 12px;
+  border-bottom: 1px solid rgba(145, 171, 189, 0.08);
+  color: var(--ink);
+  white-space: normal;
+  word-break: break-word;
+  vertical-align: top;
+}
+.markdown-content table.markdown-table tr:last-child td {
+  border-bottom: none;
+}
+.markdown-content table.markdown-table tbody tr:hover {
+  background: rgba(147, 198, 208, 0.05);
 }
 .detail-head-tag {
   display: inline-flex;
@@ -1179,16 +1322,244 @@ _INLINE_JS = r"""
     order: [],   // task_ids newest-first
     logsByTask: {},
     logEventSources: {},
+    taskRefreshIntervalId: null,
     phaseExpandedByTask: {},
     filters: { agent: 'all', level: 'all' },
     openLogFilter: null,
+    composerNote: '',
   };
 
   function $(sel) { return document.querySelector(sel); }
+  function renderComposerNote(el, fallbackText = '') {
+    if (!el) return;
+    const text = String(state.composerNote || fallbackText || '').trim();
+    el.textContent = text;
+    el.style.display = text ? 'block' : 'none';
+  }
+  function clearComposerNote() {
+    state.composerNote = '';
+  }
+
+  function ensureTaskRefreshLoop() {
+    if (state.taskRefreshIntervalId) return;
+    // Keep a low-rate full-list refresh running even when SSE appears healthy.
+    // Long-lived browser tabs sometimes stop receiving task.completed/task.failed
+    // events without surfacing an EventSource error, which leaves the list stuck
+    // in "In Progress" until the user manually refreshes the page.
+    state.taskRefreshIntervalId = setInterval(() => loadTasks(false), 5000);
+  }
+
+  function taskNeedsResume(task) {
+    if (!task) return false;
+    const kind = statusKindOf(task.statusState || task.status);
+    if (kind === 'waiting') return true;
+    const metadata = task.metadata || {};
+    if (metadata && metadata._interrupt) return true;
+    const history = Array.isArray(task.chatHistory) ? task.chatHistory : [];
+    const last = history[history.length - 1];
+    return !!(last && String(last.tone || '').toLowerCase() === 'input-required');
+  }
+
+  function resolveComposerMode(mode, targetTaskId) {
+    const task = targetTaskId ? state.tasks[targetTaskId] : null;
+    if ((mode === 'reply' || mode === 'resume') && taskNeedsResume(task)) return 'resume';
+    return mode;
+  }
+  async function fetchJsonWithTimeout(url, options, timeoutMs = 15000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { ...(options || {}), signal: controller.signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return await response.json();
+    } catch (error) {
+      if (error && error.name === 'AbortError') {
+        throw new Error(`Request timed out after ${timeoutMs}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  function discardOptimisticTask(taskId) {
+    if (!taskId) return;
+    delete state.tasks[taskId];
+    state.order = state.order.filter(id => id !== taskId);
+    if (state.selectedTaskId === taskId) state.selectedTaskId = NEW_REQUEST_ID;
+  }
   function esc(s) {
     if (s === null || s === undefined) return '';
     return String(s).replace(/[&<>"']/g, c =>
       ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+  }
+  // Safe markdown → HTML renderer for the completion summary.
+  // Order: extract code first → escape HTML → apply patterns → restore code.
+  function renderMarkdown(text) {
+    if (text === null || text === undefined) return '';
+    const value = String(text);
+    if (!value) return '';
+    const codeBlocks = [];
+    let html = value.replace(/```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```/g, function (m, lang, code) {
+      const idx = codeBlocks.length;
+      codeBlocks.push({ lang: lang || '', code: code || '' });
+      return 'ZQXCB' + idx + 'ZQX';
+    });
+    const inlineCodes = [];
+    html = html.replace(/`([^`\n]+)`/g, function (m, code) {
+      const idx = inlineCodes.length;
+      inlineCodes.push(code);
+      return 'ZQXIC' + idx + 'ZQX';
+    });
+    // Normalize literal escape sequences that arrive from upstream sources.
+    // Some agents serialise their completion summary by JSON-encoding a
+    // python string into another JSON envelope, so a real "\n" becomes the
+    // two-character sequence backslash + n by the time it reaches the
+    // browser ("Folder Organization Complete\n\n## Discovered Patterns…"
+    // arrives as one unbroken line where the heading and list never start
+    // at column 0).  Markdown grammar (headings, lists, paragraph splits,
+    // blockquotes, tables) all anchor to real \n / line starts via the
+    // ``m`` flag, so without this step those summaries render as a single
+    // blob of plain text with "## Heading" and "- item" showing inline.
+    // Code blocks and inline code were extracted into placeholders above,
+    // so a legitimate literal "\n" inside ``print("hi\n")`` is preserved.
+    html = html
+      .replace(/\\r\\n/g, '\n')
+      .replace(/\\n/g, '\n')
+      .replace(/\\r/g, '\n')
+      .replace(/\\t/g, '\t');
+    html = esc(html);
+    html = html.replace(/^[\s]*(?:[-]{3,}|[\*]{3,}|[_]{3,})[\s]*$/gm, '<hr>');
+    html = html.replace(/^######\s+(.*)$/gm, '<h6>$1</h6>');
+    html = html.replace(/^#####\s+(.*)$/gm, '<h5>$1</h5>');
+    html = html.replace(/^####\s+(.*)$/gm, '<h4>$1</h4>');
+    html = html.replace(/^###\s+(.*)$/gm, '<h3>$1</h3>');
+    html = html.replace(/^##\s+(.*)$/gm, '<h2>$1</h2>');
+    html = html.replace(/^#\s+(.*)$/gm, '<h1>$1</h1>');
+    html = html.replace(/((?:^|\n)(?:&gt;\s*.*(?:\n|$))+)/g, function (m) {
+      const inner = m.replace(/^&gt;\s*/gm, '').replace(/\n/g, '<br>').trim();
+      return '\n<blockquote>' + inner + '</blockquote>\n';
+    });
+    html = html.replace(/(^|\n)((?:[-*+]\s+.+\n?)+)/g, function (m, prefix, list) {
+      const items = list.trim().split('\n').map(function (line) {
+        return '<li>' + line.replace(/^[-*+]\s+/, '') + '</li>';
+      }).join('');
+      return prefix + '<ul>' + items + '</ul>';
+    });
+    html = html.replace(/(^|\n)((?:\d+\.\s+.+\n?)+)/g, function (m, prefix, list) {
+      const items = list.trim().split('\n').map(function (line) {
+        return '<li>' + line.replace(/^\d+\.\s+/, '') + '</li>';
+      }).join('');
+      return prefix + '<ol>' + items + '</ol>';
+    });
+    html = html.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
+    html = html.replace(/(^|[^\*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    html = html.replace(/(^|[^_])_([^_\n]+)_/g, '$1<em>$2</em>');
+    html = html.replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+    html = html.replace(/\[([^\]\n]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, function (m, text, url, title) {
+      const safeUrl = sanitizeMarkdownUrl(url);
+      const titleAttr = title ? ' title="' + esc(title) + '"' : '';
+      return '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer"' + titleAttr + '>' + text + '</a>';
+    });
+    html = html.replace(/(?<!["'=a-zA-Z>])(https?:\/\/[^\s<&]+)/g, function (m, url) {
+      const safeUrl = sanitizeMarkdownUrl(url);
+      return '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' + url + '</a>';
+    });
+    // GitHub-flavored markdown tables: a header row, a separator row, and one
+    // or more data rows.  Must be parsed BEFORE the paragraph splitter below
+    // — otherwise each row would be wrapped in <p> and the `|---|` separator
+    // would leak into the rendered text.  Cell contents are NOT re-escaped
+    // here; the earlier ``html = esc(html);`` call already neutralized raw
+    // HTML inside cells.  Inline-code / code-block placeholders
+    // (``ZQXICnZQX`` / ``ZQXCBnZQX``) are still live and will be restored by
+    // the placeholder replacers that follow.
+    //
+    // The regex is deliberately explicit about the four pieces (prefix, header
+    // row, separator row, data rows) so the separator row is consumed by
+    // group 3, not group 2, which would otherwise eat it via ``[^\n]*`` and
+    // prevent the table from being detected.
+    html = html.replace(
+      /(^|\n)(\|[^\n]*\|[ \t]*\n)(\|[\s:|-]+\|[ \t]*\n)((?:\|[^\n]*\|[ \t]*\n?)+)/g,
+      function (m, prefix, headerLine, sep, rows) {
+        const headerCells = headerLine
+          .replace(/\|[ \t]*\n?$/, '')
+          .split('|')
+          .slice(1)
+          .map(function (c) { return c.trim(); });
+        const dataLines = rows.split('\n').filter(function (l) { return l.trim(); });
+        // parse alignment from the separator row
+        const sepCells = sep
+          .replace(/^\|/, '')
+          .replace(/\|[ \t]*\n?$/, '')
+          .split('|');
+        const aligns = sepCells.map(function (c) {
+          const t = c.trim();
+          if (/^:-+:$/.test(t)) return 'center';
+          if (/^-+:$/.test(t)) return 'right';
+          if (/^:-+$/.test(t)) return 'left';
+          return '';
+        });
+        let out = '<table class="markdown-table"><thead><tr>';
+        headerCells.forEach(function (cell, i) {
+          const align = aligns[i] ? ' style="text-align:' + aligns[i] + '"' : '';
+          out += '<th' + align + '>' + cell + '</th>';
+        });
+        out += '</tr></thead><tbody>';
+        dataLines.forEach(function (row) {
+          const cells = row
+            .replace(/\|[ \t]*$/, '')
+            .split('|')
+            .slice(1)
+            .map(function (c) { return c.trim(); });
+          out += '<tr>';
+          cells.forEach(function (cell, i) {
+            const align = aligns[i] ? ' style="text-align:' + aligns[i] + '"' : '';
+            out += '<td' + align + '>' + cell + '</td>';
+          });
+          out += '</tr>';
+        });
+        out += '</tbody></table>';
+        return prefix + out + '\n';
+      }
+    );
+    html = html.replace(/ZQXCB(\d+)ZQX/g, function (m, idx) {
+      const block = codeBlocks[Number(idx)];
+      if (!block) return '';
+      const langClass = block.lang ? ' class="language-' + esc(block.lang) + '"' : '';
+      return '<pre><code' + langClass + '>' + esc(block.code) + '</code></pre>';
+    });
+    html = html.replace(/ZQXIC(\d+)ZQX/g, function (m, idx) {
+      const code = inlineCodes[Number(idx)];
+      if (code === undefined) return '';
+      return '<code>' + esc(code) + '</code>';
+    });
+    const parts = html.split(/\n{2,}/);
+    html = parts.map(function (part) {
+      const trimmed = part.trim();
+      if (!trimmed) return '';
+      if (/^<(h[1-6]|ul|ol|blockquote|pre|hr|p|table|div|article|section)\b/.test(trimmed)) {
+        return trimmed;
+      }
+      return '<p>' + trimmed.replace(/\n/g, '<br>') + '</p>';
+    }).filter(Boolean).join('\n');
+    return html;
+  }
+  function sanitizeMarkdownUrl(url) {
+    const trimmed = String(url || '').trim();
+    if (!trimmed) return '#';
+    const first = trimmed.charAt(0);
+    if (first === '#' || first === '/' || first === '?') {
+      return esc(trimmed);
+    }
+    const protoMatch = trimmed.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:)/);
+    if (protoMatch) {
+      const proto = protoMatch[1].toLowerCase();
+      if (proto === 'http:' || proto === 'https:' || proto === 'mailto:') {
+        return esc(trimmed);
+      }
+      return '#';
+    }
+    return esc(trimmed);
   }
   function statusKindOf(st) {
     return ({
@@ -1387,14 +1758,23 @@ _INLINE_JS = r"""
       ] = match;
       const milliseconds = Number(fraction.padEnd(3, '0').slice(0, 3));
       if (!zoneToken && !offsetSign) {
+        // Naive timestamp (no Z / no offset). All Python emitters in the
+        // system produce UTC (task_store, lifecycle, a2a client, compass
+        // chat entries, devlog), and the container clock defaults to UTC.
+        // Treating the value as UTC here keeps the displayed local time
+        // correct for users in any timezone. Without this, devlog's
+        // "YYYY-MM-DD HH:MM:SS" lines (e.g. "2026-06-01 12:34:56") would
+        // be re-interpreted as the browser's local clock and leak UTC.
         return new Date(
-          Number(year),
-          Number(month) - 1,
-          Number(day),
-          Number(hour),
-          Number(minute),
-          Number(second),
-          milliseconds,
+          Date.UTC(
+            Number(year),
+            Number(month) - 1,
+            Number(day),
+            Number(hour),
+            Number(minute),
+            Number(second),
+            milliseconds,
+          )
         );
       }
       const offsetMinutes = zoneToken
@@ -1551,13 +1931,55 @@ _INLINE_JS = r"""
     });
   }
 
+  function replaceTaskCollection(tasks) {
+    state.tasks = {};
+    state.order = [];
+    for (const t of (tasks || [])) upsertTask(t);
+  }
+
+  function createOptimisticTask(text) {
+    const optimisticId = '__optimistic_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+    const ts = new Date().toISOString();
+    return {
+      task_id: optimisticId,
+      id: optimisticId,
+      userRequest: text,
+      summary: 'Submitting…',
+      status: 'active',
+      statusState: 'TASK_STATE_SUBMITTED',
+      createdAt: ts,
+      taskType: 'general',
+      optimistic: true,
+      chatHistory: [{ role: 'USER', text, ts, tone: 'normal' }],
+    };
+  }
+
+  function promoteOptimisticTask(optimisticId, newId) {
+    if (!optimisticId || !newId) return;
+    if (optimisticId === newId) return;
+    const existed = Object.prototype.hasOwnProperty.call(state.tasks, optimisticId);
+    if (existed) {
+      delete state.tasks[optimisticId];
+      state.order = state.order.filter(id => id !== optimisticId);
+      if (state.selectedTaskId === optimisticId) state.selectedTaskId = newId;
+    }
+  }
+
   async function loadTasks(autoSelect) {
     try {
       const resp = await fetch('/api/tasks');
       const data = await resp.json();
-      state.tasks = {}; state.order = [];
-      for (const t of (data.tasks || [])) upsertTask(t);
-      if (autoSelect && !state.tasks[state.selectedTaskId] && state.selectedTaskId !== NEW_REQUEST_ID && !isOverviewSelection(state.selectedTaskId)) {
+      const previousSelectedId = state.selectedTaskId;
+      replaceTaskCollection(data.tasks || []);
+      // Auto-refresh MUST NOT change which task the user is looking at.
+      // Earlier versions hijacked the selection to a waiting task whenever
+      // the user was on the New Request composer, which silently stole
+      // focus the moment a user clicked "New Request" and started typing.
+      // Users now navigate to a waiting task explicitly by clicking the
+      // "Waiting for Input" dashboard card (see selectLatestWaitingTask).
+      // The only auto-adjustment we still make is rescuing the selection
+      // when the previously-selected task has been removed from the list.
+      if (autoSelect && !state.tasks[state.selectedTaskId] && !isOverviewSelection(state.selectedTaskId) && state.selectedTaskId !== NEW_REQUEST_ID) {
         state.selectedTaskId = state.order[0] || NEW_REQUEST_ID;
       }
       if (state.selectedTaskId !== NEW_REQUEST_ID && !isOverviewSelection(state.selectedTaskId) && state.tasks[state.selectedTaskId]) {
@@ -1632,14 +2054,37 @@ _INLINE_JS = r"""
   function selectTask(tid) {
     if (!tid) return;
     if (tid === state.selectedTaskId && tid !== NEW_REQUEST_ID) {
+      clearComposerNote();
       state.selectedTaskId = OVERVIEW_ID;
       renderTaskList(); renderChat(); renderDetail();
       return;
     }
+    clearComposerNote();
     state.selectedTaskId = tid;
     renderTaskList(); renderChat(); renderDetail();
     if (tid !== NEW_REQUEST_ID && !isOverviewSelection(tid)) subscribeLogs(tid);
     loadTaskDetail(tid).then(() => {
+      renderTaskList(); renderChat(); renderDetail();
+    });
+  }
+
+  // Explicit jump from the dashboard "Waiting for Input" card to the most
+  // recent task that is still waiting for the user. Auto-refresh no longer
+  // moves selection on its own (it would steal focus from someone typing
+  // a new request); this handler is the user-initiated way to reach a
+  // waiting task quickly. No-op if no waiting task exists.
+  function selectLatestWaitingTask() {
+    const waitingId = orderedTaskIds().find(id => {
+      const t = state.tasks[id];
+      return t && statusKindOf(t.statusState || t.status) === 'waiting';
+    });
+    if (!waitingId) return;
+    if (waitingId === state.selectedTaskId) return;
+    clearComposerNote();
+    state.selectedTaskId = waitingId;
+    renderTaskList(); renderChat(); renderDetail();
+    subscribeLogs(waitingId);
+    loadTaskDetail(waitingId).then(() => {
       renderTaskList(); renderChat(); renderDetail();
     });
   }
@@ -1653,7 +2098,7 @@ _INLINE_JS = r"""
 
     if (tid === NEW_REQUEST_ID || isOverviewSelection(tid)) {
       scroll.innerHTML = `<div class="empty-state">${tid === NEW_REQUEST_ID ? 'Send a request to create a new Compass task.' : 'Select a task to inspect it, or send a new request.'}</div>`;
-      composerNote.style.display = 'none';
+      renderComposerNote(composerNote);
       composerInput.disabled = false;
       composerInput.placeholder = 'Describe a new task...';
       composerSend.disabled = false;
@@ -1689,18 +2134,29 @@ _INLINE_JS = r"""
     }
     scroll.scrollTop = scroll.scrollHeight;
 
+    if (t.optimistic === true) {
+      renderComposerNote(composerNote, 'Request submission in progress. Please wait for Compass to respond.');
+      composerInput.disabled = true;
+      composerSend.disabled = true;
+      composerSend.textContent = 'Send';
+      composerInput.placeholder = 'Submitting request...';
+      composerInput.dataset.mode = 'disabled';
+      composerInput.dataset.targetTaskId = '';
+      return;
+    }
+
     const kind = statusKindOf(t.statusState || t.status);
     const isWaiting = kind === 'waiting';
     composerInput.disabled = false;
     composerSend.textContent = 'Send';
     if (isWaiting) {
-      composerNote.style.display = 'none';
+      renderComposerNote(composerNote);
       composerInput.placeholder = `Reply to ${tid}...`;
       composerSend.disabled = false;
       composerInput.dataset.mode = 'resume';
       composerInput.dataset.targetTaskId = tid;
     } else {
-      composerNote.style.display = 'none';
+      renderComposerNote(composerNote);
       const terminal = (kind === 'completed' || kind === 'failed');
       composerInput.disabled = terminal;
       composerSend.disabled = terminal;
@@ -1944,6 +2400,11 @@ _INLINE_JS = r"""
       root.innerHTML = renderTaskInfoEmpty('Task not loaded', 'The selected task is unavailable right now. Try again after the next refresh.');
       return;
     }
+    // Optimistic placeholders are pre-snapshot stand-ins for a task that has
+    // not been observed on the server yet.  Never surface their internal
+    // ``__optimistic_*`` id — show a friendly pending label instead so the
+    // detail panel does not look like the user is looking at a real task.
+    const isOptimisticPlaceholder = t.optimistic === true;
     const kind = statusKindOf(t.statusState || t.status);
     const steps = mergedProgressSignals(t);
     const currentStep = t.currentMajorStep || currentStepFromLogs(t) || (steps.length ? steps[steps.length-1].text : '');
@@ -1961,7 +2422,9 @@ _INLINE_JS = r"""
     const detailTitleLabel = originalRequest ? 'Original Request' : 'Task';
     const outcome = summarizeTaskOutcome(t, kind, currentStep);
     if (taskInfoHeadTaskId) {
-      taskInfoHeadTaskId.textContent = orchestratorTaskId;
+      // Suppress the raw ``__optimistic_*`` id so users never see internal
+      // placeholder state — show "Submitting…" until the real task lands.
+      taskInfoHeadTaskId.textContent = isOptimisticPlaceholder ? 'Submitting…' : orchestratorTaskId;
     }
     if (taskInfoHeadMeta) {
       taskInfoHeadMeta.innerHTML = `<span class="detail-type-pill ${escapeAttr(taskType)}" style="margin-top:0">${esc(typeLabel)}</span>`;
@@ -1978,7 +2441,7 @@ _INLINE_JS = r"""
         </div>
         ${outcome ? `<div class="detail-section">
           <span class="detail-label">${esc(outcome.label)}</span>
-          <div class="detail-value multiline">${esc(outcome.text)}</div>
+          <div class="detail-value multiline markdown-content">${renderMarkdown(outcome.text)}</div>
         </div>` : ''}
       </div>
       <div class="detail-card">
@@ -2121,13 +2584,13 @@ _INLINE_JS = r"""
   }
 
   function subscribeTaskEvents() {
+    ensureTaskRefreshLoop();
     try {
       const es = new EventSource('/ui/events');
       es.addEventListener('task.snapshot', ev => {
         try {
           const data = JSON.parse(ev.data);
-          state.tasks = {}; state.order = [];
-          for (const t of (data.tasks || [])) upsertTask(t);
+          replaceTaskCollection(data.tasks || []);
           renderTaskList(); renderChat(); renderDetail();
         } catch {}
       });
@@ -2139,9 +2602,32 @@ _INLINE_JS = r"""
       es.addEventListener('task.failed', refresh);
       es.addEventListener('task.resumed', refresh);
       es.onerror = () => { es.close(); setTimeout(subscribeTaskEvents, 5000); };
-    } catch (e) {
-      setInterval(() => loadTasks(false), 5000);
+    } catch (e) { /* fallback loop already armed */ }
+  }
+
+  // Short-poll a single task until it reaches a terminal state or the
+  // deadline elapses.  Used immediately after a resume POST so the UI flips
+  // from "In Progress" to "Completed" / "Failed" without waiting for the
+  // 5-second SSE fallback.  Maximum total wait is 240s — beyond that the
+  // SSE / fallback polling will pick up the change anyway.
+  async function pollTaskUntilTerminal(tid, opts) {
+    const maxMs = (opts && opts.maxMs) || 240000;
+    const intervalMs = (opts && opts.intervalMs) || 1500;
+    const deadline = Date.now() + maxMs;
+    let ticks = 0;
+    while (Date.now() < deadline) {
+      // loadTaskDetail reuses the existing single-task fetch (no full list
+      // re-render) and writes into the same state.tasks map.
+      await loadTaskDetail(tid);
+      ticks++;
+      const t = state.tasks[tid];
+      const kind = statusKindOf(t && (t.statusState || t.status));
+      if (kind === 'completed' || kind === 'failed') {
+        return { reachedTerminal: true, kind, ticks };
+      }
+      await new Promise(r => setTimeout(r, intervalMs));
     }
+    return { reachedTerminal: false, ticks };
   }
 
   async function sendComposer() {
@@ -2150,28 +2636,142 @@ _INLINE_JS = r"""
     if (!text) return;
     const mode = input.dataset.mode || 'create';
     const targetTaskId = input.dataset.targetTaskId || '';
-    input.value = '';
-    if (mode === 'create') {
-      const r = await fetch('/message:send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: { role: 'ROLE_USER', parts: [{ text }] },
-          configuration: { returnImmediately: true },
-        }),
-      });
-      const data = await r.json();
+    const effectiveMode = resolveComposerMode(mode, targetTaskId);
+    if (effectiveMode === 'create') {
+      input.value = '';
+      clearComposerNote();
+      const optimisticTask = createOptimisticTask(text);
+      const optimisticId = optimisticTask.task_id;
+      state.tasks[optimisticTask.task_id] = optimisticTask;
+      if (!state.order.includes(optimisticTask.task_id)) state.order.unshift(optimisticTask.task_id);
+      state.selectedTaskId = optimisticTask.task_id;
+      renderTaskList(); renderChat(); renderDetail();
+      let data;
+      try {
+        data = await fetchJsonWithTimeout('/message:send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: { role: 'ROLE_USER', parts: [{ text }] },
+            configuration: { returnImmediately: true },
+          }),
+        });
+      } catch (e) {
+        discardOptimisticTask(optimisticId);
+        state.selectedTaskId = NEW_REQUEST_ID;
+        state.composerNote = 'Compass did not acknowledge the request. Please retry.';
+        renderTaskList(); renderChat(); renderDetail();
+        return;
+      }
       const newId = (data.task && data.task.id) || (data.ui_update && data.ui_update.task_id);
-      await loadTasks(false);
-      if (newId) selectTask(newId);
-    } else if (mode === 'resume' && targetTaskId) {
-      await fetch(`/tasks/${encodeURIComponent(targetTaskId)}/resume`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: text }),
+      if (newId) promoteOptimisticTask(optimisticTask.task_id, newId);
+      // Pull the latest snapshot so the optimistic placeholder is replaced with
+      // the real task before the user sees the final list state.
+      try {
+        const snapData = await fetchJsonWithTimeout('/api/tasks', {}, 5000);
+        replaceTaskCollection(snapData.tasks || []);
+      } catch (e) { /* fall through to loadTasks */ }
+      // Always land on the real task id once we have one — even if the
+      // snapshot is briefly behind.  Falling back to the placeholder leaves
+      // the user staring at ``__optimistic_xxx`` in the detail panel.
+      if (newId) {
+        if (!state.tasks[newId]) await loadTasks(false);
+        state.selectedTaskId = newId;
+        if (state.tasks[newId]) subscribeLogs(newId);
+      } else {
+        await loadTasks(false);
+      }
+      // Safety net: if the snapshot wiped out the real task too (e.g. server
+      // hasn't indexed it yet) but the placeholder is still hanging around,
+      // remove it so the UI does not display a stale ``__optimistic_*`` id.
+      if (
+        state.selectedTaskId !== optimisticId
+        && Object.keys(state.tasks).some(id => id.startsWith('__optimistic_'))
+      ) {
+        for (const id of Object.keys(state.tasks)) {
+          if (id.startsWith('__optimistic_')) delete state.tasks[id];
+        }
+        state.order = state.order.filter(id => !id.startsWith('__optimistic_'));
+      }
+      renderTaskList(); renderChat(); renderDetail();
+    } else if (effectiveMode === 'resume' && targetTaskId) {
+      input.value = '';
+      clearComposerNote();
+      const targetTask = state.tasks[targetTaskId];
+      if (targetTask) {
+        // Optimistically flip the task-status badge to "In Progress" so the
+        // user sees immediate feedback while the resume POST is in flight.
+        //
+        // We deliberately do NOT push a USER bubble optimistically.  The
+        // server-side ``resume_task`` (compass/agent.py) records the resume
+        // value as a USER entry in the task's ``chat_history`` metadata via
+        // ``_append_chat_entry``, and the ``loadTasks(false)`` call below
+        // pulls that server-authoritative history into the client state.
+        // Pushing a bubble here would render the user's "workspace" (or
+        // similar) reply twice for one render tick: once from the local
+        // optimistic push, and once again when ``loadTasks`` is followed
+        // by a re-push — the previous re-push de-dup used a strict
+        // timestamp-equality check that always failed (client and server
+        // timestamps are produced independently), so the duplicate was
+        // guaranteed to survive until the next ``loadTaskDetail`` tick
+        // cleaned it up.  The resume response is fire-and-forget (returns
+        // in < 1s) so the user-perceived delay of waiting for the server
+        // snapshot to land is negligible.
+        targetTask.statusState = 'TASK_STATE_WORKING';
+        targetTask.status = 'active';
+        targetTask.summary = 'Office task dispatching in background';
+        targetTask.currentMajorStep = 'Office task dispatching in background';
+        renderTaskList(); renderChat(); renderDetail();
+      }
+      try {
+        await fetchJsonWithTimeout(`/tasks/${encodeURIComponent(targetTaskId)}/resume`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ input: text }),
+        });
+      } catch (e) {
+        if (targetTask) {
+          targetTask.statusState = 'TASK_STATE_INPUT_REQUIRED';
+          targetTask.status = 'waiting';
+          targetTask.summary = 'Waiting for output mode selection';
+          targetTask.currentMajorStep = 'Waiting for output mode selection';
+        }
+        input.value = text;
+        state.composerNote = 'Failed to send reply to Compass. Please retry.';
+        renderTaskList(); renderChat(); renderDetail();
+        return;
+      }
+      // ``loadTasks(false)`` is awaited so the server-side ``chat_history``
+      // (which now includes the resume value as a USER entry) is in place
+      // before we re-render.  We do NOT re-push the optimistic message —
+      // the server's record is the authoritative copy and would be a
+      // duplicate if added again.
+      try {
+        await loadTasks(false);
+      } catch (e) {
+        try { await loadTaskDetail(targetTaskId); } catch (_ignored) {}
+      }
+      state.selectedTaskId = targetTaskId;
+      renderTaskList(); renderChat(); renderDetail();
+      // Fire-and-forget fast-poll: the resume POST returns almost immediately
+      // (compass no longer blocks on the office roundtrip), but the actual
+      // office work still takes seconds-to-minutes to finalize the task
+      // state.  Poll this single task every 1.5s for up to 4 minutes and
+      // re-render the chat / detail pane as soon as it lands.  Without this,
+      // the user sees a stale "In Progress" until the 5s SSE fallback ticks.
+      pollTaskUntilTerminal(targetTaskId).then(async (result) => {
+        if (!result || !result.reachedTerminal) {
+          // Fell off the deadline; SSE / 5s fallback will pick up the change.
+          return;
+        }
+        // Pull the full task list so the task-list badge updates too, not
+        // just the open chat pane.
+        try { await loadTasks(false); } catch (e) { /* fall through */ }
+        renderTaskList(); renderChat(); renderDetail();
       });
-      await loadTasks(false);
-      selectTask(targetTaskId);
+    } else if (effectiveMode === 'reply' && targetTaskId) {
+      state.composerNote = 'Compass is not waiting for input on this task right now.';
+      renderTaskList(); renderChat(); renderDetail();
     }
   }
 
@@ -2182,9 +2782,28 @@ _INLINE_JS = r"""
         renderLogs();
       }
     });
+    const dashboardEl = $('#dashboard');
+    if (dashboardEl) {
+      dashboardEl.addEventListener('click', event => {
+        const waitingCard = event.target.closest('.dashboard-card.waiting');
+        if (waitingCard) {
+          selectLatestWaitingTask();
+        }
+      });
+    }
     $('#composer-send').addEventListener('click', sendComposer);
+    // Send on Enter; allow Shift+Enter for a newline inside the composer.
+    // The previous implementation required Cmd/Ctrl+Enter which silently
+    // dropped plain-Enter submissions — users who typed a one-word reply
+    // like "workspace" and pressed Enter thought the message had been
+    // sent but the request never left the browser, so the task stayed
+    // stuck in TASK_STATE_INPUT_REQUIRED. Plain Enter (or the Send
+    // button) is now the universal send gesture.
     $('#composer-input').addEventListener('keydown', ev => {
-      if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); sendComposer(); }
+      if (ev.key === 'Enter' && !ev.shiftKey) {
+        ev.preventDefault();
+        sendComposer();
+      }
     });
     loadTasks(true);
     subscribeTaskEvents();

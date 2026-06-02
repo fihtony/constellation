@@ -16,6 +16,11 @@ IMPORTANT CONSTRAINT — Source of Truth:
   you MUST NOT add it to the plan — even if it seems "obvious" or "standard".
 
 Respond in JSON with:
+- "agent_type": single string naming the PRIMARY dev agent that will execute the
+  plan.  Must be one of the dev-agent identifiers registered in Constellation
+  (e.g. "web-dev", "android-dev").  Pick the value that matches the task's
+  delivery surface (web app → "web-dev"; Android app → "android-dev"; etc.).
+  If unclear, default to "web-dev".
 - "steps": array of step objects, each with:
   - step: sequential number
   - action: what to do
@@ -56,4 +61,5 @@ component shown in that HTML file (navigation, hero, feature cards, footer, etc.
 - For UI/frontend tasks, set screenshot_required=true in definition_of_done.
 - The web-dev agent must verify all npm packages exist before adding to package.json.
 
-Produce a JSON plan with numbered steps and a definition_of_done object."""
+Produce a JSON plan with an "agent_type" naming the primary dev agent,
+"steps" (numbered), and a "definition_of_done" object."""

@@ -8,6 +8,23 @@ The ``ARTIFACT_ROOT`` is resolved from the ``ARTIFACT_ROOT`` environment
 variable (default ``artifacts/``).  When running inside a container the
 host path must be mounted to the same ``ARTIFACT_ROOT`` value.
 
+Log format (plain text, human-readable, UTC ISO with offset):
+
+    2026-06-01T12:34:56+00:00 [INFO ] [team-lead] Starting implementation step=gather_context
+    2026-06-01T12:34:57+00:00 [DEBUG] [team-lead] LLM response received tokens=512
+    2026-06-01T12:34:58+00:00 [WARN ] [jira] Ticket not found key=PROJ-99
+    2026-06-01T12:34:59+00:00 [ERROR] [web-agent] Build failed exit_code=1
+
+All timestamps are emitted in UTC with an explicit ``+00:00`` offset so
+that the Compass UI ``parseTimestamp`` function (in
+``agents/compass/ui/templates.py``) can convert them to the viewer's
+local timezone without ambiguity. The legacy naive ``YYYY-MM-DD
+HH:MM:SS`` format is still accepted by the log aggregator for backward
+compatibility with existing log files, but new lines MUST use the UTC
+ISO form.
+
+Log levels (default DEBUG):
+
 Log format (plain text, human-readable):
 
     2026-05-16 14:30:00 [INFO ] [team-lead] Starting implementation step=gather_context
@@ -46,7 +63,54 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any
+
+
+def _apply_default_timezone() -> None:
+    """Resolve the default timezone from ``config/constellation.yaml``
+    and apply it to ``os.environ['TZ']`` if no override is already set.
+
+    This makes ``config/constellation.yaml:default_tz`` the single
+    source of truth for every agent's wall-clock zone, regardless of
+    how the process is launched (docker compose, ``python -m
+    agents.<x>``, pytest, etc.). Operators can still override per
+    deployment by exporting ``TZ`` in the shell, by setting ``TZ`` in
+    ``config/.env`` (which docker compose forwards to every
+    container), or by setting ``TZ`` in the test environment.
+    """
+    if os.environ.get("TZ"):
+        return  # caller already pinned the zone — defer to them
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except ImportError:  # pragma: no cover - yaml is a hard dep
+        return
+    project_root = Path(__file__).resolve().parent.parent
+    yaml_path = project_root / "config" / "constellation.yaml"
+    if not yaml_path.is_file():
+        return
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except OSError:
+        return
+    default_tz = data.get("default_tz")
+    if not default_tz or not isinstance(default_tz, str):
+        return
+    os.environ["TZ"] = default_tz
+    # POSIX needs an explicit tzset so ``localtime`` reflects the new
+    # zone immediately. ``time.tzset`` is unavailable on Windows; on
+    # Linux/macOS (where our containers run) it is a no-op if the
+    # value did not change.
+    if hasattr(time, "tzset"):
+        try:
+            time.tzset()
+        except OSError:
+            pass
+
+
+_apply_default_timezone()
 
 # ---------------------------------------------------------------------------
 # Log levels
@@ -71,8 +135,27 @@ _DEFAULT_LEVEL = DEBUG
 # ---------------------------------------------------------------------------
 
 def _ts() -> str:
-    """Return a human-readable local timestamp: ``2026-05-16 14:30:00``."""
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    """Return the local-time ISO-8601 timestamp with explicit offset.
+
+    Example: ``2026-06-01T08:34:56-07:00`` (container TZ = America/Los_Angeles).
+
+    The container's ``TZ`` environment variable determines the wall-clock
+    zone; agents MUST set ``TZ`` in their container definitions
+    (``docker-compose-v2.yml``) so the produced offset is meaningful. The
+    emitted offset is what makes the Compass UI ``parseTimestamp`` able
+    to convert the timestamp to the viewer's local clock without
+    ambiguity: the browser knows the exact instant the line was
+    written, then renders it in whatever timezone the viewer is in.
+
+    The colon in the offset is mandatory: the JS ``parseTimestamp``
+    regex requires ``[+-]HH:MM`` (not ``[+-]HHMM``), which is the form
+    ``datetime.isoformat(timespec="seconds")`` produces.
+    """
+    # ``astimezone()`` with no argument converts a naive ``now()`` to an
+    # aware datetime in the process's local zone (driven by the ``TZ``
+    # environment variable on POSIX, the host clock on Windows). The
+    # resulting ``isoformat(timespec="seconds")`` carries the offset.
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _artifact_root() -> str:

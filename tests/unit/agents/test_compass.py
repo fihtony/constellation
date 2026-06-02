@@ -7,6 +7,7 @@ from agents.compass.agent import (
     CompassAgent,
     compass_definition,
     _classify_request,
+    _extract_office_request,
     _extract_jira_key,
     _parse_classification_payload,
 )
@@ -113,6 +114,15 @@ class TestCompassClassification:
         mock_runtime.run.return_value = {"raw_response": "development"}
         result = _classify_request("write unit tests for the user service", mock_runtime)
         assert result == "development"
+
+    def test_extract_office_request_parses_absolute_source_path_from_user_text(self):
+        request = _extract_office_request(
+            'please analyze sales data in "/Users/tony/projects/constellation/tests/data/csv", and show me the report',
+            {},
+        )
+
+        assert request["capability"] == "analyze"
+        assert request["source_paths"] == ["/Users/tony/projects/constellation/tests/data/csv"]
 
     def test_llm_fallback_returns_development_with_noise(self):
         """LLM may include extra whitespace/punctuation — still parsed correctly."""
@@ -375,7 +385,9 @@ class TestCompassTools:
         assert dispatched["metadata"]["jiraKey"] == "PROJ-123"
         assert dispatched["metadata"]["orchestratorTaskId"] == "compass-001"
         assert dispatched["metadata"]["workspacePath"] == "/tmp/workspace/compass-001"
-        assert dispatched["timeout"] == 3600
+        # Development dispatches use the configurable team-lead timeout,
+        # default 5400s (90 min) to accommodate revision rounds.
+        assert dispatched["timeout"] == 5400
 
     def test_dispatch_development_task_propagates_failed_team_lead_state(self, monkeypatch):
         from agents.compass.tools import DispatchDevelopmentTask
@@ -645,7 +657,7 @@ class TestCompassTools:
         assert launched["overrides"]["extra_binds"] == ["/host-mounted/tests/data/2026:/app/userdata/input-0/2026:ro"]
         assert launched["overrides"]["env"]["OFFICE_ALLOWED_BASE_PATHS"] == "/app/userdata/input-0/2026"
 
-    def test_office_dispatch_accepts_registry_definition_for_per_task_launch(self, monkeypatch):
+    def test_office_dispatch_accepts_registry_definition_for_per_task_launch(self, monkeypatch, tmp_path):
         from agents.compass.agent import _dispatch_office_request
 
         class StubRegistryClient:
@@ -679,6 +691,14 @@ class TestCompassTools:
             classmethod(lambda cls: StubRegistryClient()),
         )
         monkeypatch.setattr("agents.compass.agent._should_use_per_task_office_launch", lambda: True)
+        monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path))
+
+        report_dir = tmp_path / "task-123" / "office"
+        report_dir.mkdir(parents=True)
+        (report_dir / "task-report.json").write_text(
+            json.dumps({"data": {"success": True}}),
+            encoding="utf-8",
+        )
 
         result = _dispatch_office_request(
             "task-123",
@@ -689,3 +709,50 @@ class TestCompassTools:
         )
 
         assert result["status"] == "completed"
+
+    def test_office_dispatch_fails_closed_when_delivery_report_is_missing(self, monkeypatch, tmp_path):
+        from agents.compass.agent import _dispatch_office_request
+
+        class StubRegistryClient:
+            url = "http://registry:9000"
+
+            def get_capability_definition(self, capability):
+                if capability == "office.data.analyze":
+                    return {"agent_id": "office", "execution_mode": "per-task"}
+                return {}
+
+        class StubRegistry:
+            def execute_sync(self, name, arguments):
+                assert name == "dispatch_office_task"
+                return json.dumps({"status": "completed", "summary": "Office task completed."})
+
+        class StubLog:
+            def a2a(self, *args, **kwargs):
+                return None
+
+            def info(self, *args, **kwargs):
+                return None
+
+            def warn(self, *args, **kwargs):
+                return None
+
+            def error(self, *args, **kwargs):
+                return None
+
+        monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path))
+        monkeypatch.setattr(
+            "framework.registry_client.RegistryClient.from_config",
+            classmethod(lambda cls: StubRegistryClient()),
+        )
+        monkeypatch.setattr("agents.compass.agent._should_use_per_task_office_launch", lambda: True)
+
+        result = _dispatch_office_request(
+            "task-missing-report",
+            "Analyze the authorized data.",
+            {"source_paths": ["/workspace/input.csv"], "capability": "analyze", "output_mode": "workspace"},
+            StubRegistry(),
+            StubLog(),
+        )
+
+        assert result["status"] == "failed"
+        assert "task-report.json" in result["message"]

@@ -205,8 +205,19 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             loop.close()
 
     def _handle_callback(self, task_id: str, body: dict) -> None:
-        # Default: record callback metadata, write task-scoped logs, and return OK.
+        # Default: record callback metadata, write task-scoped logs, and — when
+        # the body carries a recognized terminal ``state`` — transition the
+        # local task store to match.  This is what makes fire-and-forget
+        # dispatch (e.g. compass → office) actually drive the orchestrator's
+        # task state machine: office POSTs ``{state: "completed", result: {...}}``
+        # when its workflow finishes, and the compass task flips to
+        # ``TASK_STATE_COMPLETED`` here, which the UI then renders.
         agent_id = self.agent.definition.agent_id if self.agent else "unknown"
+        state = str(body.get("state") or "").strip().lower()
+        result = body.get("result") or {}
+        if not isinstance(result, dict):
+            result = {}
+
         try:
             from framework.devlog import AgentLogger
 
@@ -214,8 +225,8 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             log.a2a(
                 "←",
                 "callback",
-                state=body.get("state", ""),
-                result_preview=str(body.get("result", ""))[:200],
+                state=state,
+                result_preview=str(result)[:200],
             )
         except Exception:
             pass
@@ -226,9 +237,42 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                 task_store.update_metadata(task_id, {"last_callback": body})
             except Exception:
                 pass
+            # Promote callback state into the task_store state machine when
+            # the body is well-formed.  Failures are logged but never block
+            # the HTTP response — the caller is fire-and-forget and the
+            # background worker (if any) is the source of truth.
+            try:
+                if state in {"completed", "succeeded", "success"}:
+                    summary = (
+                        str(result.get("summary") or "").strip()
+                        or f"{agent_id} reported completion via callback"
+                    )
+                    task_store.complete_task(task_id, message=summary)
+                elif state in {"failed", "error"}:
+                    summary = (
+                        str(result.get("summary") or result.get("message") or "").strip()
+                        or f"{agent_id} reported failure via callback"
+                    )
+                    task_store.fail_task(task_id, summary)
+                elif state in {"input-required", "input_required", "waiting"}:
+                    question = str(
+                        result.get("question")
+                        or result.get("summary")
+                        or result.get("message")
+                        or ""
+                    ).strip()
+                    task_store.pause_task(
+                        task_id,
+                        question=question or f"{agent_id} needs more input",
+                    )
+            except Exception as exc:
+                # Callback is best-effort: never 500 the caller over a
+                # promotion failure (the background worker is the real
+                # source of truth for terminal state).
+                print(f"[{agent_id}] callback state promotion failed: {exc}")
 
-        print(f"[{agent_id}] Callback received for task {task_id}")
-        self._send_json(200, {"status": "ok"})
+        print(f"[{agent_id}] Callback received for task {task_id} state={state!r}")
+        self._send_json(200, {"status": "ok", "state": state})
 
     def _handle_progress(self, task_id: str, body: dict) -> None:
         agent_id = self.agent.definition.agent_id if self.agent else "unknown"

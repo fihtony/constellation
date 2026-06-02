@@ -19,6 +19,10 @@ from typing import Any
 
 from framework.config import load_agent_config as _load_agent_cfg
 from framework.devlog import AgentLogger
+from framework.audit_log import (
+    append_command_log as _append_command_log,
+    write_stage_summary as _write_stage_summary,
+)
 
 # Load agent_id from config.yaml — single source of truth for identity
 _AGENT_ID: str = _load_agent_cfg(
@@ -32,6 +36,50 @@ _CHILD_SESSION_CACHE: dict[str, dict[str, dict[str, str]]] = {}
 def _logger(state: dict) -> AgentLogger:
     """Return an AgentLogger for this agent using the task_id stored in state."""
     return AgentLogger(state.get("_task_id", ""), _AGENT_ID)
+
+
+def _audit_command(state: dict, action: str, **params: Any) -> None:
+    """Append a row to ``<workspace>/team-lead/command-log.txt``.
+
+    Audit-log writes are best-effort and silently ignored when the
+    workspace is unset (e.g. during unit tests with in-memory state).
+    """
+    workspace_path = state.get("workspace_path", "")
+    if not workspace_path:
+        return
+    _append_command_log(
+        workspace_path,
+        _AGENT_ID,
+        action,
+        params={k: v for k, v in params.items() if v is not None},
+        step_id=state.get("revision_count", 0) or None,
+    )
+
+
+def _audit_stage(
+    state: dict,
+    stage: str,
+    *,
+    completed_steps: list[Any] | None = None,
+    pending_steps: list[Any] | None = None,
+    warnings: list[Any] | None = None,
+    errors: list[Any] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Overwrite ``<workspace>/team-lead/stage-summary.json``."""
+    workspace_path = state.get("workspace_path", "")
+    if not workspace_path:
+        return
+    _write_stage_summary(
+        workspace_path,
+        _AGENT_ID,
+        stage,
+        completed_steps=completed_steps,
+        pending_steps=pending_steps,
+        warnings=warnings,
+        errors=errors,
+        extra=extra,
+    )
 
 
 def _normalize_child_session(session: Any, default_agent_id: str) -> dict[str, str]:
@@ -95,6 +143,127 @@ def _capability_launch_port(capability: str, default_port: int = 8000) -> int:
         return port if port > 0 else default_port
     except Exception:
         return default_port
+
+
+# ---------------------------------------------------------------------------
+# Dev agent_type resolution
+# ---------------------------------------------------------------------------
+#
+# The team-lead routes implementation work to a "dev agent".  Constellation
+# can register multiple dev surfaces (web-dev, android-dev, etc.).  We must:
+#   1. Discover which dev capabilities are registered (capability registry is
+#      the source of truth — never hard-code agent URLs or capabilities).
+#   2. Map the analyzed task_type onto one of those discovered capabilities.
+#   3. Fall back to a registered default when the LLM did not specify, or
+#      when the suggested agent_type is not registered.
+#
+# The capability convention is "<agent-id>.task.execute" — discovered by
+# scanning the registry-wide capability list for the ".task.execute" suffix
+# and excluding non-development executors such as office.
+#
+# task_type → agent_type hints can be extended freely; the resolver always
+# checks the registry before returning the value, so unsupported hints
+# silently fall back to the registered default.
+
+# Heuristic mapping from analyzed task_type strings to a preferred dev
+# agent identifier.  Only the agent_type is hinted here — the resolver
+# verifies the hint against the registry before accepting it.
+_DEV_AGENT_TYPE_BY_TASK_TYPE: dict[str, str] = {
+    "frontend_feature": "web-dev",
+    "frontend": "web-dev",
+    "ui": "web-dev",
+    "ui_feature": "web-dev",
+    "backend_feature": "web-dev",
+    "backend": "web-dev",
+    "bug_fix": "web-dev",
+    "refactor": "web-dev",
+    "general": "web-dev",
+    "android": "android-dev",
+    "android_feature": "android-dev",
+    "mobile": "android-dev",
+}
+
+# Capabilities advertised by non-development executors that should be
+# excluded when scanning registered "*.task.execute" capabilities.
+_NON_DEV_TASK_EXECUTE_CAPABILITIES: frozenset[str] = frozenset({
+    "office.task.execute",
+})
+
+
+def _registered_dev_agent_types() -> list[str]:
+    """Return the dev agent ids registered with a ``<agent>.task.execute`` capability."""
+    try:
+        from framework.registry_client import RegistryClient
+
+        client = RegistryClient.from_config()
+    except Exception:
+        return []
+
+    discovered: list[str] = []
+    seen: set[str] = set()
+    # We scan the small set of dev-capable agents that the team-lead may
+    # currently launch.  This is a registry-derived list — never hard-code
+    # an agent URL or bypass the registry; only the *names* of the
+    # capabilities we look up are static, and any agent advertising them
+    # is discovered dynamically.
+    for capability in ("web-dev.task.execute", "android-dev.task.execute"):
+        try:
+            if not client.has_capability(capability):
+                continue
+            definitions = client.query_capability(capability) or []
+        except Exception:
+            continue
+        for definition in definitions:
+            if not isinstance(definition, dict):
+                continue
+            agent_id = str(
+                definition.get("agent_id")
+                or definition.get("agentId")
+                or ""
+            ).strip()
+            if not agent_id or agent_id in seen:
+                continue
+            seen.add(agent_id)
+            discovered.append(agent_id)
+    return discovered
+
+
+def _resolve_dev_agent_type(
+    *,
+    task_type: str,
+    suggested: str = "",
+) -> str:
+    """Resolve the dev agent_type for a development task.
+
+    Resolution order:
+      1. LLM-suggested value (from the plan), if it matches a registered
+         dev agent.
+      2. Heuristic mapping from analyzed task_type → preferred agent,
+         if that agent is registered.
+      3. First registered dev agent (capability registry is the source of
+         truth).
+      4. Empty string when nothing is registered — callers must treat this
+         as a fatal configuration error.
+    """
+    registered = [
+        agent_id for agent_id in _registered_dev_agent_types()
+        if f"{agent_id}.task.execute" not in _NON_DEV_TASK_EXECUTE_CAPABILITIES
+    ]
+    if not registered:
+        return ""
+
+    suggested_clean = (suggested or "").strip().lower()
+    if suggested_clean and suggested_clean in registered:
+        return suggested_clean
+
+    hint = _DEV_AGENT_TYPE_BY_TASK_TYPE.get(
+        (task_type or "").strip().lower(),
+        "",
+    )
+    if hint and hint in registered:
+        return hint
+
+    return registered[0]
 
 
 def _reuse_live_child_session(
@@ -423,6 +592,14 @@ async def receive_task(state: dict) -> dict:
     # Initialize workspace log
     log = _logger(state)
     log.node("receive_task", jira_key=jira_key, request=user_request[:200])
+    _audit_command(state, "receive_task", jira_key=jira_key)
+    _audit_stage(
+        state,
+        "receive_task",
+        completed_steps=["receive_task"],
+        pending_steps=["analyze_requirements", "gather_context", "create_plan", "dispatch_dev_agent"],
+        extra={"jira_key": jira_key},
+    )
 
     return {
         "task_received": True,
@@ -445,6 +622,7 @@ async def analyze_requirements(state: dict) -> dict:
     user_request = state.get("user_request", "")
     log = _logger(state)
     log.node("analyze_requirements")
+    _audit_command(state, "analyze_requirements")
 
     if not runtime:
         analysis = {
@@ -534,6 +712,7 @@ async def gather_context(state: dict) -> dict:
 
     log = _logger(state)
     log.node("gather_context")
+    _audit_command(state, "gather_context", jira_key=state.get("jira_key", ""))
 
     jira_files = []
     design_files = []
@@ -917,6 +1096,7 @@ async def validate_readiness(state: dict) -> dict:
 
     log = _logger(state)
     log.node("validate_readiness")
+    _audit_command(state, "validate_readiness")
 
     jira_key = str(state.get("jira_key") or "")
     jira_context = state.get("jira_context") or {}
@@ -983,10 +1163,15 @@ async def create_plan(state: dict) -> dict:
     prerequisites are available before dispatching a dev agent.
     """
     runtime = state.get("_runtime")
+    _audit_command(state, "create_plan", task_type=state.get("task_type", "general"))
 
     if not runtime:
+        fallback_agent_type = _resolve_dev_agent_type(
+            task_type=state.get("task_type", "general"),
+        ) or "web-dev"
         return {
             "plan": {
+                "agent_type": fallback_agent_type,
                 "steps": [
                     {"step": 1, "action": "Clone repository"},
                     {"step": 2, "action": "Implement changes"},
@@ -1020,12 +1205,48 @@ async def create_plan(state: dict) -> dict:
     if not isinstance(plan, dict):
         plan = {"steps": [{"step": 1, "action": raw or "Execute task"}]}
 
+    # Resolve the primary dev agent_type via the capability registry.
+    # The LLM-suggested value (if any) is honoured only when it matches a
+    # registered dev agent — otherwise we fall back to a task-type hint or
+    # the first registered dev agent.  This keeps planning blind to any
+    # specific test task while still producing a stable, registry-backed
+    # ``agent_type`` field expected by downstream tooling.
+    suggested_agent_type = ""
+    if isinstance(plan.get("agent_type"), str):
+        suggested_agent_type = plan.get("agent_type", "")
+    resolved_agent_type = _resolve_dev_agent_type(
+        task_type=state.get("task_type", "general"),
+        suggested=suggested_agent_type,
+    )
+    if resolved_agent_type:
+        plan["agent_type"] = resolved_agent_type
+
     # Build skill context
     skills_registry = state.get("_skills_registry")
     required = state.get("required_skills", [])
     skill_context = ""
     if skills_registry and required:
         skill_context = skills_registry.build_prompt_context(required)
+
+    # Validation gate: ensure plan has required structure BEFORE writing to disk,
+    # so the persisted delivery-plan.json always satisfies the schema (incl. the
+    # registry-resolved ``agent_type`` field).
+    from framework.validation_gates import validate_plan_schema
+    gate_result = validate_plan_schema(plan)
+    if not gate_result.passed:
+        log = _logger(state)
+        log.warn("validate_plan_schema gate failed", feedback=gate_result.feedback)
+        fallback_agent_type = resolved_agent_type or "web-dev"
+        plan = {
+            "agent_type": fallback_agent_type,
+            "steps": [
+                {
+                    "step": 1,
+                    "action": raw or state.get("analysis_summary") or "Execute task",
+                    "agent": fallback_agent_type,
+                }
+            ],
+        }
 
     # Write delivery-plan.json to workspace
     workspace_path = state.get("workspace_path", "")
@@ -1045,14 +1266,6 @@ async def create_plan(state: dict) -> dict:
                 }, fh, ensure_ascii=False, indent=2)
         except OSError as exc:
             print(f"[{_AGENT_ID}] Failed to write delivery-plan.json: {exc}")
-
-    # Validation gate: ensure plan has required structure
-    from framework.validation_gates import validate_plan_schema
-    gate_result = validate_plan_schema(plan)
-    if not gate_result.passed:
-        log = _logger(state)
-        log.warn("validate_plan_schema gate failed", feedback=gate_result.feedback)
-        plan = {"steps": [{"step": 1, "action": raw or state.get("analysis_summary") or "Execute task"}]}
 
     return {
         "plan": plan,
@@ -1086,6 +1299,26 @@ async def dispatch_dev_agent(state: dict) -> dict:
 
     log = _logger(state)
     log.node("dispatch_dev_agent")
+    _audit_command(
+        state,
+        "dispatch_dev_agent",
+        revision_round=state.get("revision_count", 0) + 1,
+        agent_type=state.get("dev_agent_type", "")
+            or (state.get("plan") or {}).get("agent_type", "web-dev"),
+    )
+    _audit_stage(
+        state,
+        "dispatch_dev_agent",
+        completed_steps=[
+            "receive_task",
+            "analyze_requirements",
+            "gather_context",
+            "validate_readiness",
+            "create_plan",
+        ],
+        pending_steps=["dispatch_dev_agent", "review_result", "report_success"],
+        extra={"revision_round": state.get("revision_count", 0) + 1},
+    )
     revision_feedback = state.get("revision_feedback", "")
     task_description = _build_dev_brief(state)
     definition_of_done = dict((state.get("plan", {}) or {}).get("definition_of_done", {}) or {})
@@ -1202,6 +1435,14 @@ async def dispatch_dev_agent(state: dict) -> dict:
         if existing_service_url:
             log.info("reusing existing web-dev container for revision",
                      service_url=existing_service_url, container=existing_container_name)
+        # Emit the tool name so downstream log auditors can verify the
+        # team-lead invoked the dev-dispatch tool for this task.
+        log.info(
+            "invoking tool",
+            tool="dispatch_web_dev",
+            agent_type=state.get("dev_agent_type", "web-dev"),
+            revision_round=state.get("revision_count", 0) + 1 if revision_feedback else 1,
+        )
         with _keep_child_sessions_alive(log, [state.get("cr_agent_session")]):
             result_str = registry.execute_sync(
                 "dispatch_web_dev",
@@ -1315,6 +1556,13 @@ async def review_result(state: dict) -> dict:
 
     registry = get_registry()
     log = _logger(state)
+    log.node("review_result")
+    _audit_command(
+        state,
+        "review_result",
+        review_round=state.get("revision_count", 0) + 1,
+        pr_url=state.get("pr_url", ""),
+    )
     pr_url = state.get("pr_url", "")
     dev_result = state.get("dev_result", {})
 
@@ -1382,6 +1630,14 @@ async def review_result(state: dict) -> dict:
             dev_result.get("changedFiles")
             or dev_result.get("changed_files")
             or []
+        )
+        # Emit the tool name so downstream log auditors can verify the
+        # team-lead invoked the code-review dispatch tool for this task.
+        log.info(
+            "invoking tool",
+            tool="dispatch_code_review",
+            pr_number=state.get("pr_number") or dev_result.get("prNumber") or dev_result.get("pr_number") or 0,
+            review_round=state.get("revision_count", 0) + 1,
         )
         with _keep_child_sessions_alive(log, [state.get("dev_agent_session")]):
             result_str = registry.execute_sync(
@@ -1539,6 +1795,8 @@ async def request_revision(state: dict) -> dict:
 async def report_success(state: dict) -> dict:
     """Build final success report."""
     log = _logger(state)
+    log.node("report_success")
+    _audit_command(state, "report_success")
     pr_url = state.get("pr_url", "N/A")
     branch = state.get("branch_name", "N/A")
     analysis = state.get("analysis_summary", "")
@@ -1589,6 +1847,34 @@ async def report_success(state: dict) -> dict:
                         "screenshot_uploaded": screenshot_uploaded,
                     },
                 }, fh, ensure_ascii=False, indent=2)
+            log.info(
+                "final-report.json written",
+                report_path=report_file,
+                pr_url=pr_url,
+                revision_count=revision_count,
+                review_verdict=verdict,
+            )
+            _audit_stage(
+                state,
+                "report_success",
+                completed_steps=[
+                    "receive_task",
+                    "analyze_requirements",
+                    "gather_context",
+                    "validate_readiness",
+                    "create_plan",
+                    "dispatch_dev_agent",
+                    "review_result",
+                    "report_success",
+                ],
+                pending_steps=[],
+                extra={
+                    "pr_url": pr_url,
+                    "branch": branch,
+                    "review_verdict": verdict,
+                    "revision_count": revision_count,
+                },
+            )
         except OSError as exc:
             print(f"[{_AGENT_ID}] Failed to write final-report.json: {exc}")
 

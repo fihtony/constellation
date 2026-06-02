@@ -19,6 +19,44 @@ from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
 
 
+# A development task runs through analyze → plan → implement → review with up
+# to 3 revision rounds; each round can take 15–25 minutes for a real
+# repository.  90 minutes (5400s) is the empirically observed worst-case ceiling
+# and aligns with the e2e poll timeout.  Office tasks are typically much
+# shorter (single LLM call per document), so they keep a tighter default.
+# Operators can override either via env var without touching code.
+_DEV_DISPATCH_TIMEOUT_DEFAULT_SECONDS = 5400
+_OFFICE_DISPATCH_TIMEOUT_DEFAULT_SECONDS = 1800
+
+
+def _positive_int_env(var_name: str, default_seconds: int) -> int:
+    """Return ``int(os.environ[var_name])`` if positive, else *default_seconds*."""
+    raw_value = str(os.environ.get(var_name, "")).strip()
+    if not raw_value:
+        return default_seconds
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default_seconds
+    return parsed if parsed > 0 else default_seconds
+
+
+def _dev_dispatch_timeout() -> int:
+    """Compass→team-lead A2A timeout (seconds) for development tasks."""
+    return _positive_int_env(
+        "COMPASS_DEV_DISPATCH_TIMEOUT_SECONDS",
+        _DEV_DISPATCH_TIMEOUT_DEFAULT_SECONDS,
+    )
+
+
+def _office_dispatch_timeout() -> int:
+    """Compass→office A2A timeout (seconds) for office tasks."""
+    return _positive_int_env(
+        "COMPASS_OFFICE_DISPATCH_TIMEOUT_SECONDS",
+        _OFFICE_DISPATCH_TIMEOUT_DEFAULT_SECONDS,
+    )
+
+
 def _resolve_team_lead_url() -> str:
     """Resolve the Team Lead endpoint via Registry only."""
     try:
@@ -66,8 +104,6 @@ def _is_containerized_process() -> bool:
 
 def _should_use_per_task_office_launch() -> bool:
     if os.environ.get("CONSTELLATION_FORCE_DIRECT_OFFICE_URL", "").strip().lower() in {"1", "true", "yes"}:
-        return False
-    if not _is_containerized_process():
         return False
     return bool(_office_launch_definition("summarize"))
 
@@ -277,7 +313,7 @@ def _dispatch_office_task_via_launcher(
                 "executionContract": execution_contract,
                 "permissions": permissions,
             },
-            timeout=3600,
+            timeout=_office_dispatch_timeout(),
         )
     finally:
         try:
@@ -391,7 +427,7 @@ class DispatchDevelopmentTask(BaseTool):
                 capability="team-lead.task.analyze",
                 message_parts=[{"text": task_description}],
                 metadata=meta,
-                timeout=3600,
+                timeout=_dev_dispatch_timeout(),
             )
             task = result.get("task", result)
             task_id = task.get("id", "")
@@ -526,7 +562,7 @@ class DispatchOfficeTask(BaseTool):
                 capability=_office_requested_capability(capability),
                 message_parts=[{"text": task_description}],
                 metadata=meta,
-                timeout=3600,
+                timeout=_office_dispatch_timeout(),
             )
             task = result.get("task", result)
             task_state = task.get("status", {}).get("state", "")

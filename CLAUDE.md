@@ -133,3 +133,17 @@ When encountering issues related to boundary agents (scm, ui_design, jira, etc.)
 ### Workflow
 - Improve agent code, skills, tools, instructions, and prompts — do not directly complete development tasks
 - Drive task completion through the system's workflow
+
+### Runtime & Deployment Environments
+- Always consider both execution contexts for any change to the constellation system: running the agents on a local machine and running them inside containers. Code paths, config loading, filesystem assumptions, network access, and startup logic must work in both cases. Do not introduce changes that only work in one environment.
+- Tests must run successfully on both the local machine and in containers (extends the testing principle to all artifacts, not just test code).
+
+### Boundary Agent Backend Parity
+Boundary agents (`scm`, `ui_design`, `jira`, etc.) typically integrate with multiple backends. When fixing or improving any one backend, apply the same fix to **every** other backend the agent supports. Examples:
+- **SCM agent** — GitHub MCP, GitHub REST API, and Bitbucket REST API are all valid backends. A fix for the GitHub MCP path (auth, pagination, error handling, retry, rate limiting, etc.) must be mirrored to the GitHub REST and Bitbucket REST paths so no backend is left on a known-broken or divergent code path.
+- **UI design agent** — Stitch and Figma are both valid backends. Improvements or fixes to Stitch functions must be applied to the corresponding Figma functions.
+- General rule: never leave a supported backend behind when you touch one. If a fix cannot be applied uniformly, document the gap explicitly and create a follow-up task.
+
+### Container Runtime & Network Compatibility
+- When fixing docker container issues, also verify the fix works under Rancher-managed container deployments (different orchestrators can surface different networking, DNS, and storage behaviors).
+- Some enterprise networks require customized CA certificates and some do not. Code and configuration must be compatible with both — load custom CA bundles from the standard locations when present, and fall back gracefully to system trust stores when they are absent. Do not hard-require a cert path that only exists in one environment.

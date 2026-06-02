@@ -142,6 +142,111 @@ class TestCompassUITemplates:
         assert "No task selected yet" in html
         assert "task-info-empty" in html
 
+    def test_render_ui_resume_send_keeps_current_task_selected(self):
+        html = render_compass_ui()
+        assert "state.selectedTaskId = targetTaskId;" in html
+        assert "selectTask(targetTaskId);" not in html
+
+    def test_render_ui_disables_composer_for_optimistic_placeholder_tasks(self):
+        html = render_compass_ui()
+        assert "if (t.optimistic === true) {" in html
+        assert "Request submission in progress. Please wait for Compass to respond." in html
+        assert "composerInput.placeholder = 'Submitting request...';" in html
+        assert "composerInput.dataset.mode = 'disabled';" in html
+
+    def test_render_ui_recovers_when_create_request_submission_fails(self):
+        html = render_compass_ui()
+        assert "async function fetchJsonWithTimeout(url, options, timeoutMs = 15000)" in html
+        assert "Compass did not acknowledge the request. Please retry." in html
+        assert "delete state.tasks[optimisticId];" in html
+        assert "state.selectedTaskId = NEW_REQUEST_ID;" in html
+
+    def test_render_ui_recovers_when_resume_request_submission_fails(self):
+        html = render_compass_ui()
+        assert "Failed to send reply to Compass. Please retry." in html
+        assert "targetTask.statusState = 'TASK_STATE_INPUT_REQUIRED';" in html
+        assert "targetTask.status = 'waiting';" in html
+        assert "targetTask.currentMajorStep = 'Waiting for output mode selection';" in html
+        assert "targetTask.summary = 'Waiting for output mode selection';" in html
+        assert "input.value = text;" in html
+
+    def test_render_ui_updates_office_waiting_note_when_resume_starts(self):
+        html = render_compass_ui()
+        assert "targetTask.summary = 'Office task dispatching in background';" in html
+        assert "targetTask.currentMajorStep = 'Office task dispatching in background';" in html
+
+    def test_render_ui_keeps_background_refresh_loop_even_with_sse(self):
+        html = render_compass_ui()
+        assert "taskRefreshIntervalId: null," in html
+        assert "function ensureTaskRefreshLoop()" in html
+        assert "state.taskRefreshIntervalId = setInterval(() => loadTasks(false), 5000);" in html
+        assert "ensureTaskRefreshLoop();" in html
+
+    def test_render_ui_auto_refresh_never_changes_selected_task(self):
+        """Auto-refresh (interval + SSE) must not steal focus to a waiting task.
+
+        Earlier versions hijacked ``state.selectedTaskId`` to the first task in
+        ``input-required`` whenever the user was on the New Request composer.
+        That stole focus the moment a user clicked "New Request" and started
+        typing — the next 5s refresh would yank them onto a waiting task and
+        their composer state would disappear.  ``loadTasks`` must therefore
+        NEVER auto-promote a waiting task; navigation to a waiting task is the
+        user's explicit action via the dashboard card (see the next test).
+        """
+        html = render_compass_ui()
+        # Removed hijack signatures must not reappear.
+        assert "Auto-redirect to a waiting task" not in html
+        # The old hijack scanned ``state.order`` inline inside ``loadTasks``
+        # and assigned the first waiting id to ``state.selectedTaskId``.  The
+        # explicit click path uses ``orderedTaskIds()`` instead, so the
+        # ``state.order.find`` form is the unique fingerprint of the bug.
+        assert "state.order.find(id => {" not in html
+        assert (
+            "if (state.selectedTaskId === NEW_REQUEST_ID || isOverviewSelection(state.selectedTaskId)) {"
+            not in html
+        )
+        # The only auto-adjustment that survives is the deleted-task rescue:
+        # when the previously-selected task vanishes from the server snapshot,
+        # we fall back to the newest task or the New Request composer.
+        assert (
+            "if (autoSelect && !state.tasks[state.selectedTaskId] "
+            "&& !isOverviewSelection(state.selectedTaskId) "
+            "&& state.selectedTaskId !== NEW_REQUEST_ID) {"
+        ) in html
+
+    def test_render_ui_waiting_dashboard_card_jumps_to_latest_waiting_task(self):
+        """Clicking the "Waiting for Input" dashboard card must navigate to the
+        most recent task that is still waiting for the user.  This is the only
+        place where focus moves to a waiting task — auto-refresh never does.
+        """
+        html = render_compass_ui()
+        # Selector helper exists and is invoked from a dashboard click handler.
+        assert "function selectLatestWaitingTask()" in html
+        assert "selectLatestWaitingTask();" in html
+        # The helper must scan tasks in the same order the user sees them
+        # (newest activity first) and pick the first one in 'waiting'.
+        assert "orderedTaskIds().find(id => {" in html
+        # The dashboard click handler is wired at DOMContentLoaded and uses
+        # event delegation so renderDashboard's text updates don't detach it.
+        assert "const dashboardEl = $('#dashboard');" in html
+        assert "dashboardEl.addEventListener('click', event => {" in html
+        assert "event.target.closest('.dashboard-card.waiting')" in html
+        # Visual affordance: card looks clickable.
+        assert ".dashboard-card.waiting {" in html
+        assert "cursor: pointer;" in html
+
+    def test_render_ui_promotes_stale_reply_mode_back_to_resume(self):
+        html = render_compass_ui()
+        assert "function taskNeedsResume(task)" in html
+        assert "function resolveComposerMode(mode, targetTaskId)" in html
+        assert "const effectiveMode = resolveComposerMode(mode, targetTaskId);" in html
+        assert "if ((mode === 'reply' || mode === 'resume') && taskNeedsResume(task)) return 'resume';" in html
+
+    def test_render_ui_keeps_text_when_reply_is_not_supported(self):
+        html = render_compass_ui()
+        assert "Compass is not waiting for input on this task right now." in html
+        assert "} else if (effectiveMode === 'reply' && targetTaskId) {" in html
+
     def test_render_ui_dims_non_selected_tasks_like_spec(self):
         html = render_compass_ui()
         assert ".task-list.has-selection .task-item:not(.active)" in html
@@ -226,6 +331,26 @@ class TestCompassUITemplates:
         assert "offsetMinutes * 60 * 1000" in html
         assert "const d = parseTimestamp(iso);" in html
 
+    def test_render_ui_treats_naive_timestamps_as_utc(self):
+        """Devlog emits naive "YYYY-MM-DD HH:MM:SS" in the container's UTC clock.
+        parseTimestamp must interpret that as UTC (not browser-local) so the
+        displayed local time is correct for users in any timezone.
+        """
+        html = render_compass_ui()
+        # The naive branch (no zoneToken, no offsetSign) must call Date.UTC
+        # instead of new Date(year, month, ...) which would be browser-local.
+        idx = html.index("if (!zoneToken && !offsetSign) {")
+        branch = html[idx:idx + 800]
+        assert "Date.UTC(" in branch, (
+            "Naive-timestamp branch in parseTimestamp must use Date.UTC "
+            "so UTC-emitted log lines render in the viewer's local time"
+        )
+        # Make sure the broken form is not present
+        assert "new Date(\n          Number(year)" not in branch
+        assert "new Date(" in branch  # outer Date.UTC wrap is still new Date(...)
+        # Date.UTC must appear at least twice now (offset branch + naive branch)
+        assert html.count("Date.UTC(") >= 2
+
     def test_render_ui_has_pending_timeline_marker_hollow_circle(self):
         html = render_compass_ui()
         assert ".timeline-row.pending .timeline-mark {" in html
@@ -293,3 +418,188 @@ class TestCompassUITemplates:
         html = render_compass_ui()
         assert ".detail-card.spotlight.completed {" in html
         assert ".detail-card.spotlight.failed {" in html
+
+    def test_render_ui_renders_completion_summary_as_markdown(self):
+        """The completion summary should be HTML-rendered via a markdown helper."""
+        html = render_compass_ui()
+        assert "function renderMarkdown(text)" in html
+        assert "function sanitizeMarkdownUrl(url)" in html
+        # Outcome block now uses renderMarkdown, not raw esc
+        assert "renderMarkdown(outcome.text)" in html
+        # CSS class enables markdown styling
+        assert "markdown-content" in html
+
+    def test_render_ui_markdown_supports_bold_italic_and_inline_code(self):
+        html = render_compass_ui()
+        # Bold (must come before italic so ** is not split into two *)
+        assert "\\*\\*([^*\\n]+)\\*\\*" in html
+        assert "<strong>$1</strong>" in html
+        # Italic
+        assert "<em>$2</em>" in html
+        # Inline code extraction happens before HTML escape
+        assert "`([^`\\n]+)`" in html
+        assert "<code>" in html
+
+    def test_render_ui_markdown_supports_headings_lists_and_blockquotes(self):
+        html = render_compass_ui()
+        # Headings # to ######
+        assert "^#\\s+" in html
+        assert "^##\\s+" in html
+        assert "^###\\s+" in html
+        assert "^####\\s+" in html
+        assert "^#####\\s+" in html
+        assert "^######\\s+" in html
+        # Unordered list
+        assert "[-*+]\\s+" in html
+        assert "<ul>" in html
+        assert "<li>" in html
+        # Ordered list
+        assert "\\d+\\.\\s+" in html
+        assert "<ol>" in html
+        # Blockquote
+        assert "&gt;\\s*" in html
+        assert "<blockquote>" in html
+        # Horizontal rule
+        assert "<hr>" in html
+
+    def test_render_ui_markdown_supports_links_and_strikethrough(self):
+        html = render_compass_ui()
+        # Markdown link pattern (escaped brackets in JS regex)
+        assert "\\[([^\\]\\n]+)\\]\\(" in html
+        assert "sanitizeMarkdownUrl(url)" in html
+        # Auto-link bare URLs
+        assert "https?:\\/\\/" in html
+        assert "rel=\"noopener noreferrer\"" in html
+        # Strikethrough
+        assert "~~([^~\\n]+)~~" in html
+        assert "<del>" in html
+
+    def test_render_ui_markdown_handles_fenced_code_blocks(self):
+        html = render_compass_ui()
+        # Fenced code blocks are extracted to placeholders to protect their content
+        assert "```([a-zA-Z0-9_-]*)\\n?([\\s\\S]*?)```" in html
+        # Restored as <pre><code>...</code></pre>
+        assert "<pre><code" in html
+
+    def test_render_ui_markdown_normalizes_literal_whitespace_escape_sequences(self):
+        """Completion summaries sometimes arrive with literal escape sequences
+        (backslash + n) instead of real newlines — e.g. an agent JSON-encodes
+        its output and the envelope re-encodes the already-encoded string, so
+        a real "\\n" becomes the two-character sequence backslash+n by the
+        time the browser sees it.  Without normalization, markdown headings,
+        lists, and paragraph splits never trigger because the grammar anchors
+        to real \\n line starts (the ``m`` flag and the paragraph splitter at
+        the end of renderMarkdown both depend on real \\n).
+        """
+        html = render_compass_ui()
+        # All four common literal-escape variants must be normalized.
+        assert r".replace(/\\r\\n/g, '\n')" in html
+        assert r".replace(/\\n/g, '\n')" in html
+        assert r".replace(/\\r/g, '\n')" in html
+        assert r".replace(/\\t/g, '\t')" in html
+
+    def test_render_ui_markdown_normalization_runs_after_code_extraction(self):
+        """The escape-sequence normalization must run AFTER fenced/inline code
+        blocks have been swapped out for placeholders.  Otherwise a legitimate
+        literal ``\\n`` inside code (e.g. ``print("hi\\n")``) would be turned
+        into a real newline and corrupt the code block's contents.  It must
+        also run BEFORE the ``esc(html)`` HTML-escape step so that the regex
+        is matching simple backslash + n, not HTML entities.
+        """
+        html = render_compass_ui()
+        # Inline-code extraction (must precede normalization)
+        inline_extract_pos = html.index("inlineCodes.push(code);")
+        # The first replace in the normalization chain
+        normalize_pos = html.index(r".replace(/\\r\\n/g, '\n')")
+        # HTML escape (must follow normalization)
+        esc_pos = html.index("html = esc(html);")
+        assert inline_extract_pos < normalize_pos, (
+            "Escape-sequence normalization must run after inline-code "
+            "extraction so literal \\n inside backticks is preserved"
+        )
+        assert normalize_pos < esc_pos, (
+            "Escape-sequence normalization must run before esc(html) so "
+            "the regex matches plain backslash characters, not entities"
+        )
+
+    def test_render_ui_markdown_escapes_html_before_applying_patterns(self):
+        """XSS safety: HTML must be escaped before markdown patterns are applied."""
+        html = render_compass_ui()
+        # The escape() call must come BEFORE the inline patterns (bold/italic/etc.)
+        # by appearing earlier in the source than the first <strong> replacement.
+        escape_pos = html.index("html = esc(html);")
+        strong_pos = html.index("<strong>$1</strong>")
+        assert escape_pos != -1, "HTML escape call is missing"
+        assert strong_pos != -1, "Bold replacement is missing"
+        assert escape_pos < strong_pos, (
+            "renderMarkdown must escape HTML before applying markdown patterns"
+        )
+
+    def test_render_ui_markdown_sanitizer_blocks_dangerous_protocols(self):
+        html = render_compass_ui()
+        # The sanitizer whitelists http/https/mailto only
+        assert "proto === 'http:'" in html
+        assert "proto === 'https:'" in html
+        assert "proto === 'mailto:'" in html
+        # Anything else falls back to '#'
+        assert "return '#';" in html
+
+    def test_render_ui_markdown_wraps_remaining_text_in_paragraphs(self):
+        html = render_compass_ui()
+        # Plain text blocks should be wrapped in <p>
+        assert "trimmed.replace(/\\n/g, '<br>')" in html
+        # Block elements are not re-wrapped
+        assert "h[1-6]|ul|ol|blockquote|pre|hr|p" in html
+
+    def test_render_ui_markdown_css_supports_all_rendered_elements(self):
+        """The .markdown-content container must style p, h*, lists, quotes, code, links."""
+        html = render_compass_ui()
+        assert ".markdown-content {" in html
+        assert ".markdown-content > p {" in html
+        assert ".markdown-content h1," in html
+        assert ".markdown-content h2," in html
+        assert ".markdown-content h3," in html
+        assert ".markdown-content h4," in html
+        assert ".markdown-content h5," in html
+        assert ".markdown-content h6 {" in html
+        assert ".markdown-content ul," in html
+        assert ".markdown-content ol {" in html
+        assert ".markdown-content li {" in html
+        assert ".markdown-content blockquote {" in html
+        assert ".markdown-content code {" in html
+        assert ".markdown-content pre {" in html
+        assert ".markdown-content pre code {" in html
+        assert ".markdown-content a {" in html
+        assert ".markdown-content a:hover" in html
+        assert ".markdown-content strong" in html
+        assert ".markdown-content em" in html
+        assert ".markdown-content del" in html
+        assert ".markdown-content hr {" in html
+
+    def test_render_ui_markdown_renders_gfm_tables(self):
+        """GitHub-flavored markdown tables must be rendered as <table>, not as
+        paragraphs of pipe characters.  This is what the task-completion
+        summary section relies on (e.g. summarise-documents reports a list of
+        files in a 3-column table)."""
+        html = render_compass_ui()
+        # The replacement builds <table class="markdown-table">…</table>
+        assert "table.markdown-table" in html
+        assert "<thead>" in html
+        assert "<tbody>" in html
+        assert "<th" in html
+        assert "<td" in html
+        # CSS class for styling lives in the .markdown-content block
+        assert ".markdown-content table.markdown-table" in html
+        assert ".markdown-content table.markdown-table th {" in html
+        assert ".markdown-content table.markdown-table td {" in html
+
+    def test_render_ui_markdown_table_paragraph_splitter_skips_table_block(self):
+        """The paragraph splitter must not wrap a table block in <p>.  Without
+        this, the rendered HTML would put <p><table>…</table></p> in the DOM and
+        browsers display a paragraph gap on either side of the table."""
+        html = render_compass_ui()
+        # Block-level elements including <table> are passed through as-is
+        assert "h[1-6]|ul|ol|blockquote|pre|hr|p" in html
+        assert "table" in html
+        # And the splitter trims/passes any block that starts with one of those
+        assert "if (/^<(h[1-6]|ul|ol|blockquote|pre|hr|p|table|div|article|section)\\b/" in html

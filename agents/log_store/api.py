@@ -1,18 +1,25 @@
-"""Wrapper that loads the canonical log-store API module by file path."""
+"""LogStore REST API."""
 from __future__ import annotations
+from typing import Any
 
-from importlib.util import module_from_spec, spec_from_file_location
-from pathlib import Path
+from agents.log_store.agent import LogStoreAgent
 
 
-_SOURCE = Path(__file__).resolve().parent.parent / "log-store" / "api.py"
-_SPEC = spec_from_file_location("agents._log_store_legacy_api", _SOURCE)
-if _SPEC is None or _SPEC.loader is None:
-    raise ImportError(f"Unable to load log-store API module from {_SOURCE}")
+class LogStoreAPI:
+    def __init__(self, agent: LogStoreAgent):
+        self.agent = agent
 
-_MODULE = module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_MODULE)
+    def get_logs(self, task_id: str) -> dict[str, Any]:
+        """GET /logs/{task_id}"""
+        return {
+            "task_id": task_id,
+            "logs": self.agent.get_logs_sync(task_id),
+        }
 
-LogStoreAPI = _MODULE.LogStoreAPI
+    def add_log(self, task_id: str, log_entry: dict) -> None:
+        """Internal method to add a log entry."""
+        self.agent.add_log_sync(task_id, log_entry)
 
-__all__ = ["LogStoreAPI"]
+    def health(self) -> dict[str, Any]:
+        """GET /health"""
+        return self.agent.health_sync()

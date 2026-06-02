@@ -120,6 +120,12 @@ def validate_plan_schema(plan: Any) -> ValidationResult:
             passed=False, gate_name="plan_schema",
             feedback="Plan must be a dict with 'steps' array",
         )
+    agent_type = plan.get("agent_type")
+    if not isinstance(agent_type, str) or not agent_type.strip():
+        return ValidationResult(
+            passed=False, gate_name="plan_schema",
+            feedback="Plan must declare a non-empty 'agent_type' string.",
+        )
     steps = plan.get("steps", [])
     if not steps:
         return ValidationResult(
