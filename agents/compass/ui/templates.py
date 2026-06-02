@@ -1790,8 +1790,26 @@ _INLINE_JS = r"""
     try {
       const resp = await fetch('/api/tasks');
       const data = await resp.json();
+      const previousSelectedId = state.selectedTaskId;
       replaceTaskCollection(data.tasks || []);
-      if (autoSelect && !state.tasks[state.selectedTaskId] && state.selectedTaskId !== NEW_REQUEST_ID && !isOverviewSelection(state.selectedTaskId)) {
+      // Auto-redirect to a waiting task: if any task is in INPUT_REQUIRED
+      // and the user is currently on the New Request composer, jump to
+      // that task so the resume composer is visible. This eliminates the
+      // "I replied but it blocked" failure mode where the user types a
+      // short answer like "workspace" into the New Request composer
+      // because they didn't notice the task's composer is a different
+      // place. We do NOT steal focus from an explicitly-selected task
+      // that the user is actively inspecting (e.g. a completed task).
+      if (state.selectedTaskId === NEW_REQUEST_ID || isOverviewSelection(state.selectedTaskId)) {
+        const waitingId = state.order.find(id => {
+          const t = state.tasks[id];
+          return t && statusKindOf(t.statusState || t.status) === 'waiting';
+        });
+        if (waitingId) {
+          state.selectedTaskId = waitingId;
+          await loadTaskDetail(waitingId);
+        }
+      } else if (autoSelect && !state.tasks[state.selectedTaskId] && !isOverviewSelection(state.selectedTaskId)) {
         state.selectedTaskId = state.order[0] || NEW_REQUEST_ID;
       }
       if (state.selectedTaskId !== NEW_REQUEST_ID && !isOverviewSelection(state.selectedTaskId) && state.tasks[state.selectedTaskId]) {
@@ -2456,8 +2474,18 @@ _INLINE_JS = r"""
       }
     });
     $('#composer-send').addEventListener('click', sendComposer);
+    // Send on Enter; allow Shift+Enter for a newline inside the composer.
+    // The previous implementation required Cmd/Ctrl+Enter which silently
+    // dropped plain-Enter submissions — users who typed a one-word reply
+    // like "workspace" and pressed Enter thought the message had been
+    // sent but the request never left the browser, so the task stayed
+    // stuck in TASK_STATE_INPUT_REQUIRED. Plain Enter (or the Send
+    // button) is now the universal send gesture.
     $('#composer-input').addEventListener('keydown', ev => {
-      if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); sendComposer(); }
+      if (ev.key === 'Enter' && !ev.shiftKey) {
+        ev.preventDefault();
+        sendComposer();
+      }
     });
     loadTasks(true);
     subscribeTaskEvents();

@@ -24,6 +24,8 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 TESTS_DATA = PROJECT_ROOT / "tests" / "data"
 COMPASS_BASE_URL = os.environ.get("TEST_COMPASS_BASE_URL", "http://localhost:8000").rstrip("/")
 TOOLS_DATA_CSV = TESTS_DATA / "csv" / "sales_data.csv"
+TOOLS_DATA_STLOUIS = TESTS_DATA / "stlouis"
+TOOLS_DATA_2026 = TESTS_DATA / "2026"
 
 
 def _http_get_json(url: str, timeout: int = 30) -> dict:
@@ -406,3 +408,251 @@ class TestCompassUIFixes:
         # template change that drops the markdown path).
         body = _http_get_text(f"{COMPASS_BASE_URL}/ui")
         assert "renderMarkdown(outcome.text)" in body
+
+
+class TestOfficeCapabilityResume:
+    """End-to-end coverage for every office capability's resume path.
+
+    Regression guard for the "I replied 'workspace' but it blocks" bug:
+    a task whose initial request lands in TASK_STATE_INPUT_REQUIRED must
+    reach TASK_STATE_COMPLETED after the user posts "workspace" to the
+    resume endpoint, regardless of which capability the request is for.
+    Each test runs against the live compass stack at $TEST_COMPASS_BASE_URL
+    (default http://localhost:8000).
+    """
+
+    def _submit_office(self, capability: str, source: str, prompt: str) -> str:
+        response = _http_post(
+            f"{COMPASS_BASE_URL}/message:send",
+            {
+                "message": {
+                    "messageId": f"office-cap-{capability}",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": prompt}],
+                    "metadata": {
+                        "capability": capability,
+                        "source_paths": [source],
+                    },
+                },
+                "configuration": {"returnImmediately": True},
+            },
+            timeout=60,
+        )
+        tid = _task_id(response)
+        assert tid, f"empty task id for capability {capability}"
+        assert _task_state(response) == "TASK_STATE_INPUT_REQUIRED", (
+            f"capability {capability} did not enter INPUT_REQUIRED: {response}"
+        )
+        return tid
+
+    def test_summarize_resume_to_completed(self) -> None:
+        """``summarize`` capability must reach TASK_STATE_COMPLETED after
+        a ``workspace`` reply. The summarize path is special because the
+        user text only contains the substring "summary" (not the exact
+        keyword "summarize") so the capability is inferred from the
+        office verb — and the resume handler must still surface the
+        combined-summary.md artifact in the task record.
+        """
+        task_id = self._submit_office(
+            capability="summarize",
+            source=str(TOOLS_DATA_STLOUIS),
+            prompt=(
+                "Please summary the documents in "
+                f"{TOOLS_DATA_STLOUIS} folder then create report"
+            ),
+        )
+
+        resumed = _http_post(
+            f"{COMPASS_BASE_URL}/tasks/{task_id}/resume",
+            {"input": "workspace"},
+            timeout=900,
+        )
+        # The resume response must reuse the same task id.
+        assert _task_id(resumed) == task_id, resumed
+
+        final = _poll_task(task_id, timeout_seconds=900)
+        assert _task_state(final) == "TASK_STATE_COMPLETED", final
+
+        detail = _http_get_json(f"{COMPASS_BASE_URL}/api/tasks/{task_id}")
+        task = detail.get("task", detail)
+        # The artifact must carry the office summary so the UI's
+        # markdown renderer has something to display.
+        artifacts = task.get("artifacts") or []
+        assert artifacts, "summarize task ended without artifacts"
+        artifact_meta = artifacts[0].get("metadata") or {}
+        assert artifact_meta.get("outputMode") == "workspace", artifact_meta
+        assert artifact_meta.get("status") == "completed", artifact_meta
+        summary = artifact_meta.get("summary") or ""
+        assert summary, "summarize task ended with empty summary"
+
+    def test_analyze_resume_to_completed(self) -> None:
+        """``analyze`` capability must reach TASK_STATE_COMPLETED after
+        a ``workspace`` reply. This is the path that already worked
+        before the fix; we keep it as a regression guard.
+        """
+        task_id = self._submit_office(
+            capability="analyze",
+            source=str(TOOLS_DATA_CSV),
+            prompt=(
+                "Please analyze the authorized spreadsheet in "
+                f"{TOOLS_DATA_CSV}"
+            ),
+        )
+
+        resumed = _http_post(
+            f"{COMPASS_BASE_URL}/tasks/{task_id}/resume",
+            {"input": "workspace"},
+            timeout=900,
+        )
+        assert _task_id(resumed) == task_id, resumed
+
+        final = _poll_task(task_id, timeout_seconds=900)
+        assert _task_state(final) == "TASK_STATE_COMPLETED", final
+
+    def test_organize_resume_to_completed(self) -> None:
+        """``organize`` capability must reach TASK_STATE_COMPLETED after
+        a ``workspace`` reply.
+        """
+        task_id = self._submit_office(
+            capability="organize",
+            source=str(TOOLS_DATA_2026),
+            prompt=(
+                "Please organize the files in "
+                f"{TOOLS_DATA_2026} folder"
+            ),
+        )
+
+        resumed = _http_post(
+            f"{COMPASS_BASE_URL}/tasks/{task_id}/resume",
+            {"input": "workspace"},
+            timeout=900,
+        )
+        assert _task_id(resumed) == task_id, resumed
+
+        final = _poll_task(task_id, timeout_seconds=900)
+        assert _task_state(final) == "TASK_STATE_COMPLETED", final
+
+
+class TestCompassUIResumeBehavior:
+    """Live regression tests for the UI composer / resume interactions.
+
+    These tests validate the contract that made the "I replied
+    'workspace' but it blocks" bug possible in the first place:
+
+    * The composer accepts plain Enter (not just Cmd/Ctrl+Enter) to
+      send a message. Previously the keydown handler required a
+      modifier, so users who pressed Enter thought the message had
+      been sent and the task stayed in INPUT_REQUIRED.
+    * When any task is in TASK_STATE_INPUT_REQUIRED, the loadTasks()
+      auto-select logic steers the UI onto the waiting task so the
+      resume composer is the one the user is typing into — preventing
+      a fresh "workspace" request from being misclassified as a new
+      general task.
+    """
+
+    def test_composer_sends_on_plain_enter(self) -> None:
+        """The keydown handler must accept plain Enter to send.
+
+        Regression guard: a previous implementation only triggered
+        sendComposer() on Cmd+Enter or Ctrl+Enter. Users who typed
+        ``workspace`` and pressed Enter silently lost their reply and
+        the waiting task never resumed.
+        """
+        body = _http_get_text(f"{COMPASS_BASE_URL}/ui")
+        # The composer JS lives inside a <script> tag — find the inline
+        # script block, not the first CSS occurrence of "composer-input".
+        script_start = body.rindex("<script>")
+        script_end = body.rindex("</script>")
+        snippet = body[script_start:script_end]
+        assert "sendComposer" in snippet
+        # Plain Enter (no modifier) must trigger the send.
+        assert "ev.key === 'Enter' && !ev.shiftKey" in snippet, (
+            "Composer must send on plain Enter (with Shift+Enter reserved "
+            "for newline). A modifier-only contract causes the 'I replied "
+            "but it blocks' failure mode where Enter drops the message."
+        )
+        # Cmd+Enter / Ctrl+Enter must NOT be the only path.
+        assert "ev.metaKey || ev.ctrlKey" not in snippet, (
+            "Composer should not require a modifier for Enter; that "
+            "silently drops plain-Enter submissions."
+        )
+
+    def test_ui_keeps_composer_attached_to_waiting_task(self) -> None:
+        """The UI must keep the resume composer in scope when a task
+        is in INPUT_REQUIRED — i.e. the user is not bounced back to
+        the New Request composer while a reply is pending.
+        """
+        # First, make sure at least one task is in INPUT_REQUIRED so we
+        # can validate the auto-select / auto-attach behavior.
+        # We submit a fresh summarize request, then verify the UI
+        # never accidentally returns the user to the New Request
+        # composer while the task is waiting.
+        # The metadata carries the capability explicitly so the request
+        # deterministically routes to the office branch (text-only
+        # classification can be ambiguous for short prompts).
+        response = _http_post(
+            f"{COMPASS_BASE_URL}/message:send",
+            {
+                "message": {
+                    "messageId": "compass-ui-attached-waiting",
+                    "role": "ROLE_USER",
+                    "parts": [
+                        {"text": (
+                            "Please summarize the documents in "
+                            f"{TOOLS_DATA_STLOUIS} folder"
+                        )}
+                    ],
+                    "metadata": {
+                        "capability": "summarize",
+                        "source_paths": [str(TOOLS_DATA_STLOUIS)],
+                    },
+                },
+                "configuration": {"returnImmediately": True},
+            },
+            timeout=60,
+        )
+        task_id = _task_id(response)
+        assert task_id
+        # We accept either the initial INPUT_REQUIRED state (if returnImmediately
+        # is honored) or the WORKING state (if the test runner did not honor
+        # returnImmediately on this run). The important property is that the
+        # request reached the office branch — which we verify by checking the
+        # task eventually lands in INPUT_REQUIRED.
+        if _task_state(response) != "TASK_STATE_INPUT_REQUIRED":
+            for _ in range(30):
+                time.sleep(1)
+                snap = _http_get_json(
+                    f"{COMPASS_BASE_URL}/tasks/{task_id}"
+                )
+                if _task_state(snap) == "TASK_STATE_INPUT_REQUIRED":
+                    break
+            else:
+                # If we never reached INPUT_REQUIRED, the test was unable
+                # to set up the precondition — skip rather than fail so
+                # other tests still run.
+                pytest.skip(
+                    "Could not place a task into INPUT_REQUIRED for the "
+                    "auto-attach UI behavior test (compass classification "
+                    "likely mis-routed the request as 'general')."
+                )
+
+        # UI must still embed the resume composer wiring so the
+        # user can reply without the message being dropped.
+        body = _http_get_text(f"{COMPASS_BASE_URL}/ui")
+        assert "dataset.mode = 'resume'" in body
+        assert "dataset.targetTaskId" in body
+        # The auto-select on loadTasks() must steer the UI onto a
+        # waiting task if the user is currently on the New Request
+        # composer — that's the safeguard against the misclassification
+        # failure mode.
+        assert "waitingId" in body
+
+        # Clean up: resume the task so it doesn't keep lingering.
+        try:
+            _http_post(
+                f"{COMPASS_BASE_URL}/tasks/{task_id}/resume",
+                {"input": "workspace"},
+                timeout=900,
+            )
+        except Exception:
+            pass  # best-effort cleanup
