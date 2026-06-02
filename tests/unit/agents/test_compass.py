@@ -385,7 +385,9 @@ class TestCompassTools:
         assert dispatched["metadata"]["jiraKey"] == "PROJ-123"
         assert dispatched["metadata"]["orchestratorTaskId"] == "compass-001"
         assert dispatched["metadata"]["workspacePath"] == "/tmp/workspace/compass-001"
-        assert dispatched["timeout"] == 3600
+        # Development dispatches use the configurable team-lead timeout,
+        # default 5400s (90 min) to accommodate revision rounds.
+        assert dispatched["timeout"] == 5400
 
     def test_dispatch_development_task_propagates_failed_team_lead_state(self, monkeypatch):
         from agents.compass.tools import DispatchDevelopmentTask

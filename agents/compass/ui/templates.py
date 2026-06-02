@@ -169,6 +169,15 @@ body {
 .dashboard-card.total span { color: var(--accent-strong); }
 .dashboard-card.waiting strong,
 .dashboard-card.waiting span { color: rgba(212, 152, 36, 0.98); }
+.dashboard-card.waiting {
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+}
+.dashboard-card.waiting:hover {
+  background: rgba(38, 53, 66, 0.92);
+  border-color: rgba(212, 152, 36, 0.42);
+  transform: translateY(-1px);
+}
 .dashboard-card.active strong,
 .dashboard-card.active span { color: rgba(34, 147, 173, 0.98); }
 .dashboard-card.done strong,
@@ -725,6 +734,43 @@ body {
   border: none;
   border-top: 1px solid rgba(145, 171, 189, 0.1);
 }
+.markdown-content table.markdown-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  border: 1px solid rgba(145, 171, 189, 0.14);
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(8, 14, 22, 0.42);
+  table-layout: auto;
+}
+.markdown-content table.markdown-table thead {
+  background: rgba(147, 198, 208, 0.10);
+}
+.markdown-content table.markdown-table th {
+  padding: 8px 12px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--ink);
+  border-bottom: 1px solid rgba(145, 171, 189, 0.22);
+  white-space: normal;
+  word-break: break-word;
+}
+.markdown-content table.markdown-table td {
+  padding: 6px 12px;
+  border-bottom: 1px solid rgba(145, 171, 189, 0.08);
+  color: var(--ink);
+  white-space: normal;
+  word-break: break-word;
+  vertical-align: top;
+}
+.markdown-content table.markdown-table tr:last-child td {
+  border-bottom: none;
+}
+.markdown-content table.markdown-table tbody tr:hover {
+  background: rgba(147, 198, 208, 0.05);
+}
 .detail-head-tag {
   display: inline-flex;
   align-items: center;
@@ -1276,12 +1322,71 @@ _INLINE_JS = r"""
     order: [],   // task_ids newest-first
     logsByTask: {},
     logEventSources: {},
+    taskRefreshIntervalId: null,
     phaseExpandedByTask: {},
     filters: { agent: 'all', level: 'all' },
     openLogFilter: null,
+    composerNote: '',
   };
 
   function $(sel) { return document.querySelector(sel); }
+  function renderComposerNote(el, fallbackText = '') {
+    if (!el) return;
+    const text = String(state.composerNote || fallbackText || '').trim();
+    el.textContent = text;
+    el.style.display = text ? 'block' : 'none';
+  }
+  function clearComposerNote() {
+    state.composerNote = '';
+  }
+
+  function ensureTaskRefreshLoop() {
+    if (state.taskRefreshIntervalId) return;
+    // Keep a low-rate full-list refresh running even when SSE appears healthy.
+    // Long-lived browser tabs sometimes stop receiving task.completed/task.failed
+    // events without surfacing an EventSource error, which leaves the list stuck
+    // in "In Progress" until the user manually refreshes the page.
+    state.taskRefreshIntervalId = setInterval(() => loadTasks(false), 5000);
+  }
+
+  function taskNeedsResume(task) {
+    if (!task) return false;
+    const kind = statusKindOf(task.statusState || task.status);
+    if (kind === 'waiting') return true;
+    const metadata = task.metadata || {};
+    if (metadata && metadata._interrupt) return true;
+    const history = Array.isArray(task.chatHistory) ? task.chatHistory : [];
+    const last = history[history.length - 1];
+    return !!(last && String(last.tone || '').toLowerCase() === 'input-required');
+  }
+
+  function resolveComposerMode(mode, targetTaskId) {
+    const task = targetTaskId ? state.tasks[targetTaskId] : null;
+    if ((mode === 'reply' || mode === 'resume') && taskNeedsResume(task)) return 'resume';
+    return mode;
+  }
+  async function fetchJsonWithTimeout(url, options, timeoutMs = 15000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { ...(options || {}), signal: controller.signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return await response.json();
+    } catch (error) {
+      if (error && error.name === 'AbortError') {
+        throw new Error(`Request timed out after ${timeoutMs}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  function discardOptimisticTask(taskId) {
+    if (!taskId) return;
+    delete state.tasks[taskId];
+    state.order = state.order.filter(id => id !== taskId);
+    if (state.selectedTaskId === taskId) state.selectedTaskId = NEW_REQUEST_ID;
+  }
   function esc(s) {
     if (s === null || s === undefined) return '';
     return String(s).replace(/[&<>"']/g, c =>
@@ -1305,6 +1410,23 @@ _INLINE_JS = r"""
       inlineCodes.push(code);
       return 'ZQXIC' + idx + 'ZQX';
     });
+    // Normalize literal escape sequences that arrive from upstream sources.
+    // Some agents serialise their completion summary by JSON-encoding a
+    // python string into another JSON envelope, so a real "\n" becomes the
+    // two-character sequence backslash + n by the time it reaches the
+    // browser ("Folder Organization Complete\n\n## Discovered Patterns…"
+    // arrives as one unbroken line where the heading and list never start
+    // at column 0).  Markdown grammar (headings, lists, paragraph splits,
+    // blockquotes, tables) all anchor to real \n / line starts via the
+    // ``m`` flag, so without this step those summaries render as a single
+    // blob of plain text with "## Heading" and "- item" showing inline.
+    // Code blocks and inline code were extracted into placeholders above,
+    // so a legitimate literal "\n" inside ``print("hi\n")`` is preserved.
+    html = html
+      .replace(/\\r\\n/g, '\n')
+      .replace(/\\n/g, '\n')
+      .replace(/\\r/g, '\n')
+      .replace(/\\t/g, '\t');
     html = esc(html);
     html = html.replace(/^[\s]*(?:[-]{3,}|[\*]{3,}|[_]{3,})[\s]*$/gm, '<hr>');
     html = html.replace(/^######\s+(.*)$/gm, '<h6>$1</h6>');
@@ -1343,6 +1465,63 @@ _INLINE_JS = r"""
       const safeUrl = sanitizeMarkdownUrl(url);
       return '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' + url + '</a>';
     });
+    // GitHub-flavored markdown tables: a header row, a separator row, and one
+    // or more data rows.  Must be parsed BEFORE the paragraph splitter below
+    // — otherwise each row would be wrapped in <p> and the `|---|` separator
+    // would leak into the rendered text.  Cell contents are NOT re-escaped
+    // here; the earlier ``html = esc(html);`` call already neutralized raw
+    // HTML inside cells.  Inline-code / code-block placeholders
+    // (``ZQXICnZQX`` / ``ZQXCBnZQX``) are still live and will be restored by
+    // the placeholder replacers that follow.
+    //
+    // The regex is deliberately explicit about the four pieces (prefix, header
+    // row, separator row, data rows) so the separator row is consumed by
+    // group 3, not group 2, which would otherwise eat it via ``[^\n]*`` and
+    // prevent the table from being detected.
+    html = html.replace(
+      /(^|\n)(\|[^\n]*\|[ \t]*\n)(\|[\s:|-]+\|[ \t]*\n)((?:\|[^\n]*\|[ \t]*\n?)+)/g,
+      function (m, prefix, headerLine, sep, rows) {
+        const headerCells = headerLine
+          .replace(/\|[ \t]*\n?$/, '')
+          .split('|')
+          .slice(1)
+          .map(function (c) { return c.trim(); });
+        const dataLines = rows.split('\n').filter(function (l) { return l.trim(); });
+        // parse alignment from the separator row
+        const sepCells = sep
+          .replace(/^\|/, '')
+          .replace(/\|[ \t]*\n?$/, '')
+          .split('|');
+        const aligns = sepCells.map(function (c) {
+          const t = c.trim();
+          if (/^:-+:$/.test(t)) return 'center';
+          if (/^-+:$/.test(t)) return 'right';
+          if (/^:-+$/.test(t)) return 'left';
+          return '';
+        });
+        let out = '<table class="markdown-table"><thead><tr>';
+        headerCells.forEach(function (cell, i) {
+          const align = aligns[i] ? ' style="text-align:' + aligns[i] + '"' : '';
+          out += '<th' + align + '>' + cell + '</th>';
+        });
+        out += '</tr></thead><tbody>';
+        dataLines.forEach(function (row) {
+          const cells = row
+            .replace(/\|[ \t]*$/, '')
+            .split('|')
+            .slice(1)
+            .map(function (c) { return c.trim(); });
+          out += '<tr>';
+          cells.forEach(function (cell, i) {
+            const align = aligns[i] ? ' style="text-align:' + aligns[i] + '"' : '';
+            out += '<td' + align + '>' + cell + '</td>';
+          });
+          out += '</tr>';
+        });
+        out += '</tbody></table>';
+        return prefix + out + '\n';
+      }
+    );
     html = html.replace(/ZQXCB(\d+)ZQX/g, function (m, idx) {
       const block = codeBlocks[Number(idx)];
       if (!block) return '';
@@ -1792,24 +1971,15 @@ _INLINE_JS = r"""
       const data = await resp.json();
       const previousSelectedId = state.selectedTaskId;
       replaceTaskCollection(data.tasks || []);
-      // Auto-redirect to a waiting task: if any task is in INPUT_REQUIRED
-      // and the user is currently on the New Request composer, jump to
-      // that task so the resume composer is visible. This eliminates the
-      // "I replied but it blocked" failure mode where the user types a
-      // short answer like "workspace" into the New Request composer
-      // because they didn't notice the task's composer is a different
-      // place. We do NOT steal focus from an explicitly-selected task
-      // that the user is actively inspecting (e.g. a completed task).
-      if (state.selectedTaskId === NEW_REQUEST_ID || isOverviewSelection(state.selectedTaskId)) {
-        const waitingId = state.order.find(id => {
-          const t = state.tasks[id];
-          return t && statusKindOf(t.statusState || t.status) === 'waiting';
-        });
-        if (waitingId) {
-          state.selectedTaskId = waitingId;
-          await loadTaskDetail(waitingId);
-        }
-      } else if (autoSelect && !state.tasks[state.selectedTaskId] && !isOverviewSelection(state.selectedTaskId)) {
+      // Auto-refresh MUST NOT change which task the user is looking at.
+      // Earlier versions hijacked the selection to a waiting task whenever
+      // the user was on the New Request composer, which silently stole
+      // focus the moment a user clicked "New Request" and started typing.
+      // Users now navigate to a waiting task explicitly by clicking the
+      // "Waiting for Input" dashboard card (see selectLatestWaitingTask).
+      // The only auto-adjustment we still make is rescuing the selection
+      // when the previously-selected task has been removed from the list.
+      if (autoSelect && !state.tasks[state.selectedTaskId] && !isOverviewSelection(state.selectedTaskId) && state.selectedTaskId !== NEW_REQUEST_ID) {
         state.selectedTaskId = state.order[0] || NEW_REQUEST_ID;
       }
       if (state.selectedTaskId !== NEW_REQUEST_ID && !isOverviewSelection(state.selectedTaskId) && state.tasks[state.selectedTaskId]) {
@@ -1884,14 +2054,37 @@ _INLINE_JS = r"""
   function selectTask(tid) {
     if (!tid) return;
     if (tid === state.selectedTaskId && tid !== NEW_REQUEST_ID) {
+      clearComposerNote();
       state.selectedTaskId = OVERVIEW_ID;
       renderTaskList(); renderChat(); renderDetail();
       return;
     }
+    clearComposerNote();
     state.selectedTaskId = tid;
     renderTaskList(); renderChat(); renderDetail();
     if (tid !== NEW_REQUEST_ID && !isOverviewSelection(tid)) subscribeLogs(tid);
     loadTaskDetail(tid).then(() => {
+      renderTaskList(); renderChat(); renderDetail();
+    });
+  }
+
+  // Explicit jump from the dashboard "Waiting for Input" card to the most
+  // recent task that is still waiting for the user. Auto-refresh no longer
+  // moves selection on its own (it would steal focus from someone typing
+  // a new request); this handler is the user-initiated way to reach a
+  // waiting task quickly. No-op if no waiting task exists.
+  function selectLatestWaitingTask() {
+    const waitingId = orderedTaskIds().find(id => {
+      const t = state.tasks[id];
+      return t && statusKindOf(t.statusState || t.status) === 'waiting';
+    });
+    if (!waitingId) return;
+    if (waitingId === state.selectedTaskId) return;
+    clearComposerNote();
+    state.selectedTaskId = waitingId;
+    renderTaskList(); renderChat(); renderDetail();
+    subscribeLogs(waitingId);
+    loadTaskDetail(waitingId).then(() => {
       renderTaskList(); renderChat(); renderDetail();
     });
   }
@@ -1905,7 +2098,7 @@ _INLINE_JS = r"""
 
     if (tid === NEW_REQUEST_ID || isOverviewSelection(tid)) {
       scroll.innerHTML = `<div class="empty-state">${tid === NEW_REQUEST_ID ? 'Send a request to create a new Compass task.' : 'Select a task to inspect it, or send a new request.'}</div>`;
-      composerNote.style.display = 'none';
+      renderComposerNote(composerNote);
       composerInput.disabled = false;
       composerInput.placeholder = 'Describe a new task...';
       composerSend.disabled = false;
@@ -1941,18 +2134,29 @@ _INLINE_JS = r"""
     }
     scroll.scrollTop = scroll.scrollHeight;
 
+    if (t.optimistic === true) {
+      renderComposerNote(composerNote, 'Request submission in progress. Please wait for Compass to respond.');
+      composerInput.disabled = true;
+      composerSend.disabled = true;
+      composerSend.textContent = 'Send';
+      composerInput.placeholder = 'Submitting request...';
+      composerInput.dataset.mode = 'disabled';
+      composerInput.dataset.targetTaskId = '';
+      return;
+    }
+
     const kind = statusKindOf(t.statusState || t.status);
     const isWaiting = kind === 'waiting';
     composerInput.disabled = false;
     composerSend.textContent = 'Send';
     if (isWaiting) {
-      composerNote.style.display = 'none';
+      renderComposerNote(composerNote);
       composerInput.placeholder = `Reply to ${tid}...`;
       composerSend.disabled = false;
       composerInput.dataset.mode = 'resume';
       composerInput.dataset.targetTaskId = tid;
     } else {
-      composerNote.style.display = 'none';
+      renderComposerNote(composerNote);
       const terminal = (kind === 'completed' || kind === 'failed');
       composerInput.disabled = terminal;
       composerSend.disabled = terminal;
@@ -2380,6 +2584,7 @@ _INLINE_JS = r"""
   }
 
   function subscribeTaskEvents() {
+    ensureTaskRefreshLoop();
     try {
       const es = new EventSource('/ui/events');
       es.addEventListener('task.snapshot', ev => {
@@ -2397,9 +2602,7 @@ _INLINE_JS = r"""
       es.addEventListener('task.failed', refresh);
       es.addEventListener('task.resumed', refresh);
       es.onerror = () => { es.close(); setTimeout(subscribeTaskEvents, 5000); };
-    } catch (e) {
-      setInterval(() => loadTasks(false), 5000);
-    }
+    } catch (e) { /* fallback loop already armed */ }
   }
 
   // Short-poll a single task until it reaches a terminal state or the
@@ -2433,30 +2636,39 @@ _INLINE_JS = r"""
     if (!text) return;
     const mode = input.dataset.mode || 'create';
     const targetTaskId = input.dataset.targetTaskId || '';
-    input.value = '';
-    if (mode === 'create') {
+    const effectiveMode = resolveComposerMode(mode, targetTaskId);
+    if (effectiveMode === 'create') {
+      input.value = '';
+      clearComposerNote();
       const optimisticTask = createOptimisticTask(text);
       const optimisticId = optimisticTask.task_id;
       state.tasks[optimisticTask.task_id] = optimisticTask;
       if (!state.order.includes(optimisticTask.task_id)) state.order.unshift(optimisticTask.task_id);
       state.selectedTaskId = optimisticTask.task_id;
       renderTaskList(); renderChat(); renderDetail();
-      const r = await fetch('/message:send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: { role: 'ROLE_USER', parts: [{ text }] },
-          configuration: { returnImmediately: true },
-        }),
-      });
-      const data = await r.json();
+      let data;
+      try {
+        data = await fetchJsonWithTimeout('/message:send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: { role: 'ROLE_USER', parts: [{ text }] },
+            configuration: { returnImmediately: true },
+          }),
+        });
+      } catch (e) {
+        discardOptimisticTask(optimisticId);
+        state.selectedTaskId = NEW_REQUEST_ID;
+        state.composerNote = 'Compass did not acknowledge the request. Please retry.';
+        renderTaskList(); renderChat(); renderDetail();
+        return;
+      }
       const newId = (data.task && data.task.id) || (data.ui_update && data.ui_update.task_id);
       if (newId) promoteOptimisticTask(optimisticTask.task_id, newId);
       // Pull the latest snapshot so the optimistic placeholder is replaced with
       // the real task before the user sees the final list state.
       try {
-        const snapResp = await fetch('/api/tasks');
-        const snapData = await snapResp.json();
+        const snapData = await fetchJsonWithTimeout('/api/tasks', {}, 5000);
         replaceTaskCollection(snapData.tasks || []);
       } catch (e) { /* fall through to loadTasks */ }
       // Always land on the real task id once we have one — even if the
@@ -2482,7 +2694,9 @@ _INLINE_JS = r"""
         state.order = state.order.filter(id => !id.startsWith('__optimistic_'));
       }
       renderTaskList(); renderChat(); renderDetail();
-    } else if (mode === 'resume' && targetTaskId) {
+    } else if (effectiveMode === 'resume' && targetTaskId) {
+      input.value = '';
+      clearComposerNote();
       const targetTask = state.tasks[targetTaskId];
       if (targetTask) {
         // Optimistically flip the task-status badge to "In Progress" so the
@@ -2505,19 +2719,38 @@ _INLINE_JS = r"""
         // snapshot to land is negligible.
         targetTask.statusState = 'TASK_STATE_WORKING';
         targetTask.status = 'active';
-        renderChat();
+        targetTask.summary = 'Office task dispatching in background';
+        targetTask.currentMajorStep = 'Office task dispatching in background';
+        renderTaskList(); renderChat(); renderDetail();
       }
-      await fetch(`/tasks/${encodeURIComponent(targetTaskId)}/resume`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: text }),
-      });
+      try {
+        await fetchJsonWithTimeout(`/tasks/${encodeURIComponent(targetTaskId)}/resume`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ input: text }),
+        });
+      } catch (e) {
+        if (targetTask) {
+          targetTask.statusState = 'TASK_STATE_INPUT_REQUIRED';
+          targetTask.status = 'waiting';
+          targetTask.summary = 'Waiting for output mode selection';
+          targetTask.currentMajorStep = 'Waiting for output mode selection';
+        }
+        input.value = text;
+        state.composerNote = 'Failed to send reply to Compass. Please retry.';
+        renderTaskList(); renderChat(); renderDetail();
+        return;
+      }
       // ``loadTasks(false)`` is awaited so the server-side ``chat_history``
       // (which now includes the resume value as a USER entry) is in place
       // before we re-render.  We do NOT re-push the optimistic message —
       // the server's record is the authoritative copy and would be a
       // duplicate if added again.
-      await loadTasks(false);
+      try {
+        await loadTasks(false);
+      } catch (e) {
+        try { await loadTaskDetail(targetTaskId); } catch (_ignored) {}
+      }
       state.selectedTaskId = targetTaskId;
       renderTaskList(); renderChat(); renderDetail();
       // Fire-and-forget fast-poll: the resume POST returns almost immediately
@@ -2536,6 +2769,9 @@ _INLINE_JS = r"""
         try { await loadTasks(false); } catch (e) { /* fall through */ }
         renderTaskList(); renderChat(); renderDetail();
       });
+    } else if (effectiveMode === 'reply' && targetTaskId) {
+      state.composerNote = 'Compass is not waiting for input on this task right now.';
+      renderTaskList(); renderChat(); renderDetail();
     }
   }
 
@@ -2546,6 +2782,15 @@ _INLINE_JS = r"""
         renderLogs();
       }
     });
+    const dashboardEl = $('#dashboard');
+    if (dashboardEl) {
+      dashboardEl.addEventListener('click', event => {
+        const waitingCard = event.target.closest('.dashboard-card.waiting');
+        if (waitingCard) {
+          selectLatestWaitingTask();
+        }
+      });
+    }
     $('#composer-send').addEventListener('click', sendComposer);
     // Send on Enter; allow Shift+Enter for a newline inside the composer.
     // The previous implementation required Cmd/Ctrl+Enter which silently
