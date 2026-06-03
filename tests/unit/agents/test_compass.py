@@ -121,7 +121,8 @@ class TestCompassTimelineSkeleton:
     def test_development_major_step_skeleton_matches_proposal_main_flow(self):
         skeleton = _development_major_step_skeleton("CSTL-1")
         step_keys = [row["step_key"] for row in skeleton]
-        assert step_keys[:13] == [
+        assert step_keys[:14] == [
+            "compass.received",
             "compass.dispatched",
             "tl.analyzing",
             "tl.gathering",

@@ -276,6 +276,11 @@ def _office_major_step_skeleton(office_request: dict) -> list[dict]:
 
     rows: list[dict] = [
         {
+            "step_key": "compass.received",
+            "title": "Compass receiving task",
+            "agent": "compass",
+        },
+        {
             "step_key": "compass.asking_output_mode",
             "title": "Compass asking for output location",
             "agent": "compass",
@@ -400,6 +405,11 @@ def _office_major_step_skeleton(office_request: dict) -> list[dict]:
 def _development_major_step_skeleton(jira_key: str = "") -> list[dict]:
     """Return the proposal-aligned development timeline skeleton for Compass UI."""
     return [
+        {
+            "step_key": "compass.received",
+            "title": "Compass receiving task",
+            "agent": "compass",
+        },
         {
             "step_key": "compass.dispatched",
             "title": "Compass dispatching to Team Lead",
