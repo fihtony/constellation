@@ -406,17 +406,52 @@ class Launcher:
             return []
 
     def _socket_group_add(self, socket_path: str) -> list[str]:
+        """Return the numeric GID(s) to attach to per-task containers so the
+        non-root user can access the mounted docker socket.
+
+        Tries to read the GID from the host socket file first.  When the
+        host socket lives on a filesystem that does not support ``stat``
+        (notably macOS's ``Socket`` filesystem used by Rancher Desktop's
+        SSH-forwarded socket), it falls back to ``self.socket_gid`` which
+        subclasses — most importantly :class:`RancherLauncher` — can
+        override to ship a runtime-specific default.  On Docker Desktop
+        the socket is on APFS so the stat-based path returns the real GID
+        (typically 0 for root).
+        """
         try:
             socket_gid = os.stat(socket_path).st_gid
+            return [str(socket_gid)]
         except OSError:
+            pass
+        fallback = getattr(self, "socket_gid", 0)
+        if fallback is None or fallback < 0:
             return []
-        return [str(socket_gid)]
+        return [str(fallback)]
 
 
 class RancherLauncher(Launcher):
+    """Launcher tuned for Rancher Desktop on macOS / Linux.
+
+    The host socket is forwarded by Lima over SSH, which on macOS places
+    the file on a ``Socket`` filesystem that does not support ``stat``.
+    The actual GID of the forwarded socket cannot be discovered at
+    runtime, so the launcher falls back to ``DOCKER_SOCKET_GID`` from the
+    environment (default ``102``, the standard ``docker`` group GID).
+    Operators that have chgrp'd the socket to a non-default group can
+    override via env before invoking docker compose.
+    """
+
+    DEFAULT_SOCKET_GID = 102
+
     def __init__(self):
         default_socket = _CHILD_SOCKET_PATH if os.path.exists(_CHILD_SOCKET_PATH) else os.path.expanduser("~/.rd/docker.sock")
         super().__init__(socket_path=os.environ.get("DOCKER_SOCKET", default_socket))
+        try:
+            self.socket_gid = int(
+                os.environ.get("DOCKER_SOCKET_GID", str(self.DEFAULT_SOCKET_GID))
+            )
+        except ValueError:
+            self.socket_gid = self.DEFAULT_SOCKET_GID
 
 
 def get_launcher():

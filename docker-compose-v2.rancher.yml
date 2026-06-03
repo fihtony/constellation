@@ -1,15 +1,45 @@
 # Constellation v2 — Docker Compose for Rancher Desktop
-version: "3.8"
+#
+# This file is a 1:1 mirror of docker-compose-v2.yml. The differences
+# from the Docker variant are:
+#   1. group_add uses ${DOCKER_SOCKET_GID:-102} instead of
+#      ${DOCKER_SOCKET_GID:-0} so the non-root user can access the
+#      Rancher VM's docker group (GID 102).  On macOS the host socket
+#      is owned root:docker and lives on APFS (via the /var/run/docker.sock
+#      symlink) — bind-mountable, unlike the SSH-forwarded
+#      ~/.rd/docker.sock which lives on a Socket filesystem that
+#      returns ENOTSUP for bind-mount operations.
+#   2. CONTAINER_RUNTIME=rancher is injected from config/.env via
+#      x-agent-defaults, which selects RancherLauncher in
+#      framework/launcher.py:get_launcher().
+#
+# To switch between Docker and Rancher runtimes, just change the
+# CONTAINER_RUNTIME value in config/.env and pick the matching compose file:
+#   docker compose -f docker-compose-v2.yml up
+#   docker compose -f docker-compose-v2.rancher.yml up
+#
+# Every other config (services, env, ports, depends_on, network) is
+# identical to the Docker variant — do not diverge.
+
+x-agent-defaults: &agent-defaults
+  env_file:
+    - config/.env
+  restart: unless-stopped
 
 services:
+
+  # -----------------------------------------------------------------------
+  # Registry — capability definition and live instance tracking (port 9000)
+  # -----------------------------------------------------------------------
   registry:
+    <<: *agent-defaults
     image: constellation-v2-registry:latest
     build:
       context: .
       dockerfile: registry/Dockerfile
     environment:
-      REGISTRY_HOST: 0.0.0.0
-      REGISTRY_PORT: 9000
+      REGISTRY_HOST: "0.0.0.0"
+      REGISTRY_PORT: "9000"
     ports:
       - "9000:9000"
     healthcheck:
@@ -21,7 +51,27 @@ services:
     networks:
       - constellation-v2
 
+  init-register:
+    <<: *agent-defaults
+    image: constellation-v2-init-register:latest
+    build:
+      context: .
+      dockerfile: scripts/register_agents.Dockerfile
+    command: ["python3", "scripts/register_agents.py", "--registered-by", "compose-init"]
+    depends_on:
+      registry:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: "http://registry:9000"
+    restart: "no"
+    networks:
+      - constellation-v2
+
+  # -----------------------------------------------------------------------
+  # Compass Agent — control plane entry point (port 8000)
+  # -----------------------------------------------------------------------
   compass:
+    <<: *agent-defaults
     image: constellation-v2-compass:latest
     build:
       context: .
@@ -29,26 +79,48 @@ services:
     depends_on:
       registry:
         condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
       team-lead:
         condition: service_healthy
+      jira:
+        condition: service_healthy
+      scm:
+        condition: service_healthy
+      ui-design:
+        condition: service_healthy
     environment:
-      AGENT_ID: compass
-      HOST: 0.0.0.0
-      PORT: 8000
-      REGISTRY_URL: http://registry:9000
+      AGENT_ID: "compass"
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      REGISTRY_URL: "http://registry:9000"
+      # COMPASS_BASE_URL is the callback base that downstream agents
+      # (e.g. office) POST to when their work is done.  It must be
+      # reachable from inside the constellation-v2 docker network so the
+      # per-task office container can reach compass.  In Rancher-managed
+      # deployments override this via env_file or runtime override to use
+      # the externally-routable hostname of the compass service.
+      COMPASS_BASE_URL: "http://compass:8000"
+      CONSTELLATION_RUNTIME_ENV_FILE: /app/config/.runtime.env
       ARTIFACT_ROOT: /app/artifacts
       DYNAMIC_AGENT_NETWORK: constellation-v2-network
       DOCKER_SOCKET: /var/run/docker.sock
-    labels:
-      constellation.agent_id: compass
-      constellation.agent_role: fundamental
     volumes:
       - ./artifacts:/app/artifacts
-      - .:/workspace:ro
-      - ./config/.env:/app/config/.env:ro
-      - ~/.rd/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config/.env:/app/config/.runtime.env:ro
+    # GID 102 is the docker group inside the Rancher Desktop VM.  Mount
+    # /var/run/docker.sock (not ~/.rd/docker.sock) — the symlink target
+    # sits on APFS and is bind-mountable, while ~/.rd/docker.sock lives
+    # on a Socket filesystem that returns ENOTSUP for bind-mount
+    # operations.  Override via DOCKER_SOCKET_GID in the environment or
+    # .env file.
     group_add:
-      - "${DOCKER_SOCKET_GID:-0}"
+      - "${DOCKER_SOCKET_GID:-102}"
+    labels:
+      constellation.agent_id: "compass"
+      constellation.agent_name: "Compass Agent"
+      constellation.agent_role: "fundamental"
     ports:
       - "8000:8000"
     healthcheck:
@@ -60,32 +132,206 @@ services:
     networks:
       - constellation-v2
 
+  # -----------------------------------------------------------------------
+  # Team Lead Agent — intelligence layer (port 8030)
+  # -----------------------------------------------------------------------
   team-lead:
+    <<: *agent-defaults
     image: constellation-v2-team-lead:latest
     build:
       context: .
       dockerfile: agents/team_lead/Dockerfile
+    depends_on:
+      registry:
+        condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
     environment:
-      AGENT_ID: team-lead
-      HOST: 0.0.0.0
-      PORT: 8030
-      REGISTRY_URL: http://registry:9000
+      AGENT_ID: "team-lead"
+      HOST: "0.0.0.0"
+      PORT: "8030"
+      REGISTRY_URL: "http://registry:9000"
+      CONSTELLATION_RUNTIME_ENV_FILE: /app/config/.runtime.env
       ARTIFACT_ROOT: /app/artifacts
       DYNAMIC_AGENT_NETWORK: constellation-v2-network
       DOCKER_SOCKET: /var/run/docker.sock
-    labels:
-      constellation.agent_id: team-lead
-      constellation.agent_role: fundamental
     volumes:
       - ./artifacts:/app/artifacts
-      - ./config/.env:/app/config/.env:ro
-      - ~/.rd/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config/.env:/app/config/.runtime.env:ro
     group_add:
-      - "${DOCKER_SOCKET_GID:-0}"
+      - "${DOCKER_SOCKET_GID:-102}"
+    labels:
+      constellation.agent_id: "team-lead"
+      constellation.agent_name: "Team Lead Agent"
+      constellation.agent_role: "fundamental"
     ports:
       - "8030:8030"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8030/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+    networks:
+      - constellation-v2
+
+  # -----------------------------------------------------------------------
+  # Jira Agent — boundary agent (port 8010)
+  # -----------------------------------------------------------------------
+  jira:
+    <<: *agent-defaults
+    image: constellation-v2-jira:latest
+    build:
+      context: .
+      dockerfile: agents/jira/Dockerfile
+    depends_on:
+      registry:
+        condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
+    environment:
+      AGENT_ID: "jira"
+      HOST: "0.0.0.0"
+      PORT: "8010"
+      REGISTRY_URL: "http://registry:9000"
+      ARTIFACT_ROOT: /app/artifacts
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./agents/jira/.env:/app/agents/jira/.env:ro
+    labels:
+      constellation.agent_id: "jira"
+      constellation.agent_name: "Jira Agent"
+      constellation.agent_role: "boundary"
+    ports:
+      - "8010:8010"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+    networks:
+      - constellation-v2
+
+  # -----------------------------------------------------------------------
+  # SCM Agent — boundary agent (port 8020)
+  # -----------------------------------------------------------------------
+  scm:
+    <<: *agent-defaults
+    image: constellation-v2-scm:latest
+    build:
+      context: .
+      dockerfile: agents/scm/Dockerfile
+    depends_on:
+      registry:
+        condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
+    environment:
+      AGENT_ID: "scm"
+      HOST: "0.0.0.0"
+      PORT: "8020"
+      REGISTRY_URL: "http://registry:9000"
+      ARTIFACT_ROOT: /app/artifacts
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./agents/scm/.env:/app/agents/scm/.env:ro
+    labels:
+      constellation.agent_id: "scm"
+      constellation.agent_name: "SCM Agent"
+      constellation.agent_role: "boundary"
+    ports:
+      - "8020:8020"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8020/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+    networks:
+      - constellation-v2
+
+  # -----------------------------------------------------------------------
+  # UI Design Agent — boundary agent (port 8040)
+  # -----------------------------------------------------------------------
+  ui-design:
+    <<: *agent-defaults
+    image: constellation-v2-ui-design:latest
+    build:
+      context: .
+      dockerfile: agents/ui_design/Dockerfile
+    depends_on:
+      registry:
+        condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
+    environment:
+      AGENT_ID: "ui-design"
+      HOST: "0.0.0.0"
+      PORT: "8040"
+      REGISTRY_URL: "http://registry:9000"
+      ARTIFACT_ROOT: /app/artifacts
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./agents/ui_design/.env:/app/agents/ui_design/.env:ro
+    labels:
+      constellation.agent_id: "ui-design"
+      constellation.agent_name: "UI Design Agent"
+      constellation.agent_role: "boundary"
+    ports:
+      - "8040:8040"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8040/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+    networks:
+      - constellation-v2
+
+  # -----------------------------------------------------------------------
+  # Office Agent — per-task document processing (port 8060)
+  # Declared here so the image is built by `docker compose build`.  In
+  # normal flow office is launched per-task by compass via the
+  # RancherLauncher; the manual profile keeps a long-running instance
+  # available for debugging.  Both compose variants expose the same
+  # profiles so behavior stays identical across Docker / Rancher.
+  # -----------------------------------------------------------------------
+  office:
+    <<: *agent-defaults
+    profiles:
+      - manual
+    image: constellation-v2-office:latest
+    build:
+      context: .
+      dockerfile: agents/office/Dockerfile
+    depends_on:
+      registry:
+        condition: service_healthy
+      init-register:
+        condition: service_completed_successfully
+    environment:
+      AGENT_ID: "office"
+      HOST: "0.0.0.0"
+      PORT: "8060"
+      REGISTRY_URL: "http://registry:9000"
+      CONSTELLATION_RUNTIME_ENV_FILE: /app/config/.runtime.env
+      ARTIFACT_ROOT: /app/artifacts
+      OFFICE_SOURCE_ROOT: ${OFFICE_SOURCE_ROOT:-/app/userdata}
+      OFFICE_ALLOWED_BASE_PATHS: ${OFFICE_ALLOWED_BASE_PATHS:-}
+      OFFICE_BACKUP_ENABLED: ${OFFICE_BACKUP_ENABLED:-true}
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./config/.env:/app/config/.runtime.env:ro
+    labels:
+      constellation.agent_id: "office"
+      constellation.agent_name: "Office Agent"
+      constellation.agent_role: "per-task"
+    ports:
+      - "8060:8060"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8060/health')"]
       interval: 2s
       timeout: 2s
       retries: 20
