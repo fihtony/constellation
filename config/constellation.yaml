@@ -58,3 +58,16 @@ container:
 registry:
   url: http://registry:9000
 
+# v0.8 timeline redesign — system capabilities published by Compass.
+# `compass.major_step.sink` is the fan-in endpoint downstream agents use to
+# push their workflow progress events into Compass's top-level task store.
+# Resolved via the Capability Registry; never hardcode the URL.
+system_capabilities:
+  - id: compass.major_step.sink
+    description: |
+      POST /api/major-step-events on Compass. Accepts a single
+      ``framework.major_step`` event payload (task_id, step_key, title,
+      agent, lifecycle_state, summary_template, summary_facts) and writes
+      it to Compass's local TaskStore. Idempotent on (step_key, round)
+      and honors terminal-protection (per design doc §0.7).
+

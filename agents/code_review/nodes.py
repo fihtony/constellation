@@ -17,6 +17,12 @@ from typing import Any
 
 from framework.config import load_agent_config as _load_agent_cfg
 from framework.devlog import AgentLogger
+from framework.major_step import (
+    LIFECYCLE_DONE,
+    LIFECYCLE_FAILED,
+    LIFECYCLE_RUNNING,
+    record_major_step,
+)
 
 # Load own agent_id from config.yaml — single source of truth
 _AGENT_ID: str = _load_agent_cfg(
@@ -86,6 +92,39 @@ def _parse_issue_list(text: str) -> list[dict]:
 
 def _logger(state: dict) -> AgentLogger:
     return AgentLogger(task_id=state.get("_task_id", ""), agent_name=_AGENT_ID)
+
+
+def _record_timeline_step(
+    state: dict,
+    *,
+    step_key: str,
+    title: str,
+    lifecycle_state: str = LIFECYCLE_RUNNING,
+    summary_template: str = "",
+    summary_facts: dict | None = None,
+    round: int = 0,
+    conditional: bool = False,
+) -> None:
+    task_id = state.get("_compass_task_id") or state.get("_task_id") or state.get("task_id") or ""
+    if not task_id:
+        return
+    try:
+        record_major_step(
+            task_id,
+            step_key=step_key,
+            title=title,
+            agent="code-review",
+            lifecycle_state=lifecycle_state,
+            summary_template=summary_template,
+            summary_facts=summary_facts,
+            round=round,
+            conditional=conditional,
+            orchestrator_task_id=state.get("_compass_task_id") or task_id,
+            progress_sink=state.get("_major_step_progress_sink"),
+            task_store=state.get("_task_store"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _logger(state).debug("major-step write skipped", step_key=step_key, error=str(exc))
 
 
 def _unwrap_artifact_payload(payload: Any) -> Any:
@@ -448,6 +487,18 @@ async def load_pr_context(state: dict) -> dict:
     metadata = state.get("metadata", {})
     log = _logger(state)
     log.node("load_pr_context")
+    review_round = _get_review_round(state)
+    step_key = "cr.reviewing_retry" if review_round > 1 else "cr.reviewing"
+    title = "Code Review reviewing revised PR" if review_round > 1 else "Code Review reviewing PR"
+    step_round = max(review_round - 2, 0) if review_round > 1 else 0
+    _record_timeline_step(
+        state,
+        step_key=step_key,
+        title=title,
+        summary_template="Code Review is loading the PR diff and review context.",
+        round=step_round,
+        conditional=review_round > 1,
+    )
 
     # PR context
     pr_diff = metadata.get("prDiff") or state.get("pr_diff") or ""
@@ -684,9 +735,6 @@ async def load_pr_context(state: dict) -> dict:
             original_requirements = "\n".join(f"- {c}" for c in criteria)
         elif desc:
             original_requirements = desc
-
-    # Determine review round
-    review_round = _get_review_round(state)
 
     # Persist diff to workspace as scm/<pr>-<round>/diff.patch
     diff_source = ""
@@ -1055,6 +1103,10 @@ async def generate_report(state: dict) -> dict:
     review_input_issues = _issues_with_source(state.get("review_input_issues", []), "review-input")
     log = _logger(state)
     log.node("generate_report")
+    review_round = int(state.get("review_round", 1) or 1)
+    step_key = "cr.reviewing_retry" if review_round > 1 else "cr.reviewing"
+    title = "Code Review reviewing revised PR" if review_round > 1 else "Code Review reviewing PR"
+    step_round = max(review_round - 2, 0) if review_round > 1 else 0
 
     all_comments = review_input_issues + quality + security + tests + requirements + ui_issues
 
@@ -1240,6 +1292,16 @@ async def generate_report(state: dict) -> dict:
             pass
 
     log.info("review report generated", verdict=verdict, issues=len(all_comments), checked_artifacts=len(report["checked_artifacts"]))
+    _record_timeline_step(
+        state,
+        step_key=step_key,
+        title=title,
+        lifecycle_state=LIFECYCLE_DONE if verdict == "approved" else LIFECYCLE_FAILED,
+        summary_template="Code Review completed the review with verdict {verdict}.",
+        summary_facts={"verdict": verdict, "issue_count": len(all_comments)},
+        round=step_round,
+        conditional=review_round > 1,
+    )
 
     return {
         "verdict": verdict,
@@ -1251,4 +1313,3 @@ async def generate_report(state: dict) -> dict:
         "blocking_severity_levels": report["blocking_severity_levels"],
         "checked_artifacts": report["checked_artifacts"],
     }
-

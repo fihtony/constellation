@@ -17,6 +17,12 @@ import threading
 from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent, ExecutionMode
 from framework import devlog  # noqa: F401  # default-tz side-effect
 from framework.workflow import Workflow, START, END
+from framework.major_step import (
+    LIFECYCLE_RUNNING,
+    LIFECYCLE_DONE,
+    LIFECYCLE_FAILED,
+    record_major_step,
+)
 from agents.web_dev.nodes import (
     prepare_jira,
     setup_workspace,
@@ -32,6 +38,57 @@ from agents.web_dev.nodes import (
     report_result,
     pause_for_user_input,
 )
+
+
+# ---------------------------------------------------------------------------
+# Major-step helper for Web Dev
+# ---------------------------------------------------------------------------
+
+def _record_wd_step(
+    state: dict,
+    *,
+    step_key: str,
+    title: str,
+    lifecycle_state: str = LIFECYCLE_RUNNING,
+    summary_template: str = "",
+    summary_facts: dict | None = None,
+    round: int = 0,
+    conditional: bool = False,
+) -> None:
+    """Append a Web Dev major-step event.
+
+    v0.8 emits at task entry and a few key node boundaries; the full
+    per-node 13-step skeleton is planned for v0.8.1.
+    """
+    task_id = state.get("_task_id", "") or state.get("task_id", "")
+    if not task_id:
+        return
+    task_store = state.get("_task_store") or self_task_store()
+    orchestrator_task_id = state.get("_compass_task_id", "") or task_id
+    try:
+        record_major_step(
+            task_id,
+            step_key=step_key,
+            title=title,
+            agent="web-dev",
+            lifecycle_state=lifecycle_state,
+            summary_template=summary_template,
+            summary_facts=summary_facts,
+            round=round,
+            conditional=conditional,
+            orchestrator_task_id=orchestrator_task_id,
+            progress_sink=state.get("_major_step_progress_sink"),
+            task_store=task_store,
+        )
+    except Exception as exc:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).debug("[wd-steps] record_major_step failed: %s", exc)
+
+
+def self_task_store():
+    """Return a placeholder; real TaskStore is passed via state. Used only
+    when the helper is called without a state-bound store (no-op)."""
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +230,8 @@ class WebDevAgent(BaseAgent):
 
         state = {
             "_task_id": canonical_task_id,
+            "_compass_task_id": orchestrator_task_id or canonical_task_id,
+            "_task_store": task_store,
             "user_request": user_text,
             "repo_url": metadata.get("repoUrl", ""),
             "repo_path": metadata.get("repoPath", ""),
@@ -225,6 +284,14 @@ class WebDevAgent(BaseAgent):
             ),
         }
 
+        if orchestrator_task_id and orchestrator_task_id != task.id:
+            try:
+                from framework.major_step import resolve_progress_sink
+
+                state["_major_step_progress_sink"] = resolve_progress_sink(orchestrator_task_id)
+            except Exception:
+                pass
+
         # Apply execution contract to enforce tool permissions from parent.
         # Per-task Web Dev fails closed here; direct node/unit tests bypass
         # handle_message and can still exercise isolated logic.
@@ -248,6 +315,18 @@ class WebDevAgent(BaseAgent):
 
         def _run() -> None:
             import asyncio
+
+            # v0.8: emit the first major step at the start of execution.
+            try:
+                _record_wd_step(
+                    state,
+                    step_key="wd.received",
+                    title="Web Dev receiving dev task",
+                    summary_template="Web Dev received the dev task for Jira ticket {jira_key}.",
+                    summary_facts={"jira_key": state.get("jira_key", "") or "unspecified"},
+                )
+            except Exception as exc:  # noqa: BLE001
+                pass
 
             loop = asyncio.new_event_loop()
             try:

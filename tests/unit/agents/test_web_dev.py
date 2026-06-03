@@ -39,6 +39,12 @@ def _agent_services(runtime=None):
     )
 
 
+def _timeline_task_store(task_id: str = "task-major-steps"):
+    store = InMemoryTaskStore()
+    store.create_task(agent_id="web-dev", task_id=task_id)
+    return store
+
+
 class TestWebDevWorkflowCompile:
 
     def test_web_dev_workflow_compiles(self):
@@ -101,6 +107,73 @@ class TestWebDevExecutionContract:
 
         assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
         assert "exceed local profile" in result["task"]["status"]["message"]["parts"][0]["text"]
+
+
+class TestWebDevMajorSteps:
+    async def test_analyze_task_records_drafting_plan_row(self, tmp_path):
+        store = _timeline_task_store()
+        result = await analyze_task(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "workspace_path": str(tmp_path),
+                "analysis": "Implement the task",
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["wd.drafting_plan#0"]
+        assert row["title"] == "Web Dev drafting plan"
+        assert row["lifecycle_state"] == "done"
+        assert result["implementation_plan"]
+
+    async def test_run_tests_no_runtime_records_building_row(self):
+        store = _timeline_task_store()
+        result = await run_tests(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "_runtime": None,
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["wd.building#0"]
+        assert row["title"] == "Web Dev building and testing"
+        assert row["lifecycle_state"] == "done"
+        assert result["route"] == "pass"
+
+    async def test_self_assess_no_runtime_records_self_check_row(self):
+        store = _timeline_task_store()
+        result = await self_assess(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "_runtime": None,
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["wd.self_check#0"]
+        assert row["title"] == "Web Dev running self-check"
+        assert row["lifecycle_state"] == "done"
+        assert result["route"] == "pass"
+
+    async def test_report_result_records_handover_row(self):
+        store = _timeline_task_store()
+        result = await report_result(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "pr_url": "https://example.com/pull/42",
+                "branch_name": "feature/cstl-1",
+                "changes_made": ["app.py"],
+                "test_status": "pass",
+                "pr_title": "Implement feature",
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["wd.handover#0"]
+        assert row["title"] == "Web Dev handing over to Team Lead"
+        assert row["lifecycle_state"] == "done"
+        assert result["success"] is True
 
 
 class TestSafeJson:
@@ -1056,4 +1129,3 @@ class TestWebDevBoundaryTools:
         assert dispatched["metadata"]["repo"] == "repo"
         assert dispatched["metadata"]["imagePath"] == str(image_file)
         assert dispatched["metadata"]["task_id"] == "task-123"
-

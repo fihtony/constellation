@@ -25,6 +25,53 @@ from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent
 from framework import devlog  # noqa: F401  # default-tz side-effect
 from framework.workflow import Workflow, START, END
 from framework.state import Channel, append_reducer
+from framework.major_step import (
+    LIFECYCLE_RUNNING,
+    LIFECYCLE_DONE,
+    LIFECYCLE_FAILED,
+    LIFECYCLE_WAITING_FOR_USER,
+    record_major_step,
+)
+
+
+# ---------------------------------------------------------------------------
+# Major-step helper for Team Lead
+# ---------------------------------------------------------------------------
+
+def _record_tl_step(
+    state: dict,
+    *,
+    step_key: str,
+    title: str,
+    lifecycle_state: str = LIFECYCLE_RUNNING,
+    summary_template: str = "",
+    summary_facts: dict | None = None,
+    round: int = 0,
+    conditional: bool = False,
+) -> None:
+    task_id = state.get("_task_id", "") or state.get("task_id", "")
+    if not task_id:
+        return
+    task_store = state.get("_task_store")
+    orchestrator_task_id = state.get("_compass_task_id", "") or task_id
+    try:
+        record_major_step(
+            task_id,
+            step_key=step_key,
+            title=title,
+            agent="team-lead",
+            lifecycle_state=lifecycle_state,
+            summary_template=summary_template,
+            summary_facts=summary_facts,
+            round=round,
+            conditional=conditional,
+            orchestrator_task_id=orchestrator_task_id,
+            progress_sink=state.get("_major_step_progress_sink"),
+            task_store=task_store,
+        )
+    except Exception as exc:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).debug("[tl-steps] record_major_step failed: %s", exc)
 from agents.team_lead.nodes import (
     receive_task,
     analyze_requirements,
@@ -235,8 +282,31 @@ class TeamLeadAgent(BaseAgent):
             # _task_id: use Compass task ID as the master task ID for logging.
             # All agents in this workflow log under {ARTIFACT_ROOT}/{_task_id}/
             "_task_id": orchestrator_task_id or task.id,
+            "_compass_task_id": orchestrator_task_id or task.id,
+            "_task_store": task_store,
             "_agent_id": self.definition.agent_id,
         }
+
+        if orchestrator_task_id and orchestrator_task_id != task.id:
+            try:
+                from framework.major_step import resolve_progress_sink
+
+                state["_major_step_progress_sink"] = resolve_progress_sink(orchestrator_task_id)
+                ephemeral_state["_major_step_progress_sink"] = state["_major_step_progress_sink"]
+            except Exception:
+                pass
+
+        # v0.8: emit the first major step at task entry.
+        try:
+            _record_tl_step(
+                state,
+                step_key="tl.received",
+                title="Team Lead receiving dev task",
+                summary_template="Team Lead received the dev task for Jira ticket {jira_key}.",
+                summary_facts={"jira_key": meta.get("jiraKey", "") or "unspecified"},
+            )
+        except Exception:
+            pass
 
         # Run workflow in background thread
         def _run() -> None:

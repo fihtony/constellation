@@ -209,6 +209,7 @@ body {
   justify-content: space-between;
   gap: 12px;
   padding: 15px 18px;
+  min-height: 56px;
   border-bottom: 1px solid rgba(145, 171, 189, 0.08);
   background: rgba(14, 24, 34, 0.94);
 }
@@ -891,31 +892,6 @@ body {
   font-size: 12px;
   line-height: 1.55;
 }
-.phase-rail {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 12px;
-  margin-bottom: 12px;
-}
-.phase-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  background: rgba(127,195,209,0.08);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-}
-.phase-pill.current {
-  background: rgba(127,195,209,0.18);
-  color: var(--ink);
-}
-.phase-pill.done {
-  color: var(--accent-strong);
-}
 .phase-list {
   display: flex;
   flex-direction: column;
@@ -1580,98 +1556,153 @@ _INLINE_JS = r"""
     if (kind === 'completed') return 'Review the output and decide whether any follow-up work is needed.';
     return 'Monitor the active major step and use the log stream for live execution detail.';
   }
-  function developmentPhaseForText(text) {
-    const value = String(text || '').toLowerCase();
-    if (!value) return { key: 'other', label: 'Other' };
-    if (value.includes('fix') || value.includes('fixing') || value.includes('revision') || value.includes('gap') || value.includes('retry') || value.includes('repair')) {
-      return { key: 'fix', label: 'Fix' };
+  function pickMarkForVisualState(visualState) {
+    switch (String(visualState || '')) {
+      case 'done': return '✓';
+      case 'failed': return '✕';
+      case 'warn': return '!';
+      case 'current': return '●';
+      case 'pending': return '○';
+      case 'conditional_pending': return '◐';
+      default: return '○';
     }
-    if (value.includes('analysis') || value.includes('plan') || value.includes('context') || value.includes('jira') || value.includes('design')) {
-      return { key: 'plan', label: 'Plan' };
-    }
-    if (value.includes('implement') || value.includes('code') || value.includes('branch') || value.includes('change')) {
-      return { key: 'implement', label: 'Implement' };
-    }
-    if (value.includes('build') || value.includes('compile') || value.includes('dist/')) {
-      return { key: 'build', label: 'Build' };
-    }
-    if (value.includes('test') || value.includes('validation') || value.includes('vitest') || value.includes('jest')) {
-      return { key: 'test', label: 'Test' };
-    }
-    if (value.includes('self assessment') || value.includes('self-assessment') || value.includes('self check') || value.includes('self-check') || value.includes('verify') || value.includes('screenshot')) {
-      return { key: 'self-check', label: 'Self-check' };
-    }
-    if (value.includes('review') || value.includes('pr') || value.includes('deliver') || value.includes('report')) {
-      return { key: 'deliver', label: 'Review & Deliver' };
-    }
-    return { key: 'other', label: 'Other' };
   }
-  function deriveMajorPhases(task, currentStep) {
-    const steps = mergedProgressSignals(task);
-    if ((task.taskType || task.task_type) !== 'development') return null;
-    const canonicalPhases = [
-      { key: 'plan', label: 'Plan' },
-      { key: 'implement', label: 'Implement' },
-      { key: 'build', label: 'Build' },
-      { key: 'test', label: 'Test' },
-      { key: 'self-check', label: 'Self-check' },
-      { key: 'fix', label: 'Fix' },
-      { key: 'deliver', label: 'Review & Deliver' },
-    ];
-    const phaseMap = new Map();
-    function ensurePhaseBucket(phase, fallbackAgent) {
-      if (!phaseMap.has(phase.key)) {
-        phaseMap.set(phase.key, {
-          key: phase.key,
-          label: phase.label,
-          agent: fallbackAgent || '',
-          detail: '',
-          preview: '',
-          ts: '',
-          startTs: '',
-          endTs: '',
-          items: [],
-        });
-      }
-      return phaseMap.get(phase.key);
+  function renderTemplate(template, facts) {
+    const text = String(template || '');
+    const subs = (facts && typeof facts === 'object') ? facts : {};
+    const safeValue = (v) => {
+      if (v === null || v === undefined) return '--';
+      const s = String(v);
+      // Cap length to avoid unbounded blobs in the UI.
+      return s.length > 200 ? s.slice(0, 197) + '...' : s;
+    };
+    // Escape any user-provided free text to prevent XSS through the template.
+    const escapeHtml = (s) => String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+    return text.replace(/\{([a-zA-Z0-9_]+)\}/g, (_match, key) => escapeHtml(safeValue(subs[key])));
+  }
+  function pickPointerRow(task) {
+    // Per design doc §0.6: active → failed → terminal → last.
+    const rows = task.majorStepRows || {};
+    const active = task.activeStepInstanceKey;
+    const failed = task.failedStepInstanceKey;
+    const terminal = task.terminalStepInstanceKey;
+    const last = task.lastStepInstanceKey;
+    if (active && rows[active]) return { key: active, row: rows[active] };
+    if (failed && rows[failed]) return { key: failed, row: rows[failed] };
+    if (terminal && rows[terminal]) return { key: terminal, row: rows[terminal] };
+    if (last && rows[last]) return { key: last, row: rows[last] };
+    return null;
+  }
+  function deriveMajorTimeline(task) {
+    // Build a timeline from the structured v0.8 data. Returns ``null`` for
+    // tasks that have no ``major_step_rows`` so the caller can fall back to
+    // the generic progress-steps renderer.
+    const rows = task.majorStepRows || {};
+    if (!rows || Object.keys(rows).length === 0) {
+      return null;  // signal to caller: use legacy bucketing
     }
-    canonicalPhases.forEach(phase => ensurePhaseBucket(phase, ''));
-    for (const step of steps) {
-      const text = step.text || step.step || '';
-      const phase = developmentPhaseForText(text);
-      if (phase.key === 'other') continue;
-      const bucket = ensurePhaseBucket(phase, step.agent || '');
-      bucket.agent = bucket.agent || step.agent || '';
-      bucket.detail = text;
-      bucket.preview = text;
-      bucket.ts = step.ts || bucket.ts;
-      if (step.ts && (!bucket.startTs || step.ts < bucket.startTs)) bucket.startTs = step.ts;
-      if (step.ts && (!bucket.endTs || step.ts > bucket.endTs)) bucket.endTs = step.ts;
-      bucket.items.push({ text, agent: step.agent || '', ts: step.ts || '' });
-    }
-    const currentPhase = developmentPhaseForText(currentStep || '');
-    if (currentPhase.key !== 'other') {
-      const bucket = ensurePhaseBucket(currentPhase, '');
-      if (currentStep) {
-        bucket.preview = currentStep;
-        bucket.detail = currentStep;
-        if (!bucket.items.some(item => item.text === currentStep)) {
-          bucket.items.push({ text: currentStep, agent: bucket.agent || '', ts: '' });
+    const skeleton = Array.isArray(task.majorStepsSkeleton) ? task.majorStepsSkeleton : [];
+    const states = task.stepStates || {};
+    const summaries = task.stepSummaries || {};
+
+    // Build an ordered list: emitted rows (in their stored insertion order) +
+    // any unfired conditional rows from the skeleton, dedup'd on
+    // step_instance_key.
+    const seen = new Set();
+    const ordered = [];
+    // Use the order from major_step_skeleton if present (preferred); otherwise
+    // fall back to Object.keys order, which in modern JS preserves insertion.
+    if (skeleton.length > 0) {
+      for (const skel of skeleton) {
+        const sik = skel.step_instance_key || skel.stepInstanceKey;
+        if (!sik || seen.has(sik)) continue;
+        seen.add(sik);
+        const row = rows[sik];
+        if (row) {
+          ordered.push({
+            key: sik,
+            stepKey: row.step_key || skel.step_key,
+            round: row.round || 0,
+            title: row.title || skel.title || sik,
+            agent: row.agent || skel.agent || '',
+            visualState: row.visual_state || 'current',
+            lifecycleState: row.lifecycle_state || '',
+            conditional: !!(row.conditional || skel.conditional),
+            startedAt: row.started_at || states[sik]?.started_at || '',
+            endedAt: row.ended_at ?? states[sik]?.ended_at ?? null,
+            summaryHtml: renderTemplate(row.summary_template || '', row.summary_facts || {}),
+            ignored: !!row.ignored_after_terminal,
+            fired: true,
+          });
+        } else {
+          ordered.push({
+            key: sik,
+            stepKey: skel.step_key,
+            round: skel.round || 0,
+            title: skel.title || sik,
+            agent: skel.agent || '',
+            visualState: skel.conditional ? 'conditional_pending' : 'pending',
+            lifecycleState: 'pending',
+            conditional: !!skel.conditional,
+            startedAt: '',
+            endedAt: null,
+            summaryHtml: '',
+            ignored: false,
+            fired: false,
+          });
         }
       }
+    } else {
+      for (const [sik, row] of Object.entries(rows)) {
+        if (seen.has(sik)) continue;
+        seen.add(sik);
+        ordered.push({
+          key: sik,
+          stepKey: row.step_key,
+          round: row.round || 0,
+          title: row.title || sik,
+          agent: row.agent || '',
+          visualState: row.visual_state || 'current',
+          lifecycleState: row.lifecycle_state || '',
+          conditional: !!row.conditional,
+          startedAt: row.started_at || '',
+          endedAt: row.ended_at ?? null,
+          summaryHtml: renderTemplate(row.summary_template || '', row.summary_facts || {}),
+          ignored: !!row.ignored_after_terminal,
+          fired: true,
+        });
+      }
     }
-    const fallbackCurrent = currentPhase.key !== 'other'
-      ? currentPhase.key
-      : [...canonicalPhases].reverse().find(phase => phaseMap.get(phase.key)?.items.length)?.key || 'plan';
-    const ordered = canonicalPhases.map(phaseRef => {
-      const phase = phaseMap.get(phaseRef.key);
-      return {
-        ...phase,
-        updateCount: phase.items.length,
-        detail: phase.preview || phase.detail || (phaseRef.key === fallbackCurrent ? currentStep : '') || phase.label,
-      };
+    const normalizedOrdered = ordered.map((row) => {
+      let visualState = row.visualState || 'pending';
+      let lifecycleState = row.lifecycleState || '';
+      const stepKey = String(row.stepKey || '');
+      const sik = row.key;
+      const isLegacyCompassReceived = stepKey === 'compass.received';
+      const hasLaterFiredStep = ordered.some(candidate => candidate.key !== sik && candidate.fired && !candidate.ignored);
+      // Pre-redesign tasks can leave ``compass.received`` stuck in ``running``
+      // even though later rows already fired. Show it as completed so the
+      // expanded timeline reflects the real historical sequence.
+      if (
+        isLegacyCompassReceived
+        && row.fired
+        && hasLaterFiredStep
+        && (visualState === 'current' || lifecycleState === 'running')
+      ) {
+        visualState = 'done';
+        lifecycleState = 'done';
+      }
+      return { ...row, visualState, lifecycleState };
     });
-    return ordered.length ? { currentKey: fallbackCurrent, phases: ordered } : null;
+    return {
+      currentKey: (pickPointerRow(task) || {}).key || '',
+      ordered: normalizedOrdered.filter(row => !row.ignored),
+    };
   }
   function looksGenericSummary(text, kind) {
     const value = String(text || '').trim().toLowerCase();
@@ -2166,60 +2197,11 @@ _INLINE_JS = r"""
     }
   }
 
-  function phaseStateClass(phase, currentKey, taskKind) {
-    if (phase.key === currentKey) {
-      if (taskKind === 'failed') return 'failed';
-      if (taskKind === 'waiting' || taskKind === 'active') return 'warn';
-      return 'done';
-    }
-    if (phase.updateCount > 0) return 'done';
-    return 'pending';
-  }
-  function phaseMarkForClass(statusClass) {
-    if (statusClass === 'done') return '✓';
-    if (statusClass === 'failed') return '✕';
-    if (statusClass === 'warn') return '!';
-    return '';
-  }
   function timelineAgentDetail(agent, detail, fallbackDetail = '') {
     const owner = String(agent || '').trim();
     const text = String(detail || '').trim() || String(fallbackDetail || '').trim();
     if (owner && text) return `${owner}: ${text}`;
     return text || owner;
-  }
-  function timelineHtmlForDevelopment(task, semanticPhases, currentStep, kind, expanded) {
-    const currentIndex = semanticPhases.phases.findIndex(phase => phase.key === semanticPhases.currentKey);
-    const rows = semanticPhases.phases.map((phase, index) => {
-      const statusClass = phaseStateClass(phase, semanticPhases.currentKey, kind);
-      const reached = phase.updateCount > 0 || phase.key === semanticPhases.currentKey || (currentIndex >= 0 && index < currentIndex);
-      const effectiveClass = reached ? statusClass : 'pending';
-      const rawDetail = phase.key === semanticPhases.currentKey
-        ? String(phase.detail || currentStep || '').trim()
-        : String(phase.detail || '').trim();
-      const detailText = rawDetail && rawDetail !== String(phase.label || '').trim() ? rawDetail : '';
-      const metaText = reached
-        ? timelineAgentDetail(
-            phase.agent,
-            detailText,
-            phase.key === semanticPhases.currentKey ? 'Longer execution detail continues in merged logs.' : '',
-          )
-        : 'Not reached yet.';
-      const facts = `
-        <div class="timeline-facts">
-          <span class="timeline-fact"><span class="timeline-fact-label">Started</span>${esc(phase.startTs ? fmtLocalTimestamp(phase.startTs) : '--')}</span>
-          <span class="timeline-fact"><span class="timeline-fact-label">Time Spent</span>${esc(phase.startTs ? durationBetween(phase.startTs, phase.endTs || task.updatedAt) : '--')}</span>
-        </div>`;
-      return `<div class="timeline-row ${effectiveClass}${phase.key === semanticPhases.currentKey ? ' current' : ''}">
-        <div class="timeline-mark">${phaseMarkForClass(effectiveClass)}</div>
-        <div class="timeline-headline">
-          <div class="timeline-title">${esc(phase.label)}</div>
-          ${facts}
-        </div>
-        <div class="timeline-meta">${esc(metaText)}</div>
-      </div>`;
-    }).join('');
-    return `<div class="phase-rail" style="display:none">${semanticPhases.phases.map(phase => `<span class="phase-pill${phase.key === semanticPhases.currentKey ? ' current' : ''}">${esc(phase.label)}</span>`).join('')}</div>
-      <div class="timeline-list${expanded ? '' : ' collapsed'}">${rows}</div>`;
   }
   function timelineHtmlForGeneric(task, steps, kind, expanded) {
     if (!steps.length) return '<div class="empty-state">No workflow steps yet.</div>';
@@ -2244,6 +2226,87 @@ _INLINE_JS = r"""
         <div class="timeline-meta">${esc(metaText)}</div>
       </div>`;
     }).join('')}</div>`.replace('timeline-list">', `timeline-list${expanded ? '' : ' collapsed'}">`);
+  }
+  // Compact duration formatter for the v0.8 timeline right column. Always
+  // emits ``Xh Ym Zs`` even when X or Y is 0, so the column stays aligned
+  // (e.g. ``0m 02s`` not ``2s``). Per design doc §2.1 / §8.1.
+  function compactDuration(ms) {
+    if (ms === null || ms === undefined || Number.isNaN(ms)) return '--';
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const hh = String(hours);
+    const mm = String(minutes).padStart(2, '0');
+    const ss = String(seconds).padStart(2, '0');
+    return `${hh}h ${mm}m ${ss}s`;
+  }
+  // Format a UTC ISO timestamp as ``MM-DD HH:MM:SS`` in the viewer's local
+  // timezone. Returns ``'--'`` for missing or unparseable input.
+  function compactStartTime(iso) {
+    if (!iso) return '--';
+    const d = parseTimestamp(iso);
+    if (!d || Number.isNaN(d.getTime())) return '--';
+    const pad = (n) => String(n).padStart(2, '0');
+    const month = pad(d.getMonth() + 1);
+    const day = pad(d.getDate());
+    const hours = pad(d.getHours());
+    const minutes = pad(d.getMinutes());
+    const seconds = pad(d.getSeconds());
+    return `${month}-${day} ${hours}:${minutes}:${seconds}`;
+  }
+  function timelineHtmlForMajorSteps(task, timeline, currentStep, kind, expanded) {
+    const ordered = (timeline && timeline.ordered) || [];
+    if (!ordered.length) {
+      return '<div class="empty-state">No workflow steps yet.</div>';
+    }
+    // In collapsed (current-only) mode, prefer the pointer row; fall back to
+    // the first row in the ordered list when no pointer is set.
+    const visibleRows = expanded
+      ? ordered
+      : (() => {
+          const pointer = timeline.currentKey;
+          const target = pointer ? ordered.find(r => r.key === pointer) : null;
+          return target ? [target] : [ordered[ordered.length - 1]];
+        })();
+    const rows = visibleRows.map((row) => {
+      const visualClass = String(row.visualState || 'pending');
+      const mark = pickMarkForVisualState(visualClass);
+      const isFocusedRow = !expanded || (row.fired && visualClass === 'current');
+      // Right-hand column: ``MM-DD HH:MM:SS  Xh Ym Zs``.
+      let startLabel;
+      let durationLabel;
+      if (!row.fired) {
+        // Unfired conditional row: literal "Not started yet" per §8.1.
+        startLabel = 'Not started yet';
+        durationLabel = '--';
+      } else {
+        startLabel = compactStartTime(row.startedAt);
+        const endDate = row.endedAt
+          ? parseTimestamp(row.endedAt)
+          : (visualClass === 'current' || visualClass === 'warn' ? null : parseTimestamp(task.updatedAt || ''));
+        const startDate = row.startedAt ? parseTimestamp(row.startedAt) : null;
+        const end = endDate ? endDate.getTime() : Date.now();
+        const startMs = startDate ? startDate.getTime() : 0;
+        durationLabel = compactDuration(startMs && end ? end - startMs : null);
+      }
+      const ownerAgent = row.agent || ownerOf(task);
+      const summaryLine = row.summaryHtml
+        ? `<div class="timeline-summary">${esc(ownerAgent)}: ${row.summaryHtml}</div>`
+        : `<div class="timeline-summary">${esc(ownerAgent)}</div>`;
+      return `<div class="timeline-row ${escapeAttr(visualClass)}${isFocusedRow ? ' current' : ''}">
+        <div class="timeline-mark">${mark}</div>
+        <div class="timeline-headline">
+          <div class="timeline-title">${esc(row.title)}</div>
+          <div class="timeline-facts">
+            <span class="timeline-fact"><span class="timeline-fact-label">Started</span>${esc(startLabel)}</span>
+            <span class="timeline-fact"><span class="timeline-fact-label">Time Spent</span>${esc(durationLabel)}</span>
+          </div>
+        </div>
+        <div class="timeline-meta">${summaryLine}</div>
+      </div>`;
+    }).join('');
+    return `<div class="timeline-list${expanded ? '' : ' collapsed'}">${rows}</div>`;
   }
   function mergedArtifactMetadata(task) {
     const metadata = { ...((task && task.metadata) || {}) };
@@ -2408,13 +2471,15 @@ _INLINE_JS = r"""
     const kind = statusKindOf(t.statusState || t.status);
     const steps = mergedProgressSignals(t);
     const currentStep = t.currentMajorStep || currentStepFromLogs(t) || (steps.length ? steps[steps.length-1].text : '');
-    const semanticPhases = deriveMajorPhases(t, currentStep);
+    const majorTimeline = deriveMajorTimeline(t);
     const phaseExpanded = !!state.phaseExpandedByTask[tid];
     const taskType = taskTypeOf(t);
     const typeLabel = taskTypeLabel(t);
-    const hasTimelineToggle = semanticPhases ? semanticPhases.phases.length > 1 : steps.length > 1;
-    const timelineBody = semanticPhases
-      ? timelineHtmlForDevelopment(t, semanticPhases, currentStep, kind, phaseExpanded)
+    const hasTimelineToggle = majorTimeline
+      ? majorTimeline.ordered.length > 1
+      : (steps.length > 1);
+    const timelineBody = majorTimeline
+      ? timelineHtmlForMajorSteps(t, majorTimeline, currentStep, kind, phaseExpanded)
       : timelineHtmlForGeneric(t, steps, kind, phaseExpanded);
     const orchestratorTaskId = String(t.orchestratorTaskId || t.task_id || t.id || '').trim();
     const originalRequest = String(t.userRequest || t.user_request || '').trim();

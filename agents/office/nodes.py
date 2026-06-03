@@ -270,6 +270,20 @@ def receive_task(state: dict) -> dict:
     logger.info(f"receive_task: capability={capability} output_mode={output_mode} paths={source_paths}")
     _task_log(state, "node", "receive_task", capability=capability, output_mode=output_mode, paths=source_paths)
 
+    # Emit the first major-step row: ``office.received``.
+    try:
+        from agents.office import office_steps
+
+        office_steps.emit_received(
+            {
+                **state,
+                "capability": capability,
+                "source_paths": source_paths,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("emit_received failed: %s", exc)
+
     return {
         "capability": capability,
         "output_mode": output_mode,
@@ -331,15 +345,37 @@ def analyze_request(state: dict) -> dict:
     if output_mode == "inplace":
         allow_inplace = os.environ.get("OFFICE_ALLOW_INPLACE_WRITES", "false").lower()
         if allow_inplace not in ("true", "1", "yes"):
-            logger.warning("inplace mode requested but OFFICE_ALLOW_INPLACE_WRITES not set — falling back to workspace")
-            _task_log(state, "warn", "inplace mode not permitted; falling back to workspace")
-            state["output_mode"] = "workspace"
-            output_mode = "workspace"
+            error_text = (
+                "inplace output mode is not permitted for this task. "
+                "Please choose workspace output instead."
+            )
+            logger.warning("inplace mode requested but OFFICE_ALLOW_INPLACE_WRITES not set")
+            _task_log(state, "warn", "inplace mode not permitted", requested_mode="inplace")
+            return {
+                "error": error_text,
+                "workspace_root": workspace_root,
+                "artifacts_dir": artifacts_dir,
+                "validated_paths": validated_paths,
+            }
 
     os.environ["OFFICE_OUTPUT_MODE"] = output_mode
 
     logger.info(f"analyze_request: validated_paths={validated_paths} artifacts_dir={artifacts_dir}")
     _task_log(state, "info", "validated office request", validated_paths=validated_paths, artifacts_dir=artifacts_dir)
+
+    # Emit ``office.validating`` to close the validation phase and prepare
+    # for the executing capability row.
+    try:
+        from agents.office import office_steps
+
+        office_steps.emit_validating(
+            {
+                **state,
+                "source_paths": validated_paths,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("emit_validating failed: %s", exc)
 
     return {
         "validated_paths": validated_paths,
@@ -859,6 +895,16 @@ def execute_office_work(state: dict) -> dict:
     if not runtime:
         return {"error": "No runtime configured"}
 
+    # Emit the capability summary row (round 0, lifecycle=running) at the
+    # start of execution. A closing call with lifecycle=done fires after
+    # ``runtime.run_agentic`` returns successfully.
+    try:
+        from agents.office import office_steps
+
+        office_steps.emit_executing_capability(state)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("emit_executing_capability (start) failed: %s", exc)
+
     prior_error = str(state.get("error") or "").strip()
     if prior_error:
         logger.error(f"execute_office_work: skipped due to prior validation error — {prior_error}")
@@ -999,6 +1045,26 @@ def execute_office_work(state: dict) -> dict:
             }
         logger.info(f"execute_office_work: success")
         _task_log(state, "info", "office execution completed", capability=capability)
+        try:
+            from agents.office import office_steps
+
+            office_steps.emit_capability_completion_rows(
+                {**state, "validated_paths": validated_paths}
+            )
+            office_steps.emit_writing(
+                state,
+                output_count=len(expected_outputs),
+                file_count=len(validated_paths),
+                lifecycle_state="done",
+            )
+            if capability == "organize":
+                office_steps.emit_writing_plan(state)
+            office_steps.emit_verifying(
+                state,
+                output_count=len(expected_outputs),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("office timeline close-out failed: %s", exc)
         return {
             "summary": result.summary,
             "success": True,
@@ -1292,6 +1358,20 @@ def report_result(state: dict) -> dict:
             except OSError as exc:
                 logger.error(f"report_result: failed to write agentic output: {exc}")
                 _task_log(state, "error", "failed to write office raw output", error=str(exc))
+
+    # ``office.delivered`` closes the timeline after artifacts/report files
+    # are persisted. Writing + verification rows are emitted earlier, when
+    # the deliverables have actually been materialized and checked.
+    try:
+        from agents.office import office_steps
+
+        office_steps.emit_delivered(
+            state,
+            success=success,
+            output_count=len(expected_outputs) if expected_outputs else 0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("report_result step emit failed: %s", exc)
 
     return {
         "status": status,

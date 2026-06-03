@@ -15,6 +15,12 @@ from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent
 from framework import devlog  # noqa: F401  # default-tz side-effect
 from framework.workflow import Workflow, START, END
 from framework.state import Channel, append_reducer
+from framework.major_step import (
+    LIFECYCLE_RUNNING,
+    LIFECYCLE_DONE,
+    LIFECYCLE_FAILED,
+    record_major_step,
+)
 from agents.code_review.nodes import (
     load_pr_context,
     review_quality,
@@ -24,6 +30,46 @@ from agents.code_review.nodes import (
     review_ui_design,
     generate_report,
 )
+
+
+# ---------------------------------------------------------------------------
+# Major-step helper for Code Review
+# ---------------------------------------------------------------------------
+
+def _record_cr_step(
+    state: dict,
+    *,
+    step_key: str,
+    title: str,
+    lifecycle_state: str = LIFECYCLE_RUNNING,
+    summary_template: str = "",
+    summary_facts: dict | None = None,
+    round: int = 0,
+    conditional: bool = False,
+) -> None:
+    task_id = state.get("_task_id", "") or state.get("task_id", "")
+    if not task_id:
+        return
+    task_store = state.get("_task_store")
+    orchestrator_task_id = state.get("_compass_task_id", "") or task_id
+    try:
+        record_major_step(
+            task_id,
+            step_key=step_key,
+            title=title,
+            agent="code-review",
+            lifecycle_state=lifecycle_state,
+            summary_template=summary_template,
+            summary_facts=summary_facts,
+            round=round,
+            conditional=conditional,
+            orchestrator_task_id=orchestrator_task_id,
+            progress_sink=state.get("_major_step_progress_sink"),
+            task_store=task_store,
+        )
+    except Exception as exc:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).debug("[cr-steps] record_major_step failed: %s", exc)
 
 # ---------------------------------------------------------------------------
 # State schema — declares how review issues accumulate
@@ -154,6 +200,8 @@ class CodeReviewAgent(BaseAgent):
 
         state = {
             "_task_id": canonical_task_id,
+            "_compass_task_id": orchestrator_task_id or canonical_task_id,
+            "_task_store": task_store,
             "pr_url": metadata.get("prUrl", ""),
             "pr_number": metadata.get("prNumber", 0),
             "repo_url": metadata.get("repoUrl", ""),
@@ -161,6 +209,14 @@ class CodeReviewAgent(BaseAgent):
             "original_requirements": metadata.get("originalRequirements", ""),
             "metadata": metadata,
         }
+
+        if orchestrator_task_id and orchestrator_task_id != task.id:
+            try:
+                from framework.major_step import resolve_progress_sink
+
+                state["_major_step_progress_sink"] = resolve_progress_sink(orchestrator_task_id)
+            except Exception:
+                pass
 
         exec_contract = metadata.get("executionContract")
         if not exec_contract or not isinstance(exec_contract, dict):

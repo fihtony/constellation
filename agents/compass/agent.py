@@ -30,6 +30,17 @@ from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent
 # every subsequent log line and datetime emission is anchored to the
 # right zone even before the agent calls its first AgentLogger.
 from framework import devlog  # noqa: F401
+from framework.major_step import (
+    LIFECYCLE_CANCELLED,
+    LIFECYCLE_DONE,
+    LIFECYCLE_FAILED,
+    LIFECYCLE_RESUMING,
+    LIFECYCLE_RUNNING,
+    LIFECYCLE_TERMINATED,
+    LIFECYCLE_WAITING_FOR_USER,
+    ensure_major_step_skeleton,
+    record_major_step,
+)
 from agents.compass.ui.routes import handle_ui_request
 from agents.compass.tools import TOOL_NAMES, register_compass_tools
 
@@ -257,6 +268,270 @@ def _extract_office_request(user_text: str, metadata: dict) -> dict:
             str(metadata.get("output_mode") or metadata.get("officeOutputMode") or "")
         ),
     }
+
+
+def _office_major_step_skeleton(office_request: dict) -> list[dict]:
+    """Return the proposal-aligned office timeline skeleton for Compass UI."""
+    capability = _normalize_office_capability(str(office_request.get("capability") or ""))
+
+    rows: list[dict] = [
+        {
+            "step_key": "compass.asking_output_mode",
+            "title": "Compass asking for output location",
+            "agent": "compass",
+            "conditional": True,
+        },
+        {
+            "step_key": "compass.dispatched",
+            "title": "Compass dispatching to Office Agent",
+            "agent": "compass",
+        },
+        {
+            "step_key": "office.received",
+            "title": "Office receiving task",
+            "agent": "office",
+        },
+        {
+            "step_key": "office.validating",
+            "title": "Office validating sources and permissions",
+            "agent": "office",
+        },
+    ]
+
+    if capability == "analyze":
+        rows.extend(
+            [
+                {
+                    "step_key": "office.inferring_schema",
+                    "title": "Office inferring data schema",
+                    "agent": "office",
+                },
+                {
+                    "step_key": "office.computing_stats",
+                    "title": "Office computing statistics",
+                    "agent": "office",
+                },
+                {
+                    "step_key": "office.generating_report",
+                    "title": "Office generating analysis report",
+                    "agent": "office",
+                },
+                {
+                    "step_key": "office.writing",
+                    "title": "Office writing deliverable",
+                    "agent": "office",
+                },
+            ]
+        )
+    elif capability == "organize":
+        rows.extend(
+            [
+                {
+                    "step_key": "office.scanning",
+                    "title": "Office scanning folder structure",
+                    "agent": "office",
+                },
+                {
+                    "step_key": "office.planning",
+                    "title": "Office planning organization",
+                    "agent": "office",
+                },
+                {
+                    "step_key": "office.creating_folders",
+                    "title": "Office creating folder structure",
+                    "agent": "office",
+                },
+                {
+                    "step_key": "office.moving_files",
+                    "title": "Office moving files into organized structure",
+                    "agent": "office",
+                },
+                {
+                    "step_key": "office.writing_plan",
+                    "title": "Office writing organization plan",
+                    "agent": "office",
+                },
+            ]
+        )
+    else:
+        rows.extend(
+            [
+                {
+                    "step_key": "office.reading",
+                    "title": "Office reading documents",
+                    "agent": "office",
+                },
+                {
+                    "step_key": "office.summarizing",
+                    "title": "Office summarizing each document",
+                    "agent": "office",
+                },
+                {
+                    "step_key": "office.combining",
+                    "title": "Office creating combined summary",
+                    "agent": "office",
+                    "conditional": True,
+                },
+                {
+                    "step_key": "office.writing",
+                    "title": "Office writing deliverable",
+                    "agent": "office",
+                },
+            ]
+        )
+
+    rows.extend(
+        [
+            {
+                "step_key": "office.verifying",
+                "title": "Office verifying deliverable",
+                "agent": "office",
+            },
+            {
+                "step_key": "office.delivered",
+                "title": "Office delivering report to Compass",
+                "agent": "office",
+            },
+        ]
+    )
+    return rows
+
+
+def _development_major_step_skeleton(jira_key: str = "") -> list[dict]:
+    """Return the proposal-aligned development timeline skeleton for Compass UI."""
+    return [
+        {
+            "step_key": "compass.dispatched",
+            "title": "Compass dispatching to Team Lead",
+            "agent": "compass",
+        },
+        {
+            "step_key": "tl.analyzing",
+            "title": "Team Lead analyzing task",
+            "agent": "team-lead",
+        },
+        {
+            "step_key": "tl.gathering",
+            "title": "Team Lead gathering context",
+            "agent": "team-lead",
+        },
+        {
+            "step_key": "tl.dispatched_dev",
+            "title": "Team Lead dispatching to Web Dev",
+            "agent": "team-lead",
+        },
+        {
+            "step_key": "wd.drafting_plan",
+            "title": "Web Dev drafting plan",
+            "agent": "web-dev",
+        },
+        {
+            "step_key": "wd.implementing",
+            "title": "Web Dev implementing changes",
+            "agent": "web-dev",
+        },
+        {
+            "step_key": "wd.building",
+            "title": "Web Dev building and testing",
+            "agent": "web-dev",
+        },
+        {
+            "step_key": "wd.self_check",
+            "title": "Web Dev running self-check",
+            "agent": "web-dev",
+        },
+        {
+            "step_key": "wd.handover",
+            "title": "Web Dev handing over to Team Lead",
+            "agent": "web-dev",
+        },
+        {
+            "step_key": "tl.requesting_review",
+            "title": "Team Lead requesting code review",
+            "agent": "team-lead",
+        },
+        {
+            "step_key": "cr.reviewing",
+            "title": "Code Review reviewing PR",
+            "agent": "code-review",
+        },
+        {
+            "step_key": "tl.reported",
+            "title": "Team Lead reporting to Compass",
+            "agent": "team-lead",
+        },
+        {
+            "step_key": "compass.task_completed",
+            "title": "Compass marking task completed",
+            "agent": "compass",
+        },
+        {
+            "step_key": "tl.requesting_changes",
+            "title": "Team Lead requesting changes from Web Dev",
+            "agent": "team-lead",
+            "conditional": True,
+        },
+        {
+            "step_key": "wd.addressing_feedback",
+            "title": "Web Dev addressing review feedback",
+            "agent": "web-dev",
+            "conditional": True,
+        },
+        {
+            "step_key": "wd.fixing_gaps",
+            "title": "Web Dev fixing self-check gaps",
+            "agent": "web-dev",
+            "conditional": True,
+        },
+        {
+            "step_key": "wd.rebuilding",
+            "title": "Web Dev rebuilding and retesting",
+            "agent": "web-dev",
+            "conditional": True,
+        },
+        {
+            "step_key": "wd.self_check_retry",
+            "title": "Web Dev rerunning self-check",
+            "agent": "web-dev",
+            "conditional": True,
+        },
+        {
+            "step_key": "wd.handover_retry",
+            "title": "Web Dev handing over revised result",
+            "agent": "web-dev",
+            "conditional": True,
+        },
+        {
+            "step_key": "tl.re_requesting_review",
+            "title": "Team Lead requesting follow-up code review",
+            "agent": "team-lead",
+            "conditional": True,
+        },
+        {
+            "step_key": "cr.reviewing_retry",
+            "title": "Code Review reviewing revised PR",
+            "agent": "code-review",
+            "conditional": True,
+        },
+        {
+            "step_key": "tl.requesting_user_input",
+            "title": "Team Lead requesting user input for clarification",
+            "agent": "team-lead",
+            "conditional": True,
+        },
+        {
+            "step_key": "wd.requesting_user_input",
+            "title": "Web Dev requesting user input",
+            "agent": "web-dev",
+            "conditional": True,
+        },
+        {
+            "step_key": "cr.requesting_user_input",
+            "title": "Code Review requesting user input",
+            "agent": "code-review",
+            "conditional": True,
+        },
+    ]
 
 
 def _office_output_mode_question() -> str:
@@ -501,22 +776,41 @@ def _append_chat_entry(
     task_store.update_metadata(task_id, {"chat_history": history})
 
 
-def _record_major_step(task_store, task_id: str, *, text: str, agent: str = "compass") -> None:
-    if not text:
-        return
-    task = task_store.get_task(task_id)
-    if task is None:
-        return
+def _record_major_step(
+    task_store,
+    task_id: str,
+    *,
+    step_key: str,
+    title: str,
+    agent: str = "compass",
+    lifecycle_state: str = LIFECYCLE_RUNNING,
+    summary_template: str = "",
+    summary_facts: dict | None = None,
+    conditional: bool = False,
+    round: int = 0,
+) -> None:
+    """Thin Compass-side wrapper around ``framework.major_step.record_major_step``.
 
-    metadata = task.metadata or {}
-    steps = list(metadata.get("progress_steps") or [])
-    steps.append({"text": text, "agent": agent, "ts": _chat_entry_timestamp()})
-    task_store.update_metadata(
+    Compass owns the same ``TaskStore`` as the orchestrator task, so the
+    ``orchestrator_task_id`` equals ``task_id`` and the cross-process
+    fan-out branch is a no-op.
+    """
+    if not task_id or not step_key or not title:
+        return
+    if task_store.get_task(task_id) is None:
+        return
+    record_major_step(
         task_id,
-        {
-            "current_major_step": text,
-            "progress_steps": steps,
-        },
+        step_key=step_key,
+        title=title,
+        agent=agent,
+        lifecycle_state=lifecycle_state,
+        summary_template=summary_template,
+        summary_facts=summary_facts,
+        conditional=conditional,
+        round=round,
+        orchestrator_task_id=task_id,
+        task_store=task_store,
     )
 
 
@@ -597,8 +891,12 @@ class CompassAgent(BaseAgent):
             _record_major_step(
                 task_store,
                 task_id,
-                text="Waiting for clarification from user",
+                step_key="tl.requesting_user_input",
+                title="Team Lead requesting user input for clarification",
                 agent="team-lead",
+                lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+                summary_template="Team Lead requested user input: {input_reason}; awaiting user response.",
+                summary_facts={"input_reason": "ambiguous requirements"},
             )
             _append_chat_entry(
                 task_store,
@@ -617,8 +915,12 @@ class CompassAgent(BaseAgent):
             _record_major_step(
                 task_store,
                 task_id,
-                text="Development task failed",
-                agent="team-lead",
+                step_key="compass.task_failed",
+                title=f"Compass marking task failed: {final_message[:200]}",
+                agent="compass",
+                lifecycle_state=LIFECYCLE_FAILED,
+                summary_template="Compass marked the task as failed: {failure_reason}.",
+                summary_facts={"failure_reason": final_message[:500] or "development task did not complete"},
             )
             _append_chat_entry(
                 task_store,
@@ -635,8 +937,11 @@ class CompassAgent(BaseAgent):
         _record_major_step(
             task_store,
             task_id,
-            text="Development task completed",
-            agent="team-lead",
+            step_key="compass.task_completed",
+            title="Compass marking task completed",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template="Compass marked the task as completed.",
         )
         _append_chat_entry(
             task_store,
@@ -683,7 +988,6 @@ class CompassAgent(BaseAgent):
         )
         _aid = self.definition.agent_id
         _append_chat_entry(task_store, task.id, role="USER", text=user_text)
-        _record_major_step(task_store, task.id, text="Request received by Compass", agent=_aid)
 
         runtime = self.services.runtime or get_runtime()
         registry = get_registry()
@@ -716,8 +1020,25 @@ class CompassAgent(BaseAgent):
                     "workspace_path": workspace_path,
                 },
             )
+            try:
+                ensure_major_step_skeleton(
+                    task.id,
+                    entries=_development_major_step_skeleton(jira_key),
+                    task_store=task_store,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warn("failed to seed development major-step skeleton", error=str(exc))
             response_text = _development_start_message(jira_key)
-            _record_major_step(task_store, task.id, text="Development task running in background", agent=_aid)
+            _record_major_step(
+                task_store,
+                task.id,
+                step_key="compass.dispatched",
+                title="Compass dispatching to Team Lead",
+                agent=_aid,
+                lifecycle_state=LIFECYCLE_RUNNING,
+                summary_template="Compass dispatched the task to the Team Lead Agent for Jira ticket {jira_key}.",
+                summary_facts={"jira_key": jira_key or "unspecified"},
+            )
             _append_chat_entry(task_store, task.id, role="COMPASS", text=response_text)
             ui_update = {
                 "task_id": task.id,
@@ -748,6 +1069,14 @@ class CompassAgent(BaseAgent):
             log.info("dispatching office task")
             office_request = _extract_office_request(user_text, meta)
             task_store.update_metadata(task.id, {"task_type": "office", "office_request": office_request})
+            try:
+                ensure_major_step_skeleton(
+                    task.id,
+                    entries=_office_major_step_skeleton(office_request),
+                    task_store=task_store,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warn("failed to seed office major-step skeleton", error=str(exc))
 
             if not office_request.get("output_mode"):
                 question = _office_output_mode_question()
@@ -756,7 +1085,16 @@ class CompassAgent(BaseAgent):
                     question=question,
                     interrupt_metadata={"kind": "office_output_mode", "office_request": office_request},
                 )
-                _record_major_step(task_store, task.id, text="Waiting for output mode selection", agent=_aid)
+                _record_major_step(
+                    task_store,
+                    task.id,
+                    step_key="compass.asking_output_mode",
+                    title="Compass asking for output location",
+                    agent=_aid,
+                    lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+                    conditional=True,
+                    summary_template="Compass is waiting for you to choose the output location.",
+                )
                 _append_chat_entry(
                     task_store,
                     task.id,
@@ -784,18 +1122,37 @@ class CompassAgent(BaseAgent):
             response_text = dispatch_data.get("message") or f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
             office_failed = _office_dispatch_failed(dispatch_data)
             office_status = str(dispatch_data.get("status") or "").strip().lower()
-            _record_major_step(
-                task_store,
-                task.id,
-                text=(
-                    "Office task failed"
-                    if office_failed else
-                    "Office task completed"
-                    if office_status == "completed" else
-                    "Office task returned a terminal result"
-                ),
-                agent="office",
-            )
+            if office_failed:
+                _record_major_step(
+                    task_store,
+                    task.id,
+                    step_key="compass.task_failed",
+                    title=f"Compass marking task failed: {response_text[:200]}",
+                    agent="compass",
+                    lifecycle_state=LIFECYCLE_FAILED,
+                    summary_template="Compass marked the task as failed: {failure_reason}.",
+                    summary_facts={"failure_reason": response_text[:500] or "office dispatch failed"},
+                )
+            elif office_status == "completed":
+                _record_major_step(
+                    task_store,
+                    task.id,
+                    step_key="compass.task_completed",
+                    title="Compass marking task completed",
+                    agent="compass",
+                    lifecycle_state=LIFECYCLE_DONE,
+                    summary_template="Compass marked the task as completed.",
+                )
+            else:
+                _record_major_step(
+                    task_store,
+                    task.id,
+                    step_key="office.delivered",
+                    title="Office returned a terminal result",
+                    agent="office",
+                    lifecycle_state=LIFECYCLE_DONE,
+                    summary_template="Office delivered the report to Compass.",
+                )
 
         else:
             # General conversational task — use LLM for a direct answer
@@ -809,7 +1166,15 @@ class CompassAgent(BaseAgent):
                 timeout=120,
             )
             response_text = agentic_result.summary or "I can help you with that."
-            _record_major_step(task_store, task.id, text="Direct Compass response prepared", agent=_aid)
+            _record_major_step(
+                task_store,
+                task.id,
+                step_key="compass.task_completed",
+                title="Compass marking task completed",
+                agent=_aid,
+                lifecycle_state=LIFECYCLE_DONE,
+                summary_template="Compass marked the task as completed.",
+            )
 
         response_tone = "normal"
         if task_type == "office":
@@ -902,6 +1267,50 @@ class CompassAgent(BaseAgent):
         log = AgentLogger(task_id=task_id, agent_name=self.definition.agent_id)
 
         office_request = dict(metadata.get("office_request") or {})
+        reply_text = str(resume_value or "").strip().lower()
+        # B1: user-cancel-during-wait — close the in-flight user-input row
+        # to ``cancelled`` and append a terminal ``compass.task_cancelled`` row
+        # (two-step close per design doc §13 B1).
+        if reply_text in {"cancel", "abort", "stop"}:
+            _record_major_step(
+                task_store,
+                task_id,
+                step_key="compass.asking_output_mode",
+                title="Compass asked for output location (cancelled by user)",
+                agent=self.definition.agent_id,
+                lifecycle_state=LIFECYCLE_CANCELLED,
+                summary_template="Compass cancelled the output location request.",
+            )
+            cancel_reason = str(resume_value or "user cancelled").strip() or "user cancelled"
+            _record_major_step(
+                task_store,
+                task_id,
+                step_key="compass.task_cancelled",
+                title=f"Compass marking task cancelled by user: {cancel_reason[:200]}",
+                agent="compass",
+                lifecycle_state=LIFECYCLE_CANCELLED,
+                summary_template="Compass marked the task as cancelled by user: {cancel_reason}.",
+                summary_facts={"cancel_reason": cancel_reason[:500]},
+            )
+            task_store.fail_task(task_id, f"cancelled by user: {cancel_reason}")
+            _append_chat_entry(
+                task_store,
+                task_id,
+                role="COMPASS",
+                text=f"Task cancelled by user: {cancel_reason}",
+                tone="failed",
+            )
+            log.warn("office task cancelled by user during wait", reply=reply_text)
+            ui_update = {
+                "task_id": task_id,
+                "task_status": "TASK_STATE_FAILED",
+                "chat_message": {
+                    "role": "COMPASS",
+                    "text": f"Task cancelled by user: {cancel_reason}",
+                    "style": "failed",
+                },
+            }
+            return {**task_store.get_task_dict(task_id), "ui_update": ui_update}
         output_mode = _normalize_output_mode(str(resume_value))
         if not output_mode:
             question = "Please reply with `workspace` or `inplace` so I can route the office task correctly."
@@ -910,7 +1319,16 @@ class CompassAgent(BaseAgent):
                 question=question,
                 interrupt_metadata={"kind": "office_output_mode", "office_request": office_request},
             )
-            _record_major_step(task_store, task_id, text="Waiting for output mode selection", agent=self.definition.agent_id)
+            _record_major_step(
+                task_store,
+                task_id,
+                step_key="compass.asking_output_mode",
+                title="Compass asking for output location",
+                agent=self.definition.agent_id,
+                lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+                conditional=True,
+                summary_template="Compass is waiting for a valid output location.",
+            )
             _append_chat_entry(
                 task_store,
                 task_id,
@@ -932,12 +1350,28 @@ class CompassAgent(BaseAgent):
 
         office_request["output_mode"] = output_mode
         task_store.update_metadata(task_id, {"office_request": office_request})
+        # A2: Compass writes ``resuming`` on the existing user-input row before
+        # the agent resumes. The original ``compass.asking_output_mode#0`` row
+        # transitions through ``resuming`` and lands on ``done`` below.
+        _record_major_step(
+            task_store,
+            task_id,
+            step_key="compass.asking_output_mode",
+            title="Compass resuming after output location was selected",
+            agent=self.definition.agent_id,
+            lifecycle_state=LIFECYCLE_RESUMING,
+            summary_template="Compass is resuming after output location was selected.",
+        )
         task_store.resume_task(task_id)
         _record_major_step(
             task_store,
             task_id,
-            text=f"Resumed with output mode: {output_mode}",
+            step_key="compass.asking_output_mode",
+            title="Compass accepted output location",
             agent=self.definition.agent_id,
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template="Compass accepted the output location: {output_mode}.",
+            summary_facts={"output_mode": output_mode},
         )
         log.info("office output mode selected", output_mode=output_mode)
 
@@ -959,8 +1393,11 @@ class CompassAgent(BaseAgent):
         _record_major_step(
             task_store,
             task_id,
-            text="Office task dispatching in background",
+            step_key="compass.dispatched",
+            title="Compass dispatching to Office Agent",
             agent=self.definition.agent_id,
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template="Compass dispatched the task to the Office Agent.",
         )
         _append_chat_entry(
             task_store,
@@ -1081,18 +1518,37 @@ class CompassAgent(BaseAgent):
             task_store.fail_task(task_id, response_text)
         else:
             task_store.complete_task(task_id, artifacts=artifacts, message=response_text)
-        _record_major_step(
-            task_store,
-            task_id,
-            text=(
-                "Office task failed"
-                if office_failed else
-                "Office task completed"
-                if office_status == "completed" else
-                "Office task returned a terminal result"
-            ),
-            agent="office",
-        )
+        if office_failed:
+            _record_major_step(
+                task_store,
+                task_id,
+                step_key="compass.task_failed",
+                title=f"Compass marking task failed: {response_text[:200]}",
+                agent="compass",
+                lifecycle_state=LIFECYCLE_FAILED,
+                summary_template="Compass marked the task as failed: {failure_reason}.",
+                summary_facts={"failure_reason": response_text[:500] or "office dispatch failed"},
+            )
+        elif office_status == "completed":
+            _record_major_step(
+                task_store,
+                task_id,
+                step_key="compass.task_completed",
+                title="Compass marking task completed",
+                agent="compass",
+                lifecycle_state=LIFECYCLE_DONE,
+                summary_template="Compass marked the task as completed.",
+            )
+        else:
+            _record_major_step(
+                task_store,
+                task_id,
+                step_key="office.delivered",
+                title="Office returned a terminal result",
+                agent="office",
+                lifecycle_state=LIFECYCLE_DONE,
+                summary_template="Office delivered the report to Compass.",
+            )
         _append_chat_entry(
             task_store,
             task_id,

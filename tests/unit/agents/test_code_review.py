@@ -45,6 +45,12 @@ def _agent_services(runtime=None):
     )
 
 
+def _timeline_task_store(task_id: str = "task-major-steps"):
+    store = InMemoryTaskStore()
+    store.create_task(agent_id="code-review", task_id=task_id)
+    return store
+
+
 # ---------------------------------------------------------------------------
 # Compile tests
 # ---------------------------------------------------------------------------
@@ -251,6 +257,24 @@ class TestLoadPrContext:
 
         checkpoint_file = tmp_path / "code-review" / "review-checkpoints" / "review-start-1.json"
         assert checkpoint_file.exists()
+
+    async def test_records_reviewing_major_step_row(self):
+        store = _timeline_task_store()
+
+        result = await load_pr_context(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "pr_diff": "diff --git a/src/app.py b/src/app.py",
+                "changed_files": ["src/app.py"],
+                "metadata": {"reviewRound": 1},
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["cr.reviewing#0"]
+        assert row["title"] == "Code Review reviewing PR"
+        assert row["lifecycle_state"] == "running"
+        assert result["review_round"] == 1
 
     async def test_loads_workspace_boundary_artifacts_and_latest_self_assessment(self, tmp_path, monkeypatch):
         monkeypatch.setenv("CODE_REVIEW_INPUT_WAIT_SECONDS", "0")
@@ -662,6 +686,69 @@ class TestGenerateReport:
         assert result["verdict"] == "approved"
         assert result["all_comments"] == []
 
+    async def test_closes_reviewing_row_as_done(self):
+        store = _timeline_task_store()
+        await load_pr_context(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "pr_diff": "diff --git a/src/app.py b/src/app.py",
+                "changed_files": ["src/app.py"],
+                "metadata": {"reviewRound": 1},
+            }
+        )
+
+        result = await generate_report(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "review_round": 1,
+                "quality_issues": [],
+                "security_issues": [],
+                "test_issues": [],
+                "requirement_gaps": [],
+                "ui_issues": [],
+                "review_input_issues": [],
+                "checked_artifacts": [],
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["cr.reviewing#0"]
+        assert row["title"] == "Code Review reviewing PR"
+        assert row["lifecycle_state"] == "done"
+        assert result["verdict"] == "approved"
+
+    async def test_closes_reviewing_row_as_failed_for_rejected_review(self):
+        store = _timeline_task_store()
+        await load_pr_context(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "pr_diff": "diff --git a/src/app.py b/src/app.py",
+                "changed_files": ["src/app.py"],
+                "metadata": {"reviewRound": 1},
+            }
+        )
+
+        result = await generate_report(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "review_round": 1,
+                "quality_issues": [{"severity": "high", "blocking": True, "message": "Broken behavior"}],
+                "security_issues": [],
+                "test_issues": [],
+                "requirement_gaps": [],
+                "ui_issues": [],
+                "review_input_issues": [],
+                "checked_artifacts": [],
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["cr.reviewing#0"]
+        assert row["lifecycle_state"] == "failed"
+        assert result["verdict"] == "rejected"
+
     async def test_critical_issue_rejected(self):
         state = {
             "quality_issues": [{"severity": "critical", "message": "SQL injection"}],
@@ -902,4 +989,3 @@ class TestCodeReviewWorkflowExecution:
         result = await compiled.invoke(state)
         for key in ("pr_diff", "quality_issues", "security_issues", "test_issues", "requirement_gaps", "verdict"):
             assert key in result, f"Expected key '{key}' in result"
-

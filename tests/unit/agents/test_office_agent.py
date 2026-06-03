@@ -146,6 +146,34 @@ def test_analyze_request_validates_paths():
         del os.environ["ARTIFACT_ROOT"]
 
 
+def test_analyze_request_rejects_inplace_when_policy_disallows():
+    """Unsupported inplace mode must fail closed instead of silently falling back."""
+    from agents.office.nodes import analyze_request
+
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["OFFICE_SOURCE_ROOT"] = tmp
+        os.environ["ARTIFACT_ROOT"] = tmp
+        os.environ.pop("OFFICE_ALLOW_INPLACE_WRITES", None)
+
+        test_file = os.path.join(tmp, "test.txt")
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("hello world")
+
+        state = {
+            "_task_id": "task-test123",
+            "_compass_task_id": "compass-test",
+            "source_paths": [test_file],
+            "capability": "summarize",
+            "output_mode": "inplace",
+        }
+        result = analyze_request(state)
+        assert "error" in result
+        assert "workspace output" in result["error"].lower()
+
+        del os.environ["OFFICE_SOURCE_ROOT"]
+        del os.environ["ARTIFACT_ROOT"]
+
+
 def test_report_result_writes_evidence():
     """Test report_result writes task-report.json."""
     from agents.office.nodes import report_result

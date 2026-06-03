@@ -90,6 +90,30 @@ def _serialize_ui_task(task) -> dict:
         except ValueError:
             elapsed_ms = 0
     status_kind = _ui_status_kind(task)
+
+    # Major-step timeline fields (v0.8 redesign). The new structured rows are
+    # the canonical data; the legacy ``currentMajorStep`` / ``progressSteps``
+    # fields are kept as derived views for backward compatibility.
+    major_step_rows = metadata.get("major_step_rows") or {}
+    major_step_skeleton = metadata.get("major_step_skeleton") or []
+    active_key = metadata.get("active_step_instance_key", "")
+    failed_key = metadata.get("failed_step_instance_key", "")
+    terminal_key = metadata.get("terminal_step_instance_key", "")
+    last_key = metadata.get("last_step_instance_key", "")
+
+    # Derive ``currentMajorStep`` from the active row's title (per design doc
+    # §13 B8). Falls back to the stored legacy value if the active row is
+    # missing (e.g. a pre-v0.8 task that never went through the new API).
+    legacy_current = metadata.get("current_major_step", "")
+    if active_key and active_key in major_step_rows:
+        current_major_step_title = str(major_step_rows[active_key].get("title", ""))
+    elif terminal_key and terminal_key in major_step_rows:
+        current_major_step_title = str(major_step_rows[terminal_key].get("title", ""))
+    elif failed_key and failed_key in major_step_rows:
+        current_major_step_title = str(major_step_rows[failed_key].get("title", ""))
+    else:
+        current_major_step_title = legacy_current
+
     return {
         "task_id": task.id,
         "id": task.id,
@@ -111,10 +135,22 @@ def _serialize_ui_task(task) -> dict:
         "taskType": metadata.get("task_type", metadata.get("taskType", "general")),
         "task_type": metadata.get("task_type", metadata.get("taskType", "general")),
         "chatHistory": list(metadata.get("chat_history") or []),
-        "currentMajorStep": metadata.get("current_major_step", ""),
-        "current_major_step": metadata.get("current_major_step", ""),
+        # Legacy fields (kept for clients still reading them).
+        "currentMajorStep": current_major_step_title,
+        "current_major_step": current_major_step_title,
         "progressSteps": list(metadata.get("progress_steps") or []),
         "progress_steps": list(metadata.get("progress_steps") or []),
+        # New structured fields (v0.8 timeline redesign).
+        "majorStepRows": major_step_rows,
+        "majorStepEvents": list(metadata.get("major_step_events") or []),
+        "majorSteps": major_step_rows,  # camelCase alias
+        "majorStepsSkeleton": major_step_skeleton,
+        "stepStates": dict(metadata.get("step_states") or {}),
+        "stepSummaries": dict(metadata.get("step_summaries") or {}),
+        "activeStepInstanceKey": active_key,
+        "lastStepInstanceKey": last_key,
+        "failedStepInstanceKey": failed_key,
+        "terminalStepInstanceKey": terminal_key,
     }
 
 
