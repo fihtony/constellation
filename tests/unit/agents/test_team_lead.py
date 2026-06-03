@@ -1586,8 +1586,8 @@ class TestTeamLeadTools:
             "framework.registry_client.RegistryClient.from_config",
             classmethod(lambda cls: StubRegistryClient()),
         )
-        monkeypatch.setattr("agents.team_lead.tools.get_launcher", lambda: StubLauncher())
-        monkeypatch.setattr("agents.team_lead.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr("framework.launcher_dispatch.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("framework.launcher_dispatch.wait_for_agent_ready", lambda *args, **kwargs: None)
 
         def _dispatch_sync(**kwargs):
             calls["dispatch"].append(kwargs)
@@ -1768,8 +1768,8 @@ class TestTeamLeadTools:
             "framework.registry_client.RegistryClient.from_config",
             classmethod(lambda cls: StubRegistryClient()),
         )
-        monkeypatch.setattr("agents.team_lead.tools.get_launcher", lambda: StubLauncher())
-        monkeypatch.setattr("agents.team_lead.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr("framework.launcher_dispatch.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("framework.launcher_dispatch.wait_for_agent_ready", lambda *args, **kwargs: None)
 
         def _dispatch_sync(**kwargs):
             calls["dispatch"].append(kwargs)
@@ -1841,8 +1841,8 @@ class TestTeamLeadTools:
             "framework.registry_client.RegistryClient.from_config",
             classmethod(lambda cls: StubRegistryClient()),
         )
-        monkeypatch.setattr("agents.team_lead.tools.get_launcher", lambda: StubLauncher())
-        monkeypatch.setattr("agents.team_lead.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr("framework.launcher_dispatch.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("framework.launcher_dispatch.wait_for_agent_ready", lambda *args, **kwargs: None)
         monkeypatch.setattr(
             "framework.a2a.client.dispatch_sync",
             lambda **kwargs: {

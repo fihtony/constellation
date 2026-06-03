@@ -31,7 +31,7 @@ from framework.agent import AgentDefinition, AgentMode, AgentServices, BaseAgent
 # right zone even before the agent calls its first AgentLogger.
 from framework import devlog  # noqa: F401
 from agents.compass.ui.routes import handle_ui_request
-from agents.compass.tools import TOOL_NAMES, _should_use_per_task_office_launch, register_compass_tools
+from agents.compass.tools import TOOL_NAMES, register_compass_tools
 
 
 def _build_compass_definition() -> AgentDefinition:
@@ -327,24 +327,22 @@ def _dispatch_office_request(task_id: str, user_text: str, office_request: dict,
     office_url = ""
     discovered_from_registry = False
     requested_capability = _office_requested_capability(office_request.get("capability", "summarize"))
-    use_per_task_launch = _should_use_per_task_office_launch()
     try:
         from framework.registry_client import RegistryClient
 
         rc = RegistryClient.from_config()
         registry_url = rc.url
         log.a2a("→", "registry", capability=requested_capability, registry_url=registry_url)
-        if use_per_task_launch:
-            definition = rc.get_capability_definition(requested_capability)
-            if not definition:
-                definition = rc.get_capability_definition("office.document.summarize")
-            discovered_from_registry = bool(definition)
-            office_url = "per-task-launch" if discovered_from_registry else ""
-        else:
-            office_url = rc.discover(requested_capability)
-            if not office_url:
-                office_url = rc.discover("office.agent")
-            discovered_from_registry = bool(office_url)
+        # Office is now an on-demand agent: compass always launches a
+        # per-task container via the Launcher, never talks to a
+        # long-running office service. The only thing we need from the
+        # registry is the launch definition (image, port, env); if it's
+        # not registered, fail closed.
+        definition = rc.get_capability_definition(requested_capability)
+        if not definition:
+            definition = rc.get_capability_definition("office.document.summarize")
+        discovered_from_registry = bool(definition)
+        office_url = "per-task-launch" if discovered_from_registry else ""
         log.info("registry lookup", registry_url=registry_url, discovered_url=office_url)
         log.a2a(
             "←",

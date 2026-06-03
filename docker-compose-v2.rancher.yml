@@ -120,7 +120,7 @@ services:
     labels:
       constellation.agent_id: "compass"
       constellation.agent_name: "Compass Agent"
-      constellation.agent_role: "fundamental"
+      constellation.agent_role: "orchestrator"
     ports:
       - "8000:8000"
     healthcheck:
@@ -164,7 +164,7 @@ services:
     labels:
       constellation.agent_id: "team-lead"
       constellation.agent_name: "Team Lead Agent"
-      constellation.agent_role: "fundamental"
+      constellation.agent_role: "orchestrator"
     ports:
       - "8030:8030"
     healthcheck:
@@ -283,55 +283,6 @@ services:
       - "8040:8040"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8040/health')"]
-      interval: 2s
-      timeout: 2s
-      retries: 20
-      start_period: 2s
-    networks:
-      - constellation-v2
-
-  # -----------------------------------------------------------------------
-  # Office Agent — per-task document processing (port 8060)
-  # Declared here so the image is built by `docker compose build`.  In
-  # normal flow office is launched per-task by compass via the
-  # RancherLauncher; the manual profile keeps a long-running instance
-  # available for debugging.  Both compose variants expose the same
-  # profiles so behavior stays identical across Docker / Rancher.
-  # -----------------------------------------------------------------------
-  office:
-    <<: *agent-defaults
-    profiles:
-      - manual
-    image: constellation-v2-office:latest
-    build:
-      context: .
-      dockerfile: agents/office/Dockerfile
-    depends_on:
-      registry:
-        condition: service_healthy
-      init-register:
-        condition: service_completed_successfully
-    environment:
-      AGENT_ID: "office"
-      HOST: "0.0.0.0"
-      PORT: "8060"
-      REGISTRY_URL: "http://registry:9000"
-      CONSTELLATION_RUNTIME_ENV_FILE: /app/config/.runtime.env
-      ARTIFACT_ROOT: /app/artifacts
-      OFFICE_SOURCE_ROOT: ${OFFICE_SOURCE_ROOT:-/app/userdata}
-      OFFICE_ALLOWED_BASE_PATHS: ${OFFICE_ALLOWED_BASE_PATHS:-}
-      OFFICE_BACKUP_ENABLED: ${OFFICE_BACKUP_ENABLED:-true}
-    volumes:
-      - ./artifacts:/app/artifacts
-      - ./config/.env:/app/config/.runtime.env:ro
-    labels:
-      constellation.agent_id: "office"
-      constellation.agent_name: "Office Agent"
-      constellation.agent_role: "per-task"
-    ports:
-      - "8060:8060"
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8060/health')"]
       interval: 2s
       timeout: 2s
       retries: 20

@@ -15,6 +15,13 @@ from types import SimpleNamespace
 from typing import Any
 
 from framework.launcher import get_launcher
+from framework.launcher_dispatch import (
+    destroy_launch_instance,
+    dispatch_via_launcher,
+    wait_for_agent_ready,
+)
+import framework.launcher_dispatch as _launcher_dispatch
+from framework.permissions import PermissionEngine
 from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
 
@@ -103,15 +110,34 @@ def _is_containerized_process() -> bool:
 
 
 def _should_use_per_task_office_launch() -> bool:
-    if os.environ.get("CONSTELLATION_FORCE_DIRECT_OFFICE_URL", "").strip().lower() in {"1", "true", "yes"}:
-        return False
-    return bool(_office_launch_definition("summarize"))
+    """Legacy env-toggle — kept as a shim for tests that still monkeypatch it.
+
+    The on-demand launch path is the only path now (the static office
+    service is gone from the compose files). This stub always returns
+    ``True`` so any code or test that still asks "should we launch
+    per-task?" gets the correct answer without needing code changes.
+    """
+    return True
+
+
+def _require_office_launch_permission() -> None:
+    """Enforce the orchestrator→office launch grant at runtime.
+
+    Loads ``config/permissions/compass.yaml`` and calls
+    :meth:`PermissionEngine.require_agent_launching` for ``"office"``.
+    The compass permission profile already declares
+    ``agent_launching: true`` and ``allowed_agents: [team-lead, office]``;
+    this is the runtime enforcement point that turns that declaration
+    into a hard gate before any per-task container is spawned.
+    """
+    root = Path(__file__).resolve().parents[2]
+    perm_engine = PermissionEngine.from_yaml(
+        str(root / "config" / "permissions" / "compass.yaml")
+    )
+    perm_engine.require_agent_launching("office")
 
 
 def _office_launch_definition(capability: str) -> dict[str, Any]:
-    def _as_definition_object(definition: dict[str, Any]) -> Any:
-        return SimpleNamespace(**definition)
-
     try:
         from framework.config import build_agent_definition_from_config
         from framework.registry_client import RegistryClient
@@ -121,10 +147,10 @@ def _office_launch_definition(capability: str) -> dict[str, Any]:
         for candidate in (requested_capability, "office.document.summarize"):
             definition = client.get_capability_definition(candidate)
             if definition and (definition.get("launch_spec") or definition.get("launchSpec")):
-                return _as_definition_object(definition)
+                return dict(definition)
         fallback = build_agent_definition_from_config("office")
         if fallback.get("launch_spec") or fallback.get("launchSpec"):
-            return _as_definition_object(fallback)
+            return dict(fallback)
     except Exception:
         pass
     return {}
@@ -260,17 +286,8 @@ def _build_office_dispatch_contract(output_mode: str = "workspace") -> tuple[dic
 
 
 def _wait_for_agent_ready(base_url: str, timeout: int = 30) -> None:
-    deadline = time.time() + timeout
-    health_url = f"{base_url.rstrip('/')}/health"
-    last_error = "agent did not become ready"
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(health_url, timeout=2):
-                return
-        except Exception as exc:  # noqa: BLE001
-            last_error = str(exc)
-            time.sleep(0.5)
-    raise TimeoutError(f"Timed out waiting for per-task office agent: {last_error}")
+    """Deprecated shim — use :func:`framework.launcher_dispatch.wait_for_agent_ready`."""
+    return wait_for_agent_ready(base_url, timeout)
 
 
 def _dispatch_office_task_via_launcher(
@@ -281,51 +298,37 @@ def _dispatch_office_task_via_launcher(
     orchestrator_task_id: str,
     office_definition: dict[str, Any] | None = None,
 ) -> dict:
-    from framework.a2a.client import dispatch_sync
-
     definition = office_definition or _office_launch_definition(capability)
     if not definition:
         raise RuntimeError("No registered Office launch definition was found in the registry.")
 
-    launcher = get_launcher()
-    mount_plan = _office_mount_plan(source_paths, output_mode, launcher)
-    launch = launcher.launch_instance(
+    _launcher = _launcher_dispatch.get_launcher()
+    mount_plan = _office_mount_plan(source_paths, output_mode, _launcher)
+    execution_contract, permissions = _build_office_dispatch_contract(output_mode)
+    result = dispatch_via_launcher(
         definition,
-        orchestrator_task_id or "office-task",
+        capability=_office_requested_capability(capability),
+        launch_task_id=orchestrator_task_id or "office-task",
+        message_parts=[{"text": task_description}],
+        metadata={
+            "source_paths": mount_plan["translated_paths"],
+            "output_mode": output_mode,
+            "capability": capability,
+            "compassTaskId": orchestrator_task_id,
+            "executionContract": execution_contract,
+            "permissions": permissions,
+        },
+        timeout=_office_dispatch_timeout(),
+        # Office is a single-shot document task — spawn a fresh
+        # container per call and tear it down as soon as the A2A
+        # request completes. There is no review/revision cycle that
+        # would benefit from reusing the container.
+        preserve_instance=False,
         launch_overrides={
             "env": mount_plan["env"],
             "extra_binds": mount_plan["extra_binds"],
         },
     )
-
-    try:
-        _wait_for_agent_ready(launch["service_url"])
-        execution_contract, permissions = _build_office_dispatch_contract(output_mode)
-        result = dispatch_sync(
-            url=launch["service_url"],
-            capability=_office_requested_capability(capability),
-            message_parts=[{"text": task_description}],
-            metadata={
-                "source_paths": mount_plan["translated_paths"],
-                "output_mode": output_mode,
-                "capability": capability,
-                "compassTaskId": orchestrator_task_id,
-                "executionContract": execution_contract,
-                "permissions": permissions,
-            },
-            timeout=_office_dispatch_timeout(),
-        )
-    finally:
-        try:
-            agent_id = getattr(definition, "agent_id", None)
-            if not agent_id and isinstance(definition, dict):
-                agent_id = definition.get("agent_id") or definition.get("agentId")
-            launcher.destroy_instance(
-                str(agent_id or "office"),
-                launch["container_name"],
-            )
-        except Exception:
-            pass
 
     task = result.get("task", result)
     task_state = task.get("status", {}).get("state", "")
@@ -517,66 +520,29 @@ class DispatchOfficeTask(BaseTool):
         orchestrator_task_id: str = "",
         callback_url: str = "",
     ) -> ToolResult:
+        # Permission gate: compass is the orchestrator for office work,
+        # so it must hold an explicit "agent_launching" grant for the
+        # office agent before any per-task container can be spawned.
+        # ``config/permissions/compass.yaml`` already lists ``office``
+        # in ``allowed_agents``; this call is the runtime enforcement
+        # point that turns that declaration into a hard gate.
+        _require_office_launch_permission()
+
         normalized_source_paths = [str(item) for item in (source_paths or []) if item]
         if file_path and file_path not in normalized_source_paths:
             normalized_source_paths.append(file_path)
 
         try:
-            if _should_use_per_task_office_launch():
-                office_definition = _office_launch_definition(capability)
-                result = _dispatch_office_task_via_launcher(
-                    task_description=task_description,
-                    source_paths=normalized_source_paths,
-                    output_mode=output_mode,
-                    capability=capability,
-                    orchestrator_task_id=orchestrator_task_id,
-                    office_definition=office_definition,
-                )
-                return ToolResult(output=json.dumps(result))
-
-            office_url = _resolve_office_url()
-            if not office_url:
-                return ToolResult(output=json.dumps({
-                    "status": "error",
-                    "message": "No registered Office instance was found in the registry.",
-                }))
-            meta: dict[str, Any] = {}
-            if normalized_source_paths:
-                meta["source_paths"] = normalized_source_paths
-            if output_mode in {"workspace", "inplace"}:
-                meta["output_mode"] = output_mode
-            if capability:
-                meta["capability"] = capability
-            if orchestrator_task_id:
-                meta["compassTaskId"] = orchestrator_task_id
-            if callback_url:
-                meta["orchestratorCallbackUrl"] = callback_url
-            execution_contract, permissions = _build_office_dispatch_contract(output_mode)
-            meta["executionContract"] = execution_contract
-            meta["permissions"] = permissions
-
-            from framework.a2a.client import dispatch_sync
-
-            result = dispatch_sync(
-                url=office_url,
-                capability=_office_requested_capability(capability),
-                message_parts=[{"text": task_description}],
-                metadata=meta,
-                timeout=_office_dispatch_timeout(),
+            office_definition = _office_launch_definition(capability)
+            result = _dispatch_office_task_via_launcher(
+                task_description=task_description,
+                source_paths=normalized_source_paths,
+                output_mode=output_mode,
+                capability=capability,
+                orchestrator_task_id=orchestrator_task_id,
+                office_definition=office_definition,
             )
-            task = result.get("task", result)
-            task_state = task.get("status", {}).get("state", "")
-            artifacts = task.get("artifacts", [])
-            summary = _extract_text(artifacts) or _extract_status_text(task) or "Task completed."
-            status = "completed" if task_state == "TASK_STATE_COMPLETED" else (
-                "input-required" if task_state == "TASK_STATE_INPUT_REQUIRED" else "error"
-            )
-            return ToolResult(output=json.dumps({
-                "status": status,
-                "state": task_state,
-                "taskId": task.get("id", ""),
-                "summary": summary,
-            }))
+            return ToolResult(output=json.dumps(result))
         except Exception as exc:
             return ToolResult(output=json.dumps({"status": "error", "message": str(exc)}))
 
