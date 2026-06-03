@@ -58,6 +58,10 @@ def resolve_within_root(root: str, relative: str) -> str:
     """
     if not isinstance(root, str) or not root:
         raise PathSafetyError("root must be a non-empty string")
+    if not isinstance(relative, str):
+        raise PathSafetyError(f"path must be a string, got {type(relative).__name__}")
+    if "\\" in relative:
+        raise PathSafetyError(f"backslash separator not allowed in path: {relative!r}")
     real_root = os.path.realpath(os.path.abspath(root))
     normalized = normalize_relative_path(relative)
     if not normalized:

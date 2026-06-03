@@ -50,8 +50,10 @@ def test_resolve_within_root_rejects_symlink_escape(tmp_path):
 def test_resolve_within_root_rejects_backslash_separators(tmp_path):
     root = tmp_path
     (root / "files").mkdir()
-    with pytest.raises(PathSafetyError):
+    (root / "files" / "doc.pdf").write_text("x", encoding="utf-8")
+    with pytest.raises(PathSafetyError) as excinfo:
         resolve_within_root(str(root), "files\\doc.pdf")
+    assert "backslash" in str(excinfo.value).lower()
 
 
 def test_normalize_relative_path_handles_trailing_separators(tmp_path):
