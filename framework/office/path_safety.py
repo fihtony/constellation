@@ -68,6 +68,8 @@ def resolve_within_root(root: str, relative: str) -> str:
         raise PathSafetyError("path is empty after normalization")
     if normalized.startswith("/"):
         raise PathSafetyError(f"absolute path not allowed: {relative!r}")
+    if normalized.startswith("~"):
+        raise PathSafetyError(f"tilde-prefixed path not allowed: {relative!r}")
     if _DRIVE_LETTER_RE.match(normalized):
         raise PathSafetyError(f"drive-letter path not allowed: {relative!r}")
     if ".." in normalized.split("/"):

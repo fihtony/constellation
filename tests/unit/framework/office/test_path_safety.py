@@ -1,4 +1,3 @@
-import os
 import pytest
 from framework.office.path_safety import (
     normalize_relative_path,
@@ -26,14 +25,24 @@ def test_resolve_within_root_rejects_parent_traversal(tmp_path):
 
 def test_resolve_within_root_rejects_absolute_path(tmp_path):
     root = tmp_path
-    with pytest.raises(PathSafetyError):
+    with pytest.raises(PathSafetyError) as excinfo:
         resolve_within_root(str(root), "/etc/passwd")
+    assert "absolute path" in str(excinfo.value).lower()
 
 
 def test_resolve_within_root_rejects_drive_letter(tmp_path):
     root = tmp_path
-    with pytest.raises(PathSafetyError):
+    with pytest.raises(PathSafetyError) as excinfo:
         resolve_within_root(str(root), "C:/Windows/System32")
+    assert "drive-letter" in str(excinfo.value).lower()
+
+
+def test_resolve_within_root_rejects_tilde_prefix(tmp_path):
+    root = tmp_path
+    (root / "files").mkdir()
+    with pytest.raises(PathSafetyError) as excinfo:
+        resolve_within_root(str(root), "~/escape")
+    assert "tilde" in str(excinfo.value).lower()
 
 
 def test_resolve_within_root_rejects_symlink_escape(tmp_path):
