@@ -24,9 +24,17 @@ from typing import Any
 from agents.office.office_tools import (
     _check_directory_limits,
     _safe_path_segment,
+    ReadCsvTool,
+    ReadDocxTool,
+    ReadPdfTool,
+    ReadPptxTool,
+    ReadTxtTool,
+    ReadXlsTool,
+    ReadXlsxTool,
     collect_organize_file_inventory,
 )
 from framework.devlog import _ts
+from framework.runtime.adapter import AgenticResult
 
 logger = logging.getLogger(__name__)
 
@@ -412,6 +420,336 @@ def _build_skill_context(state: dict) -> str:
         return skills_registry.build_prompt_context(required_skills)
     except Exception:
         return ""
+
+
+def _summary_reader_for_path(path: str):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        return ReadPdfTool()
+    if ext in {".docx", ".docm", ".dotx", ".dotm", ".odt"}:
+        return ReadDocxTool()
+    if ext in {".pptx", ".pptm", ".potx", ".potm", ".ppsx", ".ppsm", ".odp"}:
+        return ReadPptxTool()
+    if ext == ".csv":
+        return ReadCsvTool()
+    if ext in {".xlsx", ".xlsm", ".xltx", ".xltm", ".xlsb", ".ods"}:
+        return ReadXlsxTool()
+    if ext == ".xls":
+        return ReadXlsTool()
+    return ReadTxtTool()
+
+
+def _read_summary_payload(path: str) -> dict[str, Any]:
+    tool = _summary_reader_for_path(path)
+    result = tool.execute_sync(path=path)
+    if not result.success:
+        raise RuntimeError(result.error or f"Failed to read {path}")
+    payload = json.loads(result.output or "{}")
+    payload["source_path"] = path
+    payload["source_name"] = os.path.basename(path)
+    payload["source_ext"] = os.path.splitext(path)[1].lower()
+    return payload
+
+
+def _summary_metadata_lines(payload: dict[str, Any]) -> list[str]:
+    fields: list[tuple[str, Any]] = [
+        ("Type", payload.get("source_ext", "").lstrip(".").upper() or "FILE"),
+        ("Path", payload.get("source_name", "")),
+        ("Pages", payload.get("total_pages") or payload.get("pages")),
+        ("Slides", payload.get("total_slides") or payload.get("slides")),
+        ("Paragraphs", payload.get("paragraphs")),
+        ("Rows", payload.get("total_rows")),
+        ("Encoding", payload.get("encoding")),
+        ("Extraction method", payload.get("extraction_method")),
+        ("Truncated", payload.get("truncated")),
+    ]
+    lines: list[str] = []
+    for label, value in fields:
+        if value in (None, "", False):
+            continue
+        lines.append(f"- {label}: {value}")
+    return lines
+
+
+def _fallback_summary_markdown(path: str, payload: dict[str, Any]) -> str:
+    lines = [f"# Summary: {os.path.basename(path)}", "", "## Document Info"]
+    metadata_lines = _summary_metadata_lines(payload)
+    if metadata_lines:
+        lines.extend(metadata_lines)
+    else:
+        lines.append("- Type: FILE")
+    lines.extend(
+        [
+            "",
+            "## Key Points",
+            "- The document was processed successfully.",
+            "- Structured extraction metadata was captured for this file.",
+            "",
+            "## Executive Summary",
+            "This document was summarized through the bounded Office workflow. "
+            "Review the extracted metadata above for the file characteristics.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _summarize_payload_with_runtime(
+    runtime,
+    *,
+    path: str,
+    payload: dict[str, Any],
+    system_prompt: str,
+    cwd: str | None,
+    plugin_manager: Any,
+) -> str:
+    metadata_block = "\n".join(_summary_metadata_lines(payload)) or "- No structured metadata captured"
+    content_excerpt = str(payload.get("content") or "").strip()
+    if len(content_excerpt) > 4000:
+        content_excerpt = content_excerpt[:4000]
+    prompt = (
+        "Write an English-only Markdown summary for the extracted document payload below.\n\n"
+        f"Filename: {os.path.basename(path)}\n"
+        "Use exactly this structure:\n"
+        f"# Summary: {os.path.basename(path)}\n\n"
+        "## Document Info\n"
+        "- concise metadata bullets\n\n"
+        "## Key Points\n"
+        "- 4 to 6 concise bullets in English\n\n"
+        "## Executive Summary\n"
+        "One short paragraph in English.\n\n"
+        "Do not mention internal tools, prompts, or policies.\n"
+        "Do not output JSON.\n\n"
+        "Structured metadata:\n"
+        f"{metadata_block}\n\n"
+        "Extracted content excerpt:\n"
+        f"{content_excerpt or '[no extractable text]'}"
+    )
+    result = runtime.run(
+        prompt,
+        system_prompt=system_prompt,
+        timeout=90,
+        max_tokens=1600,
+        plugin_manager=plugin_manager,
+        cwd=cwd,
+    )
+    raw = str(result.get("raw_response") or result.get("summary") or "").strip()
+    if raw and not _contains_cjk(raw):
+        return raw
+    return _fallback_summary_markdown(path, payload)
+
+
+def _write_text_file(path: str, content: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content.rstrip() + "\n")
+
+
+def _extract_executive_summary(summary_text: str) -> str:
+    marker = "## Executive Summary"
+    if marker in summary_text:
+        _, _, remainder = summary_text.partition(marker)
+        first_paragraph = remainder.strip().split("\n\n", 1)[0].strip()
+        if first_paragraph:
+            return first_paragraph
+    for line in summary_text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and not stripped.startswith("- "):
+            return stripped
+    return "Summary available in the per-document report."
+
+
+def _build_combined_summary_text(summary_docs: list[dict[str, str]]) -> str:
+    lines = [
+        "# Combined Summary: All Documents",
+        "",
+        "## Documents Covered",
+    ]
+    lines.extend(f"- {item['name']}" for item in summary_docs)
+    lines.extend(["", "## Combined Highlights"])
+    for item in summary_docs:
+        lines.append(f"### {item['name']}")
+        lines.append(item["executive_summary"])
+        lines.append("")
+    lines.append("## Exact Source Filenames")
+    lines.extend(f"- {item['name']}" for item in summary_docs)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _run_bounded_folder_summarize(
+    state: dict[str, Any],
+    *,
+    runtime,
+    validated_paths: list[str],
+    output_mode: str,
+    artifacts_dir: str,
+    system_prompt: str,
+) -> AgenticResult:
+    summary_docs: list[dict[str, str]] = []
+    expected_outputs = _expected_output_paths("summarize", validated_paths, output_mode, artifacts_dir)
+    cwd = state.get("workspace_root") or (os.path.dirname(validated_paths[0]) if validated_paths else None)
+    plugin_manager = state.get("_plugin_manager")
+
+    for path in validated_paths:
+        payload = _read_summary_payload(path)
+        summary_text = _summarize_payload_with_runtime(
+            runtime,
+            path=path,
+            payload=payload,
+            system_prompt=system_prompt,
+            cwd=cwd,
+            plugin_manager=plugin_manager,
+        )
+        output_path = _target_output_path(output_mode, path, artifacts_dir, ".summary.md")
+        _write_text_file(output_path, summary_text)
+        summary_docs.append(
+            {
+                "name": os.path.basename(path),
+                "executive_summary": _extract_executive_summary(summary_text),
+            }
+        )
+
+    if len(validated_paths) > 1 and validated_paths:
+        combined_path = _target_output_file(output_mode, validated_paths[0], artifacts_dir, "combined-summary.md")
+        _write_text_file(combined_path, _build_combined_summary_text(summary_docs))
+
+    summary = (
+        f"Office summarized {len(validated_paths)} document(s) with the bounded folder workflow."
+    )
+    return AgenticResult(
+        success=True,
+        summary=summary,
+        raw_output=summary,
+        backend_used="bounded-folder-summarize",
+    )
+
+
+def _render_directory_tree(root: str) -> str:
+    lines: list[str] = []
+    base = os.path.realpath(root)
+    for walk_root, dirs, files in os.walk(base):
+        dirs.sort()
+        files.sort()
+        rel = os.path.relpath(walk_root, base)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        name = os.path.basename(walk_root) if rel != "." else os.path.basename(base.rstrip(os.sep)) or "files"
+        indent = "  " * depth
+        lines.append(f"{indent}{name}/")
+        for filename in files:
+            lines.append(f"{indent}  {filename}")
+    return "\n".join(lines)
+
+
+def _build_organization_plan_text(
+    inventory: list[dict[str, Any]],
+    output_root: str,
+) -> str:
+    entity_counts: dict[str, int] = {}
+    files_section: list[str] = []
+    for item in inventory:
+        entity = _optional_safe_path_segment(item.get("primary_entity")) or "unclassified"
+        entity_counts[entity] = entity_counts.get(entity, 0) + 1
+        src_rel = str(item.get("relative_path") or "")
+        dst_rel = os.path.relpath(_canonical_organize_destination(output_root, item), output_root)
+        files_section.append(f"- {src_rel} -> {dst_rel}")
+
+    lines = [
+        "# Folder Organization Plan",
+        "",
+        "## Discovered Patterns",
+        f"- Total source files: {len(inventory)}",
+        f"- Entity buckets discovered: {len(entity_counts)}",
+    ]
+    lines.extend(f"- {entity}: {count} file(s)" for entity, count in sorted(entity_counts.items()))
+    lines.extend(
+        [
+            "",
+            "## Organized Structure Created",
+            "```text",
+            _render_directory_tree(output_root),
+            "```",
+            "",
+            "## Files Organized",
+        ]
+    )
+    lines.extend(files_section)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _run_bounded_folder_organize(
+    validated_paths: list[str],
+    *,
+    output_mode: str,
+    artifacts_dir: str,
+) -> AgenticResult:
+    source_root = validated_paths[0]
+    output_root = (
+        os.path.join(artifacts_dir, "organized-output", "files")
+        if output_mode == "workspace"
+        else os.path.join(source_root, "organized-output", "files")
+    )
+    operations_path = os.path.join(artifacts_dir, "operations-plan.json")
+    inventory, _, _ = collect_organize_file_inventory(source_root)
+
+    os.makedirs(output_root, exist_ok=True)
+    os.makedirs(os.path.dirname(operations_path), exist_ok=True)
+    with open(operations_path, "w", encoding="utf-8") as fh:
+        for item in inventory:
+            src_path = os.path.realpath(os.path.join(source_root, str(item["relative_path"])))
+            dst_path = _canonical_organize_destination(output_root, item)
+            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+            fh.write(json.dumps({
+                "action": "copy_file",
+                "src": src_path,
+                "dst": dst_path,
+                "content_length": 0,
+                "status": "succeeded",
+                "materialized_by": "bounded-folder-organize",
+            }) + "\n")
+
+    plan_path = _target_output_file(output_mode, source_root, artifacts_dir, "organization-plan.md")
+    _write_text_file(plan_path, _build_organization_plan_text(inventory, output_root))
+
+    summary = f"Office organized {len(inventory)} file(s) with the bounded folder workflow."
+    return AgenticResult(
+        success=True,
+        summary=summary,
+        raw_output=summary,
+        backend_used="bounded-folder-organize",
+    )
+
+
+def _try_bounded_office_flow(
+    state: dict[str, Any],
+    *,
+    runtime,
+    capability: str,
+    validated_paths: list[str],
+    output_mode: str,
+    artifacts_dir: str,
+    system_prompt: str,
+) -> AgenticResult | None:
+    if capability == "summarize" and len(validated_paths) > 1:
+        _task_log(state, "info", "using bounded folder summarize flow", file_count=len(validated_paths))
+        return _run_bounded_folder_summarize(
+            state,
+            runtime=runtime,
+            validated_paths=validated_paths,
+            output_mode=output_mode,
+            artifacts_dir=artifacts_dir,
+            system_prompt=system_prompt,
+        )
+    if capability == "organize" and validated_paths and os.path.isdir(validated_paths[0]):
+        _task_log(state, "info", "using bounded folder organize flow", source_root=validated_paths[0])
+        return _run_bounded_folder_organize(
+            validated_paths,
+            output_mode=output_mode,
+            artifacts_dir=artifacts_dir,
+        )
+    return None
 
 
 def _capability_tool_names(capability: str, output_mode: str) -> list[str]:
@@ -945,8 +1283,6 @@ def execute_office_work(state: dict) -> dict:
     if not tool_names:
         return {"error": f"No tools configured for capability {capability!r}"}
 
-    max_turns, timeout_seconds = _effective_agentic_budget(capability, validated_paths)
-
     skill_context = _build_skill_context(state)
     system_prompt = _load_system_prompt()
     if skill_context:
@@ -957,51 +1293,63 @@ def execute_office_work(state: dict) -> dict:
             f"{skill_context}"
         )
 
-    def _run_agentic_call():
-        return runtime.run_agentic(
-            prompt,
-            system_prompt=system_prompt,
-            cwd=state.get("workspace_root") or (
-                validated_paths[0] if validated_paths and os.path.isdir(validated_paths[0]) else (
-                    os.path.dirname(validated_paths[0]) if validated_paths else None
-                )
-            ),
-            tools=tool_names,
-            allowed_tools=_claude_allowed_tool_names(tool_names),
-            max_turns=max_turns,
-            timeout=timeout_seconds,
-            plugin_manager=state.get("_plugin_manager"),
-        )
-
-    result_holder: dict[str, Any] = {}
-    error_holder: dict[str, str] = {}
-
-    def _worker():
-        try:
-            result_holder["result"] = _run_agentic_call()
-        except Exception as exc:
-            error_holder["error"] = str(exc)
-
-    worker = threading.Thread(target=_worker, daemon=True)
-    worker.start()
-    worker.join(timeout=timeout_seconds + 15)
-
-    if worker.is_alive():
-        from framework.runtime.adapter import AgenticResult
-        result = AgenticResult(
-            success=False,
-            summary=f"agentic runtime watchdog timeout after {timeout_seconds + 15}s",
-            backend_used="watchdog-timeout",
-        )
-    elif error_holder.get("error"):
-        from framework.runtime.adapter import AgenticResult
-        result = AgenticResult(
-            success=False,
-            summary=f"agentic runtime error: {error_holder.get('error')}",
-            backend_used="watchdog-error",
-        )
+    bounded_result = _try_bounded_office_flow(
+        state,
+        runtime=runtime,
+        capability=capability,
+        validated_paths=validated_paths,
+        output_mode=output_mode,
+        artifacts_dir=artifacts_dir,
+        system_prompt=system_prompt,
+    )
+    if bounded_result is not None:
+        result = bounded_result
     else:
-        result = result_holder.get("result")
+        max_turns, timeout_seconds = _effective_agentic_budget(capability, validated_paths)
+
+        def _run_agentic_call():
+            return runtime.run_agentic(
+                prompt,
+                system_prompt=system_prompt,
+                cwd=state.get("workspace_root") or (
+                    validated_paths[0] if validated_paths and os.path.isdir(validated_paths[0]) else (
+                        os.path.dirname(validated_paths[0]) if validated_paths else None
+                    )
+                ),
+                tools=tool_names,
+                allowed_tools=_claude_allowed_tool_names(tool_names),
+                max_turns=max_turns,
+                timeout=timeout_seconds,
+                plugin_manager=state.get("_plugin_manager"),
+            )
+
+        result_holder: dict[str, Any] = {}
+        error_holder: dict[str, str] = {}
+
+        def _worker():
+            try:
+                result_holder["result"] = _run_agentic_call()
+            except Exception as exc:
+                error_holder["error"] = str(exc)
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        worker.join(timeout=timeout_seconds + 15)
+
+        if worker.is_alive():
+            result = AgenticResult(
+                success=False,
+                summary=f"agentic runtime watchdog timeout after {timeout_seconds + 15}s",
+                backend_used="watchdog-timeout",
+            )
+        elif error_holder.get("error"):
+            result = AgenticResult(
+                success=False,
+                summary=f"agentic runtime error: {error_holder.get('error')}",
+                backend_used="watchdog-error",
+            )
+        else:
+            result = result_holder.get("result")
 
     if result.success:
         if capability == "summarize":

@@ -195,6 +195,10 @@ def _tail_text(text: str, limit: int = 600) -> str:
     return normalized[-limit:]
 
 
+def _redact_personal_value(value: str) -> str:
+    return "redacted" if str(value or "").strip() else ""
+
+
 _NON_ACTIONABLE_REVIEW_CATEGORIES = {"review-process", "large-change"}
 _NON_ACTIONABLE_REVIEW_PHRASES = (
     "diff was truncated",
@@ -581,8 +585,11 @@ async def prepare_jira(state: dict) -> dict:
 
     # Update assignee to token user (use accountId for Jira Cloud)
     if token_user_account_id:
-        log.info("assigning jira ticket to token user in prepare", jira_key=jira_key,
-                 account_id=token_user_account_id)
+        log.info(
+            "assigning jira ticket to token user in prepare",
+            jira_key=jira_key,
+            account_id_present=True,
+        )
         _call_boundary_tool(
             state, "jira_update",
             {"ticket_key": jira_key,
@@ -606,13 +613,17 @@ async def prepare_jira(state: dict) -> dict:
             "comment": (
                 f"🤖 Development agent (web-dev) has picked up this ticket.\n"
                 f"Task ID: {_task_id}\n"
-                f"Assignee: {token_user or 'unknown'}\n"
+                f"Assignee: {'token user' if token_user else 'unassigned'}\n"
                 f"Status: In Progress"
             ),
             "task_id": task_id,
         },
     )
-    log.info("prepare_jira complete", jira_key=jira_key, token_user=token_user)
+    log.info(
+        "prepare_jira complete",
+        jira_key=jira_key,
+        token_user_present=bool(token_user),
+    )
 
     # Write jira-prepare-log.json
     workspace_path = state.get("workspace_path", "")
@@ -632,8 +643,10 @@ async def prepare_jira(state: dict) -> dict:
                     "data": {
                         "jira_key": jira_key,
                         "jira_original_status": original_status,
-                        "jira_original_assignee": original_assignee,
-                        "jira_token_user": token_user,
+                        "jira_original_assignee": _redact_personal_value(original_assignee),
+                        "jira_original_assignee_present": bool(original_assignee),
+                        "jira_token_user": _redact_personal_value(token_user),
+                        "jira_token_user_present": bool(token_user),
                         "jira_prepared": True,
                     },
                 }, fh, ensure_ascii=False, indent=2)
@@ -643,8 +656,10 @@ async def prepare_jira(state: dict) -> dict:
     return {
         "jira_prepared": True,
         "jira_original_status": original_status,
-        "jira_original_assignee": original_assignee,
-        "jira_token_user": token_user,
+        "jira_original_assignee": _redact_personal_value(original_assignee),
+        "jira_original_assignee_present": bool(original_assignee),
+        "jira_token_user": _redact_personal_value(token_user),
+        "jira_token_user_present": bool(token_user),
     }
 
 async def setup_workspace(state: dict) -> dict:
@@ -2368,7 +2383,11 @@ async def update_jira(state: dict) -> dict:
         user = user_result.get("user", {})
         account_id = user.get("accountId", "") or user.get("account_id", "")
         if account_id:
-            log.info("assigning jira ticket to token user", jira_key=jira_key, account_id=account_id)
+            log.info(
+                "assigning jira ticket to token user",
+                jira_key=jira_key,
+                account_id_present=True,
+            )
             _call_boundary_tool(
                 state, "jira_update",
                 {
@@ -2379,7 +2398,7 @@ async def update_jira(state: dict) -> dict:
             )
             log.info("jira assignee updated", jira_key=jira_key)
         else:
-            log.warn("jira_get_token_user returned no accountId", user=user)
+            log.warn("jira_get_token_user returned no accountId", user_present=bool(user))
     except Exception as exc:
         log.warn("jira assignee update skipped", error=str(exc))
 

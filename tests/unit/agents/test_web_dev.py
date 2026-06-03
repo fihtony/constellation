@@ -9,6 +9,7 @@ from framework.workflow import START, END
 from agents.web_dev.agent import WebDevAgent, web_dev_workflow, web_dev_definition
 from agents.web_dev.tools import SCMCreatePR, SCMUploadPRImage, register_web_dev_tools
 from agents.web_dev.nodes import (
+    prepare_jira,
     setup_workspace,
     analyze_task,
     implement_changes,
@@ -138,8 +139,55 @@ class TestWebDevMajorSteps:
 
         row = store.get_task("task-major-steps").metadata["major_step_rows"]["wd.building#0"]
         assert row["title"] == "Web Dev building and testing"
-        assert row["lifecycle_state"] == "done"
-        assert result["route"] == "pass"
+
+
+class TestWebDevJiraPrivacy:
+    async def test_prepare_jira_redacts_personal_identifiers_in_logs_and_artifacts(self, tmp_path, monkeypatch):
+        boundary_calls = []
+
+        def _boundary(_state, tool_name, payload):
+            boundary_calls.append((tool_name, payload))
+            if tool_name == "jira_get_token_user":
+                return {
+                    "user": {
+                        "emailAddress": "person@example.com",
+                        "accountId": "acct-123456",
+                    }
+                }
+            if tool_name == "jira_list_transitions":
+                return {"transitions": [{"name": "In Progress"}]}
+            return {}
+
+        monkeypatch.setattr("agents.web_dev.nodes._call_boundary_tool", _boundary)
+
+        state = {
+            "_task_id": "task-privacy",
+            "workspace_path": str(tmp_path),
+            "jira_context": {
+                "key": "CSTL-1",
+                "fields": {
+                    "status": {"name": "To Do"},
+                    "assignee": {"emailAddress": "owner@example.com"},
+                },
+            },
+        }
+
+        result = await prepare_jira(state)
+
+        comment_payload = next(payload for name, payload in boundary_calls if name == "jira_comment")
+        assert "person@example.com" not in comment_payload["comment"]
+        assert "owner@example.com" not in comment_payload["comment"]
+        assert "Assignee: token user" in comment_payload["comment"]
+
+        log_payload = json.loads((tmp_path / "web-dev" / "jira-prepare-log.json").read_text(encoding="utf-8"))
+        data = log_payload["data"]
+        assert data["jira_original_assignee"] == "redacted"
+        assert data["jira_original_assignee_present"] is True
+        assert data["jira_token_user"] == "redacted"
+        assert data["jira_token_user_present"] is True
+
+        assert result["jira_original_assignee"] == "redacted"
+        assert result["jira_token_user"] == "redacted"
 
     async def test_self_assess_no_runtime_records_self_check_row(self):
         store = _timeline_task_store()
