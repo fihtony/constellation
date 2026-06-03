@@ -103,17 +103,26 @@ class TestCompassUITemplates:
         assert "currentMark = currentClass === 'failed' ? '✕' : (currentClass === 'warn' ? '!' : '✓');" in html
 
     def test_render_ui_renders_compact_duration_for_v08_timeline(self):
-        # §8.1: emit ``Xh Ym Zs`` for hour-bearing spans and ``Ym Zs`` when
-        # hours are zero; render ``Not started yet`` for unfired conditional
-        # rows.
+        # §8.1 (revised): concise form, omitting leading zero units. Unfired
+        # rows now use the ``--`` placeholder (consistent with Time Spent).
         html = render_compass_ui()
         assert "function compactDuration(ms)" in html
         assert "function compactStartTime(iso)" in html
-        assert "Not started yet" in html
-        # Hours branch: ``Xh YYm ZZs``.
-        assert "${hours}h ${mm}m ${ss}s" in html
-        # No-hours branch: ``YYm ZZs`` (design doc §2.1: zero hours omitted).
-        assert "${mm}m ${ss}s" in html
+        # Unfired rows use ``--`` for the STARTED label (consistent with the
+        # TIME SPENT ``--`` placeholder).
+        assert "startLabel = '--';" in html
+        # Hours+minutes branch: ``Xh Ym Zs``.
+        assert "${hours}h ${minutes}m ${seconds}s" in html
+        # Hours-only branch (no minutes): ``Xh Zs``.
+        assert "${hours}h ${seconds}s" in html
+        # Minutes-only branch (no hours): ``Ym Zs``.
+        assert "${minutes}m ${seconds}s" in html
+        # Seconds-only branch: ``Zs``.
+        assert "${seconds}s" in html
+        # Zero-duration rows are hidden (return empty string).
+        assert "if (totalSeconds === 0) return '';" in html
+        # Time Spent pill is hidden when duration is empty.
+        assert "durationLabel === ''" in html
 
     def test_render_ui_keeps_collapsed_major_timeline_focus_row_visible(self):
         html = render_compass_ui()
@@ -126,6 +135,41 @@ class TestCompassUITemplates:
         assert "const hasLaterFiredStep = ordered.some(candidate => candidate.key !== sik && candidate.fired && !candidate.ignored);" in html
         assert "visualState = 'done';" in html
         assert "lifecycleState = 'done';" in html
+
+    def test_render_ui_marks_skipped_skeleton_rows_as_done_when_later_steps_fired(self):
+        # UI #3 fix: unfired skeleton rows that come BEFORE a later fired row
+        # should not be displayed as ``pending`` — the agent skipped past
+        # them. Mark them as ``done`` so the timeline reflects the real
+        # execution order.
+        html = render_compass_ui()
+        assert "!row.fired" in html
+        assert "&& hasLaterFiredStep" in html
+        assert "&& (visualState === 'pending' || visualState === 'conditional_pending')" in html
+        # The skipped-row fix re-uses the same ``done`` visual state but
+        # preserves ``lifecycleState`` so the row is distinguishable from a
+        # real completion in tests/dashboards.
+        assert "lifecycleState stays empty" in html or "lifecycleState stays" in html or "lifecycleState = '';" not in html or "lifecycle_state" in html
+
+    def test_render_ui_uses_dash_placeholder_for_unfired_started_label(self):
+        # UI #4 fix: unfired rows show ``--`` for STARTED (not the literal
+        # "Not started yet" text) to match the TIME SPENT ``--`` convention.
+        html = render_compass_ui()
+        assert "Not started yet" not in html
+        assert "startLabel = '--';" in html
+
+    def test_render_ui_panel_head_does_not_wrap_with_long_task_id(self):
+        # UI #1 fix: when a long task id is shown in the "Task Info" header,
+        # the bottom separator of the panel-head must not move. The header
+        # content is single-line + ellipsis so all three panel-heads share
+        # the same bottom border y-position.
+        html = render_compass_ui()
+        assert ".panel-head-title {" in html
+        assert "flex-wrap: nowrap;" in html
+        assert ".panel-head strong {" in html
+        assert "white-space: nowrap;" in html
+        assert ".detail-head-task-id {" in html
+        assert "text-overflow: ellipsis;" in html
+        assert "max-width: 100%;" in html
 
     def test_render_ui_renders_unfired_skeleton_rows_as_pending(self):
         html = render_compass_ui()

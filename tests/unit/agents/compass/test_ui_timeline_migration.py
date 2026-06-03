@@ -10,9 +10,13 @@ Verifies the new structured-data renderer (Phase 3 of the redesign):
   ``major_step_rows`` so the caller can fall back to the generic renderer.
 - ``deriveMajorTimeline`` orders rows by ``major_step_skeleton`` insertion.
 - Unfired conditional rows render with ``visual_state=conditional_pending``
-  and ``fired=false`` so the renderer can show ``Not started yet``.
-- The compact duration format is always ``Xh YYm ZZs`` (zero-padded minutes
-  and seconds, hour always emitted).
+  and ``fired=false`` so the renderer can show ``--`` for STARTED and
+  TIME SPENT (consistent placeholder convention).
+- The compact duration format is a concise form that omits leading zero
+  units (e.g. ``53s``, ``6m 12s``, ``1h 5s``); a duration of zero hides
+  the Time Spent pill entirely.
+- Skipped skeleton rows (unfired + a later row has fired) are flipped to
+  ``visual_state=done`` so the timeline reflects the real execution order.
 """
 from __future__ import annotations
 
@@ -276,6 +280,6 @@ class TestPayloadSmoke:
             "function timelineHtmlForMajorSteps(task, timeline",
             "function compactDuration(ms)",
             "function compactStartTime(iso)",
-            "Not started yet",
+            "startLabel = '--';",
         ):
             assert fn in html, f"missing {fn!r} in rendered HTML"

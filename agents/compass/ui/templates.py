@@ -219,13 +219,16 @@ body {
   font-weight: 700;
   letter-spacing: 0.12em;
   text-transform: uppercase;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .panel-head-title {
   display: inline-flex;
   align-items: center;
   gap: 10px;
   min-width: 0;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  overflow: hidden;
 }
 .panel-note {
   color: var(--muted);
@@ -783,6 +786,10 @@ body {
   display: inline-flex;
   align-items: center;
   min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: #dce7ef;
   font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
   font-size: 12px;
@@ -1684,18 +1691,34 @@ _INLINE_JS = r"""
       const stepKey = String(row.stepKey || '');
       const sik = row.key;
       const isLegacyCompassReceived = stepKey === 'compass.received';
+      // ``hasLaterFiredStep`` captures the case where the task has progressed
+      // past this row, even if the row itself never received an event. Used
+      // both for the legacy ``compass.received`` stuck-in-running case and
+      // for unfired skeleton rows that were skipped during execution.
       const hasLaterFiredStep = ordered.some(candidate => candidate.key !== sik && candidate.fired && !candidate.ignored);
-      // Pre-redesign tasks can leave ``compass.received`` stuck in ``running``
-      // even though later rows already fired. Show it as completed so the
-      // expanded timeline reflects the real historical sequence.
       if (
         isLegacyCompassReceived
         && row.fired
         && hasLaterFiredStep
         && (visualState === 'current' || lifecycleState === 'running')
       ) {
+        // Pre-redesign tasks can leave ``compass.received`` stuck in
+        // ``running`` even though later rows already fired. Show it as
+        // completed so the expanded timeline reflects the real historical
+        // sequence.
         visualState = 'done';
         lifecycleState = 'done';
+      } else if (
+        !row.fired
+        && hasLaterFiredStep
+        && (visualState === 'pending' || visualState === 'conditional_pending')
+      ) {
+        // Skipped skeleton row: the agent never reached this step because a
+        // later step fired first. Mark it as ``done`` so the timeline does
+        // not show a ``pending → done → pending → done`` pattern that
+        // contradicts the actual execution order. ``lifecycleState`` stays
+        // empty to indicate no event was recorded.
+        visualState = 'done';
       }
       return { ...row, visualState, lifecycleState };
     });
@@ -2230,21 +2253,26 @@ _INLINE_JS = r"""
       </div>`;
     }).join('')}</div>`.replace('timeline-list">', `timeline-list${expanded ? '' : ' collapsed'}">`);
   }
-  // Compact duration formatter for the v0.8 timeline right column. Always
-  // emits ``Xh Ym Zs`` even when X or Y is 0, so the column stays aligned
-  // (e.g. ``0m 02s`` not ``2s``). Per design doc §2.1 / §8.1.
+  // Compact duration formatter for the v0.8 timeline right column.
+  // Per design doc §2.1 / §8.1 (revised): use a single concise form,
+  // omitting leading zero units. Examples:
+  //   0          -> ''   (caller hides the row)
+  //   53s        -> '53s'
+  //   6m 12s     -> '6m 12s'
+  //   1h 5s      -> '1h 5s'  (no leading 0h, no leading 0m)
   function compactDuration(ms) {
     if (ms === null || ms === undefined || Number.isNaN(ms)) return '--';
     const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    if (totalSeconds === 0) return '';
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
     const seconds = totalSeconds % 60;
-    const mm = String(minutes).padStart(2, '0');
-    const ss = String(seconds).padStart(2, '0');
     if (hours > 0) {
-      return `${hours}h ${mm}m ${ss}s`;
+      if (minutes > 0) return `${hours}h ${minutes}m ${seconds}s`;
+      return `${hours}h ${seconds}s`;
     }
-    return `${mm}m ${ss}s`;
+    if (minutes > 0) return `${minutes}m ${seconds}s`;
+    return `${seconds}s`;
   }
   // Format a UTC ISO timestamp as ``MM-DD HH:MM:SS`` in the viewer's local
   // timezone. Returns ``'--'`` for missing or unparseable input.
@@ -2278,12 +2306,15 @@ _INLINE_JS = r"""
       const visualClass = String(row.visualState || 'pending');
       const mark = pickMarkForVisualState(visualClass);
       const isFocusedRow = !expanded || (row.fired && visualClass === 'current');
-      // Right-hand column: ``MM-DD HH:MM:SS  Xh Ym Zs``.
+      // Right-hand column: ``STARTED  TIME SPENT`` pills. When a value is
+      // unavailable we render ``--`` to keep the placeholder consistent with
+      // the unfired-row case (per design doc §8.1 revised).
       let startLabel;
       let durationLabel;
       if (!row.fired) {
-        // Unfired conditional row: literal "Not started yet" per §8.1.
-        startLabel = 'Not started yet';
+        // Unfired row (skeleton or skipped): show ``--`` to keep the layout
+        // consistent with the Time Spent placeholder.
+        startLabel = '--';
         durationLabel = '--';
       } else {
         startLabel = compactStartTime(row.startedAt);
@@ -2295,6 +2326,13 @@ _INLINE_JS = r"""
         const startMs = startDate ? startDate.getTime() : 0;
         durationLabel = compactDuration(startMs && end ? end - startMs : null);
       }
+      // Hide the Time Spent pill entirely when the duration is zero/empty
+      // (e.g. a fired row that just started). This is cleaner than rendering
+      // a bare ``0s`` (which would conflict with the omit-when-zero rule in
+      // §2.1) and prevents the pill from flickering on every refresh.
+      const timeSpentHtml = durationLabel === ''
+        ? ''
+        : `<span class="timeline-fact"><span class="timeline-fact-label">Time Spent</span>${esc(durationLabel)}</span>`;
       const ownerAgent = row.agent || ownerOf(task);
       const summaryLine = row.summaryHtml
         ? `<div class="timeline-summary">${esc(ownerAgent)}: ${row.summaryHtml}</div>`
@@ -2305,7 +2343,7 @@ _INLINE_JS = r"""
           <div class="timeline-title">${esc(row.title)}</div>
           <div class="timeline-facts">
             <span class="timeline-fact"><span class="timeline-fact-label">Started</span>${esc(startLabel)}</span>
-            <span class="timeline-fact"><span class="timeline-fact-label">Time Spent</span>${esc(durationLabel)}</span>
+            ${timeSpentHtml}
           </div>
         </div>
         <div class="timeline-meta">${summaryLine}</div>
