@@ -13,6 +13,11 @@ import urllib.request
 from typing import Any
 
 from framework.launcher import get_launcher
+from framework.launcher_dispatch import (
+    destroy_launch_instance,
+    dispatch_via_launcher,
+    wait_for_agent_ready,
+)
 from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
 
@@ -87,17 +92,8 @@ def _is_per_task_definition(definition: dict[str, Any]) -> bool:
 
 
 def _wait_for_agent_ready(base_url: str, timeout: int = 30) -> None:
-    deadline = time.time() + timeout
-    health_url = f"{base_url.rstrip('/')}/health"
-    last_error = "agent did not become ready"
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(health_url, timeout=2):
-                return
-        except Exception as exc:  # noqa: BLE001
-            last_error = str(exc)
-            time.sleep(0.5)
-    raise TimeoutError(f"Timed out waiting for launched agent: {last_error}")
+    """Deprecated shim — use :func:`framework.launcher_dispatch.wait_for_agent_ready`."""
+    return wait_for_agent_ready(base_url, timeout)
 
 
 def _downstream_timeout_seconds(kind: str) -> int:
@@ -205,53 +201,25 @@ def _dispatch_via_launcher(
     timeout: int,
     preserve_instance: bool = False,
     per_task_agent_task_id: str = "",
+    launch_overrides: dict[str, Any] | None = None,
 ) -> dict:
-    from framework.a2a.client import dispatch_sync
-
-    launcher = get_launcher()
-    launch = launcher.launch_instance(definition, launch_task_id or "per-task-agent")
-    agent_id = str(definition.get("agent_id") or definition.get("agentId") or capability).strip() or capability
-
-    try:
-        _wait_for_agent_ready(launch["service_url"])
-        result = dispatch_sync(
-            url=launch["service_url"],
-            capability=capability,
-            message_parts=message_parts,
-            metadata=metadata,
-            timeout=timeout,
-        )
-        if preserve_instance and isinstance(result, dict):
-            result = dict(result)
-            result["_launch"] = {
-                "agentId": agent_id,
-                "serviceUrl": launch["service_url"],
-                "containerName": launch["container_name"],
-                "perTaskAgentTaskId": per_task_agent_task_id,
-            }
-        return result
-    finally:
-        if not preserve_instance:
-            try:
-                launcher.destroy_instance(agent_id, launch["container_name"])
-            except Exception:
-                pass
+    """Deprecated shim — use :func:`framework.launcher_dispatch.dispatch_via_launcher`."""
+    return dispatch_via_launcher(
+        definition,
+        capability=capability,
+        launch_task_id=launch_task_id,
+        message_parts=message_parts,
+        metadata=metadata,
+        timeout=timeout,
+        preserve_instance=preserve_instance,
+        per_task_agent_task_id=per_task_agent_task_id,
+        launch_overrides=launch_overrides,
+    )
 
 
 def _destroy_launch_instance(launch_info: dict[str, Any] | None) -> bool:
-    if not isinstance(launch_info, dict):
-        return False
-
-    container_name = str(launch_info.get("containerName") or "").strip()
-    if not container_name:
-        return False
-
-    agent_id = str(launch_info.get("agentId") or "unknown-agent").strip() or "unknown-agent"
-    try:
-        get_launcher().destroy_instance(agent_id, container_name)
-    except Exception:
-        return False
-    return True
+    """Deprecated shim — use :func:`framework.launcher_dispatch.destroy_launch_instance`."""
+    return destroy_launch_instance(launch_info)
 
 
 # ---------------------------------------------------------------------------

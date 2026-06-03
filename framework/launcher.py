@@ -14,6 +14,26 @@ from urllib.parse import quote
 
 _CHILD_SOCKET_PATH = "/var/run/docker.sock"
 
+# Role taxonomy emitted as the `constellation.agent_role` container
+# label. Three values are recognised:
+#
+#   "orchestrator" — long-running control-plane agents (compass,
+#                    team_lead). These hold the docker socket and
+#                    may launch child agents.
+#   "on-demand"    — task executors spawned per task and torn down
+#                    afterwards (office, web-dev, code-review,
+#                    future android-dev / ios-dev). They must NEVER
+#                    receive the docker socket.
+#   "boundary"     — long-running integration adapters (jira, scm,
+#                    ui_design). They expose fixed services and
+#                    do not launch children.
+#
+# The ExecutionMode enum keeps the canonical value "per-task" for
+# backwards compatibility with downstream consumers (registry
+# store, scripts, tests); the label emitted to docker is the
+# friendlier "on-demand".
+ON_DEMAND_ROLE_LABEL = "on-demand"
+
 
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
     def __init__(self, socket_path: str):
@@ -245,6 +265,31 @@ class Launcher:
 
         spec = dict(base_spec)
         overrides = launch_overrides or {}
+
+        # On-demand agents must never receive the docker socket — they
+        # are spawned as task executors and have no business launching
+        # further containers. Strip socket-mount directives from the
+        # base spec (defence in depth: the launch_spec shouldn't ask
+        # for it in the first place) and reject any override that tries
+        # to opt back in. Only the orchestrator agents are allowed to
+        # carry the docker socket.
+        execution_mode_text = str(
+            _enum_value(definition.get("execution_mode"), "")
+        ).strip().lower()
+        if execution_mode_text in {"per-task", "on-demand"}:
+            spec.pop("mount_docker_socket", None)
+            spec.pop("mountDockerSocket", None)
+            if (
+                overrides.get("mount_docker_socket")
+                or overrides.get("mountDockerSocket")
+            ):
+                raise PermissionError(
+                    f"Refusing to launch on-demand agent "
+                    f"'{definition.get('agent_id', '?')}': "
+                    f"launch_overrides requested docker socket mount, "
+                    f"which is forbidden for on-demand agents."
+                )
+
         if overrides.get("env"):
             spec["env"] = {
                 **_as_dict(spec.get("env")),
@@ -294,7 +339,7 @@ class Launcher:
             "Labels": {
                 "constellation.agent_id": agent_id,
                 "constellation.agent_name": str(definition.get("name") or agent_id),
-                "constellation.agent_role": _enum_value(definition.get("execution_mode"), "per-task"),
+                "constellation.agent_role": _enum_value(definition.get("execution_mode"), ON_DEMAND_ROLE_LABEL),
                 "constellation.task_id": task_id,
             },
             "HostConfig": {

@@ -456,7 +456,11 @@ class TestCompassTools:
                 return f"/host{path}"
 
             def launch_instance(self, agent_definition, task_id, *, launch_overrides=None):
-                launched["agent_id"] = agent_definition.agent_id
+                launched["agent_id"] = (
+                    agent_definition.get("agent_id")
+                    if isinstance(agent_definition, dict)
+                    else getattr(agent_definition, "agent_id", "unknown")
+                )
                 launched["task_id"] = task_id
                 launched["overrides"] = launch_overrides
                 return {
@@ -481,9 +485,8 @@ class TestCompassTools:
                 }
             }
 
-        monkeypatch.setattr("agents.compass.tools._should_use_per_task_office_launch", lambda: True)
-        monkeypatch.setattr("agents.compass.tools.get_launcher", lambda: StubLauncher())
-        monkeypatch.setattr("agents.compass.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr("framework.launcher_dispatch.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("framework.launcher_dispatch.wait_for_agent_ready", lambda *args, **kwargs: None)
         monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
 
         result = DispatchOfficeTask().execute_sync(
@@ -530,9 +533,8 @@ class TestCompassTools:
             def destroy_instance(self, agent_id, container_name):
                 return None
 
-        monkeypatch.setattr("agents.compass.tools._should_use_per_task_office_launch", lambda: True)
-        monkeypatch.setattr("agents.compass.tools.get_launcher", lambda: StubLauncher())
-        monkeypatch.setattr("agents.compass.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr("framework.launcher_dispatch.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("framework.launcher_dispatch.wait_for_agent_ready", lambda *args, **kwargs: None)
         monkeypatch.setattr(
             "framework.a2a.client.dispatch_sync",
             lambda **kwargs: {
@@ -557,45 +559,6 @@ class TestCompassTools:
         assert launched["overrides"]["env"]["OFFICE_ALLOW_INPLACE_WRITES"] == "true"
         assert launched["overrides"]["extra_binds"] == [f"/host{source_dir}:/app/userdata/input-0/folder"]
         assert launched["overrides"]["env"]["OFFICE_ALLOWED_BASE_PATHS"] == "/app/userdata/input-0/folder"
-
-    def test_dispatch_office_task_direct_dispatch_attaches_child_permissions(self, monkeypatch, tmp_path):
-        from agents.compass.tools import DispatchOfficeTask
-
-        source_file = tmp_path / "report.txt"
-        source_file.write_text("hello", encoding="utf-8")
-        dispatched = {}
-
-        def _dispatch_sync(url, capability, message_parts, metadata, **kwargs):
-            dispatched["url"] = url
-            dispatched["capability"] = capability
-            dispatched["metadata"] = metadata
-            return {
-                "task": {
-                    "id": "office-direct-1",
-                    "status": {"state": "TASK_STATE_COMPLETED"},
-                    "artifacts": [{"parts": [{"text": "Done."}], "metadata": {}}],
-                }
-            }
-
-        monkeypatch.setattr("agents.compass.tools._should_use_per_task_office_launch", lambda: False)
-        monkeypatch.setattr("agents.compass.tools._resolve_office_url", lambda: "http://office:8060")
-        monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
-
-        result = DispatchOfficeTask().execute_sync(
-            task_description="Summarize the authorized file.",
-            source_paths=[str(source_file)],
-            output_mode="workspace",
-            capability="summarize",
-            orchestrator_task_id="compass-direct-123",
-        )
-
-        payload = json.loads(result.output)
-        assert payload["status"] == "completed"
-        assert dispatched["url"] == "http://office:8060"
-        assert dispatched["metadata"]["compassTaskId"] == "compass-direct-123"
-        assert "permissions" in dispatched["metadata"]
-        assert "read_pdf" in dispatched["metadata"]["permissions"]["allowedTools"]
-        assert "dispatch_office_task" not in dispatched["metadata"]["permissions"]["allowedTools"]
 
     def test_dispatch_office_task_translates_host_paths_visible_only_via_workspace_mount(self, monkeypatch, tmp_path):
         from agents.compass.tools import DispatchOfficeTask
@@ -630,9 +593,8 @@ class TestCompassTools:
             def destroy_instance(self, agent_id, container_name):
                 return None
 
-        monkeypatch.setattr("agents.compass.tools._should_use_per_task_office_launch", lambda: True)
-        monkeypatch.setattr("agents.compass.tools.get_launcher", lambda: StubLauncher())
-        monkeypatch.setattr("agents.compass.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr("framework.launcher_dispatch.get_launcher", lambda: StubLauncher())
+        monkeypatch.setattr("framework.launcher_dispatch.wait_for_agent_ready", lambda *args, **kwargs: None)
         monkeypatch.setattr(
             "framework.a2a.client.dispatch_sync",
             lambda **kwargs: {
@@ -690,7 +652,6 @@ class TestCompassTools:
             "framework.registry_client.RegistryClient.from_config",
             classmethod(lambda cls: StubRegistryClient()),
         )
-        monkeypatch.setattr("agents.compass.agent._should_use_per_task_office_launch", lambda: True)
         monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path))
 
         report_dir = tmp_path / "task-123" / "office"
@@ -744,7 +705,6 @@ class TestCompassTools:
             "framework.registry_client.RegistryClient.from_config",
             classmethod(lambda cls: StubRegistryClient()),
         )
-        monkeypatch.setattr("agents.compass.agent._should_use_per_task_office_launch", lambda: True)
 
         result = _dispatch_office_request(
             "task-missing-report",

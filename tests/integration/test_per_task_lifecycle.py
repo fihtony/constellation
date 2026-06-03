@@ -252,8 +252,8 @@ class TestReplacementAfterExit:
             "framework.registry_client.RegistryClient.from_config",
             classmethod(lambda cls: StubRegistryClient()),
         )
-        monkeypatch.setattr("agents.team_lead.tools.get_launcher", lambda: stub_launcher)
-        monkeypatch.setattr("agents.team_lead.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr("framework.launcher_dispatch.get_launcher", lambda: stub_launcher)
+        monkeypatch.setattr("framework.launcher_dispatch.wait_for_agent_ready", lambda *args, **kwargs: None)
         monkeypatch.setattr("agents.team_lead.tools.time.sleep", lambda *args, **kwargs: None)
         monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
         monkeypatch.setenv("TEAM_LEAD_CHILD_REPLACEMENT_CONFIRM_SECONDS", "1")
@@ -334,8 +334,8 @@ class TestReplacementAfterExit:
             "framework.registry_client.RegistryClient.from_config",
             classmethod(lambda cls: StubRegistryClient()),
         )
-        monkeypatch.setattr("agents.team_lead.tools.get_launcher", lambda: stub_launcher)
-        monkeypatch.setattr("agents.team_lead.tools._wait_for_agent_ready", lambda *args, **kwargs: None)
+        monkeypatch.setattr("framework.launcher_dispatch.get_launcher", lambda: stub_launcher)
+        monkeypatch.setattr("framework.launcher_dispatch.wait_for_agent_ready", lambda *args, **kwargs: None)
         monkeypatch.setattr("agents.team_lead.tools.time.sleep", lambda *args, **kwargs: None)
         monkeypatch.setattr("framework.a2a.client.dispatch_sync", _dispatch_sync)
         monkeypatch.setenv("TEAM_LEAD_CHILD_REPLACEMENT_CONFIRM_SECONDS", "1")
@@ -389,6 +389,7 @@ class TestReplacementAfterExit:
             "framework.registry_client.RegistryClient.from_config",
             classmethod(lambda cls: StubRegistryClient()),
         )
+        monkeypatch.setattr("framework.launcher_dispatch.get_launcher", lambda: StubLauncher())
         monkeypatch.setattr("agents.team_lead.tools.get_launcher", lambda: StubLauncher())
         monkeypatch.setattr("agents.team_lead.tools.time.sleep", lambda *args, **kwargs: None)
         monkeypatch.setattr(
