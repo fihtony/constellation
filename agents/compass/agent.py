@@ -987,6 +987,20 @@ class CompassAgent(BaseAgent):
             },
         )
         _aid = self.definition.agent_id
+        # v0.8: emit the first major step (compass.received) as the canonical
+        # first row of the timeline. This matches design doc §4.2.1 step #1
+        # and ensures ``deriveMajorTimeline`` sees a real ``compass.received``
+        # row instead of relying on the legacy ``isLegacyCompassReceived``
+        # compatibility branch in the front-end renderer.
+        _record_major_step(
+            task_store,
+            task.id,
+            step_key="compass.received",
+            title="Compass receiving request",
+            agent=_aid,
+            lifecycle_state=LIFECYCLE_RUNNING,
+            summary_template="Compass received a new request.",
+        )
         _append_chat_entry(task_store, task.id, role="USER", text=user_text)
 
         runtime = self.services.runtime or get_runtime()
@@ -1529,7 +1543,14 @@ class CompassAgent(BaseAgent):
                 summary_template="Compass marked the task as failed: {failure_reason}.",
                 summary_facts={"failure_reason": response_text[:500] or "office dispatch failed"},
             )
-        elif office_status == "completed":
+        else:
+            # A6: per design doc §13.1 A6, always fire ``compass.task_completed``
+            # on the happy path so the timeline has a consistent closing row,
+            # regardless of the exact office_status (completed / success /
+            # warning / unknown-but-not-failed). The ``office.delivered`` row
+            # was previously written in the else branch but it is already
+            # emitted by Office's own report_result node when applicable, so
+            # we keep the canonical closure here as ``compass.task_completed``.
             _record_major_step(
                 task_store,
                 task_id,
@@ -1538,16 +1559,6 @@ class CompassAgent(BaseAgent):
                 agent="compass",
                 lifecycle_state=LIFECYCLE_DONE,
                 summary_template="Compass marked the task as completed.",
-            )
-        else:
-            _record_major_step(
-                task_store,
-                task_id,
-                step_key="office.delivered",
-                title="Office returned a terminal result",
-                agent="office",
-                lifecycle_state=LIFECYCLE_DONE,
-                summary_template="Office delivered the report to Compass.",
             )
         _append_chat_entry(
             task_store,

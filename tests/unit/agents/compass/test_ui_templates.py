@@ -103,14 +103,17 @@ class TestCompassUITemplates:
         assert "currentMark = currentClass === 'failed' ? '✕' : (currentClass === 'warn' ? '!' : '✓');" in html
 
     def test_render_ui_renders_compact_duration_for_v08_timeline(self):
-        # §8.1: always emit ``Xh Ym Zs`` even for short spans; render
-        # ``Not started yet`` for unfired conditional rows.
+        # §8.1: emit ``Xh Ym Zs`` for hour-bearing spans and ``Ym Zs`` when
+        # hours are zero; render ``Not started yet`` for unfired conditional
+        # rows.
         html = render_compass_ui()
         assert "function compactDuration(ms)" in html
         assert "function compactStartTime(iso)" in html
         assert "Not started yet" in html
-        # Always-zero hour format: ``0h YYm ZZs``
-        assert "${hh}h ${mm}m ${ss}s" in html
+        # Hours branch: ``Xh YYm ZZs``.
+        assert "${hours}h ${mm}m ${ss}s" in html
+        # No-hours branch: ``YYm ZZs`` (design doc §2.1: zero hours omitted).
+        assert "${mm}m ${ss}s" in html
 
     def test_render_ui_keeps_collapsed_major_timeline_focus_row_visible(self):
         html = render_compass_ui()

@@ -161,7 +161,11 @@ class TestCompassTimelineSkeleton:
         skeleton = task.metadata["major_step_skeleton"]
         step_keys = [row["step_key"] for row in skeleton]
 
-        assert step_keys[:4] == [
+        # Per design doc §4.2.1: the first row of a development timeline is
+        # ``compass.received`` (the canonical first step), followed by the
+        # dispatch + Team Lead / Web Dev skeleton rows.
+        assert step_keys[:5] == [
+            "compass.received",
             "compass.dispatched",
             "tl.analyzing",
             "tl.gathering",

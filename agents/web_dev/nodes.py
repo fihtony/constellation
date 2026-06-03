@@ -26,6 +26,7 @@ from framework.major_step import (
     LIFECYCLE_FAILED,
     LIFECYCLE_RUNNING,
     LIFECYCLE_WAITING_FOR_USER,
+    LIFECYCLE_WARNING,
     record_major_step,
 )
 
@@ -1749,11 +1750,15 @@ Return valid JSON only, and correct this validation feedback:
             "route": "pass",
         }
 
+    # Per design doc §13.1 A5 / §0.5: an intermediate self-check that fails
+    # but the task will retry must use the warn visual (LIFECYCLE_WARNING)
+    # rather than done or failed. The failed visual is reserved for the
+    # final ``compass.task_failed#0`` terminal row.
     _record_timeline_step(
         state,
         step_key=step_key,
         title=title,
-        lifecycle_state=LIFECYCLE_DONE,
+        lifecycle_state=LIFECYCLE_WARNING,
         summary_template="Web Dev self-check found remaining gaps with verdict {verdict}.",
         summary_facts={"verdict": verdict, "gap_count": len(gaps)},
         round=step_round,

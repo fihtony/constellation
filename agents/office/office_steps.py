@@ -190,20 +190,37 @@ def emit_capability_completion_rows(state: dict) -> None:
     count = len(source_paths) if isinstance(source_paths, list) else 0
 
     if capability == "analyze":
+        # Per design doc §3.3.2 the analyze skeleton uses ``{field_count}`` and
+        # ``{numeric_field_count}`` placeholders. The agent's ReAct core
+        # currently does not surface those numbers as structured state, so we
+        # seed the templates with the available count and let the renderer
+        # substitute the missing fields as ``--`` (per §6.3 fallback).
         record_office_step(
             state,
             step_key="office.inferring_schema",
             title="Office inferring data schema",
             lifecycle_state=LIFECYCLE_DONE,
-            summary_template="Office inferred the data schema for {source_count} file(s).",
-            summary_facts={"source_count": count},
+            summary_template=(
+                "Office inferred the data schema: {field_count} field(s) "
+                "detected across {source_count} file(s)."
+            ),
+            summary_facts={
+                "source_count": count,
+                "field_count": state.get("inferred_field_count", "unknown"),
+            },
         )
         record_office_step(
             state,
             step_key="office.computing_stats",
             title="Office computing statistics",
             lifecycle_state=LIFECYCLE_DONE,
-            summary_template="Office computed summary statistics for the analyzed dataset.",
+            summary_template=(
+                "Office computed summary statistics for {numeric_field_count} "
+                "numeric field(s)."
+            ),
+            summary_facts={
+                "numeric_field_count": state.get("numeric_field_count", "unknown"),
+            },
         )
         record_office_step(
             state,
@@ -220,10 +237,9 @@ def emit_capability_completion_rows(state: dict) -> None:
             step_key="office.scanning",
             title="Office scanning folder structure",
             lifecycle_state=LIFECYCLE_DONE,
-            summary_template="Office scanned the folder structure for {source_count} {source_kind}.",
+            summary_template="Office scanned the folder and inventoried {file_count} file(s).",
             summary_facts={
-                "source_count": count,
-                "source_kind": _source_kind(capability, count),
+                "file_count": count,
             },
         )
         record_office_step(
@@ -231,10 +247,11 @@ def emit_capability_completion_rows(state: dict) -> None:
             step_key="office.planning",
             title="Office planning organization",
             lifecycle_state=LIFECYCLE_DONE,
-            summary_template="Office planned the organization for {source_count} {source_kind}.",
+            summary_template="Office planned the organization around {grouping_criteria}.",
             summary_facts={
-                "source_count": count,
-                "source_kind": _source_kind(capability, count),
+                "grouping_criteria": state.get(
+                    "grouping_criteria", "discovered structural patterns"
+                ),
             },
         )
         record_office_step(
@@ -372,3 +389,26 @@ def emit_delivered(
             "failure_reason": state.get("summary", "")[:200] if not success else "",
         },
     )
+    # Per design doc §0.7: when a task ends in failure, the in-flight
+    # ``office.received#0`` row (and any other running Office rows) must
+    # transition to the matching terminal state so the timeline does not
+    # display a "current" row that is actually complete. We re-emit the
+    # office.received step with the failure lifecycle so the framework's
+    # idempotent merge updates the same row rather than creating a new one.
+    if not success:
+        record_office_step(
+            state,
+            step_key="office.received",
+            title="Office receiving task",
+            lifecycle_state=LIFECYCLE_FAILED,
+            summary_template="Office received the task: {capability} on {source_count} {source_kind}.",
+            summary_facts={
+                "capability": state.get("capability", "summarize"),
+                "source_count": len(state.get("source_paths") or state.get("validated_paths") or []),
+                "source_kind": _source_kind(
+                    state.get("capability", "summarize"),
+                    len(state.get("source_paths") or state.get("validated_paths") or []),
+                ),
+                "failure_reason": state.get("summary", "")[:200],
+            },
+        )

@@ -1861,13 +1861,16 @@ _INLINE_JS = r"""
     return formatDurationMs(Math.max(0, end - start));
   }
   function formatDurationMs(ms) {
+    // Per design doc §2.1: always emit h/m/s units to keep columns aligned
+    // (e.g. ``0m 02s`` and ``1h 23m 04s``), even when hours or minutes are zero.
     const totalSeconds = Math.max(0, Math.floor(ms / 1000));
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
     const seconds = totalSeconds % 60;
-    if (hours > 0) return `${hours}h ${String(minutes).padStart(2, '0')}m`;
-    if (minutes > 0) return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
-    return `${seconds}s`;
+    if (hours > 0) {
+      return `${hours}h ${String(minutes).padStart(2, '0')}m ${String(seconds).padStart(2, '0')}s`;
+    }
+    return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
   }
   function durationBetween(startIso, endIso) {
     if (!startIso) return '--';
@@ -2236,10 +2239,12 @@ _INLINE_JS = r"""
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
     const seconds = totalSeconds % 60;
-    const hh = String(hours);
     const mm = String(minutes).padStart(2, '0');
     const ss = String(seconds).padStart(2, '0');
-    return `${hh}h ${mm}m ${ss}s`;
+    if (hours > 0) {
+      return `${hours}h ${mm}m ${ss}s`;
+    }
+    return `${mm}m ${ss}s`;
   }
   // Format a UTC ISO timestamp as ``MM-DD HH:MM:SS`` in the viewer's local
   // timezone. Returns ``'--'`` for missing or unparseable input.
