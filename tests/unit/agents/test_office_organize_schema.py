@@ -1,12 +1,10 @@
 """Tests for organized-output/files/ schema enforcement in organize operations.
 
-Block 2 rewrote the office_tools module to drop business hardcodes. The
-allowlist-based helpers (``_normalize_organized_path``, ``VALID_CATEGORIES``,
-``_is_wrapper_prefixed``, ``WRAPPER_PREFIXES``, ``IDENTITY_PREFIXES``,
-``_clean_entity_candidate``, ``_looks_like_person_name``,
-``_extract_primary_entity``) are gone. Block 4 will rewrite this file
-end-to-end; for now we keep the suite green by mirroring the new
-generic behaviour in a smaller, neutral form.
+These tests pin the generic, dimension-agnostic path-normalisation and
+``organized-output/files/`` prefix rules. They use neutral bucket/file
+identifiers (``bucket_a/asset_1.txt`` etc.) on purpose: the office agent
+is now dimension-driven and the suite must not embed any business
+specifics (no entity names, no ``by-student/``-style wrappers).
 """
 
 import os
@@ -24,8 +22,8 @@ class TestEnsureOrganizedOutputPrefix:
     stripped and ``organized-output/files/`` is prepended when missing."""
 
     def test_strips_leading_slash(self):
-        result = _ensure_organized_output_prefix("/students/Ethan/essay.txt")
-        assert result == "organized-output/files/students/Ethan/essay.txt"
+        result = _ensure_organized_output_prefix("/bucket_a/asset_1.txt")
+        assert result == "organized-output/files/bucket_a/asset_1.txt"
 
     def test_preserves_existing_prefix(self):
         result = _ensure_organized_output_prefix("organized-output/files/a.txt")
@@ -40,7 +38,7 @@ class TestIsUnderOrganizedOutput:
     """The prefix check now only recognises ``organized-output/``."""
 
     def test_returns_true_for_schema_path(self):
-        assert _is_under_organized_output("organized-output/files/students/Ethan/essay.txt") is True
+        assert _is_under_organized_output("organized-output/files/bucket_a/asset_1.txt") is True
         assert _is_under_organized_output("organized-output/files/documents/report.pdf") is True
 
     def test_returns_true_for_stripped_leading_slash(self):
@@ -49,9 +47,9 @@ class TestIsUnderOrganizedOutput:
     def test_returns_false_for_unrelated_path(self):
         # Category-relative paths are no longer considered "under
         # organized output" because the agent is dimension-agnostic.
-        assert _is_under_organized_output("students/Ethan/essay.txt") is False
+        assert _is_under_organized_output("bucket_a/asset_1.txt") is False
         assert _is_under_organized_output("documents/report.pdf") is False
-        assert _is_under_organized_output("grouped/Ethan/essay.txt") is False
+        assert _is_under_organized_output("wrapper/asset_1.txt") is False
 
 
 class TestOrganizedOutputRootConstant:
@@ -63,8 +61,10 @@ class TestOrganizedOutputRootConstant:
 
 class TestOrganizeMoveFileToolSchemaEnforcement:
     """``OrganizeMoveFileTool`` now relies on the generic prefix check
-    only — the ``grouped/``/``by-student/``/``output/`` wrapper rejection
-    is gone because no business-specific allowlist remains."""
+    only — the wrapper-rejection allowlist is gone because no
+    business-specific allowlist remains. The agent is dimension-driven;
+    any bucket name is acceptable as long as it lands under
+    ``organized-output/files/``."""
 
     def setup_method(self):
         self.tool = OrganizeMoveFileTool()
@@ -93,9 +93,9 @@ class TestOrganizeMoveFileToolSchemaEnforcement:
 
         result = self.tool.execute_sync(
             action="mkdir",
-            dst="students/Ethan",
+            dst="bucket_a",
         )
         # The prefix is auto-prepended, so this should now succeed
         # (no business allowlist rejects arbitrary buckets).
         assert result.success, result.error
-        assert (tmp_path / "organized-output" / "files" / "students" / "Ethan").exists()
+        assert (tmp_path / "organized-output" / "files" / "bucket_a").exists()

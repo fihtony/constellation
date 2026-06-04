@@ -40,7 +40,7 @@ def test_organize_move_file_mkdir(tmp_path):
     os.environ["OFFICE_SOURCE_ROOT"] = str(tmp_path)
     os.environ["OFFICE_WORKSPACE_ROOT"] = str(tmp_path)
 
-    target_dir = tmp_path / "organized-output" / "files" / "students" / "Ethan"
+    target_dir = tmp_path / "organized-output" / "files" / "bucket_a" / "asset_1"
     result = tool.execute_sync(action="mkdir", dst=str(target_dir))
 
     assert result.success, f"mkdir failed: {result.error}"
@@ -65,7 +65,7 @@ def test_organize_move_file_copy(tmp_path):
     os.environ["OFFICE_SOURCE_ROOT"] = str(tmp_path)
     os.environ["OFFICE_WORKSPACE_ROOT"] = str(tmp_path)
 
-    dst_file = tmp_path / "organized-output" / "files" / "students" / "Ethan" / "source.txt"
+    dst_file = tmp_path / "organized-output" / "files" / "bucket_a" / "asset_1" / "source.txt"
     result = tool.execute_sync(action="copy_file", src=str(src_file), dst=str(dst_file))
 
     assert result.success, f"copy_file failed: {result.error}"
