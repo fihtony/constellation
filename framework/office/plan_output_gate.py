@@ -13,8 +13,9 @@ Capabilities
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 
 # ---------------------------------------------------------------------------
@@ -168,3 +169,338 @@ def resolve_output_contract(
         source_count=len(validated_paths),
         expected_plan_kind=_PLAN_KIND[capability],
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan parser
+# ---------------------------------------------------------------------------
+
+_MAX_PLAN_BYTES = 1_048_576  # 1 MB cap; configurable per Task 2 spec
+_PLAN_SIZE_CAP_ENV = "OFFICE_PLAN_MAX_BYTES"
+
+
+def _plan_size_cap() -> int:
+    env = os.environ.get(_PLAN_SIZE_CAP_ENV, "").strip()
+    if env.isdigit() and int(env) > 0:
+        return int(env)
+    return _MAX_PLAN_BYTES
+
+
+_SECTION_HEADERS = {
+    "organize": "files organized",
+    "summarize": "source -> summary mapping",
+    "analyze": "source -> analysis mapping",
+}
+_SECTION_COMMITTED = "committed fields"
+
+
+def _parse_table_rows(section: str) -> list[list[str]]:
+    """Parse a markdown pipe-table into a list of row-arrays of cell strings."""
+    rows: list[list[str]] = []
+    for raw in section.splitlines():
+        line = raw.strip()
+        if not line.startswith("|"):
+            continue
+        # skip alignment row (---)
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if all(re.fullmatch(r":?-{2,}:?", c) for c in cells):
+            continue
+        rows.append(cells)
+    return rows
+
+
+def _extract_section(plan_text: str, header: str) -> str:
+    """Return the body of a markdown section whose ``##`` heading matches ``header``."""
+    target = header.lower()
+    lines = plan_text.splitlines()
+    in_section = False
+    body: list[str] = []
+    for line in lines:
+        if line.strip().startswith("##"):
+            in_section = target in line.lower()
+            continue
+        if in_section:
+            body.append(line)
+    return "\n".join(body)
+
+
+def _parse_committed_fields(plan_text: str) -> dict[str, Any]:
+    section = _extract_section(plan_text, _SECTION_COMMITTED)
+    out: dict[str, Any] = {}
+    for line in section.splitlines():
+        line = line.strip()
+        if line.startswith("- "):
+            line = line[2:]
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if value.isdigit():
+            out[key] = int(value)
+        else:
+            out[key] = value
+    return out
+
+
+def _plan_capability_marker(plan_text: str) -> str | None:
+    """Infer which capability the plan's content was written for."""
+    text = plan_text.lower()
+    if "files organized" in text and "source -> summary mapping" not in text:
+        return "organize"
+    if "source -> summary mapping" in text:
+        return "summarize"
+    if "source -> analysis mapping" in text:
+        return "analyze"
+    return None
+
+
+def _plan_slot_capability(plan_path: str) -> str | None:
+    """Infer which capability slot the plan file lives in, by filename."""
+    basename = os.path.basename(plan_path)
+    if basename == "organization-plan.md":
+        return "organize"
+    if basename == "summary-plan.md":
+        return "summarize"
+    if basename == "analysis-plan.md":
+        return "analyze"
+    return None
+
+
+def _is_path_safety_violation(relative: str) -> str | None:
+    if not isinstance(relative, str) or not relative:
+        return "destination is empty"
+    if relative.startswith("/") or relative.startswith("~"):
+        return "absolute path not allowed"
+    if re.match(r"^[a-zA-Z]:[\\/]", relative):
+        return "drive-letter path not allowed"
+    if "\\" in relative:
+        return "backslash separator not allowed"
+    if ".." in relative.split("/"):
+        return "parent traversal not allowed"
+    return None
+
+
+def _validated_source_realpaths(validated_source_roots: Iterable[str] | None) -> set[str]:
+    if not validated_source_roots:
+        return set()
+    out: set[str] = set()
+    for root in validated_source_roots:
+        if not root:
+            continue
+        out.add(os.path.realpath(os.path.abspath(root)))
+    return out
+
+
+def _is_under_validated_source(source_path: str, validated_roots: set[str]) -> bool:
+    if not validated_roots:
+        return True
+    try:
+        real = os.path.realpath(os.path.abspath(source_path))
+    except OSError:
+        return False
+    for root in validated_roots:
+        if real == root or real.startswith(root.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
+
+def _split_destination_organize(cells: list[str]) -> tuple[str, str]:
+    if len(cells) < 2:
+        return "", ""
+    return cells[0], cells[1]
+
+
+def _split_destination_summarize(cells: list[str]) -> tuple[str, str]:
+    if len(cells) < 2:
+        return "", ""
+    return cells[0], cells[1]
+
+
+def _split_destination_analyze(cells: list[str]) -> tuple[str, str]:
+    if len(cells) < 2:
+        return "", ""
+    return cells[0], cells[1]
+
+
+def _parse_plan_rows(capability: str, plan_text: str) -> tuple[list[GateEntry], dict[str, Any]]:
+    section = _extract_section(plan_text, _SECTION_HEADERS[capability])
+    rows = _parse_table_rows(section)
+    entries: list[GateEntry] = []
+    data_rows = [r for r in rows if r and r[0].lower() != "source"]
+    for cells in data_rows:
+        source, target = {
+            "organize": _split_destination_organize,
+            "summarize": _split_destination_summarize,
+            "analyze": _split_destination_analyze,
+        }[capability](cells)
+        if not source and not target:
+            continue
+        extras: dict[str, Any] = {}
+        if capability == "summarize":
+            extras["summary_target"] = target
+            expected = target
+        elif capability == "analyze":
+            extras["analysis_target"] = target
+            expected = target
+        else:
+            expected = target
+        entries.append(GateEntry(source_path=source, expected_path=expected, extras=extras))
+    committed = _parse_committed_fields(plan_text) if capability == "analyze" else {}
+    return entries, committed
+
+
+def parse_plan(capability: str, plan_path: str) -> list[GateEntry]:
+    """Parse the plan and return its GateEntry list.
+
+    Convenience wrapper used by tests; production code should use
+    :func:`parse_plan_with_status` because it returns the gate status.
+    """
+    status, _invalid_entries, entries, _committed, _error = parse_plan_with_status(
+        capability, plan_path
+    )
+    if status != "ok":
+        return []
+    return entries
+
+
+def parse_plan_with_status(
+    capability: str,
+    plan_path: str,
+    *,
+    validated_source_roots: Iterable[str] | None = None,
+    expanded_file_list: Iterable[str] | None = None,
+    source_count: int | None = None,
+) -> tuple[str, list[str], list[GateEntry], dict[str, Any], str]:
+    """Parse a plan file and return ``(status, invalid_entries, entries, committed, error)``.
+
+    ``invalid_entries`` is a list of human-readable explanations of rows that
+    failed path/source safety. ``entries`` is the list of valid :class:`GateEntry`
+    objects (excluding the invalid ones — the gate fails with ``status=invalid``).
+    """
+    if not os.path.exists(plan_path):
+        return "missing", [], [], {}, "plan file not found"
+
+    try:
+        size = os.path.getsize(plan_path)
+    except OSError as exc:
+        return "unparseable", [], [], {}, f"plan stat failed: {exc}"
+
+    if size > _plan_size_cap():
+        return "unparseable", [], [], {}, f"plan exceeds {_plan_size_cap()} bytes"
+
+    try:
+        with open(plan_path, "r", encoding="utf-8", errors="strict") as fh:
+            plan_text = fh.read()
+    except UnicodeDecodeError as exc:
+        return "unparseable", [], [], {}, f"plan is not valid UTF-8: {exc}"
+    except OSError as exc:
+        return "unparseable", [], [], {}, f"plan read failed: {exc}"
+
+    plan_capability = _plan_capability_marker(plan_text)
+    slot_capability = _plan_slot_capability(plan_path)
+
+    # Wrong slot: filename implies one capability, content is for another.
+    # This catches the case where (e.g.) summary content lands in
+    # organization-plan.md.
+    if (
+        plan_capability
+        and slot_capability
+        and plan_capability != slot_capability
+    ):
+        section_header = _SECTION_HEADERS.get(plan_capability, plan_capability)
+        return (
+            "invalid",
+            [],
+            [],
+            {},
+            (
+                f"plan section '{section_header}' is for capability "
+                f"{plan_capability} but the plan slot is for capability {slot_capability}"
+            ),
+        )
+
+    # Wrong content: content is for a different capability than requested.
+    if plan_capability and plan_capability != capability:
+        section_header = _SECTION_HEADERS.get(plan_capability, plan_capability)
+        return (
+            "invalid",
+            [],
+            [],
+            {},
+            (
+                f"plan section '{section_header}' is for capability "
+                f"{plan_capability} but the plan slot is for capability {capability}"
+            ),
+        )
+
+    valid_source_roots = _validated_source_realpaths(validated_source_roots)
+    entries, committed = _parse_plan_rows(capability, plan_text)
+
+    invalid_entries: list[str] = []
+    valid_entries: list[GateEntry] = []
+    seen: set[tuple[str, str]] = set()
+
+    for entry in entries:
+        marker = f"source={entry.source_path!r} destination={entry.expected_path!r}"
+        reason = _is_path_safety_violation(entry.expected_path)
+        if reason:
+            invalid_entries.append(f"{marker}: {reason}")
+            continue
+        if valid_source_roots and not _is_under_validated_source(
+            entry.source_path, valid_source_roots
+        ):
+            invalid_entries.append(
+                f"{marker}: source path outside validated set"
+            )
+            continue
+        pair = (entry.source_path, entry.expected_path)
+        if pair in seen:
+            invalid_entries.append(f"{marker}: duplicate row")
+            continue
+        seen.add(pair)
+        valid_entries.append(entry)
+
+    if invalid_entries:
+        return "invalid", invalid_entries, [], committed, "; ".join(invalid_entries)
+
+    # Non-empty source inventory with empty plan
+    if source_count and source_count > 0 and not valid_entries:
+        return (
+            "invalid",
+            [f"plan is empty but source inventory has {source_count} item(s)"],
+            [],
+            committed,
+            "empty plan with non-empty source inventory",
+        )
+
+    # Empty source inventory with non-empty plan
+    if source_count == 0 and valid_entries:
+        return (
+            "invalid",
+            [f"plan has {len(valid_entries)} row(s) but source inventory is empty"],
+            [],
+            committed,
+            "non-empty plan with empty source inventory",
+        )
+
+    # summarize/analyze require expanded file list, not folder placeholders
+    if capability in ("summarize", "analyze") and expanded_file_list is not None:
+        expanded_set = set(expanded_file_list)
+        for entry in valid_entries:
+            if (
+                entry.source_path
+                and entry.source_path not in expanded_set
+            ):
+                return (
+                    "invalid",
+                    [
+                        f"source {entry.source_path!r} is a folder; "
+                        "expand to individual files before planning"
+                    ],
+                    [],
+                    committed,
+                    "folder source not expanded",
+                )
+
+    return "ok", [], valid_entries, committed, ""
