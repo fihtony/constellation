@@ -506,9 +506,17 @@ def emit_reconciling_plan_output(
 def emit_gate_exhausted(
     state: dict,
     *,
+    round_count: int = 0,
     summary_facts: dict | None = None,
 ) -> None:
-    """Emit the gate-exhaustion warning row."""
+    """Emit the gate-exhaustion warning row.
+
+    The default summary_template references ``{round_count}``; callers may
+    pass additional ``summary_facts`` to enrich the rendered row (e.g. with
+    missing_count, unexpected_count, no_progress_count).
+    """
+    facts = dict(summary_facts or {})
+    facts.setdefault("round_count", round_count)
     record_office_step(
         state,
         step_key="office.gate_exhausted",
@@ -517,6 +525,6 @@ def emit_gate_exhausted(
         summary_template=(
             "Office could not fully reconcile the output with the declared plan after {round_count} round(s)."
         ),
-        summary_facts=summary_facts,
+        summary_facts=facts,
         conditional=True,
     )

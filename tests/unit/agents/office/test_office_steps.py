@@ -66,3 +66,40 @@ def test_emit_gate_exhausted_warning():
     )
     assert sink.events[0]["step_key"] == "office.gate_exhausted"
     assert sink.events[0]["lifecycle_state"] == "warning"
+
+
+def test_emit_gate_exhausted_round_count_default():
+    """round_count default 0 still renders the template without KeyError."""
+    sink = _Sink()
+    state = {**_state(), "_major_step_progress_sink": sink}
+    office_steps.emit_gate_exhausted(state)
+    event = sink.events[0]
+    assert event["step_key"] == "office.gate_exhausted"
+    assert event["lifecycle_state"] == "warning"
+    assert event["summary_facts"]["round_count"] == 0
+
+
+def test_emit_gate_exhausted_round_count_kwarg():
+    sink = _Sink()
+    state = {**_state(), "_major_step_progress_sink": sink}
+    office_steps.emit_gate_exhausted(state, round_count=2, summary_facts={"missing_count": 4})
+    event = sink.events[0]
+    assert event["summary_facts"]["round_count"] == 2
+    assert event["summary_facts"]["missing_count"] == 4
+
+
+def test_emit_reconciling_plan_output_round_1_and_3():
+    """Lock in step_instance_key formatting across multiple round values."""
+    sink = _Sink()
+    state = {**_state(), "_major_step_progress_sink": sink}
+    office_steps.emit_reconciling_plan_output(
+        state, lifecycle_state="running", round=1,
+        summary_template="round {round}", summary_facts={"round": 1},
+    )
+    office_steps.emit_reconciling_plan_output(
+        state, lifecycle_state="warning", round=3,
+        summary_template="round {round}", summary_facts={"round": 3},
+    )
+    assert sink.events[0]["step_instance_key"] == "office.reconciling_plan_output#1"
+    assert sink.events[1]["step_instance_key"] == "office.reconciling_plan_output#3"
+    assert sink.events[1]["lifecycle_state"] == "warning"
