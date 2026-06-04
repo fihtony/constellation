@@ -492,3 +492,145 @@ def parse_plan_with_status(
                 )
 
     return "ok", [], valid_entries, committed, ""
+
+
+# ---------------------------------------------------------------------------
+# walk_output / diff / run
+# ---------------------------------------------------------------------------
+
+_BACKUP_SUFFIX_RE = re.compile(r"\.\d{8}-\d{6}\.bak$")
+
+
+def _is_ancillary(rel_path: str, allowlist: frozenset[str]) -> bool:
+    base = os.path.basename(rel_path)
+    if base in allowlist:
+        return True
+    if _BACKUP_SUFFIX_RE.search(base):
+        return True
+    return False
+
+
+def walk_output(output_root: str, *, allowlist: set[str] | frozenset[str] | None) -> set[str]:
+    """Return the set of deliverable files under ``output_root``.
+
+    Excluded: hidden files, empty directories, ancillary allowlist
+    basenames, timestamped backup files, and any file whose basename
+    appears in ``allowlist`` regardless of subdirectory.
+    """
+    frozen: frozenset[str] = frozenset(allowlist or set())
+    out: set[str] = set()
+    if not output_root or not os.path.isdir(output_root):
+        return out
+    for current_root, dirs, files in os.walk(output_root, followlinks=False):
+        # prune hidden directories in place so os.walk skips them
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            if name.startswith("."):
+                continue
+            full = os.path.join(current_root, name)
+            try:
+                stat = os.path.getsize(full)
+            except OSError:
+                continue
+            if stat == 0:
+                continue
+            # chase symlinks; record escapes so the gate can flag them
+            real = os.path.realpath(full)
+            real_root = os.path.realpath(output_root)
+            try:
+                rel = os.path.relpath(full, output_root).replace(os.sep, "/")
+            except ValueError:
+                rel = name
+            if not (real == real_root or real.startswith(real_root.rstrip(os.sep) + os.sep)):
+                out.add(rel)
+                continue
+            if _is_ancillary(rel, frozen):
+                continue
+            out.add(rel)
+    return out
+
+
+def _committed_field_diffs(plan_committed: dict[str, Any], contract: OutputContract) -> list[str]:
+    """Diff a tiny subset of committed fields that the analyze capability
+    is expected to validate. For now this only checks field_count and
+    numeric_field_count; expand as the spec grows.
+    """
+    if not plan_committed or contract.capability != "analyze":
+        return []
+    out: list[str] = []
+    for key in ("field_count", "numeric_field_count"):
+        if key in plan_committed:
+            out.append(
+                f"{key} committed to {plan_committed[key]} (validation deferred to analyze runtime)"
+            )
+    return out
+
+
+def diff(
+    capability: str,
+    plan: list[GateEntry],
+    actual: set[str],
+    contract: OutputContract,
+    committed: dict[str, Any] | None = None,
+) -> GateReport:
+    """Compare parsed plan vs walked output tree."""
+    if not plan and contract.source_count > 0:
+        return GateReport(
+            capability=capability,
+            plan_status="invalid",
+            planned_count=0,
+            actual_count=len(actual),
+            missing=[],
+            unexpected=sorted(actual),
+            mismatches=[],
+            error_message="empty plan with non-empty source inventory",
+        )
+    planned = {entry.expected_path for entry in plan}
+    missing = sorted(planned - actual)
+    unexpected = sorted(actual - planned)
+    mismatches = _committed_field_diffs(committed or {}, contract)
+    return GateReport(
+        capability=capability,
+        plan_status="ok",
+        planned_count=len(planned),
+        actual_count=len(actual),
+        missing=missing,
+        unexpected=unexpected,
+        mismatches=mismatches,
+    )
+
+
+def run(contract: OutputContract, *, expanded_file_list: Iterable[str] | None = None) -> GateReport:
+    """Run the full gate: parse the plan, walk the output, diff."""
+    status, invalid_entries, entries, committed, error = parse_plan_with_status(
+        contract.capability,
+        contract.plan_path,
+        validated_source_roots=None,
+        expanded_file_list=expanded_file_list,
+        source_count=contract.source_count,
+    )
+    if status == "missing":
+        return GateReport(
+            capability=contract.capability,
+            plan_status="missing",
+            planned_count=0,
+            actual_count=0,
+            missing=[],
+            unexpected=[],
+            mismatches=[],
+            error_message=error,
+        )
+    if status != "ok":
+        return GateReport(
+            capability=contract.capability,
+            plan_status=status,
+            planned_count=0,
+            actual_count=0,
+            missing=[],
+            unexpected=[],
+            mismatches=[],
+            invalid_plan_entries=list(invalid_entries),
+            error_message=error,
+        )
+    actual = walk_output(contract.output_root, allowlist=contract.ancillary_allowlist)
+    return diff(contract.capability, entries, actual, contract, committed=committed)

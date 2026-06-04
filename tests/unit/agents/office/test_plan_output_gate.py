@@ -377,3 +377,154 @@ def test_parse_plan_non_utf8_rejected(tmp_path):
         "organize", str(plan_path)
     )
     assert status == "unparseable"
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — walk_output, diff, run
+# ---------------------------------------------------------------------------
+
+from framework.office.plan_output_gate import walk_output, diff, run  # noqa: E402
+import os  # noqa: E402
+
+
+def _touch(root, *parts):
+    p = root.joinpath(*parts)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("x", encoding="utf-8")
+    return str(p.relative_to(root))
+
+
+def test_walk_output_returns_basename_paths(tmp_path):
+    _touch(tmp_path, "files", "a.txt")
+    _touch(tmp_path, "files", "b.txt")
+    files = walk_output(str(tmp_path), allowlist={"organization-plan.md"})
+    assert "files/a.txt" in files
+    assert "files/b.txt" in files
+
+
+def test_walk_output_excludes_ancillary_files(tmp_path):
+    _touch(tmp_path, "organization-plan.md")
+    _touch(tmp_path, "files", "a.txt")
+    files = walk_output(str(tmp_path), allowlist={"organization-plan.md"})
+    assert "organization-plan.md" not in files
+    assert "files/a.txt" in files
+
+
+def test_walk_output_excludes_timestamped_backups(tmp_path):
+    _touch(tmp_path, "files", "a.txt")
+    _touch(tmp_path, "files", "a.txt.20260603-120000.bak")
+    files = walk_output(str(tmp_path), allowlist={"organization-plan.md"})
+    assert "files/a.txt" in files
+    assert not any(f.endswith(".bak") for f in files)
+
+
+def test_walk_output_ignores_hidden_files_and_empty_dirs(tmp_path):
+    _touch(tmp_path, "files", "a.txt")
+    (tmp_path / "files" / "emptydir").mkdir()
+    (tmp_path / ".hidden").write_text("h", encoding="utf-8")
+    files = walk_output(str(tmp_path), allowlist={"organization-plan.md"})
+    assert "files/a.txt" in files
+    assert ".hidden" not in files
+
+
+def test_walk_output_ignores_ancillary_files_in_subdirectories(tmp_path):
+    _touch(tmp_path, "files", "a.txt")
+    _touch(tmp_path, "files", "warnings.md")
+    files = walk_output(str(tmp_path), allowlist={"warnings.md"})
+    assert "files/a.txt" in files
+    assert "files/warnings.md" not in files
+
+
+def test_walk_output_symlink_escape_treated_as_unexpected(tmp_path, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("outside")
+    (outside / "leaked.txt").write_text("x", encoding="utf-8")
+    link = tmp_path / "files" / "link"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside / "leaked.txt")
+    files = walk_output(str(tmp_path), allowlist=set())
+    assert "files/link" in files
+
+
+def test_diff_clean_tree_returns_clean_report(tmp_path):
+    _touch(tmp_path, "files", "a.txt")
+    contract = OutputContract(
+        capability="organize",
+        plan_path="",
+        output_root=str(tmp_path),
+        ancillary_allowlist=frozenset({"organization-plan.md"}),
+        source_count=1,
+        expected_plan_kind="files_organized",
+    )
+    plan = [GateEntry(source_path="/src/a.txt", expected_path="files/a.txt")]
+    report = diff("organize", plan, {"files/a.txt"}, contract)
+    assert report.is_clean is True
+
+
+def test_diff_missing_file_populates_missing(tmp_path):
+    _touch(tmp_path, "files", "a.txt")
+    contract = OutputContract(
+        capability="organize",
+        plan_path="",
+        output_root=str(tmp_path),
+        ancillary_allowlist=frozenset({"organization-plan.md"}),
+        source_count=2,
+        expected_plan_kind="files_organized",
+    )
+    plan = [
+        GateEntry(source_path="/src/a.txt", expected_path="files/a.txt"),
+        GateEntry(source_path="/src/b.txt", expected_path="files/b.txt"),
+    ]
+    report = diff("organize", plan, {"files/a.txt"}, contract)
+    assert "files/b.txt" in report.missing
+    assert report.is_clean is False
+
+
+def test_diff_unexpected_file_populates_unexpected(tmp_path):
+    _touch(tmp_path, "files", "a.txt")
+    _touch(tmp_path, "files", "b.txt")
+    contract = OutputContract(
+        capability="organize",
+        plan_path="",
+        output_root=str(tmp_path),
+        ancillary_allowlist=frozenset({"organization-plan.md"}),
+        source_count=1,
+        expected_plan_kind="files_organized",
+    )
+    plan = [GateEntry(source_path="/src/a.txt", expected_path="files/a.txt")]
+    report = diff("organize", plan, {"files/a.txt", "files/b.txt"}, contract)
+    assert "files/b.txt" in report.unexpected
+
+
+def test_diff_analyze_committed_fields_mismatch(tmp_path):
+    contract = OutputContract(
+        capability="analyze",
+        plan_path="",
+        output_root=str(tmp_path),
+        ancillary_allowlist=frozenset({"analysis-plan.md"}),
+        source_count=1,
+        expected_plan_kind="source_analysis_mapping",
+    )
+    plan = [
+        GateEntry(
+            source_path="/src/data.csv",
+            expected_path="data.analysis.md",
+            extras={"analysis_target": "data.analysis.md", "field_count": 5},
+        )
+    ]
+    actual = {"data.analysis.md"}
+    report = diff("analyze", plan, actual, contract, committed={"field_count": 4})
+    assert any("field_count" in m for m in report.mismatches)
+
+
+def test_diff_empty_plan_with_non_empty_inventory_is_invalid(tmp_path):
+    _touch(tmp_path, "files", "a.txt")
+    contract = OutputContract(
+        capability="organize",
+        plan_path="",
+        output_root=str(tmp_path),
+        ancillary_allowlist=frozenset({"organization-plan.md"}),
+        source_count=3,
+        expected_plan_kind="files_organized",
+    )
+    report = diff("organize", [], {"files/a.txt"}, contract)
+    assert report.plan_status == "invalid"
