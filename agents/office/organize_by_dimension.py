@@ -457,3 +457,34 @@ class OrganizeByFilenameTool(BaseTool):
         if "A" <= first <= "Z":
             return first
         return "_other"
+
+
+# ---- dispatcher ------------------------------------------------------------
+
+
+from agents.office.dimensions import VALID_DIMENSIONS
+
+
+_DIMENSION_TOOL = {
+    "size": OrganizeBySizeTool,
+    "type": OrganizeByTypeTool,
+    "created_time": OrganizeByCreatedTimeTool,
+    "modified_time": OrganizeByModifiedTimeTool,
+    "accessed_time": OrganizeByAccessedTimeTool,
+    "filename": OrganizeByFilenameTool,
+}
+
+
+def run_dimension_tool(dimension: str, source: str, output_root: str) -> ToolResult:
+    """Run the bounded (zero-LLM) dimension tool for ``dimension``.
+
+    Returns a ``ToolResult`` whose ``output`` is the JSON payload the
+    dimension tool produced. Used by the bounded path inside
+    ``execute_office_work`` — never invoked through the agentic runtime.
+    """
+    if dimension not in VALID_DIMENSIONS:
+        return ToolResult(output="", error=f"unsupported dimension: {dimension!r}")
+    tool_cls = _DIMENSION_TOOL.get(dimension)
+    if tool_cls is None:
+        return ToolResult(output="", error=f"no tool registered for dimension: {dimension!r}")
+    return tool_cls().execute_sync(source=source, output_root=output_root)

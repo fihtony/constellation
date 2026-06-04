@@ -224,3 +224,29 @@ def test_organize_by_filename_preserves_subdirectory(tmp_path):
     entry = payload["entries"][0]
     assert entry["destination"].startswith("G/")
     assert "sub/gamma.txt" in entry["destination"]
+
+
+from agents.office.organize_by_dimension import run_dimension_tool
+from agents.office.dimensions import VALID_DIMENSIONS
+
+
+def test_run_dimension_tool_dispatches_each_dimension(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _make_file(src, "alpha.txt", b"x" * 100)
+    out = tmp_path / "out"
+    out.mkdir()
+    for dim in sorted(VALID_DIMENSIONS):
+        local_out = tmp_path / f"out_{dim}"
+        local_out.mkdir()
+        result = run_dimension_tool(dim, str(src), str(local_out))
+        assert result.success, (dim, result.error)
+        assert (local_out / "organization-plan.md").exists()
+
+
+def test_run_dimension_tool_rejects_unknown_dimension(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    result = run_dimension_tool("alphabetical", str(tmp_path), str(out))
+    assert not result.success
+    assert "unsupported dimension" in result.error
