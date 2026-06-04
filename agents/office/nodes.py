@@ -2153,9 +2153,12 @@ def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
                 error=str(tc.get("error", "")),
             )
 
-        # Plan integrity: revert if LLM modified the plan and the previous
-        # status was ok.
-        if _plan_modified(snapshot) and final_report.plan_status == "ok":
+        # Plan integrity: revert if LLM modified the plan. The previous
+        # plan_status field on final_report reflects the *prior* state of
+        # the plan, not whether the LLM was allowed to modify it — so it
+        # must not gate the revert. The snapshot is the source of truth
+        # for "what the plan looked like before this round".
+        if _plan_modified(snapshot):
             reverted = _revert_plan(snapshot)
             if not reverted:
                 _steps.emit_gate_exhausted(
