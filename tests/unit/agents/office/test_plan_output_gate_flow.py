@@ -284,6 +284,12 @@ def test_round_0_folder_placeholder_plan_is_invalid_for_summarize(task_artifacts
         "summarize",
         ["/src/folder/a.txt", "/src/folder/b.txt"],
     )
+    # The source root is the folder itself; the validated_paths are the
+    # individual files inside it. The orchestrator needs both: the
+    # validated_source_roots is the parent folder so that "/src/folder"
+    # passes the "outside validated set" check; expanded_file_list is
+    # the file list so the "folder not expanded" check triggers.
+    state["validated_source_roots"] = ["/src/folder"]
     runtime = _StubRuntime(
         [
             AgenticResult(success=True, summary="no", tool_calls=[]),
@@ -307,11 +313,15 @@ def test_invalid_plan_exhausted_summary_surfaces_reason(task_artifacts):
 
     plan = artifacts / "organized-output" / "files" / "organization-plan.md"
     plan.parent.mkdir(parents=True, exist_ok=True)
+    # Use an absolute path that is NOT under source_root so the
+    # "outside validated set" check triggers regardless of the
+    # relative-path resolution behavior of _resolve_source_path_within_validated_roots.
+    outside_path = str(workspace / "other_root" / "alpha.txt")
     plan.write_text(
         "# Folder Organization Plan\n"
         "## Files Organized\n"
         "| Source Path | Destination |\n| --- | --- |\n"
-        "| outside/alpha.txt | files/alpha.txt |\n",
+        f"| {outside_path} | files/alpha.txt |\n",
         encoding="utf-8",
     )
 
@@ -345,7 +355,14 @@ def test_invalid_plan_exhausted_summary_surfaces_reason(task_artifacts):
     assert "{round_count}" in final_warning["summary_template"]
 
 
-def test_invalid_existing_plan_can_be_rewritten_during_retry(task_artifacts):
+def test_invalid_existing_plan_modification_during_retry_is_reverted(task_artifacts):
+    """If the LLM rewrites an invalid plan during retry, the orchestrator reverts the modification.
+
+    The orchestrator must never let the LLM modify the plan during retry —
+    the snapshot is the source of truth. Even if the rewrite would resolve
+    the original invalidity, the orchestrator reverts and the gate sees
+    the original (still-invalid) plan.
+    """
     artifacts, workspace = task_artifacts
     plan = artifacts / "summary-plan.md"
     plan.write_text(
@@ -383,8 +400,17 @@ def test_invalid_existing_plan_can_be_rewritten_during_retry(task_artifacts):
 
     report = _run_plan_output_gate(state, runtime=runtime)
 
-    assert report.is_clean
-    assert "a.txt.summary.md" in plan.read_text(encoding="utf-8")
+    # The orchestrator reverts any plan modification, so the gate runs
+    # against the original folder-placeholder plan. With the default
+    # validated_source_roots (= validated_paths, which is the file list),
+    # the folder is "outside validated set" and the plan is invalid.
+    assert not report.is_clean
+    assert report.plan_status == "invalid"
+    # The plan content is the original (folder placeholder), not the rewrite
+    plan_text = plan.read_text(encoding="utf-8")
+    assert "/src/folder" in plan_text
+    assert "/src/folder/a.txt" not in plan_text
+    assert "a.txt.summary.md" not in plan_text
 
 
 # ---------------------------------------------------------------------------
