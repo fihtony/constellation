@@ -192,3 +192,35 @@ def test_organize_by_accessed_time_buckets_by_year_month(tmp_path):
     payload = json.loads(result.output)
     bucket = payload["entries"][0]["destination"].split("/")[0]
     assert re.match(r"^\d{4}-\d{2}$", bucket)
+
+
+def test_organize_by_filename_buckets_by_first_letter(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _make_file(src, "alpha.txt", b"a")
+    _make_file(src, "beta.txt", b"b")
+    _make_file(src, "1number.txt", b"1")  # numeric first char -> _other
+    out = tmp_path / "out"
+    out.mkdir()
+    result = OrganizeByFilenameTool().execute_sync(source=str(src), output_root=str(out))
+    assert result.success, result.error
+    payload = json.loads(result.output)
+    by_src = {entry["source"]: entry["destination"] for entry in payload["entries"]}
+    assert by_src["alpha.txt"].startswith("A/")
+    assert by_src["beta.txt"].startswith("B/")
+    assert by_src["1number.txt"].startswith("_other/")
+
+
+def test_organize_by_filename_preserves_subdirectory(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    sub = src / "sub"
+    sub.mkdir()
+    _make_file(sub, "gamma.txt", b"g")
+    out = tmp_path / "out"
+    out.mkdir()
+    result = OrganizeByFilenameTool().execute_sync(source=str(src), output_root=str(out))
+    payload = json.loads(result.output)
+    entry = payload["entries"][0]
+    assert entry["destination"].startswith("G/")
+    assert "sub/gamma.txt" in entry["destination"]

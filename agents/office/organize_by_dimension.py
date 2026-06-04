@@ -30,9 +30,13 @@ _FILENAME_PLAN = "organization-plan.md"
 
 
 def _safe_segment(value: str) -> str:
-    """Return a filesystem-safe directory/bucket name."""
+    """Return a filesystem-safe directory/bucket name.
+
+    Note: we intentionally do not strip leading/trailing underscores —
+    tools deliberately use sentinel bucket names such as ``_other`` and
+    those must survive the sanitization round-trip.
+    """
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
-    cleaned = cleaned.strip("_")
     return cleaned or "other"
 
 
@@ -403,5 +407,53 @@ class OrganizeByCreatedTimeTool(_TimeBucketTool):
     fallback_attr = "st_mtime"
 
 
-class OrganizeByFilenameTool(_NotYetImplementedTool):
+class OrganizeByFilenameTool(BaseTool):
     name = "organize_by_filename"
+    description = (
+        "Group files by the first alphabetic character of the basename "
+        "(A-Z, with _other for non-letters). Zero-LLM, deterministic."
+    )
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "source": {"type": "string"},
+            "output_root": {"type": "string"},
+        },
+        "required": ["source", "output_root"],
+    }
+
+    def execute_sync(self, source: str = "", output_root: str = "", **_: Any) -> ToolResult:
+        try:
+            files = _walk_files(source)
+            entries: list[dict[str, str]] = []
+            for rel in files:
+                basename = os.path.basename(rel)
+                bucket = self._bucket_for(basename)
+                dst = _copy_into(source, rel, output_root, bucket)
+                entries.append({
+                    "source": rel,
+                    "destination": os.path.relpath(dst, output_root),
+                    "first_char": basename[:1],
+                })
+            rules = sorted({e["destination"].split("/")[0] for e in entries})
+            _write_plan(
+                output_root,
+                _format_plan_markdown(
+                    dimension="filename",
+                    source_root=source,
+                    bucket_rules=rules,
+                    entries=entries,
+                ),
+            )
+            return ToolResult(output=json.dumps({"dimension": "filename", "entries": entries}))
+        except Exception as exc:
+            return ToolResult(output="", error=f"organize_by_filename: {exc}")
+
+    @staticmethod
+    def _bucket_for(basename: str) -> str:
+        if not basename:
+            return "_other"
+        first = basename[0].upper()
+        if "A" <= first <= "Z":
+            return first
+        return "_other"
