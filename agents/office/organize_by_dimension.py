@@ -285,16 +285,122 @@ class _NotYetImplementedTool(BaseTool):
         return ToolResult(output="", error=f"{self.name}: not yet implemented")
 
 
-class OrganizeByCreatedTimeTool(_NotYetImplementedTool):
-    name = "organize_by_created_time"
+import datetime as _dt
+
+# ---- time-based dimensions -------------------------------------------------
 
 
-class OrganizeByModifiedTimeTool(_NotYetImplementedTool):
+_TIME_FMT = "%Y-%m"
+
+
+def _fmt_time(ts: float) -> str:
+    # Format in UTC so the output is identical on local machines (any
+    # timezone) and inside containers (typically UTC). Without this,
+    # year-month buckets would shift across timezones.
+    return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).strftime(_TIME_FMT)
+
+
+class _TimeBucketTool(BaseTool):
+    """Shared base for the three time-based organize tools."""
+
+    dimension_label: str = ""
+    time_attr: str = ""  # "st_mtime" / "st_atime" / "st_birthtime"
+    fallback_attr: str | None = None  # when birthtime is unavailable
+
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "source": {"type": "string"},
+            "output_root": {"type": "string"},
+        },
+        "required": ["source", "output_root"],
+    }
+
+    def execute_sync(self, source: str = "", output_root: str = "", **_: Any) -> ToolResult:
+        try:
+            files = _walk_files(source)
+            entries: list[dict[str, str]] = []
+            fallbacks: list[str] = []
+            for rel in files:
+                full = os.path.join(source, rel)
+                stat = os.stat(full)
+                # Linux stat_result has no st_birthtime; default to 0 so
+                # the fallback branch handles the missing attribute.
+                ts = getattr(stat, self.time_attr, 0) or 0
+                attr_used = self.time_attr
+                if (not ts) and self.fallback_attr is not None:
+                    ts = getattr(stat, self.fallback_attr, 0) or 0
+                    attr_used = self.fallback_attr
+                    fallbacks.append(rel)
+                bucket = _fmt_time(ts)
+                dst = _copy_into(source, rel, output_root, bucket)
+                entries.append({
+                    "source": rel,
+                    "destination": os.path.relpath(dst, output_root),
+                    "time_attr": attr_used,
+                    "inferred_from": attr_used,
+                })
+            rules = sorted({e["destination"].split("/")[0] for e in entries})
+            assumptions: list[str] = []
+            if self.fallback_attr is not None:
+                if fallbacks:
+                    assumptions.append(
+                        f"{len(fallbacks)} file(s) lack {self.time_attr}; "
+                        f"used {self.fallback_attr} as a fallback."
+                    )
+                else:
+                    assumptions.append(
+                        f"Used {self.time_attr}; falls back to "
+                        f"{self.fallback_attr} when the filesystem does "
+                        f"not report it. (inferred_from: {self.time_attr})"
+                    )
+            else:
+                assumptions.append(
+                    f"Bucketed by {self.time_attr} (inferred_from: "
+                    f"{self.time_attr})."
+                )
+            _write_plan(
+                output_root,
+                _format_plan_markdown(
+                    dimension=self.dimension_label,
+                    source_root=source,
+                    bucket_rules=rules,
+                    entries=entries,
+                    assumptions=assumptions,
+                ),
+            )
+            return ToolResult(output=json.dumps({
+                "dimension": self.dimension_label,
+                "entries": entries,
+                "fallback_count": len(fallbacks),
+            }))
+        except Exception as exc:
+            return ToolResult(output="", error=f"organize_by_{self.dimension_label}: {exc}")
+
+
+class OrganizeByModifiedTimeTool(_TimeBucketTool):
     name = "organize_by_modified_time"
+    description = "Group files by year-month of mtime. Zero-LLM."
+    dimension_label = "modified_time"
+    time_attr = "st_mtime"
 
 
-class OrganizeByAccessedTimeTool(_NotYetImplementedTool):
+class OrganizeByAccessedTimeTool(_TimeBucketTool):
     name = "organize_by_accessed_time"
+    description = "Group files by year-month of atime. Zero-LLM."
+    dimension_label = "accessed_time"
+    time_attr = "st_atime"
+
+
+class OrganizeByCreatedTimeTool(_TimeBucketTool):
+    name = "organize_by_created_time"
+    description = (
+        "Group files by year-month of birth time; falls back to mtime "
+        "on filesystems that do not report birthtime. Zero-LLM."
+    )
+    dimension_label = "created_time"
+    time_attr = "st_birthtime"
+    fallback_attr = "st_mtime"
 
 
 class OrganizeByFilenameTool(_NotYetImplementedTool):

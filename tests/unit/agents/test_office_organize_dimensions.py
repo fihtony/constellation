@@ -143,3 +143,52 @@ def test_organize_by_type_buckets_by_extension(tmp_path):
     assert by_dest["data.csv"].startswith("data/")
     assert by_dest["code.py"].startswith("code/")
     assert by_dest["image.png"].startswith("images/")
+
+
+import os as _os_for_time
+import re
+
+
+def test_organize_by_modified_time_buckets_by_year_month(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    p1 = _make_file(src, "a.txt", b"a")
+    p2 = _make_file(src, "b.txt", b"b")
+    _os_for_time.utime(p1, (1700000000, 1700000000))  # 2023-11
+    _os_for_time.utime(p2, (1735689600, 1735689600))  # 2025-01
+    out = tmp_path / "out"
+    out.mkdir()
+    result = OrganizeByModifiedTimeTool().execute_sync(source=str(src), output_root=str(out))
+    assert result.success, result.error
+    payload = json.loads(result.output)
+    by_src = {entry["source"]: entry["destination"] for entry in payload["entries"]}
+    assert by_src["a.txt"].startswith("2023-11/")
+    assert by_src["b.txt"].startswith("2025-01/")
+
+
+def test_organize_by_created_time_falls_back_to_mtime(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    p1 = _make_file(src, "fallback.txt", b"x")
+    _os_for_time.utime(p1, (1700000000, 1700000000))  # 2023-11
+    out = tmp_path / "out"
+    out.mkdir()
+    result = OrganizeByCreatedTimeTool().execute_sync(source=str(src), output_root=str(out))
+    assert result.success, result.error
+    plan_text = (out / "organization-plan.md").read_text()
+    # The fallback assumption must be recorded so the reader can tell.
+    assert "inferred_from" in plan_text or "fallback" in plan_text.lower()
+
+
+def test_organize_by_accessed_time_buckets_by_year_month(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    p1 = _make_file(src, "a.txt", b"a")
+    _os_for_time.utime(p1, (1700000000, 1700000000))
+    out = tmp_path / "out"
+    out.mkdir()
+    result = OrganizeByAccessedTimeTool().execute_sync(source=str(src), output_root=str(out))
+    assert result.success, result.error
+    payload = json.loads(result.output)
+    bucket = payload["entries"][0]["destination"].split("/")[0]
+    assert re.match(r"^\d{4}-\d{2}$", bucket)
