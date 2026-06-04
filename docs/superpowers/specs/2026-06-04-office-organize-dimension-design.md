@@ -8,14 +8,14 @@ encodes business-specific assumptions about how a folder *should* be
 grouped — most visibly a bias toward "people/identity" grouping that
 breaks ordinary requests such as *"organize this folder by file size"*.
 
-The proximate cause of the f460933b2801 failure is a chain of hardcoded
-behaviours:
+The proximate cause of recent organize-task failures is a chain of
+hardcoded behaviours:
 
 - `VALID_CATEGORIES` in `agents/office/office_tools.py` includes
   `"students"` and the organize path treats that as a valid bucket.
-- `_extract_primary_entity` and `IDENTITY_PREFIXES` cause the agent to
-  re-derive "Student Yan" / "Student Liam" as the high-confidence
-  `primary_entity` for any text file with a `>>> Student XXX` header.
+- `_extract_primary_entity` and `IDENTITY_PREFIXES` cause the agent
+  to re-derive person-style labels as the high-confidence
+  `primary_entity` for any text file with a `>>> <Name>` header.
 - `OrganizeMoveFileTool` enforces the destination tail to match that
   entity when `primary_entity_confidence == "high"`.
 - The organize prompt coaches the LLM to use `primary_entity` as the
@@ -45,7 +45,7 @@ prompts, skills, or tests after this change.
 4. **No business hardcodes anywhere in the Office agent.** No
    `students`, no `by-student`, no `primary_entity`, no `ID-prefix =
    student/author/writer/...`. The agent does not know which
-   population's essays it is processing.
+   population's documents it is processing.
 5. **The plan-output gate stays dimension-agnostic.** It continues to
    verify the contract (every source file materialized exactly once)
    without baking in any specific bucket vocabulary.
@@ -277,17 +277,16 @@ The validation checklist in Phase 5 gains one item:
 
 ### `tests/unit/agents/test_office_organize_schema.py` (modified)
 
-Replace every `students/`, `Liam/`, `Ethan/`, `Yan/`, and
-`by-student/` literal in assertions with neutral
-`<bucket>/<file>` examples. The behaviour under test (path
-normalization, wrapper stripping) is preserved; only the
-identifiers change.
+Replace every `students/`, person-name, and `by-student/` literal
+in assertions with neutral `<bucket>/<file>` examples. The
+behaviour under test (path normalization, wrapper stripping) is
+preserved; only the identifiers change.
 
 ### `tests/unit/agents/test_office_organize_verification.py` (modified)
 
 Same as above. The plan-output gate contract test keeps the
 invariant "every source file is materialized exactly once" but
-uses synthetic bucket names (e.g. `small/`, `medium/`, `large/`).
+uses synthetic bucket names.
 
 ### `tests/unit/agents/test_office_organize_dimensions.py` (new)
 
