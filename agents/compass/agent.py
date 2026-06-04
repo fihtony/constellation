@@ -38,7 +38,6 @@ from framework.major_step import (
     LIFECYCLE_RUNNING,
     LIFECYCLE_TERMINATED,
     LIFECYCLE_WAITING_FOR_USER,
-    ensure_major_step_skeleton,
     record_major_step,
 )
 from agents.compass.ui.routes import handle_ui_request
@@ -387,6 +386,23 @@ def _office_major_step_skeleton(office_request: dict) -> list[dict]:
 
     rows.extend(
         [
+            {
+                "step_key": "office.validating_plan_output",
+                "title": "Office validating output against plan",
+                "agent": "office",
+            },
+            {
+                "step_key": "office.reconciling_plan_output",
+                "title": "Office reconciling output to match plan",
+                "agent": "office",
+                "conditional": True,
+            },
+            {
+                "step_key": "office.gate_exhausted",
+                "title": "Office plan-output gate exhausted",
+                "agent": "office",
+                "conditional": True,
+            },
             {
                 "step_key": "office.verifying",
                 "title": "Office verifying deliverable",
@@ -1044,14 +1060,6 @@ class CompassAgent(BaseAgent):
                     "workspace_path": workspace_path,
                 },
             )
-            try:
-                ensure_major_step_skeleton(
-                    task.id,
-                    entries=_development_major_step_skeleton(jira_key),
-                    task_store=task_store,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warn("failed to seed development major-step skeleton", error=str(exc))
             response_text = _development_start_message(jira_key)
             _record_major_step(
                 task_store,
@@ -1093,15 +1101,6 @@ class CompassAgent(BaseAgent):
             log.info("dispatching office task")
             office_request = _extract_office_request(user_text, meta)
             task_store.update_metadata(task.id, {"task_type": "office", "office_request": office_request})
-            try:
-                ensure_major_step_skeleton(
-                    task.id,
-                    entries=_office_major_step_skeleton(office_request),
-                    task_store=task_store,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warn("failed to seed office major-step skeleton", error=str(exc))
-
             if not office_request.get("output_mode"):
                 question = _office_output_mode_question()
                 task_store.pause_task(

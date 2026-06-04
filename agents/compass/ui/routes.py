@@ -28,6 +28,189 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _office_task_report_path(task_id: str) -> str:
+    artifact_root = os.environ.get("ARTIFACT_ROOT", "artifacts")
+    return os.path.join(artifact_root, task_id, "office", "task-report.json")
+
+
+def _load_office_task_report(task_id: str) -> dict:
+    report_path = _office_task_report_path(task_id)
+    if not os.path.exists(report_path):
+        return {}
+    try:
+        with open(report_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return {}
+    data = payload.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _gate_report_path(task_id: str) -> str:
+    artifact_root = os.environ.get("ARTIFACT_ROOT", "artifacts")
+    return os.path.join(artifact_root, task_id, "office", "artifacts", "plan-output-gate-report.json")
+
+
+def _load_gate_report(task_id: str) -> dict:
+    path = _gate_report_path(task_id)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _organized_output_root(task_id: str) -> str:
+    artifact_root = os.environ.get("ARTIFACT_ROOT", "artifacts")
+    return os.path.join(artifact_root, task_id, "office", "artifacts", "organized-output", "files")
+
+
+def _count_materialized_organized_files(task_id: str) -> int:
+    root = _organized_output_root(task_id)
+    if not os.path.isdir(root):
+        return 0
+    return sum(len(files) for _, _, files in os.walk(root))
+
+
+def _count_source_files(root: str) -> int:
+    """Recursively count non-hidden regular files under ``root``."""
+    if not root or not os.path.isdir(root):
+        return 0
+    total = 0
+    for current_root, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            if name.startswith("."):
+                continue
+            total += 1
+    return total
+
+
+def _copy_row_with_summary_facts(row: dict, summary_facts: dict) -> dict:
+    updated = dict(row)
+    updated["summary_facts"] = summary_facts
+    return updated
+
+
+def _enrich_office_major_step_rows(task_id: str, metadata: dict, rows: dict) -> dict:
+    if metadata.get("task_type") != "office" or not rows:
+        return rows
+
+    report_data = _load_office_task_report(task_id)
+    if not report_data:
+        return rows
+
+    enriched = {key: dict(value) for key, value in rows.items()}
+    office_request = metadata.get("office_request") or {}
+    capability = str(
+        office_request.get("capability")
+        or report_data.get("capability")
+        or ""
+    ).strip().lower()
+
+    if capability == "summarize":
+        source_paths = report_data.get("source_paths") or []
+        source_count = len(source_paths) if isinstance(source_paths, list) else 0
+        original_inputs = office_request.get("source_paths") or []
+        is_folder_input = (
+            isinstance(original_inputs, list)
+            and len(original_inputs) == 1
+            and (
+                os.path.isdir(str(original_inputs[0]))
+                or source_count > 1
+            )
+        )
+        received_key = "office.received#0"
+        if received_key in enriched:
+            facts = dict(enriched[received_key].get("summary_facts") or {})
+            facts["capability"] = "summarize"
+            facts["source_count"] = 1 if is_folder_input else len(original_inputs) or facts.get("source_count", 0)
+            facts["source_kind"] = "folder" if is_folder_input else ("file" if facts.get("source_count") == 1 else "files")
+            enriched[received_key] = _copy_row_with_summary_facts(enriched[received_key], facts)
+        if source_count > 0:
+            reading_key = "office.reading#0"
+            if reading_key in enriched:
+                facts = dict(enriched[reading_key].get("summary_facts") or {})
+                facts["source_count"] = source_count
+                facts["source_kind"] = "file" if source_count == 1 else "files"
+                enriched[reading_key] = _copy_row_with_summary_facts(enriched[reading_key], facts)
+            summarizing_key = "office.summarizing#0"
+            if summarizing_key in enriched:
+                facts = dict(enriched[summarizing_key].get("summary_facts") or {})
+                facts["source_count"] = source_count
+                enriched[summarizing_key] = _copy_row_with_summary_facts(enriched[summarizing_key], facts)
+        return enriched
+
+    if capability == "organize":
+        file_count = _count_materialized_organized_files(task_id)
+        if file_count <= 0:
+            return enriched
+        scanning_key = "office.scanning#0"
+        if scanning_key in enriched:
+            facts = dict(enriched[scanning_key].get("summary_facts") or {})
+            facts["file_count"] = file_count
+            enriched[scanning_key] = _copy_row_with_summary_facts(enriched[scanning_key], facts)
+        moving_key = "office.moving_files#0"
+        if moving_key in enriched:
+            facts = dict(enriched[moving_key].get("summary_facts") or {})
+            facts["file_count"] = file_count
+            enriched[moving_key] = _copy_row_with_summary_facts(enriched[moving_key], facts)
+        writing_plan_key = "office.writing_plan#0"
+        if writing_plan_key in enriched:
+            row = dict(enriched[writing_plan_key])
+            row["lifecycle_state"] = "done"
+            row["visual_state"] = "done"
+            if row.get("ended_at") is None:
+                row["ended_at"] = row.get("started_at") or ""
+            enriched[writing_plan_key] = row
+
+        # NEW: Backfill discovered_source_count for folder-backed organize input
+        original_inputs = office_request.get("source_paths") or []
+        if (
+            isinstance(original_inputs, list)
+            and len(original_inputs) == 1
+            and os.path.isdir(str(original_inputs[0]))
+        ):
+            received_key = "office.received#0"
+            if received_key in enriched:
+                folder_count = _count_source_files(str(original_inputs[0]))
+                if folder_count > 0:
+                    facts = dict(enriched[received_key].get("summary_facts") or {})
+                    facts["discovered_source_count"] = folder_count
+                    enriched[received_key] = _copy_row_with_summary_facts(
+                        enriched[received_key], facts
+                    )
+
+        # NEW: Surface the gate reason into office.validating_plan_output#0
+        gate_report = _load_gate_report(task_id)
+        if gate_report:
+            validating_key = "office.validating_plan_output#0"
+            if validating_key in enriched:
+                row = dict(enriched[validating_key])
+                facts = dict(row.get("summary_facts") or {})
+                plan_status = str(gate_report.get("plan_status") or "").strip().lower()
+                if plan_status:
+                    facts["plan_status"] = plan_status
+                invalid_entries = gate_report.get("invalid_plan_entries") or []
+                if isinstance(invalid_entries, list) and invalid_entries:
+                    facts["invalid_plan_entry_count"] = len(invalid_entries)
+                # Append a "plan is {plan_status}" reason sentence to the template
+                # so the UI can render the gate reason inline.
+                existing_template = str(row.get("summary_template") or "").rstrip()
+                if plan_status and "plan is {plan_status}" not in existing_template:
+                    row["summary_template"] = (
+                        existing_template + f" plan is {{plan_status}}."
+                    )
+                row["summary_facts"] = facts
+                enriched[validating_key] = row
+
+        return enriched
+
+    return enriched
+
+
 def _ui_status_kind(task) -> str:
     raw = getattr(getattr(task, "status", None), "state", "")
     value = getattr(raw, "value", raw)
@@ -94,7 +277,11 @@ def _serialize_ui_task(task) -> dict:
     # Major-step timeline fields (v0.8 redesign). The new structured rows are
     # the canonical data; the legacy ``currentMajorStep`` / ``progressSteps``
     # fields are kept as derived views for backward compatibility.
-    major_step_rows = metadata.get("major_step_rows") or {}
+    major_step_rows = _enrich_office_major_step_rows(
+        task.id,
+        metadata,
+        metadata.get("major_step_rows") or {},
+    )
     major_step_skeleton = metadata.get("major_step_skeleton") or []
     active_key = metadata.get("active_step_instance_key", "")
     failed_key = metadata.get("failed_step_instance_key", "")

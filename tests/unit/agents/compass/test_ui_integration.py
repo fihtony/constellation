@@ -1,4 +1,5 @@
 """Tests for Compass UI routes."""
+import json
 from pathlib import Path
 
 import pytest
@@ -116,3 +117,213 @@ class TestUIRoutes:
         assert result["status"] == 200
         assert result["body"]["logs"][0]["task_id"] == task_id
         assert result["body"]["logs"][0]["message"] == "Accepted task"
+
+    def test_get_task_detail_backfills_folder_summarize_step_facts_from_task_report(
+        self,
+        task_store,
+        monkeypatch,
+        tmp_path: Path,
+    ):
+        source_dir = tmp_path / "source-folder"
+        source_dir.mkdir()
+        (source_dir / "alpha.txt").write_text("alpha", encoding="utf-8")
+        (source_dir / "beta.txt").write_text("beta", encoding="utf-8")
+
+        task = task_store.create_task(
+            agent_id="compass",
+            metadata={
+                "task_type": "office",
+                "office_request": {
+                    "capability": "summarize",
+                    "output_mode": "workspace",
+                    "source_paths": [str(source_dir)],
+                },
+                "major_step_rows": {
+                    "office.received#0": {
+                        "step_key": "office.received",
+                        "step_instance_key": "office.received#0",
+                        "title": "Office receiving task",
+                        "agent": "office",
+                        "lifecycle_state": "done",
+                        "visual_state": "done",
+                        "summary_template": "Office received the task: {capability} on {source_count} {source_kind}.",
+                        "summary_facts": {"capability": "summarize", "source_count": 1, "source_kind": "file"},
+                        "started_at": "2026-06-03T10:00:00+00:00",
+                        "ended_at": "2026-06-03T10:00:01+00:00",
+                    },
+                    "office.reading#0": {
+                        "step_key": "office.reading",
+                        "step_instance_key": "office.reading#0",
+                        "title": "Office reading documents",
+                        "agent": "office",
+                        "lifecycle_state": "done",
+                        "visual_state": "done",
+                        "summary_template": "Office read {source_count} {source_kind} via MCP tools.",
+                        "summary_facts": {"source_count": 1, "source_kind": "file"},
+                        "started_at": "2026-06-03T10:00:02+00:00",
+                        "ended_at": "2026-06-03T10:00:03+00:00",
+                    },
+                    "office.summarizing#0": {
+                        "step_key": "office.summarizing",
+                        "step_instance_key": "office.summarizing#0",
+                        "title": "Office summarizing each document",
+                        "agent": "office",
+                        "lifecycle_state": "done",
+                        "visual_state": "done",
+                        "summary_template": "Office summarized each of the {source_count} document(s).",
+                        "summary_facts": {"source_count": 1},
+                        "started_at": "2026-06-03T10:00:04+00:00",
+                        "ended_at": "2026-06-03T10:00:05+00:00",
+                    },
+                },
+            },
+            task_id="task-folder-summary",
+        )
+        monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path))
+        report_dir = tmp_path / task.id / "office"
+        report_dir.mkdir(parents=True)
+        (report_dir / "task-report.json").write_text(
+            json.dumps(
+                {
+                    "data": {
+                        "capability": "summarize",
+                        "source_paths": [
+                            str(source_dir / "alpha.txt"),
+                            str(source_dir / "beta.txt"),
+                        ],
+                        "expected_outputs": [
+                            "artifacts/alpha.txt.summary.md",
+                            "artifacts/beta.txt.summary.md",
+                            "artifacts/combined-summary.md",
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = handle_ui_request("GET", f"/tasks/{task.id}", task_store=task_store)
+
+        assert result["status"] == 200
+        rows = result["body"]["majorStepRows"]
+        assert rows["office.received#0"]["summary_facts"]["source_kind"] == "folder"
+        assert rows["office.reading#0"]["summary_facts"]["source_count"] == 2
+        assert rows["office.reading#0"]["summary_facts"]["source_kind"] == "files"
+        assert rows["office.summarizing#0"]["summary_facts"]["source_count"] == 2
+
+    def test_get_task_detail_backfills_organize_received_count_and_gate_reason(
+        self,
+        task_store,
+        monkeypatch,
+        tmp_path: Path,
+    ):
+        source_dir = tmp_path / "source-folder"
+        nested = source_dir / "nested"
+        nested.mkdir(parents=True)
+        (source_dir / "alpha.txt").write_text("alpha", encoding="utf-8")
+        (nested / "beta.txt").write_text("beta", encoding="utf-8")
+        (nested / "gamma.txt").write_text("gamma", encoding="utf-8")
+
+        task = task_store.create_task(
+            agent_id="compass",
+            metadata={
+                "task_type": "office",
+                "office_request": {
+                    "capability": "organize",
+                    "output_mode": "workspace",
+                    "source_paths": [str(source_dir)],
+                },
+                "major_step_rows": {
+                    "office.received#0": {
+                        "step_key": "office.received",
+                        "step_instance_key": "office.received#0",
+                        "title": "Office receiving task",
+                        "agent": "office",
+                        "lifecycle_state": "done",
+                        "visual_state": "done",
+                        "summary_template": "Office received the task: {capability} on {source_count} {source_kind} containing {discovered_source_count} file(s).",
+                        "summary_facts": {"capability": "organize", "source_count": 1, "source_kind": "folder", "discovered_source_count": 1},
+                        "started_at": "2026-06-03T10:00:00+00:00",
+                        "ended_at": "2026-06-03T10:00:01+00:00",
+                    },
+                    "office.validating_plan_output#0": {
+                        "step_key": "office.validating_plan_output",
+                        "step_instance_key": "office.validating_plan_output#0",
+                        "title": "Office validating output against plan",
+                        "agent": "office",
+                        "lifecycle_state": "warning",
+                        "visual_state": "warning",
+                        "summary_template": "Plan-output gate exhausted after {round_count} reconciliation round(s): {missing_count} missing, {unexpected_count} unexpected, {mismatch_count} mismatched. See plan-output-gate-report.json.",
+                        "summary_facts": {"round_count": 3, "missing_count": 0, "unexpected_count": 0, "mismatch_count": 0},
+                        "started_at": "2026-06-03T10:00:02+00:00",
+                        "ended_at": "2026-06-03T10:00:03+00:00",
+                    },
+                },
+            },
+            task_id="task-folder-organize",
+        )
+
+        monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path))
+        report_dir = tmp_path / task.id / "office"
+        artifacts_dir = report_dir / "artifacts"
+        (artifacts_dir / "organized-output" / "files" / "by-size").mkdir(parents=True)
+        for name in ("alpha.txt", "beta.txt", "gamma.txt"):
+            (artifacts_dir / "organized-output" / "files" / "by-size" / name).write_text(name, encoding="utf-8")
+        report_dir.mkdir(parents=True, exist_ok=True)
+        (report_dir / "task-report.json").write_text(
+            json.dumps(
+                {
+                    "data": {
+                        "capability": "organize",
+                        "source_paths": [str(source_dir)],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (artifacts_dir / "plan-output-gate-report.json").write_text(
+            json.dumps(
+                {
+                    "plan_status": "invalid",
+                    "rounds": 3,
+                    "final": {"missing": [], "unexpected": [], "mismatches": []},
+                    "invalid_plan_entries": ["source='nested/alpha.txt' destination='files/alpha.txt': source path outside validated set"],
+                    "error_message": "source path outside validated set",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = handle_ui_request("GET", f"/tasks/{task.id}", task_store=task_store)
+
+        assert result["status"] == 200
+        rows = result["body"]["majorStepRows"]
+        assert rows["office.received#0"]["summary_facts"]["source_kind"] == "folder"
+        assert rows["office.received#0"]["summary_facts"]["discovered_source_count"] == 3
+        assert "plan is {plan_status}" in rows["office.validating_plan_output#0"]["summary_template"]
+        assert rows["office.validating_plan_output#0"]["summary_facts"]["plan_status"] == "invalid"
+        assert rows["office.validating_plan_output#0"]["summary_facts"]["invalid_plan_entry_count"] == 1
+
+
+def test_office_skeleton_includes_validating_reconciling_exhausted():
+    """Spec §5.7: the three new gate step keys exist in the office skeleton for all capabilities."""
+    from agents.compass.agent import _office_major_step_skeleton
+    for capability in ("analyze", "summarize", "organize"):
+        rows = _office_major_step_skeleton({"capability": capability})
+        keys = [r["step_key"] for r in rows]
+        # validating is unconditional; the other two are conditional
+        assert "office.validating_plan_output" in keys, f"missing validating for {capability}"
+        reconciling = [r for r in rows if r["step_key"] == "office.reconciling_plan_output"]
+        assert len(reconciling) == 1, f"reconciling row not unique for {capability}"
+        assert reconciling[0].get("conditional") is True, f"reconciling not conditional for {capability}"
+        exhausted = [r for r in rows if r["step_key"] == "office.gate_exhausted"]
+        assert len(exhausted) == 1, f"exhausted row not unique for {capability}"
+        assert exhausted[0].get("conditional") is True, f"exhausted not conditional for {capability}"
+        # ordering: validating/reconciling/exhausted must come BEFORE verifying
+        idx_validating = keys.index("office.validating_plan_output")
+        idx_reconciling = keys.index("office.reconciling_plan_output")
+        idx_exhausted = keys.index("office.gate_exhausted")
+        idx_verifying = keys.index("office.verifying")
+        assert idx_validating < idx_verifying, f"validating not before verifying for {capability}"
+        assert idx_reconciling < idx_verifying, f"reconciling not before verifying for {capability}"
+        assert idx_exhausted < idx_verifying, f"exhausted not before verifying for {capability}"
