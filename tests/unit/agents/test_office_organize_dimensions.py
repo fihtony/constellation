@@ -250,3 +250,53 @@ def test_run_dimension_tool_rejects_unknown_dimension(tmp_path):
     result = run_dimension_tool("alphabetical", str(tmp_path), str(out))
     assert not result.success
     assert "unsupported dimension" in result.error
+
+
+# ---------------------------------------------------------------------------
+# Block 2: analyze_request dimension gate
+# ---------------------------------------------------------------------------
+
+from agents.office.nodes import analyze_request  # noqa: E402
+
+
+def _organize_state(capability: str = "organize", text: str = "organize this"):
+    return {
+        "source_paths": ["/tmp/some/folder"],
+        "output_mode": "workspace",
+        "capability": capability,
+        "user_request": text,
+        "_message_metadata": {},
+        "_compass_task_id": "test-task",
+    }
+
+
+def test_analyze_request_returns_clarification_when_dimension_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("OFFICE_SOURCE_ROOT", str(tmp_path))
+    monkeypatch.setenv("OFFICE_WORKSPACE_ROOT", str(tmp_path / "ws"))
+    state = _organize_state(text="please organize this folder")
+    out = analyze_request(state)
+    assert out["error"] == "missing_organize_dimension"
+    assert out["needs_clarification"]["missing"] == "organizeGroupBy"
+    option_ids = {opt["id"] for opt in out["needs_clarification"]["options"]}
+    assert option_ids == {"size", "type", "created_time", "modified_time", "accessed_time", "filename"}
+
+
+def test_analyze_request_records_dimension_in_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("OFFICE_SOURCE_ROOT", str(tmp_path))
+    monkeypatch.setenv("OFFICE_WORKSPACE_ROOT", str(tmp_path / "ws"))
+    state = _organize_state(text="按文件大小整理")
+    state["source_paths"] = [str(tmp_path / "src")]
+    (tmp_path / "src").mkdir()
+    out = analyze_request(state)
+    assert out.get("organize_dimension") == "size"
+
+
+def test_analyze_request_passes_through_non_organize(monkeypatch, tmp_path):
+    monkeypatch.setenv("OFFICE_SOURCE_ROOT", str(tmp_path))
+    monkeypatch.setenv("OFFICE_WORKSPACE_ROOT", str(tmp_path / "ws"))
+    state = _organize_state(capability="summarize", text="summarize this")
+    state["source_paths"] = [str(tmp_path / "src.txt")]
+    (tmp_path / "src.txt").write_text("hello")
+    out = analyze_request(state)
+    # summarize path keeps its own validation; we just confirm no clarification fires.
+    assert "needs_clarification" not in out

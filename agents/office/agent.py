@@ -232,6 +232,7 @@ class OfficeAgent(BaseAgent):
             "_message_metadata": dict(metadata),
             "_permission_engine": getattr(self, "_permission_engine", None),
         }
+        from agents.office.dimensions import parse_dimension as _parse_dimension
         state: dict[str, Any] = {
             "_task_id": canonical_task_id,
             "_compass_task_id": compass_task_id,
@@ -242,6 +243,7 @@ class OfficeAgent(BaseAgent):
             "source_paths": source_paths,
             "capability": capability or "summarize",
             "test_cycles": 0,
+            "organize_dimension": _parse_dimension(dict(metadata), user_text),
         }
 
         # v0.8 timeline redesign: resolve a progress_sink so major-step

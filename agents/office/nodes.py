@@ -34,6 +34,7 @@ from agents.office.office_tools import (
     ReadXlsxTool,
     collect_organize_file_inventory,
 )
+from agents.office.dimensions import VALID_DIMENSIONS, parse_dimension
 from framework.devlog import _ts
 from framework.major_step import LIFECYCLE_DONE, LIFECYCLE_RUNNING, LIFECYCLE_WARNING
 from framework.office.plan_output_gate import (
@@ -299,6 +300,33 @@ def receive_task(state: dict) -> dict:
 
 def analyze_request(state: dict) -> dict:
     """Validate source paths and check permissions. Returns updated state or error."""
+    # --- Dimension gate (organize capability only) ---------------------
+    metadata = state.get("_message_metadata", {}) or {}
+    user_text = state.get("user_request", "")
+    capability = state.get("capability", "summarize")
+    dimension = ""
+    if capability == "organize":
+        dimension = parse_dimension(metadata, user_text)
+        if not dimension:
+            return {
+                "error": "missing_organize_dimension",
+                "needs_clarification": {
+                    "missing": "organizeGroupBy",
+                    "options": [
+                        {"id": d, "label": d.replace("_", " ")}
+                        for d in sorted(VALID_DIMENSIONS)
+                    ],
+                    "user_message": (
+                        "Office organize needs a grouping dimension. "
+                        "Available dimensions: "
+                        + ", ".join(sorted(VALID_DIMENSIONS))
+                        + "."
+                    ),
+                },
+                "workspace_root": _get_workspace_root(state),
+                "artifacts_dir": os.path.join(_get_workspace_root(state), "artifacts"),
+            }
+
     source_paths = state.get("source_paths", [])
     output_mode = state.get("output_mode", "workspace")
     capability = state.get("capability", "summarize")
@@ -408,6 +436,7 @@ def analyze_request(state: dict) -> dict:
         "validated_paths": validated_paths,
         "workspace_root": workspace_root,
         "artifacts_dir": artifacts_dir,
+        "organize_dimension": dimension,
     }
 
 
