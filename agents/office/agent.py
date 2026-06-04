@@ -244,6 +244,23 @@ class OfficeAgent(BaseAgent):
             "test_cycles": 0,
         }
 
+        # v0.8 timeline redesign: resolve a progress_sink so major-step
+        # events flow into Compass's top-level task store. The sink is
+        # resolved via the Capability Registry (``compass.major_step.sink``)
+        # and falls back gracefully when the registry is unreachable.
+        if compass_task_id and compass_task_id != canonical_task_id:
+            try:
+                from framework.major_step import resolve_progress_sink
+
+                state["_major_step_progress_sink"] = resolve_progress_sink(
+                    compass_task_id
+                )
+                ephemeral_state["_major_step_progress_sink"] = state[
+                    "_major_step_progress_sink"
+                ]
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("office: failed to resolve progress_sink: %s", exc)
+
         # Set OFFICE_WORKSPACE_ROOT for this task
         # Workspace path: {ARTIFACT_ROOT}/{compass_task_id}/office/
         # All office tasks under the same compass task share the same workspace

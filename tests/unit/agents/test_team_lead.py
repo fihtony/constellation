@@ -32,6 +32,14 @@ def _mock_runtime(summary="PR created.", success=True):
     return runtime
 
 
+def _timeline_task_store(task_id: str = "task-major-steps"):
+    from framework.task_store import InMemoryTaskStore
+
+    store = InMemoryTaskStore()
+    store.create_task(agent_id="team-lead", task_id=task_id)
+    return store
+
+
 @pytest.fixture(autouse=True)
 def _clear_child_session_cache():
     from agents.team_lead import nodes as tl_nodes
@@ -133,6 +141,77 @@ class TestTeamLeadAgent:
         if poll["task"]["status"]["state"] == "TASK_STATE_COMPLETED":
             artifacts = poll["task"]["artifacts"]
             assert len(artifacts) > 0
+
+    async def test_analyze_requirements_records_major_step_row(self):
+        from agents.team_lead.nodes import analyze_requirements
+
+        store = _timeline_task_store()
+        result = await analyze_requirements(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "user_request": "Implement CSTL-1",
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["tl.analyzing#0"]
+        assert row["title"] == "Team Lead analyzing task"
+        assert row["lifecycle_state"] == "done"
+        assert row["summary_facts"]["complexity"] == result["complexity"]
+
+    async def test_review_result_records_requesting_review_row(self, monkeypatch):
+        from agents.team_lead.nodes import review_result
+
+        store = _timeline_task_store()
+
+        fake_registry = MagicMock()
+        fake_registry.execute_sync.return_value = json.dumps({"verdict": "approved", "comments": [], "summary": "ok"})
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: fake_registry)
+        monkeypatch.setattr(
+            "framework.execution_contract.load_child_profiles",
+            lambda mapping: {"code-review": {"agent_id": "code-review", "allowed_tools": ["read_file"]}},
+        )
+
+        result = await review_result(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "pr_url": "https://example.com/pull/42",
+                "pr_number": 42,
+                "workspace_path": "/tmp/workspace",
+                "analysis_summary": "feature work",
+                "repo_url": "https://example.com/repo.git",
+                "repo_path": "/tmp/repo",
+                "dev_result": {"summary": "done"},
+                "revision_count": 0,
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["tl.requesting_review#0"]
+        assert row["title"] == "Team Lead requesting code review"
+        assert row["lifecycle_state"] == "done"
+        assert result["route"] == "approved"
+
+    async def test_report_success_records_reported_row(self):
+        from agents.team_lead.nodes import report_success
+
+        store = _timeline_task_store()
+        result = await report_success(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "pr_url": "https://example.com/pull/42",
+                "branch_name": "feature/cstl-1",
+                "analysis_summary": "feature work",
+                "review_verdict": "approved",
+                "revision_count": 0,
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["tl.reported#0"]
+        assert row["title"] == "Team Lead reporting to Compass"
+        assert row["lifecycle_state"] == "done"
+        assert result["success"] is True
 
     async def test_handle_message_cleans_up_child_agents_when_workflow_fails(self, monkeypatch):
         runtime = _mock_runtime()

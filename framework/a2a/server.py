@@ -153,6 +153,19 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                 self._handle_resume(task_id, body)
                 return
 
+        # POST /_major_step/events — downstream agent events fan-in.
+        # The body MUST contain ``task_id`` (the Compass top-level task id);
+        # ``step_key``, ``title``, ``agent`` and ``lifecycle_state`` are
+        # forwarded to ``framework.major_step.record_major_step``. The path
+        # matches ``framework.major_step.DEFAULT_SINK_PATH`` so the
+        # ``resolve_progress_sink`` resolver appends the right suffix.
+        if path == "/_major_step/events":
+            body = self._read_json_body()
+            if body is None:
+                return
+            self._handle_major_step_event(body)
+            return
+
         self._send_json(404, {"error": "Not found"})
 
     # -- Endpoint handlers (override in subclasses if needed) ----------------
@@ -288,6 +301,54 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             pass
         print(f"[{agent_id}] Progress for task {task_id}: {step}")
         self._send_json(200, {"status": "ok"})
+
+    def _handle_major_step_event(self, body: dict) -> None:
+        """Handle a fan-in major-step event from a downstream agent.
+
+        The body must carry the structured fields from
+        ``framework.major_step.record_major_step``. We resolve the local
+        ``TaskStore`` from the agent and apply the event against the
+        Compass task id (``task_id`` in the body). Returns 404 if the task
+        is unknown, 200 with the merged event otherwise. Terminal-protection
+        and idempotence on ``(step_key, round)`` are enforced inside
+        ``record_major_step``.
+        """
+        task_id = str(body.get("task_id") or "").strip()
+        if not task_id:
+            self._send_json(400, {"error": "task_id required"})
+            return
+        agent = self.agent
+        if agent is None or not hasattr(agent, "services"):
+            self._send_json(503, {"error": "agent not initialized"})
+            return
+        task_store = agent.services.task_store
+        task = task_store.get_task(task_id)
+        if task is None:
+            self._send_json(404, {"error": "task not found"})
+            return
+        try:
+            from framework.major_step import record_major_step
+
+            event = record_major_step(
+                task_id,
+                step_key=body.get("step_key", ""),
+                title=body.get("title", ""),
+                agent=body.get("agent", ""),
+                lifecycle_state=body.get("lifecycle_state", "running"),
+                visual_state=body.get("visual_state"),
+                summary_template=body.get("summary_template", ""),
+                summary_facts=body.get("summary_facts"),
+                round=int(body.get("round", 0) or 0),
+                conditional=bool(body.get("conditional", False)),
+                task_store=task_store,
+            )
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"error": f"failed to record step: {exc}"})
+            return
+        self._send_json(200, {"status": "ok", "event": event})
 
     def _handle_child_timeout(self, task_id: str, body: dict) -> None:
         agent_id = self.agent.definition.agent_id if self.agent else "unknown"

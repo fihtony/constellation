@@ -7,6 +7,7 @@ from agents.compass.agent import (
     CompassAgent,
     compass_definition,
     _classify_request,
+    _development_major_step_skeleton,
     _extract_office_request,
     _extract_jira_key,
     _parse_classification_payload,
@@ -114,6 +115,64 @@ class TestCompassClassification:
         mock_runtime.run.return_value = {"raw_response": "development"}
         result = _classify_request("write unit tests for the user service", mock_runtime)
         assert result == "development"
+
+
+class TestCompassTimelineSkeleton:
+    def test_development_major_step_skeleton_matches_proposal_main_flow(self):
+        skeleton = _development_major_step_skeleton("CSTL-1")
+        step_keys = [row["step_key"] for row in skeleton]
+        assert step_keys[:14] == [
+            "compass.received",
+            "compass.dispatched",
+            "tl.analyzing",
+            "tl.gathering",
+            "tl.dispatched_dev",
+            "wd.drafting_plan",
+            "wd.implementing",
+            "wd.building",
+            "wd.self_check",
+            "wd.handover",
+            "tl.requesting_review",
+            "cr.reviewing",
+            "tl.reported",
+            "compass.task_completed",
+        ]
+        conditional_keys = {row["step_key"] for row in skeleton if row.get("conditional")}
+        assert {
+            "tl.requesting_user_input",
+            "wd.requesting_user_input",
+            "cr.requesting_user_input",
+        } <= conditional_keys
+
+    async def test_handle_message_seeds_development_timeline_skeleton(self, monkeypatch):
+        agent = _make_agent(_mock_runtime())
+        monkeypatch.setattr("threading.Thread.start", lambda self: None)
+
+        result = await agent.handle_message(
+            {
+                "message": {
+                    "parts": [{"text": "Implement CSTL-1"}],
+                    "metadata": {},
+                }
+            }
+        )
+
+        task_id = result["task"]["id"]
+        task = agent.services.task_store.get_task(task_id)
+        skeleton = task.metadata["major_step_skeleton"]
+        step_keys = [row["step_key"] for row in skeleton]
+
+        # Per design doc §4.2.1: the first row of a development timeline is
+        # ``compass.received`` (the canonical first step), followed by the
+        # dispatch + Team Lead / Web Dev skeleton rows.
+        assert step_keys[:5] == [
+            "compass.received",
+            "compass.dispatched",
+            "tl.analyzing",
+            "tl.gathering",
+            "tl.dispatched_dev",
+        ]
+        assert "compass.task_completed" in step_keys
 
     def test_extract_office_request_parses_absolute_source_path_from_user_text(self):
         request = _extract_office_request(

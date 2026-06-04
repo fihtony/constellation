@@ -19,6 +19,13 @@ from typing import Any
 
 from framework.config import load_agent_config as _load_agent_cfg
 from framework.devlog import AgentLogger
+from framework.major_step import (
+    LIFECYCLE_DONE,
+    LIFECYCLE_FAILED,
+    LIFECYCLE_RUNNING,
+    LIFECYCLE_WAITING_FOR_USER,
+    record_major_step,
+)
 from framework.audit_log import (
     append_command_log as _append_command_log,
     write_stage_summary as _write_stage_summary,
@@ -36,6 +43,39 @@ _CHILD_SESSION_CACHE: dict[str, dict[str, dict[str, str]]] = {}
 def _logger(state: dict) -> AgentLogger:
     """Return an AgentLogger for this agent using the task_id stored in state."""
     return AgentLogger(state.get("_task_id", ""), _AGENT_ID)
+
+
+def _record_timeline_step(
+    state: dict,
+    *,
+    step_key: str,
+    title: str,
+    lifecycle_state: str = LIFECYCLE_RUNNING,
+    summary_template: str = "",
+    summary_facts: dict | None = None,
+    round: int = 0,
+    conditional: bool = False,
+) -> None:
+    task_id = state.get("_compass_task_id") or state.get("_task_id") or state.get("task_id") or ""
+    if not task_id:
+        return
+    try:
+        record_major_step(
+            task_id,
+            step_key=step_key,
+            title=title,
+            agent="team-lead",
+            lifecycle_state=lifecycle_state,
+            summary_template=summary_template,
+            summary_facts=summary_facts,
+            round=round,
+            conditional=conditional,
+            orchestrator_task_id=state.get("_compass_task_id") or task_id,
+            progress_sink=state.get("_major_step_progress_sink"),
+            task_store=state.get("_task_store"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _logger(state).debug("major-step write skipped", step_key=step_key, error=str(exc))
 
 
 def _audit_command(state: dict, action: str, **params: Any) -> None:
@@ -623,6 +663,12 @@ async def analyze_requirements(state: dict) -> dict:
     log = _logger(state)
     log.node("analyze_requirements")
     _audit_command(state, "analyze_requirements")
+    _record_timeline_step(
+        state,
+        step_key="tl.analyzing",
+        title="Team Lead analyzing task",
+        summary_template="Team Lead is analyzing the Jira task requirements.",
+    )
 
     if not runtime:
         analysis = {
@@ -686,6 +732,18 @@ async def analyze_requirements(state: dict) -> dict:
         except OSError as exc:
             print(f"[{_AGENT_ID}] Failed to write analysis.json: {exc}")
 
+    _record_timeline_step(
+        state,
+        step_key="tl.analyzing",
+        title="Team Lead analyzing task",
+        lifecycle_state=LIFECYCLE_DONE,
+        summary_template="Team Lead analyzed the task as {task_type} work with {complexity} complexity.",
+        summary_facts={
+            "task_type": analysis.get("task_type", "general"),
+            "complexity": analysis.get("complexity", "medium"),
+        },
+    )
+
     return {
         "task_type": analysis.get("task_type", "general"),
         "complexity": analysis.get("complexity", "medium"),
@@ -713,6 +771,12 @@ async def gather_context(state: dict) -> dict:
     log = _logger(state)
     log.node("gather_context")
     _audit_command(state, "gather_context", jira_key=state.get("jira_key", ""))
+    _record_timeline_step(
+        state,
+        step_key="tl.gathering",
+        title="Team Lead gathering context",
+        summary_template="Team Lead is gathering Jira, design, and repository context.",
+    )
 
     jira_files = []
     design_files = []
@@ -1063,6 +1127,19 @@ async def gather_context(state: dict) -> dict:
         except OSError as exc:
             print(f"[{_AGENT_ID}] Failed to write context-manifest.json: {exc}")
 
+    _record_timeline_step(
+        state,
+        step_key="tl.gathering",
+        title="Team Lead gathering context",
+        lifecycle_state=LIFECYCLE_DONE,
+        summary_template="Team Lead gathered context: jira={has_jira}, design={has_design}, repo={has_repo}.",
+        summary_facts={
+            "has_jira": bool(jira_context),
+            "has_design": bool(design_context),
+            "has_repo": bool(repo_url),
+        },
+    )
+
     return {
         "jira_context": jira_context,
         "design_context": design_context,
@@ -1320,6 +1397,13 @@ async def dispatch_dev_agent(state: dict) -> dict:
         extra={"revision_round": state.get("revision_count", 0) + 1},
     )
     revision_feedback = state.get("revision_feedback", "")
+    if not revision_feedback:
+        _record_timeline_step(
+            state,
+            step_key="tl.dispatched_dev",
+            title="Team Lead dispatching to Web Dev",
+            summary_template="Team Lead is dispatching the implementation task to Web Dev.",
+        )
     task_description = _build_dev_brief(state)
     definition_of_done = dict((state.get("plan", {}) or {}).get("definition_of_done", {}) or {})
     if not definition_of_done:
@@ -1450,6 +1534,15 @@ async def dispatch_dev_agent(state: dict) -> dict:
             )
         payload = json.loads(result_str) if result_str else {}
     except Exception as exc:
+        if not revision_feedback:
+            _record_timeline_step(
+                state,
+                step_key="tl.dispatched_dev",
+                title="Team Lead dispatching to Web Dev",
+                lifecycle_state=LIFECYCLE_FAILED,
+                summary_template="Team Lead failed to dispatch Web Dev: {error}.",
+                summary_facts={"error": str(exc)[:500]},
+            )
         log.error("dev dispatch failed", error=str(exc))
         print(f"[{_AGENT_ID}] Dev dispatch failed: {exc}")
         # Container crash recovery: check if workspace has partial progress
@@ -1517,6 +1610,16 @@ async def dispatch_dev_agent(state: dict) -> dict:
     if payload.get("error"):
         print(f"[{_AGENT_ID}] Dev dispatch error detail: {payload['error']}")
 
+    if not revision_feedback:
+        _record_timeline_step(
+            state,
+            step_key="tl.dispatched_dev",
+            title="Team Lead dispatching to Web Dev",
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template="Team Lead dispatched the task to Web Dev and received delivery evidence.",
+            summary_facts={"has_pr": bool(pr_url), "branch": branch_name or ""},
+        )
+
     next_dev_session = _cache_child_session(
         orchestrator_task_id,
         "web-dev",
@@ -1557,6 +1660,22 @@ async def review_result(state: dict) -> dict:
     registry = get_registry()
     log = _logger(state)
     log.node("review_result")
+    review_attempt = int(state.get("revision_count", 0) or 0)
+    review_round = max(review_attempt - 1, 0) if review_attempt > 0 else 0
+    review_step_key = "tl.re_requesting_review" if review_attempt > 0 else "tl.requesting_review"
+    review_title = (
+        "Team Lead requesting follow-up code review"
+        if review_attempt > 0
+        else "Team Lead requesting code review"
+    )
+    _record_timeline_step(
+        state,
+        step_key=review_step_key,
+        title=review_title,
+        summary_template="Team Lead is requesting a code review of the current PR.",
+        round=review_round,
+        conditional=review_attempt > 0,
+    )
     _audit_command(
         state,
         "review_result",
@@ -1671,6 +1790,16 @@ async def review_result(state: dict) -> dict:
             )
         payload = json.loads(result_str) if result_str else {}
     except Exception as exc:
+        _record_timeline_step(
+            state,
+            step_key=review_step_key,
+            title=review_title,
+            lifecycle_state=LIFECYCLE_FAILED,
+            summary_template="Team Lead failed to complete the code-review request: {error}.",
+            summary_facts={"error": str(exc)[:500]},
+            round=review_round,
+            conditional=review_attempt > 0,
+        )
         print(f"[{_AGENT_ID}] Code review dispatch failed: {exc}")
         payload = {"verdict": "error", "message": str(exc)}
 
@@ -1698,6 +1827,18 @@ async def review_result(state: dict) -> dict:
     else:
         route = "needs_revision"
 
+    review_lifecycle = LIFECYCLE_FAILED if verdict == "error" else LIFECYCLE_DONE
+    _record_timeline_step(
+        state,
+        step_key=review_step_key,
+        title=review_title,
+        lifecycle_state=review_lifecycle,
+        summary_template="Team Lead completed the code-review request with verdict {verdict}.",
+        summary_facts={"verdict": verdict},
+        round=review_round,
+        conditional=review_attempt > 0,
+    )
+
     return {
         "review_result": payload,
         "review_verdict": verdict,
@@ -1722,6 +1863,17 @@ async def request_revision(state: dict) -> dict:
         feedback_lines.append(f"- [{c.get('severity', 'info')}] {c.get('message', '')}")
 
     revision_feedback = "\n".join(feedback_lines) or "Code review rejected. Please fix issues."
+    revision_round = state.get("revision_count", 0)
+    _record_timeline_step(
+        state,
+        step_key="tl.requesting_changes",
+        title="Team Lead requesting changes from Web Dev",
+        lifecycle_state=LIFECYCLE_DONE,
+        summary_template="Team Lead requested implementation changes after code review.",
+        summary_facts={"review_summary": summary[:500] or "Code review rejected."},
+        round=revision_round,
+        conditional=True,
+    )
 
     # Determine review report path for dev agent self-assessment reference
     revision_count = state.get("revision_count", 0)
@@ -1797,6 +1949,12 @@ async def report_success(state: dict) -> dict:
     log = _logger(state)
     log.node("report_success")
     _audit_command(state, "report_success")
+    _record_timeline_step(
+        state,
+        step_key="tl.reported",
+        title="Team Lead reporting to Compass",
+        summary_template="Team Lead is preparing the final delivery report for Compass.",
+    )
     pr_url = state.get("pr_url", "N/A")
     branch = state.get("branch_name", "N/A")
     analysis = state.get("analysis_summary", "")
@@ -1915,6 +2073,15 @@ async def report_success(state: dict) -> dict:
 
     cleanup = await _ack_and_cleanup_dev_agent(state)
 
+    _record_timeline_step(
+        state,
+        step_key="tl.reported",
+        title="Team Lead reporting to Compass",
+        lifecycle_state=LIFECYCLE_DONE,
+        summary_template="Team Lead reported success with review verdict {verdict}.",
+        summary_facts={"verdict": verdict, "pr_url": pr_url},
+    )
+
     return {
         "report_summary": report_summary,
         "success": True,
@@ -1940,6 +2107,14 @@ async def escalate_to_user(state: dict) -> dict:
     # ------------------------------------------------------------------
     resume_value = state.get("_resume_value")
     if resume_value is not None:
+        _record_timeline_step(
+            state,
+            step_key="tl.requesting_user_input",
+            title="Team Lead requesting user input for clarification",
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template="Team Lead received user input and resumed the workflow.",
+            conditional=True,
+        )
         return {
             "revision_feedback": (
                 f"User guidance after escalation: {resume_value}"
@@ -1959,6 +2134,15 @@ async def escalate_to_user(state: dict) -> dict:
 
     revision_count = state.get("revision_count", 0)
     review = state.get("review_result", {})
+    _record_timeline_step(
+        state,
+        step_key="tl.requesting_user_input",
+        title="Team Lead requesting user input for clarification",
+        lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+        summary_template="Team Lead requested user input after {revision_count} revision attempts.",
+        summary_facts={"revision_count": revision_count},
+        conditional=True,
+    )
 
     question = (
         f"Task requires user intervention after {revision_count} revision attempts.\n"
@@ -2269,5 +2453,3 @@ def _extract_context_with_llm(jira_context: dict, runtime) -> dict:
     except Exception as exc:
         print(f"[{_AGENT_ID}] LLM extraction failed ({exc}) — falling back to regex")
         return _extract_urls_from_ticket(jira_context)
-
-

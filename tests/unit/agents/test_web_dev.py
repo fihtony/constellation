@@ -9,6 +9,7 @@ from framework.workflow import START, END
 from agents.web_dev.agent import WebDevAgent, web_dev_workflow, web_dev_definition
 from agents.web_dev.tools import SCMCreatePR, SCMUploadPRImage, register_web_dev_tools
 from agents.web_dev.nodes import (
+    prepare_jira,
     setup_workspace,
     analyze_task,
     implement_changes,
@@ -37,6 +38,12 @@ def _agent_services(runtime=None):
         registry_client=None,
         task_store=InMemoryTaskStore(),
     )
+
+
+def _timeline_task_store(task_id: str = "task-major-steps"):
+    store = InMemoryTaskStore()
+    store.create_task(agent_id="web-dev", task_id=task_id)
+    return store
 
 
 class TestWebDevWorkflowCompile:
@@ -101,6 +108,120 @@ class TestWebDevExecutionContract:
 
         assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
         assert "exceed local profile" in result["task"]["status"]["message"]["parts"][0]["text"]
+
+
+class TestWebDevMajorSteps:
+    async def test_analyze_task_records_drafting_plan_row(self, tmp_path):
+        store = _timeline_task_store()
+        result = await analyze_task(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "workspace_path": str(tmp_path),
+                "analysis": "Implement the task",
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["wd.drafting_plan#0"]
+        assert row["title"] == "Web Dev drafting plan"
+        assert row["lifecycle_state"] == "done"
+        assert result["implementation_plan"]
+
+    async def test_run_tests_no_runtime_records_building_row(self):
+        store = _timeline_task_store()
+        result = await run_tests(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "_runtime": None,
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["wd.building#0"]
+        assert row["title"] == "Web Dev building and testing"
+
+
+class TestWebDevJiraPrivacy:
+    async def test_prepare_jira_redacts_personal_identifiers_in_logs_and_artifacts(self, tmp_path, monkeypatch):
+        boundary_calls = []
+
+        def _boundary(_state, tool_name, payload):
+            boundary_calls.append((tool_name, payload))
+            if tool_name == "jira_get_token_user":
+                return {
+                    "user": {
+                        "emailAddress": "person@example.com",
+                        "accountId": "acct-123456",
+                    }
+                }
+            if tool_name == "jira_list_transitions":
+                return {"transitions": [{"name": "In Progress"}]}
+            return {}
+
+        monkeypatch.setattr("agents.web_dev.nodes._call_boundary_tool", _boundary)
+
+        state = {
+            "_task_id": "task-privacy",
+            "workspace_path": str(tmp_path),
+            "jira_context": {
+                "key": "CSTL-1",
+                "fields": {
+                    "status": {"name": "To Do"},
+                    "assignee": {"emailAddress": "owner@example.com"},
+                },
+            },
+        }
+
+        result = await prepare_jira(state)
+
+        comment_payload = next(payload for name, payload in boundary_calls if name == "jira_comment")
+        assert "person@example.com" not in comment_payload["comment"]
+        assert "owner@example.com" not in comment_payload["comment"]
+        assert "Assignee: token user" in comment_payload["comment"]
+
+        log_payload = json.loads((tmp_path / "web-dev" / "jira-prepare-log.json").read_text(encoding="utf-8"))
+        data = log_payload["data"]
+        assert data["jira_original_assignee"] == "redacted"
+        assert data["jira_original_assignee_present"] is True
+        assert data["jira_token_user"] == "redacted"
+        assert data["jira_token_user_present"] is True
+
+        assert result["jira_original_assignee"] == "redacted"
+        assert result["jira_token_user"] == "redacted"
+
+    async def test_self_assess_no_runtime_records_self_check_row(self):
+        store = _timeline_task_store()
+        result = await self_assess(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "_runtime": None,
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["wd.self_check#0"]
+        assert row["title"] == "Web Dev running self-check"
+        assert row["lifecycle_state"] == "done"
+        assert result["route"] == "pass"
+
+    async def test_report_result_records_handover_row(self):
+        store = _timeline_task_store()
+        result = await report_result(
+            {
+                "_task_id": "task-major-steps",
+                "_task_store": store,
+                "pr_url": "https://example.com/pull/42",
+                "branch_name": "feature/cstl-1",
+                "changes_made": ["app.py"],
+                "test_status": "pass",
+                "pr_title": "Implement feature",
+            }
+        )
+
+        row = store.get_task("task-major-steps").metadata["major_step_rows"]["wd.handover#0"]
+        assert row["title"] == "Web Dev handing over to Team Lead"
+        assert row["lifecycle_state"] == "done"
+        assert result["success"] is True
 
 
 class TestSafeJson:
@@ -1056,4 +1177,3 @@ class TestWebDevBoundaryTools:
         assert dispatched["metadata"]["repo"] == "repo"
         assert dispatched["metadata"]["imagePath"] == str(image_file)
         assert dispatched["metadata"]["task_id"] == "task-123"
-

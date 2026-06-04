@@ -327,6 +327,30 @@ def test_office_task_workspace_live_container(
     compass_final = _poll_task(COMPASS_BASE_URL, compass_task_id)
     assert _task_state(compass_final) == "TASK_STATE_COMPLETED", f"[{test_id}] compass failed: {compass_final}"
 
+    # Fetch the full task payload via the /api endpoint which exposes the
+    # v0.8 timeline fields. The legacy /tasks/{id} endpoint returns only
+    # the raw A2A shape (id, status, artifacts, metadata).
+    detail_payload = _http_get(f"{COMPASS_BASE_URL}/api/tasks/{compass_task_id}")
+    compass_task_payload = detail_payload.get("task", detail_payload)
+
+    # v0.8 timeline redesign: the new structured timeline fields are present
+    # alongside the legacy ``currentMajorStep`` / ``progressSteps``. The
+    # closing row should be ``compass.task_completed#0`` and the office steps
+    # should appear in ``majorStepRows``.
+    assert compass_task_payload.get("majorStepRows"), f"[{test_id}] majorStepRows is empty"
+    assert compass_task_payload.get("terminalStepInstanceKey") == "compass.task_completed#0", (
+        f"[{test_id}] expected terminalStepInstanceKey=compass.task_completed#0, got "
+        f"{compass_task_payload.get('terminalStepInstanceKey')!r}"
+    )
+    # Both Compass and Office-prefix step keys should appear.
+    step_keys = set((compass_task_payload.get("majorStepRows") or {}).keys())
+    assert any(k.startswith("compass.") for k in step_keys), (
+        f"[{test_id}] no compass.* step keys in majorStepRows: {sorted(step_keys)}"
+    )
+    assert any(k.startswith("office.") for k in step_keys), (
+        f"[{test_id}] no office.* step keys in majorStepRows: {sorted(step_keys)}"
+    )
+
     office_base = ARTIFACTS_ROOT / compass_task_id / "office"
     office_workspace = office_base / "artifacts"
     task_report_path = office_base / "task-report.json"

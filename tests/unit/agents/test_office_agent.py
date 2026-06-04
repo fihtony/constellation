@@ -5,6 +5,7 @@ import os
 import tempfile
 import json
 from unittest.mock import MagicMock
+from pathlib import Path
 
 from framework.agent import AgentServices
 from framework.task_store import InMemoryTaskStore
@@ -22,6 +23,26 @@ def _agent_services(runtime=None):
         registry_client=None,
         task_store=InMemoryTaskStore(),
     )
+
+
+class _RuntimeStub:
+    def __init__(self, *, single_shot_response: str = ""):
+        self.single_shot_response = single_shot_response or "# Summary\n\nEnglish summary.\n"
+        self.run_calls: list[dict] = []
+        self.run_agentic_calls: list[dict] = []
+
+    def run(self, prompt: str, **kwargs):
+        self.run_calls.append({"prompt": prompt, **kwargs})
+        return {
+            "summary": self.single_shot_response[:500],
+            "raw_response": self.single_shot_response,
+            "warnings": [],
+            "artifacts": [],
+        }
+
+    def run_agentic(self, *args, **kwargs):
+        self.run_agentic_calls.append({"args": args, "kwargs": kwargs})
+        raise AssertionError("run_agentic should not be called for bounded folder workflows")
 
 
 def test_office_agent_class_exists():
@@ -146,6 +167,34 @@ def test_analyze_request_validates_paths():
         del os.environ["ARTIFACT_ROOT"]
 
 
+def test_analyze_request_rejects_inplace_when_policy_disallows():
+    """Unsupported inplace mode must fail closed instead of silently falling back."""
+    from agents.office.nodes import analyze_request
+
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["OFFICE_SOURCE_ROOT"] = tmp
+        os.environ["ARTIFACT_ROOT"] = tmp
+        os.environ.pop("OFFICE_ALLOW_INPLACE_WRITES", None)
+
+        test_file = os.path.join(tmp, "test.txt")
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("hello world")
+
+        state = {
+            "_task_id": "task-test123",
+            "_compass_task_id": "compass-test",
+            "source_paths": [test_file],
+            "capability": "summarize",
+            "output_mode": "inplace",
+        }
+        result = analyze_request(state)
+        assert "error" in result
+        assert "workspace output" in result["error"].lower()
+
+        del os.environ["OFFICE_SOURCE_ROOT"]
+        del os.environ["ARTIFACT_ROOT"]
+
+
 def test_report_result_writes_evidence():
     """Test report_result writes task-report.json."""
     from agents.office.nodes import report_result
@@ -220,6 +269,98 @@ def test_execute_office_work_handles_organize_error_if_no_runtime():
     result = execute_office_work(state)
     # execute_office_work with no runtime should return an error
     assert "error" in result, f"execute_office_work with no runtime should return error, got: {result}"
+
+
+def test_execute_office_work_summarize_folder_uses_bounded_single_shot_runtime(tmp_path):
+    """Folder summarize should avoid long agentic loops and write bounded outputs."""
+    from agents.office.nodes import execute_office_work
+
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    first = source_root / "first.txt"
+    second = source_root / "second.txt"
+    first.write_text("First document content.", encoding="utf-8")
+    second.write_text("Second document content.", encoding="utf-8")
+
+    workspace_root = tmp_path / "workspace"
+    artifacts_dir = workspace_root / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+
+    runtime = _RuntimeStub(single_shot_response="# Summary\n\nEnglish-only summary.\n")
+    old_source_root = os.environ.get("OFFICE_SOURCE_ROOT")
+    try:
+        os.environ["OFFICE_SOURCE_ROOT"] = str(source_root)
+        state = {
+            "_runtime": runtime,
+            "capability": "summarize",
+            "validated_paths": [str(first), str(second)],
+            "artifacts_dir": str(artifacts_dir),
+            "workspace_root": str(workspace_root),
+            "output_mode": "workspace",
+            "_plugin_manager": None,
+        }
+        result = execute_office_work(state)
+    finally:
+        if old_source_root is None:
+            os.environ.pop("OFFICE_SOURCE_ROOT", None)
+        else:
+            os.environ["OFFICE_SOURCE_ROOT"] = old_source_root
+
+    assert result["success"] is True
+    assert len(runtime.run_calls) == 2
+    assert runtime.run_agentic_calls == []
+    assert (artifacts_dir / f"{first.name}.summary.md").exists()
+    assert (artifacts_dir / f"{second.name}.summary.md").exists()
+    combined = artifacts_dir / "combined-summary.md"
+    assert combined.exists()
+    combined_text = combined.read_text(encoding="utf-8")
+    assert first.name in combined_text
+    assert second.name in combined_text
+
+
+def test_execute_office_work_organize_folder_uses_bounded_materialization_flow(tmp_path):
+    """Folder organize should materialize outputs without an open-ended agentic loop."""
+    from agents.office.nodes import execute_office_work
+
+    source_root = tmp_path / "source"
+    nested = source_root / "docs"
+    nested.mkdir(parents=True)
+    (nested / "alpha.txt").write_text("Alpha content", encoding="utf-8")
+    (nested / "beta.txt").write_text("Beta content", encoding="utf-8")
+
+    workspace_root = tmp_path / "workspace"
+    artifacts_dir = workspace_root / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+
+    runtime = _RuntimeStub()
+    old_source_root = os.environ.get("OFFICE_SOURCE_ROOT")
+    try:
+        os.environ["OFFICE_SOURCE_ROOT"] = str(source_root)
+        state = {
+            "_runtime": runtime,
+            "capability": "organize",
+            "validated_paths": [str(source_root)],
+            "artifacts_dir": str(artifacts_dir),
+            "workspace_root": str(workspace_root),
+            "output_mode": "workspace",
+            "_plugin_manager": None,
+        }
+        result = execute_office_work(state)
+    finally:
+        if old_source_root is None:
+            os.environ.pop("OFFICE_SOURCE_ROOT", None)
+        else:
+            os.environ["OFFICE_SOURCE_ROOT"] = old_source_root
+
+    organized_root = artifacts_dir / "organized-output" / "files"
+    organized_files = sorted(path for path in organized_root.rglob("*") if path.is_file())
+
+    assert result["success"] is True
+    assert runtime.run_calls == []
+    assert runtime.run_agentic_calls == []
+    assert (artifacts_dir / "organization-plan.md").exists()
+    assert organized_root.is_dir()
+    assert len(organized_files) == 2
 
 
 def test_report_result_writes_warnings_md(tmp_path):

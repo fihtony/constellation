@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+from urllib.parse import urlsplit, urlunsplit
 
 from pathlib import Path as _Path
 
@@ -23,6 +24,30 @@ _AGENT_ID: str = _load_agent_cfg(
 
 def _log(task_id: str) -> AgentLogger:
     return AgentLogger(task_id=task_id, agent_name=_AGENT_ID)
+
+
+def _sanitize_download_url(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return ""
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def _sanitize_stitch_payload(value):
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            if str(key).lower() in {"downloadurl", "download_url"} and isinstance(item, str):
+                sanitized[key] = _sanitize_download_url(item)
+            else:
+                sanitized[key] = _sanitize_stitch_payload(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_stitch_payload(item) for item in value]
+    return value
 
 
 def _get_adapter():
@@ -384,7 +409,11 @@ def _save_stitch_files(
             req = _Req(html_download_url, headers={"User-Agent": "constellation-ui-design/1.0"})
             with _urlopen(req, timeout=30) as resp:
                 html_content = resp.read().decode("utf-8", errors="replace")
-            log.info("stitch HTML downloaded", chars=len(html_content), url=html_download_url[:80])
+            log.info(
+                "stitch HTML downloaded",
+                chars=len(html_content),
+                download_host=urlsplit(html_download_url).netloc,
+            )
         except Exception as exc:
             log.warn("stitch HTML download failed", error=str(exc))
 
@@ -403,7 +432,11 @@ def _save_stitch_files(
             req = _Req(screenshot_url, headers={"User-Agent": "constellation-ui-design/1.0"})
             with _urlopen(req, timeout=30) as resp:
                 screenshot_bytes = resp.read()
-            log.info("stitch screenshot downloaded", bytes=len(screenshot_bytes), url=screenshot_url[:80])
+            log.info(
+                "stitch screenshot downloaded",
+                bytes=len(screenshot_bytes),
+                download_host=urlsplit(screenshot_url).netloc,
+            )
         except Exception as exc:
             log.warn("stitch screenshot download failed", error=str(exc))
 
@@ -433,9 +466,9 @@ def _save_stitch_files(
                 "metadata": {"agent_id": _AGENT_ID, "step": "fetch_design",
                              "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                              "project_id": project_id, "screen_id": screen_id},
-                "screen": screen_result,
-                "project": project_result,
-                "screen_meta": screen_meta,
+                "screen": _sanitize_stitch_payload(screen_result),
+                "project": _sanitize_stitch_payload(project_result),
+                "screen_meta": _sanitize_stitch_payload(screen_meta),
             }, fh, ensure_ascii=False, indent=2)
         files.append(f"ui-design/stitch/screen-meta.json")
     except OSError as exc:

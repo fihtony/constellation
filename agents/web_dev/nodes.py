@@ -21,6 +21,14 @@ from typing import Any
 
 from framework.config import load_agent_config as _load_agent_cfg
 from framework.devlog import AgentLogger
+from framework.major_step import (
+    LIFECYCLE_DONE,
+    LIFECYCLE_FAILED,
+    LIFECYCLE_RUNNING,
+    LIFECYCLE_WAITING_FOR_USER,
+    LIFECYCLE_WARNING,
+    record_major_step,
+)
 
 # Load agent_id from config.yaml — single source of truth for identity
 _AGENT_ID: str = _load_agent_cfg(
@@ -31,6 +39,39 @@ _AGENT_ID: str = _load_agent_cfg(
 def _logger(state: dict) -> AgentLogger:
     """Return an AgentLogger for this agent using the task_id stored in state."""
     return AgentLogger(state.get("_task_id", ""), _AGENT_ID)
+
+
+def _record_timeline_step(
+    state: dict,
+    *,
+    step_key: str,
+    title: str,
+    lifecycle_state: str = LIFECYCLE_RUNNING,
+    summary_template: str = "",
+    summary_facts: dict | None = None,
+    round: int = 0,
+    conditional: bool = False,
+) -> None:
+    task_id = state.get("_compass_task_id") or state.get("_task_id") or state.get("task_id") or ""
+    if not task_id:
+        return
+    try:
+        record_major_step(
+            task_id,
+            step_key=step_key,
+            title=title,
+            agent="web-dev",
+            lifecycle_state=lifecycle_state,
+            summary_template=summary_template,
+            summary_facts=summary_facts,
+            round=round,
+            conditional=conditional,
+            orchestrator_task_id=state.get("_compass_task_id") or task_id,
+            progress_sink=state.get("_major_step_progress_sink"),
+            task_store=state.get("_task_store"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _logger(state).debug("major-step write skipped", step_key=step_key, error=str(exc))
 
 
 def _boundary_log(state: dict, agent_id: str, message: str, **kwargs: Any) -> None:
@@ -153,6 +194,10 @@ def _tail_text(text: str, limit: int = 600) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[-limit:]
+
+
+def _redact_personal_value(value: str) -> str:
+    return "redacted" if str(value or "").strip() else ""
 
 
 _NON_ACTIONABLE_REVIEW_CATEGORIES = {"review-process", "large-change"}
@@ -541,8 +586,11 @@ async def prepare_jira(state: dict) -> dict:
 
     # Update assignee to token user (use accountId for Jira Cloud)
     if token_user_account_id:
-        log.info("assigning jira ticket to token user in prepare", jira_key=jira_key,
-                 account_id=token_user_account_id)
+        log.info(
+            "assigning jira ticket to token user in prepare",
+            jira_key=jira_key,
+            account_id_present=True,
+        )
         _call_boundary_tool(
             state, "jira_update",
             {"ticket_key": jira_key,
@@ -566,13 +614,17 @@ async def prepare_jira(state: dict) -> dict:
             "comment": (
                 f"🤖 Development agent (web-dev) has picked up this ticket.\n"
                 f"Task ID: {_task_id}\n"
-                f"Assignee: {token_user or 'unknown'}\n"
+                f"Assignee: {'token user' if token_user else 'unassigned'}\n"
                 f"Status: In Progress"
             ),
             "task_id": task_id,
         },
     )
-    log.info("prepare_jira complete", jira_key=jira_key, token_user=token_user)
+    log.info(
+        "prepare_jira complete",
+        jira_key=jira_key,
+        token_user_present=bool(token_user),
+    )
 
     # Write jira-prepare-log.json
     workspace_path = state.get("workspace_path", "")
@@ -592,8 +644,10 @@ async def prepare_jira(state: dict) -> dict:
                     "data": {
                         "jira_key": jira_key,
                         "jira_original_status": original_status,
-                        "jira_original_assignee": original_assignee,
-                        "jira_token_user": token_user,
+                        "jira_original_assignee": _redact_personal_value(original_assignee),
+                        "jira_original_assignee_present": bool(original_assignee),
+                        "jira_token_user": _redact_personal_value(token_user),
+                        "jira_token_user_present": bool(token_user),
                         "jira_prepared": True,
                     },
                 }, fh, ensure_ascii=False, indent=2)
@@ -603,8 +657,10 @@ async def prepare_jira(state: dict) -> dict:
     return {
         "jira_prepared": True,
         "jira_original_status": original_status,
-        "jira_original_assignee": original_assignee,
-        "jira_token_user": token_user,
+        "jira_original_assignee": _redact_personal_value(original_assignee),
+        "jira_original_assignee_present": bool(original_assignee),
+        "jira_token_user": _redact_personal_value(token_user),
+        "jira_token_user_present": bool(token_user),
     }
 
 async def setup_workspace(state: dict) -> dict:
@@ -824,6 +880,12 @@ async def analyze_task(state: dict) -> dict:
     import time as _time
     log = _logger(state)
     log.node("analyze_task")
+    _record_timeline_step(
+        state,
+        step_key="wd.drafting_plan",
+        title="Web Dev drafting plan",
+        summary_template="Web Dev is drafting the implementation plan.",
+    )
     print(f"[{_AGENT_ID}] analyze_task: building implementation plan")
 
     workspace_path = state.get("workspace_path", "")
@@ -909,6 +971,15 @@ async def analyze_task(state: dict) -> dict:
         except OSError:
             pass
 
+    _record_timeline_step(
+        state,
+        step_key="wd.drafting_plan",
+        title="Web Dev drafting plan",
+        lifecycle_state=LIFECYCLE_DONE,
+        summary_template="Web Dev drafted the implementation plan with {step_count} implementation steps.",
+        summary_facts={"step_count": len(structured_plan.get("implementation_steps", []))},
+    )
+
     return {
         "implementation_plan": plan,
         "implementation_plan_details": structured_plan,
@@ -919,10 +990,32 @@ async def implement_changes(state: dict) -> dict:
     """Write code based on the implementation plan."""
     runtime = state.get("_runtime")
     log = _logger(state)
+    revision_round = int(state.get("revision_round", 0) or 0)
+    revision_mode = bool(state.get("revision_mode") or state.get("revision_feedback"))
+    step_round = max(revision_round - 1, 0) if revision_mode else 0
+    step_key = "wd.addressing_feedback" if revision_mode else "wd.implementing"
+    title = "Web Dev addressing review feedback" if revision_mode else "Web Dev implementing changes"
     log.node("implement_changes", repo_path=state.get("repo_path", ""),
              branch=state.get("branch_name", ""))
+    _record_timeline_step(
+        state,
+        step_key=step_key,
+        title=title,
+        summary_template="Web Dev is updating the codebase for the assigned task.",
+        round=step_round,
+        conditional=revision_mode,
+    )
     if not runtime:
         # Unit-test / no-runtime path
+        _record_timeline_step(
+            state,
+            step_key=step_key,
+            title=title,
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template="Web Dev completed the implementation step in test mode.",
+            round=step_round,
+            conditional=revision_mode,
+        )
         return {
             "changes_made": [],
             "implementation_summary": "Changes implemented (no runtime — test mode).",
@@ -1102,6 +1195,17 @@ async def implement_changes(state: dict) -> dict:
     elif not gate_result.passed:
         log.warn("validate_files_changed gate inconclusive", feedback=gate_result.feedback)
 
+    _record_timeline_step(
+        state,
+        step_key=step_key,
+        title=title,
+        lifecycle_state=LIFECYCLE_DONE,
+        summary_template="Web Dev completed implementation changes on branch {branch}.",
+        summary_facts={"branch": branch_name or "unspecified"},
+        round=step_round,
+        conditional=revision_mode,
+    )
+
     return {
         "changes_made": [],
         "implementation_summary": impl_summary,
@@ -1116,6 +1220,18 @@ async def run_tests(state: dict) -> dict:
     runtime = state.get("_runtime")
     test_cycles = state.get("test_cycles", 0) + 1
     build_cycles = state.get("build_cycles", 0)
+    rebuild_mode = bool(state.get("fix_gaps_attempted"))
+    step_key = "wd.rebuilding" if rebuild_mode else "wd.building"
+    title = "Web Dev rebuilding and retesting" if rebuild_mode else "Web Dev building and testing"
+    step_round = max(test_cycles - 1, 0)
+    _record_timeline_step(
+        state,
+        step_key=step_key,
+        title=title,
+        summary_template="Web Dev is running the deterministic build and test validation.",
+        round=step_round,
+        conditional=rebuild_mode,
+    )
     max_test_cycles = state.get("max_test_cycles") or int(
         os.environ.get("WEB_DEV_MAX_TEST_CYCLES", "3")
     )
@@ -1124,6 +1240,15 @@ async def run_tests(state: dict) -> dict:
 
     if not runtime:
         log.info("run_tests skipped — no runtime (test mode)")
+        _record_timeline_step(
+            state,
+            step_key=step_key,
+            title=title,
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template="Web Dev completed build and test validation in test mode.",
+            round=step_round,
+            conditional=rebuild_mode,
+        )
         return {
             "test_results": {"passed": 1, "failed": 0, "output": ""},
             "test_cycles": test_cycles,
@@ -1186,6 +1311,16 @@ async def run_tests(state: dict) -> dict:
             pass
 
     if test_passed:
+        _record_timeline_step(
+            state,
+            step_key=step_key,
+            title=title,
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template="Web Dev completed build/test validation with {failed} failing checks.",
+            summary_facts={"failed": int(failed)},
+            round=step_round,
+            conditional=rebuild_mode,
+        )
         return {
             "test_results": data,
             "test_output": data.get("output", ""),
@@ -1197,6 +1332,16 @@ async def run_tests(state: dict) -> dict:
 
     if test_cycles >= max_test_cycles:
         print(f"[{_AGENT_ID}] run_tests: max cycles reached ({test_cycles}/{max_test_cycles}); failing task")
+        _record_timeline_step(
+            state,
+            step_key=step_key,
+            title=title,
+            lifecycle_state=LIFECYCLE_FAILED,
+            summary_template="Web Dev exhausted build/test retries after {test_cycles} cycles.",
+            summary_facts={"test_cycles": test_cycles},
+            round=step_round,
+            conditional=rebuild_mode,
+        )
         raise RuntimeError(
             "Mandatory validation failed after max cycles; Web Dev cannot proceed to self-assessment or PR"
         )
@@ -1261,10 +1406,31 @@ async def self_assess(state: dict) -> dict:
     log.node("self_assess")
     runtime = state.get("_runtime")
     assess_cycles = state.get("assess_cycles", 0) + 1
+    retry_mode = bool(state.get("fix_gaps_attempted") or assess_cycles > 1)
+    step_key = "wd.self_check_retry" if retry_mode else "wd.self_check"
+    title = "Web Dev rerunning self-check" if retry_mode else "Web Dev running self-check"
+    step_round = max(assess_cycles - 2, 0) if retry_mode else 0
     max_assess_cycles = 3
     log.info("self_assess started", cycle=assess_cycles, max_cycles=max_assess_cycles)
+    _record_timeline_step(
+        state,
+        step_key=step_key,
+        title=title,
+        summary_template="Web Dev is verifying the implementation against requirements.",
+        round=step_round,
+        conditional=retry_mode,
+    )
 
     if not runtime:
+        _record_timeline_step(
+            state,
+            step_key=step_key,
+            title=title,
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template="Web Dev completed the self-check in test mode.",
+            round=step_round,
+            conditional=retry_mode,
+        )
         return {
             "self_assessment": {
                 "score": 0.95,
@@ -1542,6 +1708,16 @@ Return valid JSON only, and correct this validation feedback:
     elif assess_cycles >= max_assess_cycles:
         failure_summary = "; ".join(str(gap) for gap in gaps[:4]) or str(data.get("summary", "self-assessment failed"))
         log.warn("self_assess exhausted retries", cycle=assess_cycles, failure_summary=failure_summary[:400])
+        _record_timeline_step(
+            state,
+            step_key=step_key,
+            title=title,
+            lifecycle_state=LIFECYCLE_FAILED,
+            summary_template="Web Dev self-check exhausted retries with verdict {verdict}.",
+            summary_facts={"verdict": verdict},
+            round=step_round,
+            conditional=retry_mode,
+        )
         raise RuntimeError(f"self_assess failed after {max_assess_cycles} cycles: {failure_summary[:400]}")
     else:
         route = "fail"
@@ -1558,12 +1734,36 @@ Return valid JSON only, and correct this validation feedback:
         log.warn("self_assess gaps", gaps=gaps[:10], summary=str(data.get("summary", ""))[:300])
 
     if route == "pass":
+        _record_timeline_step(
+            state,
+            step_key=step_key,
+            title=title,
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template="Web Dev completed the self-check with verdict {verdict}.",
+            summary_facts={"verdict": verdict},
+            round=step_round,
+            conditional=retry_mode,
+        )
         return {
             "self_assessment": data,
             "assess_cycles": assess_cycles,
             "route": "pass",
         }
 
+    # Per design doc §13.1 A5 / §0.5: an intermediate self-check that fails
+    # but the task will retry must use the warn visual (LIFECYCLE_WARNING)
+    # rather than done or failed. The failed visual is reserved for the
+    # final ``compass.task_failed#0`` terminal row.
+    _record_timeline_step(
+        state,
+        step_key=step_key,
+        title=title,
+        lifecycle_state=LIFECYCLE_WARNING,
+        summary_template="Web Dev self-check found remaining gaps with verdict {verdict}.",
+        summary_facts={"verdict": verdict, "gap_count": len(gaps)},
+        round=step_round,
+        conditional=retry_mode,
+    )
     return {
         "self_assessment": data,
         "assess_cycles": assess_cycles,
@@ -1576,9 +1776,27 @@ async def fix_gaps(state: dict) -> dict:
     log = _logger(state)
     log.node("fix_gaps")
     runtime = state.get("_runtime")
+    gap_round = max(int(state.get("assess_cycles", 0) or 0) - 1, 0)
+    _record_timeline_step(
+        state,
+        step_key="wd.fixing_gaps",
+        title="Web Dev fixing self-check gaps",
+        summary_template="Web Dev is addressing the gaps found during self-check.",
+        round=gap_round,
+        conditional=True,
+    )
 
     if not runtime:
         log.info("fix_gaps skipped — no runtime")
+        _record_timeline_step(
+            state,
+            step_key="wd.fixing_gaps",
+            title="Web Dev fixing self-check gaps",
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template="Web Dev completed the self-check gap fix in test mode.",
+            round=gap_round,
+            conditional=True,
+        )
         return {"fix_gaps_attempted": True}
 
     from agents.web_dev.prompts import FIX_GAPS_SYSTEM, FIX_GAPS_TEMPLATE
@@ -1603,6 +1821,16 @@ async def fix_gaps(state: dict) -> dict:
         plugin_manager=state.get("_plugin_manager"),
     )
     log.info("fix_gaps result", success=result.success, summary=result.summary[:300])
+    _record_timeline_step(
+        state,
+        step_key="wd.fixing_gaps",
+        title="Web Dev fixing self-check gaps",
+        lifecycle_state=LIFECYCLE_DONE if result.success else LIFECYCLE_FAILED,
+        summary_template="Web Dev completed the self-check gap fix with success={success}.",
+        summary_facts={"success": bool(result.success)},
+        round=gap_round,
+        conditional=True,
+    )
 
     return {
         "fix_gaps_attempted": True,
@@ -2160,7 +2388,11 @@ async def update_jira(state: dict) -> dict:
         user = user_result.get("user", {})
         account_id = user.get("accountId", "") or user.get("account_id", "")
         if account_id:
-            log.info("assigning jira ticket to token user", jira_key=jira_key, account_id=account_id)
+            log.info(
+                "assigning jira ticket to token user",
+                jira_key=jira_key,
+                account_id_present=True,
+            )
             _call_boundary_tool(
                 state, "jira_update",
                 {
@@ -2171,7 +2403,7 @@ async def update_jira(state: dict) -> dict:
             )
             log.info("jira assignee updated", jira_key=jira_key)
         else:
-            log.warn("jira_get_token_user returned no accountId", user=user)
+            log.warn("jira_get_token_user returned no accountId", user_present=bool(user))
     except Exception as exc:
         log.warn("jira assignee update skipped", error=str(exc))
 
@@ -2758,6 +2990,19 @@ async def report_result(state: dict) -> dict:
     """Return final result summary."""
     log = _logger(state)
     log.node("report_result")
+    revision_mode = bool(state.get("revision_mode") or state.get("revision_feedback"))
+    step_key = "wd.handover_retry" if revision_mode else "wd.handover"
+    title = "Web Dev handing over revised result" if revision_mode else "Web Dev handing over to Team Lead"
+    revision_round = int(state.get("revision_round", 0) or 0)
+    handover_round = max(revision_round - 1, 0) if revision_mode else 0
+    _record_timeline_step(
+        state,
+        step_key=step_key,
+        title=title,
+        summary_template="Web Dev is preparing the delivery package for Team Lead.",
+        round=handover_round,
+        conditional=revision_mode,
+    )
     pr_url = state.get("pr_url", "N/A")
     branch_name = state.get("branch_name", "N/A")
     changes = state.get("changes_made", [])
@@ -2776,6 +3021,17 @@ async def report_result(state: dict) -> dict:
         summary_parts.append(f"PR: {pr_title}.")
     if pr_url and pr_url != "N/A":
         summary_parts.append(f"URL: {pr_url}")
+
+    _record_timeline_step(
+        state,
+        step_key=step_key,
+        title=title,
+        lifecycle_state=LIFECYCLE_DONE,
+        summary_template="Web Dev handed over the implementation with test status {test_status}.",
+        summary_facts={"test_status": test_status},
+        round=handover_round,
+        conditional=revision_mode,
+    )
 
     return {
         "success": True,
@@ -2803,6 +3059,14 @@ async def pause_for_user_input(state: dict) -> dict:
     """
     resume_value = state.get("_resume_value")
     if resume_value is not None:
+        _record_timeline_step(
+            state,
+            step_key="wd.requesting_user_input",
+            title="Web Dev requesting user input",
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template="Web Dev received user guidance and resumed the workflow.",
+            conditional=True,
+        )
         return {
             "revision_feedback": f"User guidance after self-assessment escalation: {resume_value}",
             "assess_cycles": 0,  # reset so the loop can run again
@@ -2814,6 +3078,14 @@ async def pause_for_user_input(state: dict) -> dict:
     assessment = state.get("self_assessment", {})
     gaps = assessment.get("gaps", [])
     gap_text = "\n".join(f"- {g}" for g in gaps[:10]) if gaps else "No specific gaps."
+    _record_timeline_step(
+        state,
+        step_key="wd.requesting_user_input",
+        title="Web Dev requesting user input",
+        lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+        summary_template="Web Dev requested user input after unresolved self-check gaps.",
+        conditional=True,
+    )
 
     interrupt(
         f"Self-assessment could not resolve all gaps after maximum retries.\n"
@@ -2825,4 +3097,3 @@ async def pause_for_user_input(state: dict) -> dict:
 
     # unreachable — interrupt() raises InterruptSignal
     return {}
-

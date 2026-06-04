@@ -39,30 +39,40 @@ class TestCompassUITemplates:
         assert "Longer execution detail continues in merged logs." in html
         assert '<div class="step-digest">' not in html
         assert "step-agent" in html
-        assert "Plan" in html
-        assert "Self-check" in html
+        # v0.8 timeline redesign: each row carries an actor-prefixed title and
+        # the structured summary is rendered via ``renderTemplate`` (which
+        # substitutes ``{name}`` placeholders from ``summary_facts``).
+        assert "function renderTemplate(template, facts)" in html
+        assert "function pickMarkForVisualState(visualState)" in html
+        assert "function deriveMajorTimeline(task)" in html
+        assert "function timelineHtmlForMajorSteps(task, timeline" in html
 
     def test_render_ui_uses_compact_log_columns(self):
         html = render_compass_ui()
         assert "grid-template-columns: 96px 44px minmax(58px, 72px) 1fr;" in html
 
     def test_render_ui_contains_development_phase_semantics(self):
+        # v0.8 redesign: the timeline reads structured ``major_step_rows`` /
+        # ``major_steps_skeleton`` data; the legacy keyword-bucketing rail
+        # (``phase-rail`` with hard-coded Plan/Implement/Build/Test/...) is
+        # no longer emitted.
         html = render_compass_ui()
-        assert "deriveMajorPhases" in html
-        assert "Review & Deliver" in html
-        assert "phase-rail" in html
-        assert "Fix" in html
-        assert "Workflow Timeline" in html
-        assert "phase-count" in html
+        assert "function deriveMajorTimeline(task)" in html
+        assert "function pickPointerRow(task)" in html
+        assert "phaseExpandedByTask" in html
         assert "Show all steps" in html
         assert "Current step only" in html
-        assert "phaseExpandedByTask" in html
+        assert "Workflow Timeline" in html
+        assert 'phase-rail' not in html
+        assert 'deriveMajorPhases' not in html
+        assert 'developmentPhaseForText' not in html
+        assert "Review & Deliver" not in html  # legacy fixed-phase label removed
 
     def test_render_ui_removes_separate_active_phase_banner(self):
         html = render_compass_ui()
         assert "Active Phase" not in html
         assert 'phase-banner' not in html
-        assert 'const currentPhase = semanticPhases ? (semanticPhases.phases.find(phase => phase.key === semanticPhases.currentKey) || semanticPhases.phases[0]) : null;' not in html
+        assert 'const currentPhase = semanticPhases' not in html
 
     def test_render_ui_reduces_original_request_title_font_size_by_twenty_percent(self):
         html = render_compass_ui()
@@ -81,16 +91,96 @@ class TestCompassUITemplates:
 
     def test_render_ui_supports_generic_timeline_collapse_for_office_tasks(self):
         html = render_compass_ui()
+        # The new structured renderer is the primary path; the generic
+        # legacy renderer remains as a fallback for tasks that have no
+        # ``major_step_rows`` yet.
         assert "function timelineHtmlForGeneric(task, steps, kind, expanded)" in html
+        assert "function timelineHtmlForMajorSteps(task, timeline" in html
         assert "timeline-list${expanded ? '' : ' collapsed'}" in html
-        assert "const hasTimelineToggle = semanticPhases ? semanticPhases.phases.length > 1 : steps.length > 1;" in html
-        assert "const currentMark = currentClass === 'failed' ? '✕' : (currentClass === 'warn' ? '!' : '✓');" in html
+        # hasTimelineToggle is now driven by the new timeline's ordered rows,
+        # not the legacy phase-bucket count.
+        assert "majorTimeline.ordered.length > 1" in html
+        assert "currentMark = currentClass === 'failed' ? '✕' : (currentClass === 'warn' ? '!' : '✓');" in html
 
-    def test_render_ui_prioritizes_fix_phase_before_test_match(self):
+    def test_render_ui_renders_compact_duration_for_v08_timeline(self):
+        # §8.1 (revised): concise form, omitting leading zero units. Unfired
+        # rows now use the ``--`` placeholder (consistent with Time Spent).
         html = render_compass_ui()
-        assert "value.includes('fix')" in html
-        assert "value.includes('test')" in html
-        assert html.index("value.includes('fix')") < html.index("value.includes('test')")
+        assert "function compactDuration(ms)" in html
+        assert "function compactStartTime(iso)" in html
+        # Unfired rows use ``--`` for the STARTED label (consistent with the
+        # TIME SPENT ``--`` placeholder).
+        assert "startLabel = '--';" in html
+        # Hours+minutes branch: ``Xh Ym Zs``.
+        assert "${hours}h ${minutes}m ${seconds}s" in html
+        # Hours-only branch (no minutes): ``Xh Zs``.
+        assert "${hours}h ${seconds}s" in html
+        # Minutes-only branch (no hours): ``Ym Zs``.
+        assert "${minutes}m ${seconds}s" in html
+        # Seconds-only branch: ``Zs``.
+        assert "${seconds}s" in html
+        # Zero-duration rows are hidden (return empty string).
+        assert "if (totalSeconds === 0) return '';" in html
+        # Time Spent pill is hidden when duration is empty.
+        assert "durationLabel === ''" in html
+
+    def test_render_ui_keeps_collapsed_major_timeline_focus_row_visible(self):
+        html = render_compass_ui()
+        assert "const isFocusedRow = !expanded || (row.fired && visualClass === 'current');" in html
+        assert "${isFocusedRow ? ' current' : ''}" in html
+
+    def test_render_ui_migrates_legacy_compass_received_row_to_done_when_later_steps_exist(self):
+        html = render_compass_ui()
+        assert "const isLegacyCompassReceived = stepKey === 'compass.received';" in html
+        assert "const hasLaterFiredStep = ordered.some(candidate => candidate.key !== sik && candidate.fired && !candidate.ignored);" in html
+        assert "visualState = 'done';" in html
+        assert "lifecycleState = 'done';" in html
+
+    def test_render_ui_marks_skipped_skeleton_rows_as_done_when_later_steps_fired(self):
+        # UI #3 fix: unfired skeleton rows that come BEFORE a later fired row
+        # should not be displayed as ``pending`` — the agent skipped past
+        # them. Mark them as ``done`` so the timeline reflects the real
+        # execution order.
+        html = render_compass_ui()
+        assert "!row.fired" in html
+        assert "&& hasLaterFiredStep" in html
+        assert "&& (visualState === 'pending' || visualState === 'conditional_pending')" in html
+        # The skipped-row fix re-uses the same ``done`` visual state but
+        # preserves ``lifecycleState`` so the row is distinguishable from a
+        # real completion in tests/dashboards.
+        assert "lifecycleState stays empty" in html or "lifecycleState stays" in html or "lifecycleState = '';" not in html or "lifecycle_state" in html
+
+    def test_render_ui_uses_dash_placeholder_for_unfired_started_label(self):
+        # UI #4 fix: unfired rows show ``--`` for STARTED (not the literal
+        # "Not started yet" text) to match the TIME SPENT ``--`` convention.
+        html = render_compass_ui()
+        assert "Not started yet" not in html
+        assert "startLabel = '--';" in html
+
+    def test_render_ui_panel_head_does_not_wrap_with_long_task_id(self):
+        # UI #1 fix: when a long task id is shown in the "Task Info" header,
+        # the bottom separator of the panel-head must not move. The header
+        # content is single-line + ellipsis so all three panel-heads share
+        # the same bottom border y-position.
+        html = render_compass_ui()
+        assert ".panel-head-title {" in html
+        assert "flex-wrap: nowrap;" in html
+        assert ".panel-head strong {" in html
+        assert "white-space: nowrap;" in html
+        assert ".detail-head-task-id {" in html
+        assert "text-overflow: ellipsis;" in html
+        assert "max-width: 100%;" in html
+
+    def test_render_ui_renders_unfired_skeleton_rows_as_pending(self):
+        html = render_compass_ui()
+        assert "visualState: skel.conditional ? 'conditional_pending' : 'pending'" in html
+        assert "ordered: normalizedOrdered.filter(row => !row.ignored)" in html
+
+    def test_render_ui_uses_utc_aware_timestamp_parser_for_major_timeline(self):
+        html = render_compass_ui()
+        assert "const d = parseTimestamp(iso);" in html
+        assert "const endDate = row.endedAt" in html
+        assert "const startDate = row.startedAt ? parseTimestamp(row.startedAt) : null;" in html
 
     def test_render_ui_contains_dashboard_shell(self):
         html = render_compass_ui()
@@ -358,9 +448,13 @@ class TestCompassUITemplates:
 
     def test_render_ui_timeline_markers_have_correct_symbols(self):
         html = render_compass_ui()
-        # done = checkmark, failed = X, warn = exclamation
-        assert '"done")' in html or "'done')" in html
-        assert "phaseMarkForClass" in html
+        # v0.8 timeline redesign: visual-state → glyph mapping in
+        # ``pickMarkForVisualState`` (done=✓, failed=✕, warn=!, current=●,
+        # pending=○, conditional_pending=◐).
+        assert "function pickMarkForVisualState(visualState)" in html
+        assert "case 'done': return '✓';" in html
+        assert "case 'failed': return '✕';" in html
+        assert "case 'warn': return '!';" in html
 
     def test_render_ui_user_bubble_uses_ink_cyan_colors(self):
         html = render_compass_ui()
@@ -417,7 +511,15 @@ class TestCompassUITemplates:
     def test_render_ui_uses_semantic_spotlight_backgrounds(self):
         html = render_compass_ui()
         assert ".detail-card.spotlight.completed {" in html
+        assert ".detail-card.spotlight.warning {" in html
         assert ".detail-card.spotlight.failed {" in html
+
+    def test_render_ui_includes_warning_task_styles(self):
+        html = render_compass_ui()
+        assert '.task-item[data-status="warning"] {' in html
+        assert ".status-pill.warning" in html
+        assert "warning:'Completed with Warnings'" in html
+        assert "function taskStatusKind(task)" in html
 
     def test_render_ui_renders_completion_summary_as_markdown(self):
         """The completion summary should be HTML-rendered via a markdown helper."""

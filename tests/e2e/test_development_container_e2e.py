@@ -198,6 +198,25 @@ def test_development_task_live_container(request) -> None:
     metadata = completed_task.get("metadata", {})
     assert metadata.get("teamLeadTaskId"), "expected Team Lead task id in Compass metadata"
 
+    # v0.8 timeline redesign: the new structured fields are populated and the
+    # closing row is ``compass.task_completed#0``. We don't assert the exact
+    # row count here (loops vary by task) but require both the Compass and
+    # downstream (tl/wd/cr) prefix step keys to appear in the timeline.
+    rows = completed_task.get("majorStepRows") or {}
+    assert rows, "expected majorStepRows on completed development task"
+    step_keys = set(rows.keys())
+    assert any(k.startswith("compass.") for k in step_keys), (
+        f"no compass.* step keys in majorStepRows: {sorted(step_keys)}"
+    )
+    assert any(
+        k.startswith("tl.") or k.startswith("wd.") or k.startswith("cr.")
+        for k in step_keys
+    ), f"no tl/wd/cr step keys in majorStepRows: {sorted(step_keys)}"
+    assert completed_task.get("terminalStepInstanceKey") == "compass.task_completed#0", (
+        f"expected terminalStepInstanceKey=compass.task_completed#0, got "
+        f"{completed_task.get('terminalStepInstanceKey')!r}"
+    )
+
     merged_artifact_metadata: dict[str, object] = {}
     for artifact in completed_task.get("artifacts", []) or []:
         merged_artifact_metadata.update(artifact.get("metadata") or {})

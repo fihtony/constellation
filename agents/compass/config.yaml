@@ -23,3 +23,7 @@ permission_profile: "compass"
 port: 8000
 capabilities:
   - compass.task.route
+  # v0.8 timeline redesign: Compass exposes POST /api/major-step-events so
+  # downstream agents (Office / Team Lead / Web Dev / Code Review) can
+  # fan-in their progress events into the Compass top-level task store.
+  - compass.major_step.sink
