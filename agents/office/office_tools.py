@@ -1626,3 +1626,80 @@ def register_office_tools() -> None:
     registry = get_registry()
     for tool in _OFFICE_TOOLS:
         registry.register(tool)
+
+
+# ---------------------------------------------------------------------------
+# Delete Output File Tool
+# ---------------------------------------------------------------------------
+
+class DeleteOutputFileTool(BaseTool):
+    """Delete a file under the resolved task output root.
+
+    Hard rules (enforced in this order, fail-closed):
+    1. ``OFFICE_RESOLVED_TARGET_DIR`` (or ``OFFICE_WORKSPACE_ROOT`` as a
+       fallback for workspace mode) must be set to a real directory; the
+       tool refuses otherwise.
+    2. The candidate path resolves with ``realpath`` (following symlinks).
+    3. The candidate path must NOT resolve to a file under any validated
+       source root (``OFFICE_SOURCE_ROOT``) — checked first so a symlink
+       escape into a source folder is reported as a source violation.
+    4. The candidate path must lie inside the resolved target directory.
+    5. Only regular files are removed; non-regular targets and missing
+       files are refused with a descriptive error.
+    """
+    name = "delete_output_file"
+    description = "Delete a stale output file under the resolved task output root. Refuses source inputs and out-of-root paths."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "filename": {
+                "type": "string",
+                "description": "Path of the file to delete, relative to the resolved target directory or absolute under it.",
+            },
+        },
+        "required": ["filename"],
+    }
+
+    def execute_sync(self, filename: str = "") -> ToolResult:
+        target_dir = os.environ.get("OFFICE_RESOLVED_TARGET_DIR", "").strip()
+        if not target_dir:
+            target_dir = os.environ.get("OFFICE_WORKSPACE_ROOT", "").strip()
+        if not target_dir:
+            return ToolResult(output="", error="delete_output_file: OFFICE_RESOLVED_TARGET_DIR (or OFFICE_WORKSPACE_ROOT) is not set")
+        try:
+            real_target = os.path.realpath(os.path.abspath(target_dir))
+        except Exception as exc:
+            return ToolResult(output="", error=f"delete_output_file: target resolution failed: {exc}")
+        if not os.path.isdir(real_target):
+            return ToolResult(output="", error=f"delete_output_file: target {real_target!r} is not a directory")
+        if not filename:
+            return ToolResult(output="", error="delete_output_file: filename is required")
+        # candidate resolution — follow symlinks via realpath so escape
+        # attempts (including symlink chains) are caught by the next two
+        # checks rather than slipping through with the link's path.
+        try:
+            if os.path.isabs(filename):
+                candidate = os.path.realpath(os.path.abspath(filename))
+            else:
+                candidate = os.path.realpath(os.path.join(real_target, filename))
+        except Exception as exc:
+            return ToolResult(output="", error=f"delete_output_file: path resolution failed: {exc}")
+        # source-input protection — must precede the target-containment
+        # check so a symlink into a source folder reports as a source
+        # violation rather than a generic "outside target" error.
+        source_root = os.environ.get("OFFICE_SOURCE_ROOT", "").strip()
+        if source_root:
+            real_source = os.path.realpath(os.path.abspath(source_root))
+            if candidate == real_source or candidate.startswith(real_source.rstrip(os.sep) + os.sep):
+                return ToolResult(output="", error=f"delete_output_file: refusing to delete source input {filename!r}")
+        if not (candidate == real_target or candidate.startswith(real_target.rstrip(os.sep) + os.sep)):
+            return ToolResult(output="", error=f"delete_output_file: path {filename!r} is outside the resolved target directory")
+        if not os.path.exists(candidate):
+            return ToolResult(output="", error=f"delete_output_file: file does not exist: {filename!r}")
+        if not os.path.isfile(candidate):
+            return ToolResult(output="", error=f"delete_output_file: refusing to delete non-regular file: {filename!r}")
+        try:
+            os.remove(candidate)
+        except OSError as exc:
+            return ToolResult(output="", error=f"delete_output_file: remove failed: {exc}")
+        return ToolResult(output=json.dumps({"deleted": candidate}))
