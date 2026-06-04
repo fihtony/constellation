@@ -1,4 +1,3 @@
-import os
 import pytest
 from agents.office import office_tools
 
@@ -60,7 +59,7 @@ def test_delete_output_file_refuses_path_outside_workspace(tmp_path, monkeypatch
     tool = _resolve_tool()
     result = tool.execute_sync(filename=str(outside))
     assert result.error != ""
-    assert not outside.exists() or result.error != ""
+    assert outside.exists()
 
 
 def test_delete_output_file_refuses_symlink_escape(workspace, tmp_path):
@@ -87,3 +86,35 @@ def test_delete_output_file_inplace_uses_resolved_target(workspace, tmp_path, mo
     result = tool.execute_sync(filename=str(stale))
     assert result.error == ""
     assert not stale.exists()
+
+
+def test_delete_output_file_refuses_when_no_target_env_set(tmp_path, monkeypatch):
+    """Fails closed when neither OFFICE_RESOLVED_TARGET_DIR nor OFFICE_WORKSPACE_ROOT is set."""
+    monkeypatch.delenv("OFFICE_RESOLVED_TARGET_DIR", raising=False)
+    monkeypatch.delenv("OFFICE_WORKSPACE_ROOT", raising=False)
+    from agents.office.office_tools import DeleteOutputFileTool
+    tool = DeleteOutputFileTool()
+    result = tool.execute_sync(filename="stale.txt")
+    assert result.error != ""
+    assert "OFFICE_RESOLVED_TARGET_DIR" in result.error or "OFFICE_WORKSPACE_ROOT" in result.error
+
+
+def test_delete_output_file_refuses_missing_file(workspace):
+    """Returns an error when the target file does not exist."""
+    from agents.office.office_tools import DeleteOutputFileTool
+    tool = DeleteOutputFileTool()
+    result = tool.execute_sync(filename="never-existed.txt")
+    assert result.error != ""
+    assert "does not exist" in result.error.lower()
+
+
+def test_delete_output_file_refuses_directory(workspace):
+    """Refuses to delete a directory (non-regular file)."""
+    subdir = workspace / "subdir"
+    subdir.mkdir()
+    from agents.office.office_tools import DeleteOutputFileTool
+    tool = DeleteOutputFileTool()
+    result = tool.execute_sync(filename="subdir")
+    assert result.error != ""
+    assert "non-regular" in result.error.lower() or "directory" in result.error.lower()
+    assert subdir.exists()
