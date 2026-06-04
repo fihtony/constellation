@@ -1984,6 +1984,218 @@ def _write_gate_report(
         logger.debug("plan-output-gate-report.json write failed: %s", exc)
 
 
+def _run_gate_retry_loop(
+    state: dict,
+    *,
+    contract: OutputContract,
+    capability: str,
+    validated_paths: list[str],
+    output_mode: str,
+    inplace: bool,
+    runtime: Any,
+    initial_report: GateReport,
+) -> tuple[GateReport, bool, int, list[int], bool]:
+    """Run the plan-output gate retry loop.
+
+    The loop drives up to ``PLAN_OUTPUT_GATE_MAX_ROUNDS`` LLM-driven
+    reconciliation rounds, snapshotting and reverting plan changes, until the
+    gate converges or the budget is exhausted.
+
+    Returns
+    -------
+    tuple
+        ``(final_report, converged, retry_count, no_progress_rounds, plan_modification_detected)``
+        where ``converged`` is ``True`` when the loop terminated early via a
+        clean pass after retry, or an unrecoverable plan-revert failure. In
+        those cases the helper has already emitted the appropriate closing
+        step and ``_run_plan_output_gate`` must NOT emit the exhausted
+        emission. When ``converged`` is ``False`` the caller emits the
+        exhausted emission and writes the audit report.
+    """
+    from agents.office import office_steps as _steps
+
+    last_signature = _diff_signature(initial_report)
+    no_progress_rounds: list[int] = []
+    plan_modification_detected = False
+    retry_count = 0
+    final_report = initial_report
+    converged = False
+
+    for round_num in range(1, PLAN_OUTPUT_GATE_MAX_ROUNDS + 1):
+        # Snapshot plan integrity before this round.
+        snapshot = _snapshot_plan(contract.plan_path)
+        retry_prompt = _build_retry_prompt(
+            capability, contract, final_report, round_num, inplace=inplace
+        )
+        _steps.emit_reconciling_plan_output(
+            state,
+            lifecycle_state=LIFECYCLE_RUNNING,
+            round=round_num,
+            summary_template=(
+                f"Office is reconciling the output to match the plan "
+                f"(round {{round}} of {PLAN_OUTPUT_GATE_MAX_ROUNDS})."
+            ),
+            summary_facts={
+                "round": round_num,
+                "missing_count": len(final_report.missing),
+                "unexpected_count": len(final_report.unexpected),
+                "mismatch_count": len(final_report.mismatches),
+            },
+        )
+        # Invoke the LLM with the retry prompt. Scope the call to the
+        # capability tool allowlist and a bounded budget so a misbehaving
+        # LLM cannot invoke unrelated tools or run away.
+        tool_names = _capability_tool_names(capability, output_mode)
+        allowed = _claude_allowed_tool_names(tool_names)
+        retry_system_prompt = (
+            _load_system_prompt()
+            + "\n\n"
+            + "## Reconciliation Mode\n"
+            + "You are running inside the Office plan-output gate reconciliation loop. "
+            + "Use only the authorized Office tools for this capability "
+            + "(including delete_output_file for stale files). Do not call any other tool. "
+            + f"Available tools: {', '.join(tool_names)}."
+        )
+        retry_cwd = state.get("workspace_root") or (
+            validated_paths[0] if validated_paths and os.path.isdir(validated_paths[0]) else (
+                os.path.dirname(validated_paths[0]) if validated_paths else None
+            )
+        )
+        try:
+            retry_result = runtime.run_agentic(
+                retry_prompt,
+                system_prompt=retry_system_prompt,
+                cwd=retry_cwd,
+                tools=tool_names,
+                allowed_tools=allowed,
+                max_turns=PLAN_OUTPUT_GATE_RETRY_MAX_TURNS,
+                timeout=PLAN_OUTPUT_GATE_RETRY_TIMEOUT,
+                plugin_manager=state.get("_plugin_manager"),
+            )
+            tool_calls = list(getattr(retry_result, "tool_calls", []) or [])
+            if not tool_calls:
+                no_progress_rounds.append(round_num)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("plan-output-gate retry round %d failed: %s", round_num, exc)
+            tool_calls = []
+            no_progress_rounds.append(round_num)
+
+        for tc in tool_calls:
+            _record_retry_to_operations_log(
+                state,
+                round=round_num,
+                trigger="gate-retry",
+                tool_name=str(tc.get("name", "")),
+                ok=bool(tc.get("ok", True)),
+                error=str(tc.get("error", "")),
+            )
+
+        # Plan integrity: revert if LLM modified the plan. The previous
+        # plan_status field on final_report reflects the *prior* state of
+        # the plan, not whether the LLM was allowed to modify it — so it
+        # must not gate the revert. The snapshot is the source of truth
+        # for "what the plan looked like before this round".
+        if _plan_modified(snapshot):
+            reverted = _revert_plan(snapshot)
+            if not reverted:
+                _steps.emit_gate_exhausted(
+                    state,
+                    summary_facts={"round_count": round_num, "revert_failed": True},
+                )
+                _write_gate_report(
+                    state,
+                    contract,
+                    final_report,
+                    rounds=round_num,
+                    no_progress_rounds=no_progress_rounds,
+                    plan_modification_detected=True,
+                )
+                return final_report, True, round_num, no_progress_rounds, True
+            plan_modification_detected = True
+            _steps.emit_reconciling_plan_output(
+                state,
+                lifecycle_state=LIFECYCLE_WARNING,
+                round=round_num,
+                summary_template=(
+                    "Plan was modified during retry; reverted to snapshot."
+                ),
+                summary_facts={"round": round_num, "plan_modified": True},
+            )
+
+        # Re-run the gate.
+        report = _run_gate(contract)
+        # If the plan is missing after retry, record that explicitly.
+        if report.plan_status == "missing":
+            report = GateReport(
+                capability=report.capability,
+                plan_status="missing",
+                planned_count=0,
+                actual_count=report.actual_count,
+                missing=[],
+                unexpected=list(report.unexpected),
+                mismatches=[],
+                error_message="plan was deleted during retry; restore from snapshot",
+            )
+
+        if report.is_clean:
+            _steps.emit_reconciling_plan_output(
+                state,
+                lifecycle_state=LIFECYCLE_DONE,
+                round=round_num,
+                summary_template=(
+                    "Reconciliation round {round} completed and the output "
+                    "now matches the plan."
+                ),
+                summary_facts={
+                    "round": round_num,
+                    "missing_count": 0,
+                    "unexpected_count": 0,
+                    "mismatch_count": 0,
+                },
+            )
+            _steps.emit_validating_plan_output(
+                state,
+                lifecycle_state=LIFECYCLE_DONE,
+                summary_template=(
+                    "Plan and output match after {round_count} reconciliation "
+                    "round(s). Validated {planned_count} planned deliverable(s)."
+                ),
+                summary_facts={
+                    "plan_status": "ok",
+                    "planned_count": report.planned_count,
+                    "actual_count": report.actual_count,
+                    "round_count": round_num,
+                },
+            )
+            return report, True, round_num, no_progress_rounds, plan_modification_detected
+
+        # Detect repeated same-diff signature (no progress).
+        new_sig = _diff_signature(report)
+        if new_sig == last_signature:
+            no_progress_rounds.append(round_num)
+        last_signature = new_sig
+
+        if round_num < PLAN_OUTPUT_GATE_MAX_ROUNDS:
+            _steps.emit_reconciling_plan_output(
+                state,
+                lifecycle_state=LIFECYCLE_WARNING,
+                round=round_num,
+                summary_template=(
+                    "Reconciliation round {round} completed, but validation is still not clean."
+                ),
+                summary_facts={
+                    "round": round_num,
+                    "missing_count": len(report.missing),
+                    "unexpected_count": len(report.unexpected),
+                    "mismatch_count": len(report.mismatches),
+                },
+            )
+        retry_count = round_num
+        final_report = report
+
+    return final_report, converged, retry_count, no_progress_rounds, plan_modification_detected
+
+
 def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
     """Run the plan-output gate with reconciliation.
 
@@ -2078,183 +2290,20 @@ def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
         },
     )
 
-    last_signature = _diff_signature(report)
-    no_progress_rounds: list[int] = []
-    plan_modification_detected = False
-    retry_count = 0
-    final_report = report
-
-    for round_num in range(1, PLAN_OUTPUT_GATE_MAX_ROUNDS + 1):
-        # Snapshot plan integrity before this round.
-        snapshot = _snapshot_plan(contract.plan_path)
-        retry_prompt = _build_retry_prompt(
-            capability, contract, final_report, round_num, inplace=inplace
-        )
-        _steps.emit_reconciling_plan_output(
+    final_report, converged, retry_count, no_progress_rounds, plan_modification_detected = (
+        _run_gate_retry_loop(
             state,
-            lifecycle_state=LIFECYCLE_RUNNING,
-            round=round_num,
-            summary_template=(
-                f"Office is reconciling the output to match the plan "
-                f"(round {{round}} of {PLAN_OUTPUT_GATE_MAX_ROUNDS})."
-            ),
-            summary_facts={
-                "round": round_num,
-                "missing_count": len(final_report.missing),
-                "unexpected_count": len(final_report.unexpected),
-                "mismatch_count": len(final_report.mismatches),
-            },
+            contract=contract,
+            capability=capability,
+            validated_paths=validated_paths,
+            output_mode=output_mode,
+            inplace=inplace,
+            runtime=runtime,
+            initial_report=report,
         )
-        # Invoke the LLM with the retry prompt. Scope the call to the
-        # capability tool allowlist and a bounded budget so a misbehaving
-        # LLM cannot invoke unrelated tools or run away.
-        tool_names = _capability_tool_names(capability, output_mode)
-        allowed = _claude_allowed_tool_names(tool_names)
-        retry_system_prompt = (
-            _load_system_prompt()
-            + "\n\n"
-            + "## Reconciliation Mode\n"
-            + "You are running inside the Office plan-output gate reconciliation loop. "
-            + "Use only the authorized Office tools for this capability "
-            + "(including delete_output_file for stale files). Do not call any other tool. "
-            + f"Available tools: {', '.join(tool_names)}."
-        )
-        retry_cwd = state.get("workspace_root") or (
-            validated_paths[0] if validated_paths and os.path.isdir(validated_paths[0]) else (
-                os.path.dirname(validated_paths[0]) if validated_paths else None
-            )
-        )
-        try:
-            retry_result = runtime.run_agentic(
-                retry_prompt,
-                system_prompt=retry_system_prompt,
-                cwd=retry_cwd,
-                tools=tool_names,
-                allowed_tools=allowed,
-                max_turns=PLAN_OUTPUT_GATE_RETRY_MAX_TURNS,
-                timeout=PLAN_OUTPUT_GATE_RETRY_TIMEOUT,
-                plugin_manager=state.get("_plugin_manager"),
-            )
-            tool_calls = list(getattr(retry_result, "tool_calls", []) or [])
-            if not tool_calls:
-                no_progress_rounds.append(round_num)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("plan-output-gate retry round %d failed: %s", round_num, exc)
-            tool_calls = []
-            no_progress_rounds.append(round_num)
-
-        for tc in tool_calls:
-            _record_retry_to_operations_log(
-                state,
-                round=round_num,
-                trigger="gate-retry",
-                tool_name=str(tc.get("name", "")),
-                ok=bool(tc.get("ok", True)),
-                error=str(tc.get("error", "")),
-            )
-
-        # Plan integrity: revert if LLM modified the plan. The previous
-        # plan_status field on final_report reflects the *prior* state of
-        # the plan, not whether the LLM was allowed to modify it — so it
-        # must not gate the revert. The snapshot is the source of truth
-        # for "what the plan looked like before this round".
-        if _plan_modified(snapshot):
-            reverted = _revert_plan(snapshot)
-            if not reverted:
-                _steps.emit_gate_exhausted(
-                    state,
-                    summary_facts={"round_count": round_num, "revert_failed": True},
-                )
-                _write_gate_report(
-                    state,
-                    contract,
-                    final_report,
-                    rounds=round_num,
-                    no_progress_rounds=no_progress_rounds,
-                    plan_modification_detected=True,
-                )
-                return final_report
-            plan_modification_detected = True
-            _steps.emit_reconciling_plan_output(
-                state,
-                lifecycle_state=LIFECYCLE_WARNING,
-                round=round_num,
-                summary_template=(
-                    "Plan was modified during retry; reverted to snapshot."
-                ),
-                summary_facts={"round": round_num, "plan_modified": True},
-            )
-
-        # Re-run the gate.
-        report = _run_gate(contract)
-        # If the plan is missing after retry, record that explicitly.
-        if report.plan_status == "missing":
-            report = GateReport(
-                capability=report.capability,
-                plan_status="missing",
-                planned_count=0,
-                actual_count=report.actual_count,
-                missing=[],
-                unexpected=list(report.unexpected),
-                mismatches=[],
-                error_message="plan was deleted during retry; restore from snapshot",
-            )
-
-        if report.is_clean:
-            _steps.emit_reconciling_plan_output(
-                state,
-                lifecycle_state=LIFECYCLE_DONE,
-                round=round_num,
-                summary_template=(
-                    "Reconciliation round {round} completed and the output "
-                    "now matches the plan."
-                ),
-                summary_facts={
-                    "round": round_num,
-                    "missing_count": 0,
-                    "unexpected_count": 0,
-                    "mismatch_count": 0,
-                },
-            )
-            _steps.emit_validating_plan_output(
-                state,
-                lifecycle_state=LIFECYCLE_DONE,
-                summary_template=(
-                    "Plan and output match after {round_count} reconciliation "
-                    "round(s). Validated {planned_count} planned deliverable(s)."
-                ),
-                summary_facts={
-                    "plan_status": "ok",
-                    "planned_count": report.planned_count,
-                    "actual_count": report.actual_count,
-                    "round_count": round_num,
-                },
-            )
-            return report
-
-        # Detect repeated same-diff signature (no progress).
-        new_sig = _diff_signature(report)
-        if new_sig == last_signature:
-            no_progress_rounds.append(round_num)
-        last_signature = new_sig
-
-        if round_num < PLAN_OUTPUT_GATE_MAX_ROUNDS:
-            _steps.emit_reconciling_plan_output(
-                state,
-                lifecycle_state=LIFECYCLE_WARNING,
-                round=round_num,
-                summary_template=(
-                    "Reconciliation round {round} completed, but validation is still not clean."
-                ),
-                summary_facts={
-                    "round": round_num,
-                    "missing_count": len(report.missing),
-                    "unexpected_count": len(report.unexpected),
-                    "mismatch_count": len(report.mismatches),
-                },
-            )
-        retry_count = round_num
-        final_report = report
+    )
+    if converged:
+        return final_report
 
     # Exhausted.
     strong_no_progress = len(no_progress_rounds) >= PLAN_OUTPUT_GATE_NO_PROGRESS_LIMIT
@@ -2267,11 +2316,11 @@ def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
             "{mismatch_count} mismatched. See plan-output-gate-report.json."
         ),
         summary_facts={
-            "plan_status": report.plan_status,
+            "plan_status": final_report.plan_status,
             "round_count": retry_count,
-            "missing_count": len(report.missing),
-            "unexpected_count": len(report.unexpected),
-            "mismatch_count": len(report.mismatches),
+            "missing_count": len(final_report.missing),
+            "unexpected_count": len(final_report.unexpected),
+            "mismatch_count": len(final_report.mismatches),
             "no_progress_count": len(no_progress_rounds),
             "strong_no_progress": strong_no_progress,
         },
@@ -2281,15 +2330,15 @@ def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
         round_count=retry_count,
         summary_facts={
             "no_progress_count": len(no_progress_rounds),
-            "missing_count": len(report.missing),
-            "unexpected_count": len(report.unexpected),
+            "missing_count": len(final_report.missing),
+            "unexpected_count": len(final_report.unexpected),
             "strong_no_progress": strong_no_progress,
         },
     )
     _write_gate_report(
         state,
         contract,
-        report,
+        final_report,
         rounds=retry_count,
         no_progress_rounds=no_progress_rounds,
         plan_modification_detected=plan_modification_detected,
