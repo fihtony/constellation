@@ -9,6 +9,7 @@ report_result   — Write pr-evidence.json, return result
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import logging
 import os
@@ -34,6 +35,13 @@ from agents.office.office_tools import (
     collect_organize_file_inventory,
 )
 from framework.devlog import _ts
+from framework.major_step import LIFECYCLE_DONE, LIFECYCLE_RUNNING, LIFECYCLE_WARNING
+from framework.office.plan_output_gate import (
+    GateReport,
+    OutputContract,
+    resolve_output_contract,
+    run as _run_gate,
+)
 from framework.runtime.adapter import AgenticResult
 
 logger = logging.getLogger(__name__)
@@ -1735,3 +1743,485 @@ def report_result(state: dict) -> dict:
         "success": success,
         "warnings_count": len(warnings),
     }
+
+
+# ---------------------------------------------------------------------------
+# Plan-output gate orchestration (Task 8)
+# ---------------------------------------------------------------------------
+
+PLAN_OUTPUT_GATE_MAX_ROUNDS = 3
+PLAN_OUTPUT_GATE_NO_PROGRESS_LIMIT = 2
+
+
+def _snapshot_plan(plan_path: str) -> dict[str, Any] | None:
+    """Capture (realpath, mtime_ns, sha256, bytes) of the plan file for
+    integrity checks and a possible revert."""
+    if not plan_path or not os.path.exists(plan_path):
+        return None
+    real = os.path.realpath(plan_path)
+    stat = os.stat(real)
+    with open(real, "rb") as fh:
+        data = fh.read()
+    return {
+        "realpath": real,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": data,
+    }
+
+
+def _plan_modified(snapshot: dict[str, Any] | None) -> bool:
+    if not snapshot:
+        return False
+    real = snapshot["realpath"]
+    if not os.path.exists(real):
+        return True
+    stat = os.stat(real)
+    if stat.st_mtime_ns != snapshot["mtime_ns"]:
+        return True
+    with open(real, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    return digest != snapshot["sha256"]
+
+
+def _revert_plan(snapshot: dict[str, Any]) -> bool:
+    """Restore the plan file from the snapshot's stored bytes.
+
+    Returns True on success, False if the snapshot has no bytes (e.g. the
+    plan was missing at snapshot time) or the write fails — the caller
+    must then refuse to proceed and surface a task failure.
+    """
+    data = snapshot.get("bytes")
+    if data is None:
+        return False
+    real = snapshot["realpath"]
+    parent = os.path.dirname(real) or "."
+    try:
+        os.makedirs(parent, exist_ok=True)
+        with open(real, "wb") as fh:
+            fh.write(data)
+    except OSError:
+        return False
+    return True
+
+
+def _diff_signature(report: GateReport) -> str:
+    """Stable signature of the gate's diff for no-progress detection."""
+    h = hashlib.sha256()
+    h.update(json.dumps(sorted(report.missing), sort_keys=True).encode("utf-8"))
+    h.update(b"|")
+    h.update(json.dumps(sorted(report.unexpected), sort_keys=True).encode("utf-8"))
+    h.update(b"|")
+    h.update(json.dumps(sorted(report.mismatches), sort_keys=True).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _build_retry_prompt(
+    capability: str,
+    contract: OutputContract,
+    report: GateReport,
+    round_num: int,
+    *,
+    inplace: bool = False,
+) -> str:
+    """Build the deterministic retry prompt for the LLM."""
+    lines: list[str] = []
+    lines.append(
+        f"[plan-output-gate] The declared plan and the materialized output disagree. "
+        f"(round {round_num} of {PLAN_OUTPUT_GATE_MAX_ROUNDS})"
+    )
+    lines.append("")
+    lines.append(f"Plan status: {report.plan_status}")
+    lines.append(f"Missing deliverables: {len(report.missing)}")
+    lines.append(f"Unexpected deliverables: {len(report.unexpected)}")
+    lines.append(f"Plan-specific mismatches: {len(report.mismatches)}")
+    if report.error_message:
+        lines.append(f"Error: {report.error_message}")
+    if report.invalid_plan_entries:
+        lines.append("Invalid plan entries:")
+        for entry in report.invalid_plan_entries[:20]:
+            lines.append(f"  - {entry}")
+    if report.missing:
+        lines.append("Missing from output (max 20 shown):")
+        for path in report.missing[:20]:
+            lines.append(f"  - {path}")
+    if report.unexpected:
+        lines.append("Unexpected in output (max 20 shown):")
+        for path in report.unexpected[:20]:
+            lines.append(f"  - {path}")
+    if report.mismatches:
+        lines.append("Mismatches:")
+        for m in report.mismatches[:20]:
+            lines.append(f"  - {m}")
+    lines.append("")
+    if report.plan_status in {"missing", "unparseable", "invalid"}:
+        lines.append("The plan artifact itself is missing or invalid. Write the plan first, then materialize.")
+    else:
+        lines.append("Fix the materialized output so it matches the existing plan contract exactly.")
+    lines.append("Do not invent new deliverables.")
+    lines.append("Do not leave stale outputs from previous rounds.")
+    if inplace:
+        lines.append(
+            "This task is in inplace mode: the source tree is read-only. "
+            "Only the resolved target directory is writable."
+        )
+    lines.append(
+        f"Use only the authorized Office tools for the {capability} capability "
+        "(including delete_output_file for stale files)."
+    )
+    return "\n".join(lines)
+
+
+def _record_retry_to_operations_log(
+    state: dict,
+    *,
+    round: int,
+    trigger: str,
+    tool_name: str,
+    ok: bool,
+    error: str = "",
+) -> None:
+    """Best-effort append to operations-plan.json for audit."""
+    try:
+        artifacts_dir = state.get("artifacts_dir") or os.environ.get("OFFICE_WORKSPACE_ROOT", "")
+        if not artifacts_dir:
+            return
+        log_path = os.path.join(artifacts_dir, "operations-plan.json")
+        existing: list[dict[str, Any]] = []
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8") as fh:
+                    existing = json.load(fh)
+            except (OSError, ValueError):
+                existing = []
+        existing.append(
+            {
+                "action": tool_name,
+                "round": round,
+                "trigger": trigger,
+                "status": "succeeded" if ok else "failed",
+                "error": error[:200],
+            }
+        )
+        with open(log_path, "w", encoding="utf-8") as fh:
+            json.dump(existing, fh, indent=2, ensure_ascii=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("operations-plan.json append failed: %s", exc)
+
+
+def _write_gate_report(
+    state: dict,
+    contract: OutputContract,
+    report: GateReport,
+    rounds: int,
+    *,
+    no_progress_rounds: list[int],
+    plan_modification_detected: bool,
+) -> None:
+    artifacts_dir = state.get("artifacts_dir") or ""
+    if not artifacts_dir:
+        return
+    report_path = os.path.join(artifacts_dir, "plan-output-gate-report.json")
+    payload = {
+        "capability": report.capability,
+        "rounds": rounds,
+        "plan_status": report.plan_status,
+        "planned_count": report.planned_count,
+        "actual_count": report.actual_count,
+        "final": {
+            "missing": list(report.missing),
+            "unexpected": list(report.unexpected),
+            "mismatches": list(report.mismatches),
+        },
+        "invalid_plan_entries": list(report.invalid_plan_entries),
+        "no_progress_rounds": no_progress_rounds,
+        "plan_modification_detected": plan_modification_detected,
+        "tool_unavailable": report.tool_unavailable,
+        "plan_path": contract.plan_path,
+        "output_root": contract.output_root,
+    }
+    try:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+    except OSError as exc:
+        logger.debug("plan-output-gate-report.json write failed: %s", exc)
+
+
+def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
+    """Run the plan-output gate with reconciliation.
+
+    The runtime is the existing agentic runtime used by ``execute_office_work``.
+    The LLM is invoked only on retry rounds using a deterministic prompt and
+    the existing capability-specific prompt builder.
+    """
+    from agents.office import office_steps as _steps
+
+    capability = state.get("capability", "summarize")
+    validated_paths = state.get("validated_paths", [])
+    output_mode = state.get("output_mode", "workspace")
+    artifacts_dir = state.get("artifacts_dir", "")
+
+    contract = resolve_output_contract(
+        capability, validated_paths, output_mode, artifacts_dir
+    )
+    inplace = output_mode == "inplace"
+
+    # Check tool registration up-front; fail closed if missing.
+    expected_tools = _capability_tool_names(capability, output_mode)
+    if "delete_output_file" not in expected_tools:
+        report = GateReport(
+            capability=capability,
+            plan_status="invalid",
+            planned_count=0,
+            actual_count=0,
+            missing=[],
+            unexpected=[],
+            mismatches=[],
+            error_message="delete_output_file tool not registered for this capability",
+            tool_unavailable=True,
+        )
+        _steps.emit_validating_plan_output(
+            state,
+            lifecycle_state=LIFECYCLE_WARNING,
+            summary_template=(
+                "Plan-output gate could not start: delete_output_file tool is not registered."
+            ),
+            summary_facts={"plan_status": "invalid", "tool_unavailable": True},
+        )
+        _steps.emit_gate_exhausted(
+            state, summary_facts={"round_count": 0, "tool_unavailable": True}
+        )
+        _write_gate_report(
+            state,
+            contract,
+            report,
+            rounds=0,
+            no_progress_rounds=[],
+            plan_modification_detected=False,
+        )
+        return report
+
+    # Round 0 — initial validation.
+    _steps.emit_validating_plan_output(
+        state,
+        lifecycle_state=LIFECYCLE_RUNNING,
+        summary_template="Office is validating the materialized output against the declared plan.",
+        summary_facts={"plan_status": "running", "round": 0},
+    )
+    report = _run_gate(contract)
+    if report.is_clean:
+        _steps.emit_validating_plan_output(
+            state,
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template=(
+                "Plan and output match. Validated {planned_count} planned deliverable(s)."
+            ),
+            summary_facts={
+                "plan_status": "ok",
+                "planned_count": report.planned_count,
+                "actual_count": report.actual_count,
+                "round": 0,
+            },
+        )
+        return report
+
+    # Mismatch — enter retry loop.
+    _steps.emit_validating_plan_output(
+        state,
+        lifecycle_state=LIFECYCLE_WARNING,
+        summary_template=(
+            "Validation found {missing_count} missing, {unexpected_count} unexpected, "
+            "and {mismatch_count} mismatched item(s). Starting reconciliation."
+        ),
+        summary_facts={
+            "missing_count": len(report.missing),
+            "unexpected_count": len(report.unexpected),
+            "mismatch_count": len(report.mismatches),
+            "round": 0,
+        },
+    )
+
+    last_signature = _diff_signature(report)
+    no_progress_rounds: list[int] = []
+    plan_modification_detected = False
+    retry_count = 0
+    final_report = report
+
+    for round_num in range(1, PLAN_OUTPUT_GATE_MAX_ROUNDS + 1):
+        # Snapshot plan integrity before this round.
+        snapshot = _snapshot_plan(contract.plan_path)
+        retry_prompt = _build_retry_prompt(
+            capability, contract, final_report, round_num, inplace=inplace
+        )
+        _steps.emit_reconciling_plan_output(
+            state,
+            lifecycle_state=LIFECYCLE_RUNNING,
+            round=round_num,
+            summary_template=(
+                f"Office is reconciling the output to match the plan "
+                f"(round {{round}} of {PLAN_OUTPUT_GATE_MAX_ROUNDS})."
+            ),
+            summary_facts={
+                "round": round_num,
+                "missing_count": len(final_report.missing),
+                "unexpected_count": len(final_report.unexpected),
+                "mismatch_count": len(final_report.mismatches),
+            },
+        )
+        # Invoke the LLM with the retry prompt.
+        try:
+            retry_result = runtime.run_agentic(retry_prompt)
+            tool_calls = list(getattr(retry_result, "tool_calls", []) or [])
+            if not tool_calls:
+                no_progress_rounds.append(round_num)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("plan-output-gate retry round %d failed: %s", round_num, exc)
+            tool_calls = []
+            no_progress_rounds.append(round_num)
+
+        for tc in tool_calls:
+            _record_retry_to_operations_log(
+                state,
+                round=round_num,
+                trigger="gate-retry",
+                tool_name=str(tc.get("name", "")),
+                ok=bool(tc.get("ok", True)),
+                error=str(tc.get("error", "")),
+            )
+
+        # Plan integrity: revert if LLM modified the plan and the previous
+        # status was ok.
+        if _plan_modified(snapshot) and final_report.plan_status == "ok":
+            reverted = _revert_plan(snapshot)
+            if not reverted:
+                _steps.emit_gate_exhausted(
+                    state,
+                    summary_facts={"round_count": round_num, "revert_failed": True},
+                )
+                _write_gate_report(
+                    state,
+                    contract,
+                    final_report,
+                    rounds=round_num,
+                    no_progress_rounds=no_progress_rounds,
+                    plan_modification_detected=True,
+                )
+                return final_report
+            plan_modification_detected = True
+            _steps.emit_reconciling_plan_output(
+                state,
+                lifecycle_state=LIFECYCLE_WARNING,
+                round=round_num,
+                summary_template=(
+                    "Plan was modified during retry; reverted to snapshot."
+                ),
+                summary_facts={"round": round_num, "plan_modified": True},
+            )
+
+        # Re-run the gate.
+        report = _run_gate(contract)
+        # If the plan is missing after retry, record that explicitly.
+        if report.plan_status == "missing":
+            report = GateReport(
+                capability=report.capability,
+                plan_status="missing",
+                planned_count=0,
+                actual_count=report.actual_count,
+                missing=[],
+                unexpected=list(report.unexpected),
+                mismatches=[],
+                error_message="plan was deleted during retry; restore from snapshot",
+            )
+
+        if report.is_clean:
+            _steps.emit_reconciling_plan_output(
+                state,
+                lifecycle_state=LIFECYCLE_DONE,
+                round=round_num,
+                summary_template=(
+                    "Reconciliation round {round} completed and the output "
+                    "now matches the plan."
+                ),
+                summary_facts={
+                    "round": round_num,
+                    "missing_count": 0,
+                    "unexpected_count": 0,
+                    "mismatch_count": 0,
+                },
+            )
+            _steps.emit_validating_plan_output(
+                state,
+                lifecycle_state=LIFECYCLE_DONE,
+                summary_template=(
+                    "Plan and output match after {round_count} reconciliation "
+                    "round(s). Validated {planned_count} planned deliverable(s)."
+                ),
+                summary_facts={
+                    "plan_status": "ok",
+                    "planned_count": report.planned_count,
+                    "actual_count": report.actual_count,
+                    "round_count": round_num,
+                },
+            )
+            return report
+
+        # Detect repeated same-diff signature (no progress).
+        new_sig = _diff_signature(report)
+        if new_sig == last_signature:
+            no_progress_rounds.append(round_num)
+        last_signature = new_sig
+
+        if round_num < PLAN_OUTPUT_GATE_MAX_ROUNDS:
+            _steps.emit_reconciling_plan_output(
+                state,
+                lifecycle_state=LIFECYCLE_WARNING,
+                round=round_num,
+                summary_template=(
+                    "Reconciliation round {round} completed, but validation is still not clean."
+                ),
+                summary_facts={
+                    "round": round_num,
+                    "missing_count": len(report.missing),
+                    "unexpected_count": len(report.unexpected),
+                    "mismatch_count": len(report.mismatches),
+                },
+            )
+        retry_count = round_num
+        final_report = report
+
+    # Exhausted.
+    _steps.emit_validating_plan_output(
+        state,
+        lifecycle_state=LIFECYCLE_WARNING,
+        summary_template=(
+            "Plan-output gate exhausted after {round_count} reconciliation "
+            "round(s): {missing_count} missing, {unexpected_count} unexpected, "
+            "{mismatch_count} mismatched. See plan-output-gate-report.json."
+        ),
+        summary_facts={
+            "plan_status": report.plan_status,
+            "round_count": retry_count,
+            "missing_count": len(report.missing),
+            "unexpected_count": len(report.unexpected),
+            "mismatch_count": len(report.mismatches),
+            "no_progress_count": len(no_progress_rounds),
+        },
+    )
+    _steps.emit_gate_exhausted(
+        state,
+        round_count=retry_count,
+        summary_facts={
+            "no_progress_count": len(no_progress_rounds),
+            "missing_count": len(report.missing),
+            "unexpected_count": len(report.unexpected),
+        },
+    )
+    _write_gate_report(
+        state,
+        contract,
+        report,
+        rounds=retry_count,
+        no_progress_rounds=no_progress_rounds,
+        plan_modification_detected=plan_modification_detected,
+    )
+    return final_report
