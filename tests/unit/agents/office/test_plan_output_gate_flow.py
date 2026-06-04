@@ -371,3 +371,63 @@ def test_plan_modified_during_retry_triggers_revert_even_if_status_changed(task_
     # The plan should have been reverted to the original (3 retries × 1 revert each)
     # After 3 reverts, the plan is still the original
     assert plan_path.read_text(encoding="utf-8") == original
+
+
+# ---------------------------------------------------------------------------
+# Inplace-mode retry prompt must warn that the source tree is read-only
+# ---------------------------------------------------------------------------
+
+
+def test_inplace_mode_retry_prompt_mentions_readonly_source(task_artifacts):
+    """Inplace retry prompt must remind the LLM that the source tree is read-only."""
+    from agents.office.nodes import _build_retry_prompt
+    contract = OutputContract(
+        capability="organize",
+        plan_path="/p.md",
+        output_root="/root",
+        ancillary_allowlist=frozenset(),
+        source_count=1,
+        expected_plan_kind="files_organized",
+    )
+    report = GateReport(
+        capability="organize",
+        plan_status="ok",
+        planned_count=2,
+        actual_count=1,
+        missing=["files/a.txt"],
+        unexpected=[],
+        mismatches=[],
+    )
+    prompt_inplace = _build_retry_prompt("organize", contract, report, 1, inplace=True)
+    assert "read-only" in prompt_inplace.lower() or "read only" in prompt_inplace.lower()
+    prompt_workspace = _build_retry_prompt("organize", contract, report, 1, inplace=False)
+    assert "read-only" not in prompt_workspace.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tool-unavailable preflight: delete_output_file missing -> fail closed
+# ---------------------------------------------------------------------------
+
+
+def test_tool_unavailable_preflight_emits_gate_exhausted(task_artifacts, monkeypatch):
+    """If delete_output_file is not in capability_tool_names, the gate fails closed without retries."""
+    from agents.office import nodes as office_nodes
+    artifacts, workspace = task_artifacts
+    state = _state(artifacts, workspace, "organize", ["/src/a.txt"])
+    sink_calls: list[dict[str, Any]] = []
+    state["_major_step_progress_sink"] = type("_Sink", (), {"handle_event": lambda self, e: sink_calls.append(e)})()
+    runtime = _StubRuntime([])
+    state["_runtime"] = runtime
+    # Monkeypatch _capability_tool_names to omit delete_output_file
+    monkeypatch.setattr(
+        office_nodes,
+        "_capability_tool_names",
+        lambda capability, output_mode: ["some_other_tool"],
+    )
+    report = _run_plan_output_gate(state, runtime=runtime)
+    assert not report.is_clean
+    assert report.tool_unavailable
+    keys = [c["step_key"] for c in sink_calls]
+    assert "office.gate_exhausted" in keys
+    # The LLM runtime should never be called
+    assert runtime.calls == []
