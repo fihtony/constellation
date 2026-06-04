@@ -2204,7 +2204,11 @@ def _run_gate_retry_loop(
             )
 
         # Re-run the gate.
-        report = _run_gate(contract)
+        report = _run_gate(
+            contract,
+            expanded_file_list=state.get("expanded_file_list", validated_paths),
+            validated_source_roots=state.get("validated_source_roots", validated_paths),
+        )
         # If the plan is missing after retry, record that explicitly.
         if report.plan_status == "missing":
             report = GateReport(
@@ -2338,7 +2342,11 @@ def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
         summary_template="Office is validating the materialized output against the declared plan.",
         summary_facts={"plan_status": "running", "round": 0},
     )
-    report = _run_gate(contract)
+    report = _run_gate(
+        contract,
+        expanded_file_list=state.get("expanded_file_list", validated_paths),
+        validated_source_roots=state.get("validated_source_roots", validated_paths),
+    )
     if report.is_clean:
         _steps.emit_validating_plan_output(
             state,
