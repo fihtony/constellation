@@ -209,6 +209,32 @@ def test_exhausted_emits_gate_exhausted_step(task_artifacts):
     assert report_path.exists()
 
 
+def test_two_consecutive_no_progress_rounds_emits_strong_warning(task_artifacts):
+    """When multiple rounds make no progress, the gate_exhausted step should carry strong_no_progress=True."""
+    artifacts, workspace = task_artifacts
+    plan_path = artifacts / "organized-output" / "files" / "organization-plan.md"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text(
+        "# Plan\n## Files Organized\n| source | destination |\n| --- | --- |\n| /src/a.txt | files/a.txt |\n",
+        encoding="utf-8",
+    )
+    state = _state(artifacts, workspace, "organize", ["/src/a.txt"])
+    sink_calls: list[dict[str, Any]] = []
+    state["_major_step_progress_sink"] = type("_Sink", (), {"handle_event": lambda self, e: sink_calls.append(e)})()
+    # Three empty LLM rounds — same signature each time → no_progress for all 3
+    runtime = _StubRuntime([
+        AgenticResult(success=True, summary="", tool_calls=[]),
+        AgenticResult(success=True, summary="", tool_calls=[]),
+        AgenticResult(success=True, summary="", tool_calls=[]),
+    ])
+    state["_runtime"] = runtime
+    _run_plan_output_gate(state, runtime=runtime)
+    exhausted = [c for c in sink_calls if c["step_key"] == "office.gate_exhausted"]
+    assert exhausted, "gate_exhausted step should be emitted"
+    # strong_no_progress fact should be present
+    assert exhausted[0].get("summary_facts", {}).get("strong_no_progress") is True
+
+
 # ---------------------------------------------------------------------------
 # Round 0 — missing plan is repaired by the LLM retry
 # ---------------------------------------------------------------------------

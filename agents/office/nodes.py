@@ -2257,6 +2257,7 @@ def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
         final_report = report
 
     # Exhausted.
+    strong_no_progress = len(no_progress_rounds) >= PLAN_OUTPUT_GATE_NO_PROGRESS_LIMIT
     _steps.emit_validating_plan_output(
         state,
         lifecycle_state=LIFECYCLE_WARNING,
@@ -2272,6 +2273,7 @@ def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
             "unexpected_count": len(report.unexpected),
             "mismatch_count": len(report.mismatches),
             "no_progress_count": len(no_progress_rounds),
+            "strong_no_progress": strong_no_progress,
         },
     )
     _steps.emit_gate_exhausted(
@@ -2281,6 +2283,7 @@ def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
             "no_progress_count": len(no_progress_rounds),
             "missing_count": len(report.missing),
             "unexpected_count": len(report.unexpected),
+            "strong_no_progress": strong_no_progress,
         },
     )
     _write_gate_report(
