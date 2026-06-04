@@ -343,3 +343,22 @@ def test_execute_office_work_organize_uses_bounded_tool(monkeypatch, tmp_path):
     # workspace mode is `<artifacts_dir>/organized-output/files/`.
     assert (ws / "organized-output" / "files" / "organization-plan.md").exists()
     assert _FakeRuntime.last_call is None  # no LLM was called
+
+
+# ---------------------------------------------------------------------------
+# Block 2: dimension-agnostic organize prompt
+# ---------------------------------------------------------------------------
+
+from agents.office.nodes import _build_organize_prompt  # noqa: E402
+
+
+def test_organize_prompt_does_not_reference_primary_entity():
+    text = _build_organize_prompt(["/tmp/x"], "workspace", "/")
+    forbidden = ("primary_entity", "Entity_A", "Entity_B", "by-student", "students/")
+    for phrase in forbidden:
+        assert phrase not in text, f"prompt still references {phrase!r}"
+
+
+def test_organize_prompt_references_the_dimension_tool():
+    text = _build_organize_prompt(["/tmp/x"], "workspace", "/")
+    assert "organize_by_" in text  # at least one dimension tool is named

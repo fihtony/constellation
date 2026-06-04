@@ -1679,7 +1679,7 @@ def _build_organize_prompt(paths: list[str], output_mode: str, source_root: str)
         else
         "3. Write the organization plan using write_file tool to: {source_folder}/organization-plan.md"
     )
-    return f"""Analyze and organize the following folder(s):
+    return f"""Organize the following folder(s):
 
 {paths_list}
 
@@ -1687,45 +1687,42 @@ Source root: {source_root}
 Output mode: {output_mode}
 
 TASK:
-Your goal is to discover meaningful patterns in the file content and structure, then CREATE the organized folder structure in the workspace.
+The user has already chosen a grouping dimension for this task; that
+dimension is recorded in the task metadata. The dimension is one of:
+size, type, created_time, modified_time, accessed_time, filename.
+You MUST use the matching dimension tool to materialize the layout:
+
+- size            -> organize_by_size
+- type            -> organize_by_type
+- created_time    -> organize_by_created_time
+- modified_time   -> organize_by_modified_time
+- accessed_time   -> organize_by_accessed_time
+- filename        -> organize_by_filename
 
 WORKFLOW:
-1. Call organize_folder on each source folder first. Treat its recursive `files` inventory as the authoritative source list.
-2. Review the returned per-file metadata:
-   - Use `primary_entity`, `primary_entity_source`, `primary_entity_confidence`, `inferred_date_bucket`, `prominent_headings`, `labeled_fields`, `suggested_reader_tool`, and `suggested_destination`
-   - Use `entity_counts` and `date_bucket_counts` to sanity-check the overall distribution before copying
-   - If `primary_entity_confidence` is `high`, treat that identity as authoritative
-   - If metadata is ambiguous or missing, inspect representative files with the suggested reader tool
-   - Do NOT infer ownership from assignment titles, book titles, or topic headings
-3. Based on the discovered patterns, determine the BEST grouping strategy:
-   - Choose grouping criteria that meaningfully organizes the files
-   - Examples: by type, by date, by author, by status, by project, by topic, etc.
-4. EXECUTE the organization using organize_move_file tool:
-   - Use mkdir action to create directory structure under `organized-output/files/`
-   - Use copy_file action to copy files to their organized locations under `organized-output/files/`
-   - In workspace mode, pass category-relative destinations such as:
-     `entities/Entity_A/YYYY-MM/source-001.txt`
-     `entities/Entity_B/YYYY-MM/source-014.txt`
-     The tool will place them under `organized-output/files/`
-   - Write the organization plan using write_workspace tool with filename: organization-plan.md
+1. Read the dimension from the task metadata. NEVER invent a different
+   dimension. If the metadata does not name one, return a structured
+   needs_clarification error and stop.
+2. Call the matching `organize_by_*` tool. Pass the source folder and
+   the resolved output_root for `organized-output/files/`.
+3. The tool writes `organization-plan.md` and materializes the layout.
+{write_rules}
 
-CRITICAL: You must USE the organize_move_file tool to actually create the organized folder structure. Do not just write a plan - execute it.
-CRITICAL: A plan-only answer is a failure. The task is complete only if files exist under `organized-output/files/`.
-CRITICAL: Every non-hidden source file from `organize_folder.files` must be copied exactly once. Do not duplicate a source file into multiple destinations.
-CRITICAL: When `primary_entity` or `inferred_date_bucket` is present in the organize_folder metadata, use it in the destination path unless a file inspection proves it is wrong.
-CRITICAL: Never reference or copy a source path that is not present in `organize_folder.files`.
-CRITICAL: If `suggested_destination` is present for a file, use that exact relative destination unless a direct file inspection proves it is wrong.
-CRITICAL: Your final response and the contents of `organization-plan.md` must be in English only.
+CRITICAL: You must USE the dimension tool to actually create the
+organized folder structure. Do not just write a plan - execute it.
+CRITICAL: A plan-only answer is a failure. The task is complete only
+if files exist under `organized-output/files/`.
+CRITICAL: Every non-hidden source file must be copied exactly once.
+Do not duplicate a source file into multiple destinations.
+CRITICAL: Bucket names come from the dimension tool's output; do not
+introduce business-specific folder names (e.g. "students", "by-entity").
 
 OUTPUT FORMAT:
 Write a summary to organization-plan.md explaining:
-# Folder Organization Plan
+# Folder Organization Plan (dimension: <dimension>)
 
-## Discovered Patterns
-What patterns you found in the files.
-
-## Organized Structure Created
-Show the actual directory structure you created under `organized-output/files/`.
+## Bucket rules
+The dimension tool's bucket definitions and thresholds.
 
 ## Files Organized
 MUST include one canonical Markdown table with exactly these two columns:
@@ -1733,11 +1730,12 @@ MUST include one canonical Markdown table with exactly these two columns:
 | --- | --- |
 
 Rules for this table:
-- Include exactly one row per non-hidden source file discovered by `organize_folder.files`
+- Include exactly one row per non-hidden source file
 - `Source Path` must be the source file path relative to the validated source folder
 - `Destination` must be the final relative path under `organized-output/files/`
 - This table is the authoritative plan-output contract used for validation
-- You may add optional explanatory subsections after the canonical table, but do not replace or omit the canonical table
+- You may add optional explanatory subsections after the canonical table,
+  but do not replace or omit the canonical table
 """
 
 
