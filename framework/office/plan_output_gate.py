@@ -212,14 +212,21 @@ def _parse_table_rows(section: str) -> list[list[str]]:
 
 
 def _extract_section(plan_text: str, header: str) -> str:
-    """Return the body of a markdown section whose ``##`` heading matches ``header``."""
+    """Return the body of a markdown section whose ``##`` heading matches ``header``.
+
+    The heading must be an exact, case-insensitive match for ``header`` after
+    stripping the leading ``##`` and surrounding whitespace — substring
+    matching was too loose (e.g. a paragraph mentioning "files were
+    organized" would previously match "files organized").
+    """
     target = header.lower()
     lines = plan_text.splitlines()
     in_section = False
     body: list[str] = []
     for line in lines:
         if line.strip().startswith("##"):
-            in_section = target in line.lower()
+            stripped = line.strip().lstrip("#").strip().lower()
+            in_section = target == stripped
             continue
         if in_section:
             body.append(line)
@@ -246,14 +253,21 @@ def _parse_committed_fields(plan_text: str) -> dict[str, Any]:
 
 
 def _plan_capability_marker(plan_text: str) -> str | None:
-    """Infer which capability the plan's content was written for."""
-    text = plan_text.lower()
-    if "files organized" in text and "source -> summary mapping" not in text:
-        return "organize"
-    if "source -> summary mapping" in text:
-        return "summarize"
-    if "source -> analysis mapping" in text:
-        return "analyze"
+    """Infer which capability the plan's content was written for.
+
+    Only the first ``##``-prefixed heading of the document is considered;
+    later prose that happens to mention a section header is ignored. The
+    heading is matched exactly (case-insensitive) against the
+    capability-specific section header in :data:`_SECTION_HEADERS`.
+    """
+    for line in plan_text.splitlines():
+        if not line.strip().startswith("##"):
+            continue
+        stripped = line.strip().lstrip("#").strip().lower()
+        for capability, header in _SECTION_HEADERS.items():
+            if stripped == header:
+                return capability
+        return None
     return None
 
 
