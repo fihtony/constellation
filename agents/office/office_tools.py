@@ -1601,34 +1601,6 @@ Use organize_folder tool first to survey the folder, then organize_execute_plan 
 
 
 # ---------------------------------------------------------------------------
-# Tool registration
-# ---------------------------------------------------------------------------
-
-_OFFICE_TOOLS = [
-    ReadPdfTool(),
-    ReadDocxTool(),
-    ReadPptxTool(),
-    ReadTxtTool(),
-    ReadCsvTool(),
-    ReadXlsxTool(),
-    ReadXlsTool(),
-    ListDirectoryTool(),
-    WriteWorkspaceTool(),
-    WriteFileTool(),
-    OrganizeFolderTool(),
-    OrganizeMoveFileTool(),
-]
-
-
-def register_office_tools() -> None:
-    """Register office tools into the global ToolRegistry (idempotent)."""
-    from framework.tools.registry import get_registry
-    registry = get_registry()
-    for tool in _OFFICE_TOOLS:
-        registry.register(tool)
-
-
-# ---------------------------------------------------------------------------
 # Delete Output File Tool
 # ---------------------------------------------------------------------------
 
@@ -1703,3 +1675,32 @@ class DeleteOutputFileTool(BaseTool):
         except OSError as exc:
             return ToolResult(output="", error=f"delete_output_file: remove failed: {exc}")
         return ToolResult(output=json.dumps({"deleted": candidate}))
+
+
+# ---------------------------------------------------------------------------
+# Tool registration
+# ---------------------------------------------------------------------------
+
+_OFFICE_TOOLS = [
+    ReadPdfTool(),
+    ReadDocxTool(),
+    ReadPptxTool(),
+    ReadTxtTool(),
+    ReadCsvTool(),
+    ReadXlsxTool(),
+    ReadXlsTool(),
+    ListDirectoryTool(),
+    WriteWorkspaceTool(),
+    WriteFileTool(),
+    OrganizeFolderTool(),
+    OrganizeMoveFileTool(),
+    DeleteOutputFileTool(),
+]
+
+
+def register_office_tools() -> None:
+    """Register office tools into the global ToolRegistry (idempotent)."""
+    from framework.tools.registry import get_registry
+    registry = get_registry()
+    for tool in _OFFICE_TOOLS:
+        registry.register(tool)

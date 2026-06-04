@@ -278,20 +278,6 @@ def receive_task(state: dict) -> dict:
     logger.info(f"receive_task: capability={capability} output_mode={output_mode} paths={source_paths}")
     _task_log(state, "node", "receive_task", capability=capability, output_mode=output_mode, paths=source_paths)
 
-    # Emit the first major-step row: ``office.received``.
-    try:
-        from agents.office import office_steps
-
-        office_steps.emit_received(
-            {
-                **state,
-                "capability": capability,
-                "source_paths": source_paths,
-            }
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("emit_received failed: %s", exc)
-
     return {
         "capability": capability,
         "output_mode": output_mode,
@@ -371,11 +357,19 @@ def analyze_request(state: dict) -> dict:
     logger.info(f"analyze_request: validated_paths={validated_paths} artifacts_dir={artifacts_dir}")
     _task_log(state, "info", "validated office request", validated_paths=validated_paths, artifacts_dir=artifacts_dir)
 
-    # Emit ``office.validating`` to close the validation phase and prepare
-    # for the executing capability row.
+    # Emit ``office.received`` after the initial directory expansion so
+    # folder-backed summarize tasks can report ``folder`` plus the discovered
+    # file count before the execution phase starts.
     try:
         from agents.office import office_steps
 
+        office_steps.emit_received(
+            {
+                **state,
+                "source_paths": source_paths,
+                "discovered_source_count": len(validated_paths),
+            }
+        )
         office_steps.emit_validating(
             {
                 **state,
@@ -719,6 +713,7 @@ def _run_bounded_folder_organize(
         summary=summary,
         raw_output=summary,
         backend_used="bounded-folder-organize",
+        evidence=[{"kind": "organize_inventory", "file_count": len(inventory)}],
     )
 
 
@@ -742,13 +737,6 @@ def _try_bounded_office_flow(
             artifacts_dir=artifacts_dir,
             system_prompt=system_prompt,
         )
-    if capability == "organize" and validated_paths and os.path.isdir(validated_paths[0]):
-        _task_log(state, "info", "using bounded folder organize flow", source_root=validated_paths[0])
-        return _run_bounded_folder_organize(
-            validated_paths,
-            output_mode=output_mode,
-            artifacts_dir=artifacts_dir,
-        )
     return None
 
 
@@ -765,6 +753,7 @@ def _capability_tool_names(capability: str, output_mode: str) -> list[str]:
             "list_directory",
         ]
         tools.append("write_file" if output_mode == "inplace" else "write_workspace")
+        tools.append("delete_output_file")
         return tools
 
     if capability == "summarize":
@@ -779,6 +768,7 @@ def _capability_tool_names(capability: str, output_mode: str) -> list[str]:
             "list_directory",
         ]
         tools.append("write_file" if output_mode == "inplace" else "write_workspace")
+        tools.append("delete_output_file")
         return tools
 
     if capability == "organize":
@@ -795,6 +785,7 @@ def _capability_tool_names(capability: str, output_mode: str) -> list[str]:
             "read_xls",
         ]
         tools.append("write_file" if output_mode == "inplace" else "write_workspace")
+        tools.append("delete_output_file")
         return tools
 
     return []
@@ -841,7 +832,21 @@ def _expected_output_paths(
             expected.append(_target_output_file(output_mode, base_path, artifacts_dir, "combined-summary.md"))
     elif capability == "organize" and validated_paths:
         expected.append(_target_output_file(output_mode, validated_paths[0], artifacts_dir, "organization-plan.md"))
+        expected.append(_organized_output_root(output_mode, artifacts_dir, validated_paths))
     return expected
+
+
+def _organized_output_root(output_mode: str, artifacts_dir: str, source_paths: list[str]) -> str:
+    if output_mode == "workspace":
+        return os.path.join(artifacts_dir, "organized-output", "files")
+    source_root = source_paths[0] if source_paths else ""
+    return os.path.join(source_root, "organized-output", "files")
+
+
+def _count_materialized_files(root: str) -> int:
+    if not root or not os.path.isdir(root):
+        return 0
+    return sum(len(files) for _, _, files in os.walk(root))
 
 
 def _extract_organize_plan_text(raw_output: str) -> str:
@@ -1086,11 +1091,7 @@ def _verify_organize_materialization(output_mode: str, artifacts_dir: str, sourc
     copy operations must exist, and the final filesystem layout must match
     the canonical destinations inferred from the organize inventory.
     """
-    if output_mode == "workspace":
-        root = os.path.join(artifacts_dir, "organized-output", "files")
-    else:
-        source_root = source_paths[0] if source_paths else ""
-        root = os.path.join(source_root, "organized-output", "files")
+    root = _organized_output_root(output_mode, artifacts_dir, source_paths)
     if not os.path.isdir(root):
         return [f"Missing organized output directory: {root}"]
     copied_files: list[str] = []
@@ -1142,10 +1143,7 @@ def _repair_missing_organize_outputs(output_mode: str, artifacts_dir: str, sourc
         return []
 
     source_root = source_paths[0]
-    if output_mode == "workspace":
-        output_root = os.path.join(artifacts_dir, "organized-output", "files")
-    else:
-        output_root = os.path.join(source_root, "organized-output", "files")
+    output_root = _organized_output_root(output_mode, artifacts_dir, source_paths)
     operations_path = os.path.join(artifacts_dir, "operations-plan.json")
     if not os.path.exists(operations_path):
         return []
@@ -1359,6 +1357,7 @@ def execute_office_work(state: dict) -> dict:
                 _task_log(state, "info", "canonicalized summary filenames", repaired_files=len(repaired_paths))
             _ensure_combined_summary_exact_filenames(validated_paths, output_mode, artifacts_dir)
         expected_outputs = _expected_output_paths(capability, validated_paths, output_mode, artifacts_dir)
+        organize_file_count = 0
         if capability == "organize":
             repaired_plan_path = _repair_missing_organize_plan_output(
                 validated_paths,
@@ -1377,6 +1376,9 @@ def execute_office_work(state: dict) -> dict:
                 _task_log(state, "info", "canonicalized organize outputs", repaired_files=len(repaired_paths))
             delivery_errors.extend(_verify_organize_materialization(output_mode, artifacts_dir, validated_paths))
             delivery_ok = not delivery_errors
+            organize_file_count = _count_materialized_files(
+                _organized_output_root(output_mode, artifacts_dir, validated_paths)
+            )
         if not delivery_ok:
             logger.error("execute_office_work: delivery verification failed: %s", "; ".join(delivery_errors))
             return {
@@ -1397,12 +1399,16 @@ def execute_office_work(state: dict) -> dict:
             from agents.office import office_steps
 
             office_steps.emit_capability_completion_rows(
-                {**state, "validated_paths": validated_paths}
+                {
+                    **state,
+                    "validated_paths": validated_paths,
+                    "organize_file_count": organize_file_count,
+                }
             )
             office_steps.emit_writing(
                 state,
                 output_count=len(expected_outputs),
-                file_count=len(validated_paths),
+                file_count=organize_file_count,
                 lifecycle_state="done",
             )
             if capability == "organize":
