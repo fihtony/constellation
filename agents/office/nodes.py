@@ -343,6 +343,23 @@ def analyze_request(state: dict) -> dict:
             if limit_error:
                 return limit_error
 
+    # discovered_source_count: for folder-backed organize input, walk the
+    # folder and count files. For summarize/analyze, use the validated path
+    # count (which is already the discovered file list).
+    discovered_source_count = len(validated_paths)
+    if capability == "organize" and len(validated_paths) == 1:
+        folder = validated_paths[0]
+        if folder and os.path.isdir(folder):
+            total = 0
+            for current_root, dirs, files in os.walk(folder):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                for name in files:
+                    if name.startswith("."):
+                        continue
+                    total += 1
+            if total > 0:
+                discovered_source_count = total
+
     # Check inplace permission
     if output_mode == "inplace":
         allow_inplace = os.environ.get("OFFICE_ALLOW_INPLACE_WRITES", "false").lower()
@@ -375,7 +392,7 @@ def analyze_request(state: dict) -> dict:
             {
                 **state,
                 "source_paths": source_paths,
-                "discovered_source_count": len(validated_paths),
+                "discovered_source_count": discovered_source_count,
             }
         )
         office_steps.emit_validating(
@@ -2317,6 +2334,7 @@ def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
         ),
         summary_facts={
             "plan_status": final_report.plan_status,
+            "invalid_plan_entry_count": len(final_report.invalid_plan_entries),
             "round_count": retry_count,
             "missing_count": len(final_report.missing),
             "unexpected_count": len(final_report.unexpected),
@@ -2329,6 +2347,8 @@ def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
         state,
         round_count=retry_count,
         summary_facts={
+            "plan_status": final_report.plan_status,
+            "invalid_plan_entry_count": len(final_report.invalid_plan_entries),
             "no_progress_count": len(no_progress_rounds),
             "missing_count": len(final_report.missing),
             "unexpected_count": len(final_report.unexpected),
