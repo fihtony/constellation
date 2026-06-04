@@ -1318,6 +1318,42 @@ def execute_office_work(state: dict) -> dict:
     source_root = os.environ.get("OFFICE_SOURCE_ROOT", "")
 
     if capability == "organize":
+        dimension = state.get("organize_dimension", "")
+        if dimension:
+            from agents.office.organize_by_dimension import run_dimension_tool
+            try:
+                output_root = _organized_output_root(output_mode, artifacts_dir, validated_paths)
+            except NameError:
+                # Fall back to artifacts_dir for the workspace case.
+                output_root = artifacts_dir
+            dim_result = run_dimension_tool(
+                dimension,
+                validated_paths[0] if validated_paths else "",
+                output_root,
+            )
+            if not dim_result.success:
+                return {
+                    "summary": f"office dimension tool failed: {dim_result.error}",
+                    "success": False,
+                    "capability": capability,
+                    "status": "failed",
+                    "raw_output": "",
+                    "warnings": [dim_result.error or "unknown dimension-tool error"],
+                    "error": dim_result.error,
+                }
+            return {
+                "summary": (
+                    f"Office organized files with the dimension tool "
+                    f"({dimension})."
+                ),
+                "success": True,
+                "capability": capability,
+                "status": "completed",
+                "raw_output": dim_result.output or "",
+                "expected_outputs": _expected_output_paths(
+                    capability, validated_paths, output_mode, artifacts_dir
+                ),
+            }
         prompt = _build_organize_prompt(validated_paths, output_mode, source_root)
     elif capability == "summarize":
         prompt = _build_summarize_prompt(validated_paths, output_mode, source_root)

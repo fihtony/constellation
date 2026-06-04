@@ -300,3 +300,46 @@ def test_analyze_request_passes_through_non_organize(monkeypatch, tmp_path):
     out = analyze_request(state)
     # summarize path keeps its own validation; we just confirm no clarification fires.
     assert "needs_clarification" not in out
+
+
+# ---------------------------------------------------------------------------
+# Block 2: execute_office_work bounded dimension tool path
+# ---------------------------------------------------------------------------
+
+from agents.office.nodes import execute_office_work  # noqa: E402
+
+
+class _FakeRuntime:
+    last_call = None
+
+    def run_agentic(self, *args, **kwargs):
+        _FakeRuntime.last_call = (args, kwargs)
+        from framework.runtime.adapter import AgenticResult
+        return AgenticResult(success=False, summary="should not be called", backend_used="fake")
+
+
+def test_execute_office_work_organize_uses_bounded_tool(monkeypatch, tmp_path):
+    """When the dimension is set, the bounded tool is invoked; no LLM call."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_bytes(b"x" * 10)
+    (src / "b.txt").write_bytes(b"x" * 1000)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    state = {
+        "capability": "organize",
+        "validated_paths": [str(src)],
+        "output_mode": "workspace",
+        "artifacts_dir": str(ws),
+        "workspace_root": str(ws),
+        "organize_dimension": "size",
+        "_runtime": _FakeRuntime(),
+        "_plugin_manager": None,
+    }
+    _FakeRuntime.last_call = None
+    out = execute_office_work(state)
+    assert out["success"] is True
+    # The bounded path must materialize the plan; output_root for
+    # workspace mode is `<artifacts_dir>/organized-output/files/`.
+    assert (ws / "organized-output" / "files" / "organization-plan.md").exists()
+    assert _FakeRuntime.last_call is None  # no LLM was called
