@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from framework.office.path_safety import validate_relative_path_syntax
+from framework.office.path_safety import is_within_root, validate_relative_path_syntax
 
 
 # ---------------------------------------------------------------------------
@@ -529,19 +529,10 @@ def walk_output(output_root: str, *, allowlist: set[str] | frozenset[str] | None
                 continue
             full = os.path.join(current_root, name)
             try:
-                stat = os.path.getsize(full)
-            except OSError:
-                continue
-            if stat == 0:
-                continue
-            # chase symlinks; record escapes so the gate can flag them
-            real = os.path.realpath(full)
-            real_root = os.path.realpath(output_root)
-            try:
                 rel = os.path.relpath(full, output_root).replace(os.sep, "/")
             except ValueError:
                 rel = name
-            if not (real == real_root or real.startswith(real_root.rstrip(os.sep) + os.sep)):
+            if not is_within_root(output_root, full):
                 out.add(rel)
                 continue
             if _is_ancillary(rel, frozen):
@@ -600,12 +591,17 @@ def diff(
     )
 
 
-def run(contract: OutputContract, *, expanded_file_list: Iterable[str] | None = None) -> GateReport:
+def run(
+    contract: OutputContract,
+    *,
+    expanded_file_list: Iterable[str] | None = None,
+    validated_source_roots: Iterable[str] | None = None,
+) -> GateReport:
     """Run the full gate: parse the plan, walk the output, diff."""
     status, invalid_entries, entries, committed, error = parse_plan_with_status(
         contract.capability,
         contract.plan_path,
-        validated_source_roots=None,
+        validated_source_roots=validated_source_roots,
         expanded_file_list=expanded_file_list,
         source_count=contract.source_count,
     )
