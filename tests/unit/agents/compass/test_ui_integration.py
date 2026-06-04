@@ -97,6 +97,41 @@ class TestUIRoutes:
         assert data["artifacts"][0]["metadata"]["summary"] == "Analysis complete. The report has been written to the workspace."
         assert data["artifacts"][0]["metadata"]["deliveryReportPath"] == "artifacts/task-1/office/task-report.json"
 
+    def test_completed_with_warning_serializes_warning_status_kind(self, task_store):
+        from framework.a2a.protocol import Artifact
+
+        task = task_store.create_task(
+            agent_id="compass",
+            metadata={
+                "task_type": "office",
+                "chat_history": [{"role": "AGENT", "text": "Completed with warnings.", "tone": "warning"}],
+            },
+        )
+        task_store.complete_task(task.id, message="Completed with warnings.")
+        task_store.set_artifacts(
+            task.id,
+            [
+                Artifact(
+                    name="compass-response",
+                    artifact_type="text/plain",
+                    parts=[{"text": "Completed with warnings."}],
+                    metadata={
+                        "status": "completed_with_warning",
+                        "warnings_count": 1,
+                        "summary": "Completed with warnings.",
+                    },
+                )
+            ],
+        )
+
+        result = handle_ui_request("GET", f"/tasks/{task.id}", task_store=task_store)
+
+        assert result["status"] == 200
+        data = result["body"]
+        assert data["status"] == "warning"
+        assert data["statusKind"] == "warning"
+        assert data["statusState"] == "TASK_STATE_COMPLETED"
+
     def test_ui_events_route_exists(self, task_store):
         result = handle_ui_request("GET", "/ui/events", task_store=task_store)
         assert result["status"] == 200

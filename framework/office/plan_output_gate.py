@@ -224,9 +224,12 @@ def _extract_section(plan_text: str, header: str) -> str:
     in_section = False
     body: list[str] = []
     for line in lines:
-        if line.strip().startswith("##"):
-            stripped = line.strip().lstrip("#").strip().lower()
-            in_section = target == stripped
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            heading = stripped[3:].strip().lower()
+            if in_section and heading != target:
+                break
+            in_section = target == heading
             continue
         if in_section:
             body.append(line)
@@ -302,8 +305,10 @@ def _is_under_validated_source(source_path: str, validated_roots: set[str]) -> b
     if not validated_roots:
         return True
     try:
-        real = os.path.realpath(os.path.abspath(source_path))
+        real = _resolve_source_path_within_validated_roots(source_path, validated_roots)
     except OSError:
+        return False
+    if not real:
         return False
     for root in validated_roots:
         if real == root or real.startswith(root.rstrip(os.sep) + os.sep):
@@ -315,25 +320,162 @@ def _split_first_two_cells(cells: list[str]) -> tuple[str, str]:
     return (cells[0], cells[1]) if len(cells) >= 2 else ("", "")
 
 
+def _resolve_source_path_within_validated_roots(
+    source_path: str,
+    validated_roots: set[str],
+) -> str:
+    source_text = str(source_path or "").strip()
+    if not source_text:
+        return ""
+    try:
+        if os.path.isabs(source_text):
+            real = os.path.realpath(os.path.abspath(source_text))
+            return real if any(
+                real == root or real.startswith(root.rstrip(os.sep) + os.sep)
+                for root in validated_roots
+            ) else ""
+        normalized = source_text.replace("\\", "/").lstrip("./")
+        for root in validated_roots:
+            candidate = os.path.realpath(os.path.join(root, normalized))
+            if candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep):
+                return candidate
+    except OSError:
+        return ""
+    return ""
+
+
+def _is_source_header_cell(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized == "source" or normalized.startswith("source ")
+
+
+def _parse_combined_summary_target(plan_text: str) -> str:
+    section = _extract_section(plan_text, "combined summary")
+    for line in section.splitlines():
+        text = line.strip()
+        if text.startswith("- "):
+            text = text[2:].strip()
+        key, sep, value = text.partition(":")
+        if sep and key.strip().lower() == "combined_summary_target":
+            return value.strip()
+    return ""
+
+
+def _extract_group_destination_prefix(title: str) -> str:
+    text = str(title or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+\([^)]*\)\s*$", "", text).strip()
+    return text.rstrip("/").replace("\\", "/")
+
+
+def _parse_organize_mapping_table(section: str) -> list[GateEntry]:
+    entries: list[GateEntry] = []
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for raw in section.splitlines():
+        line = raw.strip()
+        if line.startswith("|"):
+            current.append(raw)
+            continue
+        if current:
+            blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+
+    for block in blocks:
+        rows = _parse_table_rows("\n".join(block))
+        if len(rows) < 2:
+            continue
+        header = [str(cell or "").strip().lower() for cell in rows[0]]
+        if len(header) < 2:
+            continue
+        if not _is_source_header_cell(header[0]):
+            continue
+        if not header[1].startswith("destination"):
+            continue
+        for cells in rows[1:]:
+            source, target = _split_first_two_cells(cells)
+            if not source and not target:
+                continue
+            entries.append(GateEntry(source_path=source, expected_path=target))
+    return entries
+
+
+def _parse_grouped_organize_rows(section: str) -> list[GateEntry]:
+    entries: list[GateEntry] = []
+    lines = section.splitlines()
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if not stripped.startswith("### "):
+            index += 1
+            continue
+        prefix = _extract_group_destination_prefix(stripped[4:])
+        index += 1
+        table_lines: list[str] = []
+        while index < len(lines):
+            current = lines[index].strip()
+            if current.startswith("### ") or current.startswith("## "):
+                break
+            if current.startswith("|"):
+                table_lines.append(lines[index])
+            elif table_lines:
+                break
+            index += 1
+        if not prefix or not table_lines:
+            continue
+        rows = _parse_table_rows("\n".join(table_lines))
+        if len(rows) < 2:
+            continue
+        header = [str(cell or "").strip().lower() for cell in rows[0]]
+        file_idx = next((i for i, cell in enumerate(header) if cell.startswith("file")), -1)
+        source_idx = next((i for i, cell in enumerate(header) if _is_source_header_cell(cell)), -1)
+        if file_idx < 0 or source_idx < 0:
+            continue
+        for cells in rows[1:]:
+            file_name = cells[file_idx].strip() if len(cells) > file_idx else ""
+            source = cells[source_idx].strip() if len(cells) > source_idx else ""
+            if not file_name and not source:
+                continue
+            target = "/".join(part for part in (prefix, file_name.replace("\\", "/").lstrip("/")) if part)
+            entries.append(GateEntry(source_path=source, expected_path=target))
+    return entries
+
+
 def _parse_plan_rows(capability: str, plan_text: str) -> tuple[list[GateEntry], dict[str, Any]]:
     section = _extract_section(plan_text, _SECTION_HEADERS[capability])
-    rows = _parse_table_rows(section)
     entries: list[GateEntry] = []
-    data_rows = [r for r in rows if r and r[0].lower() != "source"]
-    for cells in data_rows:
-        source, target = _split_first_two_cells(cells)
-        if not source and not target:
-            continue
-        extras: dict[str, Any] = {}
-        if capability == "summarize":
-            extras["summary_target"] = target
-            expected = target
-        elif capability == "analyze":
-            extras["analysis_target"] = target
-            expected = target
-        else:
-            expected = target
-        entries.append(GateEntry(source_path=source, expected_path=expected, extras=extras))
+    rows = _parse_table_rows(section)
+    if capability == "organize":
+        entries = _parse_organize_mapping_table(section)
+        if not entries:
+            entries = _parse_grouped_organize_rows(section)
+    else:
+        data_rows = [r for r in rows if r and not _is_source_header_cell(r[0])]
+        for cells in data_rows:
+            source, target = _split_first_two_cells(cells)
+            if not source and not target:
+                continue
+            extras: dict[str, Any] = {}
+            if capability == "summarize":
+                extras["summary_target"] = target
+                expected = target
+            else:
+                extras["analysis_target"] = target
+                expected = target
+            entries.append(GateEntry(source_path=source, expected_path=expected, extras=extras))
+    if capability == "summarize":
+        combined_target = _parse_combined_summary_target(plan_text)
+        if combined_target:
+            entries.append(
+                GateEntry(
+                    source_path="",
+                    expected_path=combined_target,
+                    extras={"combined_summary": True},
+                )
+            )
     committed = _parse_committed_fields(plan_text) if capability == "analyze" else {}
     return entries, committed
 

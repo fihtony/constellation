@@ -99,7 +99,7 @@ def _state(
 def test_clean_first_pass_emits_done_step(task_artifacts):
     artifacts, workspace = task_artifacts
     # Workspace mode: plan and output both live under artifacts_dir.
-    plan_path = artifacts / "organization-plan.md"
+    plan_path = artifacts / "organized-output" / "files" / "organization-plan.md"
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(
         "# Plan\n## Files Organized\n"
@@ -133,7 +133,7 @@ def test_clean_first_pass_emits_done_step(task_artifacts):
 def test_mismatch_triggers_retry_and_emits_warning(task_artifacts):
     artifacts, workspace = task_artifacts
     # Workspace mode: plan lives under artifacts_dir.
-    plan_path = artifacts / "organization-plan.md"
+    plan_path = artifacts / "organized-output" / "files" / "organization-plan.md"
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(
         "# Plan\n## Files Organized\n"
@@ -177,7 +177,7 @@ def test_mismatch_triggers_retry_and_emits_warning(task_artifacts):
 
 def test_exhausted_emits_gate_exhausted_step(task_artifacts):
     artifacts, workspace = task_artifacts
-    plan_path = artifacts / "organization-plan.md"
+    plan_path = artifacts / "organized-output" / "files" / "organization-plan.md"
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(
         "# Plan\n## Files Organized\n"
@@ -212,7 +212,7 @@ def test_exhausted_emits_gate_exhausted_step(task_artifacts):
 def test_two_consecutive_no_progress_rounds_emits_strong_warning(task_artifacts):
     """When multiple rounds make no progress, the gate_exhausted step should carry strong_no_progress=True."""
     artifacts, workspace = task_artifacts
-    plan_path = artifacts / "organization-plan.md"
+    plan_path = artifacts / "organized-output" / "files" / "organization-plan.md"
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(
         "# Plan\n## Files Organized\n| source | destination |\n| --- | --- |\n| /src/a.txt | files/a.txt |\n",
@@ -305,7 +305,8 @@ def test_invalid_plan_exhausted_summary_surfaces_reason(task_artifacts):
     nested.mkdir(parents=True)
     (nested / "alpha.txt").write_text("alpha", encoding="utf-8")
 
-    plan = artifacts / "organization-plan.md"
+    plan = artifacts / "organized-output" / "files" / "organization-plan.md"
+    plan.parent.mkdir(parents=True, exist_ok=True)
     plan.write_text(
         "# Folder Organization Plan\n"
         "## Files Organized\n"
@@ -335,10 +336,13 @@ def test_invalid_plan_exhausted_summary_surfaces_reason(task_artifacts):
     ]
     assert warning_rows
     final_warning = warning_rows[-1]
-    assert "plan is {plan_status}" in final_warning["summary_template"]
     assert final_warning["summary_facts"]["plan_status"] == "invalid"
     assert final_warning["summary_facts"]["invalid_plan_entry_count"] >= 1
-    assert "outside validated set" in final_warning["summary_facts"]["plan_status_reason"]
+    # Spec §5.8: the gate-exhausted template mentions plan-output-gate-report.json
+    assert "plan-output-gate-report.json" in final_warning["summary_template"]
+    # The template reports the discrepancy counts
+    assert "{missing_count}" in final_warning["summary_template"]
+    assert "{round_count}" in final_warning["summary_template"]
 
 
 def test_invalid_existing_plan_can_be_rewritten_during_retry(task_artifacts):
@@ -391,7 +395,7 @@ def test_invalid_existing_plan_can_be_rewritten_during_retry(task_artifacts):
 def test_retry_call_passes_tool_allowlist_and_system_prompt(task_artifacts, monkeypatch):
     """The retry runtime call must mirror execute_office_work's tool/system_prompt/max_turns constraints."""
     artifacts, workspace = task_artifacts
-    plan_path = artifacts / "organization-plan.md"
+    plan_path = artifacts / "organized-output" / "files" / "organization-plan.md"
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(
         "# Plan\n## Files Organized\n| source | destination |\n| --- | --- |\n| /src/a.txt | files/a.txt |\n",
@@ -516,7 +520,7 @@ def test_escape_untrusted_line_rejects_full_c0_range():
 def test_plan_modified_during_retry_triggers_revert_even_if_status_changed(task_artifacts):
     """If the LLM modifies the plan such that parse_plan would now return non-ok, the orchestrator still reverts."""
     artifacts, workspace = task_artifacts
-    plan_path = artifacts / "organization-plan.md"
+    plan_path = artifacts / "organized-output" / "files" / "organization-plan.md"
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     original = "# Plan\n## Files Organized\n| source | destination |\n| --- | --- |\n| /src/a.txt | files/a.txt |\n"
     plan_path.write_text(original, encoding="utf-8")
@@ -532,7 +536,9 @@ def test_plan_modified_during_retry_triggers_revert_even_if_status_changed(task_
     _run_plan_output_gate(state, runtime=runtime)
     # The plan should have been reverted to the original (3 retries × 1 revert each)
     # After 3 reverts, the plan is still the original
-    assert plan_path.read_text(encoding="utf-8") == original
+    content = plan_path.read_bytes()
+    content.decode("utf-8")  # must be valid UTF-8 (revert restored the original)
+    assert content.decode("utf-8") == original
 
 
 # ---------------------------------------------------------------------------

@@ -331,6 +331,59 @@ def test_parse_plan_source_outside_validated_set_is_invalid(tmp_path):
     assert "outside" in error.lower() or any("outside" in e for e in _invalid)
 
 
+def test_parse_plan_organize_accepts_relative_source_paths_within_validated_root(tmp_path):
+    source_root = tmp_path / "source"
+    nested = source_root / "nested"
+    nested.mkdir(parents=True)
+    (nested / "alpha.txt").write_text("alpha", encoding="utf-8")
+    plan = """## Files Organized
+| Source Path | Destination |
+| --- | --- |
+| nested/alpha.txt | files/by-topic/alpha.txt |
+"""
+    plan_path = _write(tmp_path, "organization-plan.md", plan)
+    status, invalid_entries, entries, _committed, error = parse_plan_with_status(
+        "organize",
+        plan_path,
+        validated_source_roots=[str(source_root)],
+        source_count=1,
+    )
+    assert status == "ok"
+    assert invalid_entries == []
+    assert error == ""
+    assert len(entries) == 1
+    assert entries[0].expected_path == "files/by-topic/alpha.txt"
+
+
+def test_parse_plan_organize_accepts_grouped_tables_under_subheadings(tmp_path):
+    source_root = tmp_path / "source"
+    dated = source_root / "0103"
+    dated.mkdir(parents=True)
+    (dated / "2.txt").write_text("alpha", encoding="utf-8")
+    plan = """# Folder Organization Plan
+
+## Files Organized
+
+### small/ (< 3,500 bytes)
+| File | Size | Source |
+| --- | --- | --- |
+| 0103-2.txt | 2396 | 0103/2.txt |
+"""
+    plan_path = _write(tmp_path, "organization-plan.md", plan)
+    status, invalid_entries, entries, _committed, error = parse_plan_with_status(
+        "organize",
+        plan_path,
+        validated_source_roots=[str(source_root)],
+        source_count=1,
+    )
+    assert status == "ok"
+    assert invalid_entries == []
+    assert error == ""
+    assert len(entries) == 1
+    assert entries[0].source_path == "0103/2.txt"
+    assert entries[0].expected_path == "small/0103-2.txt"
+
+
 def test_parse_plan_folder_source_not_expanded_is_invalid(tmp_path):
     plan = """## Source -> Summary Mapping
 | source | summary_target |

@@ -30,6 +30,7 @@ def render_chat_message(role: str, text: str, style: str = "normal") -> str:
         "input-required": "waiting",
         "failed": "failed",
         "completed": "completed",
+        "warning": "warning",
     }.get(style, "")
     classes = f"bubble {bubble_class} {style_class}".strip()
     return (
@@ -49,6 +50,7 @@ def render_task_tab(task_id: str, status: str, summary: str = "") -> str:
         "active": "In Progress",
         "waiting": "Waiting for Input",
         "completed": "Completed",
+        "warning": "Completed with Warnings",
         "failed": "Failed",
     }.get(status, "In Progress")
     safe_status = html.escape(status or "active")
@@ -319,6 +321,11 @@ body {
   border-color: var(--dev-card-border);
   box-shadow: inset 0 0 0 1px var(--dev-card-glow);
 }
+.task-item[data-status="warning"] {
+  background: linear-gradient(180deg, rgba(112, 89, 26, 0.88), rgba(62, 48, 17, 0.95));
+  border-color: rgba(245, 196, 86, 0.34);
+  box-shadow: inset 0 0 0 1px rgba(255, 232, 173, 0.08), inset 3px 0 0 rgba(245, 196, 86, 0.24);
+}
 .task-item-head {
   display: flex;
   align-items: flex-start;
@@ -404,6 +411,7 @@ body {
 .status-pill.active   { color: #effbfd; border-color: rgba(123, 220, 239, 0.58); background: rgba(34, 147, 173, 0.84); box-shadow: inset 0 0 0 1px rgba(224, 248, 252, 0.1); }
 .status-pill.waiting  { color: #fff7e2; border-color: rgba(255, 221, 118, 0.56); background: rgba(212, 152, 36, 0.8); box-shadow: inset 0 0 0 1px rgba(255, 244, 210, 0.12); }
 .status-pill.completed{ color: #e4ffef; border-color: rgba(125, 229, 171, 0.54); background: rgba(43, 141, 93, 0.82); }
+.status-pill.warning  { color: #fff5d1; border-color: rgba(245, 196, 86, 0.56); background: rgba(168, 126, 24, 0.84); box-shadow: inset 0 0 0 1px rgba(255, 244, 210, 0.12); }
 .status-pill.failed   { color: #ffe6e6; border-color: rgba(255, 153, 153, 0.52); background: rgba(170, 49, 49, 0.82); }
 .wait-badge {
   position: absolute; top: 10px; right: 10px;
@@ -452,6 +460,7 @@ body {
 }
 .bubble.agent { border-left: 3px solid var(--accent); }
 .bubble.waiting { border-left: 4px solid var(--wait-ink); background: var(--wait-bg); }
+.bubble.warning { border-left: 4px solid var(--wait-ink); background: var(--wait-bg); }
 .bubble.failed  { border-left: 4px solid var(--error-ink); background: var(--error-bg); }
 .bubble.completed { border-left: 4px solid var(--ok-ink); background: var(--ok-bg); }
 .bubble-meta {
@@ -528,6 +537,11 @@ body {
     linear-gradient(180deg, rgba(22, 56, 39, 0.9), rgba(14, 29, 23, 0.94));
   border-color: rgba(121, 224, 166, 0.16);
 }
+.detail-card.spotlight.warning {
+  background:
+    linear-gradient(180deg, rgba(114, 88, 23, 0.92), rgba(48, 36, 13, 0.96));
+  border-color: rgba(245, 196, 86, 0.24);
+}
 .detail-card.spotlight.failed {
   background:
     linear-gradient(180deg, rgba(58, 20, 20, 0.92), rgba(30, 13, 13, 0.96));
@@ -586,6 +600,7 @@ body {
 .detail-card.spotlight .status-pill.active   { background: var(--progress-bg); color: var(--progress-ink); }
 .detail-card.spotlight .status-pill.waiting  { background: var(--wait-bg);     color: var(--wait-ink); }
 .detail-card.spotlight .status-pill.completed{ background: var(--ok-bg);       color: var(--ok-ink); }
+.detail-card.spotlight .status-pill.warning  { background: var(--wait-bg);     color: var(--wait-ink); }
 .detail-card.spotlight .status-pill.failed   { background: var(--error-bg);    color: var(--error-ink); }
 .detail-badge-row {
   display: flex;
@@ -1334,7 +1349,7 @@ _INLINE_JS = r"""
 
   function taskNeedsResume(task) {
     if (!task) return false;
-    const kind = statusKindOf(task.statusState || task.status);
+    const kind = taskStatusKind(task);
     if (kind === 'waiting') return true;
     const metadata = task.metadata || {};
     if (metadata && metadata._interrupt) return true;
@@ -1546,6 +1561,8 @@ _INLINE_JS = r"""
   }
   function statusKindOf(st) {
     return ({
+      'warning': 'warning',
+      'completed_with_warning': 'warning',
       'TASK_STATE_COMPLETED': 'completed',
       'TASK_STATE_FAILED':    'failed',
       'TASK_STATE_INPUT_REQUIRED': 'waiting',
@@ -1553,13 +1570,23 @@ _INLINE_JS = r"""
       'TASK_STATE_SUBMITTED': 'active',
     })[st] || 'active';
   }
+  function taskStatusKind(task) {
+    if (!task) return 'active';
+    const explicit = String(task.statusKind || task.status || '').trim();
+    if (explicit) {
+      const normalized = statusKindOf(explicit);
+      if (normalized !== 'active' || explicit.toLowerCase() === 'active') return normalized;
+    }
+    return statusKindOf(task.statusState);
+  }
   function statusLabel(kind) {
     return ({ active:'In Progress', waiting:'Waiting for Input',
-              completed:'Completed', failed:'Failed' })[kind] || 'In Progress';
+              completed:'Completed', warning:'Completed with Warnings', failed:'Failed' })[kind] || 'In Progress';
   }
   function nextActionForTask(task, kind) {
     if (kind === 'waiting') return `Reply in chat to resume ${task.task_id}.`;
     if (kind === 'failed') return 'Inspect the latest logs and retry after correcting the failing step.';
+    if (kind === 'warning') return 'Review the warnings and decide whether a follow-up fix or rerun is needed.';
     if (kind === 'completed') return 'Review the output and decide whether any follow-up work is needed.';
     return 'Monitor the active major step and use the log stream for live execution detail.';
   }
@@ -1769,10 +1796,10 @@ _INLINE_JS = r"""
     const tasks = Object.values(state.tasks);
     const totals = {
       total: tasks.length,
-      waiting: tasks.filter(t => statusKindOf(t.statusState || t.status) === 'waiting').length,
-      active: tasks.filter(t => statusKindOf(t.statusState || t.status) === 'active').length,
-      completed: tasks.filter(t => statusKindOf(t.statusState || t.status) === 'completed').length,
-      failed: tasks.filter(t => statusKindOf(t.statusState || t.status) === 'failed').length,
+      waiting: tasks.filter(t => taskStatusKind(t) === 'waiting').length,
+      active: tasks.filter(t => taskStatusKind(t) === 'active').length,
+      completed: tasks.filter(t => taskStatusKind(t) === 'completed' || taskStatusKind(t) === 'warning').length,
+      failed: tasks.filter(t => taskStatusKind(t) === 'failed').length,
     };
     const mappings = [
       ['#dashboard-total', totals.total],
@@ -2080,7 +2107,7 @@ _INLINE_JS = r"""
     </div>`;
     for (const tid of orderedTaskIds()) {
       const t = state.tasks[tid]; if (!t) continue;
-      const kind = statusKindOf(t.statusState || t.status);
+      const kind = taskStatusKind(t);
       const isActive = tid === state.selectedTaskId;
       const taskType = taskTypeOf(t);
       const typeLabel = esc(taskTypeLabel(t));
@@ -2133,7 +2160,7 @@ _INLINE_JS = r"""
   function selectLatestWaitingTask() {
     const waitingId = orderedTaskIds().find(id => {
       const t = state.tasks[id];
-      return t && statusKindOf(t.statusState || t.status) === 'waiting';
+      return t && taskStatusKind(t) === 'waiting';
     });
     if (!waitingId) return;
     if (waitingId === state.selectedTaskId) return;
@@ -2179,7 +2206,7 @@ _INLINE_JS = r"""
         const role = (entry.role || 'agent').toLowerCase();
         const tone = entry.tone || (entry.style || 'normal');
         const cls = role === 'user' ? 'user' : 'agent';
-        const styleCls = ({ waiting:'waiting','input-required':'waiting',failed:'failed',completed:'completed'})[tone] || '';
+        const styleCls = ({ waiting:'waiting','input-required':'waiting',failed:'failed',completed:'completed',warning:'warning'})[tone] || '';
         const alignClass = cls === 'user' ? 'user' : 'agent';
         return `<div class="chat-entry ${alignClass}">
           <div class="bubble ${cls} ${styleCls}">
@@ -2202,7 +2229,7 @@ _INLINE_JS = r"""
       return;
     }
 
-    const kind = statusKindOf(t.statusState || t.status);
+    const kind = taskStatusKind(t);
     const isWaiting = kind === 'waiting';
     composerInput.disabled = false;
     composerSend.textContent = 'Send';
@@ -2432,7 +2459,7 @@ _INLINE_JS = r"""
       const errorText = latestError || String(meta.message || '').trim() || statusMessage || artifactSummary || metadataSummary || summary || currentStep || 'Task failed without a detailed error message.';
       return { label: 'Error Summary', text: errorText };
     }
-    if (kind !== 'completed') {
+    if (kind !== 'completed' && kind !== 'warning') {
       return null;
     }
     const lines = [];
@@ -2511,7 +2538,7 @@ _INLINE_JS = r"""
     // ``__optimistic_*`` id — show a friendly pending label instead so the
     // detail panel does not look like the user is looking at a real task.
     const isOptimisticPlaceholder = t.optimistic === true;
-    const kind = statusKindOf(t.statusState || t.status);
+    const kind = taskStatusKind(t);
     const steps = mergedProgressSignals(t);
     const currentStep = t.currentMajorStep || currentStepFromLogs(t) || (steps.length ? steps[steps.length-1].text : '');
     const majorTimeline = deriveMajorTimeline(t);
@@ -2729,7 +2756,7 @@ _INLINE_JS = r"""
       await loadTaskDetail(tid);
       ticks++;
       const t = state.tasks[tid];
-      const kind = statusKindOf(t && (t.statusState || t.status));
+    const kind = taskStatusKind(t);
       if (kind === 'completed' || kind === 'failed') {
         return { reachedTerminal: true, kind, ticks };
       }

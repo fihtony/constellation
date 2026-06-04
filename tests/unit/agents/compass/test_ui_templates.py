@@ -511,7 +511,15 @@ class TestCompassUITemplates:
     def test_render_ui_uses_semantic_spotlight_backgrounds(self):
         html = render_compass_ui()
         assert ".detail-card.spotlight.completed {" in html
+        assert ".detail-card.spotlight.warning {" in html
         assert ".detail-card.spotlight.failed {" in html
+
+    def test_render_ui_includes_warning_task_styles(self):
+        html = render_compass_ui()
+        assert '.task-item[data-status="warning"] {' in html
+        assert ".status-pill.warning" in html
+        assert "warning:'Completed with Warnings'" in html
+        assert "function taskStatusKind(task)" in html
 
     def test_render_ui_renders_completion_summary_as_markdown(self):
         """The completion summary should be HTML-rendered via a markdown helper."""

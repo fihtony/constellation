@@ -28,9 +28,46 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _task_has_warning(task) -> bool:
+    metadata = getattr(task, "metadata", {}) or {}
+    if str(metadata.get("status", "")).strip().lower() == "completed_with_warning":
+        return True
+    try:
+        if int(metadata.get("warnings_count", 0) or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    rows = metadata.get("major_step_rows") or {}
+    for row in rows.values():
+        lifecycle = str((row or {}).get("lifecycle_state", "")).strip().lower()
+        visual = str((row or {}).get("visual_state", "")).strip().lower()
+        if lifecycle == "warning" or visual == "warning":
+            return True
+
+    for artifact in getattr(task, "artifacts", []) or []:
+        artifact_meta = getattr(artifact, "metadata", {}) or {}
+        if str(artifact_meta.get("status", "")).strip().lower() == "completed_with_warning":
+            return True
+        try:
+            if int(artifact_meta.get("warnings_count", 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    history = metadata.get("chat_history") or []
+    for entry in reversed(history):
+        if str((entry or {}).get("tone", "")).strip().lower() == "warning":
+            return True
+    return False
+
+
 def _ui_status_kind(task) -> str:
     raw = getattr(getattr(task, "status", None), "state", "")
     value = getattr(raw, "value", raw)
+    normalized = str(value).strip().lower()
+    if normalized in {"warning", "completed_with_warning"}:
+        return "warning"
     mapping = {
         "TASK_STATE_COMPLETED": "completed",
         "TASK_STATE_FAILED": "failed",
@@ -38,7 +75,10 @@ def _ui_status_kind(task) -> str:
         "TASK_STATE_WORKING": "active",
         "TASK_STATE_SUBMITTED": "active",
     }
-    return mapping.get(str(value), "active")
+    resolved = mapping.get(str(value), "active")
+    if resolved == "completed" and _task_has_warning(task):
+        return "warning"
+    return resolved
 
 
 def _task_summary(task) -> str:
