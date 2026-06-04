@@ -693,11 +693,11 @@ def _build_organization_plan_text(
     inventory: list[dict[str, Any]],
     output_root: str,
 ) -> str:
-    entity_counts: dict[str, int] = {}
+    category_counts: dict[str, int] = {}
     files_section: list[str] = []
     for item in inventory:
-        entity = _optional_safe_path_segment(item.get("primary_entity")) or "unclassified"
-        entity_counts[entity] = entity_counts.get(entity, 0) + 1
+        category = str(item.get("category") or "").strip() or "unclassified"
+        category_counts[category] = category_counts.get(category, 0) + 1
         src_rel = str(item.get("relative_path") or "")
         dst_rel = os.path.relpath(_canonical_organize_destination(output_root, item), output_root)
         files_section.append(f"| {src_rel} | {dst_rel} |")
@@ -707,9 +707,9 @@ def _build_organization_plan_text(
         "",
         "## Discovered Patterns",
         f"- Total source files: {len(inventory)}",
-        f"- Entity buckets discovered: {len(entity_counts)}",
+        f"- Extension buckets: {len(category_counts)}",
     ]
-    lines.extend(f"- {entity}: {count} file(s)" for entity, count in sorted(entity_counts.items()))
+    lines.extend(f"- {category}: {count} file(s)" for category, count in sorted(category_counts.items()))
     lines.extend(
         [
             "",
@@ -1120,24 +1120,27 @@ def _optional_safe_path_segment(value: Any) -> str:
 
 
 def _canonical_organize_destination(output_root: str, item: dict[str, Any]) -> str:
+    """Resolve a canonical destination for one source file.
+
+    Honours an explicit ``suggested_destination`` written by the bounded
+    dimension tool. Falls back to a single-bucket layout
+    ``<output_root>/<relative_path>`` when no suggestion is present.
+    Never invents a business-specific bucket (no entity / category /
+    date inference).
+    """
     suggested = str(item.get("suggested_destination") or "").strip()
     if suggested:
-        segments = [segment for segment in suggested.replace("\\", "/").split("/") if segment not in {"", ".", ".."}]
+        segments = [
+            seg
+            for seg in suggested.replace("\\", "/").split("/")
+            if seg not in {"", ".", ".."}
+        ]
         if segments:
             return os.path.realpath(os.path.join(output_root, *segments))
-
-    relative_stem = str(item.get("relative_path") or "").replace(os.sep, "-").replace("/", "-")
-    primary_entity = _optional_safe_path_segment(item.get("primary_entity"))
-    date_bucket = _optional_safe_path_segment(item.get("inferred_date_bucket"))
-    category = _optional_safe_path_segment(str(item.get("category") or "other").strip() or "other") or "other"
-
-    if primary_entity and date_bucket:
-        return os.path.realpath(os.path.join(output_root, primary_entity, date_bucket, relative_stem))
-    if primary_entity:
-        return os.path.realpath(os.path.join(output_root, primary_entity, relative_stem))
-    if date_bucket:
-        return os.path.realpath(os.path.join(output_root, date_bucket, relative_stem))
-    return os.path.realpath(os.path.join(output_root, category, relative_stem))
+    rel = str(item.get("relative_path") or "").strip()
+    if not rel:
+        return os.path.realpath(output_root)
+    return os.path.realpath(os.path.join(output_root, rel))
 
 
 def _verify_organize_materialization(output_mode: str, artifacts_dir: str, source_paths: list[str]) -> list[str]:

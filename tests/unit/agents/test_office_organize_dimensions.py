@@ -362,3 +362,25 @@ def test_organize_prompt_does_not_reference_primary_entity():
 def test_organize_prompt_references_the_dimension_tool():
     text = _build_organize_prompt(["/tmp/x"], "workspace", "/")
     assert "organize_by_" in text  # at least one dimension tool is named
+
+
+# ---------------------------------------------------------------------------
+# Block 2: _canonical_organize_destination
+# ---------------------------------------------------------------------------
+
+def test_canonical_organize_destination_uses_explicit_destination():
+    import os
+    from agents.office.nodes import _canonical_organize_destination
+    item = {
+        "relative_path": "notes/a.txt",
+        "suggested_destination": "small/notes/a.txt",
+    }
+    out = _canonical_organize_destination("/out", item)
+    assert out.endswith(os.path.join("small", "notes", "a.txt"))
+
+
+def test_canonical_organize_destination_falls_back_to_relative_path():
+    from agents.office.nodes import _canonical_organize_destination
+    item = {"relative_path": "notes/a.txt"}
+    out = _canonical_organize_destination("/out", item)
+    assert out.endswith("notes/a.txt")
