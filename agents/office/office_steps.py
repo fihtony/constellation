@@ -19,12 +19,14 @@ generic "executing capability" placeholder.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from framework.major_step import (
     LIFECYCLE_DONE,
     LIFECYCLE_FAILED,
     LIFECYCLE_RUNNING,
+    LIFECYCLE_WARNING,
     record_major_step,
 )
 
@@ -45,6 +47,31 @@ def _source_kind(capability: str, count: int) -> str:
     if capability == "organize":
         return "folder" if count == 1 else "folders"
     return "file" if count == 1 else "files"
+
+
+def _kind_for_paths(paths: list[str]) -> str:
+    count = len(paths)
+    if count <= 0:
+        return "files"
+    directory_count = sum(1 for path in paths if path and os.path.isdir(path))
+    if directory_count == count:
+        return "folder" if count == 1 else "folders"
+    if directory_count == 0:
+        return "file" if count == 1 else "files"
+    return "source" if count == 1 else "sources"
+
+
+def _count_and_kind_from_paths(
+    capability: str,
+    paths: Any,
+    *,
+    prefer_path_types: bool = False,
+) -> tuple[int, str]:
+    normalized_paths = [str(path) for path in paths] if isinstance(paths, list) else []
+    count = len(normalized_paths)
+    if prefer_path_types:
+        return count, _kind_for_paths(normalized_paths)
+    return count, _source_kind(capability, count)
 
 
 def _output_location_for_state(state: dict) -> str:
@@ -129,16 +156,28 @@ def record_office_step(
 def emit_received(state: dict) -> None:
     capability = state.get("capability", "summarize")
     source_paths = state.get("source_paths", [])
-    count = len(source_paths) if isinstance(source_paths, list) else 0
+    count, source_kind = _count_and_kind_from_paths(
+        capability,
+        source_paths,
+        prefer_path_types=True,
+    )
+    discovered_source_count = int(state.get("discovered_source_count") or 0)
+    summary_template = "Office received the task: {capability} on {source_count} {source_kind}."
+    if source_kind in {"folder", "folders"} and discovered_source_count > 0:
+        summary_template = (
+            "Office received the task: {capability} on {source_count} {source_kind} "
+            "containing {discovered_source_count} file(s)."
+        )
     record_office_step(
         state,
         step_key="office.received",
         title="Office receiving task",
-        summary_template="Office received the task: {capability} on {source_count} {source_kind}.",
+        summary_template=summary_template,
         summary_facts={
             "capability": capability,
             "source_count": count,
-            "source_kind": _source_kind(capability, count),
+            "source_kind": source_kind,
+            "discovered_source_count": discovered_source_count,
         },
     )
 
@@ -146,7 +185,7 @@ def emit_received(state: dict) -> None:
 def emit_validating(state: dict) -> None:
     capability = state.get("capability", "summarize")
     source_paths = state.get("source_paths", [])
-    count = len(source_paths) if isinstance(source_paths, list) else 0
+    count, source_kind = _count_and_kind_from_paths(capability, source_paths)
     record_office_step(
         state,
         step_key="office.validating",
@@ -155,7 +194,7 @@ def emit_validating(state: dict) -> None:
         summary_template="Office validated {source_count} {source_kind} and prepared the output area.",
         summary_facts={
             "source_count": count,
-            "source_kind": _source_kind(capability, count),
+            "source_kind": source_kind,
         },
     )
 
@@ -168,11 +207,13 @@ def emit_executing_capability(state: dict) -> None:
     the end of the node.
     """
     capability = state.get("capability", "summarize")
-    source_paths = state.get("source_paths", [])
-    count = len(source_paths) if isinstance(source_paths, list) else 0
+    source_paths = state.get("validated_paths") or state.get("source_paths") or []
+    count, source_kind = _count_and_kind_from_paths(capability, source_paths)
     step_key, title, summary_template, summary_facts = _execution_step_for_capability(
         capability, count
     )
+    if capability != "analyze":
+        summary_facts["source_kind"] = source_kind
     record_office_step(
         state,
         step_key=step_key,
@@ -232,6 +273,7 @@ def emit_capability_completion_rows(state: dict) -> None:
         return
 
     if capability == "organize":
+        organize_file_count = int(state.get("organize_file_count") or count)
         record_office_step(
             state,
             step_key="office.scanning",
@@ -239,7 +281,7 @@ def emit_capability_completion_rows(state: dict) -> None:
             lifecycle_state=LIFECYCLE_DONE,
             summary_template="Office scanned the folder and inventoried {file_count} file(s).",
             summary_facts={
-                "file_count": count,
+                "file_count": organize_file_count,
             },
         )
         record_office_step(
@@ -345,6 +387,7 @@ def emit_writing_plan(state: dict, *, output_location: str | None = None) -> Non
         state,
         step_key="office.writing_plan",
         title="Office writing organization plan",
+        lifecycle_state=LIFECYCLE_DONE,
         summary_template="Office wrote the organization plan to {output_location}.",
         summary_facts={"output_location": output_location},
     )
@@ -412,3 +455,68 @@ def emit_delivered(
                 "failure_reason": state.get("summary", "")[:200],
             },
         )
+
+
+def emit_validating_plan_output(
+    state: dict,
+    *,
+    lifecycle_state: str,
+    summary_template: str,
+    summary_facts: dict | None = None,
+) -> None:
+    """Emit the plan-output validation step.
+
+    ``lifecycle_state`` must be one of: ``running``, ``done``, ``warning``.
+    """
+    record_office_step(
+        state,
+        step_key="office.validating_plan_output",
+        title="Office validating output against plan",
+        lifecycle_state=lifecycle_state,
+        summary_template=summary_template,
+        summary_facts=summary_facts,
+    )
+
+
+def emit_reconciling_plan_output(
+    state: dict,
+    *,
+    lifecycle_state: str,
+    round: int,
+    summary_template: str,
+    summary_facts: dict | None = None,
+) -> None:
+    """Emit a per-round reconciliation step.
+
+    The round number becomes part of ``step_instance_key`` so the UI can
+    show up to three reconciliation rows.
+    """
+    record_office_step(
+        state,
+        step_key="office.reconciling_plan_output",
+        title="Office reconciling output to match plan",
+        lifecycle_state=lifecycle_state,
+        summary_template=summary_template,
+        summary_facts=summary_facts,
+        conditional=True,
+        round=round,
+    )
+
+
+def emit_gate_exhausted(
+    state: dict,
+    *,
+    summary_facts: dict | None = None,
+) -> None:
+    """Emit the gate-exhaustion warning row."""
+    record_office_step(
+        state,
+        step_key="office.gate_exhausted",
+        title="Office plan-output gate exhausted",
+        lifecycle_state=LIFECYCLE_WARNING,
+        summary_template=(
+            "Office could not fully reconcile the output with the declared plan after {round_count} round(s)."
+        ),
+        summary_facts=summary_facts,
+        conditional=True,
+    )
