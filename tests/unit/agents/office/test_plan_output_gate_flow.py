@@ -177,7 +177,8 @@ def test_mismatch_triggers_retry_and_emits_warning(task_artifacts):
 
 def test_exhausted_emits_gate_exhausted_step(task_artifacts):
     artifacts, workspace = task_artifacts
-    plan_path = workspace / "organized-output" / "files" / "organization-plan.md"
+    plan_path = artifacts / "organized-output" / "files" / "organization-plan.md"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(
         "# Plan\n## Files Organized\n"
         "| source | destination |\n| --- | --- |\n"
