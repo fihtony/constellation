@@ -17,6 +17,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from framework.office.path_safety import validate_relative_path_syntax
+
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -268,17 +270,7 @@ def _plan_slot_capability(plan_path: str) -> str | None:
 
 
 def _is_path_safety_violation(relative: str) -> str | None:
-    if not isinstance(relative, str) or not relative:
-        return "destination is empty"
-    if relative.startswith("/") or relative.startswith("~"):
-        return "absolute path not allowed"
-    if re.match(r"^[a-zA-Z]:[\\/]", relative):
-        return "drive-letter path not allowed"
-    if "\\" in relative:
-        return "backslash separator not allowed"
-    if ".." in relative.split("/"):
-        return "parent traversal not allowed"
-    return None
+    return validate_relative_path_syntax(relative)
 
 
 def _validated_source_realpaths(validated_source_roots: Iterable[str] | None) -> set[str]:
@@ -305,22 +297,8 @@ def _is_under_validated_source(source_path: str, validated_roots: set[str]) -> b
     return False
 
 
-def _split_destination_organize(cells: list[str]) -> tuple[str, str]:
-    if len(cells) < 2:
-        return "", ""
-    return cells[0], cells[1]
-
-
-def _split_destination_summarize(cells: list[str]) -> tuple[str, str]:
-    if len(cells) < 2:
-        return "", ""
-    return cells[0], cells[1]
-
-
-def _split_destination_analyze(cells: list[str]) -> tuple[str, str]:
-    if len(cells) < 2:
-        return "", ""
-    return cells[0], cells[1]
+def _split_first_two_cells(cells: list[str]) -> tuple[str, str]:
+    return (cells[0], cells[1]) if len(cells) >= 2 else ("", "")
 
 
 def _parse_plan_rows(capability: str, plan_text: str) -> tuple[list[GateEntry], dict[str, Any]]:
@@ -329,11 +307,7 @@ def _parse_plan_rows(capability: str, plan_text: str) -> tuple[list[GateEntry], 
     entries: list[GateEntry] = []
     data_rows = [r for r in rows if r and r[0].lower() != "source"]
     for cells in data_rows:
-        source, target = {
-            "organize": _split_destination_organize,
-            "summarize": _split_destination_summarize,
-            "analyze": _split_destination_analyze,
-        }[capability](cells)
+        source, target = _split_first_two_cells(cells)
         if not source and not target:
             continue
         extras: dict[str, Any] = {}

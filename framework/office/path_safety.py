@@ -30,6 +30,39 @@ def normalize_relative_path(relative: str) -> str:
     return cleaned
 
 
+def validate_relative_path_syntax(relative: str) -> str | None:
+    """Return ``None`` if ``relative`` is a syntactically safe relative path.
+
+    Returns a human-readable reason string when ``relative`` violates the
+    safety contract. This is the string-only check shared by
+    :func:`resolve_within_root` (which adds disk-level guarantees on top)
+    and any caller that just wants to validate a path string without
+    touching the filesystem (e.g. the plan-output gate validating a
+    plan-destination string before the path is materialized).
+
+    Rejected forms:
+    * empty or non-string input — "destination is empty"
+    * absolute POSIX path (``/`` prefix) — "absolute path not allowed"
+    * tilde-prefixed path (``~`` prefix) — "tilde-prefixed path not allowed"
+    * Windows drive-letter path (``C:\\`` or ``C:/``) — "drive-letter path not allowed"
+    * backslash separator — "backslash separator not allowed"
+    * ``..`` segment after splitting on ``/`` — "parent traversal not allowed"
+    """
+    if not isinstance(relative, str) or not relative:
+        return "destination is empty"
+    if relative.startswith("/"):
+        return "absolute path not allowed"
+    if relative.startswith("~"):
+        return "tilde-prefixed path not allowed"
+    if _DRIVE_LETTER_RE.match(relative):
+        return "drive-letter path not allowed"
+    if "\\" in relative:
+        return "backslash separator not allowed"
+    if ".." in relative.split("/"):
+        return "parent traversal not allowed"
+    return None
+
+
 def is_within_root(root: str, candidate: str) -> bool:
     """Return True if ``candidate`` resolves to a path inside ``root``.
 

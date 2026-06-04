@@ -3,6 +3,7 @@ from framework.office.path_safety import (
     normalize_relative_path,
     resolve_within_root,
     is_within_root,
+    validate_relative_path_syntax,
     PathSafetyError,
 )
 
@@ -82,3 +83,19 @@ def test_is_within_root_false_for_parent(tmp_path):
     root = tmp_path
     outside = tmp_path.parent
     assert is_within_root(str(root), str(outside)) is False
+
+
+@pytest.mark.parametrize(
+    "value, expected_reason",
+    [
+        ("files/doc.pdf", None),
+        ("", "destination is empty"),
+        ("/etc/passwd", "absolute path not allowed"),
+        ("~/escape", "tilde-prefixed path not allowed"),
+        ("C:/Windows/System32", "drive-letter path not allowed"),
+        ("files\\doc.pdf", "backslash separator not allowed"),
+        ("../etc/passwd", "parent traversal not allowed"),
+    ],
+)
+def test_validate_relative_path_syntax(value, expected_reason):
+    assert validate_relative_path_syntax(value) == expected_reason
