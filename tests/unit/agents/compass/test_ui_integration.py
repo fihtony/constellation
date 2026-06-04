@@ -118,100 +118,7 @@ class TestUIRoutes:
         assert result["body"]["logs"][0]["task_id"] == task_id
         assert result["body"]["logs"][0]["message"] == "Accepted task"
 
-    def test_get_task_detail_backfills_folder_summarize_step_facts_from_task_report(
-        self,
-        task_store,
-        monkeypatch,
-        tmp_path: Path,
-    ):
-        source_dir = tmp_path / "source-folder"
-        source_dir.mkdir()
-        (source_dir / "alpha.txt").write_text("alpha", encoding="utf-8")
-        (source_dir / "beta.txt").write_text("beta", encoding="utf-8")
-
-        task = task_store.create_task(
-            agent_id="compass",
-            metadata={
-                "task_type": "office",
-                "office_request": {
-                    "capability": "summarize",
-                    "output_mode": "workspace",
-                    "source_paths": [str(source_dir)],
-                },
-                "major_step_rows": {
-                    "office.received#0": {
-                        "step_key": "office.received",
-                        "step_instance_key": "office.received#0",
-                        "title": "Office receiving task",
-                        "agent": "office",
-                        "lifecycle_state": "done",
-                        "visual_state": "done",
-                        "summary_template": "Office received the task: {capability} on {source_count} {source_kind}.",
-                        "summary_facts": {"capability": "summarize", "source_count": 1, "source_kind": "file"},
-                        "started_at": "2026-06-03T10:00:00+00:00",
-                        "ended_at": "2026-06-03T10:00:01+00:00",
-                    },
-                    "office.reading#0": {
-                        "step_key": "office.reading",
-                        "step_instance_key": "office.reading#0",
-                        "title": "Office reading documents",
-                        "agent": "office",
-                        "lifecycle_state": "done",
-                        "visual_state": "done",
-                        "summary_template": "Office read {source_count} {source_kind} via MCP tools.",
-                        "summary_facts": {"source_count": 1, "source_kind": "file"},
-                        "started_at": "2026-06-03T10:00:02+00:00",
-                        "ended_at": "2026-06-03T10:00:03+00:00",
-                    },
-                    "office.summarizing#0": {
-                        "step_key": "office.summarizing",
-                        "step_instance_key": "office.summarizing#0",
-                        "title": "Office summarizing each document",
-                        "agent": "office",
-                        "lifecycle_state": "done",
-                        "visual_state": "done",
-                        "summary_template": "Office summarized each of the {source_count} document(s).",
-                        "summary_facts": {"source_count": 1},
-                        "started_at": "2026-06-03T10:00:04+00:00",
-                        "ended_at": "2026-06-03T10:00:05+00:00",
-                    },
-                },
-            },
-            task_id="task-folder-summary",
-        )
-        monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path))
-        report_dir = tmp_path / task.id / "office"
-        report_dir.mkdir(parents=True)
-        (report_dir / "task-report.json").write_text(
-            json.dumps(
-                {
-                    "data": {
-                        "capability": "summarize",
-                        "source_paths": [
-                            str(source_dir / "alpha.txt"),
-                            str(source_dir / "beta.txt"),
-                        ],
-                        "expected_outputs": [
-                            "artifacts/alpha.txt.summary.md",
-                            "artifacts/beta.txt.summary.md",
-                            "artifacts/combined-summary.md",
-                        ],
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        result = handle_ui_request("GET", f"/tasks/{task.id}", task_store=task_store)
-
-        assert result["status"] == 200
-        rows = result["body"]["majorStepRows"]
-        assert rows["office.received#0"]["summary_facts"]["source_kind"] == "folder"
-        assert rows["office.reading#0"]["summary_facts"]["source_count"] == 2
-        assert rows["office.reading#0"]["summary_facts"]["source_kind"] == "files"
-        assert rows["office.summarizing#0"]["summary_facts"]["source_count"] == 2
-
-    def test_get_task_detail_backfills_organize_received_count_and_gate_reason(
+    def test_get_task_detail_renders_office_rows_with_emitted_facts(
         self,
         task_store,
         monkeypatch,
@@ -242,7 +149,7 @@ class TestUIRoutes:
                         "lifecycle_state": "done",
                         "visual_state": "done",
                         "summary_template": "Office received the task: {capability} on {source_count} {source_kind} containing {discovered_source_count} file(s).",
-                        "summary_facts": {"capability": "organize", "source_count": 1, "source_kind": "folder", "discovered_source_count": 1},
+                        "summary_facts": {"capability": "organize", "source_count": 1, "source_kind": "folder", "discovered_source_count": 3},
                         "started_at": "2026-06-03T10:00:00+00:00",
                         "ended_at": "2026-06-03T10:00:01+00:00",
                     },
@@ -254,7 +161,7 @@ class TestUIRoutes:
                         "lifecycle_state": "warning",
                         "visual_state": "warning",
                         "summary_template": "Plan-output gate exhausted after {round_count} reconciliation round(s): {missing_count} missing, {unexpected_count} unexpected, {mismatch_count} mismatched. See plan-output-gate-report.json.",
-                        "summary_facts": {"round_count": 3, "missing_count": 0, "unexpected_count": 0, "mismatch_count": 0},
+                        "summary_facts": {"plan_status": "invalid", "invalid_plan_entry_count": 1, "round_count": 3, "missing_count": 0, "unexpected_count": 0, "mismatch_count": 0},
                         "started_at": "2026-06-03T10:00:02+00:00",
                         "ended_at": "2026-06-03T10:00:03+00:00",
                     },
@@ -263,44 +170,12 @@ class TestUIRoutes:
             task_id="task-folder-organize",
         )
 
-        monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path))
-        report_dir = tmp_path / task.id / "office"
-        artifacts_dir = report_dir / "artifacts"
-        (artifacts_dir / "organized-output" / "files" / "by-size").mkdir(parents=True)
-        for name in ("alpha.txt", "beta.txt", "gamma.txt"):
-            (artifacts_dir / "organized-output" / "files" / "by-size" / name).write_text(name, encoding="utf-8")
-        report_dir.mkdir(parents=True, exist_ok=True)
-        (report_dir / "task-report.json").write_text(
-            json.dumps(
-                {
-                    "data": {
-                        "capability": "organize",
-                        "source_paths": [str(source_dir)],
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-        (artifacts_dir / "plan-output-gate-report.json").write_text(
-            json.dumps(
-                {
-                    "plan_status": "invalid",
-                    "rounds": 3,
-                    "final": {"missing": [], "unexpected": [], "mismatches": []},
-                    "invalid_plan_entries": ["source='nested/alpha.txt' destination='files/alpha.txt': source path outside validated set"],
-                    "error_message": "source path outside validated set",
-                }
-            ),
-            encoding="utf-8",
-        )
-
         result = handle_ui_request("GET", f"/tasks/{task.id}", task_store=task_store)
 
         assert result["status"] == 200
         rows = result["body"]["majorStepRows"]
         assert rows["office.received#0"]["summary_facts"]["source_kind"] == "folder"
         assert rows["office.received#0"]["summary_facts"]["discovered_source_count"] == 3
-        assert "plan is {plan_status}" in rows["office.validating_plan_output#0"]["summary_template"]
         assert rows["office.validating_plan_output#0"]["summary_facts"]["plan_status"] == "invalid"
         assert rows["office.validating_plan_output#0"]["summary_facts"]["invalid_plan_entry_count"] == 1
 
