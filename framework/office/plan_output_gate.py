@@ -60,6 +60,7 @@ class GateReport:
             and not self.mismatches
             and not self.invalid_plan_entries
             and not self.error_message
+            and not self.tool_unavailable
         )
 
 
@@ -149,6 +150,10 @@ def resolve_output_contract(
         workspace_root = artifacts_dir or os.environ.get(
             "OFFICE_WORKSPACE_ROOT", ""
         )
+        if not workspace_root:
+            raise ValueError(
+                "workspace mode requires artifacts_dir or OFFICE_WORKSPACE_ROOT"
+            )
         if capability == "organize":
             output_root = os.path.join(workspace_root, "organized-output", "files")
         else:
