@@ -192,6 +192,77 @@ class OrganizeBySizeTool(BaseTool):
         return "medium"
 
 
+# ---- type ------------------------------------------------------------------
+
+
+_TYPE_BUCKETS: dict[frozenset[str], str] = {
+    frozenset({".pdf", ".doc", ".docx", ".docm", ".dotx", ".dotm", ".odt"}): "documents",
+    frozenset({
+        ".txt", ".md", ".markdown", ".rtf", ".html", ".htm", ".xml",
+        ".json", ".jsonl", ".yaml", ".yml", ".log", ".ini", ".cfg", ".toml",
+    }): "text",
+    frozenset({
+        ".csv", ".xlsx", ".xls", ".xlsm", ".xltx", ".xltm", ".xlsb", ".ods", ".tsv",
+    }): "data",
+    frozenset({".png", ".jpg", ".jpeg", ".gif", ".svg"}): "images",
+    frozenset({
+        ".ppt", ".pptx", ".pptm", ".potx", ".potm", ".ppsx", ".ppsm", ".odp",
+    }): "presentations",
+    frozenset({".py", ".js", ".ts", ".java", ".cpp", ".c", ".h"}): "code",
+}
+
+
+def _bucket_for_extension(ext: str) -> str:
+    ext_lower = ext.lower()
+    for exts, bucket in _TYPE_BUCKETS.items():
+        if ext_lower in exts:
+            return bucket
+    return "other"
+
+
+class OrganizeByTypeTool(BaseTool):
+    name = "organize_by_type"
+    description = (
+        "Group files by extension bucket: documents, text, data, images, "
+        "presentations, code, or other. Zero-LLM, deterministic."
+    )
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "source": {"type": "string"},
+            "output_root": {"type": "string"},
+        },
+        "required": ["source", "output_root"],
+    }
+
+    def execute_sync(self, source: str = "", output_root: str = "", **_: Any) -> ToolResult:
+        try:
+            files = _walk_files(source)
+            entries: list[dict[str, str]] = []
+            for rel in files:
+                ext = os.path.splitext(rel)[1]
+                bucket = _bucket_for_extension(ext)
+                dst = _copy_into(source, rel, output_root, bucket)
+                entries.append({
+                    "source": rel,
+                    "destination": os.path.relpath(dst, output_root),
+                    "extension": ext,
+                })
+            rules = sorted({_bucket_for_extension(os.path.splitext(r)[1]) for r in files})
+            _write_plan(
+                output_root,
+                _format_plan_markdown(
+                    dimension="type",
+                    source_root=source,
+                    bucket_rules=[f"{b}/" for b in rules] or ["other/"],
+                    entries=entries,
+                ),
+            )
+            return ToolResult(output=json.dumps({"dimension": "type", "entries": entries}))
+        except Exception as exc:
+            return ToolResult(output="", error=f"organize_by_type: {exc}")
+
+
 # ---- stubs for tools implemented in later tasks ----------------------------
 # These exist so that `from agents.office.organize_by_dimension import ...`
 # resolves cleanly. Each task that lands the real implementation replaces
@@ -212,10 +283,6 @@ class _NotYetImplementedTool(BaseTool):
 
     def execute_sync(self, source: str = "", output_root: str = "", **_: Any) -> ToolResult:
         return ToolResult(output="", error=f"{self.name}: not yet implemented")
-
-
-class OrganizeByTypeTool(_NotYetImplementedTool):
-    name = "organize_by_type"
 
 
 class OrganizeByCreatedTimeTool(_NotYetImplementedTool):

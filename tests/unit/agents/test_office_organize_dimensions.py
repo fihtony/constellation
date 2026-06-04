@@ -123,3 +123,23 @@ def test_organize_by_size_handles_empty_dir(tmp_path):
     assert result.success
     payload = json.loads(result.output)
     assert payload["entries"] == []
+
+
+def test_organize_by_type_buckets_by_extension(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _make_file(src, "doc.pdf", b"pdf")
+    _make_file(src, "data.csv", b"csv")
+    _make_file(src, "code.py", b"py")
+    _make_file(src, "image.png", b"\x89PNG")
+    out = tmp_path / "out"
+    out.mkdir()
+    tool = OrganizeByTypeTool()
+    result = tool.execute_sync(source=str(src), output_root=str(out))
+    payload = json.loads(result.output)
+    assert result.success, result.error
+    by_dest = {entry["source"]: entry["destination"] for entry in payload["entries"]}
+    assert by_dest["doc.pdf"].startswith("documents/")
+    assert by_dest["data.csv"].startswith("data/")
+    assert by_dest["code.py"].startswith("code/")
+    assert by_dest["image.png"].startswith("images/")
