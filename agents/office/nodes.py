@@ -1751,6 +1751,11 @@ def report_result(state: dict) -> dict:
 
 PLAN_OUTPUT_GATE_MAX_ROUNDS = 3
 PLAN_OUTPUT_GATE_NO_PROGRESS_LIMIT = 2
+# Smaller budget for the gate's retry LLM call. The primary execute_office_work
+# call uses _effective_agentic_budget(); the retry only needs to make a few
+# tool calls (write/delete files) to reconcile output with the plan.
+PLAN_OUTPUT_GATE_RETRY_MAX_TURNS = 4
+PLAN_OUTPUT_GATE_RETRY_TIMEOUT = 120
 
 
 def _snapshot_plan(plan_path: str) -> dict[str, Any] | None:
@@ -2068,9 +2073,36 @@ def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
                 "mismatch_count": len(final_report.mismatches),
             },
         )
-        # Invoke the LLM with the retry prompt.
+        # Invoke the LLM with the retry prompt. Scope the call to the
+        # capability tool allowlist and a bounded budget so a misbehaving
+        # LLM cannot invoke unrelated tools or run away.
+        tool_names = _capability_tool_names(capability, output_mode)
+        allowed = _claude_allowed_tool_names(tool_names)
+        retry_system_prompt = (
+            _load_system_prompt()
+            + "\n\n"
+            + "## Reconciliation Mode\n"
+            + "You are running inside the Office plan-output gate reconciliation loop. "
+            + "Use only the authorized Office tools for this capability "
+            + "(including delete_output_file for stale files). Do not call any other tool. "
+            + f"Available tools: {', '.join(tool_names)}."
+        )
+        retry_cwd = state.get("workspace_root") or (
+            validated_paths[0] if validated_paths and os.path.isdir(validated_paths[0]) else (
+                os.path.dirname(validated_paths[0]) if validated_paths else None
+            )
+        )
         try:
-            retry_result = runtime.run_agentic(retry_prompt)
+            retry_result = runtime.run_agentic(
+                retry_prompt,
+                system_prompt=retry_system_prompt,
+                cwd=retry_cwd,
+                tools=tool_names,
+                allowed_tools=allowed,
+                max_turns=PLAN_OUTPUT_GATE_RETRY_MAX_TURNS,
+                timeout=PLAN_OUTPUT_GATE_RETRY_TIMEOUT,
+                plugin_manager=state.get("_plugin_manager"),
+            )
             tool_calls = list(getattr(retry_result, "tool_calls", []) or [])
             if not tool_calls:
                 no_progress_rounds.append(round_num)
