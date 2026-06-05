@@ -298,6 +298,7 @@ def _dispatch_office_task_via_launcher(
     orchestrator_task_id: str,
     office_definition: dict[str, Any] | None = None,
     organize_group_by: str = "",
+    extra: dict[str, Any] | None = None,
 ) -> dict:
     definition = office_definition or _office_launch_definition(capability)
     if not definition:
@@ -319,6 +320,20 @@ def _dispatch_office_task_via_launcher(
     # it from metadata on the first call.
     if organize_group_by:
         metadata["organizeGroupBy"] = organize_group_by
+    # The custom-dimension plan-then-execute flow also needs the
+    # user's custom-dimension hint (so office's planner knows what
+    # to group by) and any approved plan / modify note forwarded by
+    # the compass resume handler.
+    extra = extra or {}
+    custom_hint = str(extra.get("customDimensionHint") or "").strip()
+    if custom_hint:
+        metadata["customDimensionHint"] = custom_hint
+    custom_plan = extra.get("organize_custom_plan") or {}
+    if custom_plan:
+        metadata["organizeCustomPlan"] = custom_plan
+    custom_action = str(extra.get("organize_custom_action") or "").strip()
+    if custom_action:
+        metadata["organizeCustomAction"] = custom_action
     result = dispatch_via_launcher(
         definition,
         capability=_office_requested_capability(capability),
@@ -545,6 +560,35 @@ class DispatchOfficeTask(BaseTool):
                     "re-prompts. Compass fills this in once the user picks."
                 ),
             },
+            "customDimensionHint": {
+                "type": "string",
+                "description": (
+                    "Optional natural-language grouping hint for the "
+                    "LLM-driven custom-dimension path.  When set, office "
+                    "skips the six built-in dimensions and produces a "
+                    "plan via the LLM planner (e.g. 'student name', "
+                    "'subject area', 'department')."
+                ),
+            },
+            "organizeCustomPlan": {
+                "type": "object",
+                "description": (
+                    "Optional pre-approved plan (from a previous "
+                    "plan-then-execute round-trip).  When set, office "
+                    "skips planning and runs the LLM executor pass "
+                    "directly.  The plan is the JSON object office's "
+                    "planner produced on the previous call."
+                ),
+            },
+            "organizeCustomAction": {
+                "type": "string",
+                "description": (
+                    "Optional user action on the custom plan: "
+                    "'approve' or 'modify'.  Compass fills this in "
+                    "after the user replies to the plan-approval "
+                    "question."
+                ),
+            },
         },
         "required": ["task_description"],
     }
@@ -559,6 +603,9 @@ class DispatchOfficeTask(BaseTool):
         orchestrator_task_id: str = "",
         callback_url: str = "",
         organizeGroupBy: str = "",
+        customDimensionHint: str = "",
+        organizeCustomPlan: dict | None = None,
+        organizeCustomAction: str = "",
     ) -> ToolResult:
         # Permission gate: compass is the orchestrator for office work,
         # so it must hold an explicit "agent_launching" grant for the
@@ -572,6 +619,14 @@ class DispatchOfficeTask(BaseTool):
         if file_path and file_path not in normalized_source_paths:
             normalized_source_paths.append(file_path)
 
+        extra: dict[str, Any] = {}
+        if customDimensionHint:
+            extra["customDimensionHint"] = str(customDimensionHint).strip()
+        if organizeCustomPlan:
+            extra["organize_custom_plan"] = dict(organizeCustomPlan)
+        if organizeCustomAction:
+            extra["organize_custom_action"] = str(organizeCustomAction).strip()
+
         try:
             office_definition = _office_launch_definition(capability)
             result = _dispatch_office_task_via_launcher(
@@ -582,6 +637,7 @@ class DispatchOfficeTask(BaseTool):
                 orchestrator_task_id=orchestrator_task_id,
                 organize_group_by=str(organizeGroupBy or "").strip(),
                 office_definition=office_definition,
+                extra=extra,
             )
             return ToolResult(output=json.dumps(result))
         except Exception as exc:

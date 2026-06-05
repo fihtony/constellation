@@ -335,6 +335,14 @@ def _resolve_office_resume_reply(
                     },
                 }
             office_request["organize_custom_action"] = approval
+            if approval == "approve":
+                # Forward the approved plan so the office executor
+                # can skip planning and run the LLM classification
+                # pass directly.  The plan lives in the interrupt's
+                # needs_clarification payload.
+                plan = (existing_needs.get("plan") or {}).copy()
+                if plan:
+                    office_request["organize_custom_plan"] = plan
             if approval == "modify":
                 office_request["organize_custom_modify_note"] = reply
             return {"office_request": office_request}
@@ -807,7 +815,20 @@ def _office_dimension_resolved(user_text: str, office_request: dict) -> bool:
     """
     from framework.office.dimensions import parse_dimension
 
-    metadata = {"organizeGroupBy": office_request.get("organizeGroupBy", "")}
+    # Check the organize_metadata.organizeGroupBy (the canonical
+    # source of truth) first; fall back to organize_dimension and
+    # the top-level legacy key.  The previous version only looked
+    # at the top-level key, which was always empty after the
+    # dimension-first refactor, so the gate fired even when the
+    # office request had already pinned a custom dimension.
+    metadata = {
+        "organizeGroupBy": (
+            (office_request.get("organize_metadata") or {}).get("organizeGroupBy")
+            or office_request.get("organize_dimension")
+            or office_request.get("organizeGroupBy")
+            or ""
+        )
+    }
     if parse_dimension(metadata, user_text):
         return True
     return False
@@ -1039,6 +1060,24 @@ def _dispatch_office_request(task_id: str, user_text: str, office_request: dict,
         }
         if organize_group_by:
             dispatch_args["organizeGroupBy"] = organize_group_by
+        # Custom-dimension plan-then-execute state.  The plan
+        # approval action + the approved plan live on
+        # ``office_request`` after the user has approved via compass
+        # resume.  Forward them to office so the executor runs
+        # directly without re-planning.
+        custom_hint = str(
+            (office_request.get("organize_metadata") or {}).get("customDimensionHint")
+            or office_request.get("customDimensionHint")
+            or ""
+        ).strip()
+        if custom_hint:
+            dispatch_args["customDimensionHint"] = custom_hint
+        custom_plan = office_request.get("organize_custom_plan") or {}
+        if custom_plan:
+            dispatch_args["organizeCustomPlan"] = dict(custom_plan)
+        custom_action = str(office_request.get("organize_custom_action") or "").strip()
+        if custom_action:
+            dispatch_args["organizeCustomAction"] = custom_action
         dispatch_result_str = registry.execute_sync(
             "dispatch_office_task",
             dispatch_args,

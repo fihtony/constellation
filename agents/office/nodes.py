@@ -1601,7 +1601,8 @@ def execute_office_work(state: dict) -> dict:
                 # the layout.  This branch owns the entire
                 # plan-then-execute flow.
                 custom_hint = str(
-                    (state.get("_message_metadata") or {}).get("customDimensionHint")
+                    state.get("organize_custom_hint")
+                    or (state.get("_message_metadata") or {}).get("customDimensionHint")
                     or extract_custom_dimension_hint(user_text)
                     or ""
                 ).strip()

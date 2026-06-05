@@ -232,7 +232,21 @@ class OfficeAgent(BaseAgent):
             "_message_metadata": dict(metadata),
             "_permission_engine": getattr(self, "_permission_engine", None),
         }
-        from framework.office.dimensions import parse_dimension as _parse_dimension
+        from framework.office.dimensions import (
+            extract_custom_dimension_hint as _extract_custom_dimension_hint,
+            parse_dimension as _parse_dimension,
+        )
+        # Custom-dimension plan-then-execute: read the approved
+        # plan + user action out of the A2A metadata so the office
+        # executor can skip the planning pass and run the LLM
+        # classification directly.
+        approved_plan = metadata.get("organizeCustomPlan") or {}
+        custom_action = str(metadata.get("organizeCustomAction") or "").strip()
+        custom_hint = str(
+            metadata.get("customDimensionHint")
+            or _extract_custom_dimension_hint(user_text)
+            or ""
+        ).strip()
         state: dict[str, Any] = {
             "_task_id": canonical_task_id,
             "_compass_task_id": compass_task_id,
@@ -245,6 +259,12 @@ class OfficeAgent(BaseAgent):
             "test_cycles": 0,
             "organize_dimension": _parse_dimension(dict(metadata), user_text),
         }
+        if approved_plan:
+            state["organize_custom_plan"] = dict(approved_plan)
+        if custom_action:
+            state["organize_custom_action"] = custom_action
+        if custom_hint:
+            state["organize_custom_hint"] = custom_hint
 
         # v0.8 timeline redesign: resolve a progress_sink so major-step
         # events flow into Compass's top-level task store. The sink is
