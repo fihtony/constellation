@@ -1,7 +1,7 @@
-"""Tests for agents/office/dimensions.py — the dimension contract."""
+"""Tests for framework/office/dimensions.py — the dimension contract."""
 from __future__ import annotations
 
-from agents.office.dimensions import (
+from framework.office.dimensions import (
     VALID_DIMENSIONS,
     parse_dimension,
 )
@@ -227,7 +227,7 @@ def test_organize_by_filename_preserves_subdirectory(tmp_path):
 
 
 from agents.office.organize_by_dimension import run_dimension_tool
-from agents.office.dimensions import VALID_DIMENSIONS
+from framework.office.dimensions import VALID_DIMENSIONS
 
 
 def test_run_dimension_tool_dispatches_each_dimension(tmp_path):

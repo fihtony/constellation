@@ -232,7 +232,7 @@ class OfficeAgent(BaseAgent):
             "_message_metadata": dict(metadata),
             "_permission_engine": getattr(self, "_permission_engine", None),
         }
-        from agents.office.dimensions import parse_dimension as _parse_dimension
+        from framework.office.dimensions import parse_dimension as _parse_dimension
         state: dict[str, Any] = {
             "_task_id": canonical_task_id,
             "_compass_task_id": compass_task_id,

@@ -34,7 +34,7 @@ from agents.office.office_tools import (
     ReadXlsxTool,
     collect_organize_file_inventory,
 )
-from agents.office.dimensions import VALID_DIMENSIONS, parse_dimension
+from framework.office.dimensions import VALID_DIMENSIONS, parse_dimension
 from framework.devlog import _ts
 from framework.major_step import LIFECYCLE_DONE, LIFECYCLE_RUNNING, LIFECYCLE_WARNING
 from framework.office.plan_output_gate import (

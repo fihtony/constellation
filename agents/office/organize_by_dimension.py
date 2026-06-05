@@ -439,7 +439,7 @@ class OrganizeByFilenameTool(BaseTool):
 # ---- dispatcher ------------------------------------------------------------
 
 
-from agents.office.dimensions import VALID_DIMENSIONS
+from framework.office.dimensions import VALID_DIMENSIONS
 
 
 _DIMENSION_TOOL = {

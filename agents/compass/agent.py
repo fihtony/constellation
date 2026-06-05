@@ -42,7 +42,7 @@ from framework.major_step import (
 )
 from agents.compass.ui.routes import handle_ui_request
 from agents.compass.tools import TOOL_NAMES, register_compass_tools
-from agents.office.dimensions import VALID_DIMENSIONS, parse_dimension
+from framework.office.dimensions import VALID_DIMENSIONS, parse_dimension
 
 
 def _build_compass_definition() -> AgentDefinition:
@@ -204,7 +204,7 @@ def _normalize_organize_dimension(value: str) -> str:
     Accepts:
     - the canonical dimension id (e.g. ``size``, ``modified_time``)
     - a multilingual keyword (e.g. ``大小``, ``按修改时间``) via
-      :func:`agents.office.dimensions.parse_dimension`
+      :func:`framework.office.dimensions.parse_dimension`
 
     Returns the canonical id or ``""`` when the reply is not a recognized
     dimension. The caller is responsible for surfacing the structured
