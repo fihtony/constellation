@@ -42,6 +42,7 @@ from framework.major_step import (
 )
 from agents.compass.ui.routes import handle_ui_request
 from agents.compass.tools import TOOL_NAMES, register_compass_tools
+from agents.office.dimensions import VALID_DIMENSIONS, parse_dimension
 
 
 def _build_compass_definition() -> AgentDefinition:
@@ -195,6 +196,97 @@ def _extract_jira_key(user_text: str) -> str:
 def _normalize_output_mode(value: str) -> str:
     mode = (value or "").strip().lower()
     return mode if mode in {"workspace", "inplace"} else ""
+
+
+def _normalize_organize_dimension(value: str) -> str:
+    """Map a free-text user reply to a canonical organize dimension id.
+
+    Accepts:
+    - the canonical dimension id (e.g. ``size``, ``modified_time``)
+    - a multilingual keyword (e.g. ``大小``, ``按修改时间``) via
+      :func:`agents.office.dimensions.parse_dimension`
+
+    Returns the canonical id or ``""`` when the reply is not a recognized
+    dimension. The caller is responsible for surfacing the structured
+    ``needs_clarification`` question again when the empty result is
+    returned.
+    """
+    text = (value or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in VALID_DIMENSIONS:
+        return lowered
+    return parse_dimension({}, text)
+
+
+def _resolve_office_resume_reply(
+    kind: str,
+    reply: str,
+    office_request: dict,
+) -> dict:
+    """Validate a user resume reply against the active office interrupt kind.
+
+    Returns a dict with one of:
+
+    - ``{"error_question": str, "needs_clarification": dict}`` when the
+      reply did not validate; the caller re-prompts the user with
+      ``error_question`` and keeps the task in ``INPUT_REQUIRED``.
+    - ``{"office_request": dict}`` when the reply validated; the caller
+      applies the update and re-dispatches office.
+    """
+    office_request = dict(office_request or {})
+    if kind == "office_organize_dimension":
+        dimension = _normalize_organize_dimension(reply)
+        if not dimension:
+            options = [
+                {"id": d, "label": d.replace("_", " ")}
+                for d in sorted(VALID_DIMENSIONS)
+            ]
+            user_message = (
+                "Please reply with one of the supported organization dimensions: "
+                + ", ".join(sorted(VALID_DIMENSIONS))
+                + "."
+            )
+            return {
+                "error_question": user_message,
+                "needs_clarification": {
+                    "missing": "organizeGroupBy",
+                    "options": options,
+                    "user_message": user_message,
+                },
+            }
+        office_request["organize_dimension"] = dimension
+        # Compass re-dispatches with the dimension in the A2A message
+        # metadata; the office workflow reads it from
+        # ``metadata.organizeGroupBy`` via ``parse_dimension``.
+        office_request.setdefault("organize_metadata", {})
+        office_request["organize_metadata"]["organizeGroupBy"] = dimension
+        return {"office_request": office_request}
+
+    if kind == "office_output_mode":
+        output_mode = _normalize_output_mode(reply)
+        if not output_mode:
+            return {
+                "error_question": (
+                    "Please reply with `workspace` or `inplace` so I can route the "
+                    "office task correctly."
+                ),
+            }
+        office_request["output_mode"] = output_mode
+        return {"office_request": office_request}
+
+    if not kind:
+        # No active interrupt kind — treat as a no-op; compass will
+        # likely re-dispatch with the same arguments. Returning
+        # ``error_question`` here would dead-lock the resume.
+        return {"office_request": office_request}
+
+    return {
+        "error_question": (
+            f"Please reply with the requested information for {kind}."
+        ),
+    }
 
 
 def _normalize_source_paths(value: object) -> list[str]:
@@ -599,6 +691,70 @@ def _office_dispatch_failed(dispatch_data: dict[str, Any]) -> bool:
     return _summary_indicates_office_failure(summary)
 
 
+def _office_dispatch_awaiting_input(dispatch_data: dict[str, Any]) -> bool:
+    """Return True when office returned ``input-required``.
+
+    Detects either the normalized status string from
+    :func:`_dispatch_office_task_via_launcher` (``"input-required"``) or
+    the raw A2A state (``"TASK_STATE_INPUT_REQUIRED"``). A clarification
+    payload is also required to avoid treating a transient ""status" as
+    an input request.
+    """
+    status = str(dispatch_data.get("status") or "").strip().lower()
+    state = str(dispatch_data.get("state") or "").strip()
+    if status != "input-required" and state != "TASK_STATE_INPUT_REQUIRED":
+        return False
+    needs_clarification = dispatch_data.get("needs_clarification")
+    if not needs_clarification:
+        return False
+    return isinstance(needs_clarification, dict) and bool(
+        needs_clarification.get("missing")
+    )
+
+
+def _office_interrupt_kind(
+    office_request: dict[str, Any],
+    clarification_payload: dict[str, Any],
+) -> str:
+    """Translate a needs_clarification payload into an ``interrupt_metadata.kind`` slug.
+
+    The slug drives both the major-step step_key (e.g.
+    ``compass.office_organize_dimension``) and the ``resume_task``
+    routing. New clarification types should add their own branch here.
+    """
+    missing = str(clarification_payload.get("missing") or "").strip()
+    capability = str(office_request.get("capability") or "").strip().lower()
+    if missing == "organizeGroupBy" or (
+        capability == "organize" and missing in {"", "organizeGroupBy"}
+    ):
+        return "office_organize_dimension"
+    if missing:
+        return f"office_{missing.lower()}"
+    return "office_clarification"
+
+
+def _office_clarification_default_question(clarification_payload: dict[str, Any]) -> str:
+    """Render a user-facing question for a ``needs_clarification`` payload.
+
+    Used when the office task did not supply a ``user_message`` (rare —
+    the office gate always sets one). Falls back to a generic prompt that
+    lists the supported options so the user can still reply meaningfully.
+    """
+    options = clarification_payload.get("options") or []
+    if not options:
+        return "Office needs more information before it can continue."
+    option_lines = "\n".join(
+        f"- `{opt.get('id')}` — {opt.get('label') or opt.get('id')}"
+        for opt in options
+        if isinstance(opt, dict) and opt.get("id")
+    )
+    return (
+        "Office needs more information before it can continue.\n"
+        "Please reply with one of:\n"
+        f"{option_lines}"
+    )
+
+
 _OFFICE_FAILURE_PATTERNS = (
     "cannot be found or accessed",
     "could not be found",
@@ -673,17 +829,30 @@ def _dispatch_office_request(task_id: str, user_text: str, office_request: dict,
         source_count=len(office_request.get("source_paths", [])),
         output_mode=office_request.get("output_mode", "workspace"),
     )
+    # Pull the user-resolved dimension (set after a clarification round-trip)
+    # out of the office_request. ``organize_metadata.organizeGroupBy`` is
+    # the source of truth so the A2A metadata reflects the latest user reply.
+    organize_group_by = ""
+    if str(office_request.get("capability", "")).strip().lower() == "organize":
+        organize_group_by = str(
+            (office_request.get("organize_metadata") or {}).get("organizeGroupBy")
+            or office_request.get("organize_dimension")
+            or ""
+        ).strip()
     try:
+        dispatch_args: dict[str, Any] = {
+            "task_description": user_text,
+            "source_paths": office_request.get("source_paths", []),
+            "capability": office_request.get("capability", "summarize"),
+            "output_mode": office_request.get("output_mode", "workspace"),
+            "orchestrator_task_id": task_id,
+            "callback_url": callback_url,
+        }
+        if organize_group_by:
+            dispatch_args["organizeGroupBy"] = organize_group_by
         dispatch_result_str = registry.execute_sync(
             "dispatch_office_task",
-            {
-                "task_description": user_text,
-                "source_paths": office_request.get("source_paths", []),
-                "capability": office_request.get("capability", "summarize"),
-                "output_mode": office_request.get("output_mode", "workspace"),
-                "orchestrator_task_id": task_id,
-                "callback_url": callback_url,
-            },
+            dispatch_args,
         )
         dispatch_data = json.loads(dispatch_result_str) if dispatch_result_str else {}
         log.a2a("←", "office", status=dispatch_data.get("status", "unknown"), result_preview=str(dispatch_data)[:200])
@@ -1144,7 +1313,67 @@ class CompassAgent(BaseAgent):
             dispatch_data = _dispatch_office_request(task.id, user_text, office_request, registry, log)
             response_text = dispatch_data.get("message") or f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
             office_failed = _office_dispatch_failed(dispatch_data)
+            office_awaiting_input = _office_dispatch_awaiting_input(dispatch_data)
             office_status = str(dispatch_data.get("status") or "").strip().lower()
+            if office_awaiting_input:
+                # Office paused with a structured needs_clarification payload.
+                # Promote the compass task to INPUT_REQUIRED so the UI shows a
+                # "waiting" tone and the user can reply with the missing
+                # information. The office task is left at INPUT_REQUIRED too —
+                # the next resume will re-dispatch with the resolved values.
+                clarification_payload = (
+                    dispatch_data.get("needs_clarification") or {}
+                ) if isinstance(dispatch_data.get("needs_clarification"), dict) else {}
+                clarification_question = (
+                    dispatch_data.get("question")
+                    or clarification_payload.get("user_message")
+                    or _office_clarification_default_question(clarification_payload)
+                )
+                interrupt_kind = _office_interrupt_kind(office_request, clarification_payload)
+                task_store.pause_task(
+                    task.id,
+                    question=clarification_question,
+                    interrupt_metadata={
+                        "kind": interrupt_kind,
+                        "office_request": office_request,
+                        "needs_clarification": clarification_payload,
+                    },
+                )
+                _record_major_step(
+                    task_store,
+                    task.id,
+                    step_key=f"compass.{interrupt_kind}",
+                    title=f"Compass asking for {interrupt_kind.replace('_', ' ')}",
+                    agent=_aid,
+                    lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+                    conditional=True,
+                    summary_template=(
+                        "Compass is waiting for the user to supply {kind}."
+                    ),
+                    summary_facts={"kind": interrupt_kind},
+                )
+                _append_chat_entry(
+                    task_store,
+                    task.id,
+                    role="COMPASS",
+                    text=clarification_question,
+                    tone="input-required",
+                )
+                log.info(
+                    "office task awaiting user input",
+                    capability=office_request.get("capability", "summarize"),
+                    kind=interrupt_kind,
+                )
+                ui_update = {
+                    "task_id": task.id,
+                    "task_status": "TASK_STATE_INPUT_REQUIRED",
+                    "chat_message": {
+                        "role": "COMPASS",
+                        "text": clarification_question,
+                        "style": "normal",
+                    },
+                }
+                return {**task_store.get_task_dict(task.id), "ui_update": ui_update}
             if office_failed:
                 _record_major_step(
                     task_store,
@@ -1291,30 +1520,42 @@ class CompassAgent(BaseAgent):
 
         office_request = dict(metadata.get("office_request") or {})
         reply_text = str(resume_value or "").strip().lower()
+        # Resolve the active interrupt kind. The most recent pause_task call
+        # set ``_interrupt.kind``; older tasks may have a stale value, so we
+        # also fall back to the capability-derived kind for the legacy
+        # output_mode flow that pre-dated this dispatch table.
+        existing_interrupt = metadata.get("_interrupt") or {}
+        active_kind = str(existing_interrupt.get("kind") or "").strip()
+        if not active_kind and not office_request.get("output_mode"):
+            active_kind = "office_output_mode"
+
         # B1: user-cancel-during-wait — close the in-flight user-input row
         # to ``cancelled`` and append a terminal ``compass.task_cancelled`` row
-        # (two-step close per design doc §13 B1).
+        # (two-step close per design doc §13 B1). Applies to every kind.
         if reply_text in {"cancel", "abort", "stop"}:
-            _record_major_step(
-                task_store,
-                task_id,
-                step_key="compass.asking_output_mode",
-                title="Compass asked for output location (cancelled by user)",
-                agent=self.definition.agent_id,
-                lifecycle_state=LIFECYCLE_CANCELLED,
-                summary_template="Compass cancelled the output location request.",
-            )
             cancel_reason = str(resume_value or "user cancelled").strip() or "user cancelled"
-            _record_major_step(
-                task_store,
-                task_id,
-                step_key="compass.task_cancelled",
-                title=f"Compass marking task cancelled by user: {cancel_reason[:200]}",
-                agent="compass",
-                lifecycle_state=LIFECYCLE_CANCELLED,
-                summary_template="Compass marked the task as cancelled by user: {cancel_reason}.",
-                summary_facts={"cancel_reason": cancel_reason[:500]},
-            )
+            for step_key in (active_kind, "compass.task_cancelled"):
+                _record_major_step(
+                    task_store,
+                    task_id,
+                    step_key=step_key,
+                    title=(
+                        f"Compass asked for {active_kind.replace('_', ' ')} (cancelled by user)"
+                        if step_key == active_kind
+                        else f"Compass marking task cancelled by user: {cancel_reason[:200]}"
+                    ),
+                    agent=self.definition.agent_id,
+                    lifecycle_state=LIFECYCLE_CANCELLED,
+                    summary_template=(
+                        f"Compass cancelled the {active_kind.replace('_', ' ')} request."
+                        if step_key == active_kind
+                        else "Compass marked the task as cancelled by user: {cancel_reason}."
+                    ),
+                    summary_facts=(
+                        {} if step_key == active_kind
+                        else {"cancel_reason": cancel_reason[:500]}
+                    ),
+                )
             task_store.fail_task(task_id, f"cancelled by user: {cancel_reason}")
             _append_chat_entry(
                 task_store,
@@ -1323,7 +1564,7 @@ class CompassAgent(BaseAgent):
                 text=f"Task cancelled by user: {cancel_reason}",
                 tone="failed",
             )
-            log.warn("office task cancelled by user during wait", reply=reply_text)
+            log.warn("office task cancelled by user during wait", reply=reply_text, kind=active_kind)
             ui_update = {
                 "task_id": task_id,
                 "task_status": "TASK_STATE_FAILED",
@@ -1334,23 +1575,41 @@ class CompassAgent(BaseAgent):
                 },
             }
             return {**task_store.get_task_dict(task_id), "ui_update": ui_update}
-        output_mode = _normalize_output_mode(str(resume_value))
-        if not output_mode:
-            question = "Please reply with `workspace` or `inplace` so I can route the office task correctly."
+
+        # Resolve the user reply against the active interrupt kind. The
+        # helper returns either an office_request update dict, or an empty
+        # string ``error_question`` when the reply did not validate.
+        resolution = _resolve_office_resume_reply(active_kind, str(resume_value), office_request)
+        if resolution.get("error_question"):
+            question = str(resolution["error_question"])
+            interrupt_meta = {
+                "kind": active_kind,
+                "office_request": office_request,
+            }
+            needs_clarification = resolution.get("needs_clarification")
+            if needs_clarification:
+                interrupt_meta["needs_clarification"] = needs_clarification
+            # Walk through WORKING so the state machine accepts the
+            # INPUT_REQUIRED → INPUT_REQUIRED no-op (some re-ask flows
+            # want to swap the question without re-dispatching).
+            try:
+                task_store.resume_task(task_id)
+            except Exception:
+                pass
             task_store.pause_task(
                 task_id,
                 question=question,
-                interrupt_metadata={"kind": "office_output_mode", "office_request": office_request},
+                interrupt_metadata=interrupt_meta,
             )
             _record_major_step(
                 task_store,
                 task_id,
-                step_key="compass.asking_output_mode",
-                title="Compass asking for output location",
+                step_key=f"compass.{active_kind}",
+                title=f"Compass asking for {active_kind.replace('_', ' ')}",
                 agent=self.definition.agent_id,
                 lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
                 conditional=True,
-                summary_template="Compass is waiting for a valid output location.",
+                summary_template=f"Compass is waiting for a valid {active_kind.replace('_', ' ')}.",
             )
             _append_chat_entry(
                 task_store,
@@ -1359,7 +1618,11 @@ class CompassAgent(BaseAgent):
                 text=question,
                 tone="input-required",
             )
-            log.warn("invalid office output mode reply", reply=str(resume_value)[:100])
+            log.warn(
+                "invalid office resume reply",
+                kind=active_kind,
+                reply=str(resume_value)[:100],
+            )
             ui_update = {
                 "task_id": task_id,
                 "task_status": "TASK_STATE_INPUT_REQUIRED",
@@ -1371,7 +1634,9 @@ class CompassAgent(BaseAgent):
             }
             return {**task_store.get_task_dict(task_id), "ui_update": ui_update}
 
-        office_request["output_mode"] = output_mode
+        # Reply validated; merge any updates into office_request.
+        office_request = dict(resolution.get("office_request") or office_request)
+        output_mode = str(office_request.get("output_mode") or "workspace")
         task_store.update_metadata(task_id, {"office_request": office_request})
         # A2: Compass writes ``resuming`` on the existing user-input row before
         # the agent resumes. The original ``compass.asking_output_mode#0`` row
@@ -1520,6 +1785,7 @@ class CompassAgent(BaseAgent):
             f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
         )
         office_failed = _office_dispatch_failed(dispatch_data)
+        office_awaiting_input = _office_dispatch_awaiting_input(dispatch_data)
         office_status = str(dispatch_data.get("status") or "").strip().lower()
 
         office_artifact_metadata = {"agentId": self.definition.agent_id}
@@ -1536,6 +1802,54 @@ class CompassAgent(BaseAgent):
             parts=[{"text": response_text}],
             metadata=office_artifact_metadata,
         )]
+        if office_awaiting_input:
+            # The synchronous dispatch path returned input-required; the
+            # synchronous handle_message branch already handled it via
+            # ``return``. This branch covers the post-resume background
+            # re-dispatch path where a re-run still surfaces a clarification.
+            clarification_payload = (
+                dispatch_data.get("needs_clarification") or {}
+            ) if isinstance(dispatch_data.get("needs_clarification"), dict) else {}
+            clarification_question = (
+                dispatch_data.get("question")
+                or clarification_payload.get("user_message")
+                or _office_clarification_default_question(clarification_payload)
+            )
+            interrupt_kind = _office_interrupt_kind(office_request, clarification_payload)
+            task_store.set_artifacts(task_id, artifacts)
+            task_store.pause_task(
+                task_id,
+                question=clarification_question,
+                interrupt_metadata={
+                    "kind": interrupt_kind,
+                    "office_request": office_request,
+                    "needs_clarification": clarification_payload,
+                },
+            )
+            _record_major_step(
+                task_store,
+                task_id,
+                step_key=f"compass.{interrupt_kind}",
+                title=f"Compass asking for {interrupt_kind.replace('_', ' ')}",
+                agent=self.definition.agent_id,
+                lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+                conditional=True,
+                summary_template="Compass is waiting for the user to supply {kind}.",
+                summary_facts={"kind": interrupt_kind},
+            )
+            _append_chat_entry(
+                task_store,
+                task_id,
+                role="COMPASS",
+                text=clarification_question,
+                tone="input-required",
+            )
+            log.info(
+                "office task awaiting user input (resume path)",
+                task_id=task_id,
+                kind=interrupt_kind,
+            )
+            return
         if office_failed:
             task_store.set_artifacts(task_id, artifacts)
             task_store.fail_task(task_id, response_text)

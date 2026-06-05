@@ -296,6 +296,44 @@ class OfficeAgent(BaseAgent):
                 result = loop.run_until_complete(
                     self._compiled_workflow.invoke(state, config)
                 )
+
+                # Clarification round-trip: when the workflow surfaces a
+                # ``needs_clarification`` payload (e.g. organize capability
+                # without a grouping dimension), promote the task to
+                # ``TASK_STATE_INPUT_REQUIRED`` instead of failing it. The
+                # orchestrator (compass) reads the structured payload from
+                # ``task_store`` and re-prompts the user.
+                needs_clarification = result.get("needs_clarification")
+                if needs_clarification:
+                    user_message = str(
+                        needs_clarification.get("user_message")
+                        or "Office requires additional input before continuing."
+                    ).strip()
+                    try:
+                        task_store.pause_task(
+                            canonical_task_id,
+                            question=user_message,
+                            interrupt_metadata={
+                                "kind": "office_clarification",
+                                "needs_clarification": needs_clarification,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "office: pause_task for clarification failed: %s", exc
+                        )
+                    _append_office_log(
+                        log_task_id,
+                        "office task awaiting clarification",
+                        question=user_message,
+                        kind=str(needs_clarification.get("missing") or ""),
+                    )
+                    if callback_url:
+                        _send_callback_input_required(
+                            callback_url, canonical_task_id, user_message
+                        )
+                    return
+
                 artifacts = [
                     Artifact(
                         name="office-result",
@@ -392,6 +430,32 @@ def _send_callback(callback_url: str, task_id: str, result: dict) -> None:
         "task_id": task_id,
         "state": "completed",
         "result": safe_result,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        callback_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            pass
+    except Exception:
+        pass
+
+
+def _send_callback_input_required(callback_url: str, task_id: str, question: str) -> None:
+    """Send an ``input-required`` callback to the orchestrator.
+
+    Mirrors :func:`_send_callback` but signals the ``input-required``
+    A2A state and surfaces the clarification question. The orchestrator
+    (compass) reads this state and re-prompts the user.
+    """
+    import urllib.request
+    payload = json.dumps({
+        "task_id": task_id,
+        "state": "input-required",
+        "question": question,
     }).encode("utf-8")
     req = urllib.request.Request(
         callback_url,

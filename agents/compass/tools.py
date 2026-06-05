@@ -297,6 +297,7 @@ def _dispatch_office_task_via_launcher(
     capability: str,
     orchestrator_task_id: str,
     office_definition: dict[str, Any] | None = None,
+    organize_group_by: str = "",
 ) -> dict:
     definition = office_definition or _office_launch_definition(capability)
     if not definition:
@@ -305,19 +306,25 @@ def _dispatch_office_task_via_launcher(
     _launcher = _launcher_dispatch.get_launcher()
     mount_plan = _office_mount_plan(source_paths, output_mode, _launcher)
     execution_contract, permissions = _build_office_dispatch_contract(output_mode)
+    metadata: dict[str, Any] = {
+        "source_paths": mount_plan["translated_paths"],
+        "output_mode": output_mode,
+        "capability": capability,
+        "compassTaskId": orchestrator_task_id,
+        "executionContract": execution_contract,
+        "permissions": permissions,
+    }
+    # When the user already picked a dimension (after a clarification
+    # round-trip), forward it to office so ``parse_dimension`` resolves
+    # it from metadata on the first call.
+    if organize_group_by:
+        metadata["organizeGroupBy"] = organize_group_by
     result = dispatch_via_launcher(
         definition,
         capability=_office_requested_capability(capability),
         launch_task_id=orchestrator_task_id or "office-task",
         message_parts=[{"text": task_description}],
-        metadata={
-            "source_paths": mount_plan["translated_paths"],
-            "output_mode": output_mode,
-            "capability": capability,
-            "compassTaskId": orchestrator_task_id,
-            "executionContract": execution_contract,
-            "permissions": permissions,
-        },
+        metadata=metadata,
         timeout=_office_dispatch_timeout(),
         # Office is a single-shot document task — spawn a fresh
         # container per call and tear it down as soon as the A2A
@@ -337,11 +344,33 @@ def _dispatch_office_task_via_launcher(
     status = "completed" if task_state == "TASK_STATE_COMPLETED" else (
         "input-required" if task_state == "TASK_STATE_INPUT_REQUIRED" else "error"
     )
+    # When office pauses the task with a needs_clarification payload, the
+    # office task's ``_interrupt`` metadata carries the structured payload.
+    # Surface it so the orchestrator can re-prompt the user with the
+    # suggested options instead of treating the run as a generic failure.
+    interrupt_metadata = task.get("metadata", {}).get("_interrupt") or {}
+    needs_clarification = (
+        interrupt_metadata.get("needs_clarification")
+        if isinstance(interrupt_metadata, dict) else None
+    )
+    question = ""
+    if needs_clarification and isinstance(needs_clarification, dict):
+        question = str(needs_clarification.get("user_message") or "").strip()
+    if not question:
+        # Fall back to the status message parts (set by task_store.pause_task).
+        status_message = task.get("status", {}).get("message", {}) or {}
+        for part in status_message.get("parts", []) or []:
+            text = part.get("text")
+            if text:
+                question = str(text).strip()
+                break
     return {
         "status": status,
         "state": task_state,
         "taskId": task.get("id", ""),
         "summary": summary,
+        "question": question,
+        "needs_clarification": needs_clarification or {},
     }
 
 # ---------------------------------------------------------------------------
@@ -506,6 +535,16 @@ class DispatchOfficeTask(BaseTool):
                 "type": "string",
                 "description": "Optional orchestrator callback URL.",
             },
+            "organizeGroupBy": {
+                "type": "string",
+                "description": (
+                    "Optional organize grouping dimension (size, type, "
+                    "created_time, modified_time, accessed_time, filename). "
+                    "When the user did not supply one, the office agent "
+                    "surfaces a needs_clarification reply and the orchestrator "
+                    "re-prompts. Compass fills this in once the user picks."
+                ),
+            },
         },
         "required": ["task_description"],
     }
@@ -519,6 +558,7 @@ class DispatchOfficeTask(BaseTool):
         capability: str = "summarize",
         orchestrator_task_id: str = "",
         callback_url: str = "",
+        organizeGroupBy: str = "",
     ) -> ToolResult:
         # Permission gate: compass is the orchestrator for office work,
         # so it must hold an explicit "agent_launching" grant for the
@@ -540,6 +580,7 @@ class DispatchOfficeTask(BaseTool):
                 output_mode=output_mode,
                 capability=capability,
                 orchestrator_task_id=orchestrator_task_id,
+                organize_group_by=str(organizeGroupBy or "").strip(),
                 office_definition=office_definition,
             )
             return ToolResult(output=json.dumps(result))
