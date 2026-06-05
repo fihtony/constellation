@@ -717,6 +717,50 @@ def _office_output_mode_question() -> str:
     )
 
 
+def _office_dimension_resolved(user_text: str, office_request: dict) -> bool:
+    """Return True when the organize request already carries a usable
+    grouping dimension (either pinned in metadata or scanned from the
+    user text).  The check mirrors the office agent's own
+    :func:`framework.office.dimensions.parse_dimension` so the two
+    sides agree on what counts as "resolved".
+    """
+    from framework.office.dimensions import parse_dimension
+
+    metadata = {"organizeGroupBy": office_request.get("organizeGroupBy", "")}
+    if parse_dimension(metadata, user_text):
+        return True
+    return False
+
+
+def _office_organize_dimension_question(user_text: str) -> str:
+    """Render a user-facing question for the missing dimension.
+
+    Unlike the bare dimension list, this surfaces the user's last
+    natural-language hint so the user can see *why* their phrasing did
+    not match.  For example, "by student name" gets acknowledged as
+    not-supported and the 6 valid options are listed.
+    """
+    options_block = ", ".join(
+        f"`{dim}`" for dim in sorted(VALID_DIMENSIONS)
+    )
+    text = (user_text or "").lower()
+    has_no_dimension_signal = not parse_dimension({}, user_text)
+    if has_no_dimension_signal:
+        # The user said something that does not match any of the six
+        # supported dimensions.  Name the unsupported hint and tell
+        # them explicitly which dimensions are available.
+        return (
+            "I could not find a supported grouping dimension in the "
+            "request. The organize capability groups files by one of "
+            f"{options_block}, not by arbitrary entities like student "
+            "name. Please reply with one of the supported dimensions."
+        )
+    return (
+        "Office organize needs a grouping dimension. "
+        f"Available dimensions: {options_block}."
+    )
+
+
 def _office_callback_url(task_id: str) -> str:
     base_url = os.environ.get("COMPASS_BASE_URL", "").rstrip("/")
     if not base_url:
@@ -1328,12 +1372,84 @@ class CompassAgent(BaseAgent):
             log.info("dispatching office task")
             office_request = _extract_office_request(user_text, meta)
             task_store.update_metadata(task.id, {"task_type": "office", "office_request": office_request})
+
+            # For the organize capability, ask the dimension question BEFORE
+            # the output-mode question.  Most natural-language requests
+            # embed a grouping hint ("by file size", "by extension", ...)
+            # but miss the dimension keyword for the default output mode
+            # ("workspace" is implicit).  Putting the dimension first
+            # shrinks the typical "ask output mode, then ask dimension"
+            # two-round trip into a single round for organize requests.
+            if (
+                office_request.get("capability") == "organize"
+                and not _office_dimension_resolved(user_text, office_request)
+            ):
+                question = _office_organize_dimension_question(user_text)
+                task_store.pause_task(
+                    task.id,
+                    question=question,
+                    interrupt_metadata={
+                        "kind": "office_organize_dimension",
+                        "office_request": office_request,
+                        "needs_clarification": {
+                            "missing": "organizeGroupBy",
+                            "options": [
+                                {"id": d, "label": d.replace("_", " ")}
+                                for d in sorted(VALID_DIMENSIONS)
+                            ],
+                            "user_message": question,
+                        },
+                    },
+                )
+                _record_major_step(
+                    task_store,
+                    task.id,
+                    step_key="compass.office_organize_dimension",
+                    title="Compass asking for organize dimension",
+                    agent=_aid,
+                    lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+                    conditional=True,
+                    summary_template=(
+                        "Compass is waiting for the user to pick an "
+                        "organize dimension."
+                    ),
+                )
+                _append_chat_entry(
+                    task_store,
+                    task.id,
+                    role="COMPASS",
+                    text=question,
+                    tone="input-required",
+                )
+                log.info(
+                    "office organize task awaiting dimension",
+                    source_count=len(office_request.get("source_paths", [])),
+                )
+                ui_update = {
+                    "task_id": task.id,
+                    "task_status": "TASK_STATE_INPUT_REQUIRED",
+                    "chat_message": {
+                        "role": "COMPASS",
+                        "text": question,
+                        "style": "normal",
+                    },
+                }
+                return {"task_id": task.id, "ui_update": ui_update}
+
+            # For non-organize office capabilities (summarize / analyze),
+            # or for organize requests that already include a dimension
+            # and output mode, the dimension gate is satisfied.  If the
+            # output_mode is still empty, ask for it now — same path as
+            # before, but it no longer pre-empts the dimension round.
             if not office_request.get("output_mode"):
                 question = _office_output_mode_question()
                 task_store.pause_task(
                     task.id,
                     question=question,
-                    interrupt_metadata={"kind": "office_output_mode", "office_request": office_request},
+                    interrupt_metadata={
+                        "kind": "office_output_mode",
+                        "office_request": office_request,
+                    },
                 )
                 _record_major_step(
                     task_store,
@@ -1366,7 +1482,7 @@ class CompassAgent(BaseAgent):
                         "style": "normal",
                     },
                 }
-                return {**task_store.get_task_dict(task.id), "ui_update": ui_update}
+                return {"task_id": task.id, "ui_update": ui_update}
 
             dispatch_data = _dispatch_office_request(task.id, user_text, office_request, registry, log)
             response_text = dispatch_data.get("message") or f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
@@ -1431,7 +1547,7 @@ class CompassAgent(BaseAgent):
                         "style": "normal",
                     },
                 }
-                return {**task_store.get_task_dict(task.id), "ui_update": ui_update}
+                return {"task_id": task.id, "ui_update": ui_update}
             if office_failed:
                 _record_major_step(
                     task_store,
