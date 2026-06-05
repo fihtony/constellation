@@ -1548,7 +1548,31 @@ class CompassAgent(BaseAgent):
         task_store = self.services.task_store
         task = task_store.get_task(task_id)
         if task is None:
-            raise RuntimeError(f"Task {task_id} not found")
+            # Unknown task id — surface a clean 404-shaped error so the
+            # UI can refresh the task list instead of showing
+            # "Failed to send reply to Compass".
+            raise LookupError(f"Task {task_id} not found")
+
+        current_state = getattr(
+            getattr(task.status, "state", None), "value",
+            str(getattr(task.status, "state", "")),
+        )
+        # Only INPUT_REQUIRED tasks are eligible for resume.  If a
+        # concurrent poll / dispatch already moved the task forward
+        # (e.g. from a race with the background worker, or a stale
+        # targetTaskId after the user clicked reply on a task that
+        # the SSE had already updated), tell the caller so the UI
+        # can refresh instead of mutating an unrelated state.
+        if current_state != "TASK_STATE_INPUT_REQUIRED":
+            return {
+                "error": "task_not_waiting_for_input",
+                "message": (
+                    f"Task {task_id} is in state {current_state}; "
+                    "no resume required. Refresh the task list."
+                ),
+                "task_id": task_id,
+                "task_state": current_state,
+            }
 
         _append_chat_entry(task_store, task_id, role="USER", text=str(resume_value))
 
@@ -1632,7 +1656,7 @@ class CompassAgent(BaseAgent):
                     "style": "failed",
                 },
             }
-            return {**task_store.get_task_dict(task_id), "ui_update": ui_update}
+            return {"task_id": task_id, "ui_update": ui_update}
 
         # Resolve the user reply against the active interrupt kind. The
         # helper returns either an office_request update dict, or an empty
@@ -1690,7 +1714,7 @@ class CompassAgent(BaseAgent):
                     "style": "normal",
                 },
             }
-            return {**task_store.get_task_dict(task_id), "ui_update": ui_update}
+            return {"task_id": task_id, "ui_update": ui_update}
 
         # Reply validated; merge any updates into office_request.
         office_request = dict(resolution.get("office_request") or office_request)
@@ -1787,7 +1811,12 @@ class CompassAgent(BaseAgent):
                 "style": "normal",
             },
         }
-        return {**task_store.get_task_dict(task_id), "ui_update": ui_update}
+        # Return a slim task reference (id + ui_update) instead of the
+        # full 17KB+ task dict.  The UI re-fetches the canonical task
+        # state right after this via loadTasks(false), so embedding the
+        # full dict here just doubles the bandwidth and slows down the
+        # resume round-trip on slower connections.
+        return {"task_id": task_id, "ui_update": ui_update}
 
     def _complete_office_task(
         self,

@@ -2858,8 +2858,9 @@ _INLINE_JS = r"""
         targetTask.currentMajorStep = 'Office task dispatching in background';
         renderTaskList(); renderChat(); renderDetail();
       }
+      let resumeData;
       try {
-        await fetchJsonWithTimeout(`/tasks/${encodeURIComponent(targetTaskId)}/resume`, {
+        resumeData = await fetchJsonWithTimeout(`/tasks/${encodeURIComponent(targetTaskId)}/resume`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ input: text }),
@@ -2873,6 +2874,18 @@ _INLINE_JS = r"""
         }
         input.value = text;
         state.composerNote = 'Failed to send reply to Compass. Please retry.';
+        renderTaskList(); renderChat(); renderDetail();
+        return;
+      }
+      // The server may return HTTP 200 with a structured ``error`` field
+      // when the task is no longer waiting (e.g. a concurrent dispatch
+      // already moved it forward, or the user clicked reply on a stale
+      // taskId).  Treat that as a non-error: just refresh the task
+      // list and clear the composer — no "please retry" banner.
+      if (resumeData && resumeData.error === 'task_not_waiting_for_input') {
+        try { await loadTasks(false); } catch (_ignored) {}
+        try { await loadTaskDetail(targetTaskId); } catch (_ignored) {}
+        clearComposerNote();
         renderTaskList(); renderChat(); renderDetail();
         return;
       }
