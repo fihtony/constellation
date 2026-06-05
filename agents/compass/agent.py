@@ -198,6 +198,61 @@ def _normalize_output_mode(value: str) -> str:
     return mode if mode in {"workspace", "inplace"} else ""
 
 
+# Neutral, multilingual output-mode phrases that Compass can resolve
+# straight from the user request without going through a clarification
+# round-trip.  Every entry is a generic phrase; no business-specific or
+# test-case wording.  Order matters: longer phrases must come first so
+# "in workspace" wins over the bare "workspace" token.
+_OUTPUT_MODE_PHRASES: tuple[tuple[str, str], ...] = (
+    # workspace
+    ("in workspace", "workspace"),
+    ("to workspace", "workspace"),
+    ("use workspace", "workspace"),
+    ("workspace mode", "workspace"),
+    ("workspace output", "workspace"),
+    ("工作区", "workspace"),
+    ("写到工作区", "workspace"),
+    ("输出到工作区", "workspace"),
+    # inplace
+    ("in place", "inplace"),
+    ("in-place", "inplace"),
+    ("inplace mode", "inplace"),
+    ("in the source", "inplace"),
+    ("in source folder", "inplace"),
+    ("inside the source", "inplace"),
+    ("write inside the source", "inplace"),
+    ("原地", "inplace"),
+    ("原位", "inplace"),
+    ("就地", "inplace"),
+    ("输出到原", "inplace"),
+    ("写到原文件夹", "inplace"),
+)
+
+
+def _scan_output_mode_from_text(user_text: str) -> str:
+    """Return ``"workspace"`` / ``"inplace"`` / ``""`` from a user request.
+
+    Scans for neutral multilingual phrases. The agent never invents an
+    output mode — when neither phrase matches, the empty string lets
+    the caller fall through to the clarification round-trip.  This is
+    the symmetric counterpart of
+    :func:`framework.office.dimensions.parse_dimension`: both
+    validators look at metadata first, then keyword-scan the user
+    text, and only fail-closed (return ``""``) when both are silent.
+    """
+    text = (user_text or "").strip().lower()
+    if not text:
+        return ""
+    # Longest phrase first so "in workspace" wins over a bare "workspace"
+    # token that might appear in a different context (e.g. "the workspace
+    # output" already covered by the explicit phrase above).
+    sorted_phrases = sorted(_OUTPUT_MODE_PHRASES, key=lambda item: -len(item[0]))
+    for needle, mode in sorted_phrases:
+        if needle in text:
+            return mode
+    return ""
+
+
 def _normalize_organize_dimension(value: str) -> str:
     """Map a free-text user reply to a canonical organize dimension id.
 
@@ -355,8 +410,11 @@ def _extract_office_request(user_text: str, metadata: dict) -> dict:
             str(metadata.get("capability") or metadata.get("requestedCapability") or ""),
             user_text,
         ),
-        "output_mode": _normalize_output_mode(
-            str(metadata.get("output_mode") or metadata.get("officeOutputMode") or "")
+        "output_mode": (
+            _normalize_output_mode(
+                str(metadata.get("output_mode") or metadata.get("officeOutputMode") or "")
+            )
+            or _scan_output_mode_from_text(user_text)
         ),
     }
 
