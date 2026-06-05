@@ -9,11 +9,27 @@ result is the signal for a structured `needs_clarification` reply.
 The dimension contract is intentionally narrow. Adding a new dimension
 is a one-line change here plus a corresponding tool in
 ``organize_by_dimension`` — never a code change buried in a prompt.
+
+Custom dimensions
+----------------
+
+In addition to the six zero-LLM dimensions, the contract also defines
+a sentinel ``__custom__`` id that signals "the user has a clear
+dimension intent that does not match any of the six built-in
+dimensions" (e.g. "by student name").  The custom path is a
+two-phase flow: an LLM proposes a bucket plan, the user approves or
+modifies, and only then does office materialize the files.  The
+detection of custom intent is the *only* part that runs at
+parse_dimension time so the rest of the code (and the office tools
+that look up :data:`VALID_DIMENSIONS`) can stay consistent.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
+# Six zero-LLM dimensions.  Adding a new one is a one-line change
+# here plus a corresponding tool in ``organize_by_dimension``.
 VALID_DIMENSIONS: frozenset[str] = frozenset({
     "size",
     "type",
@@ -22,6 +38,13 @@ VALID_DIMENSIONS: frozenset[str] = frozenset({
     "accessed_time",
     "filename",
 })
+
+# Sentinel id for the LLM-driven custom-dimension path.  Resolved
+# when :func:`parse_dimension` detects a clear "by X" / "按X" hint
+# that does not match any of the six built-in dimensions.  The
+# caller is expected to read the user's natural-language hint from
+# :data:`CUSTOM_DIMENSION_HINT_RE` to feed the office planner.
+CUSTOM_DIMENSION: str = "__custom__"
 
 
 # Neutral, multilingual keyword mapping. Every entry is a generic term
@@ -72,6 +95,44 @@ KEYWORD_TO_DIMENSION: dict[str, str] = {
 }
 
 
+# Pattern for the "by X" / "按X整理" / "X-wise" hint that signals a
+# custom-dimension intent.  The captured group (1) is the raw
+# dimension hint (e.g. "student name", "subject", "department") which
+# the office planner feeds into its prompt.  We deliberately allow
+# the hint to contain any word characters and spaces; the office
+# planner decides what to do with arbitrary entity names.
+_CUSTOM_DIMENSION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # English: "by X", "group by X", "organize by X"
+    re.compile(r"\b(?:group(?:ing)?\s+)?by\s+([a-z][a-z0-9 _/-]{1,40})", re.IGNORECASE),
+    # "X-wise": "subject-wise", "department-wise"
+    re.compile(r"\b([a-z][a-z0-9 _-]{1,30})-wise\b", re.IGNORECASE),
+    # Chinese: "按X整理", "按X分组", "以X划分"
+    re.compile(r"按\s*([一-鿿][一-鿿0-9 _/-]{0,20})\s*(?:整理|分组|划分|归类|分)"),
+    # Chinese: "以X划分"
+    re.compile(r"以\s*([一-鿿][一-鿿0-9 _/-]{0,20})\s*划"),
+)
+
+
+def extract_custom_dimension_hint(user_text: str) -> str:
+    """Pull the user's natural-language dimension hint from ``user_text``.
+
+    Returns the first match across :data:`_CUSTOM_DIMENSION_PATTERNS`
+    or ``""`` if no hint is present.  The hint is returned trimmed
+    and lower-cased; the office planner is the only consumer.
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return ""
+    for pattern in _CUSTOM_DIMENSION_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        hint = match.group(1).strip().rstrip(",.;:?!")
+        if hint and hint.lower() not in {d.replace("_", " ") for d in VALID_DIMENSIONS}:
+            return hint
+    return ""
+
+
 def _from_metadata(metadata: Mapping[str, Any] | None) -> str:
     if not metadata:
         return ""
@@ -79,7 +140,14 @@ def _from_metadata(metadata: Mapping[str, Any] | None) -> str:
     if not raw or not isinstance(raw, str):
         return ""
     candidate = raw.strip().lower()
-    return candidate if candidate in VALID_DIMENSIONS else ""
+    if candidate in VALID_DIMENSIONS:
+        return candidate
+    # Sentinel that says "user wants the LLM custom path with the
+    # hint in metadata.customDimensionHint".  Compass propagates
+    # this so the office planner can pick it up.
+    if candidate == CUSTOM_DIMENSION:
+        return CUSTOM_DIMENSION
+    return ""
 
 
 def _from_user_text(user_text: str) -> str:
@@ -93,6 +161,11 @@ def _from_user_text(user_text: str) -> str:
     for needle in sorted(KEYWORD_TO_DIMENSION, key=len, reverse=True):
         if needle in text:
             return KEYWORD_TO_DIMENSION[needle]
+    # No built-in match.  See if the user has a clear custom
+    # dimension intent — e.g. "by student name" — and surface the
+    # sentinel so the office planner can take over.
+    if extract_custom_dimension_hint(user_text):
+        return CUSTOM_DIMENSION
     return ""
 
 
@@ -102,9 +175,12 @@ def parse_dimension(
 ) -> str:
     """Resolve the user-requested grouping dimension.
 
-    Returns one of ``VALID_DIMENSIONS`` or ``""`` when neither the
-    metadata nor the user text supplies a recognized dimension. The
-    caller is responsible for surfacing ``needs_clarification`` when
-    the result is empty — this function never invents a default.
+    Returns one of :data:`VALID_DIMENSIONS`, the sentinel
+    :data:`CUSTOM_DIMENSION` (``"__custom__"``) when the user
+    supplied a clear custom-dimension intent that does not match any
+    built-in dimension, or ``""`` when neither the metadata nor the
+    user text supplies any dimension signal at all.  The caller is
+    responsible for surfacing :data:`needs_clarification` when the
+    result is empty — this function never invents a default.
     """
     return _from_metadata(metadata) or _from_user_text(user_text)

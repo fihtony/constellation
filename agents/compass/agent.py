@@ -275,6 +275,25 @@ def _normalize_organize_dimension(value: str) -> str:
     return parse_dimension({}, text)
 
 
+def _normalize_custom_plan_approval(value: str) -> str:
+    """Map a user reply to a custom-plan approval action.
+
+    Returns one of:
+    - ``"approve"`` — user said yes, run the plan as drafted.
+    - ``"modify"``  — user wants changes (the rest of the reply is
+      treated as a free-text note the office planner can fold in).
+    - ``""``        — unrecognised; the caller re-prompts.
+    """
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    if text in {"approve", "approved", "yes", "ok", "okay", "go", "y", "lgtm"}:
+        return "approve"
+    if text in {"modify", "change", "revise", "update"} or text.startswith(("modify:", "change:", "revise:")):
+        return "modify"
+    return ""
+
+
 def _resolve_office_resume_reply(
     kind: str,
     reply: str,
@@ -292,6 +311,34 @@ def _resolve_office_resume_reply(
     """
     office_request = dict(office_request or {})
     if kind == "office_organize_dimension":
+        # The custom-dimension plan-approval flow puts the plan in
+        # the interrupt metadata's needs_clarification.  When the
+        # user replies "approve" / "modify", the reply must NOT be
+        # re-validated as a dimension — it is a plan action.
+        existing_needs = (office_request.get("_needs_clarification") or {})
+        if existing_needs.get("missing") == "organizeCustomPlan":
+            approval = _normalize_custom_plan_approval(reply)
+            if not approval:
+                question = (
+                    "Please reply with `approve` to execute the plan, "
+                    "or `modify: <change>` to revise it."
+                )
+                return {
+                    "error_question": question,
+                    "needs_clarification": {
+                        "missing": "organizeCustomPlan",
+                        "options": [
+                            {"id": "approve", "label": "Approve plan"},
+                            {"id": "modify", "label": "Modify plan"},
+                        ],
+                        "user_message": question,
+                    },
+                }
+            office_request["organize_custom_action"] = approval
+            if approval == "modify":
+                office_request["organize_custom_modify_note"] = reply
+            return {"office_request": office_request}
+
         dimension = _normalize_organize_dimension(reply)
         if not dimension:
             options = [
@@ -404,18 +451,52 @@ def _extract_office_request(user_text: str, metadata: dict) -> dict:
     if not source_paths:
         source_paths = _extract_office_paths_from_text(user_text)
 
+    # Resolve the dimension up front so the office agent receives a
+    # uniform ``organize_metadata.organizeGroupBy`` payload — whether
+    # the dimension is one of the six built-in ones or the
+    # ``__custom__`` sentinel that routes through the LLM planner.
+    from framework.office.dimensions import (
+        CUSTOM_DIMENSION,
+        extract_custom_dimension_hint,
+        parse_dimension,
+    )
+
+    capability = _normalize_office_capability(
+        str(metadata.get("capability") or metadata.get("requestedCapability") or ""),
+        user_text,
+    )
+    organize_group_by = ""
+    organize_metadata: dict = {}
+    if capability == "organize":
+        organize_group_by = parse_dimension(
+            {"organizeGroupBy": metadata.get("organizeGroupBy", "")},
+            user_text,
+        )
+        if organize_group_by:
+            organize_metadata = {"organizeGroupBy": organize_group_by}
+            if organize_group_by == CUSTOM_DIMENSION:
+                # Forward the user's natural-language hint so office's
+                # planner knows what to bucket by.  Pull it from
+                # metadata if the orchestrator pinned it, otherwise
+                # re-extract from the user text.
+                hint = str(
+                    metadata.get("customDimensionHint")
+                    or extract_custom_dimension_hint(user_text)
+                    or ""
+                ).strip()
+                if hint:
+                    organize_metadata["customDimensionHint"] = hint
     return {
         "source_paths": source_paths,
-        "capability": _normalize_office_capability(
-            str(metadata.get("capability") or metadata.get("requestedCapability") or ""),
-            user_text,
-        ),
+        "capability": capability,
         "output_mode": (
             _normalize_output_mode(
                 str(metadata.get("output_mode") or metadata.get("officeOutputMode") or "")
             )
             or _scan_output_mode_from_text(user_text)
         ),
+        "organize_dimension": organize_group_by,
+        "organize_metadata": organize_metadata,
     }
 
 
@@ -829,6 +910,12 @@ def _office_interrupt_kind(
     if missing == "organizeGroupBy" or (
         capability == "organize" and missing in {"", "organizeGroupBy"}
     ):
+        return "office_organize_dimension"
+    if missing == "organizeCustomPlan":
+        # Plan approval lives under the same dimension gate so the
+        # major-step timeline shows one continuous "asking for
+        # dimension" row that transitions from "pick a dimension"
+        # to "approve the plan" without a UI flicker.
         return "office_organize_dimension"
     if missing:
         return f"office_{missing.lower()}"
@@ -1717,6 +1804,16 @@ class CompassAgent(BaseAgent):
         log = AgentLogger(task_id=task_id, agent_name=self.definition.agent_id)
 
         office_request = dict(metadata.get("office_request") or {})
+        # Mirror the live ``needs_clarification`` payload from the
+        # current interrupt into the office_request so the
+        # dimension-resume helper can detect the
+        # ``organizeCustomPlan`` approval case without re-parsing
+        # the interrupt metadata.
+        interrupt_needs = (
+            (metadata.get("_interrupt") or {}).get("needs_clarification") or {}
+        )
+        if interrupt_needs and "missing" in interrupt_needs:
+            office_request.setdefault("_needs_clarification", dict(interrupt_needs))
         reply_text = str(resume_value or "").strip().lower()
         # Resolve the active interrupt kind. The most recent pause_task call
         # set ``_interrupt.kind``; older tasks may have a stale value, so we

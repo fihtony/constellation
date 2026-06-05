@@ -59,21 +59,35 @@ def test_office_dimension_resolved_true_for_keyword_in_user_text():
     assert _office_dimension_resolved("按文件大小整理", {"capability": "organize"})
 
 
-def test_office_dimension_resolved_false_for_unmatched_hint():
+def test_office_dimension_resolved_true_for_custom_hint():
+    """A clear "by X" hint that does not match any of the 6 built-in
+    dimensions is now considered RESOLVED — it routes through the
+    LLM-driven custom-dimension path.  ``by student name`` no longer
+    returns the empty string.
+    """
     from agents.compass.agent import _office_dimension_resolved
 
-    # The original failing scenario: "by student name" does not match
-    # any of the 6 supported dimensions.
-    assert not _office_dimension_resolved(
+    # "by student name" has a clear custom-dimension intent.
+    assert _office_dimension_resolved(
         "please organize by student name", {"capability": "organize"}
     )
-    # Other non-matching hints.
-    assert not _office_dimension_resolved(
+    # "by color" — clear custom intent (LLM will decide feasibility).
+    assert _office_dimension_resolved(
         "please organize by color", {"capability": "organize"}
     )
-    assert not _office_dimension_resolved(
+    assert _office_dimension_resolved(
         "请按颜色整理", {"capability": "organize"}
     )
+
+
+def test_office_dimension_resolved_false_when_no_signal_at_all():
+    from agents.compass.agent import _office_dimension_resolved
+
+    # No dimension intent at all — neither built-in nor custom.
+    assert not _office_dimension_resolved(
+        "please organize this folder", {"capability": "organize"}
+    )
+    assert not _office_dimension_resolved("", {"capability": "organize"})
 
 
 def test_office_organize_dimension_question_for_unmatched_hint():
@@ -83,10 +97,12 @@ def test_office_organize_dimension_question_for_unmatched_hint():
     """
     from agents.compass.agent import _office_organize_dimension_question
 
-    question = _office_organize_dimension_question("please organize by student name")
-    assert "student" in question or "by student" in question, (
-        f"prompt should name the unsupported hint: {question!r}"
-    )
+    # For a custom hint like "student name" we now route to the
+    # LLM-driven custom path.  The clarification prompt for the
+    # BUILT-IN path is no longer the right surface — it would only
+    # be reached when the user has no dimension signal at all.
+    # So this helper's input should not be a custom hint.
+    question = _office_organize_dimension_question("please organize this folder")
     # All 6 valid dimensions are listed.
     for dim in ("size", "type", "created_time", "modified_time", "accessed_time", "filename"):
         assert f"`{dim}`" in question, f"missing dimension {dim!r} in: {question!r}"
@@ -155,43 +171,79 @@ async def _send(agent, text, *, metadata=None):
     return await agent.handle_message(msg)
 
 
-def test_organize_by_student_name_triggers_dimension_not_output_mode(compass_agent):
+def test_organize_by_student_name_routes_to_custom_dimension(compass_agent):
     """The exact scenario from task-440f61c09ffa: 'please organize
-    folder ... by student name' should land in INPUT_REQUIRED with
-    kind=office_organize_dimension (NOT output_mode), and the
-    question should name the unsupported hint.
+    folder ... by student name' should be recognized as a custom
+    dimension (kind=office_organize_dimension) and dispatched to the
+    office agent, NOT bounced as an unsupported hint.  The office
+    planner will produce a bucket plan via the LLM.
     """
     from agents.compass.tools import register_compass_tools as _reg  # noqa: F401
 
     agent, task_store = compass_agent
 
+    # Capture what office would have been called with.
+    captured: dict = {}
+
+    def _fake_dispatch_office_request(task_id, user_text, office_request, registry, log):
+        captured["office_request"] = dict(office_request)
+        # Simulate the office planner producing a custom plan.
+        return {
+            "status": "input-required",
+            "state": "TASK_STATE_INPUT_REQUIRED",
+            "needs_clarification": {
+                "missing": "organizeCustomPlan",
+                "user_message": (
+                    "Office drafted a custom organize plan for "
+                    "**student name**. Review the plan and reply "
+                    "`approve` to execute, or `modify: <change>` to "
+                    "revise."
+                ),
+                "plan": {
+                    "buckets": ["Alice", "Bob", "Carol"],
+                    "sample_mapping": {"alice.txt": "Alice"},
+                    "classification_rule": "Read the first line of each file for the student name.",
+                },
+            },
+        }
+
+    import agents.compass.agent as _cm
+    _cm._dispatch_office_request = _fake_dispatch_office_request
+
     result = asyncio.run(agent.handle_message({
         "message": {
             "parts": [{
-                "text": "please organize folder in /Users/aibot/projects/constellation/tests/data/2026 by student name"
+                "text": "please organize folder in /Users/aibot/projects/constellation/tests/data/2026 by student name in workspace"
             }],
             "metadata": {},
         }
     }))
 
+    # The office request must carry the custom dimension + hint.
+    assert captured.get("office_request"), "office should have been dispatched"
+    req = captured["office_request"]
+    assert req["capability"] == "organize"
+    # The user-supplied dimension hint reaches office via metadata.
+    assert (
+        (req.get("organize_metadata") or {}).get("organizeGroupBy")
+        == "__custom__"
+    )
+    assert req.get("organize_dimension") == "__custom__"
+    assert req.get("output_mode") == "workspace"
+
+    # The compass task is now INPUT_REQUIRED, waiting for the
+    # user to approve the custom plan.
     ui = result.get("ui_update") or {}
     assert ui.get("task_status") == "TASK_STATE_INPUT_REQUIRED"
-    question = (ui.get("chat_message") or {}).get("text", "")
-    assert "size" in question, f"dimension list missing in: {question!r}"
-    # The prompt should mention that "by student name" is not one of
-    # the supported dimensions, so the user knows *why* they're being
-    # re-asked.
-    assert "student" in question.lower(), (
-        f"prompt should name the unsupported hint: {question!r}"
-    )
-    # The compass task was paused with the dimension interrupt, NOT
-    # the output_mode one.
+    text = (ui.get("chat_message") or {}).get("text", "")
+    assert "student name" in text, f"plan prompt missing: {text!r}"
+    assert "approve" in text.lower(), f"approve hint missing: {text!r}"
+
+    # The interrupt must be tagged as the custom-dimension kind.
     task_id = ui.get("task_id")
     promoted = task_store.get_task(task_id)
     interrupt = (promoted.metadata or {}).get("_interrupt") or {}
-    assert interrupt.get("kind") == "office_organize_dimension", (
-        f"expected dimension gate first, got: {interrupt.get('kind')!r}"
-    )
+    assert interrupt.get("kind") == "office_organize_dimension"
 
 
 def test_organize_with_dim_and_output_mode_dispatches_immediately(compass_agent):

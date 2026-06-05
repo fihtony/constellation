@@ -773,6 +773,263 @@ def _run_bounded_folder_organize(
     )
 
 
+# ---------------------------------------------------------------------------
+# Custom-dimension plan-then-execute path
+# ---------------------------------------------------------------------------
+
+
+def _parse_json_object(text: str) -> dict:
+    """Tolerantly extract the first JSON object from ``text``.
+
+    The LLM sometimes wraps the JSON in ```json fences or adds a
+    trailing sentence.  This helper is good enough for the planner
+    prompt's contract ("reply in JSON only") and never raises.
+    """
+    text = (text or "").strip()
+    if not text:
+        return {}
+    if text.startswith("```"):
+        # Strip leading ``` or ```json and the matching trailing fence.
+        end = text.rfind("```")
+        if end > 0:
+            inner = text[3:end]
+            if inner.startswith("json"):
+                inner = inner[4:]
+            text = inner.strip()
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except (ValueError, TypeError):
+                return {}
+    return {}
+
+
+def _run_custom_dimension_path(
+    *,
+    state: dict,
+    runtime: Any,
+    source: str,
+    output_root: str,
+    custom_hint: str,
+    approved_plan: dict,
+    output_mode: str,
+    artifacts_dir: str,
+    validated_paths: list[str],
+) -> dict:
+    """Plan-then-execute flow for the ``__custom__`` dimension.
+
+    When ``approved_plan`` is empty: ask the LLM to produce a plan,
+    write it to ``custom-organize-plan.md``, and return an
+    INPUT_REQUIRED-shaped payload so the user can approve / modify.
+    When ``approved_plan`` is present: classify the remaining files
+    and materialize the layout under ``<output_root>/<bucket>/``.
+    """
+    import os as _os
+    from agents.office.organize_by_dimension import (
+        _build_planning_prompt,
+        _build_execution_prompt,
+        _read_sample_files,
+        _plan_published,
+    )
+
+    system_prompt = (
+        "You are the office organize planner.  The user has asked for "
+        "a custom grouping that none of the six built-in dimensions "
+        "(size / type / created_time / modified_time / accessed_time "
+        "/ filename) can express.  You read sample files, propose "
+        "buckets, and reply in JSON only — no prose around the JSON."
+    )
+
+    # ----- Phase 1: plan -----
+    if not approved_plan:
+        if not custom_hint:
+            return {
+                "summary": "Office organize needs a custom dimension hint.",
+                "success": False,
+                "capability": "organize",
+                "status": "failed",
+                "error": "missing custom dimension hint",
+                "needs_clarification": {
+                    "missing": "organizeCustomHint",
+                    "user_message": (
+                        "Office needs a custom grouping hint, e.g. "
+                        "'student name' or 'subject'.  Please reply with "
+                        "the entity you want to group files by."
+                    ),
+                },
+            }
+        samples = _read_sample_files(source, max_files=5, max_chars=600)
+        planning_prompt = _build_planning_prompt(custom_hint, source, samples)
+        try:
+            response = runtime.run(
+                planning_prompt,
+                system_prompt=system_prompt,
+                max_tokens=1500,
+                cwd=state.get("workspace_root"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "summary": f"office custom planner failed: {exc}",
+                "success": False,
+                "capability": "organize",
+                "status": "failed",
+                "error": f"planner runtime error: {exc}",
+            }
+        raw = response.get("raw_response") or response.get("summary") or ""
+        plan = _parse_json_object(raw)
+        if not plan or not plan.get("buckets"):
+            return {
+                "summary": "office custom planner returned no buckets",
+                "success": False,
+                "capability": "organize",
+                "status": "failed",
+                "error": "planner produced no usable JSON plan",
+                "raw_output": raw,
+            }
+        plan_path = _plan_published(plan, source=source, output_root=output_root)
+        # Pause for user approval.  The state fields ``organize_dimension``
+        # and the inline ``plan`` let compass re-dispatch with the
+        # plan on approval.
+        return {
+            "summary": (
+                f"Office drafted a custom organize plan for "
+                f"'{custom_hint}'.  Awaiting user approval."
+            ),
+            "success": False,  # not terminal — must wait for approval
+            "capability": "organize",
+            "status": "input-required",
+            "needs_clarification": {
+                "missing": "organizeCustomPlan",
+                "user_message": (
+                    f"Office drafted an organize plan for "
+                    f"**{custom_hint}**.  Review the plan at "
+                    f"`{plan_path}` and reply `approve` to execute, "
+                    "or `modify: <change>` to revise."
+                ),
+                "options": [
+                    {"id": "approve", "label": "Approve plan"},
+                    {"id": "modify", "label": "Modify plan"},
+                ],
+                "plan": plan,
+                "plan_path": plan_path,
+                "custom_hint": custom_hint,
+            },
+        }
+
+    # ----- Phase 2: execute -----
+    if not source or not _os.path.isdir(source):
+        return {
+            "summary": f"office custom execute: source missing: {source!r}",
+            "success": False,
+            "capability": "organize",
+            "status": "failed",
+            "error": f"source directory missing: {source!r}",
+        }
+    inventory, _, _ = collect_organize_file_inventory(source)
+    sample_paths = set((approved_plan.get("sample_mapping") or {}).keys())
+    remaining: list[dict] = []
+    for item in inventory:
+        rel = item.get("relative_path", "")
+        if rel in sample_paths:
+            continue
+        full = _os.path.join(source, rel)
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                excerpt = fh.read(200)
+        except OSError:
+            excerpt = ""
+        remaining.append({"path": rel, "excerpt": excerpt})
+    mapping: dict[str, str] = dict(approved_plan.get("sample_mapping") or {})
+    if remaining:
+        execution_prompt = _build_execution_prompt(custom_hint, approved_plan, remaining)
+        try:
+            response = runtime.run(
+                execution_prompt,
+                system_prompt=system_prompt,
+                max_tokens=4000,
+                cwd=state.get("workspace_root"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "summary": f"office custom executor failed: {exc}",
+                "success": False,
+                "capability": "organize",
+                "status": "failed",
+                "error": f"executor runtime error: {exc}",
+            }
+        raw = response.get("raw_response") or response.get("summary") or ""
+        exec_plan = _parse_json_object(raw)
+        mapping.update((exec_plan or {}).get("mapping") or {})
+
+    # Materialize files into bucket folders.
+    bucket_dirs: dict[str, str] = {}
+    plan_rows: list[dict[str, str]] = []
+    for item in inventory:
+        rel = item.get("relative_path", "")
+        bucket = str(mapping.get(rel) or "unmatched").strip() or "unmatched"
+        bucket_dir = bucket_dirs.get(bucket)
+        if not bucket_dir:
+            bucket_dir = _os.path.join(output_root, _safe_path_segment(bucket))
+            bucket_dirs[bucket] = bucket_dir
+            _os.makedirs(bucket_dir, exist_ok=True)
+        src_path = _os.path.realpath(_os.path.join(source, rel))
+        dst_path = _os.path.realpath(_os.path.join(bucket_dir, rel))
+        try:
+            _os.makedirs(_os.path.dirname(dst_path), exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+        except OSError as exc:  # noqa: BLE001
+            return {
+                "summary": f"office custom execute: copy failed: {exc}",
+                "success": False,
+                "capability": "organize",
+                "status": "failed",
+                "error": f"copy failed for {rel}: {exc}",
+            }
+        plan_rows.append({"source": rel, "bucket": bucket, "destination": _os.path.relpath(dst_path, output_root)})
+
+    # Write a final organization plan markdown for the audit trail.
+    plan_lines = [
+        f"# Folder Organization Plan (custom: {custom_hint})",
+        "",
+        f"**Source:** {source}",
+        f"**Output:** {output_root}",
+        f"**Mode:** {output_mode}",
+        "",
+        "## Buckets",
+        *[f"- {b}" for b in sorted(bucket_dirs)],
+        "",
+        "## Files Organized",
+        "| Source Path | Destination |",
+        "| --- | --- |",
+        *[f"| {row['source']} | {row['destination']} |" for row in plan_rows],
+        "",
+    ]
+    final_plan_path = _target_output_file(
+        output_mode,
+        source,
+        artifacts_dir,
+        "organization-plan.md",
+    )
+    _write_text_file(final_plan_path, "\n".join(plan_lines))
+    return {
+        "summary": (
+            f"Office organized {len(plan_rows)} file(s) with the custom "
+            f"dimension ({custom_hint})."
+        ),
+        "success": True,
+        "capability": "organize",
+        "status": "completed",
+        "raw_output": json.dumps({"plan_rows": plan_rows[:200], "buckets": sorted(bucket_dirs)}),
+        "expected_outputs": _expected_output_paths(
+            "organize", validated_paths, output_mode, artifacts_dir
+        ),
+    }
+
+
 def _try_bounded_office_flow(
     state: dict[str, Any],
     *,
@@ -1319,12 +1576,47 @@ def execute_office_work(state: dict) -> dict:
     artifacts_dir = state.get("artifacts_dir", "")
     output_mode = state.get("output_mode", "workspace")
     source_root = os.environ.get("OFFICE_SOURCE_ROOT", "")
+    user_text = str(state.get("user_request") or "")
 
     if capability == "organize":
         dimension = state.get("organize_dimension", "")
         if dimension:
             from agents.office.organize_by_dimension import run_dimension_tool
+            from framework.office.dimensions import (
+                CUSTOM_DIMENSION,
+                extract_custom_dimension_hint,
+            )
+            from agents.office.organize_by_dimension import (
+                _build_planning_prompt,
+                _build_execution_prompt,
+                _read_sample_files,
+                _plan_published,
+            )
             output_root = _organized_output_root(output_mode, artifacts_dir, validated_paths)
+            source_root = validated_paths[0] if validated_paths else ""
+
+            if dimension == CUSTOM_DIMENSION:
+                # Custom-dimension path: the LLM produces a plan, the
+                # user approves it, and only then does office execute
+                # the layout.  This branch owns the entire
+                # plan-then-execute flow.
+                custom_hint = str(
+                    (state.get("_message_metadata") or {}).get("customDimensionHint")
+                    or extract_custom_dimension_hint(user_text)
+                    or ""
+                ).strip()
+                approved_plan = state.get("organize_custom_plan") or {}
+                return _run_custom_dimension_path(
+                    state=state,
+                    runtime=runtime,
+                    source=source_root,
+                    output_root=output_root,
+                    custom_hint=custom_hint,
+                    approved_plan=approved_plan,
+                    output_mode=output_mode,
+                    artifacts_dir=artifacts_dir,
+                    validated_paths=validated_paths,
+                )
             dim_result = run_dimension_tool(
                 dimension,
                 validated_paths[0] if validated_paths else "",

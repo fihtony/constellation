@@ -439,7 +439,7 @@ class OrganizeByFilenameTool(BaseTool):
 # ---- dispatcher ------------------------------------------------------------
 
 
-from framework.office.dimensions import VALID_DIMENSIONS
+from framework.office.dimensions import CUSTOM_DIMENSION, VALID_DIMENSIONS
 
 
 _DIMENSION_TOOL = {
@@ -452,16 +452,198 @@ _DIMENSION_TOOL = {
 }
 
 
-def run_dimension_tool(dimension: str, source: str, output_root: str) -> ToolResult:
-    """Run the bounded (zero-LLM) dimension tool for ``dimension``.
+def run_dimension_tool(
+    dimension: str,
+    source: str,
+    output_root: str,
+    *,
+    custom_hint: str = "",
+    custom_plan: dict | None = None,
+) -> ToolResult:
+    """Run the bounded dimension tool for ``dimension``.
 
     Returns a ``ToolResult`` whose ``output`` is the JSON payload the
     dimension tool produced. Used by the bounded path inside
     ``execute_office_work`` — never invoked through the agentic runtime.
     """
+    if dimension == CUSTOM_DIMENSION:
+        # The custom-dimension path is LLM-driven and lives in
+        # ``execute_office_work`` rather than in a zero-LLM tool.  We
+        # route the call through the dispatcher anyway so the same
+        # entry point handles both built-in and custom dimensions.
+        return _dispatch_custom_dimension(
+            source=source,
+            output_root=output_root,
+            custom_hint=custom_hint,
+            custom_plan=custom_plan,
+        )
     if dimension not in VALID_DIMENSIONS:
         return ToolResult(output="", error=f"unsupported dimension: {dimension!r}")
     tool_cls = _DIMENSION_TOOL.get(dimension)
     if tool_cls is None:
         return ToolResult(output="", error=f"no tool registered for dimension: {dimension!r}")
     return tool_cls().execute_sync(source=source, output_root=output_root)
+
+
+# ---------------------------------------------------------------------------
+# Custom-dimension planning + execution (LLM-driven)
+# ---------------------------------------------------------------------------
+
+
+from typing import Callable
+import json as _json
+
+
+def _read_sample_files(source: str, *, max_files: int = 5, max_chars: int = 600) -> list[dict]:
+    """Read up to ``max_files`` sample files from ``source``.
+
+    Returns a list of ``{"path": rel, "excerpt": str}`` dicts.
+    Skips hidden files and non-text extensions so the planner prompt
+    stays small and focused.
+    """
+    samples: list[dict] = []
+    if not source or not os.path.isdir(source):
+        return samples
+    text_exts = {".txt", ".md", ".csv", ".json", ".yaml", ".yml", ".log",
+                ".html", ".htm", ".xml", ".rst", ".tsv"}
+    for walk_root, dirs, files in os.walk(source):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(files):
+            if name.startswith("."):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            full = os.path.join(walk_root, name)
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                    excerpt = fh.read(max_chars)
+            except OSError:
+                continue
+            samples.append({
+                "path": os.path.relpath(full, source),
+                "ext": ext,
+                "excerpt": excerpt,
+            })
+            if len(samples) >= max_files:
+                return samples
+    return samples
+
+
+def _build_planning_prompt(hint: str, source: str, samples: list[dict]) -> str:
+    """Render the LLM prompt that produces a custom-dimension plan."""
+    sample_block = "\n\n".join(
+        f"--- {s['path']} ({s['ext']}) ---\n{s['excerpt']}"
+        for s in samples
+    )
+    return (
+        f"You are helping organize files in this folder:\n{source}\n\n"
+        f"The user wants to group them by **{hint}**.\n\n"
+        "Read the sample files below and propose an organize plan with:\n"
+        "1. A list of bucket names you recommend (3-12 buckets).\n"
+        "2. For each sample file, which bucket it belongs to and why.\n"
+        "3. A general rule the agent can use to classify the\n"
+        "   remaining (unsampled) files into the same buckets.\n\n"
+        "Reply in JSON only, with this exact schema:\n"
+        "{\n"
+        '  "buckets": ["name1", "name2", ...],\n'
+        '  "sample_mapping": {"<sample_path>": "<bucket_name>", ...},\n'
+        '  "classification_rule": "Plain-English rule the agent can apply to all files",\n'
+        '  "rationale": "One paragraph explaining the plan."\n'
+        "}\n\n"
+        f"Sample files ({len(samples)}):\n\n{sample_block}\n"
+    )
+
+
+def _build_execution_prompt(
+    hint: str,
+    plan: dict,
+    remaining: list[dict],
+) -> str:
+    """Render the LLM prompt that classifies unsampled files into buckets."""
+    file_block = "\n".join(
+        f"- {item['path']} (excerpt: {item['excerpt'][:200]!r})"
+        for item in remaining
+    )
+    bucket_list = ", ".join(repr(b) for b in plan.get("buckets", []))
+    return (
+        f"You classified a sample of files into these buckets for "
+        f"organizing by **{hint}**:\n{bucket_list}\n\n"
+        f"Plan rationale: {plan.get('rationale', '')}\n\n"
+        f"Classification rule from the planner: {plan.get('classification_rule', '')}\n\n"
+        "Now classify the following remaining files. For each, output "
+        "the bucket name from the list above (or `__unmatched__` if the "
+        "rule does not apply). Reply in JSON only:\n"
+        "{\n"
+        '  "mapping": {"<file_path>": "<bucket_name>", ...}\n'
+        "}\n\n"
+        f"Files to classify ({len(remaining)}):\n\n{file_block}\n"
+    )
+
+
+def _plan_published(
+    plan: dict,
+    *,
+    source: str,
+    output_root: str,
+) -> str:
+    """Write ``plan`` to ``output_root/custom-organize-plan.md``.
+
+    Returns the plan path. The markdown rendering is deliberately
+    small — compass surfaces the same JSON to the UI, and the file
+    is the durable record.
+    """
+    os.makedirs(output_root, exist_ok=True)
+    plan_path = os.path.join(output_root, "custom-organize-plan.md")
+    buckets = plan.get("buckets") or []
+    sample_mapping = plan.get("sample_mapping") or {}
+    rule = plan.get("classification_rule", "")
+    rationale = plan.get("rationale", "")
+    lines = [
+        "# Custom Organize Plan",
+        "",
+        f"**Source:** {source}",
+        f"**Output:** {output_root}",
+        "",
+        "## Buckets",
+        *[f"- `{b}`" for b in buckets],
+        "",
+        "## Classification rule",
+        rule or "(none)",
+        "",
+        "## Rationale",
+        rationale or "(none)",
+        "",
+        "## Sample mapping",
+        "| Source file | Bucket |",
+        "| --- | --- |",
+        *[f"| `{path}` | `{bucket}` |" for path, bucket in sorted(sample_mapping.items())],
+        "",
+    ]
+    with open(plan_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    return plan_path
+
+
+def _dispatch_custom_dimension(
+    *,
+    source: str,
+    output_root: str,
+    custom_hint: str,
+    custom_plan: dict | None,
+) -> ToolResult:
+    """Stub dispatcher for the custom-dimension path.
+
+    The real LLM call lives in :func:`execute_office_work` so the
+    runtime context is available.  This stub exists to keep
+    :func:`run_dimension_tool` a single dispatch entry point and
+    returns a structured "needs planner" payload the office node
+    can act on.
+    """
+    payload = {
+        "dimension": CUSTOM_DIMENSION,
+        "stage": "plan_required" if not custom_plan else "execute",
+        "custom_hint": custom_hint,
+        "plan": custom_plan or {},
+        "source": source,
+        "output_root": output_root,
+    }
+    return ToolResult(output=_json.dumps(payload))
