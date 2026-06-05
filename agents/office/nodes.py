@@ -1324,11 +1324,7 @@ def execute_office_work(state: dict) -> dict:
         dimension = state.get("organize_dimension", "")
         if dimension:
             from agents.office.organize_by_dimension import run_dimension_tool
-            try:
-                output_root = _organized_output_root(output_mode, artifacts_dir, validated_paths)
-            except NameError:
-                # Fall back to artifacts_dir for the workspace case.
-                output_root = artifacts_dir
+            output_root = _organized_output_root(output_mode, artifacts_dir, validated_paths)
             dim_result = run_dimension_tool(
                 dimension,
                 validated_paths[0] if validated_paths else "",

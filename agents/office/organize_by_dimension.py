@@ -14,6 +14,7 @@ method of each tool.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import re
@@ -266,30 +267,6 @@ class OrganizeByTypeTool(BaseTool):
         except Exception as exc:
             return ToolResult(output="", error=f"organize_by_type: {exc}")
 
-
-# ---- stubs for tools implemented in later tasks ----------------------------
-# These exist so that `from agents.office.organize_by_dimension import ...`
-# resolves cleanly. Each task that lands the real implementation replaces
-# the stub with a functional class.
-
-
-class _NotYetImplementedTool(BaseTool):
-    name = ""
-    description = ""
-    parameters_schema = {
-        "type": "object",
-        "properties": {
-            "source": {"type": "string"},
-            "output_root": {"type": "string"},
-        },
-        "required": ["source", "output_root"],
-    }
-
-    def execute_sync(self, source: str = "", output_root: str = "", **_: Any) -> ToolResult:
-        return ToolResult(output="", error=f"{self.name}: not yet implemented")
-
-
-import datetime as _dt
 
 # ---- time-based dimensions -------------------------------------------------
 
