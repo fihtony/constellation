@@ -633,6 +633,32 @@ def _merge_into_task_store(
 
     major_step_events.append(event)
 
+    # Single-active-row normalization: when a new step instance starts (or the
+    # task emits a different terminal row), any previously-active non-terminal
+    # row must be closed so its visual state and elapsed time stop advancing.
+    previous_active_key = active_key if active_key and active_key != sik else ""
+    if previous_active_key:
+        previous_active_row = major_step_rows.get(previous_active_key)
+        previous_active_state = step_states.get(previous_active_key) or {}
+        previous_active_terminal = bool(
+            previous_active_row
+            and previous_active_row.get("lifecycle_state") in TERMINAL_LIFECYCLE_STATES
+        )
+        if previous_active_row and not previous_active_terminal:
+            closed_row = dict(previous_active_row)
+            closed_row["lifecycle_state"] = LIFECYCLE_DONE
+            closed_row["visual_state"] = VISUAL_DONE
+            closed_row["ended_at"] = event["created_at"]
+            major_step_rows[previous_active_key] = closed_row
+
+            closed_state = dict(previous_active_state)
+            closed_state["lifecycle_state"] = LIFECYCLE_DONE
+            closed_state["visual_state"] = VISUAL_DONE
+            if "started_at" not in closed_state and closed_row.get("started_at"):
+                closed_state["started_at"] = closed_row.get("started_at")
+            closed_state["ended_at"] = event["created_at"]
+            step_states[previous_active_key] = closed_state
+
     # Upsert row in major_step_rows
     previous_row = existing_row
     new_row = dict(previous_row or {})

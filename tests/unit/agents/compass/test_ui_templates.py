@@ -129,17 +129,19 @@ class TestCompassUITemplates:
         assert "const isFocusedRow = !expanded || (row.fired && visualClass === 'current');" in html
         assert "${isFocusedRow ? ' current' : ''}" in html
 
-    def test_render_ui_migrates_legacy_compass_received_row_to_done_when_later_steps_exist(self):
-        # Bug #61 expanded the stuck-running heuristic to cover
-        # ``office.received`` and any earlier office row, not just
-        # ``compass.received``.  The new predicate name reflects the
-        # broader scope.
+    def test_render_ui_closes_non_pointer_running_rows_when_later_steps_exist(self):
+        # Development tasks like task-79f7f621ba59 can accumulate several
+        # stale ``current`` rows (``compass.dispatched`` → ``tl.received`` →
+        # ``wd.received``) while only the active pointer row should remain
+        # live. The renderer must therefore close any non-pointer running row
+        # once a later fired step exists, rather than relying on a small list
+        # of hard-coded step keys.
         html = render_compass_ui()
+        assert "const pointerKey = (pickPointerRow(task) || {}).key || '';" in html
+        assert "const laterFiredSteps = ordered.slice(index + 1).filter(candidate => candidate.fired && !candidate.ignored);" in html
+        assert "const hasLaterFiredStep = laterFiredSteps.length > 0;" in html
+        assert "&& row.key !== pointerKey" in html
         assert "const isStuckRunningRow =" in html
-        assert "stepKey === 'compass.received'" in html
-        assert "stepKey === 'compass.asking_output_mode'" in html
-        assert "stepKey === 'office.received'" in html
-        assert "const hasLaterFiredStep = ordered.some(candidate => candidate.key !== sik && candidate.fired && !candidate.ignored);" in html
         assert "visualState = 'done';" in html
         assert "lifecycleState = 'done';" in html
 
@@ -151,9 +153,10 @@ class TestCompassUITemplates:
         # Time Spent renderer then fell back to ``Date.now()`` and the
         # counter ticked up forever on every refresh.  The fix: when
         # ``isStuckRunningRow`` matches, the close-out must seed
-        # ``endedAt`` from the next fired step's ``startedAt`` (or, as a
+        # ``endedAt`` from the next later fired step's ``startedAt`` (or, as a
         # last resort, ``task.updatedAt``) so the duration is frozen.
         html = render_compass_ui()
+        assert "const nextStep = laterFiredSteps.find(candidate => candidate.startedAt);" in html
         assert "endedAt = (nextStep && nextStep.startedAt) || (task.updatedAt || task.updated_at || '') || null;" in html
         assert "return { ...row, visualState, lifecycleState, endedAt };" in html
 

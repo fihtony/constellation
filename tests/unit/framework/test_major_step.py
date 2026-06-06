@@ -584,6 +584,34 @@ class TestTerminalProtection:
 # ---------------------------------------------------------------------------
 
 class TestPointerFields:
+    def test_new_running_step_closes_previous_active_row(self):
+        store = _make_task_store()
+        record_major_step(
+            "task-x",
+            step_key="compass.dispatched",
+            title="Compass dispatching to Team Lead",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_RUNNING,
+            task_store=store,
+        )
+        record_major_step(
+            "task-x",
+            step_key="tl.received",
+            title="Team Lead receiving dev task",
+            agent="team-lead",
+            lifecycle_state=LIFECYCLE_RUNNING,
+            task_store=store,
+        )
+
+        meta = store.get_task("task-x").metadata
+        dispatched = meta["major_step_rows"]["compass.dispatched#0"]
+        received = meta["major_step_rows"]["tl.received#0"]
+        assert dispatched["lifecycle_state"] == LIFECYCLE_DONE
+        assert dispatched["visual_state"] == VISUAL_DONE
+        assert dispatched["ended_at"] is not None
+        assert received["lifecycle_state"] == LIFECYCLE_RUNNING
+        assert meta["active_step_instance_key"] == "tl.received#0"
+
     def test_active_pointer_set_on_running(self):
         store = _make_task_store()
         record_major_step(

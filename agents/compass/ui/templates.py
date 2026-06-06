@@ -1783,38 +1783,33 @@ _INLINE_JS = r"""
         });
       }
     }
-    const normalizedOrdered = ordered.map((row) => {
+    const pointerKey = (pickPointerRow(task) || {}).key || '';
+    const normalizedOrdered = ordered.map((row, index) => {
       let visualState = row.visualState || 'pending';
       let lifecycleState = row.lifecycleState || '';
       let endedAt = row.endedAt;
       const stepKey = String(row.stepKey || '');
       const sik = row.key;
       // ``hasLaterFiredStep`` captures the case where the task has progressed
-      // past this row, even if the row itself never received an event. Used
-      // both for stuck-running fixes (compass.received legacy + office.received)
-      // and for unfired skeleton rows that were skipped during execution.
-      const hasLaterFiredStep = ordered.some(candidate => candidate.key !== sik && candidate.fired && !candidate.ignored);
-      // A row can be "stuck in running" for two reasons:
-      //   1. Legacy ``compass.received`` rows (pre-v0.8 designs that never
-      //      recorded a terminal event).
-      //   2. ``office.received`` and any earlier office row that was emitted
-      //      with ``LIFECYCLE_RUNNING`` and never explicitly closed (an
-      //      office workflow that forgot to re-emit, or historical tasks
-      //      written before ``emit_delivered`` started closing the row).
-      // In either case, if a later step in the same task has already
-      // fired, the row is logically complete and we should show it as
-      // ``done`` so the timeline reflects the real historical sequence.
+      // past this row, even if the row itself never received an explicit
+      // terminal event. Used both for old stuck-running rows and for unfired
+      // skeleton rows that were skipped during execution.
+      const laterFiredSteps = ordered.slice(index + 1).filter(candidate => candidate.fired && !candidate.ignored);
+      const hasLaterFiredStep = laterFiredSteps.length > 0;
+      // A row is "stuck in running" when:
+      //   1. it is still marked current/running,
+      //   2. it is NOT the active pointer row, and
+      //   3. a later real step has already fired.
+      // This closes stale rows like ``compass.dispatched``,
+      // ``tl.received``, ``wd.received``, and historical office rows while
+      // keeping the real active row live.
       const isStuckRunningRow =
         row.fired
+        && row.key !== pointerKey
         && hasLaterFiredStep
-        && (visualState === 'current' || lifecycleState === 'running')
-        && (stepKey === 'compass.received'
-            || stepKey === 'compass.asking_output_mode'
-            || stepKey === 'office.received'
-            || (row.agent === 'office'
-                && lifecycleState !== 'done'
-                && lifecycleState !== 'failed'
-                && lifecycleState !== 'cancelled'));
+        && (visualState === 'current'
+            || lifecycleState === 'running'
+            || lifecycleState === 'resuming');
       if (isStuckRunningRow) {
         visualState = 'done';
         lifecycleState = 'done';
@@ -1828,7 +1823,7 @@ _INLINE_JS = r"""
         // ``updatedAt`` (which is frozen once the task enters a terminal
         // state).
         if (!endedAt) {
-          const nextStep = ordered.find(candidate => candidate.key !== sik && candidate.fired && !candidate.ignored && candidate.startedAt);
+          const nextStep = laterFiredSteps.find(candidate => candidate.startedAt);
           endedAt = (nextStep && nextStep.startedAt) || (task.updatedAt || task.updated_at || '') || null;
         }
       } else if (
