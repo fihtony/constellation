@@ -1978,8 +1978,13 @@ class CompassAgent(BaseAgent):
         output_mode = str(office_request.get("output_mode") or "workspace")
         task_store.update_metadata(task_id, {"office_request": office_request})
         # A2: Compass writes ``resuming`` on the existing user-input row before
-        # the agent resumes. The original ``compass.asking_output_mode#0`` row
-        # transitions through ``resuming`` and lands on ``done`` below.
+        # the agent resumes, then transitions the same row to ``done`` with
+        # the accepted output location. Re-using the same step_instance_key
+        # (``compass.asking_output_mode#0``) is required so the row in the
+        # timeline reflects the real lifecycle (RESUMING -> DONE) instead of
+        # staying stuck in RESUMING forever. Without the close-out the row
+        # has no ``ended_at`` and the UI's Time Spent keeps growing each
+        # refresh (bug task-03db89946011).
         _record_major_step(
             task_store,
             task_id,

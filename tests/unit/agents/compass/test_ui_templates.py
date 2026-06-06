@@ -142,6 +142,41 @@ class TestCompassUITemplates:
         assert "visualState = 'done';" in html
         assert "lifecycleState = 'done';" in html
 
+    def test_render_ui_fills_endedAt_for_stuck_running_rows(self):
+        # Bug task-03db89946011: stuck-running rows (e.g. ``office.received``
+        # that the office workflow never explicitly closed, or
+        # ``compass.asking_output_mode`` that the resume path never
+        # re-emitted as ``done``) used to leave ``endedAt`` null.  The
+        # Time Spent renderer then fell back to ``Date.now()`` and the
+        # counter ticked up forever on every refresh.  The fix: when
+        # ``isStuckRunningRow`` matches, the close-out must seed
+        # ``endedAt`` from the next fired step's ``startedAt`` (or, as a
+        # last resort, ``task.updatedAt``) so the duration is frozen.
+        html = render_compass_ui()
+        assert "endedAt = (nextStep && nextStep.startedAt) || (task.updatedAt || task.updated_at || '') || null;" in html
+        assert "return { ...row, visualState, lifecycleState, endedAt };" in html
+
+    def test_render_ui_does_not_use_Date_now_for_terminal_task_time_spent(self):
+        # Bug task-03db89946011 follow-up: even with the stuck-running
+        # close-out, the ``Time Spent`` pill must NEVER fall back to
+        # ``Date.now()`` for tasks in a terminal state.  Otherwise the
+        # "0s" rows on a fresh completion would tick up to "1s", "2s",
+        # ... every UI refresh.
+        html = render_compass_ui()
+        # The terminal-status guard is the canonical way to stop the
+        # ticker.  It checks the live task status kind and only allows
+        # ``Date.now()`` when the task is still non-terminal.
+        assert "const taskKind = String(taskStatusKind(task) || '').toLowerCase();" in html
+        assert "taskIsTerminal" in html
+        # The conditional path for terminal tasks uses task.updatedAt
+        # rather than Date.now() — both for the live row and as a
+        # general fallback.
+        assert "task.updatedAt || task.updated_at" in html
+        # The "current / warn row in a non-terminal task" branch is the
+        # only path that still uses Date.now() as a live counter; the
+        # terminal branch must not.
+        assert "(taskIsTerminal ? null : Date.now())" in html
+
     def test_render_ui_marks_skipped_skeleton_rows_as_done_when_later_steps_fired(self):
         # UI #3 fix: unfired skeleton rows that come BEFORE a later fired row
         # should not be displayed as ``pending`` — the agent skipped past

@@ -1786,6 +1786,7 @@ _INLINE_JS = r"""
     const normalizedOrdered = ordered.map((row) => {
       let visualState = row.visualState || 'pending';
       let lifecycleState = row.lifecycleState || '';
+      let endedAt = row.endedAt;
       const stepKey = String(row.stepKey || '');
       const sik = row.key;
       // ``hasLaterFiredStep`` captures the case where the task has progressed
@@ -1816,6 +1817,19 @@ _INLINE_JS = r"""
       if (isStuckRunningRow) {
         visualState = 'done';
         lifecycleState = 'done';
+        // The server-side merge did not record ``ended_at`` for this row, so
+        // ``Time Spent`` would otherwise fall back to ``Date.now()`` and
+        // tick up every refresh (bug task-03db89946011). Use the next
+        // fired step's ``started_at`` as the synthetic close time —
+        // anything between the row's actual start and the next step's
+        // start is by definition this step's execution window. If no
+        // later step has a usable timestamp, fall back to the task's
+        // ``updatedAt`` (which is frozen once the task enters a terminal
+        // state).
+        if (!endedAt) {
+          const nextStep = ordered.find(candidate => candidate.key !== sik && candidate.fired && !candidate.ignored && candidate.startedAt);
+          endedAt = (nextStep && nextStep.startedAt) || (task.updatedAt || task.updated_at || '') || null;
+        }
       } else if (
         !row.fired
         && hasLaterFiredStep
@@ -1828,7 +1842,7 @@ _INLINE_JS = r"""
         // empty to indicate no event was recorded.
         visualState = 'done';
       }
-      return { ...row, visualState, lifecycleState };
+      return { ...row, visualState, lifecycleState, endedAt };
     });
     return {
       currentKey: (pickPointerRow(task) || {}).key || '',
@@ -2461,13 +2475,32 @@ _INLINE_JS = r"""
         durationLabel = '--';
       } else {
         startLabel = compactStartTime(row.startedAt);
+        // ``end`` is the row's close timestamp. The order of preference is:
+        //   1. ``row.endedAt`` — explicitly recorded by the agent.
+        //   2. ``task.updatedAt`` — the task's last-write timestamp, which
+        //      is frozen once the task enters a terminal state and is the
+        //      best deterministic fallback for stuck-running rows
+        //      (see deriveMajorTimeline isStuckRunningRow).
+        //   3. ``Date.now()`` — only while the task is still live AND the
+        //      row is in a current/warn visual state. This keeps a live
+        //      "in progress" counter incrementing on refresh. We never
+        //      fall back to ``Date.now()`` on terminal tasks; otherwise
+        //      Time Spent would tick up forever on every refresh
+        //      (bug task-03db89946011).
+        const taskKind = String(taskStatusKind(task) || '').toLowerCase();
+        const taskIsTerminal = (taskKind === 'completed'
+                                || taskKind === 'failed'
+                                || taskKind === 'cancelled'
+                                || taskKind === 'warning');
         const endDate = row.endedAt
           ? parseTimestamp(row.endedAt)
-          : (visualClass === 'current' || visualClass === 'warn' ? null : parseTimestamp(task.updatedAt || ''));
+          : (visualClass === 'current' || visualClass === 'warn'
+              ? (taskIsTerminal ? parseTimestamp(task.updatedAt || task.updated_at || '') : null)
+              : parseTimestamp(task.updatedAt || task.updated_at || ''));
         const startDate = row.startedAt ? parseTimestamp(row.startedAt) : null;
-        const end = endDate ? endDate.getTime() : Date.now();
+        const end = endDate ? endDate.getTime() : (taskIsTerminal ? null : Date.now());
         const startMs = startDate ? startDate.getTime() : 0;
-        durationLabel = compactDuration(startMs && end ? end - startMs : null);
+        durationLabel = (end !== null) ? compactDuration(startMs && end ? end - startMs : null) : '--';
       }
       // Always render the Time Spent pill. ``compactDuration`` returns
       // ``'0s'`` for sub-second rows so the user sees a consistent layout

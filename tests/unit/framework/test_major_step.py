@@ -409,6 +409,65 @@ class TestEndedAt:
             sik = f"compass.task_{terminal}#0"
             assert meta["major_step_rows"][sik]["ended_at"] is not None
 
+    def test_resume_path_emits_resuming_then_done_on_same_step_key(self):
+        # Bug task-03db89946011: the compass resume path emits
+        # ``compass.asking_output_mode#0`` three times in sequence —
+        # WAITING_FOR_USER (initial pause) → RESUMING (user reply received)
+        # → DONE (output location accepted). The RESUMING and DONE events
+        # must land on the SAME row so the row has a real ``ended_at`` and
+        # the timeline does not display a perpetually-running
+        # "Compass resuming after output location was selected" step.
+        store = _make_task_store()
+        record_major_step(
+            "task-x",
+            step_key="compass.asking_output_mode",
+            title="Compass asking for output location",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+            task_store=store,
+        )
+        record_major_step(
+            "task-x",
+            step_key="compass.asking_output_mode",
+            title="Compass resuming after output location was selected",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_RESUMING,
+            task_store=store,
+        )
+        record_major_step(
+            "task-x",
+            step_key="compass.asking_output_mode",
+            title="Compass accepted output location",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_facts={"output_mode": "workspace"},
+            task_store=store,
+        )
+        meta = store.get_task("task-x").metadata
+        rows = meta["major_step_rows"]
+        sik = "compass.asking_output_mode#0"
+        # All three events must collapse into a single row.
+        assert len(rows) == 1, rows
+        row = rows[sik]
+        # The terminal event wins: lifecycle_state, visual_state, ended_at
+        # must all reflect DONE. The intermediate RESUMING state must not
+        # leave the row stuck in current/running.
+        assert row["lifecycle_state"] == LIFECYCLE_DONE
+        assert row["visual_state"] == VISUAL_DONE
+        assert row["ended_at"] is not None
+        # The title from the terminal event is what the UI displays; this
+        # is intentional because the final state is the one the user
+        # cares about. The first two titles remain in the event log.
+        assert row["title"] == "Compass accepted output location"
+        events = meta["major_step_events"]
+        # All three events are recorded in the audit log.
+        title_sequence = [ev["title"] for ev in events if ev["step_instance_key"] == sik]
+        assert title_sequence == [
+            "Compass asking for output location",
+            "Compass resuming after output location was selected",
+            "Compass accepted output location",
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Terminal protection
