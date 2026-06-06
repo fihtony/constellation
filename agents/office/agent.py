@@ -123,10 +123,50 @@ office_definition = _build_office_definition()
 # OfficeAgent
 # ---------------------------------------------------------------------------
 
+class _CancelWorkflow(Exception):
+    """Raised inside the office workflow when the user requests a cancel.
+
+    The workflow thread catches this exception, marks the task CANCELLED
+    via :meth:`TaskStore.cancel_task`, and exits cleanly without
+    re-entering the post-workflow success path. Distinct from a normal
+    exception: a cancel is a deliberate termination, not a failure.
+    """
+
+
 class OfficeAgent(BaseAgent):
+    # task_id → ``threading.Event`` set by ``handle_task_cancel`` when the
+    # user requests a cancel. The office workflow thread polls this event
+    # between node invocations and raises ``_CancelWorkflow`` if it fires.
+    # Keying by task id lets the office run multiple workflows concurrently
+    # and only signal the one being cancelled.
+    _cancel_events: dict[str, threading.Event] = {}
+
     async def start(self) -> None:
         await super().start()
         register_office_tools()
+
+    async def handle_task_cancel(self, task_id: str, reason: str = "") -> dict:
+        """Signal an in-flight office workflow to stop.
+
+        Looks up the ``threading.Event`` registered for this task id by
+        :meth:`handle_message` and sets it. The workflow thread will
+        observe the signal at the next node boundary, raise
+        ``_CancelWorkflow``, and exit cleanly. Then we delegate to the
+        base implementation so the task store row is also transitioned to
+        ``CANCELLED``.
+        """
+        event = self._cancel_events.get(task_id)
+        if event is not None:
+            event.set()
+            _append_office_log(
+                task_id,
+                "office cancel signal delivered to in-flight workflow",
+                reason=reason,
+            )
+        # Always delegate to the base behavior so the task store row is
+        # transitioned to CANCELLED even if the workflow already exited
+        # (e.g. the cancel raced a normal completion).
+        return await super().handle_task_cancel(task_id, reason)
 
     async def handle_message(self, message: dict) -> dict:
         """Handle incoming A2A message.
@@ -242,6 +282,9 @@ class OfficeAgent(BaseAgent):
         # classification directly.
         approved_plan = metadata.get("organizeCustomPlan") or {}
         custom_action = str(metadata.get("organizeCustomAction") or "").strip()
+        custom_modify_note = str(
+            metadata.get("organizeCustomModifyNote") or ""
+        ).strip()
         custom_hint = str(
             metadata.get("customDimensionHint")
             or _extract_custom_dimension_hint(user_text)
@@ -263,6 +306,8 @@ class OfficeAgent(BaseAgent):
             state["organize_custom_plan"] = dict(approved_plan)
         if custom_action:
             state["organize_custom_action"] = custom_action
+        if custom_modify_note:
+            state["organize_custom_modify_note"] = custom_modify_note
         if custom_hint:
             state["organize_custom_hint"] = custom_hint
 
@@ -304,6 +349,12 @@ class OfficeAgent(BaseAgent):
 
         # Run workflow in background thread
         def _run() -> None:
+            # Register a cancel event for this task id so
+            # ``handle_task_cancel`` can signal the workflow thread to
+            # stop. Removed on every exit path below.
+            cancel_event = OfficeAgent._cancel_events.setdefault(
+                canonical_task_id, threading.Event()
+            )
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
@@ -313,9 +364,43 @@ class OfficeAgent(BaseAgent):
                     timeout_seconds=3600,
                     ephemeral_state=ephemeral_state,
                 )
-                result = loop.run_until_complete(
-                    self._compiled_workflow.invoke(state, config)
-                )
+                # Surface the cancel event to the workflow state so the
+                # office nodes can poll it between major steps and raise
+                # ``_CancelWorkflow`` promptly. The base class does not
+                # need to know about it; this is purely a node-level
+                # contract.
+                state["_cancel_event"] = cancel_event
+                try:
+                    result = loop.run_until_complete(
+                        self._compiled_workflow.invoke(state, config)
+                    )
+                except _CancelWorkflow:
+                    # The user cancelled mid-flight. Mark the task as
+                    # CANCELLED and exit cleanly — do not call the
+                    # success / failure path. The base handle_task_cancel
+                    # already transitioned the store, but we re-assert
+                    # here in case the cancel raced the workflow start.
+                    _append_office_log(
+                        log_task_id,
+                        "office workflow cancelled by user",
+                        reason="cancelled by user",
+                    )
+                    try:
+                        task_store.cancel_task(
+                            canonical_task_id, "cancelled by user"
+                        )
+                    except Exception:
+                        pass
+                    if callback_url:
+                        try:
+                            _send_callback_input_required(
+                                callback_url,
+                                canonical_task_id,
+                                "Task cancelled by user",
+                            )
+                        except Exception:
+                            pass
+                    return
 
                 # Clarification round-trip: when the workflow surfaces a
                 # ``needs_clarification`` payload (e.g. organize capability
@@ -389,6 +474,10 @@ class OfficeAgent(BaseAgent):
                 _append_office_log(log_task_id, "office workflow failed", level="ERROR", error=str(exc))
                 task_store.fail_task(canonical_task_id, str(exc))
             finally:
+                # Always drop the cancel event so a future task with the
+                # same id (none in practice, but defensive) does not
+                # inherit a stale signal.
+                OfficeAgent._cancel_events.pop(canonical_task_id, None)
                 loop.close()
 
         worker = threading.Thread(target=_run, daemon=True)
@@ -493,4 +582,3 @@ def _send_callback_input_required(callback_url: str, task_id: str, question: str
 # ---------------------------------------------------------------------------
 # In-process dispatch (overrides HTTP dispatch)
 # ---------------------------------------------------------------------------
-

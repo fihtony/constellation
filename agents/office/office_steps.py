@@ -79,6 +79,25 @@ def _output_location_for_state(state: dict) -> str:
     return "the workspace" if output_mode == "workspace" else "the source folder"
 
 
+def check_office_cancel(state: dict) -> None:
+    """Raise :class:`agents.office.agent._CancelWorkflow` if the user
+    requested a cancel on the running task.
+
+    Office public node functions call this helper at the top of their
+    body so a long-running workflow exits promptly at the next node
+    boundary. The cancel event itself is wired up by
+    :class:`agents.office.agent.OfficeAgent` before the workflow
+    starts; here we only read the value from state.
+    """
+    # Local import avoids a circular dependency between
+    # ``office_steps`` and ``office.agent``.
+    from agents.office.agent import _CancelWorkflow
+
+    event = state.get("_cancel_event")
+    if event is not None and event.is_set():
+        raise _CancelWorkflow()
+
+
 def _execution_step_for_capability(capability: str, source_count: int) -> tuple[str, str, str, dict]:
     if capability == "analyze":
         return (
@@ -432,12 +451,12 @@ def emit_delivered(
             "failure_reason": state.get("summary", "")[:200] if not success else "",
         },
     )
-    # Per design doc §0.7: when a task ends in failure, the in-flight
-    # ``office.received#0`` row (and any other running Office rows) must
-    # transition to the matching terminal state so the timeline does not
-    # display a "current" row that is actually complete. We re-emit the
-    # office.received step with the failure lifecycle so the framework's
-    # idempotent merge updates the same row rather than creating a new one.
+    # Per design doc §0.7: close the in-flight ``office.received#0`` row
+    # regardless of outcome so the timeline does not display a "current"
+    # row that is actually complete. ``emit_received`` initially emits the
+    # row with ``LIFECYCLE_RUNNING``; the framework's idempotent merge
+    # collapses this re-emission into the existing row instead of
+    # creating a new one.
     if not success:
         record_office_step(
             state,
@@ -453,6 +472,24 @@ def emit_delivered(
                     len(state.get("source_paths") or state.get("validated_paths") or []),
                 ),
                 "failure_reason": state.get("summary", "")[:200],
+            },
+        )
+    else:
+        record_office_step(
+            state,
+            step_key="office.received",
+            title="Office receiving task",
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_template=(
+                "Office received the task: {capability} on {source_count} {source_kind}."
+            ),
+            summary_facts={
+                "capability": state.get("capability", "summarize"),
+                "source_count": len(state.get("source_paths") or state.get("validated_paths") or []),
+                "source_kind": _source_kind(
+                    state.get("capability", "summarize"),
+                    len(state.get("source_paths") or state.get("validated_paths") or []),
+                ),
             },
         )
 

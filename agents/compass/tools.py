@@ -334,6 +334,9 @@ def _dispatch_office_task_via_launcher(
     custom_action = str(extra.get("organize_custom_action") or "").strip()
     if custom_action:
         metadata["organizeCustomAction"] = custom_action
+    custom_modify_note = str(extra.get("organize_custom_modify_note") or "").strip()
+    if custom_modify_note:
+        metadata["organizeCustomModifyNote"] = custom_modify_note
     result = dispatch_via_launcher(
         definition,
         capability=_office_requested_capability(capability),
@@ -386,6 +389,16 @@ def _dispatch_office_task_via_launcher(
         "summary": summary,
         "question": question,
         "needs_clarification": needs_clarification or {},
+        # Surface the per-task office launch URL so the compass can
+        # forward a cancel request to the running container even when
+        # ``preserve_instance=False`` (the container is torn down in the
+        # ``finally`` of ``dispatch_via_launcher`` once the message-send
+        # returns, but the URL remains valid for the duration of the
+        # call).  The field is also useful for debugging.
+        "office_service_url": (
+            (result.get("_launch") or {}).get("serviceUrl")
+            if isinstance(result, dict) else ""
+        ),
     }
 
 # ---------------------------------------------------------------------------
@@ -589,6 +602,14 @@ class DispatchOfficeTask(BaseTool):
                     "question."
                 ),
             },
+            "organizeCustomModifyNote": {
+                "type": "string",
+                "description": (
+                    "Optional free-text revision note captured from a "
+                    "`modify: ...` reply during the custom-plan approval "
+                    "round-trip."
+                ),
+            },
         },
         "required": ["task_description"],
     }
@@ -606,6 +627,7 @@ class DispatchOfficeTask(BaseTool):
         customDimensionHint: str = "",
         organizeCustomPlan: dict | None = None,
         organizeCustomAction: str = "",
+        organizeCustomModifyNote: str = "",
     ) -> ToolResult:
         # Permission gate: compass is the orchestrator for office work,
         # so it must hold an explicit "agent_launching" grant for the
@@ -626,6 +648,10 @@ class DispatchOfficeTask(BaseTool):
             extra["organize_custom_plan"] = dict(organizeCustomPlan)
         if organizeCustomAction:
             extra["organize_custom_action"] = str(organizeCustomAction).strip()
+        if organizeCustomModifyNote:
+            extra["organize_custom_modify_note"] = str(
+                organizeCustomModifyNote
+            ).strip()
 
         try:
             office_definition = _office_launch_definition(capability)

@@ -119,10 +119,10 @@ class TestCompassUITemplates:
         assert "${minutes}m ${seconds}s" in html
         # Seconds-only branch: ``Zs``.
         assert "${seconds}s" in html
-        # Zero-duration rows are hidden (return empty string).
-        assert "if (totalSeconds === 0) return '';" in html
-        # Time Spent pill is hidden when duration is empty.
-        assert "durationLabel === ''" in html
+        # Zero-duration rows now render ``0s`` (Bug #62 fix).  The pill
+        # is no longer hidden — a sub-second row should still show its
+        # Time Spent value so the layout is consistent.
+        assert "if (totalSeconds === 0) return '0s';" in html
 
     def test_render_ui_keeps_collapsed_major_timeline_focus_row_visible(self):
         html = render_compass_ui()
@@ -130,8 +130,14 @@ class TestCompassUITemplates:
         assert "${isFocusedRow ? ' current' : ''}" in html
 
     def test_render_ui_migrates_legacy_compass_received_row_to_done_when_later_steps_exist(self):
+        # Bug #61 expanded the stuck-running heuristic to cover
+        # ``office.received`` and any earlier office row, not just
+        # ``compass.received``.  The new predicate name reflects the
+        # broader scope.
         html = render_compass_ui()
-        assert "const isLegacyCompassReceived = stepKey === 'compass.received';" in html
+        assert "const isStuckRunningRow =" in html
+        assert "stepKey === 'compass.received'" in html
+        assert "stepKey === 'office.received'" in html
         assert "const hasLaterFiredStep = ordered.some(candidate => candidate.key !== sik && candidate.fired && !candidate.ignored);" in html
         assert "visualState = 'done';" in html
         assert "lifecycleState = 'done';" in html

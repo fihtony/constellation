@@ -323,27 +323,31 @@ def _resolve_office_resume_reply(
                     "Please reply with `approve` to execute the plan, "
                     "or `modify: <change>` to revise it."
                 )
+                preserved = dict(existing_needs)
+                preserved.update({
+                    "missing": "organizeCustomPlan",
+                    "options": [
+                        {"id": "approve", "label": "Approve plan"},
+                        {"id": "modify", "label": "Modify plan"},
+                    ],
+                    "user_message": question,
+                })
                 return {
                     "error_question": question,
-                    "needs_clarification": {
-                        "missing": "organizeCustomPlan",
-                        "options": [
-                            {"id": "approve", "label": "Approve plan"},
-                            {"id": "modify", "label": "Modify plan"},
-                        ],
-                        "user_message": question,
-                    },
+                    "needs_clarification": preserved,
                 }
             office_request["organize_custom_action"] = approval
+            plan = dict(existing_needs.get("plan") or {})
             if approval == "approve":
                 # Forward the approved plan so the office executor
                 # can skip planning and run the LLM classification
                 # pass directly.  The plan lives in the interrupt's
                 # needs_clarification payload.
-                plan = (existing_needs.get("plan") or {}).copy()
                 if plan:
                     office_request["organize_custom_plan"] = plan
             if approval == "modify":
+                if plan:
+                    office_request["organize_custom_plan"] = plan
                 office_request["organize_custom_modify_note"] = reply
             return {"office_request": office_request}
 
@@ -1078,6 +1082,11 @@ def _dispatch_office_request(task_id: str, user_text: str, office_request: dict,
         custom_action = str(office_request.get("organize_custom_action") or "").strip()
         if custom_action:
             dispatch_args["organizeCustomAction"] = custom_action
+        custom_modify_note = str(
+            office_request.get("organize_custom_modify_note") or ""
+        ).strip()
+        if custom_modify_note:
+            dispatch_args["organizeCustomModifyNote"] = custom_modify_note
         dispatch_result_str = registry.execute_sync(
             "dispatch_office_task",
             dispatch_args,
@@ -1852,7 +1861,7 @@ class CompassAgent(BaseAgent):
             (metadata.get("_interrupt") or {}).get("needs_clarification") or {}
         )
         if interrupt_needs and "missing" in interrupt_needs:
-            office_request.setdefault("_needs_clarification", dict(interrupt_needs))
+            office_request["_needs_clarification"] = dict(interrupt_needs)
         reply_text = str(resume_value or "").strip().lower()
         # Resolve the active interrupt kind. The most recent pause_task call
         # set ``_interrupt.kind``; older tasks may have a stale value, so we
@@ -1863,52 +1872,48 @@ class CompassAgent(BaseAgent):
         if not active_kind and not office_request.get("output_mode"):
             active_kind = "office_output_mode"
 
-        # B1: user-cancel-during-wait — close the in-flight user-input row
-        # to ``cancelled`` and append a terminal ``compass.task_cancelled`` row
-        # (two-step close per design doc §13 B1). Applies to every kind.
+        # B1: user-cancel-during-wait — delegate to the unified
+        # ``cancel_task`` handler so the legacy "cancel" / "abort" /
+        # "stop" text shortcut and the new Cancel button share the same
+        # code path.  Works in any non-terminal state (SUBMITTED /
+        # WORKING / INPUT_REQUIRED) — the new method no longer requires
+        # the task to be paused for input.
         if reply_text in {"cancel", "abort", "stop"}:
-            cancel_reason = str(resume_value or "user cancelled").strip() or "user cancelled"
-            for step_key in (active_kind, "compass.task_cancelled"):
-                _record_major_step(
-                    task_store,
-                    task_id,
-                    step_key=step_key,
-                    title=(
-                        f"Compass asked for {active_kind.replace('_', ' ')} (cancelled by user)"
-                        if step_key == active_kind
-                        else f"Compass marking task cancelled by user: {cancel_reason[:200]}"
-                    ),
-                    agent=self.definition.agent_id,
-                    lifecycle_state=LIFECYCLE_CANCELLED,
-                    summary_template=(
-                        f"Compass cancelled the {active_kind.replace('_', ' ')} request."
-                        if step_key == active_kind
-                        else "Compass marked the task as cancelled by user: {cancel_reason}."
-                    ),
-                    summary_facts=(
-                        {} if step_key == active_kind
-                        else {"cancel_reason": cancel_reason[:500]}
-                    ),
-                )
-            task_store.fail_task(task_id, f"cancelled by user: {cancel_reason}")
-            _append_chat_entry(
-                task_store,
-                task_id,
-                role="COMPASS",
-                text=f"Task cancelled by user: {cancel_reason}",
-                tone="failed",
+            cancel_reason = "cancelled by user"
+            log.warn(
+                "office task cancelled by user during wait; "
+                "delegating to cancel_task",
+                reply=reply_text, kind=active_kind,
             )
-            log.warn("office task cancelled by user during wait", reply=reply_text, kind=active_kind)
-            ui_update = {
+            cancel_result = await self.cancel_task(task_id, cancel_reason)
+            if cancel_result.get("status") == "already_terminal":
+                # Nothing to do — task already terminal.  Surface a
+                # structured response so the UI refreshes instead of
+                # showing "Failed to send reply to Compass".
+                return {
+                    "task_id": task_id,
+                    "ui_update": {
+                        "task_id": task_id,
+                        "task_status": cancel_result.get("task_state", ""),
+                        "chat_message": {
+                            "role": "COMPASS",
+                            "text": "This task is already closed.",
+                            "style": "normal",
+                        },
+                    },
+                }
+            return {
                 "task_id": task_id,
-                "task_status": "TASK_STATE_FAILED",
-                "chat_message": {
-                    "role": "COMPASS",
-                    "text": f"Task cancelled by user: {cancel_reason}",
-                    "style": "failed",
+                "ui_update": {
+                    "task_id": task_id,
+                    "task_status": "TASK_STATE_CANCELLED",
+                    "chat_message": {
+                        "role": "COMPASS",
+                        "text": f"Task cancelled by user: {cancel_reason}",
+                        "style": "failed",
+                    },
                 },
             }
-            return {"task_id": task_id, "ui_update": ui_update}
 
         # Resolve the user reply against the active interrupt kind. The
         # helper returns either an office_request update dict, or an empty
@@ -2070,6 +2075,122 @@ class CompassAgent(BaseAgent):
         # resume round-trip on slower connections.
         return {"task_id": task_id, "ui_update": ui_update}
 
+    async def cancel_task(self, task_id: str, reason: str = "") -> dict:
+        """Cancel a compass task in any non-terminal state.
+
+        Distinct from the legacy ``reply_text in {"cancel", ...}`` branch
+        in :meth:`resume_task`: this method works in any state
+        (SUBMITTED / WORKING / INPUT_REQUIRED), propagates the cancel
+        to the running office container over A2A when the URL is
+        known, and records a structured ``compass.task_cancelled``
+        major step plus a chat entry so the timeline and chat
+        panel both reflect the cancellation.
+
+        The cancel signal is delivered in three layers:
+          1. **Local-truth first** — the compass ``task_store`` is
+             transitioned to ``CANCELLED`` so the UI flips
+             immediately, even if the office container is unreachable.
+          2. **In-flight office stop** — when the dispatcher stashed
+             the office launch URL on the task metadata
+             (``office_service_url``), POST to the office's
+             ``/tasks/{id}/cancel`` endpoint to set the
+             ``threading.Event`` that the office workflow observes
+             at its next node boundary.
+          3. **Timeline + chat** — record the cancel row + chat
+             entry so the user sees the cancellation in both panes.
+        """
+        from framework.a2a.client import A2AClient
+        from framework.a2a.protocol import TaskState
+        from framework.devlog import AgentLogger
+
+        task_store = self.services.task_store
+        task = task_store.get_task(task_id) if task_store else None
+        if task is None:
+            return {"error": "not_found", "task_id": task_id}
+
+        current_state = getattr(
+            getattr(task.status, "state", None), "value",
+            str(getattr(task.status, "state", "")),
+        )
+        if current_state in {
+            TaskState.COMPLETED.value,
+            TaskState.FAILED.value,
+            TaskState.CANCELLED.value,
+        }:
+            return {
+                "status": "already_terminal",
+                "task_id": task_id,
+                "task_state": current_state,
+            }
+
+        cancel_reason = (reason or "").strip() or "cancelled by user"
+
+        # Layer 1: local-truth first.
+        cancelled = task_store.cancel_task(task_id, cancel_reason)
+
+        # Layer 2: forward the cancel to the office container if the
+        # dispatcher stashed the launch URL on the task metadata.  We
+        # never block the local cancel on this — best-effort only.
+        office_service_url = str(
+            (task.metadata or {}).get("office_service_url") or ""
+        ).strip()
+        propagation: dict = {"attempted": False, "delivered": False}
+        if office_service_url:
+            propagation["attempted"] = True
+            try:
+                client = A2AClient()
+                # A2AClient._http_post is synchronous (urllib) so offload
+                # it to a thread to avoid blocking the event loop.
+                import asyncio as _asyncio
+                resp = await _asyncio.to_thread(
+                    client.send_cancel,
+                    office_service_url, task_id, cancel_reason,
+                )
+                propagation["delivered"] = bool(resp)
+                propagation["response"] = resp
+            except Exception as exc:  # noqa: BLE001
+                propagation["error"] = str(exc)[:200]
+                log_warn = AgentLogger(
+                    task_id=task_id, agent_name=self.definition.agent_id
+                )
+                log_warn.warn(
+                    "office cancel propagation failed",
+                    error=str(exc)[:200],
+                )
+
+        # Layer 3: timeline + chat.
+        try:
+            _record_major_step(
+                task_store,
+                task_id,
+                step_key="compass.task_cancelled",
+                title=f"Compass marking task cancelled by user",
+                agent=self.definition.agent_id,
+                lifecycle_state=LIFECYCLE_CANCELLED,
+                summary_template="Compass marked the task as cancelled by user: {cancel_reason}.",
+                summary_facts={"cancel_reason": cancel_reason[:500]},
+            )
+        except Exception:
+            pass
+        try:
+            _append_chat_entry(
+                task_store,
+                task_id,
+                role="COMPASS",
+                text=f"Task cancelled by user: {cancel_reason}",
+                tone="failed",
+            )
+        except Exception:
+            pass
+
+        return {
+            "status": "ok" if cancelled else "already_terminal",
+            "task_id": task_id,
+            "task_state": "TASK_STATE_CANCELLED",
+            "cancel_reason": cancel_reason,
+            "office_propagation": propagation,
+        }
+
     def _complete_office_task(
         self,
         *,
@@ -2113,6 +2234,22 @@ class CompassAgent(BaseAgent):
             log.error("office dispatch raised in background worker", error=str(exc))
             print(f"[compass] _complete_office_task: dispatch raised: {exc}")
             dispatch_data = {"status": "error", "message": str(exc)}
+
+        # Stash the per-task office launch URL on the task metadata so
+        # ``cancel_task`` can forward a cancel signal to the still-running
+        # office container.  The container is destroyed in the
+        # ``finally`` of ``dispatch_via_launcher`` once the message-send
+        # returns, but the URL is valid for the duration of the call —
+        # which is exactly the window in which the user can click
+        # "Cancel" while the office task is in flight.
+        office_service_url = str(dispatch_data.get("office_service_url") or "").strip()
+        if office_service_url:
+            try:
+                task_store.update_metadata(task_id, {
+                    "office_service_url": office_service_url,
+                })
+            except Exception:
+                pass
 
         # Re-check the task exists — a /terminate or restart could have
         # removed it while dispatch was running.

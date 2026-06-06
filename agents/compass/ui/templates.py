@@ -484,7 +484,7 @@ body {
 }
 .composer-box {
   display: grid;
-  grid-template-columns: 1fr 92px;
+  grid-template-columns: 1fr 92px 92px;
   gap: 8px;
 }
 #composer-input {
@@ -510,6 +510,19 @@ body {
   cursor: pointer;
 }
 #composer-send:disabled { opacity: 0.5; cursor: not-allowed; }
+#composer-cancel {
+  padding: 0 16px;
+  border-radius: 14px;
+  border: 1px solid rgba(220, 130, 130, 0.32);
+  background: rgba(60, 22, 28, 0.78);
+  color: #ffd7d7;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+#composer-cancel:hover { background: rgba(120, 36, 44, 0.92); border-color: rgba(240, 150, 150, 0.6); }
+#composer-cancel:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* Detail */
 #task-info-panel .panel-body { padding: 16px; overflow-y: auto; }
@@ -1579,6 +1592,64 @@ _INLINE_JS = r"""
     }
     return statusKindOf(task.statusState);
   }
+
+  // Show or hide the Cancel button on the composer based on the
+  // currently-selected task. Visible for any non-terminal state
+  // (SUBMITTED / WORKING / INPUT_REQUIRED) so the user can cancel
+  // mid-flight, not just while the task is paused for input.
+  function updateCancelButtonVisibility(task) {
+    const btn = $('#composer-cancel');
+    if (!btn) return;
+    if (!task || !task.task_id || task.task_id === NEW_REQUEST_ID) {
+      btn.style.display = 'none';
+      btn.dataset.targetTaskId = '';
+      return;
+    }
+    const kind = taskStatusKind(task);
+    const isTerminal = (kind === 'completed' || kind === 'failed' || kind === 'warning');
+    if (isTerminal) {
+      btn.style.display = 'none';
+      btn.dataset.targetTaskId = '';
+    } else {
+      btn.style.display = '';
+      btn.dataset.targetTaskId = task.task_id;
+      btn.textContent = (kind === 'waiting') ? 'Cancel' : 'Cancel';
+    }
+  }
+
+  // POST /tasks/{id}/cancel on the compass.  On success, refresh the
+  // task list and detail so the UI flips to TASK_STATE_CANCELLED.  On
+  // ``already_terminal`` the server reports the task is already closed
+  // and we just refresh.  On any other error we surface a transient
+  // composer note and restore the cancel button.
+  async function cancelTask(tid) {
+    if (!tid) return;
+    const btn = $('#composer-cancel');
+    if (btn) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
+    try {
+      const resp = await fetchJsonWithTimeout(
+        `/tasks/${encodeURIComponent(tid)}/cancel`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason: 'cancelled by user' }),
+        },
+        10000,
+      );
+      if (resp && resp.status === 'already_terminal') {
+        state.composerNote = 'This task is already closed.';
+        clearComposerNoteAfter?.();
+      }
+      try { await loadTasks(false); } catch (_ignored) {}
+      try { await loadTaskDetail(tid); } catch (_ignored) {}
+      renderTaskList(); renderChat(); renderDetail();
+    } catch (e) {
+      state.composerNote = 'Failed to cancel the task. Please retry.';
+      renderComposerNote($('#composer-note'), state.composerNote);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Cancel'; }
+    }
+  }
   function statusLabel(kind) {
     return ({ active:'In Progress', waiting:'Waiting for Input',
               completed:'Completed', warning:'Completed with Warnings', failed:'Failed' })[kind] || 'In Progress';
@@ -1717,22 +1788,32 @@ _INLINE_JS = r"""
       let lifecycleState = row.lifecycleState || '';
       const stepKey = String(row.stepKey || '');
       const sik = row.key;
-      const isLegacyCompassReceived = stepKey === 'compass.received';
       // ``hasLaterFiredStep`` captures the case where the task has progressed
       // past this row, even if the row itself never received an event. Used
-      // both for the legacy ``compass.received`` stuck-in-running case and
-      // for unfired skeleton rows that were skipped during execution.
+      // both for stuck-running fixes (compass.received legacy + office.received)
+      // and for unfired skeleton rows that were skipped during execution.
       const hasLaterFiredStep = ordered.some(candidate => candidate.key !== sik && candidate.fired && !candidate.ignored);
-      if (
-        isLegacyCompassReceived
-        && row.fired
+      // A row can be "stuck in running" for two reasons:
+      //   1. Legacy ``compass.received`` rows (pre-v0.8 designs that never
+      //      recorded a terminal event).
+      //   2. ``office.received`` and any earlier office row that was emitted
+      //      with ``LIFECYCLE_RUNNING`` and never explicitly closed (an
+      //      office workflow that forgot to re-emit, or historical tasks
+      //      written before ``emit_delivered`` started closing the row).
+      // In either case, if a later step in the same task has already
+      // fired, the row is logically complete and we should show it as
+      // ``done`` so the timeline reflects the real historical sequence.
+      const isStuckRunningRow =
+        row.fired
         && hasLaterFiredStep
         && (visualState === 'current' || lifecycleState === 'running')
-      ) {
-        // Pre-redesign tasks can leave ``compass.received`` stuck in
-        // ``running`` even though later rows already fired. Show it as
-        // completed so the expanded timeline reflects the real historical
-        // sequence.
+        && (stepKey === 'compass.received'
+            || stepKey === 'office.received'
+            || (row.agent === 'office'
+                && lifecycleState !== 'done'
+                && lifecycleState !== 'failed'
+                && lifecycleState !== 'cancelled'));
+      if (isStuckRunningRow) {
         visualState = 'done';
         lifecycleState = 'done';
       } else if (
@@ -2199,24 +2280,42 @@ _INLINE_JS = r"""
     }
 
     const history = Array.isArray(t.chatHistory) ? t.chatHistory : [];
-    if (!history.length) {
-      scroll.innerHTML = `<div class="empty-state">No chat history yet.</div>`;
-    } else {
-      scroll.innerHTML = history.map(entry => {
-        const role = (entry.role || 'agent').toLowerCase();
-        const tone = entry.tone || (entry.style || 'normal');
-        const cls = role === 'user' ? 'user' : 'agent';
-        const styleCls = ({ waiting:'waiting','input-required':'waiting',failed:'failed',completed:'completed',warning:'warning'})[tone] || '';
-        const alignClass = cls === 'user' ? 'user' : 'agent';
-        return `<div class="chat-entry ${alignClass}">
-          <div class="bubble ${cls} ${styleCls}">
-            <div class="bubble-text">${esc(entry.text || '').replace(/\n/g,'<br>')}</div>
-          </div>
-          <div class="bubble-meta">${esc(fmtLocalTimestamp(entry.ts || entry.timestamp || entry.createdAt || ''))}</div>
-        </div>`;
-      }).join('');
+    // Sticky-bottom guard: only auto-scroll when the user was already at
+    // (or near) the bottom. If the user has scrolled up to read history,
+    // their scroll position must survive every render — including the
+    // auto-refresh poll. This matches the behaviour of Slack, VS Code and
+    // the macOS console.
+    const wasStickyChat = isStickyBottom(scroll);
+    // Signature-based no-op skip: if the chat history is byte-identical
+    // to the previous render, skip the innerHTML rewrite entirely. This
+    // is the cleanest way to avoid destroying the user's text selection
+    // on a refresh that has nothing new to show.
+    const chatSignature = history.map(e => `${e.role || ''}|${e.tone || ''}|${e.text || ''}|${e.ts || ''}`).join('\n');
+    if (scroll._lastChatSignature !== chatSignature) {
+      if (!history.length) {
+        scroll.innerHTML = `<div class="empty-state">No chat history yet.</div>`;
+      } else {
+        scroll.innerHTML = history.map(entry => {
+          const role = (entry.role || 'agent').toLowerCase();
+          const tone = entry.tone || (entry.style || 'normal');
+          const cls = role === 'user' ? 'user' : 'agent';
+          const styleCls = ({ waiting:'waiting','input-required':'waiting',failed:'failed',completed:'completed',warning:'warning'})[tone] || '';
+          const alignClass = cls === 'user' ? 'user' : 'agent';
+          return `<div class="chat-entry ${alignClass}">
+            <div class="bubble ${cls} ${styleCls}">
+              <div class="bubble-text">${esc(entry.text || '').replace(/\n/g,'<br>')}</div>
+            </div>
+            <div class="bubble-meta">${esc(fmtLocalTimestamp(entry.ts || entry.timestamp || entry.createdAt || ''))}</div>
+          </div>`;
+        }).join('');
+      }
+      scroll._lastChatSignature = chatSignature;
+      if (wasStickyChat) scroll.scrollTop = scroll.scrollHeight;
+    } else if (wasStickyChat) {
+      // Signature unchanged but the user is pinned to the bottom — keep
+      // them pinned in case a tiny layout change altered scrollHeight.
+      scroll.scrollTop = scroll.scrollHeight;
     }
-    scroll.scrollTop = scroll.scrollHeight;
 
     if (t.optimistic === true) {
       renderComposerNote(composerNote, 'Request submission in progress. Please wait for Compass to respond.');
@@ -2248,6 +2347,12 @@ _INLINE_JS = r"""
       composerInput.dataset.mode = terminal ? 'disabled' : 'reply';
       composerInput.dataset.targetTaskId = tid;
     }
+    // Cancel button: visible only when the selected task is in a
+    // non-terminal state. Works in any non-terminal state (SUBMITTED,
+    // WORKING, INPUT_REQUIRED) — distinct from the "cancel" text
+    // shortcut in :meth:`resume_task`, which was INPUT_REQUIRED-only
+    // and therefore useless during long-running operations.
+    updateCancelButtonVisibility(t);
   }
 
   function timelineAgentDetail(agent, detail, fallbackDetail = '') {
@@ -2280,17 +2385,28 @@ _INLINE_JS = r"""
       </div>`;
     }).join('')}</div>`.replace('timeline-list">', `timeline-list${expanded ? '' : ' collapsed'}">`);
   }
+  // Sticky-bottom detector: returns true when the scroll container is
+  // pinned to the bottom of its content (or within ``thresholdPx`` of it).
+  // Used by chat and log renders to decide whether to auto-scroll after
+  // a content refresh — auto-refresh must NOT yank the user away from
+  // history they were reading.
+  function isStickyBottom(el, thresholdPx = 24) {
+    if (!el) return true;
+    const overflow = el.scrollHeight - el.clientHeight - el.scrollTop;
+    return overflow <= thresholdPx;
+  }
+
   // Compact duration formatter for the v0.8 timeline right column.
   // Per design doc §2.1 / §8.1 (revised): use a single concise form,
   // omitting leading zero units. Examples:
-  //   0          -> ''   (caller hides the row)
+  //   0          -> '0s'    (always render the pill, even for sub-second rows)
   //   53s        -> '53s'
   //   6m 12s     -> '6m 12s'
   //   1h 5s      -> '1h 5s'  (no leading 0h, no leading 0m)
   function compactDuration(ms) {
     if (ms === null || ms === undefined || Number.isNaN(ms)) return '--';
     const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-    if (totalSeconds === 0) return '';
+    if (totalSeconds === 0) return '0s';
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
     const seconds = totalSeconds % 60;
@@ -2353,13 +2469,10 @@ _INLINE_JS = r"""
         const startMs = startDate ? startDate.getTime() : 0;
         durationLabel = compactDuration(startMs && end ? end - startMs : null);
       }
-      // Hide the Time Spent pill entirely when the duration is zero/empty
-      // (e.g. a fired row that just started). This is cleaner than rendering
-      // a bare ``0s`` (which would conflict with the omit-when-zero rule in
-      // §2.1) and prevents the pill from flickering on every refresh.
-      const timeSpentHtml = durationLabel === ''
-        ? ''
-        : `<span class="timeline-fact"><span class="timeline-fact-label">Time Spent</span>${esc(durationLabel)}</span>`;
+      // Always render the Time Spent pill. ``compactDuration`` returns
+      // ``'0s'`` for sub-second rows so the user sees a consistent layout
+      // (and can tell the row fired in the same render tick).
+      const timeSpentHtml = `<span class="timeline-fact"><span class="timeline-fact-label">Time Spent</span>${esc(durationLabel)}</span>`;
       const ownerAgent = row.agent || ownerOf(task);
       const summaryLine = row.summaryHtml
         ? `<div class="timeline-summary">${esc(ownerAgent)}: ${row.summaryHtml}</div>`
@@ -2685,6 +2798,18 @@ _INLINE_JS = r"""
     }
     if (!visible.length) {
       box.innerHTML = `<div class="empty-state">No logs yet for this filter.</div>`;
+      box._lastLogSignature = '';
+      return;
+    }
+    // Sticky-bottom guard + signature-based no-op skip. The log box is
+    // hot: SSE appends one line at a time and a poll re-fetches every
+    // 5s. We must not yank the user's scroll on every tick, and we must
+    // not destroy any active text selection (e.g. when the user is
+    // copying a stack trace).
+    const wasStickyLog = isStickyBottom(box);
+    const logSignature = visible.map(l => `${l.timestamp || ''}|${l.level || ''}|${l.agent || ''}|${l.message || ''}`).join('\n');
+    if (box._lastLogSignature === logSignature) {
+      if (wasStickyLog) box.scrollTop = box.scrollHeight;
       return;
     }
     box.innerHTML = visible.map(l => {
@@ -2695,7 +2820,8 @@ _INLINE_JS = r"""
       <span class="log-msg">${esc(l.message || '')}</span>
     </div>`;
     }).join('');
-    box.scrollTop = box.scrollHeight;
+    box._lastLogSignature = logSignature;
+    if (wasStickyLog) box.scrollTop = box.scrollHeight;
   }
 
   function subscribeLogs(tid) {
@@ -2940,6 +3066,19 @@ _INLINE_JS = r"""
       });
     }
     $('#composer-send').addEventListener('click', sendComposer);
+    // Cancel button: visible only for non-terminal tasks (see
+    // updateCancelButtonVisibility).  Posts to the new
+    // ``/tasks/{id}/cancel`` endpoint introduced for cross-state
+    // cancellation.  Distinct from typing the word "cancel" in the
+    // composer, which still goes through ``/resume`` and is rejected
+    // for non-INPUT_REQUIRED tasks.
+    const composerCancel = $('#composer-cancel');
+    if (composerCancel) {
+      composerCancel.addEventListener('click', () => {
+        const tid = composerCancel.dataset.targetTaskId;
+        if (tid) cancelTask(tid);
+      });
+    }
     // Send on Enter; allow Shift+Enter for a newline inside the composer.
     // The previous implementation required Cmd/Ctrl+Enter which silently
     // dropped plain-Enter submissions — users who typed a one-word reply
@@ -3034,6 +3173,7 @@ def render_compass_ui(
               <div class="composer-box">
                 <textarea id="composer-input" rows="2" placeholder="Describe a new task..."></textarea>
                 <button id="composer-send">Send</button>
+                <button id="composer-cancel" style="display:none" title="Cancel the current task">Cancel</button>
               </div>
             </div>
           </div>

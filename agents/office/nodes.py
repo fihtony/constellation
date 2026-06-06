@@ -245,6 +245,8 @@ def _expand_summarize_sources(paths: list[str]) -> list[str]:
 
 def receive_task(state: dict) -> dict:
     """Parse the incoming task message to extract capability, paths, and output mode."""
+    from agents.office.office_steps import check_office_cancel
+    check_office_cancel(state)
     user_text = state.get("user_request", "")
     metadata = state.get("_message_metadata", {}) or {}
 
@@ -300,6 +302,8 @@ def receive_task(state: dict) -> dict:
 
 def analyze_request(state: dict) -> dict:
     """Validate source paths and check permissions. Returns updated state or error."""
+    from agents.office.office_steps import check_office_cancel
+    check_office_cancel(state)
     # --- Dimension gate (organize capability only) ---------------------
     metadata = state.get("_message_metadata", {}) or {}
     user_text = state.get("user_request", "")
@@ -816,6 +820,8 @@ def _run_custom_dimension_path(
     output_root: str,
     custom_hint: str,
     approved_plan: dict,
+    custom_action: str,
+    custom_modify_note: str,
     output_mode: str,
     artifacts_dir: str,
     validated_paths: list[str],
@@ -844,8 +850,10 @@ def _run_custom_dimension_path(
         "buckets, and reply in JSON only — no prose around the JSON."
     )
 
-    # ----- Phase 1: plan -----
-    if not approved_plan:
+    replan_requested = custom_action == "modify"
+
+    # ----- Phase 1: plan / revise -----
+    if not approved_plan or replan_requested:
         if not custom_hint:
             return {
                 "summary": "Office organize needs a custom dimension hint.",
@@ -863,7 +871,13 @@ def _run_custom_dimension_path(
                 },
             }
         samples = _read_sample_files(source, max_files=5, max_chars=600)
-        planning_prompt = _build_planning_prompt(custom_hint, source, samples)
+        planning_prompt = _build_planning_prompt(
+            custom_hint,
+            source,
+            samples,
+            existing_plan=approved_plan if replan_requested else None,
+            revision_note=custom_modify_note if replan_requested else "",
+        )
         try:
             response = runtime.run(
                 planning_prompt,
@@ -894,9 +908,10 @@ def _run_custom_dimension_path(
         # Pause for user approval.  The state fields ``organize_dimension``
         # and the inline ``plan`` let compass re-dispatch with the
         # plan on approval.
+        draft_verb = "revised" if replan_requested else "drafted"
         return {
             "summary": (
-                f"Office drafted a custom organize plan for "
+                f"Office {draft_verb} a custom organize plan for "
                 f"'{custom_hint}'.  Awaiting user approval."
             ),
             "success": False,  # not terminal — must wait for approval
@@ -905,7 +920,7 @@ def _run_custom_dimension_path(
             "needs_clarification": {
                 "missing": "organizeCustomPlan",
                 "user_message": (
-                    f"Office drafted an organize plan for "
+                    f"Office {draft_verb} an organize plan for "
                     f"**{custom_hint}**.  Review the plan at "
                     f"`{plan_path}` and reply `approve` to execute, "
                     "or `modify: <change>` to revise."
@@ -1543,6 +1558,8 @@ def _effective_agentic_budget(capability: str, validated_paths: list[str]) -> tu
 
 def execute_office_work(state: dict) -> dict:
     """ReAct core: call runtime.run_agentic() with office tools to do the actual work."""
+    from agents.office.office_steps import check_office_cancel
+    check_office_cancel(state)
     runtime = state.get("_runtime")
     if not runtime:
         return {"error": "No runtime configured"}
@@ -1607,6 +1624,12 @@ def execute_office_work(state: dict) -> dict:
                     or ""
                 ).strip()
                 approved_plan = state.get("organize_custom_plan") or {}
+                custom_action = str(
+                    state.get("organize_custom_action") or ""
+                ).strip()
+                custom_modify_note = str(
+                    state.get("organize_custom_modify_note") or ""
+                ).strip()
                 return _run_custom_dimension_path(
                     state=state,
                     runtime=runtime,
@@ -1614,6 +1637,8 @@ def execute_office_work(state: dict) -> dict:
                     output_root=output_root,
                     custom_hint=custom_hint,
                     approved_plan=approved_plan,
+                    custom_action=custom_action,
+                    custom_modify_note=custom_modify_note,
                     output_mode=output_mode,
                     artifacts_dir=artifacts_dir,
                     validated_paths=validated_paths,
@@ -2037,6 +2062,8 @@ Rules for this table:
 
 def report_result(state: dict) -> dict:
     """Write pr-evidence.json, warnings.md (if partial failures), and return final result."""
+    from agents.office.office_steps import check_office_cancel
+    check_office_cancel(state)
     import time
     workspace_root = state.get("workspace_root", "")
     capability = state.get("capability", "summarize")
