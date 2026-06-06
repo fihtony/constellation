@@ -1809,6 +1809,7 @@ _INLINE_JS = r"""
         && hasLaterFiredStep
         && (visualState === 'current' || lifecycleState === 'running')
         && (stepKey === 'compass.received'
+            || stepKey === 'compass.asking_output_mode'
             || stepKey === 'office.received'
             || (row.agent === 'office'
                 && lifecycleState !== 'done'

@@ -468,6 +468,53 @@ class TestEndedAt:
             "Compass accepted output location",
         ]
 
+    def test_late_resuming_event_cannot_reopen_finished_output_mode_step(self):
+        # task-200cbd9fa537 exposed an out-of-order duplicate where a late
+        # ``resuming`` event for ``compass.asking_output_mode#0`` arrived
+        # after the terminal ``done`` event. The row must stay finished
+        # instead of regressing back to the "resuming" title/state.
+        store = _make_task_store()
+        record_major_step(
+            "task-x",
+            step_key="compass.asking_output_mode",
+            title="Compass asking for output location",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+            task_store=store,
+        )
+        record_major_step(
+            "task-x",
+            step_key="compass.asking_output_mode",
+            title="Compass accepted output location",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_facts={"output_mode": "workspace"},
+            task_store=store,
+        )
+        record_major_step(
+            "task-x",
+            step_key="compass.asking_output_mode",
+            title="Compass resuming after output location was selected",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_RESUMING,
+            task_store=store,
+        )
+
+        meta = store.get_task("task-x").metadata
+        row = meta["major_step_rows"]["compass.asking_output_mode#0"]
+        assert row["lifecycle_state"] == LIFECYCLE_DONE
+        assert row["visual_state"] == VISUAL_DONE
+        assert row["title"] == "Compass accepted output location"
+        assert row["summary_facts"]["output_mode"] == "workspace"
+        late_events = [
+            ev
+            for ev in meta["major_step_events"]
+            if ev["step_instance_key"] == "compass.asking_output_mode#0"
+            and ev["title"] == "Compass resuming after output location was selected"
+        ]
+        assert len(late_events) == 1
+        assert late_events[0]["ignored_after_terminal"] is True
+
 
 # ---------------------------------------------------------------------------
 # Terminal protection

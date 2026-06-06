@@ -585,6 +585,10 @@ def _merge_into_task_store(
     sik = event["step_instance_key"]
     is_terminal_event = lifecycle_state in TERMINAL_LIFECYCLE_STATES
     existing_row = major_step_rows.get(sik)
+    previous_row_terminal = bool(
+        existing_row
+        and existing_row.get("lifecycle_state") in TERMINAL_LIFECYCLE_STATES
+    )
     active_key = metadata.get("active_step_instance_key", "")
     last_key = metadata.get("last_step_instance_key", "")
     failed_key = metadata.get("failed_step_instance_key", "")
@@ -600,6 +604,22 @@ def _merge_into_task_store(
     if is_task_terminal and not is_terminal_event:
         # Terminal protection: append event with ignored_after_terminal=true
         # but do NOT touch major_step_rows.
+        event_for_log = dict(event)
+        event_for_log["ignored_after_terminal"] = True
+        major_step_events.append(event_for_log)
+        task_store.update_metadata(
+            task_id,
+            {
+                "major_step_events": major_step_events,
+            },
+        )
+        return
+
+    if previous_row_terminal and not is_terminal_event:
+        # Per-row terminal protection: late duplicate updates for the same
+        # step_instance_key must not reopen a row that already reached a
+        # terminal lifecycle (for example a duplicate ``resuming`` event
+        # arriving after ``compass.asking_output_mode#0`` was already ``done``).
         event_for_log = dict(event)
         event_for_log["ignored_after_terminal"] = True
         major_step_events.append(event_for_log)

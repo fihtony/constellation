@@ -177,7 +177,7 @@ def test_resume_on_waiting_task_returns_slim_payload(monkeypatch, tmp_path):
 
     # Replace the background dispatch worker so the test does not
     # spawn a real daemon thread.
-    async def _no_complete(self, **kwargs):
+    def _no_complete(self, **kwargs):
         return None
     monkeypatch.setattr(
         "agents.compass.agent.CompassAgent._complete_office_task",
@@ -202,6 +202,14 @@ def test_resume_on_waiting_task_returns_slim_payload(monkeypatch, tmp_path):
         e.get("role") == "USER" and e.get("text") == "workspace"
         for e in history
     )
+    output_row = (promoted.metadata or {}).get("major_step_rows", {}).get(
+        "compass.asking_output_mode#0"
+    )
+    assert output_row is not None
+    assert output_row["lifecycle_state"] == "done"
+    assert output_row["visual_state"] == "done"
+    assert output_row["ended_at"] is not None
+    assert output_row["title"] == "Compass accepted output location"
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +257,7 @@ def test_ten_concurrent_resumes_all_succeed(monkeypatch, tmp_path):
 
     # Stub the background worker so the test does not need a real
     # office roundtrip.
-    async def _no_complete(self, **kwargs):
+    def _no_complete(self, **kwargs):
         return None
     monkeypatch.setattr(
         "agents.compass.agent.CompassAgent._complete_office_task",

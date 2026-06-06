@@ -137,6 +137,7 @@ class TestCompassUITemplates:
         html = render_compass_ui()
         assert "const isStuckRunningRow =" in html
         assert "stepKey === 'compass.received'" in html
+        assert "stepKey === 'compass.asking_output_mode'" in html
         assert "stepKey === 'office.received'" in html
         assert "const hasLaterFiredStep = ordered.some(candidate => candidate.key !== sik && candidate.fired && !candidate.ignored);" in html
         assert "visualState = 'done';" in html
