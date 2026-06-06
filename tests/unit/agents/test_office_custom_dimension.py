@@ -279,3 +279,51 @@ def test_execution_phase_copies_files_into_buckets(tmp_path):
     assert "Alice" in plan_text
     assert "Bob" in plan_text
     assert "Dave" in plan_text
+
+
+def test_modify_phase_replans_with_revision_note(tmp_path):
+    """A ``modify: ...`` reply must re-run the planner with the user's
+    revision note and return a fresh plan for approval instead of
+    immediately executing the stale plan.
+    """
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_text("Student: Alice\nMonth: January\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    previous_plan = {
+        "buckets": ["Alice-January"],
+        "sample_mapping": {"a.txt": "Alice-January"},
+        "classification_rule": "Combine student and month.",
+        "rationale": "original",
+    }
+    revised_plan = {
+        "buckets": ["Alice/January"],
+        "sample_mapping": {"a.txt": "Alice/January"},
+        "classification_rule": "Group by student, then month.",
+        "rationale": "revised",
+    }
+    runtime = _runtime_with_plan_response(revised_plan)
+    state = _organize_state(
+        source=str(src),
+        artifacts_dir=str(artifacts),
+        approved_plan=previous_plan,
+    ) | {
+        "organize_custom_action": "modify",
+        "organize_custom_modify_note": (
+            "modify: create a student folder first, then month folders inside it"
+        ),
+    }
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "input-required"
+    needs = result["needs_clarification"]
+    assert needs["missing"] == "organizeCustomPlan"
+    assert needs["plan"] == revised_plan
+    prompt = runtime.prompts[0]
+    assert "student folder first" in prompt
+    assert "Alice-January" in prompt

@@ -585,15 +585,19 @@ def _merge_into_task_store(
     sik = event["step_instance_key"]
     is_terminal_event = lifecycle_state in TERMINAL_LIFECYCLE_STATES
     existing_row = major_step_rows.get(sik)
-    # Terminal protection is task-wide: if ANY row in ``major_step_rows`` is
-    # already in a terminal state, later non-terminal events for the same task
-    # are ignored in the row set (per design doc §0.7).
-    is_any_terminal_row = any(
-        (row.get("lifecycle_state") in TERMINAL_LIFECYCLE_STATES)
-        for row in major_step_rows.values()
-    )
+    active_key = metadata.get("active_step_instance_key", "")
+    last_key = metadata.get("last_step_instance_key", "")
+    failed_key = metadata.get("failed_step_instance_key", "")
+    terminal_key = metadata.get("terminal_step_instance_key", "")
+    # Task-wide terminal protection only applies after the workflow has
+    # emitted a canonical terminal pointer (for example
+    # ``compass.task_completed#0``). Ordinary completed intermediate rows like
+    # ``compass.dispatched#0`` or ``office.reading#0`` must not freeze the
+    # timeline; otherwise downstream running steps can only appear after the
+    # task is already complete.
+    is_task_terminal = bool(terminal_key)
 
-    if is_any_terminal_row and not is_terminal_event:
+    if is_task_terminal and not is_terminal_event:
         # Terminal protection: append event with ignored_after_terminal=true
         # but do NOT touch major_step_rows.
         event_for_log = dict(event)
@@ -678,11 +682,6 @@ def _merge_into_task_store(
     }
 
     # Update pointer fields per §0.6.
-    active_key = metadata.get("active_step_instance_key", "")
-    last_key = metadata.get("last_step_instance_key", "")
-    failed_key = metadata.get("failed_step_instance_key", "")
-    terminal_key = metadata.get("terminal_step_instance_key", "")
-
     if is_terminal_event and sik.startswith("compass.task_"):
         # Always-fires Compass terminal rows become the canonical terminal pointer.
         terminal_key = sik

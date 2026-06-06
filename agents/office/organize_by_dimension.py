@@ -528,15 +528,34 @@ def _read_sample_files(source: str, *, max_files: int = 5, max_chars: int = 600)
     return samples
 
 
-def _build_planning_prompt(hint: str, source: str, samples: list[dict]) -> str:
+def _build_planning_prompt(
+    hint: str,
+    source: str,
+    samples: list[dict],
+    *,
+    existing_plan: dict | None = None,
+    revision_note: str = "",
+) -> str:
     """Render the LLM prompt that produces a custom-dimension plan."""
     sample_block = "\n\n".join(
         f"--- {s['path']} ({s['ext']}) ---\n{s['excerpt']}"
         for s in samples
     )
+    revision_block = ""
+    if existing_plan or revision_note:
+        revision_block = (
+            "\nThe previous draft plan was:\n"
+            f"{json.dumps(existing_plan or {}, ensure_ascii=False, indent=2)}\n\n"
+            "Revise that draft to address this user feedback:\n"
+            f"{revision_note or '(no additional note supplied)'}\n\n"
+            "Preserve any parts of the prior plan that still fit the files, "
+            "but change the buckets and classification rule where the "
+            "feedback requires it.\n"
+        )
     return (
         f"You are helping organize files in this folder:\n{source}\n\n"
         f"The user wants to group them by **{hint}**.\n\n"
+        f"{revision_block}"
         "Read the sample files below and propose an organize plan with:\n"
         "1. A list of bucket names you recommend (3-12 buckets).\n"
         "2. For each sample file, which bucket it belongs to and why.\n"

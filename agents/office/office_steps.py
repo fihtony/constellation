@@ -172,7 +172,11 @@ def record_office_step(
         logger.debug("[office-steps] record_major_step failed: %s", exc)
 
 
-def emit_received(state: dict) -> None:
+def emit_received(
+    state: dict,
+    *,
+    lifecycle_state: str = LIFECYCLE_RUNNING,
+) -> None:
     capability = state.get("capability", "summarize")
     source_paths = state.get("source_paths", [])
     count, source_kind = _count_and_kind_from_paths(
@@ -191,6 +195,7 @@ def emit_received(state: dict) -> None:
         state,
         step_key="office.received",
         title="Office receiving task",
+        lifecycle_state=lifecycle_state,
         summary_template=summary_template,
         summary_facts={
             "capability": capability,
@@ -201,7 +206,11 @@ def emit_received(state: dict) -> None:
     )
 
 
-def emit_validating(state: dict) -> None:
+def emit_validating(
+    state: dict,
+    *,
+    lifecycle_state: str = LIFECYCLE_RUNNING,
+) -> None:
     capability = state.get("capability", "summarize")
     source_paths = state.get("source_paths", [])
     count, source_kind = _count_and_kind_from_paths(capability, source_paths)
@@ -209,7 +218,7 @@ def emit_validating(state: dict) -> None:
         state,
         step_key="office.validating",
         title="Office validating sources and permissions",
-        lifecycle_state=LIFECYCLE_RUNNING,
+        lifecycle_state=lifecycle_state,
         summary_template="Office validated {source_count} {source_kind} and prepared the output area.",
         summary_facts={
             "source_count": count,
@@ -240,6 +249,41 @@ def emit_executing_capability(state: dict) -> None:
         lifecycle_state=state.get("lifecycle_state", LIFECYCLE_RUNNING),
         summary_template=summary_template,
         summary_facts=summary_facts,
+    )
+
+
+def emit_summarizing(
+    state: dict,
+    *,
+    lifecycle_state: str = LIFECYCLE_RUNNING,
+) -> None:
+    source_paths = state.get("validated_paths") or state.get("source_paths") or []
+    source_count = len(source_paths) if isinstance(source_paths, list) else 0
+    record_office_step(
+        state,
+        step_key="office.summarizing",
+        title="Office summarizing each document",
+        lifecycle_state=lifecycle_state,
+        summary_template="Office summarized each of the {source_count} document(s).",
+        summary_facts={"source_count": source_count},
+    )
+
+
+def emit_combining(
+    state: dict,
+    *,
+    lifecycle_state: str = LIFECYCLE_RUNNING,
+) -> None:
+    source_paths = state.get("validated_paths") or state.get("source_paths") or []
+    source_count = len(source_paths) if isinstance(source_paths, list) else 0
+    record_office_step(
+        state,
+        step_key="office.combining",
+        title="Office creating combined summary",
+        lifecycle_state=lifecycle_state,
+        summary_template="Office created the combined summary covering all {source_count} document(s).",
+        summary_facts={"source_count": source_count},
+        conditional=True,
     )
 
 
@@ -412,13 +456,18 @@ def emit_writing_plan(state: dict, *, output_location: str | None = None) -> Non
     )
 
 
-def emit_verifying(state: dict, *, output_count: int) -> None:
+def emit_verifying(
+    state: dict,
+    *,
+    output_count: int,
+    lifecycle_state: str = LIFECYCLE_DONE,
+) -> None:
     """Emit ``office.verifying`` after delivery-path validation succeeds."""
     record_office_step(
         state,
         step_key="office.verifying",
         title="Office verifying deliverable",
-        lifecycle_state=LIFECYCLE_DONE,
+        lifecycle_state=lifecycle_state,
         summary_template="Office verified {output_count} deliverable(s).",
         summary_facts={"output_count": output_count},
     )
@@ -451,47 +500,6 @@ def emit_delivered(
             "failure_reason": state.get("summary", "")[:200] if not success else "",
         },
     )
-    # Per design doc §0.7: close the in-flight ``office.received#0`` row
-    # regardless of outcome so the timeline does not display a "current"
-    # row that is actually complete. ``emit_received`` initially emits the
-    # row with ``LIFECYCLE_RUNNING``; the framework's idempotent merge
-    # collapses this re-emission into the existing row instead of
-    # creating a new one.
-    if not success:
-        record_office_step(
-            state,
-            step_key="office.received",
-            title="Office receiving task",
-            lifecycle_state=LIFECYCLE_FAILED,
-            summary_template="Office received the task: {capability} on {source_count} {source_kind}.",
-            summary_facts={
-                "capability": state.get("capability", "summarize"),
-                "source_count": len(state.get("source_paths") or state.get("validated_paths") or []),
-                "source_kind": _source_kind(
-                    state.get("capability", "summarize"),
-                    len(state.get("source_paths") or state.get("validated_paths") or []),
-                ),
-                "failure_reason": state.get("summary", "")[:200],
-            },
-        )
-    else:
-        record_office_step(
-            state,
-            step_key="office.received",
-            title="Office receiving task",
-            lifecycle_state=LIFECYCLE_DONE,
-            summary_template=(
-                "Office received the task: {capability} on {source_count} {source_kind}."
-            ),
-            summary_facts={
-                "capability": state.get("capability", "summarize"),
-                "source_count": len(state.get("source_paths") or state.get("validated_paths") or []),
-                "source_kind": _source_kind(
-                    state.get("capability", "summarize"),
-                    len(state.get("source_paths") or state.get("validated_paths") or []),
-                ),
-            },
-        )
 
 
 def emit_validating_plan_output(

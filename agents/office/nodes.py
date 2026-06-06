@@ -425,13 +425,30 @@ def analyze_request(state: dict) -> dict:
                 **state,
                 "source_paths": source_paths,
                 "discovered_source_count": discovered_source_count,
-            }
+            },
+            lifecycle_state=LIFECYCLE_RUNNING,
+        )
+        office_steps.emit_received(
+            {
+                **state,
+                "source_paths": source_paths,
+                "discovered_source_count": discovered_source_count,
+            },
+            lifecycle_state=LIFECYCLE_DONE,
         )
         office_steps.emit_validating(
             {
                 **state,
                 "source_paths": validated_paths,
-            }
+            },
+            lifecycle_state=LIFECYCLE_RUNNING,
+        )
+        office_steps.emit_validating(
+            {
+                **state,
+                "source_paths": validated_paths,
+            },
+            lifecycle_state=LIFECYCLE_DONE,
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("emit_validating failed: %s", exc)
@@ -638,13 +655,38 @@ def _run_bounded_folder_summarize(
     artifacts_dir: str,
     system_prompt: str,
 ) -> AgenticResult:
+    from agents.office import office_steps as _steps
+
     summary_docs: list[dict[str, str]] = []
+    summary_outputs: list[dict[str, str]] = []
     expected_outputs = _expected_output_paths("summarize", validated_paths, output_mode, artifacts_dir)
     cwd = state.get("workspace_root") or (os.path.dirname(validated_paths[0]) if validated_paths else None)
     plugin_manager = state.get("_plugin_manager")
+    payloads: list[dict[str, Any]] = []
 
     for path in validated_paths:
         payload = _read_summary_payload(path)
+        payloads.append(payload)
+    try:
+        _steps.emit_executing_capability(
+            {
+                **state,
+                "validated_paths": validated_paths,
+                "lifecycle_state": LIFECYCLE_DONE,
+            }
+        )
+        _steps.emit_summarizing(
+            {
+                **state,
+                "validated_paths": validated_paths,
+            },
+            lifecycle_state=LIFECYCLE_RUNNING,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bounded summarize timeline start failed: %s", exc)
+
+    for payload in payloads:
+        path = str(payload["source_path"])
         summary_text = _summarize_payload_with_runtime(
             runtime,
             path=path,
@@ -653,8 +695,13 @@ def _run_bounded_folder_summarize(
             cwd=cwd,
             plugin_manager=plugin_manager,
         )
-        output_path = _target_output_path(output_mode, path, artifacts_dir, ".summary.md")
-        _write_text_file(output_path, summary_text)
+        summary_outputs.append(
+            {
+                "path": path,
+                "output_path": _target_output_path(output_mode, path, artifacts_dir, ".summary.md"),
+                "summary_text": summary_text,
+            }
+        )
         summary_docs.append(
             {
                 "name": os.path.basename(path),
@@ -662,9 +709,65 @@ def _run_bounded_folder_summarize(
             }
         )
 
+    combined_path = ""
+    combined_text = ""
+    try:
+        _steps.emit_summarizing(
+            {
+                **state,
+                "validated_paths": validated_paths,
+            },
+            lifecycle_state=LIFECYCLE_DONE,
+        )
+        if len(validated_paths) > 1:
+            _steps.emit_combining(
+                {
+                    **state,
+                    "validated_paths": validated_paths,
+                },
+                lifecycle_state=LIFECYCLE_RUNNING,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bounded summarize timeline mid-phase failed: %s", exc)
+
     if len(validated_paths) > 1 and validated_paths:
         combined_path = _target_output_file(output_mode, validated_paths[0], artifacts_dir, "combined-summary.md")
-        _write_text_file(combined_path, _build_combined_summary_text(summary_docs))
+        combined_text = _build_combined_summary_text(summary_docs)
+        try:
+            _steps.emit_combining(
+                {
+                    **state,
+                    "validated_paths": validated_paths,
+                },
+                lifecycle_state=LIFECYCLE_DONE,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("bounded summarize combining close failed: %s", exc)
+
+    try:
+        _steps.emit_writing(
+            state,
+            output_count=len(expected_outputs),
+            lifecycle_state=LIFECYCLE_RUNNING,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bounded summarize writing start failed: %s", exc)
+
+    for item in summary_outputs:
+        _write_text_file(item["output_path"], item["summary_text"])
+    if combined_path and combined_text:
+        _write_text_file(combined_path, combined_text)
+
+    try:
+        _steps.emit_writing(
+            state,
+            output_count=len(expected_outputs),
+            lifecycle_state=LIFECYCLE_DONE,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bounded summarize writing close failed: %s", exc)
+
+    state["_office_summary_phases_emitted"] = True
 
     summary = (
         f"Office summarized {len(validated_paths)} document(s) with the bounded folder workflow."
@@ -1767,6 +1870,16 @@ def execute_office_work(state: dict) -> dict:
             _ensure_combined_summary_exact_filenames(validated_paths, output_mode, artifacts_dir)
         expected_outputs = _expected_output_paths(capability, validated_paths, output_mode, artifacts_dir)
         organize_file_count = 0
+        try:
+            from agents.office import office_steps
+
+            office_steps.emit_verifying(
+                state,
+                output_count=len(expected_outputs),
+                lifecycle_state=LIFECYCLE_RUNNING,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("office timeline verify-start failed: %s", exc)
         if capability == "organize":
             repaired_plan_path = _repair_missing_organize_plan_output(
                 validated_paths,
@@ -1790,6 +1903,16 @@ def execute_office_work(state: dict) -> dict:
             )
         if not delivery_ok:
             logger.error("execute_office_work: delivery verification failed: %s", "; ".join(delivery_errors))
+            try:
+                from agents.office import office_steps
+
+                office_steps.emit_verifying(
+                    state,
+                    output_count=len(expected_outputs),
+                    lifecycle_state=LIFECYCLE_WARNING,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("office timeline verify-warning failed: %s", exc)
             return {
                 "summary": (
                     "Agentic execution completed, but delivery verification failed.\n"
@@ -1807,24 +1930,26 @@ def execute_office_work(state: dict) -> dict:
         try:
             from agents.office import office_steps
 
-            office_steps.emit_capability_completion_rows(
-                {
-                    **state,
-                    "validated_paths": validated_paths,
-                    "organize_file_count": organize_file_count,
-                }
-            )
-            office_steps.emit_writing(
-                state,
-                output_count=len(expected_outputs),
-                file_count=organize_file_count,
-                lifecycle_state="done",
-            )
-            if capability == "organize":
-                office_steps.emit_writing_plan(state)
+            if not state.get("_office_summary_phases_emitted"):
+                office_steps.emit_capability_completion_rows(
+                    {
+                        **state,
+                        "validated_paths": validated_paths,
+                        "organize_file_count": organize_file_count,
+                    }
+                )
+                office_steps.emit_writing(
+                    state,
+                    output_count=len(expected_outputs),
+                    file_count=organize_file_count,
+                    lifecycle_state="done",
+                )
+                if capability == "organize":
+                    office_steps.emit_writing_plan(state)
             office_steps.emit_verifying(
                 state,
                 output_count=len(expected_outputs),
+                lifecycle_state=LIFECYCLE_DONE,
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("office timeline close-out failed: %s", exc)

@@ -503,6 +503,34 @@ class TestTerminalProtection:
         assert len(late_events) == 1
         assert late_events[0]["ignored_after_terminal"] is True
 
+    def test_completed_intermediate_row_does_not_block_later_running_step(self):
+        store = _make_task_store()
+        record_major_step(
+            "task-x",
+            step_key="compass.dispatched",
+            title="Compass dispatching to Office Agent",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_DONE,
+            task_store=store,
+        )
+        record_major_step(
+            "task-x",
+            step_key="office.reading",
+            title="Office reading documents",
+            agent="office",
+            lifecycle_state=LIFECYCLE_RUNNING,
+            task_store=store,
+        )
+        meta = store.get_task("task-x").metadata
+        assert "office.reading#0" in meta["major_step_rows"]
+        office_row = meta["major_step_rows"]["office.reading#0"]
+        assert office_row["lifecycle_state"] == LIFECYCLE_RUNNING
+        late_events = [
+            e for e in meta["major_step_events"] if e.get("step_key") == "office.reading"
+        ]
+        assert len(late_events) == 1
+        assert not late_events[0].get("ignored_after_terminal")
+
 
 # ---------------------------------------------------------------------------
 # Pointer fields

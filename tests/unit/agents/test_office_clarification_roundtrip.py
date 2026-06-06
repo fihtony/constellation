@@ -311,6 +311,44 @@ def test_compass_resolve_office_resume_reply_for_organize_dimension():
     }
 
 
+def test_compass_resolve_office_resume_reply_for_custom_plan_reask_preserves_plan():
+    from agents.compass.agent import _resolve_office_resume_reply
+
+    existing_plan = {
+        "buckets": ["alpha", "beta"],
+        "sample_mapping": {"one.txt": "alpha"},
+        "classification_rule": "rule",
+        "rationale": "why",
+    }
+    office_request = {
+        "capability": "organize",
+        "_needs_clarification": {
+            "missing": "organizeCustomPlan",
+            "options": [
+                {"id": "approve", "label": "Approve plan"},
+                {"id": "modify", "label": "Modify plan"},
+            ],
+            "user_message": "Review the plan and reply.",
+            "plan": existing_plan,
+            "plan_path": "/tmp/custom-organize-plan.md",
+            "custom_hint": "student then month",
+        },
+    }
+
+    resolved = _resolve_office_resume_reply(
+        "office_organize_dimension",
+        "not yet",
+        office_request,
+    )
+
+    assert resolved["error_question"]
+    payload = resolved["needs_clarification"]
+    assert payload["missing"] == "organizeCustomPlan"
+    assert payload["plan"] == existing_plan
+    assert payload["plan_path"] == "/tmp/custom-organize-plan.md"
+    assert payload["custom_hint"] == "student then month"
+
+
 def test_compass_resolve_office_resume_reply_for_output_mode():
     from agents.compass.agent import _resolve_office_resume_reply
 
@@ -632,3 +670,108 @@ def test_compass_resume_task_for_invalid_dimension_re_asks(monkeypatch, tmp_path
         "size", "type", "created_time", "modified_time",
         "accessed_time", "filename",
     }
+
+
+def test_compass_resume_task_for_custom_plan_approve_after_reask_re_dispatches_plan(
+    monkeypatch, tmp_path
+):
+    """If a custom-plan approval round re-asked the user first, a later
+    ``approve`` must still forward the drafted plan to office instead of
+    falling back to the planning phase again.
+    """
+    from agents.compass.agent import CompassAgent, compass_definition
+
+    task_store = InMemoryTaskStore()
+    services = AgentServices(
+        session_service=MagicMock(),
+        event_store=MagicMock(),
+        memory_service=MagicMock(),
+        skills_registry=MagicMock(),
+        plugin_manager=MagicMock(),
+        checkpoint_service=MagicMock(),
+        runtime=MagicMock(),
+        registry_client=None,
+        task_store=task_store,
+    )
+    agent = CompassAgent(definition=compass_definition, services=services)
+    asyncio.run(agent.start())
+
+    plan = {
+        "buckets": ["alpha", "beta"],
+        "sample_mapping": {"one.txt": "alpha"},
+        "classification_rule": "rule",
+        "rationale": "why",
+    }
+    office_request = {
+        "capability": "organize",
+        "source_paths": ["/tmp/folder"],
+        "output_mode": "workspace",
+        "organize_dimension": "__custom__",
+        "organize_metadata": {
+            "organizeGroupBy": "__custom__",
+            "customDimensionHint": "student then month",
+        },
+        "_needs_clarification": {
+            "missing": "organizeCustomPlan",
+            "options": [
+                {"id": "approve", "label": "Approve plan"},
+                {"id": "modify", "label": "Modify plan"},
+            ],
+            "user_message": "Please reply with `approve` or `modify: <change>`.",
+        },
+    }
+    task = task_store.create_task(
+        agent_id=compass_definition.agent_id,
+        metadata={
+            "task_type": "office",
+            "user_request": "please organize this folder by student then month",
+            "office_request": office_request,
+        },
+    )
+    task_store.pause_task(
+        task.id,
+        question="Review the plan and reply.",
+        interrupt_metadata={
+            "kind": "office_organize_dimension",
+            "office_request": office_request,
+            "needs_clarification": {
+                "missing": "organizeCustomPlan",
+                "options": [
+                    {"id": "approve", "label": "Approve plan"},
+                    {"id": "modify", "label": "Modify plan"},
+                ],
+                "user_message": "Review the plan and reply.",
+                "plan": plan,
+                "plan_path": "/tmp/custom-organize-plan.md",
+                "custom_hint": "student then month",
+            },
+        },
+    )
+
+    captured: dict = {}
+
+    def _fake_dispatch_office_request(task_id, user_text, office_request, registry, log):
+        captured["office_request"] = dict(office_request)
+        return {
+            "status": "completed",
+            "state": "TASK_STATE_COMPLETED",
+            "message": "Office task done.",
+        }
+
+    def _fake_complete_office_task(self, *, task_id, user_text, office_request):
+        registry = MagicMock()
+        log = MagicMock()
+        _fake_dispatch_office_request(task_id, user_text, office_request, registry, log)
+
+    monkeypatch.setattr("agents.compass.agent._dispatch_office_request", _fake_dispatch_office_request)
+    monkeypatch.setattr(
+        "agents.compass.agent.CompassAgent._complete_office_task",
+        _fake_complete_office_task,
+    )
+
+    asyncio.run(agent.resume_task(task.id, "approve"))
+
+    assert captured.get("office_request"), "resume_task should have re-dispatched office"
+    forwarded = captured["office_request"]
+    assert forwarded.get("organize_custom_action") == "approve"
+    assert forwarded.get("organize_custom_plan") == plan
