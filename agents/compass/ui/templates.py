@@ -1350,6 +1350,27 @@ _INLINE_JS = r"""
   function clearComposerNote() {
     state.composerNote = '';
   }
+  function isOptimisticTaskId(tid) {
+    return String(tid || '').startsWith('__optimistic_');
+  }
+  function closeLogSubscription(tid) {
+    const es = state.logEventSources[tid];
+    if (!es) return;
+    try { es.close(); } catch (_ignored) {}
+    delete state.logEventSources[tid];
+  }
+  function syncLogSubscriptions(activeTid) {
+    const keepTid = (
+      activeTid
+      && activeTid !== NEW_REQUEST_ID
+      && !isOverviewSelection(activeTid)
+      && !isOptimisticTaskId(activeTid)
+      && state.tasks[activeTid]
+    ) ? activeTid : '';
+    Object.keys(state.logEventSources).forEach(tid => {
+      if (tid !== keepTid) closeLogSubscription(tid);
+    });
+  }
 
   function ensureTaskRefreshLoop() {
     if (state.taskRefreshIntervalId) return;
@@ -1394,6 +1415,7 @@ _INLINE_JS = r"""
   }
   function discardOptimisticTask(taskId) {
     if (!taskId) return;
+    closeLogSubscription(taskId);
     delete state.tasks[taskId];
     state.order = state.order.filter(id => id !== taskId);
     if (state.selectedTaskId === taskId) state.selectedTaskId = NEW_REQUEST_ID;
@@ -2134,6 +2156,7 @@ _INLINE_JS = r"""
     if (optimisticId === newId) return;
     const existed = Object.prototype.hasOwnProperty.call(state.tasks, optimisticId);
     if (existed) {
+      closeLogSubscription(optimisticId);
       delete state.tasks[optimisticId];
       state.order = state.order.filter(id => id !== optimisticId);
       if (state.selectedTaskId === optimisticId) state.selectedTaskId = newId;
@@ -2157,16 +2180,26 @@ _INLINE_JS = r"""
       if (autoSelect && !state.tasks[state.selectedTaskId] && !isOverviewSelection(state.selectedTaskId) && state.selectedTaskId !== NEW_REQUEST_ID) {
         state.selectedTaskId = state.order[0] || NEW_REQUEST_ID;
       }
-      if (state.selectedTaskId !== NEW_REQUEST_ID && !isOverviewSelection(state.selectedTaskId) && state.tasks[state.selectedTaskId]) {
+      syncLogSubscriptions(state.selectedTaskId);
+      if (
+        state.selectedTaskId !== NEW_REQUEST_ID
+        && !isOverviewSelection(state.selectedTaskId)
+        && !isOptimisticTaskId(state.selectedTaskId)
+        && state.tasks[state.selectedTaskId]
+      ) {
         await loadTaskDetail(state.selectedTaskId);
       }
       renderTaskList(); renderChat(); renderDetail();
-      if (state.selectedTaskId !== NEW_REQUEST_ID && !isOverviewSelection(state.selectedTaskId)) subscribeLogs(state.selectedTaskId);
+      if (
+        state.selectedTaskId !== NEW_REQUEST_ID
+        && !isOverviewSelection(state.selectedTaskId)
+        && !isOptimisticTaskId(state.selectedTaskId)
+      ) subscribeLogs(state.selectedTaskId);
     } catch (e) { console.error('loadTasks failed', e); }
   }
 
   async function loadTaskDetail(tid) {
-    if (!tid || tid === NEW_REQUEST_ID) return;
+    if (!tid || tid === NEW_REQUEST_ID || isOverviewSelection(tid) || isOptimisticTaskId(tid)) return;
     try {
       const resp = await fetch(`/api/tasks/${encodeURIComponent(tid)}`);
       const data = await resp.json();
@@ -2231,13 +2264,15 @@ _INLINE_JS = r"""
     if (tid === state.selectedTaskId && tid !== NEW_REQUEST_ID) {
       clearComposerNote();
       state.selectedTaskId = OVERVIEW_ID;
+      syncLogSubscriptions('');
       renderTaskList(); renderChat(); renderDetail();
       return;
     }
     clearComposerNote();
     state.selectedTaskId = tid;
+    syncLogSubscriptions(tid);
     renderTaskList(); renderChat(); renderDetail();
-    if (tid !== NEW_REQUEST_ID && !isOverviewSelection(tid)) subscribeLogs(tid);
+    if (tid !== NEW_REQUEST_ID && !isOverviewSelection(tid) && !isOptimisticTaskId(tid)) subscribeLogs(tid);
     loadTaskDetail(tid).then(() => {
       renderTaskList(); renderChat(); renderDetail();
     });
@@ -2257,6 +2292,7 @@ _INLINE_JS = r"""
     if (waitingId === state.selectedTaskId) return;
     clearComposerNote();
     state.selectedTaskId = waitingId;
+    syncLogSubscriptions(waitingId);
     renderTaskList(); renderChat(); renderDetail();
     subscribeLogs(waitingId);
     loadTaskDetail(waitingId).then(() => {
@@ -2854,6 +2890,8 @@ _INLINE_JS = r"""
   }
 
   function subscribeLogs(tid) {
+    if (!tid || isOptimisticTaskId(tid) || !state.tasks[tid]) return;
+    syncLogSubscriptions(tid);
     if (state.logEventSources[tid]) return;
     fetch(`/logs/${encodeURIComponent(tid)}`).then(r => r.json()).then(data => {
       state.logsByTask[tid] = Array.isArray(data.logs) ? data.logs : [];

@@ -16,6 +16,8 @@ class TestUIRoutes:
         result = handle_ui_request("GET", "/ui")
         assert result["status"] == 200
         assert "text/html" in result["headers"]["Content-Type"]
+        assert result["headers"]["Cache-Control"] == "no-store, no-cache, must-revalidate"
+        assert result["headers"]["Pragma"] == "no-cache"
         assert "Compass Chat" in result["body"]
         assert 'id="dashboard"' in result["body"]
 
@@ -31,6 +33,8 @@ class TestUIRoutes:
         result = handle_ui_request("GET", "/tasks", task_store=task_store)
         assert result["status"] == 200
         assert "application/json" in result["headers"]["Content-Type"]
+        assert result["headers"]["Cache-Control"] == "no-store, no-cache, must-revalidate"
+        assert result["headers"]["Pragma"] == "no-cache"
         assert result["body"]["tasks"]
         first = result["body"]["tasks"][0]
         assert "createdAt" in first
@@ -46,6 +50,8 @@ class TestUIRoutes:
 
         result = handle_ui_request("GET", f"/tasks/{task_id}", task_store=task_store)
         assert result["status"] == 200
+        assert result["headers"]["Cache-Control"] == "no-store, no-cache, must-revalidate"
+        assert result["headers"]["Pragma"] == "no-cache"
         data = result["body"]
         assert data["task_id"] == task_id
         assert data["orchestratorTaskId"] == task_id

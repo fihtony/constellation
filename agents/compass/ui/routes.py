@@ -28,6 +28,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _no_store_headers(content_type: str) -> dict[str, str]:
+    return {
+        "Content-Type": content_type,
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+    }
+
+
 def _task_has_warning(task) -> bool:
     metadata = getattr(task, "metadata", {}) or {}
     if str(metadata.get("status", "")).strip().lower() == "completed_with_warning":
@@ -250,7 +258,7 @@ def serve_ui(task_store=None) -> dict:
     html = render_compass_ui(messages=[], tasks=tasks)
     return {
         "status": 200,
-        "headers": {"Content-Type": "text/html; charset=utf-8"},
+        "headers": _no_store_headers("text/html; charset=utf-8"),
         "body": html,
     }
 
@@ -263,13 +271,13 @@ def list_tasks_json(task_store) -> dict:
     if task_store is None:
         return {
             "status": 200,
-            "headers": {"Content-Type": "application/json"},
+            "headers": _no_store_headers("application/json"),
             "body": {"tasks": []},
         }
     tasks = task_store.list_tasks()
     return {
         "status": 200,
-        "headers": {"Content-Type": "application/json"},
+        "headers": _no_store_headers("application/json"),
         "body": {"tasks": [_serialize_ui_task(t) for t in tasks]},
     }
 
@@ -280,10 +288,18 @@ list_tasks = list_tasks_json
 
 def get_task_detail(task_id: str, task_store) -> dict:
     if task_store is None:
-        return {"status": 404, "body": "Task store not available"}
+        return {
+            "status": 404,
+            "headers": _no_store_headers("application/json"),
+            "body": {"error": "Task store not available"},
+        }
     task = task_store.get_task(task_id)
     if task is None:
-        return {"status": 404, "body": "Task not found"}
+        return {
+            "status": 404,
+            "headers": _no_store_headers("application/json"),
+            "body": {"error": "Task not found"},
+        }
     payload = _serialize_ui_task(task)
     payload["artifacts"] = [
         {
@@ -300,7 +316,7 @@ def get_task_detail(task_id: str, task_store) -> dict:
     payload["metadata"] = getattr(task, "metadata", {}) or {}
     return {
         "status": 200,
-        "headers": {"Content-Type": "application/json"},
+        "headers": _no_store_headers("application/json"),
         "body": {"task": payload, **payload},
     }
 
@@ -309,7 +325,7 @@ def poll_task_status(task_store, since: str | None = None) -> dict:
     tasks = task_store.list_tasks() if task_store else []
     return {
         "status": 200,
-        "headers": {"Content-Type": "application/json"},
+        "headers": _no_store_headers("application/json"),
         "body": {
             "tasks": [_serialize_ui_task(t) for t in tasks],
             "messages": [],

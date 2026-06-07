@@ -289,6 +289,23 @@ class TestCompassUITemplates:
         assert "composerInput.placeholder = 'Submitting request...';" in html
         assert "composerInput.dataset.mode = 'disabled';" in html
 
+    def test_render_ui_never_opens_log_streams_for_optimistic_placeholder_tasks(self):
+        html = render_compass_ui()
+        assert "function isOptimisticTaskId(tid)" in html
+        assert "if (!tid || isOptimisticTaskId(tid) || !state.tasks[tid]) return;" in html
+        assert "&& !isOptimisticTaskId(state.selectedTaskId)" in html
+
+    def test_render_ui_closes_stale_log_streams_when_selection_changes(self):
+        html = render_compass_ui()
+        assert "function closeLogSubscription(tid)" in html
+        assert "function syncLogSubscriptions(activeTid)" in html
+        assert "Object.keys(state.logEventSources).forEach(tid => {" in html
+        assert "if (tid !== keepTid) closeLogSubscription(tid);" in html
+        assert "closeLogSubscription(optimisticId);" in html
+        assert "closeLogSubscription(taskId);" in html
+        assert "syncLogSubscriptions(state.selectedTaskId);" in html
+        assert "syncLogSubscriptions(tid);" in html
+
     def test_render_ui_recovers_when_create_request_submission_fails(self):
         html = render_compass_ui()
         assert "async function fetchJsonWithTimeout(url, options, timeoutMs = 15000)" in html
