@@ -98,6 +98,31 @@ class TaskStore(ABC):
         """Mark task failed with error message."""
         self.update_state(task_id, TaskState.FAILED, error)
 
+    def cancel_task(self, task_id: str, reason: str = "") -> bool:
+        """Cancel a non-terminal task.
+
+        Returns ``True`` if the task transitioned to ``CANCELLED``,
+        ``False`` if the task is missing or already in a terminal state
+        (COMPLETED / FAILED / CANCELLED). The ``reason`` is recorded in the
+        status message so the UI can surface "cancelled by user" text.
+        Idempotent: calling cancel on an already-cancelled task is a no-op.
+        """
+        task = self.get_task(task_id)
+        if task is None:
+            return False
+        current_state = getattr(
+            getattr(task.status, "state", None), "value",
+            str(getattr(task.status, "state", "")),
+        )
+        if current_state in {
+            TaskState.COMPLETED.value,
+            TaskState.FAILED.value,
+            TaskState.CANCELLED.value,
+        }:
+            return False
+        self.update_state(task_id, TaskState.CANCELLED, reason or "cancelled by user")
+        return True
+
     def pause_task(
         self,
         task_id: str,

@@ -100,8 +100,10 @@ def test_organize_folder_tool_returns_recursive_file_metadata(tmp_path):
     assert files[0]["relative_path"] == "0103/1.txt"
     assert files[0]["suggested_reader_tool"] == "read_txt"
     assert files[0]["inferred_date_bucket"] == "2026-01"
-    assert files[0]["primary_entity"] == "Yan"
-    assert "Student Yan" in "\n".join(files[0]["prominent_headings"])
+    # Business hardcode (primary_entity) was removed in Block 2; the
+    # organise capability is now dimension-agnostic.
+    assert "primary_entity" not in files[0]
+    assert "The Most Important Discovery" in "\n".join(files[0]["prominent_headings"])
 
 
 def test_organize_folder_tool_counts_all_nested_files(tmp_path):
@@ -121,8 +123,8 @@ def test_organize_folder_tool_counts_all_nested_files(tmp_path):
     assert relative_paths == {"0103/1.txt", "0207/2.txt"}
 
 
-def test_organize_folder_tool_uses_explicit_identity_not_assignment_title(tmp_path):
-    """OrganizeFolderTool should prefer explicit identity markers over document titles."""
+def test_organize_folder_tool_is_dimension_agnostic(tmp_path):
+    """Block 2 removed explicit-identity inference; organize is dimension-agnostic."""
     tool = OrganizeFolderTool()
     essay_dir = tmp_path / "0131"
     essay_dir.mkdir(parents=True)
@@ -136,5 +138,13 @@ def test_organize_folder_tool_uses_explicit_identity_not_assignment_title(tmp_pa
     assert result.success, f"organize_folder failed: {result.error}"
     data = json.loads(result.output)
     file_entry = data["files"][0]
-    assert file_entry["primary_entity"] == "Ethan"
-    assert file_entry["primary_entity_confidence"] == "high"
+    # The organizer's job is to expose source metadata, not infer a
+    # person/entity. Verify the business hardcode is gone but the
+    # structural fields are still populated.
+    assert "primary_entity" not in file_entry
+    assert "primary_entity_confidence" not in file_entry
+    assert file_entry["relative_path"] == "0131/1.txt"
+    # The structural heading extractor is dimension-agnostic; verify
+    # it still exposes content-derived headings when present.
+    headings_blob = "\n".join(file_entry.get("prominent_headings") or [])
+    assert "Formal Letter Writing" in headings_blob

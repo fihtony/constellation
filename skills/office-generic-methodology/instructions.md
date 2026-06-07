@@ -70,12 +70,23 @@ Collect:
 
 ### C) For Organization Tasks
 
-1. Survey current tree and classify items by generic signals:
-- Extension/type
-- Directory/date patterns
-- Existing category folders
-2. Produce a plan first; do not delete source files.
-3. If execution is requested, only perform allowed operations.
+1. Identify the dimension from the user:
+   - Read `metadata.organizeGroupBy` first.
+   - Otherwise scan the user request for a generic keyword
+     (size, type, created_time, modified_time, accessed_time,
+     filename).
+   - If no dimension is identified, return a structured
+     `needs_clarification` payload and STOP. Never invent a
+     dimension.
+2. Use the matching dimension tool
+   (`organize_by_size` / `organize_by_type` /
+   `organize_by_created_time` / `organize_by_modified_time` /
+   `organize_by_accessed_time` / `organize_by_filename`) to
+   materialize the layout and write `organization-plan.md` with
+   explicit bucket rules.
+3. Bucket names come from the dimension tool. Never introduce
+   business-specific folder names (no `students/`, no
+   `by-entity/`, etc.).
 
 ## Phase 4: Output Contract
 
@@ -94,3 +105,4 @@ Before finishing:
 2. Confirm output filenames and locations match requested mode.
 3. Confirm no credentials or secrets are included in output/log text.
 4. Confirm no domain-specific field assumptions were hardcoded.
+5. The chosen grouping dimension matches the user request.

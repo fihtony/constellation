@@ -585,15 +585,23 @@ def _merge_into_task_store(
     sik = event["step_instance_key"]
     is_terminal_event = lifecycle_state in TERMINAL_LIFECYCLE_STATES
     existing_row = major_step_rows.get(sik)
-    # Terminal protection is task-wide: if ANY row in ``major_step_rows`` is
-    # already in a terminal state, later non-terminal events for the same task
-    # are ignored in the row set (per design doc §0.7).
-    is_any_terminal_row = any(
-        (row.get("lifecycle_state") in TERMINAL_LIFECYCLE_STATES)
-        for row in major_step_rows.values()
+    previous_row_terminal = bool(
+        existing_row
+        and existing_row.get("lifecycle_state") in TERMINAL_LIFECYCLE_STATES
     )
+    active_key = metadata.get("active_step_instance_key", "")
+    last_key = metadata.get("last_step_instance_key", "")
+    failed_key = metadata.get("failed_step_instance_key", "")
+    terminal_key = metadata.get("terminal_step_instance_key", "")
+    # Task-wide terminal protection only applies after the workflow has
+    # emitted a canonical terminal pointer (for example
+    # ``compass.task_completed#0``). Ordinary completed intermediate rows like
+    # ``compass.dispatched#0`` or ``office.reading#0`` must not freeze the
+    # timeline; otherwise downstream running steps can only appear after the
+    # task is already complete.
+    is_task_terminal = bool(terminal_key)
 
-    if is_any_terminal_row and not is_terminal_event:
+    if is_task_terminal and not is_terminal_event:
         # Terminal protection: append event with ignored_after_terminal=true
         # but do NOT touch major_step_rows.
         event_for_log = dict(event)
@@ -607,7 +615,49 @@ def _merge_into_task_store(
         )
         return
 
+    if previous_row_terminal and not is_terminal_event:
+        # Per-row terminal protection: late duplicate updates for the same
+        # step_instance_key must not reopen a row that already reached a
+        # terminal lifecycle (for example a duplicate ``resuming`` event
+        # arriving after ``compass.asking_output_mode#0`` was already ``done``).
+        event_for_log = dict(event)
+        event_for_log["ignored_after_terminal"] = True
+        major_step_events.append(event_for_log)
+        task_store.update_metadata(
+            task_id,
+            {
+                "major_step_events": major_step_events,
+            },
+        )
+        return
+
     major_step_events.append(event)
+
+    # Single-active-row normalization: when a new step instance starts (or the
+    # task emits a different terminal row), any previously-active non-terminal
+    # row must be closed so its visual state and elapsed time stop advancing.
+    previous_active_key = active_key if active_key and active_key != sik else ""
+    if previous_active_key:
+        previous_active_row = major_step_rows.get(previous_active_key)
+        previous_active_state = step_states.get(previous_active_key) or {}
+        previous_active_terminal = bool(
+            previous_active_row
+            and previous_active_row.get("lifecycle_state") in TERMINAL_LIFECYCLE_STATES
+        )
+        if previous_active_row and not previous_active_terminal:
+            closed_row = dict(previous_active_row)
+            closed_row["lifecycle_state"] = LIFECYCLE_DONE
+            closed_row["visual_state"] = VISUAL_DONE
+            closed_row["ended_at"] = event["created_at"]
+            major_step_rows[previous_active_key] = closed_row
+
+            closed_state = dict(previous_active_state)
+            closed_state["lifecycle_state"] = LIFECYCLE_DONE
+            closed_state["visual_state"] = VISUAL_DONE
+            if "started_at" not in closed_state and closed_row.get("started_at"):
+                closed_state["started_at"] = closed_row.get("started_at")
+            closed_state["ended_at"] = event["created_at"]
+            step_states[previous_active_key] = closed_state
 
     # Upsert row in major_step_rows
     previous_row = existing_row
@@ -678,11 +728,6 @@ def _merge_into_task_store(
     }
 
     # Update pointer fields per §0.6.
-    active_key = metadata.get("active_step_instance_key", "")
-    last_key = metadata.get("last_step_instance_key", "")
-    failed_key = metadata.get("failed_step_instance_key", "")
-    terminal_key = metadata.get("terminal_step_instance_key", "")
-
     if is_terminal_event and sik.startswith("compass.task_"):
         # Always-fires Compass terminal rows become the canonical terminal pointer.
         terminal_key = sik

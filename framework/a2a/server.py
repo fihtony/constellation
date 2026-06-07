@@ -153,6 +153,19 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                 self._handle_resume(task_id, body)
                 return
 
+        # POST /tasks/{id}/cancel — task-scoped cancellation. Distinct
+        # from ``/terminate`` (which kills the agent process). Works in
+        # any non-terminal state (SUBMITTED / WORKING / INPUT_REQUIRED);
+        # returns ``already_terminal`` for tasks that are already
+        # COMPLETED / FAILED / CANCELLED.
+        if path.endswith("/cancel"):
+            parts = path.split("/")
+            if len(parts) >= 3:
+                task_id = parts[2]
+                body = self._read_json_body() or {}
+                self._handle_cancel(task_id, body)
+                return
+
         # POST /_major_step/events — downstream agent events fan-in.
         # The body MUST contain ``task_id`` (the Compass top-level task id);
         # ``step_key``, ``title``, ``agent`` and ``lifecycle_state`` are
@@ -440,6 +453,75 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(exc)})
         finally:
             loop.close()
+
+    def _handle_cancel(self, task_id: str, body: dict) -> None:
+        """Handle a task-scoped cancel request.
+
+        Distinct from ``/terminate`` (which shuts down the agent process
+        via the lifecycle manager). Cancel works in any non-terminal
+        state and propagates to downstream agents (e.g. compass →
+        office) over A2A. The actual signal delivery to in-flight
+        workflow threads happens inside ``agent.handle_task_cancel``.
+        """
+        import asyncio
+
+        agent_id = self.agent.definition.agent_id if self.agent else "unknown"
+        reason = str(body.get("reason") or "cancelled by user")
+        print(f"[{agent_id}] Cancel request for task {task_id}")
+
+        task_store = getattr(
+            getattr(self.agent, "services", None), "task_store", None
+        )
+        if task_store is None:
+            self._send_json(500, {"error": "task_store unavailable"})
+            return
+
+        task = task_store.get_task(task_id)
+        if task is None:
+            self._send_json(404, {"error": "not_found", "task_id": task_id})
+            return
+
+        current_state = getattr(
+            getattr(task.status, "state", None), "value",
+            str(getattr(task.status, "state", "")),
+        )
+        if current_state in {
+            "TASK_STATE_COMPLETED",
+            "TASK_STATE_FAILED",
+            "TASK_STATE_CANCELLED",
+        }:
+            self._send_json(200, {
+                "status": "already_terminal",
+                "task_id": task_id,
+                "task_state": current_state,
+            })
+            return
+
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                self.agent.handle_task_cancel(task_id, reason)
+            )
+        except AttributeError:
+            # Agent does not implement handle_task_cancel — fall back to
+            # the base behavior (mark the local task CANCELLED).
+            task_store.cancel_task(task_id, reason)
+            result = {"status": "ok", "task_id": task_id, "mode": "local_only"}
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        finally:
+            loop.close()
+
+        # If the agent's handler already did the cancel_task transition,
+        # ``result`` is informational. If the handler is missing, we did
+        # it above. Either way, return 200 with the structured response.
+        self._send_json(200, {
+            "status": "ok",
+            "task_id": task_id,
+            "task_state": "TASK_STATE_CANCELLED",
+            **(result or {}),
+        })
 
     # -- Helpers --------------------------------------------------------------
 

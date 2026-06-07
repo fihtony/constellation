@@ -297,6 +297,8 @@ def _dispatch_office_task_via_launcher(
     capability: str,
     orchestrator_task_id: str,
     office_definition: dict[str, Any] | None = None,
+    organize_group_by: str = "",
+    extra: dict[str, Any] | None = None,
 ) -> dict:
     definition = office_definition or _office_launch_definition(capability)
     if not definition:
@@ -305,19 +307,42 @@ def _dispatch_office_task_via_launcher(
     _launcher = _launcher_dispatch.get_launcher()
     mount_plan = _office_mount_plan(source_paths, output_mode, _launcher)
     execution_contract, permissions = _build_office_dispatch_contract(output_mode)
+    metadata: dict[str, Any] = {
+        "source_paths": mount_plan["translated_paths"],
+        "output_mode": output_mode,
+        "capability": capability,
+        "compassTaskId": orchestrator_task_id,
+        "executionContract": execution_contract,
+        "permissions": permissions,
+    }
+    # When the user already picked a dimension (after a clarification
+    # round-trip), forward it to office so ``parse_dimension`` resolves
+    # it from metadata on the first call.
+    if organize_group_by:
+        metadata["organizeGroupBy"] = organize_group_by
+    # The custom-dimension plan-then-execute flow also needs the
+    # user's custom-dimension hint (so office's planner knows what
+    # to group by) and any approved plan / modify note forwarded by
+    # the compass resume handler.
+    extra = extra or {}
+    custom_hint = str(extra.get("customDimensionHint") or "").strip()
+    if custom_hint:
+        metadata["customDimensionHint"] = custom_hint
+    custom_plan = extra.get("organize_custom_plan") or {}
+    if custom_plan:
+        metadata["organizeCustomPlan"] = custom_plan
+    custom_action = str(extra.get("organize_custom_action") or "").strip()
+    if custom_action:
+        metadata["organizeCustomAction"] = custom_action
+    custom_modify_note = str(extra.get("organize_custom_modify_note") or "").strip()
+    if custom_modify_note:
+        metadata["organizeCustomModifyNote"] = custom_modify_note
     result = dispatch_via_launcher(
         definition,
         capability=_office_requested_capability(capability),
         launch_task_id=orchestrator_task_id or "office-task",
         message_parts=[{"text": task_description}],
-        metadata={
-            "source_paths": mount_plan["translated_paths"],
-            "output_mode": output_mode,
-            "capability": capability,
-            "compassTaskId": orchestrator_task_id,
-            "executionContract": execution_contract,
-            "permissions": permissions,
-        },
+        metadata=metadata,
         timeout=_office_dispatch_timeout(),
         # Office is a single-shot document task — spawn a fresh
         # container per call and tear it down as soon as the A2A
@@ -337,11 +362,43 @@ def _dispatch_office_task_via_launcher(
     status = "completed" if task_state == "TASK_STATE_COMPLETED" else (
         "input-required" if task_state == "TASK_STATE_INPUT_REQUIRED" else "error"
     )
+    # When office pauses the task with a needs_clarification payload, the
+    # office task's ``_interrupt`` metadata carries the structured payload.
+    # Surface it so the orchestrator can re-prompt the user with the
+    # suggested options instead of treating the run as a generic failure.
+    interrupt_metadata = task.get("metadata", {}).get("_interrupt") or {}
+    needs_clarification = (
+        interrupt_metadata.get("needs_clarification")
+        if isinstance(interrupt_metadata, dict) else None
+    )
+    question = ""
+    if needs_clarification and isinstance(needs_clarification, dict):
+        question = str(needs_clarification.get("user_message") or "").strip()
+    if not question:
+        # Fall back to the status message parts (set by task_store.pause_task).
+        status_message = task.get("status", {}).get("message", {}) or {}
+        for part in status_message.get("parts", []) or []:
+            text = part.get("text")
+            if text:
+                question = str(text).strip()
+                break
     return {
         "status": status,
         "state": task_state,
         "taskId": task.get("id", ""),
         "summary": summary,
+        "question": question,
+        "needs_clarification": needs_clarification or {},
+        # Surface the per-task office launch URL so the compass can
+        # forward a cancel request to the running container even when
+        # ``preserve_instance=False`` (the container is torn down in the
+        # ``finally`` of ``dispatch_via_launcher`` once the message-send
+        # returns, but the URL remains valid for the duration of the
+        # call).  The field is also useful for debugging.
+        "office_service_url": (
+            (result.get("_launch") or {}).get("serviceUrl")
+            if isinstance(result, dict) else ""
+        ),
     }
 
 # ---------------------------------------------------------------------------
@@ -506,6 +563,53 @@ class DispatchOfficeTask(BaseTool):
                 "type": "string",
                 "description": "Optional orchestrator callback URL.",
             },
+            "organizeGroupBy": {
+                "type": "string",
+                "description": (
+                    "Optional organize grouping dimension (size, type, "
+                    "created_time, modified_time, accessed_time, filename). "
+                    "When the user did not supply one, the office agent "
+                    "surfaces a needs_clarification reply and the orchestrator "
+                    "re-prompts. Compass fills this in once the user picks."
+                ),
+            },
+            "customDimensionHint": {
+                "type": "string",
+                "description": (
+                    "Optional natural-language grouping hint for the "
+                    "LLM-driven custom-dimension path.  When set, office "
+                    "skips the six built-in dimensions and produces a "
+                    "plan via the LLM planner (e.g. 'student name', "
+                    "'subject area', 'department')."
+                ),
+            },
+            "organizeCustomPlan": {
+                "type": "object",
+                "description": (
+                    "Optional pre-approved plan (from a previous "
+                    "plan-then-execute round-trip).  When set, office "
+                    "skips planning and runs the LLM executor pass "
+                    "directly.  The plan is the JSON object office's "
+                    "planner produced on the previous call."
+                ),
+            },
+            "organizeCustomAction": {
+                "type": "string",
+                "description": (
+                    "Optional user action on the custom plan: "
+                    "'approve' or 'modify'.  Compass fills this in "
+                    "after the user replies to the plan-approval "
+                    "question."
+                ),
+            },
+            "organizeCustomModifyNote": {
+                "type": "string",
+                "description": (
+                    "Optional free-text revision note captured from a "
+                    "`modify: ...` reply during the custom-plan approval "
+                    "round-trip."
+                ),
+            },
         },
         "required": ["task_description"],
     }
@@ -519,6 +623,11 @@ class DispatchOfficeTask(BaseTool):
         capability: str = "summarize",
         orchestrator_task_id: str = "",
         callback_url: str = "",
+        organizeGroupBy: str = "",
+        customDimensionHint: str = "",
+        organizeCustomPlan: dict | None = None,
+        organizeCustomAction: str = "",
+        organizeCustomModifyNote: str = "",
     ) -> ToolResult:
         # Permission gate: compass is the orchestrator for office work,
         # so it must hold an explicit "agent_launching" grant for the
@@ -532,6 +641,18 @@ class DispatchOfficeTask(BaseTool):
         if file_path and file_path not in normalized_source_paths:
             normalized_source_paths.append(file_path)
 
+        extra: dict[str, Any] = {}
+        if customDimensionHint:
+            extra["customDimensionHint"] = str(customDimensionHint).strip()
+        if organizeCustomPlan:
+            extra["organize_custom_plan"] = dict(organizeCustomPlan)
+        if organizeCustomAction:
+            extra["organize_custom_action"] = str(organizeCustomAction).strip()
+        if organizeCustomModifyNote:
+            extra["organize_custom_modify_note"] = str(
+                organizeCustomModifyNote
+            ).strip()
+
         try:
             office_definition = _office_launch_definition(capability)
             result = _dispatch_office_task_via_launcher(
@@ -540,7 +661,9 @@ class DispatchOfficeTask(BaseTool):
                 output_mode=output_mode,
                 capability=capability,
                 orchestrator_task_id=orchestrator_task_id,
+                organize_group_by=str(organizeGroupBy or "").strip(),
                 office_definition=office_definition,
+                extra=extra,
             )
             return ToolResult(output=json.dumps(result))
         except Exception as exc:

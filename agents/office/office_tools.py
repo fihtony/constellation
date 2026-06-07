@@ -241,8 +241,6 @@ def _truncate_content(text: str, max_chars: int = 16000) -> tuple[str, bool]:
 # ---------------------------------------------------------------------------
 
 ORGANIZED_OUTPUT_ROOT = "organized-output/files/"
-VALID_CATEGORIES = {"students", "documents", "data", "code", "images", "presentations"}
-WRAPPER_PREFIXES = {"grouped", "by-student", "organized", "output", "originals"}
 TEXT_PREVIEW_EXTENSIONS = {
     ".txt", ".md", ".markdown",
     ".csv", ".tsv",
@@ -291,65 +289,42 @@ READER_TOOL_BY_EXTENSION = {
     ".ods": "read_xlsx",
     ".xls": "read_xls",
 }
-IDENTITY_PREFIXES = {
-    "student",
-    "author",
-    "writer",
-    "owner",
-    "employee",
-    "member",
-    "candidate",
-    "user",
-    "agent",
-    "participant",
-    "customer",
-    "client",
-    "employee name",
-    "name",
-    "created by",
-    "prepared by",
-}
 
 
-def _is_wrapper_prefixed(path: str) -> bool:
-    """Check if path starts with a wrapper prefix like grouped/, by-student/, etc."""
-    parts = path.strip("/").split("/")
-    if parts:
-        return parts[0].rstrip("s") in WRAPPER_PREFIXES or parts[0] in WRAPPER_PREFIXES
-    return False
+# ---------------------------------------------------------------------------
+# Generic organized-output prefix check
+# ---------------------------------------------------------------------------
 
-
-def _normalize_organized_path(target_path: str, output_mode: str = "workspace") -> str:
-    """Normalize organize output path to organized-output/files/ schema.
-
-    Strips wrapper prefixes like grouped/, by-student/, etc. and ensures
-    all paths are under organized-output/files/.
-    """
-    path = target_path.strip()
-    # Strip leading slash
-    if path.startswith("/"):
-        path = path[1:]
-    # Strip wrapper prefixes
-    while _is_wrapper_prefixed(path):
-        parts = path.strip("/").split("/", 1)
-        path = parts[1] if len(parts) > 1 else ""
-    # Add schema prefix
-    if not path.startswith(ORGANIZED_OUTPUT_ROOT):
-        path = ORGANIZED_OUTPUT_ROOT + path
-    return path
+ORGANIZED_OUTPUT_ROOT_PREFIX = "organized-output"
 
 
 def _is_under_organized_output(path: str) -> bool:
-    """Check if path is under organized-output/files/ schema."""
-    normalized = path.strip()
+    """Return True if ``path`` lives under ``organized-output/files/``.
+
+    No business-specific category or wrapper allowlist is consulted
+    here. The agent is dimension-agnostic; only the agent's own output
+    prefix is recognised.
+    """
+    normalized = (path or "").strip()
     if normalized.startswith("/"):
-        normalized = normalized[len(ORGANIZED_OUTPUT_ROOT):]
-    # Check if it's under organized-output/files/ or is a category-relative path
-    if normalized.startswith(ORGANIZED_OUTPUT_ROOT) or normalized == ORGANIZED_OUTPUT_ROOT.rstrip("/"):
-        return True
-    # Check if it's a category-relative path (students/, documents/, data/, etc.)
-    first_component = normalized.split("/")[0] if normalized else ""
-    return first_component in VALID_CATEGORIES
+        normalized = normalized[1:]
+    return normalized.startswith(ORGANIZED_OUTPUT_ROOT_PREFIX + "/")
+
+
+def _ensure_organized_output_prefix(target_path: str) -> str:
+    """Ensure ``target_path`` lives under ``organized-output/files/``.
+
+    Pure prefix helper. Strips a leading slash, then prepends the
+    ``organized-output/files/`` schema prefix if it is not already
+    present. No business-specific category or wrapper allowlist is
+    consulted — bucket names are an artefact of the dimension tool.
+    """
+    path = (target_path or "").strip()
+    if path.startswith("/"):
+        path = path[1:]
+    if not path.startswith(ORGANIZED_OUTPUT_ROOT):
+        path = ORGANIZED_OUTPUT_ROOT + path
+    return path
 
 
 def _categorize_extension(ext: str) -> str:
@@ -437,44 +412,6 @@ def _extract_labeled_fields(lines: list[str]) -> list[dict[str, str]]:
         if len(fields) >= 8:
             break
     return fields
-
-
-def _clean_entity_candidate(value: str) -> str:
-    candidate = re.sub(r"^[>\-#\s]+", "", value).strip()
-    candidate = re.sub(r"\s+", " ", candidate)
-    lowered = candidate.lower()
-    for prefix in sorted(IDENTITY_PREFIXES, key=len, reverse=True):
-        if lowered.startswith(prefix + " "):
-            return candidate[len(prefix):].strip(" :-")
-    return candidate.strip(" :-")
-
-
-def _looks_like_person_name(value: str) -> bool:
-    tokens = re.findall(r"[A-Za-z][A-Za-z'._-]*", value)
-    if not tokens or len(tokens) > 4:
-        return False
-    return all(token[:1].isupper() for token in tokens if token)
-
-
-def _extract_primary_entity(lines: list[str], headings: list[str], labeled_fields: list[dict[str, str]]) -> tuple[str | None, str | None, str]:
-    for line in lines[:20]:
-        stripped = line.strip()
-        for prefix in sorted(IDENTITY_PREFIXES, key=len, reverse=True):
-            marker = prefix.title()
-            if stripped.lower().startswith((">>> " + prefix + " ", prefix + " ")):
-                candidate = _clean_entity_candidate(
-                    stripped.split(">>>", 1)[-1].strip() if stripped.startswith(">>>") else stripped
-                )
-                if candidate.lower().startswith(prefix + " "):
-                    candidate = candidate[len(prefix):].strip(" :-")
-                if candidate:
-                    return candidate, "explicit_heading", "high"
-    for field in labeled_fields:
-        candidate = _clean_entity_candidate(field["value"])
-        label = field["label"].strip().lower()
-        if label in IDENTITY_PREFIXES and candidate:
-            return candidate, "labeled_field", "high"
-    return None, None, "none"
 
 
 def _read_text_preview(path: str, max_chars: int = 1200) -> str:
@@ -664,20 +601,7 @@ def _build_file_metadata(root: str, full_path: str) -> dict[str, object]:
     lines = preview.splitlines()
     headings = _extract_prominent_headings(lines)
     labeled_fields = _extract_labeled_fields(lines)
-    primary_entity, primary_entity_source, primary_entity_confidence = _extract_primary_entity(
-        lines,
-        headings,
-        labeled_fields,
-    )
     inferred_date_bucket = _infer_date_bucket(root, rel_path, preview)
-    relative_stem = rel_path.replace(os.sep, "-")
-    suggested_destination = None
-    if primary_entity and inferred_date_bucket:
-        suggested_destination = (
-            f"{_safe_path_segment(primary_entity)}/"
-            f"{inferred_date_bucket}/"
-            f"{relative_stem}"
-        )
     return {
         "relative_path": rel_path,
         "name": os.path.basename(full_path),
@@ -687,12 +611,8 @@ def _build_file_metadata(root: str, full_path: str) -> dict[str, object]:
         "parent_dirs": list(Path(rel_path).parts[:-1]),
         "suggested_reader_tool": _suggested_reader_tool(ext),
         "inferred_date_bucket": inferred_date_bucket,
-        "primary_entity": primary_entity,
-        "primary_entity_source": primary_entity_source,
-        "primary_entity_confidence": primary_entity_confidence,
         "prominent_headings": headings[:2],
         "labeled_fields": labeled_fields[:2],
-        "suggested_destination": suggested_destination,
     }
 
 
@@ -1399,23 +1319,12 @@ date buckets, and suggested reader tools. Use this before planning organize_move
 
         try:
             files, groups, total_dirs = collect_organize_file_inventory(normalized)
-            entity_counts: dict[str, int] = {}
-            date_bucket_counts: dict[str, int] = {}
-            for item in files:
-                entity = str(item.get("primary_entity") or "").strip()
-                if entity:
-                    entity_counts[entity] = entity_counts.get(entity, 0) + 1
-                date_bucket = str(item.get("inferred_date_bucket") or "").strip()
-                if date_bucket:
-                    date_bucket_counts[date_bucket] = date_bucket_counts.get(date_bucket, 0) + 1
             return ToolResult(output=json.dumps({
                 "path": normalized,
                 "groups": groups,
                 "files": files,
                 "total_files": len(files),
                 "total_dirs": total_dirs,
-                "entity_counts": entity_counts,
-                "date_bucket_counts": date_bucket_counts,
                 "errors": [],
             }))
         except Exception as exc:
@@ -1453,16 +1362,13 @@ Use organize_folder tool first to survey the folder, then organize_execute_plan 
         if action not in self.ALLOWED_ACTIONS:
             return ToolResult(output="", error=f"organize_move_file: action {action!r} not allowed. Allowed: {self.ALLOWED_ACTIONS}")
 
-        if not os.path.isabs(dst) and _is_wrapper_prefixed(dst):
-            return ToolResult(output="", error=f"organize_move_file: destination {dst!r} is outside the organized-output/files/ schema (wrapper prefix not allowed)")
-
         # Validate destination path
         if output_mode == "inplace":
             if not allow_inplace:
                 return ToolResult(output="", error="organize_move_file: inplace writes not enabled. Set OFFICE_ALLOW_INPLACE_WRITES=true")
             raw_dst = dst
             if not os.path.isabs(raw_dst):
-                raw_dst = os.path.join(source_root, _normalize_organized_path(raw_dst))
+                raw_dst = os.path.join(source_root, _ensure_organized_output_prefix(raw_dst))
             dst_normalized, err = _validate_path(raw_dst)
             if err:
                 return ToolResult(output="", error=f"organize_move_file: destination {err}")
@@ -1473,9 +1379,9 @@ Use organize_folder tool first to survey the folder, then organize_execute_plan 
                 if not dst.startswith(workspace_root):
                     return ToolResult(output="", error=f"organize_move_file: destination {dst!r} is outside OFFICE_WORKSPACE_ROOT")
                 rel_dst = os.path.relpath(dst, workspace_root)
-                raw_dst = os.path.join(workspace_root, _normalize_organized_path(rel_dst))
+                raw_dst = os.path.join(workspace_root, _ensure_organized_output_prefix(rel_dst))
             else:
-                raw_dst = os.path.join(workspace_root, _normalize_organized_path(dst))
+                raw_dst = os.path.join(workspace_root, _ensure_organized_output_prefix(dst))
             dst_normalized, err = _validate_workspace_path(raw_dst)
             if err:
                 return ToolResult(output="", error=f"organize_move_file: destination {err}")
@@ -1492,27 +1398,11 @@ Use organize_folder tool first to survey the folder, then organize_execute_plan 
             src_normalized = ""
 
         if action == "copy_file" and src_normalized:
-            try:
-                metadata_root = _metadata_root_for_path(src_normalized)
-                source_metadata = _build_file_metadata(metadata_root, src_normalized)
-            except Exception:
-                source_metadata = {}
-            expected_entity = _safe_path_segment(str(source_metadata.get("primary_entity") or ""))
-            expected_date = str(source_metadata.get("inferred_date_bucket") or "")
-            expected_filename = str(source_metadata.get("relative_path") or "").replace(os.sep, "-")
-            confidence = str(source_metadata.get("primary_entity_confidence") or "")
-            if confidence == "high" and expected_entity and expected_date and expected_filename:
-                dst_parts = Path(dst_normalized).parts
-                tail = list(dst_parts[-3:]) if len(dst_parts) >= 3 else list(dst_parts)
-                expected_tail = [expected_entity, expected_date, expected_filename]
-                if tail != expected_tail:
-                    return ToolResult(
-                        output="",
-                        error=(
-                            "organize_move_file: destination does not match high-confidence source metadata. "
-                            f"Expected tail {'/'.join(expected_tail)!r}, got {'/'.join(tail)!r}"
-                        ),
-                    )
+            # The destination contract is enforced by the plan-output gate
+            # and the dimension tool. We no longer require the destination
+            # to match an inferred primary entity, because the organize
+            # capability is dimension-agnostic.
+            pass
 
         plan_path = os.path.join(workspace_root, "operations-plan.json") if workspace_root else ""
         if action == "copy_file" and src_normalized and plan_path and os.path.exists(plan_path):
@@ -1681,6 +1571,16 @@ class DeleteOutputFileTool(BaseTool):
 # Tool registration
 # ---------------------------------------------------------------------------
 
+from agents.office.organize_by_dimension import (
+    OrganizeBySizeTool,
+    OrganizeByTypeTool,
+    OrganizeByCreatedTimeTool,
+    OrganizeByModifiedTimeTool,
+    OrganizeByAccessedTimeTool,
+    OrganizeByFilenameTool,
+)
+
+
 _OFFICE_TOOLS = [
     ReadPdfTool(),
     ReadDocxTool(),
@@ -1695,6 +1595,12 @@ _OFFICE_TOOLS = [
     OrganizeFolderTool(),
     OrganizeMoveFileTool(),
     DeleteOutputFileTool(),
+    OrganizeBySizeTool(),
+    OrganizeByTypeTool(),
+    OrganizeByCreatedTimeTool(),
+    OrganizeByModifiedTimeTool(),
+    OrganizeByAccessedTimeTool(),
+    OrganizeByFilenameTool(),
 ]
 
 

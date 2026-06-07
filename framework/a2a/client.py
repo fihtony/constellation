@@ -142,6 +142,21 @@ class A2AClient:
         url = f"{base_url.rstrip('/')}/tasks/{task_id}/terminate"
         self._http_post(url, {})
 
+    async def send_cancel(
+        self,
+        base_url: str,
+        task_id: str,
+        reason: str = "",
+    ) -> dict:
+        """POST /tasks/{task_id}/cancel to cancel a task in any non-terminal state.
+
+        Returns the structured response from the child agent. Distinct
+        from ``send_terminate`` (which kills the child agent process);
+        cancel is task-scoped and idempotent.
+        """
+        url = f"{base_url.rstrip('/')}/tasks/{task_id}/cancel"
+        return self._http_post(url, {"reason": reason})
+
     # -- Internal helpers ---------------------------------------------------
 
     async def _discover(self, capability: str, registry_client: Any) -> str:

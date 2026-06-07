@@ -34,6 +34,7 @@ from agents.office.office_tools import (
     ReadXlsxTool,
     collect_organize_file_inventory,
 )
+from framework.office.dimensions import VALID_DIMENSIONS, parse_dimension
 from framework.devlog import _ts
 from framework.major_step import LIFECYCLE_DONE, LIFECYCLE_RUNNING, LIFECYCLE_WARNING
 from framework.office.plan_output_gate import (
@@ -244,6 +245,8 @@ def _expand_summarize_sources(paths: list[str]) -> list[str]:
 
 def receive_task(state: dict) -> dict:
     """Parse the incoming task message to extract capability, paths, and output mode."""
+    from agents.office.office_steps import check_office_cancel
+    check_office_cancel(state)
     user_text = state.get("user_request", "")
     metadata = state.get("_message_metadata", {}) or {}
 
@@ -299,6 +302,35 @@ def receive_task(state: dict) -> dict:
 
 def analyze_request(state: dict) -> dict:
     """Validate source paths and check permissions. Returns updated state or error."""
+    from agents.office.office_steps import check_office_cancel
+    check_office_cancel(state)
+    # --- Dimension gate (organize capability only) ---------------------
+    metadata = state.get("_message_metadata", {}) or {}
+    user_text = state.get("user_request", "")
+    capability = state.get("capability", "summarize")
+    dimension = ""
+    if capability == "organize":
+        dimension = parse_dimension(metadata, user_text)
+        if not dimension:
+            return {
+                "error": "missing_organize_dimension",
+                "needs_clarification": {
+                    "missing": "organizeGroupBy",
+                    "options": [
+                        {"id": d, "label": d.replace("_", " ")}
+                        for d in sorted(VALID_DIMENSIONS)
+                    ],
+                    "user_message": (
+                        "Office organize needs a grouping dimension. "
+                        "Available dimensions: "
+                        + ", ".join(sorted(VALID_DIMENSIONS))
+                        + "."
+                    ),
+                },
+                "workspace_root": _get_workspace_root(state),
+                "artifacts_dir": os.path.join(_get_workspace_root(state), "artifacts"),
+            }
+
     source_paths = state.get("source_paths", [])
     output_mode = state.get("output_mode", "workspace")
     capability = state.get("capability", "summarize")
@@ -393,13 +425,30 @@ def analyze_request(state: dict) -> dict:
                 **state,
                 "source_paths": source_paths,
                 "discovered_source_count": discovered_source_count,
-            }
+            },
+            lifecycle_state=LIFECYCLE_RUNNING,
+        )
+        office_steps.emit_received(
+            {
+                **state,
+                "source_paths": source_paths,
+                "discovered_source_count": discovered_source_count,
+            },
+            lifecycle_state=LIFECYCLE_DONE,
         )
         office_steps.emit_validating(
             {
                 **state,
                 "source_paths": validated_paths,
-            }
+            },
+            lifecycle_state=LIFECYCLE_RUNNING,
+        )
+        office_steps.emit_validating(
+            {
+                **state,
+                "source_paths": validated_paths,
+            },
+            lifecycle_state=LIFECYCLE_DONE,
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("emit_validating failed: %s", exc)
@@ -408,6 +457,7 @@ def analyze_request(state: dict) -> dict:
         "validated_paths": validated_paths,
         "workspace_root": workspace_root,
         "artifacts_dir": artifacts_dir,
+        "organize_dimension": dimension,
     }
 
 
@@ -605,13 +655,38 @@ def _run_bounded_folder_summarize(
     artifacts_dir: str,
     system_prompt: str,
 ) -> AgenticResult:
+    from agents.office import office_steps as _steps
+
     summary_docs: list[dict[str, str]] = []
+    summary_outputs: list[dict[str, str]] = []
     expected_outputs = _expected_output_paths("summarize", validated_paths, output_mode, artifacts_dir)
     cwd = state.get("workspace_root") or (os.path.dirname(validated_paths[0]) if validated_paths else None)
     plugin_manager = state.get("_plugin_manager")
+    payloads: list[dict[str, Any]] = []
 
     for path in validated_paths:
         payload = _read_summary_payload(path)
+        payloads.append(payload)
+    try:
+        _steps.emit_executing_capability(
+            {
+                **state,
+                "validated_paths": validated_paths,
+                "lifecycle_state": LIFECYCLE_DONE,
+            }
+        )
+        _steps.emit_summarizing(
+            {
+                **state,
+                "validated_paths": validated_paths,
+            },
+            lifecycle_state=LIFECYCLE_RUNNING,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bounded summarize timeline start failed: %s", exc)
+
+    for payload in payloads:
+        path = str(payload["source_path"])
         summary_text = _summarize_payload_with_runtime(
             runtime,
             path=path,
@@ -620,8 +695,13 @@ def _run_bounded_folder_summarize(
             cwd=cwd,
             plugin_manager=plugin_manager,
         )
-        output_path = _target_output_path(output_mode, path, artifacts_dir, ".summary.md")
-        _write_text_file(output_path, summary_text)
+        summary_outputs.append(
+            {
+                "path": path,
+                "output_path": _target_output_path(output_mode, path, artifacts_dir, ".summary.md"),
+                "summary_text": summary_text,
+            }
+        )
         summary_docs.append(
             {
                 "name": os.path.basename(path),
@@ -629,9 +709,65 @@ def _run_bounded_folder_summarize(
             }
         )
 
+    combined_path = ""
+    combined_text = ""
+    try:
+        _steps.emit_summarizing(
+            {
+                **state,
+                "validated_paths": validated_paths,
+            },
+            lifecycle_state=LIFECYCLE_DONE,
+        )
+        if len(validated_paths) > 1:
+            _steps.emit_combining(
+                {
+                    **state,
+                    "validated_paths": validated_paths,
+                },
+                lifecycle_state=LIFECYCLE_RUNNING,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bounded summarize timeline mid-phase failed: %s", exc)
+
     if len(validated_paths) > 1 and validated_paths:
         combined_path = _target_output_file(output_mode, validated_paths[0], artifacts_dir, "combined-summary.md")
-        _write_text_file(combined_path, _build_combined_summary_text(summary_docs))
+        combined_text = _build_combined_summary_text(summary_docs)
+        try:
+            _steps.emit_combining(
+                {
+                    **state,
+                    "validated_paths": validated_paths,
+                },
+                lifecycle_state=LIFECYCLE_DONE,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("bounded summarize combining close failed: %s", exc)
+
+    try:
+        _steps.emit_writing(
+            state,
+            output_count=len(expected_outputs),
+            lifecycle_state=LIFECYCLE_RUNNING,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bounded summarize writing start failed: %s", exc)
+
+    for item in summary_outputs:
+        _write_text_file(item["output_path"], item["summary_text"])
+    if combined_path and combined_text:
+        _write_text_file(combined_path, combined_text)
+
+    try:
+        _steps.emit_writing(
+            state,
+            output_count=len(expected_outputs),
+            lifecycle_state=LIFECYCLE_DONE,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bounded summarize writing close failed: %s", exc)
+
+    state["_office_summary_phases_emitted"] = True
 
     summary = (
         f"Office summarized {len(validated_paths)} document(s) with the bounded folder workflow."
@@ -664,11 +800,11 @@ def _build_organization_plan_text(
     inventory: list[dict[str, Any]],
     output_root: str,
 ) -> str:
-    entity_counts: dict[str, int] = {}
+    category_counts: dict[str, int] = {}
     files_section: list[str] = []
     for item in inventory:
-        entity = _optional_safe_path_segment(item.get("primary_entity")) or "unclassified"
-        entity_counts[entity] = entity_counts.get(entity, 0) + 1
+        category = str(item.get("category") or "").strip() or "unclassified"
+        category_counts[category] = category_counts.get(category, 0) + 1
         src_rel = str(item.get("relative_path") or "")
         dst_rel = os.path.relpath(_canonical_organize_destination(output_root, item), output_root)
         files_section.append(f"| {src_rel} | {dst_rel} |")
@@ -678,9 +814,9 @@ def _build_organization_plan_text(
         "",
         "## Discovered Patterns",
         f"- Total source files: {len(inventory)}",
-        f"- Entity buckets discovered: {len(entity_counts)}",
+        f"- Extension buckets: {len(category_counts)}",
     ]
-    lines.extend(f"- {entity}: {count} file(s)" for entity, count in sorted(entity_counts.items()))
+    lines.extend(f"- {category}: {count} file(s)" for category, count in sorted(category_counts.items()))
     lines.extend(
         [
             "",
@@ -742,6 +878,274 @@ def _run_bounded_folder_organize(
         backend_used="bounded-folder-organize",
         evidence=[{"kind": "organize_inventory", "file_count": len(inventory)}],
     )
+
+
+# ---------------------------------------------------------------------------
+# Custom-dimension plan-then-execute path
+# ---------------------------------------------------------------------------
+
+
+def _parse_json_object(text: str) -> dict:
+    """Tolerantly extract the first JSON object from ``text``.
+
+    The LLM sometimes wraps the JSON in ```json fences or adds a
+    trailing sentence.  This helper is good enough for the planner
+    prompt's contract ("reply in JSON only") and never raises.
+    """
+    text = (text or "").strip()
+    if not text:
+        return {}
+    if text.startswith("```"):
+        # Strip leading ``` or ```json and the matching trailing fence.
+        end = text.rfind("```")
+        if end > 0:
+            inner = text[3:end]
+            if inner.startswith("json"):
+                inner = inner[4:]
+            text = inner.strip()
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except (ValueError, TypeError):
+                return {}
+    return {}
+
+
+def _run_custom_dimension_path(
+    *,
+    state: dict,
+    runtime: Any,
+    source: str,
+    output_root: str,
+    custom_hint: str,
+    approved_plan: dict,
+    custom_action: str,
+    custom_modify_note: str,
+    output_mode: str,
+    artifacts_dir: str,
+    validated_paths: list[str],
+) -> dict:
+    """Plan-then-execute flow for the ``__custom__`` dimension.
+
+    When ``approved_plan`` is empty: ask the LLM to produce a plan,
+    write it to ``custom-organize-plan.md``, and return an
+    INPUT_REQUIRED-shaped payload so the user can approve / modify.
+    When ``approved_plan`` is present: classify the remaining files
+    and materialize the layout under ``<output_root>/<bucket>/``.
+    """
+    import os as _os
+    from agents.office.organize_by_dimension import (
+        _build_planning_prompt,
+        _build_execution_prompt,
+        _read_sample_files,
+        _plan_published,
+    )
+
+    system_prompt = (
+        "You are the office organize planner.  The user has asked for "
+        "a custom grouping that none of the six built-in dimensions "
+        "(size / type / created_time / modified_time / accessed_time "
+        "/ filename) can express.  You read sample files, propose "
+        "buckets, and reply in JSON only — no prose around the JSON."
+    )
+
+    replan_requested = custom_action == "modify"
+
+    # ----- Phase 1: plan / revise -----
+    if not approved_plan or replan_requested:
+        if not custom_hint:
+            return {
+                "summary": "Office organize needs a custom dimension hint.",
+                "success": False,
+                "capability": "organize",
+                "status": "failed",
+                "error": "missing custom dimension hint",
+                "needs_clarification": {
+                    "missing": "organizeCustomHint",
+                    "user_message": (
+                        "Office needs a custom grouping hint, e.g. "
+                        "'student name' or 'subject'.  Please reply with "
+                        "the entity you want to group files by."
+                    ),
+                },
+            }
+        samples = _read_sample_files(source, max_files=5, max_chars=600)
+        planning_prompt = _build_planning_prompt(
+            custom_hint,
+            source,
+            samples,
+            existing_plan=approved_plan if replan_requested else None,
+            revision_note=custom_modify_note if replan_requested else "",
+        )
+        try:
+            response = runtime.run(
+                planning_prompt,
+                system_prompt=system_prompt,
+                max_tokens=1500,
+                cwd=state.get("workspace_root"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "summary": f"office custom planner failed: {exc}",
+                "success": False,
+                "capability": "organize",
+                "status": "failed",
+                "error": f"planner runtime error: {exc}",
+            }
+        raw = response.get("raw_response") or response.get("summary") or ""
+        plan = _parse_json_object(raw)
+        if not plan or not plan.get("buckets"):
+            return {
+                "summary": "office custom planner returned no buckets",
+                "success": False,
+                "capability": "organize",
+                "status": "failed",
+                "error": "planner produced no usable JSON plan",
+                "raw_output": raw,
+            }
+        plan_path = _plan_published(plan, source=source, output_root=output_root)
+        # Pause for user approval.  The state fields ``organize_dimension``
+        # and the inline ``plan`` let compass re-dispatch with the
+        # plan on approval.
+        draft_verb = "revised" if replan_requested else "drafted"
+        return {
+            "summary": (
+                f"Office {draft_verb} a custom organize plan for "
+                f"'{custom_hint}'.  Awaiting user approval."
+            ),
+            "success": False,  # not terminal — must wait for approval
+            "capability": "organize",
+            "status": "input-required",
+            "needs_clarification": {
+                "missing": "organizeCustomPlan",
+                "user_message": (
+                    f"Office {draft_verb} an organize plan for "
+                    f"**{custom_hint}**.  Review the plan at "
+                    f"`{plan_path}` and reply `approve` to execute, "
+                    "or `modify: <change>` to revise."
+                ),
+                "options": [
+                    {"id": "approve", "label": "Approve plan"},
+                    {"id": "modify", "label": "Modify plan"},
+                ],
+                "plan": plan,
+                "plan_path": plan_path,
+                "custom_hint": custom_hint,
+            },
+        }
+
+    # ----- Phase 2: execute -----
+    if not source or not _os.path.isdir(source):
+        return {
+            "summary": f"office custom execute: source missing: {source!r}",
+            "success": False,
+            "capability": "organize",
+            "status": "failed",
+            "error": f"source directory missing: {source!r}",
+        }
+    inventory, _, _ = collect_organize_file_inventory(source)
+    sample_paths = set((approved_plan.get("sample_mapping") or {}).keys())
+    remaining: list[dict] = []
+    for item in inventory:
+        rel = item.get("relative_path", "")
+        if rel in sample_paths:
+            continue
+        full = _os.path.join(source, rel)
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                excerpt = fh.read(200)
+        except OSError:
+            excerpt = ""
+        remaining.append({"path": rel, "excerpt": excerpt})
+    mapping: dict[str, str] = dict(approved_plan.get("sample_mapping") or {})
+    if remaining:
+        execution_prompt = _build_execution_prompt(custom_hint, approved_plan, remaining)
+        try:
+            response = runtime.run(
+                execution_prompt,
+                system_prompt=system_prompt,
+                max_tokens=4000,
+                cwd=state.get("workspace_root"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "summary": f"office custom executor failed: {exc}",
+                "success": False,
+                "capability": "organize",
+                "status": "failed",
+                "error": f"executor runtime error: {exc}",
+            }
+        raw = response.get("raw_response") or response.get("summary") or ""
+        exec_plan = _parse_json_object(raw)
+        mapping.update((exec_plan or {}).get("mapping") or {})
+
+    # Materialize files into bucket folders.
+    bucket_dirs: dict[str, str] = {}
+    plan_rows: list[dict[str, str]] = []
+    for item in inventory:
+        rel = item.get("relative_path", "")
+        bucket = str(mapping.get(rel) or "unmatched").strip() or "unmatched"
+        bucket_dir = bucket_dirs.get(bucket)
+        if not bucket_dir:
+            bucket_dir = _os.path.join(output_root, _safe_path_segment(bucket))
+            bucket_dirs[bucket] = bucket_dir
+            _os.makedirs(bucket_dir, exist_ok=True)
+        src_path = _os.path.realpath(_os.path.join(source, rel))
+        dst_path = _os.path.realpath(_os.path.join(bucket_dir, rel))
+        try:
+            _os.makedirs(_os.path.dirname(dst_path), exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+        except OSError as exc:  # noqa: BLE001
+            return {
+                "summary": f"office custom execute: copy failed: {exc}",
+                "success": False,
+                "capability": "organize",
+                "status": "failed",
+                "error": f"copy failed for {rel}: {exc}",
+            }
+        plan_rows.append({"source": rel, "bucket": bucket, "destination": _os.path.relpath(dst_path, output_root)})
+
+    # Write a final organization plan markdown for the audit trail.
+    plan_lines = [
+        f"# Folder Organization Plan (custom: {custom_hint})",
+        "",
+        f"**Source:** {source}",
+        f"**Output:** {output_root}",
+        f"**Mode:** {output_mode}",
+        "",
+        "## Buckets",
+        *[f"- {b}" for b in sorted(bucket_dirs)],
+        "",
+        "## Files Organized",
+        "| Source Path | Destination |",
+        "| --- | --- |",
+        *[f"| {row['source']} | {row['destination']} |" for row in plan_rows],
+        "",
+    ]
+    final_plan_path = _target_output_file(
+        output_mode,
+        source,
+        artifacts_dir,
+        "organization-plan.md",
+    )
+    _write_text_file(final_plan_path, "\n".join(plan_lines))
+    return {
+        "summary": (
+            f"Office organized {len(plan_rows)} file(s) with the custom "
+            f"dimension ({custom_hint})."
+        ),
+        "success": True,
+        "capability": "organize",
+        "status": "completed",
+        "raw_output": json.dumps({"plan_rows": plan_rows[:200], "buckets": sorted(bucket_dirs)}),
+        "expected_outputs": _expected_output_paths(
+            "organize", validated_paths, output_mode, artifacts_dir
+        ),
+    }
 
 
 def _try_bounded_office_flow(
@@ -1091,24 +1495,27 @@ def _optional_safe_path_segment(value: Any) -> str:
 
 
 def _canonical_organize_destination(output_root: str, item: dict[str, Any]) -> str:
+    """Resolve a canonical destination for one source file.
+
+    Honours an explicit ``suggested_destination`` written by the bounded
+    dimension tool. Falls back to a single-bucket layout
+    ``<output_root>/<relative_path>`` when no suggestion is present.
+    Never invents a business-specific bucket (no entity / category /
+    date inference).
+    """
     suggested = str(item.get("suggested_destination") or "").strip()
     if suggested:
-        segments = [segment for segment in suggested.replace("\\", "/").split("/") if segment not in {"", ".", ".."}]
+        segments = [
+            seg
+            for seg in suggested.replace("\\", "/").split("/")
+            if seg not in {"", ".", ".."}
+        ]
         if segments:
             return os.path.realpath(os.path.join(output_root, *segments))
-
-    relative_stem = str(item.get("relative_path") or "").replace(os.sep, "-").replace("/", "-")
-    primary_entity = _optional_safe_path_segment(item.get("primary_entity"))
-    date_bucket = _optional_safe_path_segment(item.get("inferred_date_bucket"))
-    category = _optional_safe_path_segment(str(item.get("category") or "other").strip() or "other") or "other"
-
-    if primary_entity and date_bucket:
-        return os.path.realpath(os.path.join(output_root, primary_entity, date_bucket, relative_stem))
-    if primary_entity:
-        return os.path.realpath(os.path.join(output_root, primary_entity, relative_stem))
-    if date_bucket:
-        return os.path.realpath(os.path.join(output_root, date_bucket, relative_stem))
-    return os.path.realpath(os.path.join(output_root, category, relative_stem))
+    rel = str(item.get("relative_path") or "").strip()
+    if not rel:
+        return os.path.realpath(output_root)
+    return os.path.realpath(os.path.join(output_root, rel))
 
 
 def _verify_organize_materialization(output_mode: str, artifacts_dir: str, source_paths: list[str]) -> list[str]:
@@ -1254,6 +1661,8 @@ def _effective_agentic_budget(capability: str, validated_paths: list[str]) -> tu
 
 def execute_office_work(state: dict) -> dict:
     """ReAct core: call runtime.run_agentic() with office tools to do the actual work."""
+    from agents.office.office_steps import check_office_cancel
+    check_office_cancel(state)
     runtime = state.get("_runtime")
     if not runtime:
         return {"error": "No runtime configured"}
@@ -1287,8 +1696,84 @@ def execute_office_work(state: dict) -> dict:
     artifacts_dir = state.get("artifacts_dir", "")
     output_mode = state.get("output_mode", "workspace")
     source_root = os.environ.get("OFFICE_SOURCE_ROOT", "")
+    user_text = str(state.get("user_request") or "")
 
     if capability == "organize":
+        dimension = state.get("organize_dimension", "")
+        if dimension:
+            from agents.office.organize_by_dimension import run_dimension_tool
+            from framework.office.dimensions import (
+                CUSTOM_DIMENSION,
+                extract_custom_dimension_hint,
+            )
+            from agents.office.organize_by_dimension import (
+                _build_planning_prompt,
+                _build_execution_prompt,
+                _read_sample_files,
+                _plan_published,
+            )
+            output_root = _organized_output_root(output_mode, artifacts_dir, validated_paths)
+            source_root = validated_paths[0] if validated_paths else ""
+
+            if dimension == CUSTOM_DIMENSION:
+                # Custom-dimension path: the LLM produces a plan, the
+                # user approves it, and only then does office execute
+                # the layout.  This branch owns the entire
+                # plan-then-execute flow.
+                custom_hint = str(
+                    state.get("organize_custom_hint")
+                    or (state.get("_message_metadata") or {}).get("customDimensionHint")
+                    or extract_custom_dimension_hint(user_text)
+                    or ""
+                ).strip()
+                approved_plan = state.get("organize_custom_plan") or {}
+                custom_action = str(
+                    state.get("organize_custom_action") or ""
+                ).strip()
+                custom_modify_note = str(
+                    state.get("organize_custom_modify_note") or ""
+                ).strip()
+                return _run_custom_dimension_path(
+                    state=state,
+                    runtime=runtime,
+                    source=source_root,
+                    output_root=output_root,
+                    custom_hint=custom_hint,
+                    approved_plan=approved_plan,
+                    custom_action=custom_action,
+                    custom_modify_note=custom_modify_note,
+                    output_mode=output_mode,
+                    artifacts_dir=artifacts_dir,
+                    validated_paths=validated_paths,
+                )
+            dim_result = run_dimension_tool(
+                dimension,
+                validated_paths[0] if validated_paths else "",
+                output_root,
+            )
+            if not dim_result.success:
+                return {
+                    "summary": f"office dimension tool failed: {dim_result.error}",
+                    "success": False,
+                    "capability": capability,
+                    "status": "failed",
+                    "raw_output": "",
+                    "warnings": [dim_result.error or "unknown dimension-tool error"],
+                    "error": dim_result.error,
+                }
+            return {
+                "summary": (
+                    f"Office organized files with the dimension tool "
+                    f"({dimension})."
+                ),
+                "success": True,
+                "capability": capability,
+                "status": "completed",
+                "raw_output": dim_result.output or "",
+                "expected_outputs": _expected_output_paths(
+                    capability, validated_paths, output_mode, artifacts_dir
+                ),
+            }
         prompt = _build_organize_prompt(validated_paths, output_mode, source_root)
     elif capability == "summarize":
         prompt = _build_summarize_prompt(validated_paths, output_mode, source_root)
@@ -1385,6 +1870,16 @@ def execute_office_work(state: dict) -> dict:
             _ensure_combined_summary_exact_filenames(validated_paths, output_mode, artifacts_dir)
         expected_outputs = _expected_output_paths(capability, validated_paths, output_mode, artifacts_dir)
         organize_file_count = 0
+        try:
+            from agents.office import office_steps
+
+            office_steps.emit_verifying(
+                state,
+                output_count=len(expected_outputs),
+                lifecycle_state=LIFECYCLE_RUNNING,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("office timeline verify-start failed: %s", exc)
         if capability == "organize":
             repaired_plan_path = _repair_missing_organize_plan_output(
                 validated_paths,
@@ -1408,6 +1903,16 @@ def execute_office_work(state: dict) -> dict:
             )
         if not delivery_ok:
             logger.error("execute_office_work: delivery verification failed: %s", "; ".join(delivery_errors))
+            try:
+                from agents.office import office_steps
+
+                office_steps.emit_verifying(
+                    state,
+                    output_count=len(expected_outputs),
+                    lifecycle_state=LIFECYCLE_WARNING,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("office timeline verify-warning failed: %s", exc)
             return {
                 "summary": (
                     "Agentic execution completed, but delivery verification failed.\n"
@@ -1425,24 +1930,26 @@ def execute_office_work(state: dict) -> dict:
         try:
             from agents.office import office_steps
 
-            office_steps.emit_capability_completion_rows(
-                {
-                    **state,
-                    "validated_paths": validated_paths,
-                    "organize_file_count": organize_file_count,
-                }
-            )
-            office_steps.emit_writing(
-                state,
-                output_count=len(expected_outputs),
-                file_count=organize_file_count,
-                lifecycle_state="done",
-            )
-            if capability == "organize":
-                office_steps.emit_writing_plan(state)
+            if not state.get("_office_summary_phases_emitted"):
+                office_steps.emit_capability_completion_rows(
+                    {
+                        **state,
+                        "validated_paths": validated_paths,
+                        "organize_file_count": organize_file_count,
+                    }
+                )
+                office_steps.emit_writing(
+                    state,
+                    output_count=len(expected_outputs),
+                    file_count=organize_file_count,
+                    lifecycle_state="done",
+                )
+                if capability == "organize":
+                    office_steps.emit_writing_plan(state)
             office_steps.emit_verifying(
                 state,
                 output_count=len(expected_outputs),
+                lifecycle_state=LIFECYCLE_DONE,
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("office timeline close-out failed: %s", exc)
@@ -1614,7 +2121,7 @@ def _build_organize_prompt(paths: list[str], output_mode: str, source_root: str)
         else
         "3. Write the organization plan using write_file tool to: {source_folder}/organization-plan.md"
     )
-    return f"""Analyze and organize the following folder(s):
+    return f"""Organize the following folder(s):
 
 {paths_list}
 
@@ -1622,45 +2129,42 @@ Source root: {source_root}
 Output mode: {output_mode}
 
 TASK:
-Your goal is to discover meaningful patterns in the file content and structure, then CREATE the organized folder structure in the workspace.
+The user has already chosen a grouping dimension for this task; that
+dimension is recorded in the task metadata. The dimension is one of:
+size, type, created_time, modified_time, accessed_time, filename.
+You MUST use the matching dimension tool to materialize the layout:
+
+- size            -> organize_by_size
+- type            -> organize_by_type
+- created_time    -> organize_by_created_time
+- modified_time   -> organize_by_modified_time
+- accessed_time   -> organize_by_accessed_time
+- filename        -> organize_by_filename
 
 WORKFLOW:
-1. Call organize_folder on each source folder first. Treat its recursive `files` inventory as the authoritative source list.
-2. Review the returned per-file metadata:
-   - Use `primary_entity`, `primary_entity_source`, `primary_entity_confidence`, `inferred_date_bucket`, `prominent_headings`, `labeled_fields`, `suggested_reader_tool`, and `suggested_destination`
-   - Use `entity_counts` and `date_bucket_counts` to sanity-check the overall distribution before copying
-   - If `primary_entity_confidence` is `high`, treat that identity as authoritative
-   - If metadata is ambiguous or missing, inspect representative files with the suggested reader tool
-   - Do NOT infer ownership from assignment titles, book titles, or topic headings
-3. Based on the discovered patterns, determine the BEST grouping strategy:
-   - Choose grouping criteria that meaningfully organizes the files
-   - Examples: by type, by date, by author, by status, by project, by topic, etc.
-4. EXECUTE the organization using organize_move_file tool:
-   - Use mkdir action to create directory structure under `organized-output/files/`
-   - Use copy_file action to copy files to their organized locations under `organized-output/files/`
-   - In workspace mode, pass category-relative destinations such as:
-     `entities/Entity_A/YYYY-MM/source-001.txt`
-     `entities/Entity_B/YYYY-MM/source-014.txt`
-     The tool will place them under `organized-output/files/`
-   - Write the organization plan using write_workspace tool with filename: organization-plan.md
+1. Read the dimension from the task metadata. NEVER invent a different
+   dimension. If the metadata does not name one, return a structured
+   needs_clarification error and stop.
+2. Call the matching `organize_by_*` tool. Pass the source folder and
+   the resolved output_root for `organized-output/files/`.
+3. The tool writes `organization-plan.md` and materializes the layout.
+{write_rules}
 
-CRITICAL: You must USE the organize_move_file tool to actually create the organized folder structure. Do not just write a plan - execute it.
-CRITICAL: A plan-only answer is a failure. The task is complete only if files exist under `organized-output/files/`.
-CRITICAL: Every non-hidden source file from `organize_folder.files` must be copied exactly once. Do not duplicate a source file into multiple destinations.
-CRITICAL: When `primary_entity` or `inferred_date_bucket` is present in the organize_folder metadata, use it in the destination path unless a file inspection proves it is wrong.
-CRITICAL: Never reference or copy a source path that is not present in `organize_folder.files`.
-CRITICAL: If `suggested_destination` is present for a file, use that exact relative destination unless a direct file inspection proves it is wrong.
-CRITICAL: Your final response and the contents of `organization-plan.md` must be in English only.
+CRITICAL: You must USE the dimension tool to actually create the
+organized folder structure. Do not just write a plan - execute it.
+CRITICAL: A plan-only answer is a failure. The task is complete only
+if files exist under `organized-output/files/`.
+CRITICAL: Every non-hidden source file must be copied exactly once.
+Do not duplicate a source file into multiple destinations.
+CRITICAL: Bucket names come from the dimension tool's output; do not
+introduce business-specific folder names (e.g. "students", "by-entity").
 
 OUTPUT FORMAT:
 Write a summary to organization-plan.md explaining:
-# Folder Organization Plan
+# Folder Organization Plan (dimension: <dimension>)
 
-## Discovered Patterns
-What patterns you found in the files.
-
-## Organized Structure Created
-Show the actual directory structure you created under `organized-output/files/`.
+## Bucket rules
+The dimension tool's bucket definitions and thresholds.
 
 ## Files Organized
 MUST include one canonical Markdown table with exactly these two columns:
@@ -1668,11 +2172,12 @@ MUST include one canonical Markdown table with exactly these two columns:
 | --- | --- |
 
 Rules for this table:
-- Include exactly one row per non-hidden source file discovered by `organize_folder.files`
+- Include exactly one row per non-hidden source file
 - `Source Path` must be the source file path relative to the validated source folder
 - `Destination` must be the final relative path under `organized-output/files/`
 - This table is the authoritative plan-output contract used for validation
-- You may add optional explanatory subsections after the canonical table, but do not replace or omit the canonical table
+- You may add optional explanatory subsections after the canonical table,
+  but do not replace or omit the canonical table
 """
 
 
@@ -1682,6 +2187,8 @@ Rules for this table:
 
 def report_result(state: dict) -> dict:
     """Write pr-evidence.json, warnings.md (if partial failures), and return final result."""
+    from agents.office.office_steps import check_office_cancel
+    check_office_cancel(state)
     import time
     workspace_root = state.get("workspace_root", "")
     capability = state.get("capability", "summarize")
@@ -2204,7 +2711,11 @@ def _run_gate_retry_loop(
             )
 
         # Re-run the gate.
-        report = _run_gate(contract)
+        report = _run_gate(
+            contract,
+            expanded_file_list=state.get("expanded_file_list", validated_paths),
+            validated_source_roots=state.get("validated_source_roots", validated_paths),
+        )
         # If the plan is missing after retry, record that explicitly.
         if report.plan_status == "missing":
             report = GateReport(
@@ -2338,7 +2849,11 @@ def _run_plan_output_gate(state: dict, *, runtime) -> GateReport:
         summary_template="Office is validating the materialized output against the declared plan.",
         summary_facts={"plan_status": "running", "round": 0},
     )
-    report = _run_gate(contract)
+    report = _run_gate(
+        contract,
+        expanded_file_list=state.get("expanded_file_list", validated_paths),
+        validated_source_roots=state.get("validated_source_roots", validated_paths),
+    )
     if report.is_clean:
         _steps.emit_validating_plan_output(
             state,

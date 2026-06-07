@@ -48,6 +48,14 @@ All outputs must contain:
 - Result content (summary/analysis/organization plan)
 - Assumptions and confidence limits
 
+## Organize Dimension Contract
+
+The `organize` capability is dimension-driven. The grouping dimension
+must come from the user (via `metadata.organizeGroupBy` or a generic
+keyword in the request). The agent MUST NOT invent a dimension. If
+neither source supplies a recognized dimension, the agent must return
+a structured `needs_clarification` payload and stop.
+
 ## Path Validation
 
 All paths must be under OFFICE_SOURCE_ROOT. If a path is outside, return an error.

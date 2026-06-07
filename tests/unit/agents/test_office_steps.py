@@ -1,6 +1,7 @@
 """Unit tests for proposal-aligned Office major-step helpers."""
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from agents.office import office_steps
@@ -89,3 +90,62 @@ def test_emit_verifying_records_done_verification_row():
     row = state["_task_store"].get_task("task-x").metadata["major_step_rows"]["office.verifying#0"]
     assert row["lifecycle_state"] == "done"
     assert row["summary_facts"]["output_count"] == 3
+
+
+def test_execute_office_work_emits_live_summary_phase_transitions(tmp_path):
+    from agents.office.nodes import execute_office_work
+
+    source_a = tmp_path / "a.txt"
+    source_b = tmp_path / "b.txt"
+    source_a.write_text("Alpha document", encoding="utf-8")
+    source_b.write_text("Beta document", encoding="utf-8")
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+
+    class _Runtime:
+        def run(self, *args, **kwargs):
+            filename = Path(kwargs.get("cwd") or "").name
+            text = (
+                "# Summary: file\n\n"
+                "## Document Info\n"
+                "- Type: TXT\n\n"
+                "## Key Points\n"
+                "- point\n\n"
+                "## Executive Summary\n"
+                "Short summary.\n"
+            )
+            return {"summary": text, "raw_response": text}
+
+    state = {
+        "_task_id": "task-x",
+        "_task_store": _Store(),
+        "_runtime": _Runtime(),
+        "capability": "summarize",
+        "output_mode": "workspace",
+        "source_paths": [str(source_a), str(source_b)],
+        "validated_paths": [str(source_a), str(source_b)],
+        "artifacts_dir": str(artifacts_dir),
+        "workspace_root": str(tmp_path),
+    }
+
+    result = execute_office_work(state)
+
+    assert result["success"] is True
+    events = state["_task_store"].get_task("task-x").metadata["major_step_events"]
+
+    def _lifecycles(step_key: str) -> list[str]:
+        sequence = [
+            event["lifecycle_state"]
+            for event in events
+            if event["step_key"] == step_key
+        ]
+        deduped: list[str] = []
+        for item in sequence:
+            if not deduped or deduped[-1] != item:
+                deduped.append(item)
+        return deduped
+
+    assert _lifecycles("office.reading") == ["running", "done"]
+    assert _lifecycles("office.summarizing") == ["running", "done"]
+    assert _lifecycles("office.combining") == ["running", "done"]
+    assert _lifecycles("office.writing") == ["running", "done"]

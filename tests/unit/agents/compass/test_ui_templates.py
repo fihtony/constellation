@@ -119,22 +119,67 @@ class TestCompassUITemplates:
         assert "${minutes}m ${seconds}s" in html
         # Seconds-only branch: ``Zs``.
         assert "${seconds}s" in html
-        # Zero-duration rows are hidden (return empty string).
-        assert "if (totalSeconds === 0) return '';" in html
-        # Time Spent pill is hidden when duration is empty.
-        assert "durationLabel === ''" in html
+        # Zero-duration rows now render ``0s`` (Bug #62 fix).  The pill
+        # is no longer hidden — a sub-second row should still show its
+        # Time Spent value so the layout is consistent.
+        assert "if (totalSeconds === 0) return '0s';" in html
 
     def test_render_ui_keeps_collapsed_major_timeline_focus_row_visible(self):
         html = render_compass_ui()
         assert "const isFocusedRow = !expanded || (row.fired && visualClass === 'current');" in html
         assert "${isFocusedRow ? ' current' : ''}" in html
 
-    def test_render_ui_migrates_legacy_compass_received_row_to_done_when_later_steps_exist(self):
+    def test_render_ui_closes_non_pointer_running_rows_when_later_steps_exist(self):
+        # Development tasks like task-79f7f621ba59 can accumulate several
+        # stale ``current`` rows (``compass.dispatched`` → ``tl.received`` →
+        # ``wd.received``) while only the active pointer row should remain
+        # live. The renderer must therefore close any non-pointer running row
+        # once a later fired step exists, rather than relying on a small list
+        # of hard-coded step keys.
         html = render_compass_ui()
-        assert "const isLegacyCompassReceived = stepKey === 'compass.received';" in html
-        assert "const hasLaterFiredStep = ordered.some(candidate => candidate.key !== sik && candidate.fired && !candidate.ignored);" in html
+        assert "const pointerKey = (pickPointerRow(task) || {}).key || '';" in html
+        assert "const laterFiredSteps = ordered.slice(index + 1).filter(candidate => candidate.fired && !candidate.ignored);" in html
+        assert "const hasLaterFiredStep = laterFiredSteps.length > 0;" in html
+        assert "&& row.key !== pointerKey" in html
+        assert "const isStuckRunningRow =" in html
         assert "visualState = 'done';" in html
         assert "lifecycleState = 'done';" in html
+
+    def test_render_ui_fills_endedAt_for_stuck_running_rows(self):
+        # Bug task-03db89946011: stuck-running rows (e.g. ``office.received``
+        # that the office workflow never explicitly closed, or
+        # ``compass.asking_output_mode`` that the resume path never
+        # re-emitted as ``done``) used to leave ``endedAt`` null.  The
+        # Time Spent renderer then fell back to ``Date.now()`` and the
+        # counter ticked up forever on every refresh.  The fix: when
+        # ``isStuckRunningRow`` matches, the close-out must seed
+        # ``endedAt`` from the next later fired step's ``startedAt`` (or, as a
+        # last resort, ``task.updatedAt``) so the duration is frozen.
+        html = render_compass_ui()
+        assert "const nextStep = laterFiredSteps.find(candidate => candidate.startedAt);" in html
+        assert "endedAt = (nextStep && nextStep.startedAt) || (task.updatedAt || task.updated_at || '') || null;" in html
+        assert "return { ...row, visualState, lifecycleState, endedAt };" in html
+
+    def test_render_ui_does_not_use_Date_now_for_terminal_task_time_spent(self):
+        # Bug task-03db89946011 follow-up: even with the stuck-running
+        # close-out, the ``Time Spent`` pill must NEVER fall back to
+        # ``Date.now()`` for tasks in a terminal state.  Otherwise the
+        # "0s" rows on a fresh completion would tick up to "1s", "2s",
+        # ... every UI refresh.
+        html = render_compass_ui()
+        # The terminal-status guard is the canonical way to stop the
+        # ticker.  It checks the live task status kind and only allows
+        # ``Date.now()`` when the task is still non-terminal.
+        assert "const taskKind = String(taskStatusKind(task) || '').toLowerCase();" in html
+        assert "taskIsTerminal" in html
+        # The conditional path for terminal tasks uses task.updatedAt
+        # rather than Date.now() — both for the live row and as a
+        # general fallback.
+        assert "task.updatedAt || task.updated_at" in html
+        # The "current / warn row in a non-terminal task" branch is the
+        # only path that still uses Date.now() as a live counter; the
+        # terminal branch must not.
+        assert "(taskIsTerminal ? null : Date.now())" in html
 
     def test_render_ui_marks_skipped_skeleton_rows_as_done_when_later_steps_fired(self):
         # UI #3 fix: unfired skeleton rows that come BEFORE a later fired row
@@ -243,6 +288,23 @@ class TestCompassUITemplates:
         assert "Request submission in progress. Please wait for Compass to respond." in html
         assert "composerInput.placeholder = 'Submitting request...';" in html
         assert "composerInput.dataset.mode = 'disabled';" in html
+
+    def test_render_ui_never_opens_log_streams_for_optimistic_placeholder_tasks(self):
+        html = render_compass_ui()
+        assert "function isOptimisticTaskId(tid)" in html
+        assert "if (!tid || isOptimisticTaskId(tid) || !state.tasks[tid]) return;" in html
+        assert "&& !isOptimisticTaskId(state.selectedTaskId)" in html
+
+    def test_render_ui_closes_stale_log_streams_when_selection_changes(self):
+        html = render_compass_ui()
+        assert "function closeLogSubscription(tid)" in html
+        assert "function syncLogSubscriptions(activeTid)" in html
+        assert "Object.keys(state.logEventSources).forEach(tid => {" in html
+        assert "if (tid !== keepTid) closeLogSubscription(tid);" in html
+        assert "closeLogSubscription(optimisticId);" in html
+        assert "closeLogSubscription(taskId);" in html
+        assert "syncLogSubscriptions(state.selectedTaskId);" in html
+        assert "syncLogSubscriptions(tid);" in html
 
     def test_render_ui_recovers_when_create_request_submission_fails(self):
         html = render_compass_ui()

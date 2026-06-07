@@ -343,6 +343,7 @@ def test_execute_office_work_organize_folder_uses_bounded_materialization_flow(t
             "artifacts_dir": str(artifacts_dir),
             "workspace_root": str(workspace_root),
             "output_mode": "workspace",
+            "organize_dimension": "type",
             "_plugin_manager": None,
         }
         result = execute_office_work(state)
@@ -358,9 +359,9 @@ def test_execute_office_work_organize_folder_uses_bounded_materialization_flow(t
     assert result["success"] is True
     assert runtime.run_calls == []
     assert runtime.run_agentic_calls == []
-    assert (artifacts_dir / "organization-plan.md").exists()
+    assert (artifacts_dir / "organized-output" / "files" / "organization-plan.md").exists()
     assert organized_root.is_dir()
-    assert len(organized_files) == 2
+    assert len(organized_files) == 3  # 2 source files + the plan
 
 
 def test_report_result_writes_warnings_md(tmp_path):

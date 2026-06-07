@@ -40,7 +40,7 @@ def test_organize_move_file_mkdir(tmp_path):
     os.environ["OFFICE_SOURCE_ROOT"] = str(tmp_path)
     os.environ["OFFICE_WORKSPACE_ROOT"] = str(tmp_path)
 
-    target_dir = tmp_path / "organized-output" / "files" / "students" / "Ethan"
+    target_dir = tmp_path / "organized-output" / "files" / "bucket_a" / "asset_1"
     result = tool.execute_sync(action="mkdir", dst=str(target_dir))
 
     assert result.success, f"mkdir failed: {result.error}"
@@ -65,7 +65,7 @@ def test_organize_move_file_copy(tmp_path):
     os.environ["OFFICE_SOURCE_ROOT"] = str(tmp_path)
     os.environ["OFFICE_WORKSPACE_ROOT"] = str(tmp_path)
 
-    dst_file = tmp_path / "organized-output" / "files" / "students" / "Ethan" / "source.txt"
+    dst_file = tmp_path / "organized-output" / "files" / "bucket_a" / "asset_1" / "source.txt"
     result = tool.execute_sync(action="copy_file", src=str(src_file), dst=str(dst_file))
 
     assert result.success, f"copy_file failed: {result.error}"
@@ -104,8 +104,13 @@ def test_organize_move_file_write_text(tmp_path):
     os.environ.pop("OFFICE_WORKSPACE_ROOT", None)
 
 
-def test_organize_move_file_rejects_high_confidence_wrong_destination(tmp_path):
-    """High-confidence identity/date metadata should block an incorrect destination."""
+def test_organize_move_file_no_longer_blocks_on_identity_metadata(tmp_path):
+    """Block 2 dropped the high-confidence identity/date destination check.
+
+    The destination contract is now enforced by the plan-output gate
+    and the dimension tool. This test pins the new contract: an
+    arbitrary organized-output destination succeeds.
+    """
     from agents.office.office_tools import OrganizeMoveFileTool
 
     source_dir = tmp_path / "2026" / "0103"
@@ -119,11 +124,11 @@ def test_organize_move_file_rejects_high_confidence_wrong_destination(tmp_path):
     os.environ["OFFICE_SOURCE_ROOT"] = str(tmp_path / "2026")
     os.environ["OFFICE_WORKSPACE_ROOT"] = str(tmp_path / "workspace")
 
-    wrong_target = "Ethan/2026-01/0103-1.txt"
-    result = tool.execute_sync(action="copy_file", src=str(src_file), dst=wrong_target)
+    result = tool.execute_sync(action="copy_file", src=str(src_file), dst="Ethan/2026-01/0103-1.txt")
 
-    assert not result.success
-    assert "high-confidence source metadata" in result.error
+    # The destination gets the organized-output prefix prepended and is
+    # accepted regardless of the source's primary entity / date metadata.
+    assert result.success, result.error
 
     os.environ.pop("OFFICE_ALLOW_INPLACE_WRITES", None)
     os.environ.pop("OFFICE_OUTPUT_MODE", None)

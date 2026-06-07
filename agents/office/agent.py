@@ -123,10 +123,50 @@ office_definition = _build_office_definition()
 # OfficeAgent
 # ---------------------------------------------------------------------------
 
+class _CancelWorkflow(Exception):
+    """Raised inside the office workflow when the user requests a cancel.
+
+    The workflow thread catches this exception, marks the task CANCELLED
+    via :meth:`TaskStore.cancel_task`, and exits cleanly without
+    re-entering the post-workflow success path. Distinct from a normal
+    exception: a cancel is a deliberate termination, not a failure.
+    """
+
+
 class OfficeAgent(BaseAgent):
+    # task_id → ``threading.Event`` set by ``handle_task_cancel`` when the
+    # user requests a cancel. The office workflow thread polls this event
+    # between node invocations and raises ``_CancelWorkflow`` if it fires.
+    # Keying by task id lets the office run multiple workflows concurrently
+    # and only signal the one being cancelled.
+    _cancel_events: dict[str, threading.Event] = {}
+
     async def start(self) -> None:
         await super().start()
         register_office_tools()
+
+    async def handle_task_cancel(self, task_id: str, reason: str = "") -> dict:
+        """Signal an in-flight office workflow to stop.
+
+        Looks up the ``threading.Event`` registered for this task id by
+        :meth:`handle_message` and sets it. The workflow thread will
+        observe the signal at the next node boundary, raise
+        ``_CancelWorkflow``, and exit cleanly. Then we delegate to the
+        base implementation so the task store row is also transitioned to
+        ``CANCELLED``.
+        """
+        event = self._cancel_events.get(task_id)
+        if event is not None:
+            event.set()
+            _append_office_log(
+                task_id,
+                "office cancel signal delivered to in-flight workflow",
+                reason=reason,
+            )
+        # Always delegate to the base behavior so the task store row is
+        # transitioned to CANCELLED even if the workflow already exited
+        # (e.g. the cancel raced a normal completion).
+        return await super().handle_task_cancel(task_id, reason)
 
     async def handle_message(self, message: dict) -> dict:
         """Handle incoming A2A message.
@@ -232,6 +272,24 @@ class OfficeAgent(BaseAgent):
             "_message_metadata": dict(metadata),
             "_permission_engine": getattr(self, "_permission_engine", None),
         }
+        from framework.office.dimensions import (
+            extract_custom_dimension_hint as _extract_custom_dimension_hint,
+            parse_dimension as _parse_dimension,
+        )
+        # Custom-dimension plan-then-execute: read the approved
+        # plan + user action out of the A2A metadata so the office
+        # executor can skip the planning pass and run the LLM
+        # classification directly.
+        approved_plan = metadata.get("organizeCustomPlan") or {}
+        custom_action = str(metadata.get("organizeCustomAction") or "").strip()
+        custom_modify_note = str(
+            metadata.get("organizeCustomModifyNote") or ""
+        ).strip()
+        custom_hint = str(
+            metadata.get("customDimensionHint")
+            or _extract_custom_dimension_hint(user_text)
+            or ""
+        ).strip()
         state: dict[str, Any] = {
             "_task_id": canonical_task_id,
             "_compass_task_id": compass_task_id,
@@ -242,7 +300,16 @@ class OfficeAgent(BaseAgent):
             "source_paths": source_paths,
             "capability": capability or "summarize",
             "test_cycles": 0,
+            "organize_dimension": _parse_dimension(dict(metadata), user_text),
         }
+        if approved_plan:
+            state["organize_custom_plan"] = dict(approved_plan)
+        if custom_action:
+            state["organize_custom_action"] = custom_action
+        if custom_modify_note:
+            state["organize_custom_modify_note"] = custom_modify_note
+        if custom_hint:
+            state["organize_custom_hint"] = custom_hint
 
         # v0.8 timeline redesign: resolve a progress_sink so major-step
         # events flow into Compass's top-level task store. The sink is
@@ -282,6 +349,12 @@ class OfficeAgent(BaseAgent):
 
         # Run workflow in background thread
         def _run() -> None:
+            # Register a cancel event for this task id so
+            # ``handle_task_cancel`` can signal the workflow thread to
+            # stop. Removed on every exit path below.
+            cancel_event = OfficeAgent._cancel_events.setdefault(
+                canonical_task_id, threading.Event()
+            )
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
@@ -291,9 +364,81 @@ class OfficeAgent(BaseAgent):
                     timeout_seconds=3600,
                     ephemeral_state=ephemeral_state,
                 )
-                result = loop.run_until_complete(
-                    self._compiled_workflow.invoke(state, config)
-                )
+                # Surface the cancel event to the workflow state so the
+                # office nodes can poll it between major steps and raise
+                # ``_CancelWorkflow`` promptly. The base class does not
+                # need to know about it; this is purely a node-level
+                # contract.
+                state["_cancel_event"] = cancel_event
+                try:
+                    result = loop.run_until_complete(
+                        self._compiled_workflow.invoke(state, config)
+                    )
+                except _CancelWorkflow:
+                    # The user cancelled mid-flight. Mark the task as
+                    # CANCELLED and exit cleanly — do not call the
+                    # success / failure path. The base handle_task_cancel
+                    # already transitioned the store, but we re-assert
+                    # here in case the cancel raced the workflow start.
+                    _append_office_log(
+                        log_task_id,
+                        "office workflow cancelled by user",
+                        reason="cancelled by user",
+                    )
+                    try:
+                        task_store.cancel_task(
+                            canonical_task_id, "cancelled by user"
+                        )
+                    except Exception:
+                        pass
+                    if callback_url:
+                        try:
+                            _send_callback_input_required(
+                                callback_url,
+                                canonical_task_id,
+                                "Task cancelled by user",
+                            )
+                        except Exception:
+                            pass
+                    return
+
+                # Clarification round-trip: when the workflow surfaces a
+                # ``needs_clarification`` payload (e.g. organize capability
+                # without a grouping dimension), promote the task to
+                # ``TASK_STATE_INPUT_REQUIRED`` instead of failing it. The
+                # orchestrator (compass) reads the structured payload from
+                # ``task_store`` and re-prompts the user.
+                needs_clarification = result.get("needs_clarification")
+                if needs_clarification:
+                    user_message = str(
+                        needs_clarification.get("user_message")
+                        or "Office requires additional input before continuing."
+                    ).strip()
+                    try:
+                        task_store.pause_task(
+                            canonical_task_id,
+                            question=user_message,
+                            interrupt_metadata={
+                                "kind": "office_clarification",
+                                "needs_clarification": needs_clarification,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "office: pause_task for clarification failed: %s", exc
+                        )
+                    _append_office_log(
+                        log_task_id,
+                        "office task awaiting clarification",
+                        question=user_message,
+                        kind=str(needs_clarification.get("missing") or ""),
+                    )
+                    if callback_url:
+                        _send_callback_input_required(
+                            callback_url, canonical_task_id, user_message
+                        )
+                    return
+
                 artifacts = [
                     Artifact(
                         name="office-result",
@@ -329,6 +474,10 @@ class OfficeAgent(BaseAgent):
                 _append_office_log(log_task_id, "office workflow failed", level="ERROR", error=str(exc))
                 task_store.fail_task(canonical_task_id, str(exc))
             finally:
+                # Always drop the cancel event so a future task with the
+                # same id (none in practice, but defensive) does not
+                # inherit a stale signal.
+                OfficeAgent._cancel_events.pop(canonical_task_id, None)
                 loop.close()
 
         worker = threading.Thread(target=_run, daemon=True)
@@ -404,7 +553,32 @@ def _send_callback(callback_url: str, task_id: str, result: dict) -> None:
         pass
 
 
+def _send_callback_input_required(callback_url: str, task_id: str, question: str) -> None:
+    """Send an ``input-required`` callback to the orchestrator.
+
+    Mirrors :func:`_send_callback` but signals the ``input-required``
+    A2A state and surfaces the clarification question. The orchestrator
+    (compass) reads this state and re-prompts the user.
+    """
+    import urllib.request
+    payload = json.dumps({
+        "task_id": task_id,
+        "state": "input-required",
+        "question": question,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        callback_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            pass
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # In-process dispatch (overrides HTTP dispatch)
 # ---------------------------------------------------------------------------
-

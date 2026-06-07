@@ -149,6 +149,27 @@ class BaseAgent:
         """A2A ``GET /tasks/{id}`` handler."""
         raise NotImplementedError
 
+    async def handle_task_cancel(self, task_id: str, reason: str = "") -> dict:
+        """A2A ``POST /tasks/{id}/cancel`` handler.
+
+        Default implementation marks the local task CANCELLED via
+        :meth:`TaskStore.cancel_task`. Subclasses that own long-running
+        workflow threads (e.g. the office agent) should override this to
+        signal the in-flight thread to stop, then call the base behavior.
+
+        Returns a structured response that the A2A server forwards back
+        to the caller (e.g. compass forwarding a cancel to office).
+        """
+        task_store = self.services.task_store if self.services else None
+        if task_store is None:
+            return {"status": "error", "error": "no task_store"}
+        cancelled = task_store.cancel_task(task_id, reason or "cancelled by user")
+        return {
+            "status": "ok" if cancelled else "already_terminal",
+            "task_id": task_id,
+            "mode": "local_only",
+        }
+
     async def resume_task(self, task_id: str, resume_value: Any) -> dict:
         """Resume a task that was paused for user input.
 

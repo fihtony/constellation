@@ -409,6 +409,112 @@ class TestEndedAt:
             sik = f"compass.task_{terminal}#0"
             assert meta["major_step_rows"][sik]["ended_at"] is not None
 
+    def test_resume_path_emits_resuming_then_done_on_same_step_key(self):
+        # Bug task-03db89946011: the compass resume path emits
+        # ``compass.asking_output_mode#0`` three times in sequence —
+        # WAITING_FOR_USER (initial pause) → RESUMING (user reply received)
+        # → DONE (output location accepted). The RESUMING and DONE events
+        # must land on the SAME row so the row has a real ``ended_at`` and
+        # the timeline does not display a perpetually-running
+        # "Compass resuming after output location was selected" step.
+        store = _make_task_store()
+        record_major_step(
+            "task-x",
+            step_key="compass.asking_output_mode",
+            title="Compass asking for output location",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+            task_store=store,
+        )
+        record_major_step(
+            "task-x",
+            step_key="compass.asking_output_mode",
+            title="Compass resuming after output location was selected",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_RESUMING,
+            task_store=store,
+        )
+        record_major_step(
+            "task-x",
+            step_key="compass.asking_output_mode",
+            title="Compass accepted output location",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_facts={"output_mode": "workspace"},
+            task_store=store,
+        )
+        meta = store.get_task("task-x").metadata
+        rows = meta["major_step_rows"]
+        sik = "compass.asking_output_mode#0"
+        # All three events must collapse into a single row.
+        assert len(rows) == 1, rows
+        row = rows[sik]
+        # The terminal event wins: lifecycle_state, visual_state, ended_at
+        # must all reflect DONE. The intermediate RESUMING state must not
+        # leave the row stuck in current/running.
+        assert row["lifecycle_state"] == LIFECYCLE_DONE
+        assert row["visual_state"] == VISUAL_DONE
+        assert row["ended_at"] is not None
+        # The title from the terminal event is what the UI displays; this
+        # is intentional because the final state is the one the user
+        # cares about. The first two titles remain in the event log.
+        assert row["title"] == "Compass accepted output location"
+        events = meta["major_step_events"]
+        # All three events are recorded in the audit log.
+        title_sequence = [ev["title"] for ev in events if ev["step_instance_key"] == sik]
+        assert title_sequence == [
+            "Compass asking for output location",
+            "Compass resuming after output location was selected",
+            "Compass accepted output location",
+        ]
+
+    def test_late_resuming_event_cannot_reopen_finished_output_mode_step(self):
+        # task-200cbd9fa537 exposed an out-of-order duplicate where a late
+        # ``resuming`` event for ``compass.asking_output_mode#0`` arrived
+        # after the terminal ``done`` event. The row must stay finished
+        # instead of regressing back to the "resuming" title/state.
+        store = _make_task_store()
+        record_major_step(
+            "task-x",
+            step_key="compass.asking_output_mode",
+            title="Compass asking for output location",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+            task_store=store,
+        )
+        record_major_step(
+            "task-x",
+            step_key="compass.asking_output_mode",
+            title="Compass accepted output location",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_DONE,
+            summary_facts={"output_mode": "workspace"},
+            task_store=store,
+        )
+        record_major_step(
+            "task-x",
+            step_key="compass.asking_output_mode",
+            title="Compass resuming after output location was selected",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_RESUMING,
+            task_store=store,
+        )
+
+        meta = store.get_task("task-x").metadata
+        row = meta["major_step_rows"]["compass.asking_output_mode#0"]
+        assert row["lifecycle_state"] == LIFECYCLE_DONE
+        assert row["visual_state"] == VISUAL_DONE
+        assert row["title"] == "Compass accepted output location"
+        assert row["summary_facts"]["output_mode"] == "workspace"
+        late_events = [
+            ev
+            for ev in meta["major_step_events"]
+            if ev["step_instance_key"] == "compass.asking_output_mode#0"
+            and ev["title"] == "Compass resuming after output location was selected"
+        ]
+        assert len(late_events) == 1
+        assert late_events[0]["ignored_after_terminal"] is True
+
 
 # ---------------------------------------------------------------------------
 # Terminal protection
@@ -444,12 +550,68 @@ class TestTerminalProtection:
         assert len(late_events) == 1
         assert late_events[0]["ignored_after_terminal"] is True
 
+    def test_completed_intermediate_row_does_not_block_later_running_step(self):
+        store = _make_task_store()
+        record_major_step(
+            "task-x",
+            step_key="compass.dispatched",
+            title="Compass dispatching to Office Agent",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_DONE,
+            task_store=store,
+        )
+        record_major_step(
+            "task-x",
+            step_key="office.reading",
+            title="Office reading documents",
+            agent="office",
+            lifecycle_state=LIFECYCLE_RUNNING,
+            task_store=store,
+        )
+        meta = store.get_task("task-x").metadata
+        assert "office.reading#0" in meta["major_step_rows"]
+        office_row = meta["major_step_rows"]["office.reading#0"]
+        assert office_row["lifecycle_state"] == LIFECYCLE_RUNNING
+        late_events = [
+            e for e in meta["major_step_events"] if e.get("step_key") == "office.reading"
+        ]
+        assert len(late_events) == 1
+        assert not late_events[0].get("ignored_after_terminal")
+
 
 # ---------------------------------------------------------------------------
 # Pointer fields
 # ---------------------------------------------------------------------------
 
 class TestPointerFields:
+    def test_new_running_step_closes_previous_active_row(self):
+        store = _make_task_store()
+        record_major_step(
+            "task-x",
+            step_key="compass.dispatched",
+            title="Compass dispatching to Team Lead",
+            agent="compass",
+            lifecycle_state=LIFECYCLE_RUNNING,
+            task_store=store,
+        )
+        record_major_step(
+            "task-x",
+            step_key="tl.received",
+            title="Team Lead receiving dev task",
+            agent="team-lead",
+            lifecycle_state=LIFECYCLE_RUNNING,
+            task_store=store,
+        )
+
+        meta = store.get_task("task-x").metadata
+        dispatched = meta["major_step_rows"]["compass.dispatched#0"]
+        received = meta["major_step_rows"]["tl.received#0"]
+        assert dispatched["lifecycle_state"] == LIFECYCLE_DONE
+        assert dispatched["visual_state"] == VISUAL_DONE
+        assert dispatched["ended_at"] is not None
+        assert received["lifecycle_state"] == LIFECYCLE_RUNNING
+        assert meta["active_step_instance_key"] == "tl.received#0"
+
     def test_active_pointer_set_on_running(self):
         store = _make_task_store()
         record_major_step(
