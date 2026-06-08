@@ -1933,9 +1933,56 @@ async def request_revision(state: dict) -> dict:
                         file=ic.get("file", ""),
                         line=ic.get("line", 0),
                         error=str(inline_result.get("error")),
-                    )
+                        )
         except Exception as exc:
             print(f"[{_AGENT_ID}] Inline PR comments failed (non-critical): {exc}")
+
+        try:
+            residual_comments = [
+                c for c in comments[:10]
+                if not (c.get("file") and c.get("line"))
+            ]
+            if summary or residual_comments:
+                pr_comment_lines = ["Code review requested changes."]
+                if summary:
+                    pr_comment_lines.append("")
+                    pr_comment_lines.append(f"Summary: {summary}")
+                if residual_comments:
+                    pr_comment_lines.append("")
+                    pr_comment_lines.append("Additional review findings:")
+                    for comment in residual_comments[:5]:
+                        severity = str(comment.get("severity", "info")).upper()
+                        file_ref = str(comment.get("file") or "").strip()
+                        line_ref = comment.get("line")
+                        location = ""
+                        if file_ref and line_ref:
+                            location = f"{file_ref}:{line_ref} - "
+                        elif file_ref:
+                            location = f"{file_ref} - "
+                        pr_comment_lines.append(
+                            f"- [{severity}] {location}{str(comment.get('message', '')).strip()}"
+                        )
+                summary_result = _safe_json(
+                    tool_registry.execute_sync(
+                        "scm_add_pr_comment",
+                        {
+                            "repo_url": repo_url,
+                            "pr_number": pr_number,
+                            "comment": "\n".join(pr_comment_lines).strip(),
+                            "task_id": state.get("_task_id", ""),
+                        },
+                    ),
+                    {},
+                )
+                if isinstance(summary_result, dict) and summary_result.get("error"):
+                    log.warn(
+                        "summary PR comment failed",
+                        repo_url=repo_url,
+                        pr_number=pr_number,
+                        error=str(summary_result.get("error")),
+                    )
+        except Exception as exc:
+            print(f"[{_AGENT_ID}] Summary PR comment failed (non-critical): {exc}")
 
     return {
         "revision_feedback": revision_feedback,

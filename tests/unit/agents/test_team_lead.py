@@ -1425,6 +1425,50 @@ class TestDispatchDevAgentValidation:
         assert calls[2][0] == "scm_add_pr_inline_comment"
         assert calls[2][1]["file_path"] == "src/components/Hero.jsx"
 
+    async def test_request_revision_posts_summary_comment_for_unanchored_findings(self, monkeypatch):
+        from agents.team_lead.nodes import request_revision
+
+        calls = []
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                calls.append((name, args))
+                return json.dumps({"ok": True})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        await request_revision(
+            {
+                "_task_id": "task-team-lead",
+                "jira_key": "CSTL-2",
+                "pr_url": "https://github.com/example/repo/pull/9",
+                "pr_number": 9,
+                "repo_url": "https://github.com/example/repo",
+                "review_result": {
+                    "summary": "Fix blocking review findings",
+                    "comments": [
+                        {
+                            "severity": "high",
+                            "message": "Missing input validation on the request payload.",
+                            "file": "src/api/handler.py",
+                            "line": None,
+                        },
+                        {
+                            "severity": "medium",
+                            "message": "Add regression coverage for invalid payloads.",
+                        },
+                    ],
+                },
+            }
+        )
+
+        assert calls[0][0] == "jira_comment"
+        assert all(name != "scm_add_pr_inline_comment" for name, _args in calls[1:])
+        assert calls[1][0] == "scm_add_pr_comment"
+        assert "Code review requested changes." in calls[1][1]["comment"]
+        assert "src/api/handler.py - Missing input validation on the request payload." in calls[1][1]["comment"]
+        assert "Add regression coverage for invalid payloads." in calls[1][1]["comment"]
+
     def test_team_lead_inline_comment_tool_dispatches_via_a2a(self, monkeypatch):
         from agents.team_lead.tools import SCMAddPRInlineComment
 

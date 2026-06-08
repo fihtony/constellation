@@ -23,6 +23,7 @@ from framework.major_step import (
     LIFECYCLE_RUNNING,
     record_major_step,
 )
+from framework.review_contract import annotate_issue_blocking, issue_blocks_merge
 
 # Load own agent_id from config.yaml — single source of truth
 _AGENT_ID: str = _load_agent_cfg(
@@ -237,6 +238,73 @@ def _detect_large_changed_files(pr_diff: str, threshold: int = 2000) -> list[dic
     ]
 
 
+def _diff_anchor_lines(pr_diff: str) -> dict[str, int]:
+    """Return a best-effort right-side anchor line for each changed file.
+
+    The anchor is the first line on the new-file side of the diff hunk that can
+    accept a PR review comment. Prefer added lines, but fall back to context
+    lines when a hunk contains deletions only.
+    """
+    if not pr_diff:
+        return {}
+
+    anchors: dict[str, int] = {}
+    current_file = ""
+    new_line: int | None = None
+
+    for raw_line in pr_diff.splitlines():
+        if raw_line.startswith("diff --git "):
+            match = re.match(r"diff --git a/(.+?) b/(.+)", raw_line)
+            current_file = match.group(2) if match else ""
+            new_line = None
+            continue
+        if not current_file:
+            continue
+        if raw_line.startswith("@@"):
+            match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw_line)
+            new_line = int(match.group(1)) if match else None
+            continue
+        if new_line is None:
+            continue
+        if raw_line.startswith("+++"):
+            continue
+        if raw_line.startswith("+"):
+            anchors.setdefault(current_file, new_line)
+            new_line += 1
+            continue
+        if raw_line.startswith(" "):
+            anchors.setdefault(current_file, new_line)
+            new_line += 1
+            continue
+        if raw_line.startswith("-"):
+            continue
+
+    return anchors
+
+
+def _backfill_issue_locations(issues: list[dict[str, Any]], pr_diff: str) -> list[dict[str, Any]]:
+    """Normalize file/line metadata so downstream PR comments can anchor reliably."""
+    anchors = _diff_anchor_lines(pr_diff)
+    normalized: list[dict[str, Any]] = []
+
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        current = dict(issue)
+        file_path = str(current.get("file") or "").strip()
+        line = current.get("line")
+        if isinstance(line, str) and line.strip().isdigit():
+            line = int(line.strip())
+        if file_path and (line is None or line == ""):
+            anchor = anchors.get(file_path)
+            if anchor is not None:
+                current["line"] = anchor
+                current.setdefault("line_source", "diff_anchor")
+        normalized.append(current)
+
+    return normalized
+
+
 def _coerce_review_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -260,85 +328,8 @@ def _issues_with_source(issues: Any, source_phase: str) -> list[dict[str, Any]]:
     return tagged
 
 
-def _issue_text_blob(issue: dict[str, Any]) -> str:
-    parts = [
-        str(issue.get("message", "")),
-        str(issue.get("suggestion", "")),
-        str(issue.get("requirement", "")),
-        str(issue.get("category", "")),
-    ]
-    return " ".join(parts).strip().lower()
-
-
-def _is_design_fidelity_only_issue(issue: dict[str, Any]) -> bool:
-    text = _issue_text_blob(issue)
-    if not text:
-        return False
-
-    design_keywords = (
-        "design spec",
-        "design token",
-        "typography",
-        "font",
-        "color",
-        "background",
-        "spacing",
-        "layout",
-        "visual",
-        "text-primary",
-        "text-on-surface",
-        "bg-",
-        "tailwind",
-        "token",
-    )
-    functional_keywords = (
-        "cannot",
-        "unable",
-        "broken",
-        "fails",
-        "missing acceptance",
-        "missing requirement",
-        "user flow",
-        "redirect",
-        "submit",
-        "select",
-        "save",
-        "login",
-        "route",
-        "unusable",
-        "regression",
-        "does not render",
-    )
-
-    return any(keyword in text for keyword in design_keywords) and not any(
-        keyword in text for keyword in functional_keywords
-    )
-
-
 def _issue_blocks_merge(issue: dict[str, Any]) -> bool:
-    severity = str(issue.get("severity", "")).strip().lower()
-    if severity == "critical":
-        return True
-    if severity != "high":
-        return False
-
-    source_phase = str(issue.get("source_phase", "")).strip().lower()
-    if "blocking" in issue:
-        if source_phase == "requirements" and _is_design_fidelity_only_issue(issue):
-            return False
-        return _coerce_review_bool(issue.get("blocking"))
-
-    if source_phase in {"review-input", "security"}:
-        return True
-    if source_phase == "requirements":
-        return not _is_design_fidelity_only_issue(issue)
-    if source_phase == "ui-design":
-        return str(issue.get("category", "")).strip().lower() in {
-            "icon_rendering",
-            "footer_positioning",
-            "components",
-        }
-    return False
+    return issue_blocks_merge(issue)
 
 
 def _child_permissions(state: dict) -> dict[str, Any] | None:
@@ -1108,7 +1099,13 @@ async def generate_report(state: dict) -> dict:
     title = "Code Review reviewing revised PR" if review_round > 1 else "Code Review reviewing PR"
     step_round = max(review_round - 2, 0) if review_round > 1 else 0
 
-    all_comments = review_input_issues + quality + security + tests + requirements + ui_issues
+    all_comments = [
+        annotate_issue_blocking(issue)
+        for issue in _backfill_issue_locations(
+            review_input_issues + quality + security + tests + requirements + ui_issues,
+            state.get("pr_diff", ""),
+        )
+    ]
 
     # Count by severity
     critical = sum(1 for c in all_comments if c.get("severity") == "critical")
@@ -1116,7 +1113,7 @@ async def generate_report(state: dict) -> dict:
     medium = sum(1 for c in all_comments if c.get("severity") == "medium")
     low = sum(1 for c in all_comments if c.get("severity") == "low")
 
-    blocking_issues = [issue for issue in all_comments if _issue_blocks_merge(issue)]
+    blocking_issues = [issue for issue in all_comments if issue.get("effective_blocking") is True]
     blocking_critical = sum(1 for issue in blocking_issues if issue.get("severity") == "critical")
     blocking_high = sum(1 for issue in blocking_issues if issue.get("severity") == "high")
 
@@ -1126,34 +1123,34 @@ async def generate_report(state: dict) -> dict:
     manual_review_required = state.get("manual_review_required", False)
     diff_truncated = state.get("diff_truncated", False)
     if manual_review_required:
-        all_comments.append({
+        all_comments.append(annotate_issue_blocking({
             "severity": "high",
             "blocking": True,
             "source_phase": "review-process",
             "category": "review-process",
             "message": "PR exceeds 50 changed files — automatic review cannot provide reliable coverage. Manual review required.",
             "suggestion": "Split this PR into smaller, focused PRs or request human reviewer escalation.",
-        })
+        }))
         verdict = "rejected"
         high += 1
     if diff_truncated and not manual_review_required:
-        all_comments.append({
+        all_comments.append(annotate_issue_blocking({
             "severity": "medium",
             "category": "review-process",
             "message": "Diff was truncated (>100KB). Review focused on visible portion only.",
             "suggestion": "Consider splitting large changes for more thorough automated review.",
-        })
+        }))
         medium += 1
 
     large_changed_files = _detect_large_changed_files(state.get("pr_diff", ""))
     for entry in large_changed_files[:5]:
-        all_comments.append({
+        all_comments.append(annotate_issue_blocking({
             "severity": "low",
             "category": "large-change",
             "file": entry["file"],
             "message": f"Single-file change is very large ({entry['changed_lines']} changed lines).",
             "suggestion": "Split this file change into smaller logical steps when possible.",
-        })
+        }))
         low += 1
 
     # Validation gate: verify review report structure

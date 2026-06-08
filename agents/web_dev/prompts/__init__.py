@@ -5,6 +5,8 @@ Naming convention:
   <PURPOSE>_TEMPLATE  — user prompt template (f-string variables)
 """
 
+from framework.review_contract import REVIEW_ISSUE_SCHEMA
+
 # ---------------------------------------------------------------------------
 # setup_workspace — branch name generation
 # ---------------------------------------------------------------------------
@@ -676,9 +678,27 @@ Verify font families, primary colors, and spacing match the design spec.
 STEP 5 — ROUTING CHECK:
 Confirm the new page is wired into App.tsx. If not, add gap: "Blank screen: page not routed".
 
+STEP 6 — CODE-REVIEW STANDARD PARITY:
+Run the SAME merge-blocking standard used by the Code Review Agent across:
+- code quality and reliability
+- security
+- test coverage for changed critical paths
+- requirements coverage
+- UI fidelity for UI tasks
+
+If you find any issue that would likely cause Code Review to reject the PR,
+add it to "self_review_issues" using this exact schema:
+{review_issue_schema}
+
+Rules for "self_review_issues":
+- Include only review-blocking or likely-reject issues.
+- If "self_review_issues" is non-empty, set verdict to "fail".
+- If "self_review_issues" is non-empty, score MUST be below 0.9.
+- Each issue should include file and line when you can determine them from the changed files.
+
 SCORING RULES:
 - Score 0.9+ ONLY if ALL Jira acceptance criteria are met AND all design components
-  are present AND zero unauthorized extra elements exist.
+  are present AND zero unauthorized extra elements exist AND self_review_issues is empty.
 - If Jira requires search/filter (e.g. "searchable/filterable list") and design HTML
   does not show it — add the feature (it is Jira-required), do not flag as extra.
 - Missing design component → score reduced proportionally.
@@ -693,6 +713,9 @@ Return only valid JSON, no markdown fences:
   ],
   "component_checks": [
     {{"component": "<component name>", "status": "present" or "missing" or "incomplete" or "extra", "notes": "..."}}
+  ],
+  "self_review_issues": [
+    {{"severity": "high", "file": "src/App.tsx", "line": 42, "message": "...", "suggestion": "...", "blocking": true}}
   ],
   "gaps": ["specific gap 1 — name the element or criterion", "specific gap 2"],
   "summary": "brief overall assessment"
@@ -727,4 +750,3 @@ Previously changed files:
 
 Fix each gap. After all fixes, verify correctness by re-reading changed files.
 """
-

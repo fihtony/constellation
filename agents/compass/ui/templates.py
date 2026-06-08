@@ -1713,13 +1713,24 @@ _INLINE_JS = r"""
     return text.replace(/\{([a-zA-Z0-9_]+)\}/g, (_match, key) => escapeHtml(safeValue(subs[key])));
   }
   function pickPointerRow(task) {
-    // Per design doc §0.6: active → failed → terminal → last.
+    // Normal live tasks prefer active → failed → terminal → last. Once the
+    // task itself is terminal, the final terminal row becomes the canonical
+    // focus even if a historical failed row remains from a prior review/self-
+    // check loop.
     const rows = task.majorStepRows || {};
     const active = task.activeStepInstanceKey;
     const failed = task.failedStepInstanceKey;
     const terminal = task.terminalStepInstanceKey;
     const last = task.lastStepInstanceKey;
+    const taskKind = String(taskStatusKind(task) || '').toLowerCase();
+    const taskIsTerminal = (
+      taskKind === 'completed'
+      || taskKind === 'failed'
+      || taskKind === 'cancelled'
+      || taskKind === 'warning'
+    );
     if (active && rows[active]) return { key: active, row: rows[active] };
+    if (taskIsTerminal && terminal && rows[terminal]) return { key: terminal, row: rows[terminal] };
     if (failed && rows[failed]) return { key: failed, row: rows[failed] };
     if (terminal && rows[terminal]) return { key: terminal, row: rows[terminal] };
     if (last && rows[last]) return { key: last, row: rows[last] };

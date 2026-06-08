@@ -9,37 +9,9 @@ The array is empty when no issues are found.  The ``generate_report`` node
 is pure Python (no LLM) — it aggregates the issue arrays from all phases.
 """
 
-# Issue schema (for reference in all templates):
-#   {
-#     "severity": "critical" | "high" | "medium" | "low",
-#     "file":     "<filename or empty string>",
-#     "line":     <int or null>,
-#     "message":  "<description>",
-#     "suggestion": "<how to fix>"
-#   }
+from framework.review_contract import REVIEW_ISSUE_SCHEMA
 
-_ISSUE_SCHEMA = """\
-Return a JSON array of issue objects. Each object must have:
-- "severity": "critical" | "high" | "medium" | "low"
-- "file": filename (or "" if general)
-- "line": line number (integer or null)
-- "message": clear description of the issue
-- "suggestion": concrete fix recommendation
-
-Optional field:
-- "blocking": true | false
-
-Severity guidance:
-- critical: confirmed exploitable security issue, data loss/corruption risk, auth bypass, or a clear production-breaking defect.
-- high: serious issue likely to break a required user flow, violate a hard requirement, or leave a core UI/UX path unusable.
-- medium: meaningful but non-blocking issue that should be fixed soon.
-- low: minor issue, maintainability note, or non-blocking suggestion.
-
-Prefer medium over high for naming, maintainability, missing non-critical tests, duplication, or small UI fidelity gaps.
-Set "blocking": true only when the issue should stop merge/review approval.
-
-Return [] if no issues are found.
-Return ONLY the JSON array — no markdown fences, no prose."""
+_ISSUE_SCHEMA = REVIEW_ISSUE_SCHEMA
 
 # ---------------------------------------------------------------------------
 # review_quality
@@ -228,5 +200,3 @@ Add a "category" field to each issue indicating which category above applies
 (e.g. "icon_rendering", "footer_positioning", "typography", "colors", "spacing", "components").
 
 """ + _ISSUE_SCHEMA
-
-

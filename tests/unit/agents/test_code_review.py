@@ -758,7 +758,45 @@ class TestGenerateReport:
         }
         result = await generate_report(state)
         assert result["verdict"] == "rejected"
-        assert result["severity_levels"]["critical"] == 1
+
+    async def test_generate_report_backfills_missing_issue_line_from_diff(self):
+        result = await generate_report(
+            {
+                "review_round": 1,
+                "pr_diff": "\n".join(
+                    [
+                        "diff --git a/src/app.py b/src/app.py",
+                        "--- a/src/app.py",
+                        "+++ b/src/app.py",
+                        "@@ -10,0 +11,3 @@",
+                        "+def handler():",
+                        "+    return 1",
+                        "+",
+                    ]
+                ),
+                "quality_issues": [
+                    {
+                        "severity": "high",
+                        "blocking": True,
+                        "file": "src/app.py",
+                        "line": None,
+                        "message": "Handler returns a placeholder value.",
+                    }
+                ],
+                "security_issues": [],
+                "test_issues": [],
+                "requirement_gaps": [],
+                "ui_issues": [],
+                "review_input_issues": [],
+                "checked_artifacts": [],
+            }
+        )
+
+        assert result["verdict"] == "rejected"
+        assert result["comments"][0]["file"] == "src/app.py"
+        assert result["comments"][0]["line"] == 11
+        assert result["comments"][0]["line_source"] == "diff_anchor"
+        assert result["severity_levels"]["high"] == 1
 
     async def test_high_issue_rejected(self):
         state = {
@@ -810,6 +848,8 @@ class TestGenerateReport:
 
         assert result["verdict"] == "rejected"
         assert result["blocking_issue_count"] == 1
+        assert result["comments"][0]["blocking_requested"] is True
+        assert result["comments"][0]["effective_blocking"] is True
 
     async def test_high_requirement_design_issue_is_advisory(self):
         state = {
@@ -828,6 +868,9 @@ class TestGenerateReport:
 
         assert result["verdict"] == "approved"
         assert result["blocking_issue_count"] == 0
+        assert result["comments"][0]["blocking"] is True
+        assert result["comments"][0]["blocking_requested"] is True
+        assert result["comments"][0]["effective_blocking"] is False
 
     async def test_high_requirement_gap_without_design_only_still_blocks(self):
         state = {

@@ -5,7 +5,9 @@ Verifies the new structured-data renderer (Phase 3 of the redesign):
 - ``renderTemplate`` substitutes ``{name}`` placeholders from
   ``summary_facts`` and escapes user-provided free text.
 - ``pickMarkForVisualState`` returns the right glyph for each visual state.
-- ``pickPointerRow`` honors the §0.6 priority: active → failed → terminal → last.
+- ``pickPointerRow`` honors the §0.6 priority for live tasks
+  (active → failed → terminal → last) while terminal tasks focus the final
+  terminal row instead of a historical failed loop step.
 - ``deriveMajorTimeline`` returns ``null`` for legacy tasks with no
   ``major_step_rows`` so the caller can fall back to the generic renderer.
 - ``deriveMajorTimeline`` orders rows by ``major_step_skeleton`` insertion.
@@ -161,8 +163,12 @@ def _pick_pointer_row(task):
     failed = task.get("failedStepInstanceKey")
     terminal = task.get("terminalStepInstanceKey")
     last = task.get("lastStepInstanceKey")
+    task_kind = str(task.get("statusKind") or "").lower()
+    task_is_terminal = task_kind in {"completed", "failed", "cancelled", "warning"}
     if active and rows.get(active):
         return {"key": active, "row": rows[active]}
+    if task_is_terminal and terminal and rows.get(terminal):
+        return {"key": terminal, "row": rows[terminal]}
     if failed and rows.get(failed):
         return {"key": failed, "row": rows[failed]}
     if terminal and rows.get(terminal):
@@ -198,6 +204,20 @@ class TestPointerPriority:
             "lastStepInstanceKey": "wd.building#0",
         }
         assert _pick_pointer_row(task)["key"] == "wd.building#0"
+
+    def test_terminal_task_prefers_terminal_row_over_historical_failed_row(self):
+        task = {
+            "majorStepRows": {
+                "cr.reviewing#0": {"title": "Code Review reviewing PR"},
+                "compass.task_completed#0": {"title": "Task completed"},
+            },
+            "statusKind": "completed",
+            "activeStepInstanceKey": "",
+            "failedStepInstanceKey": "cr.reviewing#0",
+            "terminalStepInstanceKey": "compass.task_completed#0",
+            "lastStepInstanceKey": "compass.task_completed#0",
+        }
+        assert _pick_pointer_row(task)["key"] == "compass.task_completed#0"
 
     def test_terminal_used_when_no_active_or_failed(self):
         task = {

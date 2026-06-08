@@ -29,6 +29,7 @@ from framework.major_step import (
     LIFECYCLE_WARNING,
     record_major_step,
 )
+from framework.review_contract import REVIEW_ISSUE_SCHEMA, issue_blocks_merge
 
 # Load agent_id from config.yaml — single source of truth for identity
 _AGENT_ID: str = _load_agent_cfg(
@@ -228,22 +229,7 @@ def _review_comment_requires_fix(comment: dict[str, Any]) -> bool:
     if not _is_actionable_review_comment(comment):
         return False
 
-    try:
-        from agents.code_review.nodes import _issue_blocks_merge
-
-        return bool(_issue_blocks_merge(comment))
-    except Exception:
-        severity = str(comment.get("severity", "")).strip().lower()
-        if severity == "critical":
-            return True
-        if severity != "high":
-            return False
-
-        if str(comment.get("blocking", "")).strip().lower() in {"true", "1", "yes"}:
-            return True
-
-        source_phase = str(comment.get("source_phase", "")).strip().lower()
-        return source_phase in {"review-input", "security", "requirements"}
+    return bool(issue_blocks_merge(comment))
 
 
 def _git_worktree_changed_files(repo_path: str) -> list[str]:
@@ -1565,6 +1551,7 @@ async def self_assess(state: dict) -> dict:
         implementation_summary=str(state.get("implementation_summary", ""))[:1000],
         test_results=json.dumps(state.get("test_results", {}), ensure_ascii=False)[:500],
         changed_files="\n".join(changed_files_list) or "unknown",
+        review_issue_schema=REVIEW_ISSUE_SCHEMA,
     )
 
     # Inject coding standards for self-assessment evaluation
@@ -1632,6 +1619,7 @@ Return valid JSON only, and correct this validation feedback:
         data = parsed if isinstance(parsed, dict) else {}
         data.setdefault("criteria_checks", [])
         data.setdefault("component_checks", [])
+        data.setdefault("self_review_issues", [])
         data.setdefault("gaps", [])
         data.setdefault("summary", "")
 
@@ -1651,6 +1639,25 @@ Return valid JSON only, and correct this validation feedback:
         }
 
     deterministic_gaps: list[str] = []
+    self_review_issues = data.get("self_review_issues", [])
+    if not isinstance(self_review_issues, list):
+        self_review_issues = []
+        data["self_review_issues"] = self_review_issues
+    if self_review_issues:
+        for issue in self_review_issues:
+            if not isinstance(issue, dict):
+                continue
+            message = str(issue.get("message", "")).strip()
+            if not message:
+                continue
+            file_ref = str(issue.get("file") or "").strip()
+            line_ref = issue.get("line")
+            location = file_ref
+            if file_ref and line_ref:
+                location = f"{file_ref}:{line_ref}"
+            gap = f"{location} - {message}" if location else message
+            deterministic_gaps.append(gap)
+
     if _is_screenshot_required(state):
         icon_validation = _detect_fragile_icon_font_usage(state.get("repo_path", ""))
         deterministic_gaps.extend(icon_validation.get("issues") or [])

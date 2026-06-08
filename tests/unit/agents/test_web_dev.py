@@ -1,6 +1,7 @@
 """Tests for Web Dev Agent workflow."""
 import json
 import os
+from pathlib import Path
 import pytest
 from unittest.mock import MagicMock
 from framework.agent import AgentServices
@@ -108,6 +109,17 @@ class TestWebDevExecutionContract:
 
         assert result["task"]["status"]["state"] == "TASK_STATE_FAILED"
         assert "exceed local profile" in result["task"]["status"]["message"]["parts"][0]["text"]
+
+
+class TestWebDevBoundaries:
+
+    def test_web_dev_does_not_import_code_review_agent_modules(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        nodes_source = (repo_root / "agents" / "web_dev" / "nodes.py").read_text(encoding="utf-8")
+        prompts_source = (repo_root / "agents" / "web_dev" / "prompts" / "__init__.py").read_text(encoding="utf-8")
+
+        assert "from agents.code_review" not in nodes_source
+        assert "from agents.code_review" not in prompts_source
 
 
 class TestWebDevMajorSteps:
@@ -419,6 +431,51 @@ class TestScreenshotRenderChecks:
         assert result["assess_cycles"] == 1
         assert result["route"] == "pass"
         assert "previous self-assessment response was invalid" in runtime.prompts[1]
+
+    async def test_self_assess_fails_when_self_review_issues_exist(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 0.72,
+                            "verdict": "fail",
+                            "gaps": [],
+                            "component_checks": [],
+                            "criteria_checks": [],
+                            "self_review_issues": [
+                                {
+                                    "severity": "high",
+                                    "file": "src/app.py",
+                                    "line": 27,
+                                    "message": "Request payload is written without validation.",
+                                    "suggestion": "Validate the payload before persisting it.",
+                                    "blocking": True,
+                                }
+                            ],
+                            "summary": "Found a merge-blocking issue.",
+                        }
+                    )
+                }
+
+        state = {
+            "_runtime": _MockRuntime(),
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/app.py"],
+            "implementation_summary": "Updated the request handler.",
+            "test_results": {"passed": 4, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        assert result["route"] == "fail"
+        assert result["self_assessment"]["verdict"] == "fail"
+        assert "src/app.py:27 - Request payload is written without validation." in result["self_assessment"]["gaps"]
 
     async def test_self_assess_filters_non_actionable_review_comments(self, tmp_path):
         repo_path = tmp_path / "repo"

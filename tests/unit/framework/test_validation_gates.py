@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 
-from framework.validation_gates import validate_files_changed
+from framework.validation_gates import validate_files_changed, validate_self_assessment
 
 
 def _git(repo_path, *args):
@@ -52,3 +52,26 @@ def test_validate_files_changed_fails_clean_base_branch(tmp_path):
 
     assert result.passed is False
     assert "No file changes detected" in result.feedback
+
+
+def test_validate_self_assessment_rejects_pass_when_self_review_issues_exist():
+    result = validate_self_assessment(
+        {
+            "score": 0.95,
+            "verdict": "pass",
+            "criteria_checks": [],
+            "self_review_issues": [
+                {
+                    "severity": "high",
+                    "file": "src/app.py",
+                    "line": 11,
+                    "message": "Blocking issue.",
+                    "blocking": True,
+                }
+            ],
+        },
+        acceptance_criteria_count=0,
+    )
+
+    assert result.passed is False
+    assert "self_review_issues is non-empty" in result.feedback
