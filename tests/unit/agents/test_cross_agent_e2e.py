@@ -21,7 +21,7 @@ from framework.workflow import interrupt
 class TestEscalateToUserInterrupt:
     """escalate_to_user node raises InterruptSignal."""
 
-    def test_raises_interrupt_signal(self):
+    async def test_raises_interrupt_signal(self):
         """escalate_to_user() raises InterruptSignal with revision context."""
         from agents.team_lead.nodes import escalate_to_user
 
@@ -31,14 +31,12 @@ class TestEscalateToUserInterrupt:
             "pr_url": "https://github.com/org/repo/pull/42",
         }
         with pytest.raises(InterruptSignal) as exc_info:
-            asyncio.get_event_loop().run_until_complete(
-                escalate_to_user(state)
-            )
+            await escalate_to_user(state)
         assert "user intervention" in exc_info.value.question
         assert exc_info.value.metadata.get("revision_count") == 3
         assert exc_info.value.metadata.get("pr_url") == "https://github.com/org/repo/pull/42"
 
-    def test_interrupt_includes_review_verdict(self):
+    async def test_interrupt_includes_review_verdict(self):
         from agents.team_lead.nodes import escalate_to_user
 
         state = {
@@ -47,16 +45,14 @@ class TestEscalateToUserInterrupt:
             "pr_url": "",
         }
         with pytest.raises(InterruptSignal) as exc_info:
-            asyncio.get_event_loop().run_until_complete(
-                escalate_to_user(state)
-            )
+            await escalate_to_user(state)
         assert exc_info.value.metadata.get("review_verdict") == "needs_work"
 
 
 class TestTeamLeadInterruptHandling:
     """TeamLeadAgent catches InterruptSignal in handle_message."""
 
-    def test_interrupt_pauses_task(self):
+    async def test_interrupt_pauses_task(self):
         """When workflow raises InterruptSignal, task enters INPUT_REQUIRED."""
         from agents.team_lead.agent import TeamLeadAgent, team_lead_definition
         from framework.agent import AgentServices
@@ -88,7 +84,7 @@ class TestTeamLeadInterruptHandling:
         )
         agent = TeamLeadAgent(definition=team_lead_definition, services=services)
         # Agent needs a compiled workflow
-        asyncio.get_event_loop().run_until_complete(agent.start())
+        await agent.start()
         assert agent._compiled_workflow is not None
 
 
@@ -130,7 +126,7 @@ class TestConfigSingleSource:
 class TestResumeTaskArtifacts:
     """BaseAgent.resume_task() builds proper artifacts from workflow result."""
 
-    def test_resume_produces_artifacts(self):
+    async def test_resume_produces_artifacts(self):
         """After resume, completed task should have artifacts (not hardcoded msg)."""
         from framework.agent import AgentDefinition, AgentServices, BaseAgent
         from framework.task_store import InMemoryTaskStore
@@ -175,7 +171,7 @@ class TestResumeTaskArtifacts:
             task_store=task_store,
         )
         agent = TestAgent(defn, services)
-        asyncio.get_event_loop().run_until_complete(agent.start())
+        await agent.start()
 
         # Create and pause task
         task = task_store.create_task(agent_id="test-resume")
@@ -185,15 +181,11 @@ class TestResumeTaskArtifacts:
             checkpoint_service=checkpoint,
         )
         with pytest.raises(InterruptSignal):
-            asyncio.get_event_loop().run_until_complete(
-                agent._compiled_workflow.invoke({"input": "hi"}, config)
-            )
+            await agent._compiled_workflow.invoke({"input": "hi"}, config)
         task_store.pause_task(task.id, question="What next?")
 
         # Resume
-        result = asyncio.get_event_loop().run_until_complete(
-            agent.resume_task(task.id, "continue please")
-        )
+        result = await agent.resume_task(task.id, "continue please")
 
         assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
         artifacts = result["task"].get("artifacts", [])

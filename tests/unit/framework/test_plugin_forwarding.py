@@ -6,7 +6,6 @@ Verifies that:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 from unittest.mock import MagicMock, call
 
@@ -16,7 +15,7 @@ import pytest
 class TestTeamLeadPluginForwarding:
     """Team Lead nodes forward plugin_manager to runtime calls."""
 
-    def test_analyze_requirements_passes_plugin_manager(self):
+    async def test_analyze_requirements_passes_plugin_manager(self):
         """analyze_requirements() passes plugin_manager to runtime.run()."""
         plugin_manager = MagicMock()
         runtime = MagicMock()
@@ -34,15 +33,13 @@ class TestTeamLeadPluginForwarding:
             "user_request": "Build login page",
             "jira_key": "",
         }
-        result = asyncio.get_event_loop().run_until_complete(
-            analyze_requirements(state)
-        )
+        result = await analyze_requirements(state)
         # Verify runtime.run was called with plugin_manager
         runtime.run.assert_called_once()
         _, kwargs = runtime.run.call_args
         assert kwargs.get("plugin_manager") is plugin_manager
 
-    def test_create_plan_passes_plugin_manager(self):
+    async def test_create_plan_passes_plugin_manager(self):
         """create_plan() passes plugin_manager to runtime.run()."""
         plugin_manager = MagicMock()
         runtime = MagicMock()
@@ -61,9 +58,7 @@ class TestTeamLeadPluginForwarding:
             "complexity": "low",
             "required_skills": [],
         }
-        result = asyncio.get_event_loop().run_until_complete(
-            create_plan(state)
-        )
+        result = await create_plan(state)
         runtime.run.assert_called_once()
         _, kwargs = runtime.run.call_args
         assert kwargs.get("plugin_manager") is plugin_manager
@@ -72,7 +67,7 @@ class TestTeamLeadPluginForwarding:
 class TestWebDevPluginForwarding:
     """Web Dev nodes forward plugin_manager to runtime calls."""
 
-    def test_implement_changes_passes_plugin_manager(self):
+    async def test_implement_changes_passes_plugin_manager(self):
         """implement_changes() passes plugin_manager to runtime.run_agentic()."""
         plugin_manager = MagicMock()
         runtime = MagicMock()
@@ -95,14 +90,12 @@ class TestWebDevPluginForwarding:
             "skill_context": "",
             "memory_context": "",
         }
-        result = asyncio.get_event_loop().run_until_complete(
-            implement_changes(state)
-        )
+        result = await implement_changes(state)
         runtime.run_agentic.assert_called_once()
         _, kwargs = runtime.run_agentic.call_args
         assert kwargs.get("plugin_manager") is plugin_manager
 
-    def test_fix_tests_passes_plugin_manager(self):
+    async def test_fix_tests_passes_plugin_manager(self):
         """fix_tests() passes plugin_manager to runtime.run_agentic()."""
         plugin_manager = MagicMock()
         runtime = MagicMock()
@@ -119,9 +112,7 @@ class TestWebDevPluginForwarding:
             "repo_path": "/tmp/repo",
             "changes_made": ["foo.py"],
         }
-        result = asyncio.get_event_loop().run_until_complete(
-            fix_tests(state)
-        )
+        result = await fix_tests(state)
         runtime.run_agentic.assert_called_once()
         _, kwargs = runtime.run_agentic.call_args
         assert kwargs.get("plugin_manager") is plugin_manager
@@ -130,7 +121,7 @@ class TestWebDevPluginForwarding:
 class TestCodeReviewPluginForwarding:
     """Code Review nodes forward plugin_manager to runtime.run()."""
 
-    def test_review_quality_passes_plugin_manager(self):
+    async def test_review_quality_passes_plugin_manager(self):
         plugin_manager = MagicMock()
         runtime = MagicMock()
         runtime.run.return_value = {"raw_response": "[]"}
@@ -143,14 +134,12 @@ class TestCodeReviewPluginForwarding:
             "pr_description": "Add feature",
             "changed_files": ["foo.py"],
         }
-        result = asyncio.get_event_loop().run_until_complete(
-            review_quality(state)
-        )
+        result = await review_quality(state)
         runtime.run.assert_called_once()
         _, kwargs = runtime.run.call_args
         assert kwargs.get("plugin_manager") is plugin_manager
 
-    def test_review_security_passes_plugin_manager(self):
+    async def test_review_security_passes_plugin_manager(self):
         plugin_manager = MagicMock()
         runtime = MagicMock()
         runtime.run.return_value = {"raw_response": "[]"}
@@ -163,9 +152,7 @@ class TestCodeReviewPluginForwarding:
             "pr_description": "Fix vuln",
             "changed_files": ["foo.py"],
         }
-        result = asyncio.get_event_loop().run_until_complete(
-            review_security(state)
-        )
+        result = await review_security(state)
         runtime.run.assert_called_once()
         _, kwargs = runtime.run.call_args
         assert kwargs.get("plugin_manager") is plugin_manager

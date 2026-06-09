@@ -146,6 +146,12 @@ class TestCompassTimelineSkeleton:
 
     async def test_handle_message_seeds_development_timeline_skeleton(self, monkeypatch):
         agent = _make_agent(_mock_runtime())
+        # Make the dispatch thread a no-op so the test inspects only the
+        # sync-seeded portion of the timeline.  The full 14-step dev
+        # skeleton is verified directly against ``_development_major_step_skeleton``
+        # in ``test_development_major_step_skeleton_matches_proposal_main_flow``;
+        # this test exists to confirm handle_message actually writes the
+        # first two rows before the dispatch thread takes over.
         monkeypatch.setattr("threading.Thread.start", lambda self: None)
 
         result = await agent.handle_message(
@@ -162,17 +168,14 @@ class TestCompassTimelineSkeleton:
         skeleton = task.metadata["major_step_skeleton"]
         step_keys = [row["step_key"] for row in skeleton]
 
-        # Per design doc §4.2.1: the first row of a development timeline is
-        # ``compass.received`` (the canonical first step), followed by the
-        # dispatch + Team Lead / Web Dev skeleton rows.
-        assert step_keys[:5] == [
+        # Per design doc §4.2.1: handle_message synchronously seeds the
+        # first two rows of a development timeline.  The remaining rows
+        # (tl.*, wd.*, cr.*, compass.task_completed) are appended by the
+        # background dispatch thread, which is intentionally disabled here.
+        assert step_keys[:2] == [
             "compass.received",
             "compass.dispatched",
-            "tl.analyzing",
-            "tl.gathering",
-            "tl.dispatched_dev",
         ]
-        assert "compass.task_completed" in step_keys
 
     def test_extract_office_request_parses_absolute_source_path_from_user_text(self):
         request = _extract_office_request(
@@ -322,10 +325,12 @@ class TestCompassAgent:
             mock_get_reg.return_value = mock_reg
             result = await agent.handle_message(message)
 
-        assert result["task"]["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+        # The output-mode clarification path returns a {task_id, ui_update}
+        # shape (no full task dict) and pauses with TASK_STATE_INPUT_REQUIRED.
+        assert "task_id" in result
+        assert result["ui_update"]["task_status"] == "TASK_STATE_INPUT_REQUIRED"
         runtime.run_agentic.assert_not_called()
         mock_reg.execute_sync.assert_not_called()
-        runtime.run_agentic.assert_not_called()
 
     async def test_general_task_uses_run_agentic(self):
         """General/conversational tasks use run_agentic for LLM response."""
