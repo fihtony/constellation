@@ -171,7 +171,7 @@ async def _send(agent, text, *, metadata=None):
     return await agent.handle_message(msg)
 
 
-def test_organize_by_student_name_routes_to_custom_dimension(compass_agent):
+def test_organize_by_student_name_routes_to_custom_dimension(compass_agent, monkeypatch):
     """The exact scenario from task-440f61c09ffa: 'please organize
     folder ... by student name' should be recognized as a custom
     dimension (kind=office_organize_dimension) and dispatched to the
@@ -207,8 +207,12 @@ def test_organize_by_student_name_routes_to_custom_dimension(compass_agent):
             },
         }
 
-    import agents.compass.agent as _cm
-    _cm._dispatch_office_request = _fake_dispatch_office_request
+    # monkeypatch auto-reverts after the test, so other tests in the
+    # same process see the real ``_dispatch_office_request`` again.
+    monkeypatch.setattr(
+        "agents.compass.agent._dispatch_office_request",
+        _fake_dispatch_office_request,
+    )
 
     result = asyncio.run(agent.handle_message({
         "message": {
@@ -246,7 +250,7 @@ def test_organize_by_student_name_routes_to_custom_dimension(compass_agent):
     assert interrupt.get("kind") == "office_organize_dimension"
 
 
-def test_organize_with_dim_and_output_mode_dispatches_immediately(compass_agent):
+def test_organize_with_dim_and_output_mode_dispatches_immediately(compass_agent, monkeypatch):
     """Sanity check: when the user provides both a dimension hint and
     an output-mode hint, the office task must dispatch immediately
     with no clarifying questions.
@@ -263,8 +267,12 @@ def test_organize_with_dim_and_output_mode_dispatches_immediately(compass_agent)
         captured["office_request"] = dict(office_request)
         return {"status": "completed", "state": "TASK_STATE_COMPLETED"}
 
-    import agents.compass.agent as _cm
-    _cm._dispatch_office_request = _fake_dispatch_office_request
+    # monkeypatch auto-reverts after the test, so other tests in the
+    # same process see the real ``_dispatch_office_request`` again.
+    monkeypatch.setattr(
+        "agents.compass.agent._dispatch_office_request",
+        _fake_dispatch_office_request,
+    )
 
     result = asyncio.run(agent.handle_message({
         "message": {

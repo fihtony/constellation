@@ -57,37 +57,31 @@ class TestInterruptWorkflow:
     def checkpointer(self):
         return InMemoryCheckpointer()
 
-    def test_interrupt_raises_signal(self, compiled, checkpointer):
+    async def test_interrupt_raises_signal(self, compiled, checkpointer):
         config = RunConfig(
             session_id="s1",
             thread_id="t1",
             checkpoint_service=checkpointer,
         )
         with pytest.raises(InterruptSignal) as exc_info:
-            asyncio.get_event_loop().run_until_complete(
-                compiled.invoke({"input": "hello"}, config)
-            )
+            await compiled.invoke({"input": "hello"}, config)
         assert exc_info.value.question == "What is your preference?"
         assert exc_info.value.metadata.get("topic") == "config"
 
-    def test_checkpoint_saved_on_interrupt(self, compiled, checkpointer):
+    async def test_checkpoint_saved_on_interrupt(self, compiled, checkpointer):
         config = RunConfig(
             session_id="s2",
             thread_id="t2",
             checkpoint_service=checkpointer,
         )
         with pytest.raises(InterruptSignal):
-            asyncio.get_event_loop().run_until_complete(
-                compiled.invoke({"input": "hello"}, config)
-            )
+            await compiled.invoke({"input": "hello"}, config)
         # Verify checkpoint was persisted
-        saved = asyncio.get_event_loop().run_until_complete(
-            checkpointer.load("s2", "t2")
-        )
+        saved = await checkpointer.load("s2", "t2")
         assert saved is not None
         assert saved["interrupt"] == "What is your preference?"
 
-    def test_resume_completes_workflow(self, compiled, checkpointer):
+    async def test_resume_completes_workflow(self, compiled, checkpointer):
         config = RunConfig(
             session_id="s3",
             thread_id="t3",
@@ -95,14 +89,10 @@ class TestInterruptWorkflow:
         )
         # First invoke — interrupts
         with pytest.raises(InterruptSignal):
-            asyncio.get_event_loop().run_until_complete(
-                compiled.invoke({"input": "hello"}, config)
-            )
+            await compiled.invoke({"input": "hello"}, config)
 
         # Resume with user answer
-        result = asyncio.get_event_loop().run_until_complete(
-            compiled.resume(config, resume_value="dark theme")
-        )
+        result = await compiled.resume(config, resume_value="dark theme")
         assert result.get("b_done") is True
         assert result.get("c_done") is True
         assert "dark theme" in result.get("final", "")
