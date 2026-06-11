@@ -5,7 +5,7 @@ Constellation is a capability-driven multi-agent engineering system built on the
 ## Highlights
 
 - Live capability discovery: agents register skills through the registry, and the runtime refreshes topology as new capabilities appear.
-- Elastic execution model: persistent boundary agents stay available for integrations, while per-task execution agents launch only when work actually arrives.
+- Elastic execution model: persistent boundary agents stay available for integrations, while on-demand execution agents launch only when work actually arrives.
 - Workflow-aware dispatch: each request can follow a different path, with task-specific workflow instructions injected into the execution agent at runtime.
 - Least-privilege operation: agent dispatch and execution are shaped by role checks, tool restrictions, and launch-time isolation controls.
 - Parallel and multi-task ready: independent tasks can be routed, launched, and tracked concurrently without forcing a single shared worker model.
@@ -14,7 +14,7 @@ Constellation is a capability-driven multi-agent engineering system built on the
 
 ## Architecture
 
-![Architecture Diagram](./constellation-Architecture.png)
+![Architecture Diagram](./docs/images/constellation-Architecture.png)
 
 ```
 Browser / API client
@@ -27,6 +27,22 @@ Browser / API client
                       ├─► UI Design Agent (:8040)  — Figma + Stitch design context
                       └─► Execution Agents         — Android / Web / future iOS
 ```
+
+## Compass UI
+
+Compass is the user-facing control plane: every request — development or office — is initiated, monitored, and reviewed in the same console. The two screenshots below show the two main task flows end to end.
+
+### Development task
+
+![Compass UI — Development Task](./docs/images/compass-ui-dev-task.png)
+
+A JIRA implementation request (`CSTL-2`) is submitted from the chat panel. Compass dispatches it to Team Lead, which plans the work and delegates to the Web Dev execution agent. The right-hand timeline surfaces every stage — build and test, self-check, gap fix, rebuild, code review, and final report — and reveals the PR, branch, and review verdict once the pipeline completes.
+
+### Office folder organization task
+
+![Compass UI — Office Folder Organization](./docs/images/compass-ui-office-task.png)
+
+A local folder-organization request ("organize the files by student name by month") is routed directly to the Office Agent. Compass collects the output mode (`workspace` vs. `inplace`), the Office Agent drafts a plan, the user reviews and modifies it interactively (`approve` / `modify: <change>`), and the completion summary — files organized, output paths, and live task logs — appears in the task info panel.
 
 ## Quick Start
 
