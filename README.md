@@ -1,6 +1,6 @@
 # Constellation
 
-Constellation is a capability-driven multi-agent engineering system built on the [A2A (Agent-to-Agent) protocol](https://google.github.io/A2A/). Instead of collapsing routing, planning, integration, and execution into one service, it runs as a live agent topology where new skills can register at runtime, be discovered without restarting the platform, and scale independently. Compass serves as the control plane, Team Lead handles analysis, planning, and review, and specialized agents own external integrations or execution domains behind the same task contract. For each request, Constellation can choose a different workflow, inject task-specific instructions into the execution agent, and grant only the permissions that workflow requires. The result is an architecture built for real engineering work: parallel task handling, on-demand agent launch, resumable human-in-the-loop flows, shared workspaces, async callbacks, and a clean boundary between orchestration and delivery that is designed to grow with the system.
+Constellation is a capability-driven multi-agent engineering system built on LangGraph and the [A2A (Agent-to-Agent) protocol](https://google.github.io/A2A/). Instead of collapsing routing, planning, integration, and execution into one service, it runs as a live agent topology where new skills can register at runtime, be discovered without restarting the platform, and scale independently. Compass serves as the control plane, Team Lead handles analysis, planning, and review, and specialized agents own external integrations or execution domains behind the same task contract. For each request, Constellation can choose a different workflow, inject task-specific instructions into the execution agent, and grant only the permissions that workflow requires. The result is an architecture built for real engineering work: parallel task handling, on-demand agent launch, resumable human-in-the-loop flows, shared workspaces, async callbacks, and a clean boundary between orchestration and delivery that is designed to grow with the system.
 
 ## Highlights
 
@@ -30,7 +30,7 @@ Browser / API client
 
 ## Compass UI
 
-Compass is the user-facing control plane: every request — development or office — is initiated, monitored, and reviewed in the same console. The two screenshots below show the two main task flows end to end.
+Compass is the user-facing control plane: every request — development or office — is initiated, monitored, and reviewed in the same console.
 
 ### Development task
 
