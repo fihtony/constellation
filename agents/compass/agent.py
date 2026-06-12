@@ -267,18 +267,22 @@ def _strip_output_mode_phrase(reply: str) -> tuple[str, str, str]:
     without losing it.  When no phrase matches, ``mode`` is empty and
     ``stripped_reply`` is the original reply unchanged.
 
-    Two-step scan so both whole-reply and combined answers work:
+    Three-step scan so both whole-reply and combined answers work,
+    including the bare token that survives dimension stripping:
 
     1. Whole-reply match against the output-mode contract
        (covers bare ``workspace`` / ``inplace`` / ``in place``).
     2. Substring match against ``_OUTPUT_MODE_PHRASES``
        (covers combined answers like ``by type in place``).
+    3. Strip the dimension phrase (using the same machinery as
+       :func:`_strip_dimension_phrase`) and re-run the contract on
+       what remains.  ``by type workspace`` becomes ``workspace``
+       after the dimension scan, which the contract accepts.
     """
     text = (reply or "").strip()
     if not text:
         return "", "", ""
 
-    # Step 1: whole-reply match against the contract.
     contract = build_select_option_contract(
         [
             {"id": "workspace", "label": "workspace"},
@@ -286,19 +290,62 @@ def _strip_output_mode_phrase(reply: str) -> tuple[str, str, str]:
         ],
         reask_message="",
     )
+
+    # Step 1: whole-reply match against the contract.
     resolved = resolve_reply(contract, text)
     if resolved.get("ok"):
         mode = str((resolved.get("normalized") or {}).get("selection") or "").strip()
         if mode:
             return mode, "", text
 
-    # Step 2: substring match for combined answers.
+    # Step 2: substring match for combined answers like "by type in place".
     lowered = text.lower()
     sorted_phrases = sorted(_OUTPUT_MODE_PHRASES, key=lambda item: -len(item[0]))
     for needle, mode in sorted_phrases:
         if needle in lowered:
             stripped = (lowered.replace(needle, "", 1)).strip()
             return mode, stripped, needle
+
+    # Step 3: handle the case where a bare ``workspace`` / ``inplace``
+    # / ``in place`` token survives the dimension strip.  Example:
+    # ``"by type workspace"`` becomes ``"workspace"`` once the
+    # ``"by type"`` dimension needle is removed.  The contract accepts
+    # the bare token.  Return the dimension-stripped text (i.e. the
+    # text with the OUTPUT-MODE token removed) so the caller can
+    # resolve the dimension in the same round.
+    from framework.office.dimensions import (
+        KEYWORD_TO_DIMENSION,
+        _CUSTOM_DIMENSION_PATTERNS,
+    )
+    for needle in sorted(KEYWORD_TO_DIMENSION, key=len, reverse=True):
+        if needle in lowered:
+            dim_stripped = (lowered.replace(needle, "", 1)).strip()
+            # dim_stripped should be the bare mode token, e.g. "workspace".
+            leftover_resolved = resolve_reply(contract, dim_stripped)
+            if leftover_resolved.get("ok"):
+                leftover_mode = str(
+                    (leftover_resolved.get("normalized") or {}).get("selection") or ""
+                ).strip()
+                if leftover_mode:
+                    # Re-strip: the caller wants the dimension side
+                    # of the reply (e.g. "by type") in stripped_reply
+                    # so it can resolve the dimension in this round.
+                    dim_only = needle
+                    return leftover_mode, dim_only, text
+            break
+    for pattern in _CUSTOM_DIMENSION_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            dim_stripped = (text[: match.start()] + text[match.end() :]).strip()
+            leftover_resolved = resolve_reply(contract, dim_stripped)
+            if leftover_resolved.get("ok"):
+                leftover_mode = str(
+                    (leftover_resolved.get("normalized") or {}).get("selection") or ""
+                ).strip()
+                if leftover_mode:
+                    dim_only = match.group(0)
+                    return leftover_mode, dim_only, text
+            break
     return "", text, ""
 
 
@@ -981,6 +1028,80 @@ def _office_output_mode_question() -> str:
         "Where should the office output go? Reply `workspace` to keep the source read-only and "
         "write results under the task workspace, or reply `inplace` to write inside the source folder."
     )
+
+
+def _gate_output_mode_round(
+    *,
+    task_id: str,
+    office_request: dict,
+    task_store,
+    log,
+    aid: str,
+    capability_label: str,
+) -> dict | None:
+    """Ask the output-mode question when the office_request still has
+    an empty ``output_mode``.
+
+    Used by both the init path (line 1817-1864) and the resume path
+    (line 2232 onwards) so the same gate fires in both flows.  The
+    resume path silently defaulted to ``"workspace"`` and dispatched
+    without asking; that bug is the reason this helper exists.
+
+    Returns:
+      - ``None`` when ``output_mode`` is set, meaning the caller
+        should proceed to dispatch.
+      - a ``ui_update`` dict (with ``task_status="TASK_STATE_INPUT_REQUIRED"``)
+        when the task was paused; the caller must return it directly
+        instead of dispatching.
+
+    The caller is responsible for forwarding the new state to the
+    user.  No background workers are spawned from this helper.
+    """
+    if office_request.get("output_mode"):
+        return None
+    question = _office_output_mode_question()
+    task_store.pause_task(
+        task_id,
+        question=question,
+        interrupt_metadata={
+            "kind": "office_output_mode",
+            "office_request": dict(office_request),
+        },
+    )
+    _record_major_step(
+        task_store,
+        task_id,
+        step_key="compass.asking_output_mode",
+        title="Compass asking for output location",
+        agent=aid,
+        lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
+        conditional=True,
+        summary_template="Compass is waiting for you to choose the output location.",
+    )
+    _append_chat_entry(
+        task_store,
+        task_id,
+        role="COMPASS",
+        text=question,
+        tone="input-required",
+    )
+    log.info(
+        "office task awaiting output mode",
+        capability=capability_label,
+        source_count=len(office_request.get("source_paths", []) or []),
+    )
+    return {
+        "task_id": task_id,
+        "ui_update": {
+            "task_id": task_id,
+            "task_status": "TASK_STATE_INPUT_REQUIRED",
+            "chat_message": {
+                "role": "COMPASS",
+                "text": question,
+                "style": "normal",
+            },
+        },
+    }
 
 
 def _office_dimension_resolved(user_text: str, office_request: dict) -> bool:
@@ -1820,48 +1941,16 @@ class CompassAgent(BaseAgent):
             # and output mode, the dimension gate is satisfied.  If the
             # output_mode is still empty, ask for it now — same path as
             # before, but it no longer pre-empts the dimension round.
-            if not office_request.get("output_mode"):
-                question = _office_output_mode_question()
-                task_store.pause_task(
-                    task.id,
-                    question=question,
-                    interrupt_metadata={
-                        "kind": "office_output_mode",
-                        "office_request": office_request,
-                    },
-                )
-                _record_major_step(
-                    task_store,
-                    task.id,
-                    step_key="compass.asking_output_mode",
-                    title="Compass asking for output location",
-                    agent=_aid,
-                    lifecycle_state=LIFECYCLE_WAITING_FOR_USER,
-                    conditional=True,
-                    summary_template="Compass is waiting for you to choose the output location.",
-                )
-                _append_chat_entry(
-                    task_store,
-                    task.id,
-                    role="COMPASS",
-                    text=question,
-                    tone="input-required",
-                )
-                log.info(
-                    "office task awaiting output mode",
-                    capability=office_request.get("capability", "summarize"),
-                    source_count=len(office_request.get("source_paths", [])),
-                )
-                ui_update = {
-                    "task_id": task.id,
-                    "task_status": "TASK_STATE_INPUT_REQUIRED",
-                    "chat_message": {
-                        "role": "COMPASS",
-                        "text": question,
-                        "style": "normal",
-                    },
-                }
-                return {"task_id": task.id, "ui_update": ui_update}
+            gated = _gate_output_mode_round(
+                task_id=task.id,
+                office_request=office_request,
+                task_store=task_store,
+                log=log,
+                aid=_aid,
+                capability_label=office_request.get("capability", "summarize"),
+            )
+            if gated is not None:
+                return gated
 
             dispatch_data = _dispatch_office_request(task.id, user_text, office_request, registry, log)
             response_text = dispatch_data.get("message") or f"Office task dispatched. Status: {dispatch_data.get('status', 'unknown')}"
@@ -2232,8 +2321,39 @@ class CompassAgent(BaseAgent):
         # Reply validated; merge any updates into office_request.
         office_request = dict(resolution.get("office_request") or office_request)
         forwarded_resume_value = resolution.get("resume_payload", str(resume_value))
-        output_mode = str(office_request.get("output_mode") or "workspace")
         task_store.update_metadata(task_id, {"office_request": office_request})
+
+        # B3: cross-round output-mode gate.  When the user just answered
+        # the dimension round with a dimension-only reply (or, more
+        # generally, the round they were on did not actually pin an
+        # output mode), the dispatcher must NOT silently default to
+        # ``workspace`` and ship the task.  The init path's
+        # ``_gate_output_mode_round`` already enforces this rule on
+        # first contact; we re-use the same helper here so the resume
+        # path stays symmetric.  This is the fix for task-115d9fb72c78.
+        # The task is currently INPUT_REQUIRED (we just got a reply);
+        # the gate's pause_task would no-op the state machine, so we
+        # walk through WORKING first.
+        try:
+            task_store.resume_task(task_id)
+        except Exception:
+            pass
+        gated = _gate_output_mode_round(
+            task_id=task_id,
+            office_request=office_request,
+            task_store=task_store,
+            log=log,
+            aid=self.definition.agent_id,
+            capability_label=office_request.get("capability", "summarize"),
+        )
+        if gated is not None:
+            return gated
+
+        # If we reach here, output_mode is set.  Derive it AFTER the
+        # gate so the ``or "workspace"`` fallback is unreachable — the
+        # gate would have paused the task instead of letting us fall
+        # through.
+        output_mode = str(office_request.get("output_mode") or "")
         # A2: Compass writes ``resuming`` on the existing user-input row before
         # the agent resumes, then transitions the same row to ``done`` with
         # the accepted output location. Re-using the same step_instance_key
@@ -2251,7 +2371,10 @@ class CompassAgent(BaseAgent):
             lifecycle_state=LIFECYCLE_RESUMING,
             summary_template="Compass is resuming after output location was selected.",
         )
-        task_store.resume_task(task_id)
+        # We already walked through WORKING above (so the gate's
+        # pause_task would be valid INPUT_REQUIRED -> WORKING ->
+        # INPUT_REQUIRED if needed).  The state machine forbids
+        # WORKING -> WORKING, so don't re-call resume_task here.
         _record_major_step(
             task_store,
             task_id,
