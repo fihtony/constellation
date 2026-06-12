@@ -22,6 +22,18 @@ import time
 import unicodedata
 from typing import Any
 
+from agents.office.integrity import (
+    check_operations_plan_no_deletes as _integrity_check_no_deletes,
+)
+from agents.office.integrity import (
+    cleanup_empty_dirs as _integrity_cleanup_empty_dirs,
+)
+from agents.office.integrity import (
+    snapshot_source as _integrity_snapshot_source,
+)
+from agents.office.integrity import (
+    verify_post as _integrity_verify_post,
+)
 from agents.office.office_tools import (
     _check_directory_limits,
     _safe_path_segment,
@@ -871,12 +883,26 @@ def _run_bounded_folder_organize(
     if output_mode == "workspace":
         os.makedirs(output_root, exist_ok=True)
     os.makedirs(os.path.dirname(operations_path), exist_ok=True)
+    # Snapshot the source tree *before* any move/copy.  Recording the
+    # snapshot into operations-plan.json gives the post-run verifier
+    # a baseline to compare against: every (rel, size, mtime) tuple
+    # must still be reachable somewhere after the run, with the
+    # same size and mtime.  This is the "no file has been deleted or
+    # modified, only moving is allowed" guarantee.
+    integrity_snapshot = _integrity_snapshot_source(source_root)
     # Inplace organize MOVES the originals into the bucket subdirs.
     # Workspace organize COPIES the originals into the artifacts
     # workspace.  The action recorded in operations-plan.json
     # mirrors the actual filesystem operation.
     transfer_action = "move_file" if output_mode == "inplace" else "copy_file"
     with open(operations_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "action": "audit_snapshot",
+            "phase": "before",
+            "source": os.path.realpath(source_root),
+            "files": integrity_snapshot,
+            "materialized_by": "bounded-folder-organize",
+        }) + "\n")
         for item in inventory:
             src_path = os.path.realpath(os.path.join(source_root, str(item["relative_path"])))
             dst_path = _canonical_organize_destination(output_root, item)
@@ -894,12 +920,56 @@ def _run_bounded_folder_organize(
                 "materialized_by": "bounded-folder-organize",
             }) + "\n")
 
+    # Inplace organize MOVES files out of subdirectories that may
+    # become empty.  Remove those empties so the user does not have
+    # a forest of stale ``1/``, ``2/`` directories sitting next to
+    # the new bucket tree.  This only runs in inplace mode — the
+    # workspace source is supposed to stay read-only, and the
+    # artifacts-dir layout is built fresh and has no empties to
+    # clean.
+    if output_mode == "inplace":
+        removed_dirs = _integrity_cleanup_empty_dirs(source_root)
+        if removed_dirs:
+            with open(operations_path, "a", encoding="utf-8") as fh:
+                for removed in removed_dirs:
+                    fh.write(json.dumps({
+                        "action": "remove_empty_dir",
+                        "dst": removed,
+                        "status": "succeeded",
+                        "materialized_by": "bounded-folder-organize",
+                    }) + "\n")
+
+    # Post-organize integrity check.  Workspace mode looks for every
+    # snapshot file under ``source_root`` (untouched); inplace mode
+    # looks under ``output_root`` (== ``source_root``) which now holds
+    # the bucket tree.  We also re-scan operations-plan.json for any
+    # ``delete_file`` action and surface that as a violation, so a
+    # buggy executor that tries to "clean up" a stray file cannot
+    # silently violate the integrity contract.
+    integrity_errors = _integrity_verify_post(
+        integrity_snapshot,
+        source_root=source_root,
+        output_root=output_root,
+        output_mode=output_mode,
+    )
+    integrity_errors.extend(_integrity_check_no_deletes(operations_path))
+    with open(operations_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "action": "integrity_verify",
+            "phase": "after",
+            "source": os.path.realpath(source_root),
+            "errors": integrity_errors,
+            "materialized_by": "bounded-folder-organize",
+        }) + "\n")
+
     plan_path = _target_output_file(output_mode, source_root, artifacts_dir, "organization-plan.md")
     _write_text_file(plan_path, _build_organization_plan_text(inventory, output_root))
 
     summary = f"Office organized {len(inventory)} file(s) with the bounded folder workflow."
+    if integrity_errors:
+        summary += f" (integrity check flagged {len(integrity_errors)} issue(s))"
     return AgenticResult(
-        success=True,
+        success=not integrity_errors,
         summary=summary,
         raw_output=summary,
         backend_used="bounded-folder-organize",

@@ -23,11 +23,121 @@ from typing import Any
 
 from framework.tools.base import BaseTool, ToolResult
 
+from agents.office.integrity import (
+    check_operations_plan_no_deletes as _integrity_check_no_deletes,
+)
+from agents.office.integrity import (
+    cleanup_empty_dirs as _integrity_cleanup_empty_dirs,
+)
+from agents.office.integrity import (
+    snapshot_source as _integrity_snapshot_source,
+)
+from agents.office.integrity import (
+    verify_post as _integrity_verify_post,
+)
+
 
 # ---- shared helpers --------------------------------------------------------
 
 _ORGANIZED_OUTPUT_ROOT = "organized-output"
 _FILENAME_PLAN = "organization-plan.md"
+
+# Each dimension tool records the operations-plan.json path it is
+# associated with, if known.  The dimension tools themselves do not
+# own the artifacts dir — the office node passes it in via the
+# ``output_root`` convention.  We derive the operations-plan path
+# from the artifacts parent: tools receive ``output_root`` which is
+# either ``<artifacts>/organized-output/files`` (workspace) or the
+# source folder (inplace).  In both cases the operations-plan.json
+# is two levels up from output_root when workspace, and lives next
+# to the output_root (in ``<artifacts>/operations-plan.json``) when
+# inplace — we conservatively use a sibling of output_root for both.
+_OPERATIONS_PLAN_NAME = "operations-plan.json"
+
+
+def _operations_plan_path(output_root: str) -> str:
+    """Best-effort path to the per-task operations audit log.
+
+    For workspace mode the artifacts dir is the grandparent of
+    ``output_root`` (``<artifacts>/organized-output/files``); for
+    inplace mode the artifacts dir is the parent of ``output_root``
+    in the office node's state but the dimension tool only sees the
+    source folder.  We default to a sibling of ``output_root`` —
+    ``integrity.py`` and the office node both look there.
+    """
+    return os.path.join(os.path.dirname(output_root), _OPERATIONS_PLAN_NAME)
+
+
+def _integrity_audit(
+    *,
+    source: str,
+    output_root: str,
+    snapshot: list[dict[str, Any]],
+    output_mode: str,
+) -> list[str]:
+    """Append the post-run integrity verdict to operations-plan.json.
+
+    Also performs the in-place empty-dir cleanup when applicable.
+    Returns the list of integrity errors so the caller can decide
+    whether to downgrade ``ToolResult.success``.
+    """
+    operations_path = _operations_plan_path(output_root)
+    if output_mode == "inplace":
+        _integrity_cleanup_empty_dirs(source)
+    errors = _integrity_verify_post(
+        snapshot,
+        source_root=source,
+        output_root=output_root,
+        output_mode=output_mode,
+    )
+    errors.extend(_integrity_check_no_deletes(operations_path))
+    try:
+        os.makedirs(os.path.dirname(operations_path), exist_ok=True)
+        with open(operations_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "action": "integrity_verify",
+                "phase": "after",
+                "source": os.path.realpath(source),
+                "output_root": os.path.realpath(output_root),
+                "output_mode": output_mode,
+                "errors": errors,
+                "materialized_by": "dimension-tool",
+            }) + "\n")
+    except OSError:
+        # The audit log is best-effort.  Integrity errors are
+        # returned via the ``errors`` list regardless of whether
+        # the append succeeded.
+        pass
+    return errors
+
+
+def _record_integrity_snapshot(
+    output_root: str,
+    source: str,
+    snapshot: list[dict[str, Any]],
+    output_mode: str,
+) -> None:
+    """Append the pre-organize snapshot to operations-plan.json.
+
+    Best-effort: a failure to write the snapshot must not break the
+    organize flow, but it WILL be flagged as a missing
+    ``audit_snapshot`` record in the post-run verify step.
+    """
+    operations_path = _operations_plan_path(output_root)
+    try:
+        os.makedirs(os.path.dirname(operations_path), exist_ok=True)
+        with open(operations_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "action": "audit_snapshot",
+                "phase": "before",
+                "source": os.path.realpath(source),
+                "output_root": os.path.realpath(output_root),
+                "output_mode": output_mode,
+                "files": snapshot,
+                "materialized_by": "dimension-tool",
+            }) + "\n")
+    except OSError:
+        pass
 
 
 def _safe_segment(value: str) -> str:
@@ -181,6 +291,9 @@ class OrganizeBySizeTool(BaseTool):
 
     def execute_sync(self, source: str = "", output_root: str = "", **_: Any) -> ToolResult:
         try:
+            output_mode = "inplace" if os.path.realpath(source) == os.path.realpath(output_root) else "workspace"
+            integrity_snapshot = _integrity_snapshot_source(source)
+            _record_integrity_snapshot(output_root, source, integrity_snapshot, output_mode)
             files = _walk_files(source)
             sizes = [os.path.getsize(os.path.join(source, rel)) for rel in files]
             small_max, large_min = self._quartile_thresholds(sizes)
@@ -217,6 +330,20 @@ class OrganizeBySizeTool(BaseTool):
                     bucket_section_title="Size buckets",
                 ),
             )
+            integrity_errors = _integrity_audit(
+                source=source,
+                output_root=output_root,
+                snapshot=integrity_snapshot,
+                output_mode=output_mode,
+            )
+            if integrity_errors:
+                return ToolResult(
+                    output="",
+                    error=(
+                        "organize_by_size: integrity check failed: "
+                        + "; ".join(integrity_errors)
+                    ),
+                )
             return ToolResult(output=json.dumps({
                 "dimension": "size",
                 "entries": entries,
@@ -296,6 +423,9 @@ class OrganizeByTypeTool(BaseTool):
 
     def execute_sync(self, source: str = "", output_root: str = "", **_: Any) -> ToolResult:
         try:
+            output_mode = "inplace" if os.path.realpath(source) == os.path.realpath(output_root) else "workspace"
+            integrity_snapshot = _integrity_snapshot_source(source)
+            _record_integrity_snapshot(output_root, source, integrity_snapshot, output_mode)
             files = _walk_files(source)
             entries: list[dict[str, str]] = []
             for rel in files:
@@ -325,6 +455,20 @@ class OrganizeByTypeTool(BaseTool):
                     entries=entries,
                 ),
             )
+            integrity_errors = _integrity_audit(
+                source=source,
+                output_root=output_root,
+                snapshot=integrity_snapshot,
+                output_mode=output_mode,
+            )
+            if integrity_errors:
+                return ToolResult(
+                    output="",
+                    error=(
+                        "organize_by_type: integrity check failed: "
+                        + "; ".join(integrity_errors)
+                    ),
+                )
             return ToolResult(output=json.dumps({"dimension": "type", "entries": entries}))
         except Exception as exc:
             return ToolResult(output="", error=f"organize_by_type: {exc}")
@@ -361,6 +505,9 @@ class _TimeBucketTool(BaseTool):
 
     def execute_sync(self, source: str = "", output_root: str = "", **_: Any) -> ToolResult:
         try:
+            output_mode = "inplace" if os.path.realpath(source) == os.path.realpath(output_root) else "workspace"
+            integrity_snapshot = _integrity_snapshot_source(source)
+            _record_integrity_snapshot(output_root, source, integrity_snapshot, output_mode)
             files = _walk_files(source)
             entries: list[dict[str, str]] = []
             fallbacks: list[str] = []
@@ -420,6 +567,20 @@ class _TimeBucketTool(BaseTool):
                     assumptions=assumptions,
                 ),
             )
+            integrity_errors = _integrity_audit(
+                source=source,
+                output_root=output_root,
+                snapshot=integrity_snapshot,
+                output_mode=output_mode,
+            )
+            if integrity_errors:
+                return ToolResult(
+                    output="",
+                    error=(
+                        f"organize_by_{self.dimension_label}: integrity check failed: "
+                        + "; ".join(integrity_errors)
+                    ),
+                )
             return ToolResult(output=json.dumps({
                 "dimension": self.dimension_label,
                 "entries": entries,
@@ -471,6 +632,9 @@ class OrganizeByFilenameTool(BaseTool):
 
     def execute_sync(self, source: str = "", output_root: str = "", **_: Any) -> ToolResult:
         try:
+            output_mode = "inplace" if os.path.realpath(source) == os.path.realpath(output_root) else "workspace"
+            integrity_snapshot = _integrity_snapshot_source(source)
+            _record_integrity_snapshot(output_root, source, integrity_snapshot, output_mode)
             files = _walk_files(source)
             entries: list[dict[str, str]] = []
             for rel in files:
@@ -500,6 +664,20 @@ class OrganizeByFilenameTool(BaseTool):
                     entries=entries,
                 ),
             )
+            integrity_errors = _integrity_audit(
+                source=source,
+                output_root=output_root,
+                snapshot=integrity_snapshot,
+                output_mode=output_mode,
+            )
+            if integrity_errors:
+                return ToolResult(
+                    output="",
+                    error=(
+                        "organize_by_filename: integrity check failed: "
+                        + "; ".join(integrity_errors)
+                    ),
+                )
             return ToolResult(output=json.dumps({"dimension": "filename", "entries": entries}))
         except Exception as exc:
             return ToolResult(output="", error=f"organize_by_filename: {exc}")
