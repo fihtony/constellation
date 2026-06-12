@@ -344,11 +344,10 @@ def _dispatch_office_task_via_launcher(
         message_parts=[{"text": task_description}],
         metadata=metadata,
         timeout=_office_dispatch_timeout(),
-        # Office is a single-shot document task — spawn a fresh
-        # container per call and tear it down as soon as the A2A
-        # request completes. There is no review/revision cycle that
-        # would benefit from reusing the container.
-        preserve_instance=False,
+        # Preserve the per-task Office instance so an INPUT_REQUIRED
+        # clarification round can be resumed on the same agent instead
+        # of launching a second Office container for the same task.
+        preserve_instance=True,
         launch_overrides={
             "env": mount_plan["env"],
             "extra_binds": mount_plan["extra_binds"],
@@ -382,6 +381,16 @@ def _dispatch_office_task_via_launcher(
             if text:
                 question = str(text).strip()
                 break
+    launch_info = result.get("_launch") if isinstance(result, dict) else {}
+    office_session = {}
+    if isinstance(launch_info, dict):
+        office_session = {
+            "task_id": task.get("id", ""),
+            "service_url": launch_info.get("serviceUrl", ""),
+            "container_name": launch_info.get("containerName", ""),
+            "agent_id": launch_info.get("agentId", "office"),
+        }
+
     return {
         "status": status,
         "state": task_state,
@@ -389,16 +398,8 @@ def _dispatch_office_task_via_launcher(
         "summary": summary,
         "question": question,
         "needs_clarification": needs_clarification or {},
-        # Surface the per-task office launch URL so the compass can
-        # forward a cancel request to the running container even when
-        # ``preserve_instance=False`` (the container is torn down in the
-        # ``finally`` of ``dispatch_via_launcher`` once the message-send
-        # returns, but the URL remains valid for the duration of the
-        # call).  The field is also useful for debugging.
-        "office_service_url": (
-            (result.get("_launch") or {}).get("serviceUrl")
-            if isinstance(result, dict) else ""
-        ),
+        "office_service_url": office_session.get("service_url", ""),
+        "office_session": office_session,
     }
 
 # ---------------------------------------------------------------------------

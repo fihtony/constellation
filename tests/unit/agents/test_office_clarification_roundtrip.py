@@ -13,8 +13,8 @@ crosses three layers:
 3. ``agents.compass.agent.OfficeAgent.CompassAgent.handle_message``
    detects the same state on the office dispatch result and pauses its
    own task with a user-facing question.  When the user replies, the
-   ``resume_task`` branch validates the reply and re-dispatches office
-   with the chosen dimension.
+   ``resume_task`` branch validates the reply and forwards it to the
+   same waiting office agent session.
 
 The compass helpers under test (the new ones) are:
 
@@ -30,12 +30,14 @@ import asyncio
 import json
 import os
 import sys
-from unittest.mock import MagicMock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from framework.agent import AgentServices
 from framework.a2a.protocol import TaskState
+from framework.checkpoint import InMemoryCheckpointer
 from framework.task_store import InMemoryTaskStore
 
 
@@ -198,6 +200,86 @@ def test_office_handle_message_pauses_task_on_clarification(monkeypatch, tmp_pat
     assert "Office organize needs a grouping dimension." in message.text()
 
 
+def test_office_resume_task_reuses_same_task_with_updated_metadata(monkeypatch, tmp_path):
+    """OfficeAgent.resume_task should continue the existing office task.
+
+    The task id must stay the same and the rebuilt workflow state must
+    carry the resolved organizeGroupBy metadata instead of creating a
+    brand new office task / container cycle.
+    """
+    monkeypatch.setenv("OFFICE_SOURCE_ROOT", str(tmp_path))
+    monkeypatch.setenv("OFFICE_WORKSPACE_ROOT", str(tmp_path / "ws"))
+    monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    from agents.office.agent import OfficeAgent, office_definition
+
+    task_store = InMemoryTaskStore()
+    agent = OfficeAgent(
+        definition=office_definition,
+        services=_agent_services(task_store=task_store),
+    )
+    asyncio.run(agent.start())
+    assert agent._compiled_workflow is not None
+
+    captured: dict[str, object] = {}
+
+    async def _fake_invoke(state, config):
+        captured["task_id"] = state.get("_task_id")
+        captured["organize_dimension"] = state.get("organize_dimension")
+        return {
+            "summary": "organized by size",
+            "success": True,
+            "capability": "organize",
+            "output_mode": "workspace",
+        }
+
+    agent._compiled_workflow.invoke = _fake_invoke  # type: ignore[assignment]
+
+    request_metadata = {
+        "source_paths": ["/tmp/some/folder"],
+        "capability": "organize",
+        "output_mode": "workspace",
+        "executionContract": _make_execution_contract().to_dict(),
+    }
+    task = task_store.create_task(
+        agent_id=office_definition.agent_id,
+        task_id="office-task-clarify-1",
+        metadata={
+            "user_text": "please organize this folder",
+            "source_paths": ["/tmp/some/folder"],
+            "capability": "organize",
+            "output_mode": "workspace",
+            "callback_url": "",
+            "request_metadata": request_metadata,
+        },
+    )
+    task_store.pause_task(
+        task.id,
+        question="Office organize needs a grouping dimension.",
+        interrupt_metadata={
+            "kind": "office_clarification",
+            "needs_clarification": {
+                "missing": "organizeGroupBy",
+                "options": [
+                    {"id": "size", "label": "size"},
+                    {"id": "type", "label": "type"},
+                ],
+                "user_message": "Office organize needs a grouping dimension.",
+            },
+        },
+    )
+
+    result = asyncio.run(agent.resume_task(task.id, "size"))
+
+    assert result["task"]["id"] == task.id
+    assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+    assert captured["task_id"] == task.id
+    assert captured["organize_dimension"] == "size"
+    persisted = task_store.get_task(task.id)
+    assert persisted is not None
+    assert persisted.metadata["request_metadata"]["organizeGroupBy"] == "size"
+
+
 # ---------------------------------------------------------------------------
 # Compass helpers
 # ---------------------------------------------------------------------------
@@ -254,6 +336,60 @@ def test_compass_office_dispatch_awaiting_input_helper():
         "status": "error",
         "state": "TASK_STATE_FAILED",
     })
+
+
+def test_compass_office_task_to_dispatch_data_maps_resume_input_required_response():
+    from agents.compass.agent import _office_task_to_dispatch_data
+
+    reply_contract = {
+        "schema_version": 1,
+        "kind": "approve_or_modify",
+        "reask_message": "Please reply with `approve` or `modify: <change>`.",
+    }
+    office_response = {
+        "task": {
+            "id": "office-task-1",
+            "status": {
+                "state": "TASK_STATE_INPUT_REQUIRED",
+                "message": {
+                    "parts": [{"text": "Review the drafted plan and reply approve."}],
+                },
+            },
+            "artifacts": [
+                {
+                    "parts": [{"text": "Office drafted an organize plan."}],
+                    "metadata": {},
+                }
+            ],
+            "metadata": {
+                "_interrupt": {
+                    "needs_clarification": {
+                        "missing": "organizeCustomPlan",
+                        "user_message": "Review the drafted plan and reply approve.",
+                        "reply_contract": reply_contract,
+                    }
+                }
+            },
+        }
+    }
+
+    out = _office_task_to_dispatch_data(
+        office_response,
+        {
+            "task_id": "office-task-1",
+            "service_url": "http://office-live:8040",
+            "container_name": "office-task-live",
+            "agent_id": "office",
+        },
+    )
+
+    assert out["status"] == "input-required"
+    assert out["state"] == "TASK_STATE_INPUT_REQUIRED"
+    assert out["taskId"] == "office-task-1"
+    assert out["summary"] == "Office drafted an organize plan."
+    assert out["question"] == "Review the drafted plan and reply approve."
+    assert out["needs_clarification"]["missing"] == "organizeCustomPlan"
+    assert out["needs_clarification"]["reply_contract"] == reply_contract
 
 
 def test_compass_office_interrupt_kind_for_organize_dimension():
@@ -504,19 +640,22 @@ def test_dispatch_office_task_via_launcher_returns_completed_when_no_clarificati
 # ---------------------------------------------------------------------------
 
 
-def test_compass_resume_task_for_organize_dimension_re_dispatches(monkeypatch, tmp_path):
-    """End-to-end: when the user replies with a valid dimension after the
-    office clarification round-trip, ``resume_task`` must promote the
-    task back to WORKING and re-dispatch office with the dimension
-    attached in the A2A metadata.
+def test_compass_resume_task_for_organize_dimension_forwards_to_same_office_session(
+    monkeypatch, tmp_path
+):
+    """A valid organize reply must be forwarded to the existing office session.
+
+    Compass must not launch a second office agent for the same task.
     """
     from agents.compass.agent import CompassAgent, compass_definition
     from framework.task_store import InMemoryTaskStore
 
     task_store = InMemoryTaskStore()
+    event_store = MagicMock()
+    event_store.append = AsyncMock()
     services = AgentServices(
         session_service=MagicMock(),
-        event_store=MagicMock(),
+        event_store=event_store,
         memory_service=MagicMock(),
         skills_registry=MagicMock(),
         plugin_manager=MagicMock(),
@@ -529,8 +668,10 @@ def test_compass_resume_task_for_organize_dimension_re_dispatches(monkeypatch, t
     asyncio.run(agent.start())
 
     # Pre-seed a task that is paused on the dimension clarification.
+    task_id = "task-office-session-1"
     task = task_store.create_task(
         agent_id=compass_definition.agent_id,
+        task_id=task_id,
         metadata={
             "task_type": "office",
             "user_request": "please organize this folder",
@@ -538,6 +679,12 @@ def test_compass_resume_task_for_organize_dimension_re_dispatches(monkeypatch, t
                 "capability": "organize",
                 "source_paths": ["/tmp/folder"],
                 "output_mode": "workspace",
+            },
+            "office_session": {
+                "task_id": task_id,
+                "service_url": "http://office-live:8040",
+                "container_name": "office-task-live",
+                "agent_id": "office",
             },
         },
     )
@@ -559,47 +706,45 @@ def test_compass_resume_task_for_organize_dimension_re_dispatches(monkeypatch, t
         },
     )
 
-    # Stub the office dispatch result so resume_task does not actually
-    # call into a real launcher.  We capture the office_request passed
-    # to the dispatch helper so the assertion below can verify the
-    # dimension reached the dispatch layer.
     captured: dict = {}
 
-    def _fake_dispatch_office_request(task_id, user_text, office_request, registry, log):
+    def _fake_resume_office_task(self, *, task_id, office_session, resume_value, office_request):
+        captured["task_id"] = task_id
+        captured["office_session"] = dict(office_session)
+        captured["resume_value"] = resume_value
         captured["office_request"] = dict(office_request)
-        captured["user_text"] = user_text
-        return {
-            "status": "completed",
-            "state": "TASK_STATE_COMPLETED",
-            "message": "Office task done.",
-        }
 
-    # Override the background worker to call our stub synchronously,
-    # so the captured office_request is populated before the assertion.
-    def _fake_complete_office_task(self, *, task_id, user_text, office_request):
-        registry = MagicMock()
-        log = MagicMock()
-        _fake_dispatch_office_request(task_id, user_text, office_request, registry, log)
+    class _InlineThread:
+        def __init__(self, *, target=None, kwargs=None, daemon=None, name=None):
+            self._target = target
+            self._kwargs = kwargs or {}
 
-    monkeypatch.setattr("agents.compass.agent._dispatch_office_request", _fake_dispatch_office_request)
+        def start(self):
+            if self._target:
+                self._target(**self._kwargs)
+
     monkeypatch.setattr(
-        "agents.compass.agent.CompassAgent._complete_office_task",
-        _fake_complete_office_task,
+        "agents.compass.agent.CompassAgent._resume_office_task",
+        _fake_resume_office_task,
     )
+    monkeypatch.setattr("agents.compass.agent.threading.Thread", _InlineThread)
 
     result = asyncio.run(agent.resume_task(task.id, "size"))
 
-    # The captured office_request must contain the resolved dimension so
-    # the next A2A dispatch sends ``organizeGroupBy=size`` to office.
     assert captured.get("office_request"), (
-        "resume_task should have re-dispatched office"
+        "resume_task should have forwarded to the waiting office session"
     )
     office_request = captured["office_request"]
+    assert captured["resume_value"] == "size"
+    assert captured["office_session"]["service_url"] == "http://office-live:8040"
     assert office_request.get("organize_dimension") == "size"
     assert (
         (office_request.get("organize_metadata") or {}).get("organizeGroupBy")
         == "size"
     )
+    ui = result.get("ui_update") or {}
+    assert ui.get("task_id") == task.id
+    assert ui.get("task_status") in {"TASK_STATE_WORKING", "TASK_STATE_SUBMITTED"}
 
 
 def test_compass_resume_task_for_invalid_dimension_re_asks(monkeypatch, tmp_path):
@@ -672,7 +817,7 @@ def test_compass_resume_task_for_invalid_dimension_re_asks(monkeypatch, tmp_path
     }
 
 
-def test_compass_resume_task_for_custom_plan_approve_after_reask_re_dispatches_plan(
+def test_compass_resume_task_for_custom_plan_approve_after_reask_forwards_plan_to_same_session(
     monkeypatch, tmp_path
 ):
     """If a custom-plan approval round re-asked the user first, a later
@@ -718,6 +863,11 @@ def test_compass_resume_task_for_custom_plan_approve_after_reask_re_dispatches_p
                 {"id": "modify", "label": "Modify plan"},
             ],
             "user_message": "Please reply with `approve` or `modify: <change>`.",
+            "reply_contract": {
+                "schema_version": 1,
+                "kind": "approve_or_modify",
+                "reask_message": "Please reply with `approve` or `modify: <change>`.",
+            },
         },
     }
     task = task_store.create_task(
@@ -726,6 +876,12 @@ def test_compass_resume_task_for_custom_plan_approve_after_reask_re_dispatches_p
             "task_type": "office",
             "user_request": "please organize this folder by student then month",
             "office_request": office_request,
+            "office_session": {
+                "task_id": "task-custom-plan-1",
+                "service_url": "http://office-live:8040",
+                "container_name": "office-task-live",
+                "agent_id": "office",
+            },
         },
     )
     task_store.pause_task(
@@ -744,34 +900,522 @@ def test_compass_resume_task_for_custom_plan_approve_after_reask_re_dispatches_p
                 "plan": plan,
                 "plan_path": "/tmp/custom-organize-plan.md",
                 "custom_hint": "student then month",
+                "reply_contract": {
+                    "schema_version": 1,
+                    "kind": "approve_or_modify",
+                    "reask_message": "Please reply with `approve` or `modify: <change>`.",
+                },
             },
         },
     )
 
     captured: dict = {}
 
-    def _fake_dispatch_office_request(task_id, user_text, office_request, registry, log):
+    def _fake_resume_office_task(self, *, task_id, office_session, resume_value, office_request):
+        captured["task_id"] = task_id
+        captured["office_session"] = dict(office_session)
+        captured["resume_value"] = resume_value
         captured["office_request"] = dict(office_request)
-        return {
-            "status": "completed",
-            "state": "TASK_STATE_COMPLETED",
-            "message": "Office task done.",
-        }
 
-    def _fake_complete_office_task(self, *, task_id, user_text, office_request):
-        registry = MagicMock()
-        log = MagicMock()
-        _fake_dispatch_office_request(task_id, user_text, office_request, registry, log)
+    class _InlineThread:
+        def __init__(self, *, target=None, kwargs=None, daemon=None, name=None):
+            self._target = target
+            self._kwargs = kwargs or {}
 
-    monkeypatch.setattr("agents.compass.agent._dispatch_office_request", _fake_dispatch_office_request)
+        def start(self):
+            if self._target:
+                self._target(**self._kwargs)
+
     monkeypatch.setattr(
-        "agents.compass.agent.CompassAgent._complete_office_task",
-        _fake_complete_office_task,
+        "agents.compass.agent.CompassAgent._resume_office_task",
+        _fake_resume_office_task,
     )
+    monkeypatch.setattr("agents.compass.agent.threading.Thread", _InlineThread)
 
     asyncio.run(agent.resume_task(task.id, "approve"))
 
-    assert captured.get("office_request"), "resume_task should have re-dispatched office"
+    assert captured.get("office_request"), "resume_task should forward to the same office session"
+    assert captured["resume_value"]["text"] == "approve"
+    assert captured["resume_value"]["clarification_resolution"] == {
+        "contract_kind": "approve_or_modify",
+        "action": "approve",
+        "note": "",
+    }
+    assert captured["office_session"]["service_url"] == "http://office-live:8040"
     forwarded = captured["office_request"]
-    assert forwarded.get("organize_custom_action") == "approve"
+    assert forwarded.get("clarification_resolution") == {
+        "contract_kind": "approve_or_modify",
+        "action": "approve",
+        "note": "",
+    }
     assert forwarded.get("organize_custom_plan") == plan
+
+
+def test_compass_resume_task_for_custom_plan_modify_forwards_resolution_to_same_session(
+    monkeypatch, tmp_path
+):
+    from agents.compass.agent import CompassAgent, compass_definition
+
+    task_store = InMemoryTaskStore()
+    services = AgentServices(
+        session_service=MagicMock(),
+        event_store=MagicMock(),
+        memory_service=MagicMock(),
+        skills_registry=MagicMock(),
+        plugin_manager=MagicMock(),
+        checkpoint_service=MagicMock(),
+        runtime=MagicMock(),
+        registry_client=None,
+        task_store=task_store,
+    )
+    agent = CompassAgent(definition=compass_definition, services=services)
+    asyncio.run(agent.start())
+
+    plan = {
+        "buckets": ["January - Ethan"],
+        "sample_mapping": {"one.txt": "January - Ethan"},
+        "classification_rule": "rule",
+        "rationale": "why",
+    }
+    office_request = {
+        "capability": "organize",
+        "source_paths": ["/tmp/folder"],
+        "output_mode": "workspace",
+        "organize_dimension": "__custom__",
+        "organize_metadata": {
+            "organizeGroupBy": "__custom__",
+            "customDimensionHint": "student by month",
+        },
+        "_needs_clarification": {
+            "missing": "organizeCustomPlan",
+            "options": [
+                {"id": "approve", "label": "Approve plan"},
+                {"id": "modify", "label": "Modify plan"},
+            ],
+            "user_message": "Please reply with `approve` or `modify: <change>`.",
+            "reply_contract": {
+                "schema_version": 1,
+                "kind": "approve_or_modify",
+                "reask_message": "Please reply with `approve` or `modify: <change>`.",
+            },
+        },
+    }
+    task = task_store.create_task(
+        agent_id=compass_definition.agent_id,
+        metadata={
+            "task_type": "office",
+            "user_request": "please organize this folder by student then month",
+            "office_request": office_request,
+            "office_session": {
+                "task_id": "task-custom-plan-modify-1",
+                "service_url": "http://office-live:8040",
+                "container_name": "office-task-live",
+                "agent_id": "office",
+            },
+        },
+    )
+    task_store.pause_task(
+        task.id,
+        question="Review the plan and reply.",
+        interrupt_metadata={
+            "kind": "office_organize_dimension",
+            "office_request": office_request,
+            "needs_clarification": {
+                "missing": "organizeCustomPlan",
+                "options": [
+                    {"id": "approve", "label": "Approve plan"},
+                    {"id": "modify", "label": "Modify plan"},
+                ],
+                "user_message": "Review the plan and reply.",
+                "plan": plan,
+                "plan_path": "/tmp/custom-organize-plan.md",
+                "custom_hint": "student by month",
+                "reply_contract": {
+                    "schema_version": 1,
+                    "kind": "approve_or_modify",
+                    "reask_message": "Please reply with `approve` or `modify: <change>`.",
+                },
+            },
+        },
+    )
+
+    captured: dict[str, Any] = {}
+
+    def _fake_resume_office_task(self, *, task_id, office_session, resume_value, office_request):
+        captured["task_id"] = task_id
+        captured["office_session"] = dict(office_session)
+        captured["resume_value"] = resume_value
+        captured["office_request"] = dict(office_request)
+
+    class _InlineThread:
+        def __init__(self, *, target=None, kwargs=None, daemon=None, name=None):
+            self._target = target
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            if self._target:
+                self._target(**self._kwargs)
+
+    monkeypatch.setattr(
+        "agents.compass.agent.CompassAgent._resume_office_task",
+        _fake_resume_office_task,
+    )
+    monkeypatch.setattr("agents.compass.agent.threading.Thread", _InlineThread)
+
+    reply = (
+        "modify: create two level folder, first level folder use student name as "
+        "folder name, under each student name folder, then create sub-folder "
+        "using month name"
+    )
+    asyncio.run(agent.resume_task(task.id, reply))
+
+    assert captured["resume_value"]["text"] == reply
+    assert captured["resume_value"]["clarification_resolution"] == {
+        "contract_kind": "approve_or_modify",
+        "action": "modify",
+        "note": (
+            "create two level folder, first level folder use student name as "
+            "folder name, under each student name folder, then create sub-folder "
+            "using month name"
+        ),
+    }
+    forwarded = captured["office_request"]
+    assert forwarded["clarification_resolution"]["action"] == "modify"
+    assert forwarded["organize_custom_modify_note"].startswith("create two level folder")
+    assert forwarded["organize_custom_plan"] == plan
+
+
+def test_office_resume_task_prefers_structured_clarification_resolution(monkeypatch, tmp_path):
+    monkeypatch.setenv("OFFICE_SOURCE_ROOT", str(tmp_path))
+    monkeypatch.setenv("OFFICE_WORKSPACE_ROOT", str(tmp_path / "ws"))
+    monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    from agents.office.agent import OfficeAgent, office_definition
+
+    task_store = InMemoryTaskStore()
+    agent = OfficeAgent(
+        definition=office_definition,
+        services=_agent_services(task_store=task_store),
+    )
+    asyncio.run(agent.start())
+
+    captured: dict[str, Any] = {}
+
+    def _fake_execute(*, state, **kwargs):
+        captured["state"] = dict(state)
+        task_store.complete_task(
+            "office-task-contract-1",
+            artifacts=[],
+            message="done",
+        )
+        return task_store.get_task_dict("office-task-contract-1")
+
+    monkeypatch.setattr(agent, "_execute_office_workflow", _fake_execute)
+
+    request_metadata = {
+        "organizeGroupBy": "__custom__",
+        "customDimensionHint": "student then month",
+        "executionContract": _make_execution_contract().to_dict(),
+    }
+    task = task_store.create_task(
+        agent_id=office_definition.agent_id,
+        task_id="office-task-contract-1",
+        metadata={
+            "user_text": "please organize this folder",
+            "source_paths": ["/tmp/some/folder"],
+            "capability": "organize",
+            "output_mode": "workspace",
+            "callback_url": "",
+            "request_metadata": request_metadata,
+        },
+    )
+    task_store.pause_task(
+        task.id,
+        question="Review the drafted plan and reply approve.",
+        interrupt_metadata={
+            "kind": "office_clarification",
+            "needs_clarification": {
+                "missing": "organizeCustomPlan",
+                "plan": {"buckets": ["alpha"]},
+                "reply_contract": {
+                    "schema_version": 1,
+                    "kind": "approve_or_modify",
+                    "reask_message": "Please reply with `approve` or `modify: <change>`.",
+                },
+            },
+        },
+    )
+
+    asyncio.run(agent.resume_task(task.id, {
+        "text": "approve",
+        "clarification_resolution": {
+            "contract_kind": "approve_or_modify",
+            "action": "approve",
+            "note": "",
+        },
+    }))
+
+    assert captured["state"]["organize_custom_action"] == "approve"
+
+
+def test_office_resume_task_modify_replans_and_returns_revised_question(monkeypatch, tmp_path):
+    monkeypatch.setenv("OFFICE_SOURCE_ROOT", str(tmp_path))
+    monkeypatch.setenv("OFFICE_WORKSPACE_ROOT", str(tmp_path / "ws"))
+    monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    from agents.office.agent import OfficeAgent, office_definition
+
+    task_store = InMemoryTaskStore()
+    runtime = MagicMock()
+    revised_plan = {
+        "buckets": ["Ethan/January"],
+        "sample_mapping": {"one.txt": "Ethan/January"},
+        "classification_rule": "Group by student, then month.",
+        "rationale": "revised",
+    }
+    runtime.run.return_value = {
+        "summary": json.dumps(revised_plan),
+        "raw_response": json.dumps(revised_plan),
+    }
+    plugin_manager = MagicMock()
+    plugin_manager.fire = AsyncMock()
+    event_store = MagicMock()
+    event_store.append = AsyncMock()
+    services = AgentServices(
+        session_service=MagicMock(),
+        event_store=event_store,
+        memory_service=MagicMock(),
+        skills_registry=MagicMock(),
+        plugin_manager=plugin_manager,
+        checkpoint_service=InMemoryCheckpointer(),
+        runtime=runtime,
+        registry_client=None,
+        task_store=task_store,
+    )
+    agent = OfficeAgent(
+        definition=office_definition,
+        services=services,
+    )
+    asyncio.run(agent.start())
+
+    request_metadata = {
+        "organizeGroupBy": "__custom__",
+        "customDimensionHint": "student by month",
+        "source_paths": [str(tmp_path)],
+        "capability": "organize",
+        "output_mode": "workspace",
+        "executionContract": _make_execution_contract().to_dict(),
+    }
+    task = task_store.create_task(
+        agent_id=office_definition.agent_id,
+        task_id="office-task-contract-modify-1",
+        metadata={
+            "user_text": "please organize this folder by student by month",
+            "source_paths": [str(tmp_path)],
+            "capability": "organize",
+            "output_mode": "workspace",
+            "callback_url": "",
+            "request_metadata": request_metadata,
+        },
+    )
+    task_store.pause_task(
+        task.id,
+        question="Review the drafted plan and reply approve.",
+        interrupt_metadata={
+            "kind": "office_clarification",
+            "needs_clarification": {
+                "missing": "organizeCustomPlan",
+                "plan": {
+                    "buckets": ["January - Ethan"],
+                    "sample_mapping": {"one.txt": "January - Ethan"},
+                    "classification_rule": "Group by month and student.",
+                    "rationale": "original",
+                },
+                "custom_hint": "student by month",
+                "reply_contract": {
+                    "schema_version": 1,
+                    "kind": "approve_or_modify",
+                    "reask_message": "Please reply with `approve` or `modify: <change>`.",
+                },
+            },
+        },
+    )
+
+    result = asyncio.run(agent.resume_task(task.id, {
+        "text": (
+            "modify: create two level folder, first level folder use student "
+            "name as folder name, under each student name folder, then create "
+            "sub-folder using month name"
+        ),
+        "clarification_resolution": {
+            "contract_kind": "approve_or_modify",
+            "action": "modify",
+            "note": (
+                "create two level folder, first level folder use student "
+                "name as folder name, under each student name folder, then "
+                "create sub-folder using month name"
+            ),
+        },
+    }))
+
+    resumed = result["task"]
+    assert resumed["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+    question = resumed["status"]["message"]["parts"][0]["text"]
+    assert "revised an organize plan" in question
+    interrupt = resumed["metadata"]["_interrupt"]["needs_clarification"]
+    assert interrupt["plan"] == revised_plan
+
+
+# ---------------------------------------------------------------------------
+# Regression: a re-dispatched handle_message with a modify request must
+# not be silently swallowed by a stale workflow checkpoint.
+# ---------------------------------------------------------------------------
+
+
+def test_office_handle_message_modify_redispatch_uses_new_state(monkeypatch, tmp_path):
+    """When a paused organize plan is re-dispatched via handle_message
+    (the path compass uses when there is no live office session), the
+    new ``organizeCustomAction`` / ``organizeCustomModifyNote`` must
+    reach the planner.  The previous behaviour was for the workflow
+    checkpoint from the first run to short-circuit the second run,
+    so the user was re-prompted with the old plan instead of the
+    revised one.
+    """
+    monkeypatch.setenv("OFFICE_SOURCE_ROOT", str(tmp_path))
+    monkeypatch.setenv("OFFICE_WORKSPACE_ROOT", str(tmp_path / "ws"))
+    monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    from agents.office.agent import OfficeAgent, office_definition
+
+    task_store = InMemoryTaskStore()
+    checkpointer = InMemoryCheckpointer()
+    runtime = MagicMock()
+    original_plan = {
+        "buckets": ["January - Ethan"],
+        "sample_mapping": {"one.txt": "January - Ethan"},
+        "classification_rule": "Group by month and student.",
+        "rationale": "original",
+    }
+    revised_plan = {
+        "buckets": ["Ethan/January"],
+        "sample_mapping": {"one.txt": "Ethan/January"},
+        "classification_rule": "Group by student, then month.",
+        "rationale": "revised",
+    }
+    runtime.run.side_effect = [
+        {
+            "summary": json.dumps(original_plan),
+            "raw_response": json.dumps(original_plan),
+        },
+        {
+            "summary": json.dumps(revised_plan),
+            "raw_response": json.dumps(revised_plan),
+        },
+    ]
+    plugin_manager = MagicMock()
+    plugin_manager.fire = AsyncMock()
+    event_store = MagicMock()
+    event_store.append = AsyncMock()
+    services = AgentServices(
+        session_service=MagicMock(),
+        event_store=event_store,
+        memory_service=MagicMock(),
+        skills_registry=MagicMock(),
+        plugin_manager=plugin_manager,
+        checkpoint_service=checkpointer,
+        runtime=runtime,
+        registry_client=None,
+        task_store=task_store,
+    )
+    agent = OfficeAgent(
+        definition=office_definition,
+        services=services,
+    )
+    asyncio.run(agent.start())
+
+    base_metadata = {
+        "organizeGroupBy": "__custom__",
+        "customDimensionHint": "student by month",
+        "source_paths": [str(tmp_path)],
+        "capability": "organize",
+        "outputMode": "workspace",
+        "executionContract": _make_execution_contract().to_dict(),
+        "compassTaskId": "office-task-modify-redispatch",
+    }
+
+    # First dispatch: planner produces the original plan and the office
+    # task pauses for user approval.
+    first = asyncio.run(agent.handle_message(_build_message(base_metadata)))
+    first_task = first["task"]
+    first_task_id = first_task["id"]
+    _wait_for_task_state(task_store, first_task_id, TaskState.INPUT_REQUIRED)
+    assert runtime.run.call_count == 1
+
+    # Second dispatch: same task id, but compass forwards the user's
+    # modify reply.  The planner must be called again with the
+    # modify note, and the revised plan must be the one the user is
+    # asked to approve.
+    modify_metadata = dict(base_metadata)
+    modify_metadata["organizeCustomAction"] = "modify"
+    modify_metadata["organizeCustomPlan"] = dict(original_plan)
+    modify_metadata["organizeCustomModifyNote"] = (
+        "create two level folder, first level folder use student name as "
+        "folder name, under each student name folder, then create "
+        "sub-folder using month name"
+    )
+    second = asyncio.run(agent.handle_message(_build_message(modify_metadata)))
+    second_task = second["task"]
+    _wait_for_task_state(task_store, first_task_id, TaskState.INPUT_REQUIRED)
+    refreshed = task_store.get_task_dict(first_task_id)["task"]
+    # The planner must have been called a second time with the modify note.
+    assert runtime.run.call_count == 2
+    second_call_prompt = runtime.run.call_args_list[1].args[0]
+    assert "create two level folder" in second_call_prompt
+    interrupt = refreshed["metadata"]["_interrupt"]["needs_clarification"]
+    assert interrupt["plan"] == revised_plan
+    question = refreshed["status"]["message"]["parts"][0]["text"]
+    assert "revised an organize plan" in question
+
+
+def _wait_for_task_state(task_store, task_id, expected_state, *, timeout: float = 5.0):
+    """Poll the task store until the task reaches ``expected_state`` or
+    ``timeout`` seconds elapse.  The office workflow runs in a
+    background thread, so the test needs to wait for it.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        task = task_store.get_task(task_id)
+        if task is not None:
+            state_value = getattr(task.status.state, "value", str(task.status.state))
+            if state_value == expected_state.value:
+                return
+            if state_value in {
+                TaskState.COMPLETED.value,
+                TaskState.FAILED.value,
+                TaskState.CANCELLED.value,
+            }:
+                break
+        time.sleep(0.05)
+    task = task_store.get_task(task_id)
+    actual = (
+        getattr(task.status.state, "value", str(task.status.state))
+        if task is not None
+        else None
+    )
+    raise AssertionError(
+        f"Task {task_id} did not reach {expected_state.value!r} "
+        f"within {timeout}s (actual: {actual!r})"
+    )
+
+
+def _build_message(metadata: dict) -> dict:
+    return {
+        "message": {
+            "parts": [
+                {"text": "please organize this folder by student by month"},
+            ],
+            "metadata": dict(metadata),
+        },
+    }

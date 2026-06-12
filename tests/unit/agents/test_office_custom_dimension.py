@@ -327,3 +327,103 @@ def test_modify_phase_replans_with_revision_note(tmp_path):
     prompt = runtime.prompts[0]
     assert "student folder first" in prompt
     assert "Alice-January" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: nested-bucket execution
+# ---------------------------------------------------------------------------
+
+
+def test_execution_phase_materializes_nested_bucket_paths(tmp_path):
+    """Phase 2 must materialize the approved plan's bucket names
+    verbatim.  When the plan expresses a two-level layout such as
+    ``Yan/January`` (student name / month), the executor must create
+    ``<output>/Yan/January/...`` and not collapse the slash into a
+    single ``<output>/Yan_January/...`` directory.
+    """
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "yan_jan.txt").write_text(">>> Student Yan\nJanuary essay\n")
+    (src / "liam_jan.txt").write_text(">>> Student Liam\nJanuary essay\n")
+    (src / "ethan_jan.txt").write_text(">>> Student Ethan\nJanuary essay\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    approved_plan = {
+        "buckets": ["Yan/January", "Liam/January", "Ethan/January"],
+        "sample_mapping": {
+            "yan_jan.txt": "Yan/January",
+            "liam_jan.txt": "Liam/January",
+        },
+        "classification_rule": "Group by student, then month, with a slash.",
+        "rationale": "Two-level hierarchy: student / month.",
+    }
+    runtime = _runtime_with_plan_response(
+        plan=approved_plan,
+        mapping={"ethan_jan.txt": "Ethan/January"},
+    )
+    state = _organize_state(
+        source=str(src),
+        artifacts_dir=str(artifacts),
+        approved_plan=approved_plan,
+    )
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "completed"
+    assert result["success"] is True
+
+    output_root = artifacts / "organized-output" / "files"
+    # Nested directory layout must exist for every bucket.
+    for fname, bucket in [
+        ("yan_jan.txt", "Yan/January"),
+        ("liam_jan.txt", "Liam/January"),
+        ("ethan_jan.txt", "Ethan/January"),
+    ]:
+        target = output_root / bucket / fname
+        assert target.exists(), (
+            f"missing nested materialized file: {target}  "
+            f"(bucket {bucket!r} was collapsed instead of nested)"
+        )
+    # The collapsed single-segment layout must NOT exist.
+    assert not (output_root / "Yan_January").exists(), (
+        "bucket slash was collapsed into an underscore; "
+        "the executor ignored the nested path from the approved plan"
+    )
+
+    # The final organization plan must report the nested destination.
+    plan_text = (artifacts / "organization-plan.md").read_text()
+    assert "Yan/January" in plan_text
+    # The destination column must show the nested path, not the
+    # sanitized single-segment form.
+    assert "Yan_January/" not in plan_text
+
+
+def test_safe_path_segment_preserves_nested_paths():
+    """The path sanitizer used by the custom-dimension executor must
+    treat ``/`` as a path separator, not a character to flatten.
+    A single-segment name still goes through the same sanitizer so
+    existing plans keep working.
+    """
+    from agents.office.office_tools import _safe_path_segment
+
+    # Nested paths are preserved.
+    assert _safe_path_segment("Yan/January") == "Yan/January"
+    assert _safe_path_segment("Ethan/April/2026") == "Ethan/April/2026"
+    # Whitespace inside a segment is collapsed to underscore, but the
+    # hierarchy stays.
+    assert _safe_path_segment("Yan / January") == "Yan/January"
+    # Backslashes also count as path separators (Windows-friendly).
+    assert _safe_path_segment(r"Ethan\January") == "Ethan/January"
+    # A single-segment name without slashes is still sanitized as
+    # before — dots survive and trailing underscores are stripped
+    # (matches the original behaviour for the built-in dimensions).
+    assert _safe_path_segment("v1.2") == "v1.2"
+    # Empty / whitespace input falls back to ``"unknown"`` so the
+    # executor never writes into the output root by accident.
+    assert _safe_path_segment("") == "unknown"
+    assert _safe_path_segment("   ") == "unknown"
+    # Leading / trailing slashes do not produce empty segments.
+    assert _safe_path_segment("/Yan/January/") == "Yan/January"

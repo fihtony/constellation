@@ -40,6 +40,11 @@ from framework.major_step import (
     LIFECYCLE_WAITING_FOR_USER,
     record_major_step,
 )
+from framework.clarification_reply import (
+    build_approve_or_modify_contract,
+    build_select_option_contract,
+    resolve_reply,
+)
 from agents.compass.ui.routes import handle_ui_request
 from agents.compass.tools import TOOL_NAMES, register_compass_tools
 from framework.office.dimensions import VALID_DIMENSIONS, parse_dimension
@@ -317,10 +322,14 @@ def _resolve_office_resume_reply(
         # re-validated as a dimension — it is a plan action.
         existing_needs = (office_request.get("_needs_clarification") or {})
         if existing_needs.get("missing") == "organizeCustomPlan":
-            approval = _normalize_custom_plan_approval(reply)
-            if not approval:
-                question = (
-                    "Please reply with `approve` to execute the plan, "
+            reply_contract = dict(existing_needs.get("reply_contract") or {})
+            if not reply_contract:
+                reply_contract = build_approve_or_modify_contract()
+            resolved = resolve_reply(reply_contract, reply)
+            if not resolved.get("ok"):
+                question = str(
+                    resolved.get("reask_message")
+                    or "Please reply with `approve` to execute the plan, "
                     "or `modify: <change>` to revise it."
                 )
                 preserved = dict(existing_needs)
@@ -331,11 +340,20 @@ def _resolve_office_resume_reply(
                         {"id": "modify", "label": "Modify plan"},
                     ],
                     "user_message": question,
+                    "reply_contract": reply_contract,
                 })
                 return {
                     "error_question": question,
                     "needs_clarification": preserved,
                 }
+            normalized = dict(resolved.get("normalized") or {})
+            approval = str(normalized.get("action") or "").strip()
+            note = str(normalized.get("note") or "").strip()
+            office_request["clarification_resolution"] = {
+                "contract_kind": "approve_or_modify",
+                "action": approval,
+                "note": note,
+            }
             office_request["organize_custom_action"] = approval
             plan = dict(existing_needs.get("plan") or {})
             if approval == "approve":
@@ -348,8 +366,16 @@ def _resolve_office_resume_reply(
             if approval == "modify":
                 if plan:
                     office_request["organize_custom_plan"] = plan
-                office_request["organize_custom_modify_note"] = reply
-            return {"office_request": office_request}
+                office_request["organize_custom_modify_note"] = note or reply
+            return {
+                "office_request": office_request,
+                "resume_payload": {
+                    "text": reply,
+                    "clarification_resolution": dict(
+                        office_request["clarification_resolution"]
+                    ),
+                },
+            }
 
         dimension = _normalize_organize_dimension(reply)
         if not dimension:
@@ -379,11 +405,25 @@ def _resolve_office_resume_reply(
         return {"office_request": office_request}
 
     if kind == "office_output_mode":
-        output_mode = _normalize_output_mode(reply)
-        if not output_mode:
+        contract = build_select_option_contract(
+            [
+                {"id": "workspace", "label": "workspace"},
+                {"id": "inplace", "label": "inplace", "aliases": ["in place"]},
+            ],
+            reask_message=(
+                "Please reply with `workspace` or `inplace` so I can route the "
+                "office task correctly."
+            ),
+        )
+        resolved = resolve_reply(contract, reply)
+        output_mode = str(
+            (resolved.get("normalized") or {}).get("selection") or ""
+        ).strip()
+        if not resolved.get("ok") or not output_mode:
             return {
-                "error_question": (
-                    "Please reply with `workspace` or `inplace` so I can route the "
+                "error_question": str(
+                    resolved.get("reask_message")
+                    or "Please reply with `workspace` or `inplace` so I can route the "
                     "office task correctly."
                 ),
             }
@@ -1152,6 +1192,77 @@ def _dispatch_office_request(task_id: str, user_text: str, office_request: dict,
     return dispatch_data
 
 
+def _office_session_from_metadata(metadata: dict[str, Any] | None, task_id: str) -> dict[str, Any]:
+    metadata = metadata or {}
+    session = metadata.get("office_session") or {}
+    if isinstance(session, dict) and session.get("service_url"):
+        merged = dict(session)
+        merged.setdefault("task_id", task_id)
+        merged.setdefault("agent_id", "office")
+        return merged
+    office_service_url = str(metadata.get("office_service_url") or "").strip()
+    if not office_service_url:
+        return {}
+    return {
+        "task_id": task_id,
+        "service_url": office_service_url,
+        "container_name": str(metadata.get("office_container_name") or "").strip(),
+        "agent_id": "office",
+    }
+
+
+def _office_task_to_dispatch_data(
+    office_response: dict[str, Any],
+    office_session: dict[str, Any],
+) -> dict[str, Any]:
+    task = office_response.get("task", office_response)
+    if not isinstance(task, dict):
+        task = {}
+    task_state = str((task.get("status") or {}).get("state") or "").strip()
+    artifacts = task.get("artifacts") or []
+    summary = _extract_text(artifacts) or _extract_status_text(task) or "Task completed."
+    status = "completed" if task_state == "TASK_STATE_COMPLETED" else (
+        "input-required" if task_state == "TASK_STATE_INPUT_REQUIRED" else "error"
+    )
+    interrupt_metadata = task.get("metadata", {}).get("_interrupt") or {}
+    needs_clarification = (
+        interrupt_metadata.get("needs_clarification")
+        if isinstance(interrupt_metadata, dict) else None
+    )
+    question = ""
+    if isinstance(needs_clarification, dict):
+        question = str(needs_clarification.get("user_message") or "").strip()
+    if not question:
+        question = _extract_status_text(task)
+    return {
+        "status": status,
+        "state": task_state,
+        "taskId": task.get("id", ""),
+        "summary": summary,
+        "message": summary,
+        "question": question,
+        "needs_clarification": needs_clarification or {},
+        "office_service_url": str(office_session.get("service_url") or "").strip(),
+        "office_session": dict(office_session or {}),
+    }
+
+
+def _extract_text(artifacts: list[dict]) -> str:
+    for art in artifacts:
+        for part in art.get("parts", []):
+            if "text" in part:
+                return part["text"]
+    return ""
+
+
+def _extract_status_text(task: dict) -> str:
+    parts = task.get("status", {}).get("message", {}).get("parts", [])
+    for part in parts:
+        if "text" in part:
+            return part["text"]
+    return ""
+
+
 def _development_start_message(jira_key: str) -> str:
     jira_label = jira_key or "N/A"
     return (
@@ -1639,6 +1750,15 @@ class CompassAgent(BaseAgent):
                     or _office_clarification_default_question(clarification_payload)
                 )
                 interrupt_kind = _office_interrupt_kind(office_request, clarification_payload)
+                office_session = dispatch_data.get("office_session") or {}
+                session_delta = {}
+                if isinstance(office_session, dict) and office_session.get("service_url"):
+                    session_delta["office_session"] = dict(office_session)
+                    session_delta["office_service_url"] = office_session.get("service_url", "")
+                    if office_session.get("container_name"):
+                        session_delta["office_container_name"] = office_session.get("container_name", "")
+                if session_delta:
+                    task_store.update_metadata(task.id, session_delta)
                 task_store.pause_task(
                     task.id,
                     question=clarification_question,
@@ -1714,6 +1834,9 @@ class CompassAgent(BaseAgent):
                     lifecycle_state=LIFECYCLE_DONE,
                     summary_template="Office delivered the report to Compass.",
                 )
+            office_session = dispatch_data.get("office_session") or {}
+            if isinstance(office_session, dict) and office_session.get("service_url"):
+                self._ack_and_cleanup_office_session(task.id, office_session)
 
         else:
             # General conversational task — use LLM for a direct answer
@@ -1975,6 +2098,7 @@ class CompassAgent(BaseAgent):
 
         # Reply validated; merge any updates into office_request.
         office_request = dict(resolution.get("office_request") or office_request)
+        forwarded_resume_value = resolution.get("resume_payload", str(resume_value))
         output_mode = str(office_request.get("output_mode") or "workspace")
         task_store.update_metadata(task_id, {"office_request": office_request})
         # A2: Compass writes ``resuming`` on the existing user-input row before
@@ -2007,29 +2131,65 @@ class CompassAgent(BaseAgent):
         )
         log.info("office output mode selected", output_mode=output_mode)
 
-        # Fire-and-forget: spawn a daemon worker to run the actual office
-        # dispatch and finalize the task state.  Returning WORKING immediately
-        # unblocks the HTTP request so the UI can show "In Progress" without
-        # blocking on a 5+ minute office roundtrip.  Mirrors the
-        # `_complete_development_task` pattern used for development tasks
-        # further up in this file.
-        user_text = str(metadata.get("user_request") or "")
+        # Fire-and-forget:
+        # - if an Office session already exists, forward the reply to the
+        #   same waiting Office agent;
+        # - otherwise this clarification happened before the first Office
+        #   launch (for example output-mode or pre-dispatch dimension
+        #   selection), so Compass must launch Office now.
+        office_session = _office_session_from_metadata(metadata, task_id)
+        has_live_office_session = bool(office_session)
+        if not has_live_office_session:
+            timeout_meta = metadata.get("last_child_timeout") or {}
+            if timeout_meta:
+                timeout_message = (
+                    "The waiting Office agent timed out before the reply arrived. "
+                    "This task can no longer resume on the same Office session."
+                )
+                task_store.fail_task(task_id, timeout_message)
+                return task_store.get_task_dict(task_id)
+
         office_artifact_metadata = {"agentId": self.definition.agent_id, "outputMode": output_mode}
 
         # Seed a "dispatching" artifact so the chat pane shows progress text
         # before the background worker finishes.
-        dispatching_text = (
-            f"Office task accepted with output mode: `{output_mode}`. "
-            f"Compass is dispatching the request to the office agent now."
-        )
+        if has_live_office_session:
+            dispatching_text = (
+                f"Office task accepted with output mode: `{output_mode}`. "
+                "Compass is forwarding the reply to the waiting Office agent now."
+            )
+            dispatch_title = "Compass forwarding reply to Office Agent"
+            dispatch_summary = "Compass forwarded the reply to the waiting Office Agent."
+            worker_target = self._resume_office_task
+            worker_kwargs = {
+                "task_id": task_id,
+                "office_session": dict(office_session),
+                "resume_value": forwarded_resume_value,
+                "office_request": dict(office_request),
+            }
+            worker_name = "compass-office-resume"
+        else:
+            dispatching_text = (
+                f"Office task accepted with output mode: `{output_mode}`. "
+                "Compass is launching the Office agent now."
+            )
+            dispatch_title = "Compass dispatching to Office Agent"
+            dispatch_summary = "Compass dispatched the task to the Office Agent."
+            worker_target = self._complete_office_task
+            worker_kwargs = {
+                "task_id": task_id,
+                "user_text": str(metadata.get("user_request") or ""),
+                "office_request": dict(office_request),
+            }
+            worker_name = "compass-office-dispatch"
         _record_major_step(
             task_store,
             task_id,
             step_key="compass.dispatched",
-            title="Compass dispatching to Office Agent",
+            title=dispatch_title,
             agent=self.definition.agent_id,
             lifecycle_state=LIFECYCLE_DONE,
-            summary_template="Compass dispatched the task to the Office Agent.",
+            summary_template=dispatch_summary,
         )
         _append_chat_entry(
             task_store,
@@ -2049,18 +2209,14 @@ class CompassAgent(BaseAgent):
         )
 
         worker = threading.Thread(
-            target=self._complete_office_task,
-            kwargs={
-                "task_id": task_id,
-                "user_text": user_text,
-                "office_request": dict(office_request),
-            },
+            target=worker_target,
+            kwargs=worker_kwargs,
             daemon=True,
-            name="compass-office-dispatch",
+            name=worker_name,
         )
         worker.start()
         print(
-            f"[{self.definition.agent_id}] office dispatch started in background: "
+            f"[{self.definition.agent_id}] office background worker started: "
             f"task_id={task_id} output_mode={output_mode!r}"
         )
 
@@ -2196,68 +2352,92 @@ class CompassAgent(BaseAgent):
             "office_propagation": propagation,
         }
 
-    def _complete_office_task(
+    def _ack_and_cleanup_office_session(
         self,
-        *,
         task_id: str,
-        user_text: str,
-        office_request: dict,
+        office_session: dict[str, Any],
     ) -> None:
-        """Background worker: dispatch the office task and finalize task state.
+        from framework.launcher import get_launcher
+        import urllib.request
 
-        Runs in a daemon thread spawned by ``resume_task`` (office branch).
-        Mirrors ``_complete_development_task`` for symmetry — both are
-        fire-and-forget workers that block on a synchronous A2A call and then
-        update the task_store with the terminal result.
-
-        Per-task isolation: every argument here is a snapshot of the resume
-        payload captured at enqueue time, so multiple concurrent resumes do
-        not share mutable state.  The ``task_store`` itself is thread-safe.
-        """
-        from framework.a2a.protocol import Artifact
-        from framework.devlog import AgentLogger
-        from framework.tools.registry import get_registry
-
-        register_compass_tools()
-        task_store = self.services.task_store
-        # A task_store lookup failure here means compass was restarted between
-        # the resume POST and this thread running.  In that case there's
-        # nothing to update; log and exit cleanly.
-        if task_store.get_task(task_id) is None:
-            print(f"[compass] _complete_office_task: task {task_id} not found, skipping")
+        if not isinstance(office_session, dict):
             return
 
-        log = AgentLogger(task_id=task_id, agent_name=self.definition.agent_id)
-        registry = get_registry()
+        child_task_id = str(office_session.get("task_id") or task_id).strip() or task_id
+        child_service_url = str(office_session.get("service_url") or "").strip()
+        child_container_name = str(office_session.get("container_name") or "").strip()
+        child_agent_id = str(office_session.get("agent_id") or "office").strip() or "office"
 
-        try:
-            dispatch_data = _dispatch_office_request(task_id, user_text, office_request, registry, log)
-        except Exception as exc:
-            # The dispatch path is supposed to absorb its own errors, but a
-            # late exception (e.g. launcher socket failure) must not crash the
-            # daemon thread.  Surface it as a failed task and continue.
-            log.error("office dispatch raised in background worker", error=str(exc))
-            print(f"[compass] _complete_office_task: dispatch raised: {exc}")
-            dispatch_data = {"status": "error", "message": str(exc)}
-
-        # Stash the per-task office launch URL on the task metadata so
-        # ``cancel_task`` can forward a cancel signal to the still-running
-        # office container.  The container is destroyed in the
-        # ``finally`` of ``dispatch_via_launcher`` once the message-send
-        # returns, but the URL is valid for the duration of the call —
-        # which is exactly the window in which the user can click
-        # "Cancel" while the office task is in flight.
-        office_service_url = str(dispatch_data.get("office_service_url") or "").strip()
-        if office_service_url:
+        if child_task_id and child_service_url:
             try:
-                task_store.update_metadata(task_id, {
-                    "office_service_url": office_service_url,
-                })
+                payload = json.dumps({
+                    "orchestratorTaskId": task_id,
+                    "exitReason": "task_completed_success",
+                }).encode("utf-8")
+                request = urllib.request.Request(
+                    f"{child_service_url.rstrip('/')}/tasks/{child_task_id}/ack",
+                    data=payload,
+                    headers={"Content-Type": "application/json; charset=utf-8"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=10):
+                    pass
             except Exception:
                 pass
 
-        # Re-check the task exists — a /terminate or restart could have
-        # removed it while dispatch was running.
+        if child_container_name:
+            try:
+                get_launcher().destroy_instance(child_agent_id, child_container_name)
+            except Exception:
+                pass
+
+        task_store = self.services.task_store
+        if task_store is not None:
+            try:
+                task_store.update_metadata(
+                    task_id,
+                    {
+                        "office_session": {},
+                        "office_service_url": "",
+                        "office_container_name": "",
+                    },
+                )
+            except Exception:
+                pass
+
+    def _finalize_office_task_result(
+        self,
+        *,
+        task_id: str,
+        office_request: dict,
+        dispatch_data: dict,
+    ) -> None:
+        from framework.a2a.protocol import Artifact
+        from framework.devlog import AgentLogger
+        task_store = self.services.task_store
+        if task_store.get_task(task_id) is None:
+            print(f"[compass] _finalize_office_task_result: task {task_id} not found, skipping")
+            return
+
+        log = AgentLogger(task_id=task_id, agent_name=self.definition.agent_id)
+        office_session = dispatch_data.get("office_session") or {}
+        office_service_url = str(dispatch_data.get("office_service_url") or "").strip()
+        if office_service_url or (
+            isinstance(office_session, dict) and office_session.get("service_url")
+        ):
+            session_delta = {}
+            if office_service_url:
+                session_delta["office_service_url"] = office_service_url
+            if isinstance(office_session, dict) and office_session.get("service_url"):
+                session_delta["office_session"] = dict(office_session)
+                if office_session.get("container_name"):
+                    session_delta["office_container_name"] = office_session.get("container_name", "")
+            if session_delta:
+                try:
+                    task_store.update_metadata(task_id, session_delta)
+                except Exception:
+                    pass
+
         if task_store.get_task(task_id) is None:
             log.warn("office task disappeared before finalization", task_id=task_id)
             return
@@ -2371,11 +2551,100 @@ class CompassAgent(BaseAgent):
             text=response_text,
             tone="failed" if office_failed else "completed",
         )
+        if not office_awaiting_input:
+            current_task = task_store.get_task(task_id)
+            session = dispatch_data.get("office_session") or _office_session_from_metadata(
+                current_task.metadata if current_task else {},
+                task_id,
+            )
+            if session:
+                self._ack_and_cleanup_office_session(task_id, session)
         log.info(
             "office task finalization complete",
             task_id=task_id,
             status=office_status,
             failed=office_failed,
+        )
+
+    def _resume_office_task(
+        self,
+        *,
+        task_id: str,
+        office_session: dict[str, Any],
+        resume_value: Any,
+        office_request: dict,
+    ) -> None:
+        import urllib.request
+
+        service_url = str(office_session.get("service_url") or "").strip()
+        child_task_id = str(office_session.get("task_id") or task_id).strip() or task_id
+        if not service_url:
+            self._finalize_office_task_result(
+                task_id=task_id,
+                office_request=office_request,
+                dispatch_data={
+                    "status": "error",
+                    "message": "No live Office session is available for resume.",
+                    "office_session": office_session,
+                },
+            )
+            return
+
+        payload = json.dumps({"input": resume_value}).encode("utf-8")
+        request = urllib.request.Request(
+            f"{service_url.rstrip('/')}/tasks/{child_task_id}/resume",
+            data=payload,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5400) as response:
+                office_response = json.loads(response.read().decode("utf-8"))
+            dispatch_data = _office_task_to_dispatch_data(office_response, office_session)
+        except Exception as exc:
+            dispatch_data = {
+                "status": "error",
+                "message": str(exc),
+                "office_session": office_session,
+            }
+
+        self._finalize_office_task_result(
+            task_id=task_id,
+            office_request=office_request,
+            dispatch_data=dispatch_data,
+        )
+
+    def _complete_office_task(
+        self,
+        *,
+        task_id: str,
+        user_text: str,
+        office_request: dict,
+    ) -> None:
+        """Background worker: dispatch the office task and finalize task state."""
+        from framework.devlog import AgentLogger
+        from framework.tools.registry import get_registry
+
+        register_compass_tools()
+        task_store = self.services.task_store
+        if task_store.get_task(task_id) is None:
+            print(f"[compass] _complete_office_task: task {task_id} not found, skipping")
+            return
+
+        log = AgentLogger(task_id=task_id, agent_name=self.definition.agent_id)
+        registry = get_registry()
+
+        try:
+            dispatch_data = _dispatch_office_request(task_id, user_text, office_request, registry, log)
+        except Exception as exc:
+            log.error("office dispatch raised in background worker", error=str(exc))
+            print(f"[compass] _complete_office_task: dispatch raised: {exc}")
+            dispatch_data = {"status": "error", "message": str(exc)}
+
+        self._finalize_office_task_result(
+            task_id=task_id,
+            office_request=office_request,
+            dispatch_data=dispatch_data,
         )
 
     async def get_task(self, task_id: str) -> dict:

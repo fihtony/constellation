@@ -34,6 +34,10 @@ from agents.office.office_tools import (
     ReadXlsxTool,
     collect_organize_file_inventory,
 )
+from framework.clarification_reply import (
+    build_approve_or_modify_contract,
+    build_select_option_contract,
+)
 from framework.office.dimensions import VALID_DIMENSIONS, parse_dimension
 from framework.devlog import _ts
 from framework.major_step import LIFECYCLE_DONE, LIFECYCLE_RUNNING, LIFECYCLE_WARNING
@@ -312,19 +316,25 @@ def analyze_request(state: dict) -> dict:
     if capability == "organize":
         dimension = parse_dimension(metadata, user_text)
         if not dimension:
+            options = [
+                {"id": d, "label": d.replace("_", " ")}
+                for d in sorted(VALID_DIMENSIONS)
+            ]
+            user_message = (
+                "Office organize needs a grouping dimension. "
+                "Available dimensions: "
+                + ", ".join(sorted(VALID_DIMENSIONS))
+                + "."
+            )
             return {
                 "error": "missing_organize_dimension",
                 "needs_clarification": {
                     "missing": "organizeGroupBy",
-                    "options": [
-                        {"id": d, "label": d.replace("_", " ")}
-                        for d in sorted(VALID_DIMENSIONS)
-                    ],
-                    "user_message": (
-                        "Office organize needs a grouping dimension. "
-                        "Available dimensions: "
-                        + ", ".join(sorted(VALID_DIMENSIONS))
-                        + "."
+                    "options": options,
+                    "user_message": user_message,
+                    "reply_contract": build_select_option_contract(
+                        options,
+                        reask_message=user_message,
                     ),
                 },
                 "workspace_root": _get_workspace_root(state),
@@ -1032,6 +1042,7 @@ def _run_custom_dimension_path(
                     {"id": "approve", "label": "Approve plan"},
                     {"id": "modify", "label": "Modify plan"},
                 ],
+                "reply_contract": build_approve_or_modify_contract(),
                 "plan": plan,
                 "plan_path": plan_path,
                 "custom_hint": custom_hint,

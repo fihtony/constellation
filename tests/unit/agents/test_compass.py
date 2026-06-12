@@ -572,7 +572,13 @@ class TestCompassTools:
         assert dispatched["metadata"]["source_paths"] == ["/app/userdata/input-0/report.txt"]
         assert "read_pdf" in dispatched["metadata"]["permissions"]["allowedTools"]
         assert "dispatch_office_task" not in dispatched["metadata"]["permissions"]["allowedTools"]
-        assert destroyed == {"agent_id": "office", "container_name": "office-task-1"}
+        assert destroyed == {}
+        assert payload["office_session"] == {
+            "task_id": "office-1",
+            "service_url": "http://office-task-1:8060",
+            "container_name": "office-task-1",
+            "agent_id": "office",
+        }
 
     def test_dispatch_office_task_uses_writable_mounts_for_inplace_mode(self, monkeypatch, tmp_path):
         from agents.compass.tools import DispatchOfficeTask
