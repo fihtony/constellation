@@ -2060,10 +2060,11 @@ def _build_analyze_prompt(paths: list[str], output_mode: str, source_root: str) 
     paths_list = "\n".join(f"- {p}" for p in paths)
     target_lines = []
     for path in paths:
+        target = _target_with_suffix_impl(output_mode, path, "", ".analysis.md")
         if output_mode == "workspace":
-            target_lines.append(f"- Source: {path}\n  Target filename: {os.path.basename(path)}.analysis.md")
+            target_lines.append(f"- Source: {path}\n  Target filename: {os.path.basename(target)}")
         else:
-            target_lines.append(f"- Source: {path}\n  Target path: {path}.analysis.md")
+            target_lines.append(f"- Source: {path}\n  Target path: {target}")
     targets_block = "\n".join(target_lines)
     write_rules = (
         "4. Write an analysis report using write_workspace to the exact target filename listed below."
