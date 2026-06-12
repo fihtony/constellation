@@ -2120,12 +2120,17 @@ CRITICAL:
 
 def _build_organize_prompt(paths: list[str], output_mode: str, source_root: str) -> str:
     paths_list = "\n".join(f"- {p}" for p in paths)
-    write_rules = (
-        "3. Write the organization plan using write_workspace tool with filename: organization-plan.md"
-        if output_mode == "workspace"
-        else
-        "3. Write the organization plan using write_file tool to: {source_folder}/organization-plan.md"
-    )
+    if output_mode == "workspace":
+        write_rules = (
+            "3. Write the organization plan using write_workspace tool "
+            "with filename: organization-plan.md"
+        )
+    else:
+        source_folder = paths[0] if paths else source_root
+        write_rules = (
+            f"3. Write the organization plan using write_file tool to: "
+            f"{source_folder}/organization-plan.md"
+        )
     return f"""Organize the following folder(s):
 
 {paths_list}

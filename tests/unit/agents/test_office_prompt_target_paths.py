@@ -52,3 +52,15 @@ def test_analyze_prompt_inplace_file_target_next_to_source(tmp_path):
     prompt = _build_analyze_prompt([str(source_file)], "inplace", "/app/userdata")
     expected = str(tmp_path / "sales.csv.analysis.md")
     assert expected in prompt
+
+
+def test_organize_prompt_inplace_does_not_contain_literal_placeholder():
+    """Bug B: the inplace branch used to ship a literal
+    `{source_folder}` token that was never interpolated."""
+    prompt = _build_organize_prompt(["/data"], "inplace", "/app/userdata")
+    assert "{source_folder}" not in prompt
+
+
+def test_organize_prompt_inplace_advertises_source_dir_path():
+    prompt = _build_organize_prompt(["/data"], "inplace", "/app/userdata")
+    assert "/data/organization-plan.md" in prompt
