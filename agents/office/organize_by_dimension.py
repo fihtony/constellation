@@ -69,13 +69,27 @@ def _validate_inside(child: str, parent: str) -> bool:
     return rp == pr or rp.startswith(pr.rstrip(os.sep) + os.sep)
 
 
-def _copy_into(src_root: str, rel: str, dst_root: str, bucket: str) -> str:
-    """Copy ``<src_root>/<rel>`` to ``<dst_root>/<bucket>/<rel>`` safely.
+def _copy_into(
+    src_root: str,
+    rel: str,
+    dst_root: str,
+    bucket: str,
+    *,
+    move: bool = False,
+) -> str:
+    """Materialize ``<src_root>/<rel>`` to ``<dst_root>/<bucket>/<rel>`` safely.
 
     ``bucket`` may be a nested path (e.g. ``"Yan/January"``) — it is
     sanitized segment-by-segment so the resulting layout mirrors the
     approved plan's bucket names instead of collapsing to a single
     directory.
+
+    When ``move`` is True, the source file is moved (not copied) into
+    the destination.  Inplace organize passes ``move=True`` so the
+    user's source folder does not end up with a duplicate copy of
+    every file alongside the dimension buckets.  Workspace organize
+    leaves ``move`` at its default ``False`` to keep the source
+    read-only.
     """
     src = os.path.realpath(os.path.join(src_root, rel))
     if not _validate_inside(src, src_root):
@@ -86,7 +100,10 @@ def _copy_into(src_root: str, rel: str, dst_root: str, bucket: str) -> str:
     if not _validate_inside(dst, dst_root):
         raise ValueError(f"destination escapes root: {rel}")
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    shutil.copy2(src, dst)
+    if move:
+        shutil.move(src, dst)
+    else:
+        shutil.copy2(src, dst)
     return dst
 
 
@@ -170,7 +187,15 @@ class OrganizeBySizeTool(BaseTool):
             entries: list[dict[str, str]] = []
             for rel, size in zip(files, sizes):
                 bucket = self._bucket_for(size, small_max, large_min)
-                dst = _copy_into(source, rel, output_root, bucket)
+                # Inplace organize passes the user source folder as
+                # both source and output_root (see
+                # ``_organized_output_root`` in nodes.py).  Detect
+                # that case so the file is moved (not copied) and the
+                # user's disk usage is not doubled.
+                dst = _copy_into(
+                    source, rel, output_root, bucket,
+                    move=os.path.realpath(source) == os.path.realpath(output_root),
+                )
                 entries.append({
                     "source": rel,
                     "destination": os.path.relpath(dst, output_root),
@@ -276,7 +301,15 @@ class OrganizeByTypeTool(BaseTool):
             for rel in files:
                 ext = os.path.splitext(rel)[1]
                 bucket = _bucket_for_extension(ext)
-                dst = _copy_into(source, rel, output_root, bucket)
+                # Inplace organize passes the user source folder as
+                # both source and output_root (see
+                # ``_organized_output_root`` in nodes.py).  Detect
+                # that case so the file is moved (not copied) and the
+                # user's disk usage is not doubled.
+                dst = _copy_into(
+                    source, rel, output_root, bucket,
+                    move=os.path.realpath(source) == os.path.realpath(output_root),
+                )
                 entries.append({
                     "source": rel,
                     "destination": os.path.relpath(dst, output_root),
@@ -343,7 +376,15 @@ class _TimeBucketTool(BaseTool):
                     attr_used = self.fallback_attr
                     fallbacks.append(rel)
                 bucket = _fmt_time(ts)
-                dst = _copy_into(source, rel, output_root, bucket)
+                # Inplace organize passes the user source folder as
+                # both source and output_root (see
+                # ``_organized_output_root`` in nodes.py).  Detect
+                # that case so the file is moved (not copied) and the
+                # user's disk usage is not doubled.
+                dst = _copy_into(
+                    source, rel, output_root, bucket,
+                    move=os.path.realpath(source) == os.path.realpath(output_root),
+                )
                 entries.append({
                     "source": rel,
                     "destination": os.path.relpath(dst, output_root),
@@ -435,7 +476,15 @@ class OrganizeByFilenameTool(BaseTool):
             for rel in files:
                 basename = os.path.basename(rel)
                 bucket = self._bucket_for(basename)
-                dst = _copy_into(source, rel, output_root, bucket)
+                # Inplace organize passes the user source folder as
+                # both source and output_root (see
+                # ``_organized_output_root`` in nodes.py).  Detect
+                # that case so the file is moved (not copied) and the
+                # user's disk usage is not doubled.
+                dst = _copy_into(
+                    source, rel, output_root, bucket,
+                    move=os.path.realpath(source) == os.path.realpath(output_root),
+                )
                 entries.append({
                     "source": rel,
                     "destination": os.path.relpath(dst, output_root),

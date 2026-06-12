@@ -127,12 +127,15 @@ def test_all_targets_for_capability_summarize_multi_file(tmp_path):
 
 
 def test_all_targets_for_capability_organize_inplace_dir(tmp_path):
+    """Inplace organize uses the user source folder as the root, so
+    there is no ``organized-output/files/`` wrapper to assert on.  Only
+    the plan file lands in the expected list.
+    """
     source_dir = tmp_path / "data"
     source_dir.mkdir()
     expected = all_targets_for_capability("organize", [str(source_dir)], "inplace", str(tmp_path / "artifacts"))
     assert expected == [
         str(source_dir / "organization-plan.md"),
-        str(source_dir / "organized-output" / "files"),
     ]
 
 

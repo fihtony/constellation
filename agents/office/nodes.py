@@ -857,24 +857,36 @@ def _run_bounded_folder_organize(
     artifacts_dir: str,
 ) -> AgenticResult:
     source_root = validated_paths[0]
-    output_root = (
-        os.path.join(artifacts_dir, "organized-output", "files")
-        if output_mode == "workspace"
-        else os.path.join(source_root, "organized-output", "files")
-    )
+    output_root = _organized_output_root(output_mode, artifacts_dir, validated_paths)
     operations_path = os.path.join(artifacts_dir, "operations-plan.json")
     inventory, _, _ = collect_organize_file_inventory(source_root)
 
-    os.makedirs(output_root, exist_ok=True)
+    # In inplace mode the source folder IS the output root, so the
+    # bucket subdirectories sit directly next to (not nested under) any
+    # pre-existing top-level files in the user's folder.  In workspace
+    # mode the output root is a fresh directory under the artifacts
+    # dir, so makedirs is safe.  In inplace mode the folder already
+    # exists, so we must NOT makedirs the source itself — bucket
+    # subdirectories are created per-destination below.
+    if output_mode == "workspace":
+        os.makedirs(output_root, exist_ok=True)
     os.makedirs(os.path.dirname(operations_path), exist_ok=True)
+    # Inplace organize MOVES the originals into the bucket subdirs.
+    # Workspace organize COPIES the originals into the artifacts
+    # workspace.  The action recorded in operations-plan.json
+    # mirrors the actual filesystem operation.
+    transfer_action = "move_file" if output_mode == "inplace" else "copy_file"
     with open(operations_path, "w", encoding="utf-8") as fh:
         for item in inventory:
             src_path = os.path.realpath(os.path.join(source_root, str(item["relative_path"])))
             dst_path = _canonical_organize_destination(output_root, item)
             os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-            shutil.copy2(src_path, dst_path)
+            if transfer_action == "move_file":
+                shutil.move(src_path, dst_path)
+            else:
+                shutil.copy2(src_path, dst_path)
             fh.write(json.dumps({
-                "action": "copy_file",
+                "action": transfer_action,
                 "src": src_path,
                 "dst": dst_path,
                 "content_length": 0,
@@ -1267,10 +1279,26 @@ def _expected_output_paths(
 
 
 def _organized_output_root(output_mode: str, artifacts_dir: str, source_paths: list[str]) -> str:
+    """Return the canonical root directory for the organize output.
+
+    The two modes are intentionally asymmetric so the user's source
+    folder never gets duplicated:
+
+    - ``workspace`` — the organize output lands inside the office
+      workspace as ``<artifacts>/organized-output/files/``.  The
+      user's source is read-only here, so duplicating under the
+      artifacts dir is the right call.
+    - ``inplace`` — the user's source folder IS the root.  Bucket
+      subdirectories (``documents/``, ``images/``, ...) land directly
+      under the source.  The historical
+      ``<source>/organized-output/files/`` wrapper was creating a
+      duplicate copy of the user's data; the fix moves the originals
+      into the buckets instead.
+    """
     if output_mode == "workspace":
         return os.path.join(artifacts_dir, "organized-output", "files")
     source_root = source_paths[0] if source_paths else ""
-    return os.path.join(source_root, "organized-output", "files")
+    return source_root
 
 
 def _count_materialized_files(root: str) -> int:
@@ -1541,15 +1569,39 @@ def _verify_organize_materialization(output_mode: str, artifacts_dir: str, sourc
         return [f"Missing operations log: {operations_path}"]
 
     source_root = source_paths[0]
-    inventory, _, _ = collect_organize_file_inventory(source_root)
-    expected_destinations = {
-        os.path.relpath(_canonical_organize_destination(root, item), root)
-        for item in inventory
-    }
+    # Inplace organize MOVES the originals out of the source, so a
+    # fresh ``collect_organize_file_inventory(source_root)`` would
+    # return an empty list and the verifier would flag every actual
+    # bucket file as "unexpected".  Trust the operations log in
+    # inplace mode: the executor recorded every dst it materialised.
+    if output_mode == "inplace":
+        planned_dsts: set[str] = set()
+        with open(operations_path, encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                op = json.loads(line)
+                dst = str(op.get("dst") or "").strip()
+                if dst:
+                    planned_dsts.add(dst)
+        expected_destinations = {
+            os.path.relpath(dst, root) for dst in planned_dsts
+        }
+    else:
+        inventory, _, _ = collect_organize_file_inventory(source_root)
+        expected_destinations = {
+            os.path.relpath(_canonical_organize_destination(root, item), root)
+            for item in inventory
+        }
     actual_destinations = {
         os.path.relpath(os.path.join(walk_root, name), root)
         for walk_root, _, files in os.walk(root)
         for name in files
+        # Exclude the operations log itself and the plan file from
+        # the verifier's "actual" set — they live under the artifacts
+        # dir in workspace mode, not under ``root``, but defensively
+        # skip them here in case the layout ever shifts.
+        if name not in {"operations-plan.json", "organization-plan.md"}
     }
 
     errors: list[str] = []
@@ -1581,26 +1633,41 @@ def _repair_missing_organize_outputs(output_mode: str, artifacts_dir: str, sourc
     if not os.path.exists(operations_path):
         return []
 
-    inventory, _, _ = collect_organize_file_inventory(source_root)
     repaired: list[str] = []
     expected_destinations: set[str] = set()
-    for item in inventory:
-        src_path = os.path.realpath(os.path.join(source_root, str(item["relative_path"])))
-        dst_path = _canonical_organize_destination(output_root, item)
-        expected_destinations.add(dst_path)
-        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-        if not os.path.exists(dst_path) or not filecmp.cmp(src_path, dst_path, shallow=False):
-            shutil.copy2(src_path, dst_path)
-            with open(operations_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps({
-                    "action": "copy_file",
-                    "src": src_path,
-                    "dst": dst_path,
-                    "content_length": 0,
-                    "status": "succeeded",
-                    "repaired_by": "office-organize-canonicalizer",
-                }) + "\n")
-            repaired.append(src_path)
+    if output_mode == "inplace":
+        # Inplace organize MOVES the originals out of the source, so a
+        # fresh inventory over ``source_root`` would be empty and the
+        # "actual files not in expected" sweep below would delete the
+        # moved bucket files.  Trust the operations log instead: the
+        # executor recorded every dst it materialised.
+        with open(operations_path, encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                op = json.loads(line)
+                dst = str(op.get("dst") or "").strip()
+                if dst:
+                    expected_destinations.add(os.path.realpath(dst))
+    else:
+        inventory, _, _ = collect_organize_file_inventory(source_root)
+        for item in inventory:
+            src_path = os.path.realpath(os.path.join(source_root, str(item["relative_path"])))
+            dst_path = _canonical_organize_destination(output_root, item)
+            expected_destinations.add(dst_path)
+            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+            if not os.path.exists(dst_path) or not filecmp.cmp(src_path, dst_path, shallow=False):
+                shutil.copy2(src_path, dst_path)
+                with open(operations_path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({
+                        "action": "copy_file",
+                        "src": src_path,
+                        "dst": dst_path,
+                        "content_length": 0,
+                        "status": "succeeded",
+                        "repaired_by": "office-organize-canonicalizer",
+                    }) + "\n")
+                repaired.append(src_path)
 
     actual_files = [
         os.path.realpath(os.path.join(walk_root, name))
@@ -2139,11 +2206,51 @@ def _build_organize_prompt(paths: list[str], output_mode: str, source_root: str)
             "3. Write the organization plan using write_workspace tool "
             "with filename: organization-plan.md"
         )
+        output_root_rule = (
+            "2. Call the matching `organize_by_*` tool. Pass the source "
+            "folder and the resolved output_root for "
+            "`organized-output/files/` (under the office workspace).  "
+            "The tool copies every source file into "
+            "`<output_root>/<bucket>/...`."
+        )
+        completion_rule = (
+            "CRITICAL: A plan-only answer is a failure. The task is "
+            "complete only if files exist under `organized-output/files/`."
+        )
+        dedup_rule = (
+            "CRITICAL: Every non-hidden source file must be copied "
+            "exactly once. Do not duplicate a source file into multiple "
+            "destinations."
+        )
     else:
         source_folder = paths[0] if paths else source_root
         write_rules = (
             f"3. Write the organization plan using write_file tool to: "
             f"{source_folder}/organization-plan.md"
+        )
+        # Inplace organize: the user source folder IS the output root.
+        # Bucket subdirs (documents/, images/, ...) sit directly under
+        # the source — no organized-output/files/ wrapper.  Source
+        # files are MOVED (not copied) into the bucket subdirs so the
+        # user's disk usage is not doubled.
+        output_root_rule = (
+            "2. Call the matching `organize_by_*` tool. Pass the "
+            f"source folder ({source_folder}) as BOTH the source and "
+            "the output root.  The tool will create bucket "
+            f"subdirectories directly under {source_folder} and MOVE "
+            "every source file into "
+            f"`<{source_folder}>/<bucket>/...`."
+        )
+        completion_rule = (
+            "CRITICAL: A plan-only answer is a failure. The task is "
+            f"complete only if bucket subdirectories under {source_folder} "
+            "contain the source files."
+        )
+        dedup_rule = (
+            "CRITICAL: Every non-hidden source file must be moved "
+            "exactly once. Do not duplicate a source file into multiple "
+            "destinations; the source folder must no longer hold the "
+            "original files after the move."
         )
     return f"""Organize the following folder(s):
 
@@ -2169,17 +2276,14 @@ WORKFLOW:
 1. Read the dimension from the task metadata. NEVER invent a different
    dimension. If the metadata does not name one, return a structured
    needs_clarification error and stop.
-2. Call the matching `organize_by_*` tool. Pass the source folder and
-   the resolved output_root for `organized-output/files/`.
+{output_root_rule}
 3. The tool writes `organization-plan.md` and materializes the layout.
 {write_rules}
 
 CRITICAL: You must USE the dimension tool to actually create the
 organized folder structure. Do not just write a plan - execute it.
-CRITICAL: A plan-only answer is a failure. The task is complete only
-if files exist under `organized-output/files/`.
-CRITICAL: Every non-hidden source file must be copied exactly once.
-Do not duplicate a source file into multiple destinations.
+{completion_rule}
+{dedup_rule}
 CRITICAL: Bucket names come from the dimension tool's output; do not
 introduce business-specific folder names (e.g. "students", "by-entity").
 

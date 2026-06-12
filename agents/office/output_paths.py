@@ -110,8 +110,17 @@ def all_targets_for_capability(
         expected.append(
             target_for_source(output_mode, validated_paths[0], artifacts_dir, "organization-plan.md")
         )
-        root = _deliverable_base_dir(output_mode, validated_paths[0], artifacts_dir)
-        expected.append(os.path.join(root, "organized-output", "files"))
+        # In workspace mode the organize output root is
+        # ``<artifacts>/organized-output/files/``; the verifier still
+        # checks that the bucket tree exists there.  In inplace mode
+        # the user source folder IS the root (see
+        # ``_organized_output_root`` in nodes.py), so there is no
+        # ``organized-output/files/`` wrapper to assert on — bucket
+        # subdirectories land directly under the source.  We only
+        # register the wrapper path for workspace mode.
+        if output_mode != "inplace":
+            root = _deliverable_base_dir(output_mode, validated_paths[0], artifacts_dir)
+            expected.append(os.path.join(root, "organized-output", "files"))
         return expected
 
     return expected
