@@ -64,3 +64,36 @@ def test_organize_prompt_inplace_does_not_contain_literal_placeholder():
 def test_organize_prompt_inplace_advertises_source_dir_path():
     prompt = _build_organize_prompt(["/data"], "inplace", "/app/userdata")
     assert "/data/organization-plan.md" in prompt
+
+
+def test_summarize_prompt_inplace_file_target_next_to_source(tmp_path):
+    source_file = tmp_path / "sales.csv"
+    source_file.write_text("a,b\n1,2\n", encoding="utf-8")
+    prompt = _build_summarize_prompt([str(source_file)], "inplace", "/app/userdata")
+    expected = str(tmp_path / "sales.csv.summary.md")
+    assert expected in prompt
+
+
+def test_summarize_prompt_inplace_multi_file_combined_in_source_dir():
+    """When summarizing multiple files in inplace mode, the combined
+    report must be advertised inside the source directory, not in
+    artifacts."""
+    prompt = _build_summarize_prompt(
+        ["/data/a.txt", "/data/b.txt"], "inplace", "/app/userdata"
+    )
+    assert "/data/a.txt.summary.md" in prompt
+    assert "/data/b.txt.summary.md" in prompt
+    assert "combined-summary.md" in prompt
+    # The combined path must reference /data/, not /app/artifacts/.
+    assert "/data/combined-summary.md" in prompt
+
+
+def test_summarize_prompt_workspace_combined_in_artifacts():
+    prompt = _build_summarize_prompt(
+        ["/data/a.txt", "/data/b.txt"], "workspace", "/app/userdata"
+    )
+    assert "combined-summary.md" in prompt
+    # The combined-summary label must keep its "Combined report"
+    # prefix so the LLM can distinguish it from the per-file
+    # "Target filename:" lines.
+    assert "Combined report target filename: combined-summary.md" in prompt

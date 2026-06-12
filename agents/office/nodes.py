@@ -1996,15 +1996,25 @@ def _build_summarize_prompt(paths: list[str], output_mode: str, source_root: str
     has_multiple_files = len(paths) > 1
     target_lines = []
     for path in paths:
+        target = _target_with_suffix_impl(output_mode, path, "", ".summary.md")
         if output_mode == "workspace":
-            target_lines.append(f"- Source: {path}\n  Target filename: {os.path.basename(path)}.summary.md")
+            target_lines.append(
+                f"- Source: {path}\n  Target filename: {os.path.basename(target)}"
+            )
         else:
-            target_lines.append(f"- Source: {path}\n  Target path: {path}.summary.md")
-    if has_multiple_files:
+            target_lines.append(f"- Source: {path}\n  Target path: {target}")
+    if has_multiple_files and paths:
+        combined_target = _target_for_source_impl(
+            output_mode, paths[0], "", "combined-summary.md"
+        )
         if output_mode == "workspace":
-            target_lines.append("- Combined report target filename: combined-summary.md")
+            target_lines.append(
+                f"- Combined report target filename: {os.path.basename(combined_target)}"
+            )
         else:
-            target_lines.append(f"- Combined report target path: {os.path.join(os.path.dirname(paths[0]), 'combined-summary.md')}")
+            target_lines.append(
+                f"- Combined report target path: {combined_target}"
+            )
     targets_block = "\n".join(target_lines)
     write_rules = (
         "2. Write a summary using the write_workspace tool to the exact target filename listed below."
