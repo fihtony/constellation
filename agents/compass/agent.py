@@ -258,6 +258,90 @@ def _scan_output_mode_from_text(user_text: str) -> str:
     return ""
 
 
+def _strip_output_mode_phrase(reply: str) -> tuple[str, str, str]:
+    """Scan ``reply`` for an output-mode phrase and return
+    ``(mode, stripped_reply, matched_phrase)``.
+
+    Used by the cross-aware resume handler so the dimension round can
+    pick up an "in place" / "workspace" intent from the user's reply
+    without losing it.  When no phrase matches, ``mode`` is empty and
+    ``stripped_reply`` is the original reply unchanged.
+
+    Two-step scan so both whole-reply and combined answers work:
+
+    1. Whole-reply match against the output-mode contract
+       (covers bare ``workspace`` / ``inplace`` / ``in place``).
+    2. Substring match against ``_OUTPUT_MODE_PHRASES``
+       (covers combined answers like ``by type in place``).
+    """
+    text = (reply or "").strip()
+    if not text:
+        return "", "", ""
+
+    # Step 1: whole-reply match against the contract.
+    contract = build_select_option_contract(
+        [
+            {"id": "workspace", "label": "workspace"},
+            {"id": "inplace", "label": "inplace", "aliases": ["in place"]},
+        ],
+        reask_message="",
+    )
+    resolved = resolve_reply(contract, text)
+    if resolved.get("ok"):
+        mode = str((resolved.get("normalized") or {}).get("selection") or "").strip()
+        if mode:
+            return mode, "", text
+
+    # Step 2: substring match for combined answers.
+    lowered = text.lower()
+    sorted_phrases = sorted(_OUTPUT_MODE_PHRASES, key=lambda item: -len(item[0]))
+    for needle, mode in sorted_phrases:
+        if needle in lowered:
+            stripped = (lowered.replace(needle, "", 1)).strip()
+            return mode, stripped, needle
+    return "", text, ""
+
+
+def _strip_dimension_phrase(reply: str) -> tuple[str, str, str]:
+    """Scan ``reply`` for a dimension phrase and return
+    ``(dimension, stripped_reply, matched_phrase)``.
+
+    Symmetric counterpart of :func:`_strip_output_mode_phrase` — the
+    output-mode round uses this to pick up a "by type" / "by size"
+    intent from the user's reply without losing it.  Returns
+    ``"__custom__"`` (the :data:`CUSTOM_DIMENSION` sentinel) when the
+    user wrote a clear "by X" hint that does not match any built-in
+    dimension.  When no phrase matches, ``dimension`` is empty and
+    ``stripped_reply`` is the original reply unchanged.
+    """
+    from framework.office.dimensions import (
+        CUSTOM_DIMENSION,
+        KEYWORD_TO_DIMENSION,
+        _CUSTOM_DIMENSION_PATTERNS,
+    )
+
+    text = (reply or "").strip()
+    if not text:
+        return "", "", ""
+    lowered = text.lower()
+    # Built-in keywords first (longest first so "by file size" wins
+    # over the bare "size" token).
+    for needle in sorted(KEYWORD_TO_DIMENSION, key=len, reverse=True):
+        if needle in lowered:
+            dimension = KEYWORD_TO_DIMENSION[needle]
+            stripped = (lowered.replace(needle, "", 1)).strip()
+            return dimension, stripped, needle
+    # Custom-dimension intent (e.g. "by student name") → sentinel.
+    for pattern in _CUSTOM_DIMENSION_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            hint = match.group(1).strip()
+            if hint:
+                stripped = (text[: match.start()] + text[match.end() :]).strip()
+                return CUSTOM_DIMENSION, stripped, match.group(0)
+    return "", text, ""
+
+
 def _normalize_organize_dimension(value: str) -> str:
     """Map a free-text user reply to a canonical organize dimension id.
 
@@ -377,17 +461,46 @@ def _resolve_office_resume_reply(
                 },
             }
 
-        dimension = _normalize_organize_dimension(reply)
+        # Cross-aware: detect an output mode phrase in the reply and
+        # save it.  The user often types the answer to the *next*
+        # round while answering the current one (e.g. "in place"
+        # typed into the dimension question).  Silently dropping that
+        # intent was the bug behind task-51fccd6b57e1.
+        output_mode, stripped_reply, _matched_mode_phrase = _strip_output_mode_phrase(reply)
+        if output_mode:
+            office_request["output_mode"] = output_mode
+            # Continue parsing the dimension from the stripped reply
+            # so a combined answer (e.g. "by type in place") still
+            # resolves the dimension in the same round.
+            reply_for_dimension = stripped_reply
+        else:
+            reply_for_dimension = reply
+
+        dimension = _normalize_organize_dimension(reply_for_dimension)
         if not dimension:
+            # If the only intent the user expressed was an output mode
+            # phrase (e.g. "in place"), tell them we caught it and
+            # surface a re-prompt that still lists the dimensions.
             options = [
                 {"id": d, "label": d.replace("_", " ")}
                 for d in sorted(VALID_DIMENSIONS)
             ]
-            user_message = (
-                "Please reply with one of the supported organization dimensions: "
-                + ", ".join(sorted(VALID_DIMENSIONS))
-                + "."
-            )
+            if output_mode:
+                user_message = (
+                    f"Got it — output mode is `{output_mode}`. "
+                    "Now please reply with one of the supported "
+                    "organization dimensions: "
+                    + ", ".join(sorted(VALID_DIMENSIONS))
+                    + "."
+                )
+            else:
+                user_message = (
+                    "Please reply with one of the supported organization dimensions: "
+                    + ", ".join(sorted(VALID_DIMENSIONS))
+                    + "."
+                )
+            # Return the partial update so the saved output_mode is
+            # not lost on the re-prompt round.
             return {
                 "error_question": user_message,
                 "needs_clarification": {
@@ -395,6 +508,7 @@ def _resolve_office_resume_reply(
                     "options": options,
                     "user_message": user_message,
                 },
+                "office_request": office_request,
             }
         office_request["organize_dimension"] = dimension
         # Compass re-dispatches with the dimension in the A2A message
@@ -405,6 +519,20 @@ def _resolve_office_resume_reply(
         return {"office_request": office_request}
 
     if kind == "office_output_mode":
+        # Cross-aware: detect a dimension phrase in the reply and
+        # save it.  Symmetric to the dimension round above — the
+        # user often types the answer to the *previous* round while
+        # answering the current one (e.g. "by type" typed into the
+        # output mode question).
+        dimension, stripped_reply, _matched_dim_phrase = _strip_dimension_phrase(reply)
+        if dimension:
+            office_request["organize_dimension"] = dimension
+            office_request.setdefault("organize_metadata", {})
+            office_request["organize_metadata"]["organizeGroupBy"] = dimension
+            reply_for_mode = stripped_reply
+        else:
+            reply_for_mode = reply
+
         contract = build_select_option_contract(
             [
                 {"id": "workspace", "label": "workspace"},
@@ -415,18 +543,23 @@ def _resolve_office_resume_reply(
                 "office task correctly."
             ),
         )
-        resolved = resolve_reply(contract, reply)
+        resolved = resolve_reply(contract, reply_for_mode)
         output_mode = str(
             (resolved.get("normalized") or {}).get("selection") or ""
         ).strip()
         if not resolved.get("ok") or not output_mode:
-            return {
-                "error_question": str(
-                    resolved.get("reask_message")
-                    or "Please reply with `workspace` or `inplace` so I can route the "
-                    "office task correctly."
-                ),
-            }
+            reask = str(
+                resolved.get("reask_message")
+                or "Please reply with `workspace` or `inplace` so I can route the "
+                "office task correctly."
+            )
+            if dimension:
+                # We caught the dimension but not the output mode —
+                # confirm the dimension catch in the re-prompt.
+                reask = f"Got it — grouping is `{dimension}`. " + reask
+            # Return the partial update so the saved dimension is
+            # not lost on the re-prompt round.
+            return {"error_question": reask, "office_request": office_request}
         office_request["output_mode"] = output_mode
         return {"office_request": office_request}
 
