@@ -97,3 +97,98 @@ def test_summarize_prompt_workspace_combined_in_artifacts():
     # prefix so the LLM can distinguish it from the per-file
     # "Target filename:" lines.
     assert "Combined report target filename: combined-summary.md" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Regression guards: the prompt must not nudge the LLM to rename the
+# deliverable based on inner files. Bug observed in task e1a19c246f4b:
+# the analyze prompt's "Preserve the full original filename" line made
+# the LLM write `/data/csv/sales_data.csv.analysis.md` (named after the
+# inner file) instead of `/data/csv/csv.analysis.md` (named after the
+# source directory basename, which is what the helper + verifier expect).
+# ---------------------------------------------------------------------------
+
+
+def test_analyze_prompt_does_not_tell_llm_to_preserve_inner_filename(tmp_path):
+    """Pin that the misleading 'Preserve the full original filename,
+    including its extension' instruction is gone from the analyze prompt.
+
+    For directory inputs that wording was hijacking the LLM into naming
+    the report after an inner file (e.g. ``sales_data.csv.analysis.md``)
+    rather than after the source directory basename (``csv.analysis.md``).
+    """
+    source_dir = tmp_path / "csv"
+    source_dir.mkdir()
+    (source_dir / "sales_data.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    prompt = _build_analyze_prompt([str(source_dir)], "inplace", "/app/userdata")
+    assert "Preserve the full original filename" not in prompt
+    assert "before appending `.analysis.md`" not in prompt
+
+
+def test_analyze_prompt_tells_llm_to_use_exact_target(tmp_path):
+    """The replacement instruction must tell the LLM to use the
+    authoritative target path verbatim and NOT derive a different
+    filename from files inside the source folder.
+    """
+    source_dir = tmp_path / "csv"
+    source_dir.mkdir()
+    prompt = _build_analyze_prompt([str(source_dir)], "inplace", "/app/userdata")
+    assert "EXACT target" in prompt
+    # The replacement instruction must explicitly warn against
+    # renaming based on inner files (this is what the previous wording
+    # accidentally encouraged). The wording varies but the key concept
+    # must be present: do not use the name of any inner file.
+    lower = prompt.lower()
+    assert "do not use" in lower
+    assert "inside the source" in lower
+
+
+def test_analyze_prompt_clarifies_directory_target_naming(tmp_path):
+    """For directory sources the target filename is the BASENAME of
+    the directory, not any filename from inside it. The prompt must
+    state that explicitly so the LLM does not regress to the inner-file
+    rename.
+    """
+    source_dir = tmp_path / "csv"
+    source_dir.mkdir()
+    prompt = _build_analyze_prompt([str(source_dir)], "inplace", "/app/userdata")
+    # The clarification line must reference the directory → basename rule
+    # so the LLM understands why the target is ``csv.analysis.md``
+    # even though the directory contains other files.
+    assert "directory" in prompt.lower()
+    assert "basename" in prompt.lower() or "BASENAME" in prompt
+
+
+def test_summarize_prompt_does_not_tell_llm_to_preserve_inner_filename(tmp_path):
+    """Same regression guard for the summarize prompt: the misleading
+    'Preserve the full original filename' line must be gone.
+    """
+    source_dir = tmp_path / "docs"
+    source_dir.mkdir()
+    prompt = _build_summarize_prompt([str(source_dir)], "inplace", "/app/userdata")
+    assert "Preserve the full original filename" not in prompt
+    assert "before appending `.summary.md`" not in prompt
+
+
+def test_summarize_prompt_tells_llm_to_use_exact_target(tmp_path):
+    """Replacement instruction must tell the LLM to use the
+    authoritative target path verbatim for summaries too.
+    """
+    source_dir = tmp_path / "docs"
+    source_dir.mkdir()
+    prompt = _build_summarize_prompt([str(source_dir)], "inplace", "/app/userdata")
+    assert "EXACT target" in prompt
+    lower = prompt.lower()
+    assert "do not use" in lower
+    assert "inside the source" in lower
+
+
+def test_summarize_prompt_clarifies_directory_target_naming(tmp_path):
+    """For directory sources the summary filename is the BASENAME of
+    the directory, not any filename from inside it.
+    """
+    source_dir = tmp_path / "docs"
+    source_dir.mkdir()
+    prompt = _build_summarize_prompt([str(source_dir)], "inplace", "/app/userdata")
+    assert "directory" in prompt.lower()
+    assert "basename" in prompt.lower() or "BASENAME" in prompt

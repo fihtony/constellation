@@ -2042,8 +2042,10 @@ For each file:
 {write_rules}
 3. Summarize in English. For French or other foreign language documents, summarize accurately.
 4. Use only the provided MCP tools. Do not use native Write/Edit/Read tools.
-5. Preserve the full original filename, including its extension, before appending `.summary.md`.
-6. If multiple documents are provided, you MUST create `combined-summary.md` that includes one section per document and a cross-document overview.
+5. Use the EXACT target path / filename shown in the 'Required output targets' section above. The target has already been pre-computed from the source path; do NOT derive a different filename.
+6. If the source is a DIRECTORY, the target filename uses the BASENAME of the directory (e.g. for source `/data/docs` the target is `docs.summary.md`). Do NOT use the name of any file inside the source directory.
+7. If the source is a FILE, the target filename is `<original_filename>.summary.md` (preserve the file's extension, e.g. `q1.pdf` → `q1.pdf.summary.md`).
+8. If multiple documents are provided, you MUST create `combined-summary.md` that includes one section per document and a cross-document overview.
 
 Output format for each file:
 # Summary: {{filename}}
@@ -2123,7 +2125,9 @@ Use Markdown tables where possible. For each detected numeric field include: cou
 IMPORTANT: Write all analysis results in English. Do not use any other language.
 
 CRITICAL:
-- Preserve the full original filename, including its extension, before appending `.analysis.md`.
+- Use the EXACT target path / filename shown in the 'Required output targets' section above. The target has already been pre-computed from the source path; do NOT derive a different filename.
+- If the source is a DIRECTORY, the target filename uses the BASENAME of the directory (e.g. for source `/data/csv` the target is `csv.analysis.md`). Do NOT use the name of any file inside the source directory.
+- If the source is a FILE, the target filename is `<original_filename>.analysis.md` (preserve the file's extension, e.g. `sales_data.csv` → `sales_data.csv.analysis.md`).
 - Do not write to relative paths like `artifacts/...`. The only authorized workspace write path is via write_workspace.
 """
 
