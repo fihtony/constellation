@@ -139,6 +139,42 @@ def test_cleanup_empty_dirs_no_op_for_rootless_path(tmp_path):
     assert cleanup_empty_dirs("") == []
 
 
+def test_cleanup_empty_dirs_handles_nested_two_level_layout(tmp_path):
+    """The custom-dimension inplace layout produces multi-level
+    empty sub-trees (``A/B/`` empty after the leaves were moved,
+    ``A/`` empty after ``A/B/`` was rmdir'd).  A single bottom-up
+    ``os.walk`` pass would leave ``A/`` behind because the walk
+    snapshot still lists ``A/B/`` as a child of ``A/`` when it
+    yields ``A/`` (the rmdir happens *after* the snapshot is
+    taken).  The cleanup helper must converge to a fixed point
+    so the user is not left with stale empty parent directories
+    next to the new bucket tree — this is the half of
+    task-afc50de4fa71 that ``shutil.copy2`` couldn't cause on
+    its own.
+    """
+    source_root = tmp_path / "nested_rw"
+    source_root.mkdir()
+    # Three independent two-level chains, mirroring the date
+    # sub-folders in the real ``2026_rw`` fixture.
+    for d in ("0103", "0110", "0117"):
+        (source_root / d / "text").mkdir(parents=True)
+    # Now manually empty the leaves; the parents become empty
+    # only after the leaves are rmdir'd.
+    for d in ("0103", "0110", "0117"):
+        (source_root / d / "text").rmdir()
+
+    removed = cleanup_empty_dirs(str(source_root))
+
+    for d in ("0103", "0110", "0117"):
+        assert not (source_root / d).exists(), (
+            f"empty parent {d!r}/ must be rmdir'd by cleanup; "
+            f"removed list: {removed!r}"
+        )
+    assert source_root.is_dir(), (
+        "the source root itself must NEVER be removed by cleanup"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 2. Pre/post integrity snapshot
 # ---------------------------------------------------------------------------
@@ -245,11 +281,17 @@ def test_verify_post_inplace_passes_after_dimension_tool_move(tmp_path):
     )
     assert result.success, f"dimension tool failed: {result.error}"
 
+    # The dimension tool just wrote its plan to the source root;
+    # pass that exact produced path so the verifier can exclude
+    # the plan from the "unexpected" sweep (replacing the old
+    # filename-based skip).
+    plan_path = str(source_root / "organization-plan.md")
     errors = verify_post(
         snap,
         source_root=str(source_root),
         output_root=str(source_root),
         output_mode="inplace",
+        produced_paths=[plan_path],
     )
     assert errors == [], (
         f"inplace organize should leave every pre-snapshot file "
@@ -288,6 +330,144 @@ def test_verify_post_inplace_detects_missing_file(tmp_path):
     )
     assert any("intro.txt" in e for e in errors), (
         f"deleted bucket file should be flagged; got {errors!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2b. User-file / system-artifact name collision
+#
+# The dimension tool writes ``organization-plan.md`` to the
+# output root, which in inplace mode is the source folder.  A
+# user can legitimately have a file with that exact basename
+# (it happens to be the most common "I already started
+# organizing by hand" filename).  A previous revision of the
+# integrity check hard-skip-filtered ``organization-plan.md``
+# from the post-organize walk, which produced false-positive
+# "file missing or modified" errors on the user's file.
+#
+# The fix is a path-aware ``produced_paths`` allowlist: the
+# verifier only excludes the EXACT path the tool produced, so a
+# user file that happens to share the basename is still
+# matched against its (rel, size, mtime) snapshot entry once
+# the dimension tool has moved it into a bucket.
+# ---------------------------------------------------------------------------
+
+
+def _make_user_owned_plan_file(tmp_path) -> Path:
+    """Lay out a source tree that already contains a user-owned
+    ``organization-plan.md`` (and a ``small/`` subdir with another
+    file of the same basename — the exact shape the failing
+    task-32b2a79aff73 run hit on ``tests/data/2026_rw``)."""
+    root = tmp_path / "unsorted_rw"
+    root.mkdir(parents=True, exist_ok=True)
+    # User-owned plan file at the root — this is the slot the
+    # tool will overwrite with its own plan.
+    _touch(root / "organization-plan.md", "USER_PLAN_ROOT", mtime=1_700_000_100.0)
+    # A second, distinct user file sharing the basename inside
+    # ``small/`` — its content survives the move into the
+    # ``small/`` bucket and must be re-found by the verifier
+    # through (size, mtime) matching, not by name.
+    _touch(root / "small" / "organization-plan.md", "USER_PLAN_IN_SMALL", mtime=1_700_000_200.0)
+    # A few non-colliding files so the dimension tool has real
+    # work to do.
+    _touch(root / "notes.md", "notes body", mtime=1_700_000_010.0)
+    _touch(root / "1" / "doc.pdf", "pdf-bytes-001", mtime=1_700_000_020.0)
+    return root
+
+
+def test_verify_post_inplace_does_not_flag_user_organization_plan_md(
+    tmp_path,
+):
+    """The headline regression for the task-32b2a79aff73 failure:
+    a user-owned ``organization-plan.md`` in the source must not
+    trigger a false "file missing or modified" integrity error
+    when the dimension tool writes its own plan to the same
+    slot.  The user's file is moved into a bucket and matched
+    by (size, mtime); the tool's new plan is excluded from the
+    "unexpected" sweep via the path-aware ``produced_paths``
+    allowlist.
+    """
+    source_root = _make_user_owned_plan_file(tmp_path)
+    snap = snapshot_source(str(source_root))
+
+    result = OrganizeByTypeTool().execute_sync(
+        source=str(source_root),
+        output_root=str(source_root),
+    )
+    assert result.success, (
+        f"dimension tool must succeed even when the source "
+        f"contains a user file named organization-plan.md; "
+        f"got error: {result.error!r}"
+    )
+
+    errors = verify_post(
+        snap,
+        source_root=str(source_root),
+        output_root=str(source_root),
+        output_mode="inplace",
+        produced_paths=[str(source_root / "organization-plan.md")],
+    )
+    assert errors == [], (
+        f"inplace organize with a user-owned "
+        f"organization-plan.md in the source must not produce "
+        f"any integrity errors; got {errors!r}"
+    )
+
+    # The user's ``small/organization-plan.md`` survives the
+    # move and is still readable at its new bucket path.
+    moved_user_plan = source_root / "text" / "small" / "organization-plan.md"
+    assert moved_user_plan.is_file(), (
+        f"user file at small/organization-plan.md must be moved "
+        f"into the bucket layout, not silently dropped; "
+        f"expected at {moved_user_plan}"
+    )
+    assert moved_user_plan.read_text(encoding="utf-8") == "USER_PLAN_IN_SMALL", (
+        "user file content must be preserved byte-for-byte "
+        "across the move"
+    )
+
+    # The tool's own plan sits at the canonical path.
+    tool_plan = source_root / "organization-plan.md"
+    assert tool_plan.is_file(), (
+        "dimension tool must still write its organization-plan.md"
+    )
+    assert "USER_PLAN_ROOT" not in tool_plan.read_text(encoding="utf-8"), (
+        "the tool's plan must replace the user's pre-existing "
+        "organization-plan.md, not preserve its content"
+    )
+
+
+def test_verify_post_inplace_flags_unexpected_stray_file(tmp_path):
+    """The path-aware ``produced_paths`` allowlist must not be a
+    blanket "ignore everything new" — a file the tool did NOT
+    produce (a stray file dropped into the source after the
+    snapshot) must still be flagged as unexpected.
+    """
+    source_root = _make_user_owned_plan_file(tmp_path)
+    snap = snapshot_source(str(source_root))
+
+    # Organize runs cleanly.
+    OrganizeByTypeTool().execute_sync(
+        source=str(source_root),
+        output_root=str(source_root),
+    )
+
+    # An unrelated file lands in the source AFTER the run.
+    _touch(source_root / "sneaky.txt", "I should not be here", mtime=1_700_000_999.0)
+
+    errors = verify_post(
+        snap,
+        source_root=str(source_root),
+        output_root=str(source_root),
+        output_mode="inplace",
+        produced_paths=[str(source_root / "organization-plan.md")],
+    )
+    assert any("sneaky.txt" in e for e in errors), (
+        f"stray post-run file must be flagged; got {errors!r}"
+    )
+    # But the plan path must still be excluded.
+    assert not any("organization-plan.md" in e for e in errors), (
+        f"produced plan path must be excluded; got {errors!r}"
     )
 
 

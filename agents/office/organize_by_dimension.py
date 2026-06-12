@@ -74,12 +74,23 @@ def _integrity_audit(
     output_root: str,
     snapshot: list[dict[str, Any]],
     output_mode: str,
+    produced_paths: list[str] | None = None,
 ) -> list[str]:
     """Append the post-run integrity verdict to operations-plan.json.
 
     Also performs the in-place empty-dir cleanup when applicable.
     Returns the list of integrity errors so the caller can decide
     whether to downgrade ``ToolResult.success``.
+
+    ``produced_paths`` is forwarded to the integrity verifier as a
+    path-aware allowlist.  In inplace mode the dimension tool writes
+    its ``organization-plan.md`` to ``output_root`` (which equals
+    ``source``), so the plan must be excluded from the
+    "unexpected file" check — otherwise a user file that happens to
+    share the basename would be flagged.  The verifier also treats
+    a snapshot entry that points at a produced path as
+    intentionally consumed, so the overwrite does not double-flag
+    the same slot.
     """
     operations_path = _operations_plan_path(output_root)
     if output_mode == "inplace":
@@ -89,6 +100,7 @@ def _integrity_audit(
         source_root=source,
         output_root=output_root,
         output_mode=output_mode,
+        produced_paths=produced_paths,
     )
     errors.extend(_integrity_check_no_deletes(operations_path))
     try:
@@ -100,6 +112,9 @@ def _integrity_audit(
                 "source": os.path.realpath(source),
                 "output_root": os.path.realpath(output_root),
                 "output_mode": output_mode,
+                "produced_paths": [
+                    os.path.realpath(p) for p in (produced_paths or []) if p
+                ],
                 "errors": errors,
                 "materialized_by": "dimension-tool",
             }) + "\n")
@@ -320,7 +335,7 @@ class OrganizeBySizeTool(BaseTool):
                 f"medium: {small_max} B - {large_min} B",
                 f"large: >= {large_min} B",
             ]
-            _write_plan(
+            plan_path = _write_plan(
                 output_root,
                 _format_plan_markdown(
                     dimension="size",
@@ -335,6 +350,7 @@ class OrganizeBySizeTool(BaseTool):
                 output_root=output_root,
                 snapshot=integrity_snapshot,
                 output_mode=output_mode,
+                produced_paths=[plan_path],
             )
             if integrity_errors:
                 return ToolResult(
@@ -446,7 +462,7 @@ class OrganizeByTypeTool(BaseTool):
                     "extension": ext,
                 })
             rules = sorted({_bucket_for_extension(os.path.splitext(r)[1]) for r in files})
-            _write_plan(
+            plan_path = _write_plan(
                 output_root,
                 _format_plan_markdown(
                     dimension="type",
@@ -460,6 +476,7 @@ class OrganizeByTypeTool(BaseTool):
                 output_root=output_root,
                 snapshot=integrity_snapshot,
                 output_mode=output_mode,
+                produced_paths=[plan_path],
             )
             if integrity_errors:
                 return ToolResult(
@@ -557,7 +574,7 @@ class _TimeBucketTool(BaseTool):
                     f"Bucketed by {self.time_attr} (inferred_from: "
                     f"{self.time_attr})."
                 )
-            _write_plan(
+            plan_path = _write_plan(
                 output_root,
                 _format_plan_markdown(
                     dimension=self.dimension_label,
@@ -572,6 +589,7 @@ class _TimeBucketTool(BaseTool):
                 output_root=output_root,
                 snapshot=integrity_snapshot,
                 output_mode=output_mode,
+                produced_paths=[plan_path],
             )
             if integrity_errors:
                 return ToolResult(
@@ -655,7 +673,7 @@ class OrganizeByFilenameTool(BaseTool):
                     "first_char": basename[:1],
                 })
             rules = sorted({e["destination"].split("/")[0] for e in entries})
-            _write_plan(
+            plan_path = _write_plan(
                 output_root,
                 _format_plan_markdown(
                     dimension="filename",
@@ -669,6 +687,7 @@ class OrganizeByFilenameTool(BaseTool):
                 output_root=output_root,
                 snapshot=integrity_snapshot,
                 output_mode=output_mode,
+                produced_paths=[plan_path],
             )
             if integrity_errors:
                 return ToolResult(

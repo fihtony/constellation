@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from io import StringIO
 from pathlib import Path
+from typing import Iterable
 
 from framework.tools.base import BaseTool, ToolResult
 
@@ -638,8 +639,33 @@ def _build_file_metadata(root: str, full_path: str) -> dict[str, object]:
     }
 
 
-def collect_organize_file_inventory(root: str) -> tuple[list[dict[str, object]], dict[str, list[str]], int]:
-    """Return recursive file inventory and category groups for organize tasks."""
+def collect_organize_file_inventory(
+    root: str,
+    *,
+    exclude_paths: Iterable[str] | None = None,
+) -> tuple[list[dict[str, object]], dict[str, list[str]], int]:
+    """Return recursive file inventory and category groups for organize tasks.
+
+    ``exclude_paths`` is an optional iterable of absolute paths the
+    caller wants the inventory walk to skip.  Use it for *tool-produced*
+    artifacts that happen to live under ``root`` — e.g. the
+    ``custom-organize-plan.md`` written during the planning phase of
+    the custom-dimension path, or the ``organization-plan.md`` that
+    the dimension tools write at the end of an organize run.  Without
+    this filter the inventory would sweep those artifacts in along
+    with the user's files, the LLM classifier would put them in some
+    bucket (typically ``__unmatched__``), and the executor would
+    relocate them next to user content.  Matching is by realpath so
+    a symlink or relative path still resolves to the same artifact.
+    """
+    excluded: set[str] = set()
+    for path in exclude_paths or ():
+        if not path:
+            continue
+        try:
+            excluded.add(os.path.realpath(path))
+        except OSError:
+            continue
     inventory: list[dict[str, object]] = []
     groups: dict[str, list[str]] = {}
     total_dirs = 0
@@ -650,6 +676,13 @@ def collect_organize_file_inventory(root: str) -> tuple[list[dict[str, object]],
             if name.startswith("."):
                 continue
             full_path = os.path.join(walk_root, name)
+            if excluded:
+                try:
+                    real = os.path.realpath(full_path)
+                except OSError:
+                    real = full_path
+                if real in excluded:
+                    continue
             item = _build_file_metadata(root, full_path)
             inventory.append(item)
             groups.setdefault(str(item["category"]), []).append(str(item["relative_path"]))

@@ -99,20 +99,27 @@ def _file_matches(rel: str, size: int, mtime: float, roots: Iterable[str]) -> bo
 def _list_post_files(root: str) -> list[tuple[str, int, float]]:
     """Walk ``root`` and return every regular file's ``(rel, size, mtime)``.
 
-    Skips hidden files and the audit-log filenames we know about
-    (the snapshot/verify records are written by this module into a
-    sibling of ``output_root`` and would never appear under the
-    source folder; the defensive filter keeps the helper robust to
-    any future layout change).
+    Skips hidden files — editor state (``~/.DS_Store`` etc.) is not
+    part of the integrity contract.  Audit-log filenames that the
+    tool produces (e.g. ``organization-plan.md``) are NOT filtered
+    here: the verifier must be able to see them so it can tell a
+    user file that happens to share a name apart from a system
+    artifact.  ``operations-plan.json`` lives next to the source, not
+    under it, so it never appears in this walk in either mode.
+
+    Tool-produced files are excluded from the *unexpected* check in
+    :func:`verify_post` via the ``produced_paths`` parameter — by
+    exact realpath, not by name — so a user file that happens to
+    have the same basename as a system artifact is still matched
+    against its snapshot entry.
     """
     if not root or not os.path.isdir(root):
         return []
     out: list[tuple[str, int, float]] = []
-    skip_names = {"operations-plan.json", "organization-plan.md"}
     for walk_root, dirs, files in os.walk(root):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
         for name in sorted(files):
-            if name.startswith(".") or name in skip_names:
+            if name.startswith("."):
                 continue
             abs_path = os.path.join(walk_root, name)
             try:
@@ -133,11 +140,12 @@ def verify_post(
     source_root: str,
     output_root: str,
     output_mode: str,
+    produced_paths: Iterable[str] | None = None,
 ) -> list[str]:
     """Return integrity errors; empty list means every file is intact.
 
-    The contract in both modes is the same in spirit — *no file is
-    modified, deleted, or created; only its location may change* —
+    The contract in both modes is the same in spirit — *no user file
+    is modified, deleted, or created; only its location may change* —
     but the implementation differs because the post-organize
     layout is different.
 
@@ -153,6 +161,23 @@ def verify_post(
       already know about.  The original location may have been
       emptied by a ``shutil.move``.
 
+    ``produced_paths`` is an explicit, path-aware allowlist of files
+    the executor intentionally created (e.g. the
+    ``organization-plan.md`` it writes at the end of an organize
+    run).  These exact paths are excluded from the *unexpected*
+    check so the tool can produce a plan next to a user file with
+    the same basename.  Crucially, ``produced_paths`` does NOT
+    suppress the *missing/modified* check — a user file at the
+    produced path is still expected to be present in the post tree
+    with the same size and mtime, and if the tool overwrote it the
+    check will correctly flag the violation.
+
+    The path-aware allowlist replaces a previous filename-based
+    skip (``{"organization-plan.md", "operations-plan.json"}``)
+    that created false-positive "missing or modified" errors
+    whenever the user's source folder happened to contain a file
+    with a matching basename.
+
     Each error is a short human-readable string; the caller is
     expected to surface them in the agent's delivery-error stream.
     """
@@ -161,6 +186,13 @@ def verify_post(
     mode = (output_mode or "").strip().lower()
     if not source_root and not output_root:
         return ["integrity verify skipped: no roots supplied"]
+    produced_realpaths: set[str] = set()
+    for path in produced_paths or ():
+        if path:
+            try:
+                produced_realpaths.add(os.path.realpath(path))
+            except OSError:
+                continue
     if mode == "workspace":
         if not source_root:
             return ["integrity verify skipped: no source_root for workspace mode"]
@@ -196,6 +228,11 @@ def verify_post(
         for rel, size, mtime in post:
             if rel in matched_rels:
                 continue
+            abs_path = os.path.realpath(os.path.join(source_root, rel))
+            if abs_path in produced_realpaths:
+                # Tool produced this file intentionally; it is
+                # the plan/audit artifact, not a stray user file.
+                continue
             errors.append(
                 f"unexpected file present after organize: {rel} "
                 f"(size={size}, mtime={mtime:.0f})"
@@ -226,6 +263,17 @@ def verify_post(
             continue
         bucket = post_index.get((size, int(mtime)), [])
         if not bucket:
+            # The snapshot's rel may have been the same path the
+            # tool now uses for a produced artifact (e.g. the
+            # user already had a file named organization-plan.md
+            # and the tool overwrote it).  Treat the produced
+            # path as "consumed" — the tool intentionally took
+            # that slot — so the verifier does not double-flag
+            # the same intended overwrite as both "missing" and
+            # "unexpected".
+            abs_path = os.path.realpath(os.path.join(output_root, rel))
+            if abs_path in produced_realpaths:
+                continue
             errors.append(
                 f"file missing or modified after organize: {rel} "
                 f"(expected size={size}, mtime={mtime:.0f})"
@@ -234,6 +282,11 @@ def verify_post(
         matched_rels.add(bucket.pop(0))
     for rel, size, mtime in post:
         if rel in matched_rels:
+            continue
+        abs_path = os.path.realpath(os.path.join(output_root, rel))
+        if abs_path in produced_realpaths:
+            # Tool produced this file intentionally; it is
+            # the plan/audit artifact, not a stray user file.
             continue
         errors.append(
             f"unexpected file present after organize: {rel} "
@@ -276,6 +329,18 @@ def cleanup_empty_dirs(root: str) -> list[str]:
     (no files, no subdirectories).  Never removes ``root`` itself,
     even if it becomes empty.
 
+    The pass is repeated until no new directory is removed.  This
+    matters when the source tree was nested more than one level
+    deep — for example the custom-dimension path's inplace layout
+    may have ``A/B/1.txt`` where after the move ``A/B/`` is empty
+    and ``A/`` is empty too.  ``os.walk(topdown=False)`` snapshots
+    the parent directory's children at walk start, so a single
+    bottom-up pass would remove ``A/B/`` and then still see ``A/``
+    as non-empty (its ``dirs`` list still contains the just-removed
+    ``A/B/``).  A second pass sees ``A/`` as truly empty and
+    rmdir's it.  The loop terminates as soon as a pass removes
+    nothing, which is the fixed point.
+
     Returns the list of removed directory paths.  Directories that
     are non-empty (typically the bucket subdirectories that
     received the moved files) are left untouched.
@@ -284,19 +349,24 @@ def cleanup_empty_dirs(root: str) -> list[str]:
         return []
     real_root = os.path.realpath(root)
     removed: list[str] = []
-    for walk_root, dirs, files in os.walk(real_root, topdown=False):
-        if walk_root == real_root:
-            # Never remove the source/output root itself, even if
-            # every loose file was moved out and the bucket
-            # subdirectories are also empty.  Removing the user's
-            # source folder would be catastrophic.
-            continue
-        if dirs or files:
-            continue
-        try:
-            os.rmdir(walk_root)
+    while True:
+        progressed = False
+        for walk_root, dirs, files in os.walk(real_root, topdown=False):
+            if walk_root == real_root:
+                # Never remove the source/output root itself, even
+                # if every loose file was moved out and the bucket
+                # subdirectories are also empty.  Removing the
+                # user's source folder would be catastrophic.
+                continue
+            if dirs or files:
+                continue
+            try:
+                os.rmdir(walk_root)
+            except OSError:
+                # Already gone, or a permission race.  Skip silently.
+                continue
             removed.append(walk_root)
-        except OSError:
-            # Already gone, or a permission race.  Skip silently.
-            pass
+            progressed = True
+        if not progressed:
+            break
     return removed

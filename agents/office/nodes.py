@@ -939,6 +939,16 @@ def _run_bounded_folder_organize(
                         "materialized_by": "bounded-folder-organize",
                     }) + "\n")
 
+    # Write the plan BEFORE the integrity check so the verifier can
+    # see the exact path the tool produced and exclude it from the
+    # "unexpected file" sweep.  The verifier treats a snapshot
+    # entry that points at a produced path as intentionally
+    # consumed, so a user file that happens to share the plan's
+    # basename is matched against its bucket-moved copy instead of
+    # being flagged as missing.
+    plan_path = _target_output_file(output_mode, source_root, artifacts_dir, "organization-plan.md")
+    _write_text_file(plan_path, _build_organization_plan_text(inventory, output_root))
+
     # Post-organize integrity check.  Workspace mode looks for every
     # snapshot file under ``source_root`` (untouched); inplace mode
     # looks under ``output_root`` (== ``source_root``) which now holds
@@ -951,6 +961,7 @@ def _run_bounded_folder_organize(
         source_root=source_root,
         output_root=output_root,
         output_mode=output_mode,
+        produced_paths=[plan_path],
     )
     integrity_errors.extend(_integrity_check_no_deletes(operations_path))
     with open(operations_path, "a", encoding="utf-8") as fh:
@@ -958,12 +969,10 @@ def _run_bounded_folder_organize(
             "action": "integrity_verify",
             "phase": "after",
             "source": os.path.realpath(source_root),
+            "produced_paths": [os.path.realpath(plan_path)],
             "errors": integrity_errors,
             "materialized_by": "bounded-folder-organize",
         }) + "\n")
-
-    plan_path = _target_output_file(output_mode, source_root, artifacts_dir, "organization-plan.md")
-    _write_text_file(plan_path, _build_organization_plan_text(inventory, output_root))
 
     summary = f"Office organized {len(inventory)} file(s) with the bounded folder workflow."
     if integrity_errors:
@@ -1145,7 +1154,72 @@ def _run_custom_dimension_path(
             "status": "failed",
             "error": f"source directory missing: {source!r}",
         }
-    inventory, _, _ = collect_organize_file_inventory(source)
+    # Track every artifact this executor is going to produce, plus
+    # every stale copy of the same artifacts that may already live
+    # under the source root from a previous run.  The inventory
+    # walk must skip all of them so the LLM classifier does not
+    # try to bucket-assign a tool-produced file, and the integrity
+    # check must skip them so the post-run verifier does not flag
+    # the tool's own writes as unexpected.  This is the same
+    # ``produced_paths`` discipline the built-in dimension tools
+    # follow; without it the custom path would (a) sweep the
+    # ``custom-organize-plan.md`` it wrote during Phase 1 into the
+    # inventory and let the LLM put it under ``__unmatched__`` (the
+    # bug behind ``unmatched/custom-organize-plan.md`` in
+    # task-afc50de4fa71, the inplace case), and (b) pick up
+    # **stale** ``custom-organize-plan.md`` / ``organization-plan.md``
+    # left at the source root by a previous inplace run and copy
+    # them into ``<output_root>/unmatched/`` during a workspace
+    # run (the bug behind task-298e13f787ac, where
+    # ``source != output_root`` so the stale copies never collide
+    # with the executor's own write target).
+    final_plan_path = _target_output_file(
+        output_mode,
+        source,
+        artifacts_dir,
+        "organization-plan.md",
+    )
+    # The Phase 1 plan is written at ``<output_root>/custom-organize-plan.md``
+    # by ``_plan_published``.  In inplace mode ``output_root`` IS
+    # ``source``, so this path sits next to the user's files; in
+    # workspace mode it sits in the artifacts dir and the source
+    # is left untouched — but a previous inplace run may have left
+    # a stale copy at ``<source>/custom-organize-plan.md`` that a
+    # workspace-mode inventory walk would otherwise sweep in.  Add
+    # both locations to the inventory's ``exclude_paths`` (and the
+    # integrity check's ``produced_paths``) so the file is never
+    # classified, whether the user is running inplace or workspace.
+    custom_plan_at_output = _os.path.join(output_root, "custom-organize-plan.md")
+    custom_plan_at_source = _os.path.join(source, "custom-organize-plan.md")
+    final_plan_at_source = _os.path.join(source, "organization-plan.md")
+    produced_paths: list[str] = [
+        custom_plan_at_output,
+        custom_plan_at_source,
+        final_plan_path,
+        final_plan_at_source,
+    ]
+    # ``produced_paths`` is allowed to contain duplicate paths
+    # (e.g. in inplace mode ``custom_plan_at_output`` and
+    # ``custom_plan_at_source`` resolve to the same realpath);
+    # dedup by realpath so the inventory skip set and the
+    # integrity-check allowlist stay tight.
+    deduped_paths: list[str] = []
+    seen_realpaths: set[str] = set()
+    for path in produced_paths:
+        try:
+            real = _os.path.realpath(path)
+        except OSError:
+            real = path
+        if real in seen_realpaths:
+            continue
+        seen_realpaths.add(real)
+        deduped_paths.append(path)
+    produced_paths = deduped_paths
+
+    inventory, _, _ = collect_organize_file_inventory(
+        source,
+        exclude_paths=produced_paths,
+    )
     sample_paths = set((approved_plan.get("sample_mapping") or {}).keys())
     remaining: list[dict] = []
     for item in inventory:
@@ -1184,6 +1258,35 @@ def _run_custom_dimension_path(
     # Materialize files into bucket folders.
     bucket_dirs: dict[str, str] = {}
     plan_rows: list[dict[str, str]] = []
+    # Snapshot the source tree *before* any transfer so the integrity
+    # verifier can confirm every original file is reachable
+    # somewhere in the post-organize layout (matching size+mtime).
+    integrity_snapshot = _integrity_snapshot_source(source)
+    operations_path = _os.path.join(artifacts_dir, "operations-plan.json")
+    _os.makedirs(_os.path.dirname(operations_path), exist_ok=True)
+    with open(operations_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "action": "audit_snapshot",
+            "phase": "before",
+            "source": _os.path.realpath(source),
+            "files": integrity_snapshot,
+            "produced_paths": [_os.path.realpath(p) for p in produced_paths],
+            "materialized_by": "custom-dimension",
+        }) + "\n")
+
+    # Materialize files into bucket folders.  The transfer mode
+    # follows the same contract as the built-in dimension tools:
+    #   - ``inplace``  — ``shutil.move`` (the source IS the output
+    #     root, so moving preserves the "no duplicate copy" contract
+    #     and makes the original sub-folders empty for the cleanup
+    #     pass below).
+    #   - ``workspace`` — ``shutil.copy2`` (the source is read-only,
+    #     so we never mutate it; the bucket tree is a fresh copy
+    #     under ``artifacts/organized-output/files/``).
+    transfer_action = "move_file" if output_mode == "inplace" else "copy_file"
+    transfer_op = shutil.move if transfer_action == "move_file" else shutil.copy2
+    bucket_dirs: dict[str, str] = {}
+    plan_rows: list[dict[str, str]] = []
     for item in inventory:
         rel = item.get("relative_path", "")
         bucket = str(mapping.get(rel) or "unmatched").strip() or "unmatched"
@@ -1196,16 +1299,69 @@ def _run_custom_dimension_path(
         dst_path = _os.path.realpath(_os.path.join(bucket_dir, rel))
         try:
             _os.makedirs(_os.path.dirname(dst_path), exist_ok=True)
-            shutil.copy2(src_path, dst_path)
+            transfer_op(src_path, dst_path)
         except OSError as exc:  # noqa: BLE001
             return {
-                "summary": f"office custom execute: copy failed: {exc}",
+                "summary": f"office custom execute: {transfer_action} failed: {exc}",
                 "success": False,
                 "capability": "organize",
                 "status": "failed",
-                "error": f"copy failed for {rel}: {exc}",
+                "error": f"{transfer_action} failed for {rel}: {exc}",
             }
+        with open(operations_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "action": transfer_action,
+                "src": src_path,
+                "dst": dst_path,
+                "content_length": 0,
+                "status": "succeeded",
+                "materialized_by": "custom-dimension",
+            }) + "\n")
         plan_rows.append({"source": rel, "bucket": bucket, "destination": _os.path.relpath(dst_path, output_root)})
+
+    # Inplace mode: after every file is moved out, the user's
+    # original sub-folders (e.g. ``0103/``, ``0207/``) become empty.
+    # Remove them so the user does not see stale directory skeletons
+    # next to the new bucket tree.  Built-in dimension tools do the
+    # same; without it the custom path silently leaves the original
+    # layout in place, which is what task-afc50de4fa71 flagged.
+    if output_mode == "inplace":
+        removed_dirs = _integrity_cleanup_empty_dirs(source)
+        if removed_dirs:
+            with open(operations_path, "a", encoding="utf-8") as fh:
+                for removed in removed_dirs:
+                    fh.write(json.dumps({
+                        "action": "remove_empty_dir",
+                        "dst": removed,
+                        "status": "succeeded",
+                        "materialized_by": "custom-dimension",
+                    }) + "\n")
+
+    # Post-organize integrity check.  Workspace mode looks for every
+    # snapshot file under ``source_root`` (untouched); inplace mode
+    # looks under ``output_root`` (== ``source_root``) which now holds
+    # the bucket tree.  The ``produced_paths`` allowlist matches the
+    # tool's own writes (``custom-organize-plan.md`` and
+    # ``organization-plan.md``) so they are not flagged as
+    # "unexpected".  This brings the custom path on par with the
+    # built-in dimension tools' integrity contract.
+    integrity_errors = _integrity_verify_post(
+        integrity_snapshot,
+        source_root=source,
+        output_root=output_root,
+        output_mode=output_mode,
+        produced_paths=produced_paths,
+    )
+    integrity_errors.extend(_integrity_check_no_deletes(operations_path))
+    with open(operations_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "action": "integrity_verify",
+            "phase": "after",
+            "source": _os.path.realpath(source),
+            "produced_paths": [_os.path.realpath(p) for p in produced_paths],
+            "errors": integrity_errors,
+            "materialized_by": "custom-dimension",
+        }) + "\n")
 
     # Write a final organization plan markdown for the audit trail.
     plan_lines = [
@@ -1224,25 +1380,20 @@ def _run_custom_dimension_path(
         *[f"| {row['source']} | {row['destination']} |" for row in plan_rows],
         "",
     ]
-    final_plan_path = _target_output_file(
-        output_mode,
-        source,
-        artifacts_dir,
-        "organization-plan.md",
-    )
     _write_text_file(final_plan_path, "\n".join(plan_lines))
     return {
         "summary": (
             f"Office organized {len(plan_rows)} file(s) with the custom "
             f"dimension ({custom_hint})."
         ),
-        "success": True,
+        "success": not integrity_errors,
         "capability": "organize",
-        "status": "completed",
+        "status": "completed" if not integrity_errors else "failed",
         "raw_output": json.dumps({"plan_rows": plan_rows[:200], "buckets": sorted(bucket_dirs)}),
         "expected_outputs": _expected_output_paths(
             "organize", validated_paths, output_mode, artifacts_dir
         ),
+        "warnings": integrity_errors,
     }
 
 
