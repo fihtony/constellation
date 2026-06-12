@@ -164,6 +164,12 @@ def test_resume_on_waiting_task_returns_slim_payload(monkeypatch, tmp_path):
                 "source_paths": ["/tmp/x"],
                 "output_mode": "",
             },
+            "office_session": {
+                "task_id": "task-office-1",
+                "service_url": "http://office-live:8040",
+                "container_name": "office-task-live",
+                "agent_id": "office",
+            },
         },
     )
     task_store.pause_task(
@@ -180,7 +186,7 @@ def test_resume_on_waiting_task_returns_slim_payload(monkeypatch, tmp_path):
     def _no_complete(self, **kwargs):
         return None
     monkeypatch.setattr(
-        "agents.compass.agent.CompassAgent._complete_office_task",
+        "agents.compass.agent.CompassAgent._resume_office_task",
         _no_complete,
     )
 
@@ -246,6 +252,12 @@ def test_ten_concurrent_resumes_all_succeed(monkeypatch, tmp_path):
                     "source_paths": ["/tmp/x"],
                     "output_mode": "",
                 },
+                "office_session": {
+                    "task_id": f"office-{_}",
+                    "service_url": f"http://office-live-{_}:8040",
+                    "container_name": f"office-task-live-{_}",
+                    "agent_id": "office",
+                },
             },
         )
         task_store.pause_task(
@@ -260,7 +272,7 @@ def test_ten_concurrent_resumes_all_succeed(monkeypatch, tmp_path):
     def _no_complete(self, **kwargs):
         return None
     monkeypatch.setattr(
-        "agents.compass.agent.CompassAgent._complete_office_task",
+        "agents.compass.agent.CompassAgent._resume_office_task",
         _no_complete,
     )
 

@@ -41,6 +41,28 @@ def _safe_segment(value: str) -> str:
     return cleaned or "other"
 
 
+def _safe_bucket_path(value: str) -> str:
+    """Sanitize a bucket name that may be a nested path.
+
+    Custom-dimension plans routinely express the desired layout with
+    slashes (e.g. ``Yan/January`` for "student name / month").  The
+    agent must materialize the actual nested folder hierarchy, not a
+    single sanitized segment.  This helper splits the value on path
+    separators, sanitizes each segment with :func:`_safe_segment`, and
+    rejoins them so the bucket name drives a real directory tree.
+
+    Empty or whitespace-only input falls back to ``"other"`` so the
+    executor never writes into the output root by accident.
+    """
+    if not value or not value.strip():
+        return "other"
+    parts = re.split(r"[\\/]+", value.strip())
+    cleaned_parts = [_safe_segment(part) for part in parts if part and part.strip()]
+    if not cleaned_parts:
+        return "other"
+    return "/".join(cleaned_parts)
+
+
 def _validate_inside(child: str, parent: str) -> bool:
     rp = os.path.realpath(os.path.abspath(child))
     pr = os.path.realpath(os.path.abspath(parent))
@@ -48,11 +70,18 @@ def _validate_inside(child: str, parent: str) -> bool:
 
 
 def _copy_into(src_root: str, rel: str, dst_root: str, bucket: str) -> str:
-    """Copy ``<src_root>/<rel>`` to ``<dst_root>/<bucket>/<rel>`` safely."""
+    """Copy ``<src_root>/<rel>`` to ``<dst_root>/<bucket>/<rel>`` safely.
+
+    ``bucket`` may be a nested path (e.g. ``"Yan/January"``) — it is
+    sanitized segment-by-segment so the resulting layout mirrors the
+    approved plan's bucket names instead of collapsing to a single
+    directory.
+    """
     src = os.path.realpath(os.path.join(src_root, rel))
     if not _validate_inside(src, src_root):
         raise ValueError(f"source escapes root: {rel}")
-    dst_dir = os.path.join(dst_root, _safe_segment(bucket))
+    bucket_path = _safe_bucket_path(bucket)
+    dst_dir = os.path.join(dst_root, bucket_path)
     dst = os.path.realpath(os.path.join(dst_dir, rel))
     if not _validate_inside(dst, dst_root):
         raise ValueError(f"destination escapes root: {rel}")

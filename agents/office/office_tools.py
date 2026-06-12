@@ -589,8 +589,30 @@ def _extract_ods_rows(path: str) -> tuple[dict[str, dict[str, object]], list[str
 
 
 def _safe_path_segment(value: str) -> str:
-    segment = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
-    return segment.strip("_") or "unknown"
+    """Return a filesystem-safe path for a bucket name.
+
+    Custom-dimension plans express their desired layout with slashes
+    (e.g. ``"Yan/January"`` for "student name / month").  The agent
+    must materialize that hierarchy verbatim, not collapse it into a
+    single directory.  We split the input on path separators,
+    sanitize each segment independently, and rejoin them so the bucket
+    name drives a real directory tree.
+
+    Empty or whitespace-only input falls back to ``"unknown"`` so the
+    executor never writes into the output root by accident.
+    """
+    if not value or not value.strip():
+        return "unknown"
+    parts = re.split(r"[\\/]+", value.strip())
+    cleaned = []
+    for part in parts:
+        if not part or not part.strip():
+            continue
+        segment = re.sub(r"[^A-Za-z0-9._-]+", "_", part.strip()).strip("_")
+        if not segment:
+            continue
+        cleaned.append(segment)
+    return "/".join(cleaned) if cleaned else "unknown"
 
 
 def _build_file_metadata(root: str, full_path: str) -> dict[str, object]:

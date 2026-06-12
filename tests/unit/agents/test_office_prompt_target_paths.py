@@ -1,0 +1,99 @@
+"""Pin the prompt builders' target-path output.
+
+The Office agent's prompt builders and the delivery-verification
+helper must compute the same target path. These tests pin the
+prompt text for each capability x mode combination.
+"""
+from __future__ import annotations
+
+import pytest
+
+from agents.office.nodes import (
+    _build_analyze_prompt,
+    _build_organize_prompt,
+    _build_summarize_prompt,
+)
+
+
+def test_analyze_prompt_inplace_dir_contains_inside_source_path(tmp_path):
+    """Bug A: the prompt must advertise the target INSIDE the source
+    directory, not as a sibling.
+
+    The helper target_with_suffix relies on os.path.isdir(), so we
+    need a real directory on the filesystem (tmp_path) rather than a
+    hard-coded non-existent path like "/data".
+    """
+    source_dir = tmp_path / "data"
+    source_dir.mkdir()
+    prompt = _build_analyze_prompt([str(source_dir)], "inplace", "/app/userdata")
+    expected = str(source_dir / "data.analysis.md")
+    assert expected in prompt
+    # The buggy old form would have been sibling: /tmp/.../data.analysis.md
+    # We assert the sibling form is NOT present as a standalone target path.
+    sibling_form = f"{tmp_path}.analysis.md"
+    assert sibling_form not in prompt
+
+
+def test_analyze_prompt_workspace_dir_uses_basename_only(tmp_path):
+    source_dir = tmp_path / "data"
+    source_dir.mkdir()
+    prompt = _build_analyze_prompt([str(source_dir)], "workspace", "/app/userdata")
+    assert "data.analysis.md" in prompt
+    # In workspace mode, the prompt tells the LLM to use write_workspace
+    # with a bare filename. The absolute path of the deliverable is
+    # decided by the helper downstream; the prompt just needs the
+    # filename, not the full path.
+    assert "Target filename" in prompt
+
+
+def test_analyze_prompt_inplace_file_target_next_to_source(tmp_path):
+    source_file = tmp_path / "sales.csv"
+    source_file.write_text("a,b\n1,2\n", encoding="utf-8")
+    prompt = _build_analyze_prompt([str(source_file)], "inplace", "/app/userdata")
+    expected = str(tmp_path / "sales.csv.analysis.md")
+    assert expected in prompt
+
+
+def test_organize_prompt_inplace_does_not_contain_literal_placeholder():
+    """Bug B: the inplace branch used to ship a literal
+    `{source_folder}` token that was never interpolated."""
+    prompt = _build_organize_prompt(["/data"], "inplace", "/app/userdata")
+    assert "{source_folder}" not in prompt
+
+
+def test_organize_prompt_inplace_advertises_source_dir_path():
+    prompt = _build_organize_prompt(["/data"], "inplace", "/app/userdata")
+    assert "/data/organization-plan.md" in prompt
+
+
+def test_summarize_prompt_inplace_file_target_next_to_source(tmp_path):
+    source_file = tmp_path / "sales.csv"
+    source_file.write_text("a,b\n1,2\n", encoding="utf-8")
+    prompt = _build_summarize_prompt([str(source_file)], "inplace", "/app/userdata")
+    expected = str(tmp_path / "sales.csv.summary.md")
+    assert expected in prompt
+
+
+def test_summarize_prompt_inplace_multi_file_combined_in_source_dir():
+    """When summarizing multiple files in inplace mode, the combined
+    report must be advertised inside the source directory, not in
+    artifacts."""
+    prompt = _build_summarize_prompt(
+        ["/data/a.txt", "/data/b.txt"], "inplace", "/app/userdata"
+    )
+    assert "/data/a.txt.summary.md" in prompt
+    assert "/data/b.txt.summary.md" in prompt
+    assert "combined-summary.md" in prompt
+    # The combined path must reference /data/, not /app/artifacts/.
+    assert "/data/combined-summary.md" in prompt
+
+
+def test_summarize_prompt_workspace_combined_in_artifacts():
+    prompt = _build_summarize_prompt(
+        ["/data/a.txt", "/data/b.txt"], "workspace", "/app/userdata"
+    )
+    assert "combined-summary.md" in prompt
+    # The combined-summary label must keep its "Combined report"
+    # prefix so the LLM can distinguish it from the per-file
+    # "Target filename:" lines.
+    assert "Combined report target filename: combined-summary.md" in prompt

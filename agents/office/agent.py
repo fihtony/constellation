@@ -19,6 +19,10 @@ from framework import devlog  # noqa: F401  # default-tz side-effect
 from framework.config import build_agent_definition_from_config
 from framework.workflow import Workflow, START, END
 from framework.a2a.protocol import Artifact
+from framework.clarification_reply import (
+    build_approve_or_modify_contract,
+    resolve_reply,
+)
 from framework.devlog import _ts
 
 from agents.office.nodes import (
@@ -75,6 +79,32 @@ def _normalize_capability(value: str) -> str:
     }
     capability = mapping.get(capability, capability)
     return capability if capability in {"summarize", "analyze", "organize"} else ""
+
+
+def _normalize_custom_plan_action(value: str) -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    if text in {"approve", "approved", "yes", "ok", "okay", "go", "y", "lgtm"}:
+        return "approve"
+    if text in {"modify", "change", "revise", "update"} or text.startswith(
+        ("modify:", "change:", "revise:")
+    ):
+        return "modify"
+    return ""
+
+
+def _unpack_resume_payload(resume_value: Any) -> tuple[str, dict[str, Any]]:
+    if isinstance(resume_value, dict):
+        reply_text = str(
+            resume_value.get("text")
+            or resume_value.get("input")
+            or resume_value.get("reply")
+            or ""
+        ).strip()
+        resolution = resume_value.get("clarification_resolution") or {}
+        return reply_text, dict(resolution) if isinstance(resolution, dict) else {}
+    return str(resume_value or "").strip(), {}
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +171,18 @@ class OfficeAgent(BaseAgent):
     # and only signal the one being cancelled.
     _cancel_events: dict[str, threading.Event] = {}
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        from framework.lifecycle import PerTaskLifecycleManager
+
+        idle_timeout = float(os.environ.get("OFFICE_IDLE_TIMEOUT_SECONDS", "1800"))
+        workspace_path = os.environ.get("CONSTELLATION_TASK_WORKSPACE", "")
+        self._lifecycle = PerTaskLifecycleManager(
+            agent_id=self.definition.agent_id,
+            idle_timeout_seconds=idle_timeout,
+            workspace_path=workspace_path,
+        )
+
     async def start(self) -> None:
         await super().start()
         register_office_tools()
@@ -168,19 +210,34 @@ class OfficeAgent(BaseAgent):
         # (e.g. the cancel raced a normal completion).
         return await super().handle_task_cancel(task_id, reason)
 
-    async def handle_message(self, message: dict) -> dict:
-        """Handle incoming A2A message.
+    def _resolve_execution_contract(self, task_id: str, exec_contract: Any):
+        from framework.execution_contract import resolve_execution_contract_permission_set
+        from framework.permissions import PermissionEngine
 
-        Non-blocking: returns task dict immediately, runs workflow in background thread.
-        """
-        from framework.workflow import RunConfig
+        if not exec_contract or not isinstance(exec_contract, dict):
+            raise ValueError("Missing executionContract metadata")
+        contract, permission_set = resolve_execution_contract_permission_set(
+            self.definition.permission_profile,
+            exec_contract,
+        )
+        self._permission_engine = PermissionEngine(permission_set)
+        return contract
+
+    def _build_run_payload(
+        self,
+        *,
+        task_id: str,
+        user_text: str,
+        metadata: dict[str, Any],
+        contract: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
         from framework.devlog import AgentLogger
+        from framework.office.dimensions import (
+            CUSTOM_DIMENSION,
+            extract_custom_dimension_hint as _extract_custom_dimension_hint,
+            parse_dimension as _parse_dimension,
+        )
 
-        msg = message.get("message", message)
-        parts = msg.get("parts", [])
-        user_text = parts[0].get("text", "") if parts else ""
-        metadata = msg.get("metadata", {})
-        callback_url = metadata.get("callbackUrl", "") or metadata.get("orchestratorCallbackUrl", "")
         source_paths = _normalize_source_paths(
             metadata.get("source_paths") or metadata.get("officeTargetPaths")
         )
@@ -198,88 +255,63 @@ class OfficeAgent(BaseAgent):
         if output_mode not in {"workspace", "inplace"}:
             output_mode = "workspace"
 
-        # Get compass task ID for workspace scoping
-        compass_task_id = metadata.get("compassTaskId", metadata.get("taskId", ""))
+        compass_task_id = str(
+            metadata.get("compassTaskId")
+            or metadata.get("taskId")
+            or task_id
+        ).strip() or task_id
+        log_task_id = compass_task_id or task_id
 
-        # Create task via task store
-        task_store = self.services.task_store
-        canonical_task_id = compass_task_id or ""
-        task = task_store.create_task(
-            agent_id=self.definition.agent_id,
-            metadata={
-                "compass_task_id": compass_task_id,
-                "user_text": user_text,
-                "source_paths": source_paths,
-                "capability": capability,
-                "output_mode": output_mode,
-            },
-            task_id=canonical_task_id or None,
-        )
-
-        canonical_task_id = task.id
-
-        exec_contract = metadata.get("executionContract")
-        if not exec_contract or not isinstance(exec_contract, dict):
-            task_store.fail_task(canonical_task_id, "Missing executionContract metadata")
-            return task_store.get_task_dict(canonical_task_id)
-
-        from framework.execution_contract import resolve_execution_contract_permission_set
-        from framework.permissions import PermissionEngine
-        try:
-            contract, permission_set = resolve_execution_contract_permission_set(
-                self.definition.permission_profile,
-                exec_contract,
-            )
-            self._permission_engine = PermissionEngine(permission_set)
-        except Exception as exc:
-            _append_office_log(canonical_task_id, "invalid execution contract", level="ERROR", error=str(exc))
-            task_store.fail_task(canonical_task_id, f"Invalid executionContract metadata: {exc}")
-            return task_store.get_task_dict(canonical_task_id)
-
-        # Setup logging - use compass_task_id if available, else own task id
-        log_task_id = compass_task_id if compass_task_id else canonical_task_id
         log = AgentLogger(task_id=log_task_id, agent_name=self.definition.agent_id)
-        log.node("handle_message", compass_task_id=compass_task_id, office_task_id=canonical_task_id,
-                 request_preview=user_text[:200])
+        log.node(
+            "handle_message",
+            compass_task_id=compass_task_id,
+            office_task_id=task_id,
+            request_preview=user_text[:200],
+        )
         _append_office_log(
             log_task_id,
             "[NODE] handle_message",
             compass_task_id=compass_task_id,
-            office_task_id=canonical_task_id,
+            office_task_id=task_id,
             request_preview=user_text[:200],
         )
-        log.info("office agent started", output_mode=metadata.get("output_mode", "workspace"),
-                 has_callback=bool(callback_url))
+        log.info(
+            "office agent started",
+            output_mode=output_mode,
+            has_callback=bool(
+                metadata.get("callbackUrl") or metadata.get("orchestratorCallbackUrl")
+            ),
+        )
         _append_office_log(
             log_task_id,
             "office agent started",
-            output_mode=metadata.get("output_mode", "workspace"),
-            has_callback=bool(callback_url),
+            output_mode=output_mode,
+            has_callback=bool(
+                metadata.get("callbackUrl") or metadata.get("orchestratorCallbackUrl")
+            ),
         )
-        log.a2a("←", "compass", event="task received",
-                compass_task_id=compass_task_id, office_task_id=canonical_task_id)
+        log.a2a(
+            "←",
+            "compass",
+            event="task received",
+            compass_task_id=compass_task_id,
+            office_task_id=task_id,
+        )
         _append_office_log(
             log_task_id,
             "[A2A] ← compass",
             capability=capability,
             compass_task_id=compass_task_id,
-            office_task_id=canonical_task_id,
+            office_task_id=task_id,
         )
 
-        # Build initial state
         ephemeral_state = {
             "_task_logger": log,
             "_message_metadata": dict(metadata),
             "_permission_engine": getattr(self, "_permission_engine", None),
         }
-        from framework.office.dimensions import (
-            extract_custom_dimension_hint as _extract_custom_dimension_hint,
-            parse_dimension as _parse_dimension,
-        )
-        # Custom-dimension plan-then-execute: read the approved
-        # plan + user action out of the A2A metadata so the office
-        # executor can skip the planning pass and run the LLM
-        # classification directly.
+
         approved_plan = metadata.get("organizeCustomPlan") or {}
         custom_action = str(metadata.get("organizeCustomAction") or "").strip()
         custom_modify_note = str(
@@ -290,8 +322,9 @@ class OfficeAgent(BaseAgent):
             or _extract_custom_dimension_hint(user_text)
             or ""
         ).strip()
+        organize_dimension = _parse_dimension(dict(metadata), user_text)
         state: dict[str, Any] = {
-            "_task_id": canonical_task_id,
+            "_task_id": task_id,
             "_compass_task_id": compass_task_id,
             "_allowed_tools": contract.allowed_tools,
             "required_skills": list(self.definition.skills or []),
@@ -300,7 +333,7 @@ class OfficeAgent(BaseAgent):
             "source_paths": source_paths,
             "capability": capability or "summarize",
             "test_cycles": 0,
-            "organize_dimension": _parse_dimension(dict(metadata), user_text),
+            "organize_dimension": organize_dimension,
         }
         if approved_plan:
             state["organize_custom_plan"] = dict(approved_plan)
@@ -310,12 +343,10 @@ class OfficeAgent(BaseAgent):
             state["organize_custom_modify_note"] = custom_modify_note
         if custom_hint:
             state["organize_custom_hint"] = custom_hint
+        if organize_dimension == CUSTOM_DIMENSION and custom_hint:
+            state["organize_custom_hint"] = custom_hint
 
-        # v0.8 timeline redesign: resolve a progress_sink so major-step
-        # events flow into Compass's top-level task store. The sink is
-        # resolved via the Capability Registry (``compass.major_step.sink``)
-        # and falls back gracefully when the registry is unreachable.
-        if compass_task_id and compass_task_id != canonical_task_id:
+        if compass_task_id and compass_task_id != task_id:
             try:
                 from framework.major_step import resolve_progress_sink
 
@@ -328,18 +359,17 @@ class OfficeAgent(BaseAgent):
             except Exception as exc:  # noqa: BLE001
                 logger.debug("office: failed to resolve progress_sink: %s", exc)
 
-        # Set OFFICE_WORKSPACE_ROOT for this task
-        # Workspace path: {ARTIFACT_ROOT}/{compass_task_id}/office/
-        # All office tasks under the same compass task share the same workspace
         artifact_root = os.environ.get("ARTIFACT_ROOT", "")
         if artifact_root:
-            # Use compass_task_id if available, otherwise use canonical_task_id for standalone operation
-            ws_id = compass_task_id if compass_task_id else canonical_task_id
-            workspace_root = os.path.join(artifact_root, ws_id, "office")
+            workspace_root = os.path.join(artifact_root, compass_task_id or task_id, "office")
             artifacts_dir = os.path.join(workspace_root, "artifacts")
             os.makedirs(artifacts_dir, exist_ok=True)
             os.environ["OFFICE_WORKSPACE_ROOT"] = artifacts_dir
-            log.info("office workspace prepared", workspace_root=workspace_root, artifacts_dir=artifacts_dir)
+            log.info(
+                "office workspace prepared",
+                workspace_root=workspace_root,
+                artifacts_dir=artifacts_dir,
+            )
             _append_office_log(
                 log_task_id,
                 "office workspace prepared",
@@ -347,143 +377,460 @@ class OfficeAgent(BaseAgent):
                 artifacts_dir=artifacts_dir,
             )
 
-        # Run workflow in background thread
-        def _run() -> None:
-            # Register a cancel event for this task id so
-            # ``handle_task_cancel`` can signal the workflow thread to
-            # stop. Removed on every exit path below.
-            cancel_event = OfficeAgent._cancel_events.setdefault(
-                canonical_task_id, threading.Event()
+        return state, ephemeral_state, log_task_id
+
+    def _execute_office_workflow(
+        self,
+        *,
+        task_id: str,
+        state: dict[str, Any],
+        ephemeral_state: dict[str, Any],
+        task_store,
+        callback_url: str,
+        log_task_id: str,
+        send_callback: bool,
+    ) -> dict:
+        cancel_event = OfficeAgent._cancel_events.setdefault(
+            task_id, threading.Event()
+        )
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            config = self._build_run_config(
+                task_id,
+                max_steps=50,
+                timeout_seconds=3600,
+                ephemeral_state=ephemeral_state,
             )
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            state["_cancel_event"] = cancel_event
             try:
-                config = self._build_run_config(
-                    canonical_task_id,
-                    max_steps=50,
-                    timeout_seconds=3600,
-                    ephemeral_state=ephemeral_state,
+                result = loop.run_until_complete(
+                    self._compiled_workflow.invoke(state, config)
                 )
-                # Surface the cancel event to the workflow state so the
-                # office nodes can poll it between major steps and raise
-                # ``_CancelWorkflow`` promptly. The base class does not
-                # need to know about it; this is purely a node-level
-                # contract.
-                state["_cancel_event"] = cancel_event
+            except _CancelWorkflow:
+                _append_office_log(
+                    log_task_id,
+                    "office workflow cancelled by user",
+                    reason="cancelled by user",
+                )
                 try:
-                    result = loop.run_until_complete(
-                        self._compiled_workflow.invoke(state, config)
-                    )
-                except _CancelWorkflow:
-                    # The user cancelled mid-flight. Mark the task as
-                    # CANCELLED and exit cleanly — do not call the
-                    # success / failure path. The base handle_task_cancel
-                    # already transitioned the store, but we re-assert
-                    # here in case the cancel raced the workflow start.
-                    _append_office_log(
-                        log_task_id,
-                        "office workflow cancelled by user",
-                        reason="cancelled by user",
-                    )
-                    try:
-                        task_store.cancel_task(
-                            canonical_task_id, "cancelled by user"
-                        )
-                    except Exception:
-                        pass
-                    if callback_url:
-                        try:
-                            _send_callback_input_required(
-                                callback_url,
-                                canonical_task_id,
-                                "Task cancelled by user",
-                            )
-                        except Exception:
-                            pass
-                    return
+                    task_store.cancel_task(task_id, "cancelled by user")
+                except Exception:
+                    pass
+                self._lifecycle.arm_idle_timer(task_id)
+                return task_store.get_task_dict(task_id)
 
-                # Clarification round-trip: when the workflow surfaces a
-                # ``needs_clarification`` payload (e.g. organize capability
-                # without a grouping dimension), promote the task to
-                # ``TASK_STATE_INPUT_REQUIRED`` instead of failing it. The
-                # orchestrator (compass) reads the structured payload from
-                # ``task_store`` and re-prompts the user.
-                needs_clarification = result.get("needs_clarification")
-                if needs_clarification:
-                    user_message = str(
-                        needs_clarification.get("user_message")
-                        or "Office requires additional input before continuing."
-                    ).strip()
-                    try:
-                        task_store.pause_task(
-                            canonical_task_id,
-                            question=user_message,
-                            interrupt_metadata={
-                                "kind": "office_clarification",
-                                "needs_clarification": needs_clarification,
-                            },
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "office: pause_task for clarification failed: %s", exc
-                        )
-                    _append_office_log(
-                        log_task_id,
-                        "office task awaiting clarification",
+            needs_clarification = result.get("needs_clarification")
+            if needs_clarification:
+                if (
+                    isinstance(needs_clarification, dict)
+                    and str(needs_clarification.get("missing") or "").strip()
+                    == "organizeCustomPlan"
+                    and not isinstance(needs_clarification.get("reply_contract"), dict)
+                ):
+                    needs_clarification = dict(needs_clarification)
+                    needs_clarification["reply_contract"] = (
+                        build_approve_or_modify_contract()
+                    )
+                user_message = str(
+                    needs_clarification.get("user_message")
+                    or "Office requires additional input before continuing."
+                ).strip()
+                try:
+                    task_store.pause_task(
+                        task_id,
                         question=user_message,
-                        kind=str(needs_clarification.get("missing") or ""),
-                    )
-                    if callback_url:
-                        _send_callback_input_required(
-                            callback_url, canonical_task_id, user_message
-                        )
-                    return
-
-                artifacts = [
-                    Artifact(
-                        name="office-result",
-                        artifact_type="text/plain",
-                        parts=[{"text": result.get("summary", "Office task completed.")}],
-                        metadata={
-                            "capability": result.get("capability", "summarize"),
-                            "output_mode": result.get("output_mode", "workspace"),
+                        interrupt_metadata={
+                            "kind": "office_clarification",
+                            "needs_clarification": needs_clarification,
                         },
                     )
-                ]
-                if result.get("success", False) and not _result_summary_indicates_failure(result):
-                    task_store.complete_task(canonical_task_id, artifacts=artifacts)
-                else:
-                    if result.get("success", False):
-                        # LLM claimed success but its summary still describes a real
-                        # failure (e.g. "the file could not be found").  Treat it as
-                        # a failure so the orchestrator surfaces the error.
-                        logger.warning(
-                            "office agent result claimed success but summary indicates failure: %s",
-                            str(result.get("summary", ""))[:200],
-                        )
-                        result = dict(result)
-                        result["success"] = False
-                        result.setdefault("status", "failed")
-                    task_store.fail_task(canonical_task_id, result.get("summary", "Office task failed."))
-                    return
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "office: pause_task for clarification failed: %s", exc
+                    )
+                _append_office_log(
+                    log_task_id,
+                    "office task awaiting clarification",
+                    question=user_message,
+                    kind=str(needs_clarification.get("missing") or ""),
+                )
+                if callback_url and send_callback:
+                    _send_callback_input_required(
+                        callback_url, task_id, user_message
+                    )
+                self._lifecycle.arm_idle_timer(task_id)
+                return task_store.get_task_dict(task_id)
 
-                if callback_url:
-                    _send_callback(callback_url, canonical_task_id, result)
-            except Exception as exc:
-                logger.exception(f"Office workflow failed: {exc}")
-                _append_office_log(log_task_id, "office workflow failed", level="ERROR", error=str(exc))
-                task_store.fail_task(canonical_task_id, str(exc))
-            finally:
-                # Always drop the cancel event so a future task with the
-                # same id (none in practice, but defensive) does not
-                # inherit a stale signal.
-                OfficeAgent._cancel_events.pop(canonical_task_id, None)
-                loop.close()
+            artifacts = [
+                Artifact(
+                    name="office-result",
+                    artifact_type="text/plain",
+                    parts=[{"text": result.get("summary", "Office task completed.")}],
+                    metadata={
+                        "capability": result.get("capability", "summarize"),
+                        "output_mode": result.get("output_mode", "workspace"),
+                    },
+                )
+            ]
+            if result.get("success", False) and not _result_summary_indicates_failure(result):
+                summary = str(result.get("summary") or "Office task completed.").strip()
+                task_store.complete_task(task_id, artifacts=artifacts, message=summary)
+                if callback_url and send_callback:
+                    _send_callback(callback_url, task_id, result)
+            else:
+                if result.get("success", False):
+                    logger.warning(
+                        "office agent result claimed success but summary indicates failure: %s",
+                        str(result.get("summary", ""))[:200],
+                    )
+                    result = dict(result)
+                    result["success"] = False
+                    result.setdefault("status", "failed")
+                task_store.fail_task(
+                    task_id,
+                    result.get("summary", "Office task failed."),
+                )
+            self._lifecycle.arm_idle_timer(task_id)
+            return task_store.get_task_dict(task_id)
+        except Exception as exc:
+            logger.exception(f"Office workflow failed: {exc}")
+            _append_office_log(
+                log_task_id,
+                "office workflow failed",
+                level="ERROR",
+                error=str(exc),
+            )
+            task_store.fail_task(task_id, str(exc))
+            self._lifecycle.arm_idle_timer(task_id)
+            return task_store.get_task_dict(task_id)
+        finally:
+            OfficeAgent._cancel_events.pop(task_id, None)
+            loop.close()
+
+    def _reask_for_clarification(
+        self,
+        *,
+        task_store,
+        task_id: str,
+        question: str,
+        interrupt_metadata: dict[str, Any],
+    ) -> dict:
+        try:
+            task_store.resume_task(task_id)
+        except Exception:
+            pass
+        task_store.pause_task(
+            task_id,
+            question=question,
+            interrupt_metadata=interrupt_metadata,
+        )
+        self._lifecycle.arm_idle_timer(task_id)
+        return task_store.get_task_dict(task_id)
+
+    async def handle_message(self, message: dict) -> dict:
+        """Handle incoming A2A message.
+
+        Non-blocking: returns task dict immediately, runs workflow in background thread.
+        """
+        msg = message.get("message", message)
+        parts = msg.get("parts", [])
+        user_text = parts[0].get("text", "") if parts else ""
+        metadata = dict(msg.get("metadata", {}) or {})
+        callback_url = str(
+            metadata.get("callbackUrl", "") or metadata.get("orchestratorCallbackUrl", "")
+        ).strip()
+        source_paths = _normalize_source_paths(
+            metadata.get("source_paths") or metadata.get("officeTargetPaths")
+        )
+        capability = _normalize_capability(
+            str(
+                metadata.get("capability")
+                or metadata.get("officeCapability")
+                or metadata.get("requestedCapability")
+                or ""
+            )
+        )
+        output_mode = str(
+            metadata.get("output_mode") or metadata.get("officeOutputMode") or "workspace"
+        ).strip().lower()
+        if output_mode not in {"workspace", "inplace"}:
+            output_mode = "workspace"
+        compass_task_id = str(
+            metadata.get("compassTaskId", metadata.get("taskId", ""))
+        ).strip()
+
+        self._lifecycle.cancel_idle_timer()
+
+        # Create task via task store
+        task_store = self.services.task_store
+        canonical_task_id = compass_task_id or ""
+        task = task_store.create_task(
+            agent_id=self.definition.agent_id,
+            metadata={
+                "compass_task_id": compass_task_id,
+                "user_text": user_text,
+                "source_paths": source_paths,
+                "capability": capability,
+                "output_mode": output_mode,
+                "callback_url": callback_url,
+                "request_metadata": dict(metadata),
+            },
+            task_id=canonical_task_id or None,
+        )
+
+        canonical_task_id = task.id
+        try:
+            contract = self._resolve_execution_contract(
+                canonical_task_id,
+                metadata.get("executionContract"),
+            )
+        except Exception as exc:
+            _append_office_log(
+                canonical_task_id,
+                "invalid execution contract",
+                level="ERROR",
+                error=str(exc),
+            )
+            task_store.fail_task(canonical_task_id, str(exc))
+            return task_store.get_task_dict(canonical_task_id)
+
+        self._lifecycle.configure_timeout_notification(
+            callback_url,
+            orchestrator_task_id=compass_task_id or canonical_task_id,
+        )
+        self._lifecycle.mark_working(canonical_task_id)
+
+        # A re-dispatched task (same task_id as a previously paused run)
+        # must start the workflow fresh.  The office workflow is invoked
+        # (not resumed), so the saved checkpoint from the previous run
+        # would otherwise overwrite the new ``organize_custom_action`` /
+        # ``organize_custom_modify_note`` metadata and silently drop
+        # the user's modify reply.  Drop the checkpoint here so the
+        # planner actually re-runs with the new state.
+        if self.checkpoint_service is not None:
+            try:
+                await self.checkpoint_service.delete(
+                    canonical_task_id, canonical_task_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "office: failed to clear checkpoint for re-dispatched task %s: %s",
+                    canonical_task_id,
+                    exc,
+                )
+
+        state, ephemeral_state, log_task_id = self._build_run_payload(
+            task_id=canonical_task_id,
+            user_text=user_text,
+            metadata=metadata,
+            contract=contract,
+        )
+
+        # Run workflow in background thread
+        def _run() -> None:
+            self._execute_office_workflow(
+                task_id=canonical_task_id,
+                state=dict(state),
+                ephemeral_state=dict(ephemeral_state),
+                task_store=task_store,
+                callback_url=callback_url,
+                log_task_id=log_task_id,
+                send_callback=True,
+            )
 
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()
 
         return task_store.get_task_dict(canonical_task_id)
+
+    async def resume_task(self, task_id: str, resume_value: Any) -> dict:
+        from framework.a2a.protocol import TaskState
+        from framework.office.dimensions import (
+            CUSTOM_DIMENSION,
+            extract_custom_dimension_hint,
+            parse_dimension,
+        )
+
+        task_store = self.services.task_store
+        task = task_store.get_task(task_id)
+        if task is None:
+            raise RuntimeError(f"Task {task_id} not found")
+
+        current_state = getattr(
+            getattr(task.status, "state", None), "value",
+            str(getattr(task.status, "state", "")),
+        )
+        if current_state != TaskState.INPUT_REQUIRED.value:
+            return task_store.get_task_dict(task_id)
+
+        metadata = dict(task.metadata or {})
+        request_metadata = dict(metadata.get("request_metadata") or {})
+        callback_url = str(metadata.get("callback_url") or "").strip()
+        interrupt = dict(metadata.get("_interrupt") or {})
+        needs_clarification = dict(interrupt.get("needs_clarification") or {})
+        reply_text, structured_resolution = _unpack_resume_payload(resume_value)
+
+        updated_metadata = dict(request_metadata)
+        missing = str(needs_clarification.get("missing") or "").strip()
+        if missing == "organizeGroupBy":
+            resolution_kind = str(
+                structured_resolution.get("contract_kind")
+                or structured_resolution.get("kind")
+                or ""
+            ).strip()
+            dimension = ""
+            if resolution_kind == "select_option":
+                dimension = str(structured_resolution.get("selection") or "").strip()
+            if not dimension:
+                dimension = parse_dimension({}, reply_text)
+            if not dimension:
+                return self._reask_for_clarification(
+                    task_store=task_store,
+                    task_id=task_id,
+                    question=str(
+                        needs_clarification.get("user_message")
+                        or "Office organize needs a grouping dimension."
+                    ),
+                    interrupt_metadata={
+                        "kind": "office_clarification",
+                        "needs_clarification": needs_clarification,
+                    },
+                )
+            updated_metadata["organizeGroupBy"] = dimension
+            if dimension == CUSTOM_DIMENSION:
+                custom_hint = str(
+                    extract_custom_dimension_hint(reply_text)
+                    or request_metadata.get("customDimensionHint")
+                    or ""
+                ).strip()
+                if custom_hint:
+                    updated_metadata["customDimensionHint"] = custom_hint
+        elif missing == "organizeCustomPlan":
+            resolution = dict(structured_resolution)
+            resolution_kind = str(
+                resolution.get("contract_kind")
+                or resolution.get("kind")
+                or ""
+            ).strip()
+            if resolution_kind != "approve_or_modify":
+                reply_contract = dict(needs_clarification.get("reply_contract") or {})
+                if not reply_contract:
+                    reply_contract = build_approve_or_modify_contract()
+                resolved = resolve_reply(reply_contract, reply_text)
+                if not resolved.get("ok"):
+                    question = str(
+                        resolved.get("reask_message")
+                        or needs_clarification.get("user_message")
+                        or "Please reply `approve` or `modify: <change>`."
+                    )
+                    refreshed = dict(needs_clarification)
+                    refreshed["reply_contract"] = reply_contract
+                    refreshed["user_message"] = question
+                    return self._reask_for_clarification(
+                        task_store=task_store,
+                        task_id=task_id,
+                        question=question,
+                        interrupt_metadata={
+                            "kind": "office_clarification",
+                            "needs_clarification": refreshed,
+                        },
+                    )
+                resolution = {
+                    "contract_kind": "approve_or_modify",
+                    **dict(resolved.get("normalized") or {}),
+                }
+
+            action = str(resolution.get("action") or "").strip()
+            note = str(resolution.get("note") or "").strip()
+            if not action:
+                return self._reask_for_clarification(
+                    task_store=task_store,
+                    task_id=task_id,
+                    question=str(
+                        needs_clarification.get("user_message")
+                        or "Please reply `approve` or `modify: <change>`."
+                    ),
+                    interrupt_metadata={
+                        "kind": "office_clarification",
+                        "needs_clarification": needs_clarification,
+                    },
+                )
+            updated_metadata["organizeGroupBy"] = CUSTOM_DIMENSION
+            plan = dict(needs_clarification.get("plan") or {})
+            if plan:
+                updated_metadata["organizeCustomPlan"] = plan
+            updated_metadata["organizeCustomAction"] = action
+            if action == "modify":
+                updated_metadata["organizeCustomModifyNote"] = note or reply_text
+            else:
+                updated_metadata.pop("organizeCustomModifyNote", None)
+            custom_hint = str(
+                needs_clarification.get("custom_hint")
+                or request_metadata.get("customDimensionHint")
+                or ""
+            ).strip()
+            if custom_hint:
+                updated_metadata["customDimensionHint"] = custom_hint
+            updated_metadata["clarificationResolution"] = {
+                "contract_kind": "approve_or_modify",
+                "action": action,
+                "note": note or "",
+            }
+        else:
+            updated_metadata["clarificationResponse"] = reply_text
+
+        try:
+            contract = self._resolve_execution_contract(
+                task_id,
+                updated_metadata.get("executionContract"),
+            )
+        except Exception as exc:
+            task_store.fail_task(task_id, str(exc))
+            return task_store.get_task_dict(task_id)
+
+        self._lifecycle.cancel_idle_timer()
+        self._lifecycle.configure_timeout_notification(
+            callback_url,
+            orchestrator_task_id=str(
+                metadata.get("compass_task_id") or task_id
+            ).strip() or task_id,
+        )
+        self._lifecycle.mark_working(task_id)
+        task_store.resume_task(task_id)
+        task_store.update_metadata(task_id, {"request_metadata": updated_metadata})
+
+        # The resume path also invokes the workflow fresh (not via
+        # :meth:`CompiledWorkflow.resume`), so the saved checkpoint from
+        # the previous run would otherwise overwrite the user's
+        # ``organize_custom_modify_note`` (etc.) with the stale state.
+        # Drop the checkpoint so the new state survives.
+        if self.checkpoint_service is not None:
+            try:
+                await self.checkpoint_service.delete(task_id, task_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "office: failed to clear checkpoint for resumed task %s: %s",
+                    task_id,
+                    exc,
+                )
+
+        state, ephemeral_state, log_task_id = self._build_run_payload(
+            task_id=task_id,
+            user_text=str(metadata.get("user_text") or ""),
+            metadata=updated_metadata,
+            contract=contract,
+        )
+        return await asyncio.to_thread(
+            self._execute_office_workflow,
+            task_id=task_id,
+            state=state,
+            ephemeral_state=ephemeral_state,
+            task_store=task_store,
+            callback_url=callback_url,
+            log_task_id=log_task_id,
+            send_callback=False,
+        )
 
     async def get_task(self, task_id: str) -> dict:
         """Return real task state from TaskStore."""

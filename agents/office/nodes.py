@@ -34,7 +34,16 @@ from agents.office.office_tools import (
     ReadXlsxTool,
     collect_organize_file_inventory,
 )
+from framework.clarification_reply import (
+    build_approve_or_modify_contract,
+    build_select_option_contract,
+)
 from framework.office.dimensions import VALID_DIMENSIONS, parse_dimension
+from agents.office.output_paths import (
+    all_targets_for_capability as _all_targets_for_capability,
+    target_for_source as _target_for_source_impl,
+    target_with_suffix as _target_with_suffix_impl,
+)
 from framework.devlog import _ts
 from framework.major_step import LIFECYCLE_DONE, LIFECYCLE_RUNNING, LIFECYCLE_WARNING
 from framework.office.plan_output_gate import (
@@ -312,19 +321,25 @@ def analyze_request(state: dict) -> dict:
     if capability == "organize":
         dimension = parse_dimension(metadata, user_text)
         if not dimension:
+            options = [
+                {"id": d, "label": d.replace("_", " ")}
+                for d in sorted(VALID_DIMENSIONS)
+            ]
+            user_message = (
+                "Office organize needs a grouping dimension. "
+                "Available dimensions: "
+                + ", ".join(sorted(VALID_DIMENSIONS))
+                + "."
+            )
             return {
                 "error": "missing_organize_dimension",
                 "needs_clarification": {
                     "missing": "organizeGroupBy",
-                    "options": [
-                        {"id": d, "label": d.replace("_", " ")}
-                        for d in sorted(VALID_DIMENSIONS)
-                    ],
-                    "user_message": (
-                        "Office organize needs a grouping dimension. "
-                        "Available dimensions: "
-                        + ", ".join(sorted(VALID_DIMENSIONS))
-                        + "."
+                    "options": options,
+                    "user_message": user_message,
+                    "reply_contract": build_select_option_contract(
+                        options,
+                        reask_message=user_message,
                     ),
                 },
                 "workspace_root": _get_workspace_root(state),
@@ -1032,6 +1047,7 @@ def _run_custom_dimension_path(
                     {"id": "approve", "label": "Approve plan"},
                     {"id": "modify", "label": "Modify plan"},
                 ],
+                "reply_contract": build_approve_or_modify_contract(),
                 "plan": plan,
                 "plan_path": plan_path,
                 "custom_hint": custom_hint,
@@ -1245,26 +1261,9 @@ def _expected_output_paths(
     always register the expected output for every validated source path —
     missing-source failures can no longer slip through delivery verification.
     """
-    expected: list[str] = []
-    if capability == "analyze":
-        for path in validated_paths:
-            if not path:
-                continue
-            expected.append(_target_output_path(output_mode, path, artifacts_dir, ".analysis.md"))
-    elif capability == "summarize":
-        file_count = 0
-        for path in validated_paths:
-            if not path:
-                continue
-            expected.append(_target_output_path(output_mode, path, artifacts_dir, ".summary.md"))
-            file_count += 1
-        if file_count > 1 and validated_paths:
-            base_path = next((p for p in validated_paths if p), validated_paths[0])
-            expected.append(_target_output_file(output_mode, base_path, artifacts_dir, "combined-summary.md"))
-    elif capability == "organize" and validated_paths:
-        expected.append(_target_output_file(output_mode, validated_paths[0], artifacts_dir, "organization-plan.md"))
-        expected.append(_organized_output_root(output_mode, artifacts_dir, validated_paths))
-    return expected
+    return _all_targets_for_capability(
+        capability, validated_paths, output_mode, artifacts_dir
+    )
 
 
 def _organized_output_root(output_mode: str, artifacts_dir: str, source_paths: list[str]) -> str:
@@ -1975,16 +1974,21 @@ def execute_office_work(state: dict) -> dict:
     }
 
 
+# --- Compat shims ---------------------------------------------------------
+# The helpers below are kept as private names so existing call sites
+# (and the import in tests/unit/agents/test_office_analyze_expected_outputs.py)
+# keep working. The real implementation lives in
+# ``agents.office.output_paths`` — every code path in this module should
+# consume the helper directly via ``target_with_suffix`` or
+# ``target_for_source``.
+
+
 def _target_output_file(output_mode: str, source_path: str, artifacts_dir: str, filename: str) -> str:
-    if output_mode == "inplace":
-        base_dir = source_path if os.path.isdir(source_path) else os.path.dirname(source_path)
-        return os.path.join(base_dir, os.path.basename(filename))
-    return os.path.join(artifacts_dir, os.path.basename(filename))
+    return _target_for_source_impl(output_mode, source_path, artifacts_dir, filename)
 
 
 def _target_output_path(output_mode: str, source_path: str, artifacts_dir: str, suffix: str) -> str:
-    basename = os.path.basename(source_path.rstrip("/"))
-    return _target_output_file(output_mode, source_path, artifacts_dir, f"{basename}{suffix}")
+    return _target_with_suffix_impl(output_mode, source_path, artifacts_dir, suffix)
 
 
 def _build_summarize_prompt(paths: list[str], output_mode: str, source_root: str) -> str:
@@ -1992,15 +1996,25 @@ def _build_summarize_prompt(paths: list[str], output_mode: str, source_root: str
     has_multiple_files = len(paths) > 1
     target_lines = []
     for path in paths:
+        target = _target_with_suffix_impl(output_mode, path, "", ".summary.md")
         if output_mode == "workspace":
-            target_lines.append(f"- Source: {path}\n  Target filename: {os.path.basename(path)}.summary.md")
+            target_lines.append(
+                f"- Source: {path}\n  Target filename: {os.path.basename(target)}"
+            )
         else:
-            target_lines.append(f"- Source: {path}\n  Target path: {path}.summary.md")
-    if has_multiple_files:
+            target_lines.append(f"- Source: {path}\n  Target path: {target}")
+    if has_multiple_files and paths:
+        combined_target = _target_for_source_impl(
+            output_mode, paths[0], "", "combined-summary.md"
+        )
         if output_mode == "workspace":
-            target_lines.append("- Combined report target filename: combined-summary.md")
+            target_lines.append(
+                f"- Combined report target filename: {os.path.basename(combined_target)}"
+            )
         else:
-            target_lines.append(f"- Combined report target path: {os.path.join(os.path.dirname(paths[0]), 'combined-summary.md')}")
+            target_lines.append(
+                f"- Combined report target path: {combined_target}"
+            )
     targets_block = "\n".join(target_lines)
     write_rules = (
         "2. Write a summary using the write_workspace tool to the exact target filename listed below."
@@ -2056,10 +2070,11 @@ def _build_analyze_prompt(paths: list[str], output_mode: str, source_root: str) 
     paths_list = "\n".join(f"- {p}" for p in paths)
     target_lines = []
     for path in paths:
+        target = _target_with_suffix_impl(output_mode, path, "", ".analysis.md")
         if output_mode == "workspace":
-            target_lines.append(f"- Source: {path}\n  Target filename: {os.path.basename(path)}.analysis.md")
+            target_lines.append(f"- Source: {path}\n  Target filename: {os.path.basename(target)}")
         else:
-            target_lines.append(f"- Source: {path}\n  Target path: {path}.analysis.md")
+            target_lines.append(f"- Source: {path}\n  Target path: {target}")
     targets_block = "\n".join(target_lines)
     write_rules = (
         "4. Write an analysis report using write_workspace to the exact target filename listed below."
@@ -2115,12 +2130,17 @@ CRITICAL:
 
 def _build_organize_prompt(paths: list[str], output_mode: str, source_root: str) -> str:
     paths_list = "\n".join(f"- {p}" for p in paths)
-    write_rules = (
-        "3. Write the organization plan using write_workspace tool with filename: organization-plan.md"
-        if output_mode == "workspace"
-        else
-        "3. Write the organization plan using write_file tool to: {source_folder}/organization-plan.md"
-    )
+    if output_mode == "workspace":
+        write_rules = (
+            "3. Write the organization plan using write_workspace tool "
+            "with filename: organization-plan.md"
+        )
+    else:
+        source_folder = paths[0] if paths else source_root
+        write_rules = (
+            f"3. Write the organization plan using write_file tool to: "
+            f"{source_folder}/organization-plan.md"
+        )
     return f"""Organize the following folder(s):
 
 {paths_list}
