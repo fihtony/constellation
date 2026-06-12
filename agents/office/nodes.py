@@ -39,6 +39,11 @@ from framework.clarification_reply import (
     build_select_option_contract,
 )
 from framework.office.dimensions import VALID_DIMENSIONS, parse_dimension
+from agents.office.output_paths import (
+    all_targets_for_capability as _all_targets_for_capability,
+    target_for_source as _target_for_source_impl,
+    target_with_suffix as _target_with_suffix_impl,
+)
 from framework.devlog import _ts
 from framework.major_step import LIFECYCLE_DONE, LIFECYCLE_RUNNING, LIFECYCLE_WARNING
 from framework.office.plan_output_gate import (
@@ -1256,26 +1261,9 @@ def _expected_output_paths(
     always register the expected output for every validated source path —
     missing-source failures can no longer slip through delivery verification.
     """
-    expected: list[str] = []
-    if capability == "analyze":
-        for path in validated_paths:
-            if not path:
-                continue
-            expected.append(_target_output_path(output_mode, path, artifacts_dir, ".analysis.md"))
-    elif capability == "summarize":
-        file_count = 0
-        for path in validated_paths:
-            if not path:
-                continue
-            expected.append(_target_output_path(output_mode, path, artifacts_dir, ".summary.md"))
-            file_count += 1
-        if file_count > 1 and validated_paths:
-            base_path = next((p for p in validated_paths if p), validated_paths[0])
-            expected.append(_target_output_file(output_mode, base_path, artifacts_dir, "combined-summary.md"))
-    elif capability == "organize" and validated_paths:
-        expected.append(_target_output_file(output_mode, validated_paths[0], artifacts_dir, "organization-plan.md"))
-        expected.append(_organized_output_root(output_mode, artifacts_dir, validated_paths))
-    return expected
+    return _all_targets_for_capability(
+        capability, validated_paths, output_mode, artifacts_dir
+    )
 
 
 def _organized_output_root(output_mode: str, artifacts_dir: str, source_paths: list[str]) -> str:
@@ -1986,16 +1974,21 @@ def execute_office_work(state: dict) -> dict:
     }
 
 
+# --- Compat shims ---------------------------------------------------------
+# The helpers below are kept as private names so existing call sites
+# (and the import in tests/unit/agents/test_office_analyze_expected_outputs.py)
+# keep working. The real implementation lives in
+# ``agents.office.output_paths`` — every code path in this module should
+# consume the helper directly via ``target_with_suffix`` or
+# ``target_for_source``.
+
+
 def _target_output_file(output_mode: str, source_path: str, artifacts_dir: str, filename: str) -> str:
-    if output_mode == "inplace":
-        base_dir = source_path if os.path.isdir(source_path) else os.path.dirname(source_path)
-        return os.path.join(base_dir, os.path.basename(filename))
-    return os.path.join(artifacts_dir, os.path.basename(filename))
+    return _target_for_source_impl(output_mode, source_path, artifacts_dir, filename)
 
 
 def _target_output_path(output_mode: str, source_path: str, artifacts_dir: str, suffix: str) -> str:
-    basename = os.path.basename(source_path.rstrip("/"))
-    return _target_output_file(output_mode, source_path, artifacts_dir, f"{basename}{suffix}")
+    return _target_with_suffix_impl(output_mode, source_path, artifacts_dir, suffix)
 
 
 def _build_summarize_prompt(paths: list[str], output_mode: str, source_root: str) -> str:
