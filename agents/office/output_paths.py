@@ -25,6 +25,19 @@ from typing import Literal
 OutputMode = Literal["workspace", "inplace"]
 
 
+def _deliverable_base_dir(output_mode: str, source_path: str, artifacts_dir: str) -> str:
+    """Return the base directory an office deliverable should land under.
+
+    - ``workspace``: ``artifacts_dir``
+    - ``inplace`` + file: ``dirname(source_path)``
+    - ``inplace`` + directory: ``source_path``
+    """
+    mode = (output_mode or "").strip().lower()
+    if mode == "inplace":
+        return source_path if os.path.isdir(source_path) else os.path.dirname(source_path)
+    return artifacts_dir
+
+
 def target_for_source(
     output_mode: str,
     source_path: str,
@@ -39,11 +52,8 @@ def target_for_source(
 
     Unknown ``output_mode`` values fall back to ``workspace``.
     """
-    mode = (output_mode or "").strip().lower()
-    if mode == "inplace":
-        base_dir = source_path if os.path.isdir(source_path) else os.path.dirname(source_path)
-        return os.path.join(base_dir, os.path.basename(filename))
-    return os.path.join(artifacts_dir, os.path.basename(filename))
+    base_dir = _deliverable_base_dir(output_mode, source_path, artifacts_dir)
+    return os.path.join(base_dir, os.path.basename(filename))
 
 
 def target_with_suffix(
@@ -52,7 +62,13 @@ def target_with_suffix(
     artifacts_dir: str,
     suffix: str,
 ) -> str:
-    """Convenience wrapper; filename = ``<basename(source_path)><suffix>``."""
+    """Convenience wrapper; filename = ``<basename(source_path)><suffix>``.
+
+    If ``source_path`` is empty (which the analyze/summarize paths
+    already filter out), the filename falls back to ``output<suffix>``
+    rather than producing an empty string. This is a defensive
+    default; callers should pass a real path.
+    """
     basename = os.path.basename(source_path.rstrip("/").rstrip(os.sep)) or "output"
     return target_for_source(output_mode, source_path, artifacts_dir, f"{basename}{suffix}")
 
@@ -81,26 +97,21 @@ def all_targets_for_capability(
         return expected
 
     if capability == "summarize":
-        file_count = 0
-        for path in validated_paths:
-            if not path:
-                continue
+        non_empty = [p for p in validated_paths if p]
+        for path in non_empty:
             expected.append(target_with_suffix(output_mode, path, artifacts_dir, ".summary.md"))
-            file_count += 1
-        if file_count > 1 and validated_paths:
-            base_path = next((p for p in validated_paths if p), validated_paths[0])
-            expected.append(target_for_source(output_mode, base_path, artifacts_dir, "combined-summary.md"))
+        if len(non_empty) > 1:
+            expected.append(
+                target_for_source(output_mode, non_empty[0], artifacts_dir, "combined-summary.md")
+            )
         return expected
 
     if capability == "organize" and validated_paths:
         expected.append(
             target_for_source(output_mode, validated_paths[0], artifacts_dir, "organization-plan.md")
         )
-        source_root = validated_paths[0] if validated_paths else ""
-        if (output_mode or "").strip().lower() == "inplace":
-            expected.append(os.path.join(source_root, "organized-output", "files"))
-        else:
-            expected.append(os.path.join(artifacts_dir, "organized-output", "files"))
+        root = _deliverable_base_dir(output_mode, validated_paths[0], artifacts_dir)
+        expected.append(os.path.join(root, "organized-output", "files"))
         return expected
 
     return expected

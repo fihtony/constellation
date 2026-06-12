@@ -79,6 +79,11 @@ def test_target_with_suffix_strips_trailing_separators(tmp_path):
     assert result == str(source_dir / "data.summary.md")
 
 
+def test_target_with_suffix_empty_source_falls_back_to_output():
+    result = target_with_suffix("workspace", "", "/tmp/artifacts", ".analysis.md")
+    assert os.path.basename(result) == "output.analysis.md"
+
+
 # ---------------------------------------------------------------------------
 # all_targets_for_capability
 # ---------------------------------------------------------------------------
