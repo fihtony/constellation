@@ -603,9 +603,21 @@ def _summarize_payload_with_runtime(
     content_excerpt = str(payload.get("content") or "").strip()
     if len(content_excerpt) > 4000:
         content_excerpt = content_excerpt[:4000]
+    # The verb "Produce" (rather than "Write") is deliberate: the
+    # prompt is sent through ``runtime.run`` which, on local-subprocess
+    # backends, hands the LLM its full native tool surface.  Asking
+    # the LLM to "write" a summary was reliably triggering Claude's
+    # native ``Write`` tool and dropping a stray file at
+    # ``<cwd>/<filename>`` — the parent of ``artifacts_dir`` in
+    # workspace mode (see task-555101087925).  We pair the softer
+    # wording with a hard ``disallowed_tools=["*"]`` on the
+    # ``runtime.run`` call below, but the wording change is also a
+    # useful belt-and-braces defence.
     prompt = (
-        "Write an English-only Markdown summary for the extracted document payload below.\n\n"
+        "Produce an English-only Markdown summary for the extracted document payload below.\n\n"
         f"Filename: {os.path.basename(path)}\n"
+        "Respond with the summary text only — do not call any tools, "
+        "do not write any files, and do not include any extra preamble.\n\n"
         "Use exactly this structure:\n"
         f"# Summary: {os.path.basename(path)}\n\n"
         "## Document Info\n"
@@ -621,6 +633,21 @@ def _summarize_payload_with_runtime(
         "Extracted content excerpt:\n"
         f"{content_excerpt or '[no extractable text]'}"
     )
+    # ``runtime.run`` is supposed to be a pure text round-trip —
+    # we already extracted the document payload above and pass the
+    # excerpt inline, the LLM has no business touching the
+    # filesystem.  We pass ``disallowed_tools=["*"]`` to make the
+    # tool-free contract structural instead of advisory: local
+    # subprocess backends (claude-code) translate this into
+    # ``--tools ""`` so the LLM cannot reach ``Write``/``Edit``/
+    # ``Bash``/... even when the prompt wording nudges it that way.
+    # Without this guard the LLM sometimes drops a stray summary
+    # file at ``<cwd>/<filename>`` — the parent of ``artifacts_dir``
+    # in workspace mode — producing files like
+    # ``office/RECUPERATION-...-summary.md`` outside the agreed
+    # delivery folder.  See task-555101087925 for the symptom and
+    # the ``test_office_summarize_no_stray_files_in_workspace_root``
+    # regression test for the contract.
     result = runtime.run(
         prompt,
         system_prompt=system_prompt,
@@ -628,6 +655,7 @@ def _summarize_payload_with_runtime(
         max_tokens=1600,
         plugin_manager=plugin_manager,
         cwd=cwd,
+        disallowed_tools=["*"],
     )
     raw = str(result.get("raw_response") or result.get("summary") or "").strip()
     if raw and not _contains_cjk(raw):
@@ -671,6 +699,86 @@ def _build_combined_summary_text(summary_docs: list[dict[str, str]]) -> str:
     lines.extend(f"- {item['name']}" for item in summary_docs)
     lines.append("")
     return "\n".join(lines)
+
+
+def _sweep_stray_summary_files(*, workspace_root: str, artifacts_dir: str) -> list[str]:
+    """Remove per-document summary files that landed in ``workspace_root`` instead of ``artifacts_dir``.
+
+    This is a defensive backstop for the bounded folder summarize
+    flow.  The flow's per-document LLM call goes through
+    ``runtime.run`` which, on local-subprocess backends, gives the
+    LLM its full native tool surface (Read/Write/Edit/Bash/...);
+    even with ``disallowed_tools=["*"]`` the LLM is non-deterministic
+    and can occasionally reach the ``Write`` tool, dropping a file
+    at ``<cwd>/<filename>`` (i.e. ``workspace_root``).  In workspace
+    mode that is one level up from the agreed delivery folder
+    ``artifacts_dir``; in inplace mode ``workspace_root`` may equal
+    ``artifacts_dir`` (source-equals-output) or be its parent (file
+    source), in which case there is nothing to sweep.
+
+    The Python code that materialises the deliverables writes the
+    canonical copy to ``artifacts_dir`` for every validated path, so
+    any ``*.summary.md`` (or ``combined-summary.md``) that ends up
+    directly under ``workspace_root`` is redundant and safe to
+    remove.  We do not touch files inside ``artifacts_dir`` itself,
+    so an inplace run where ``workspace_root == artifacts_dir`` is a
+    no-op.
+
+    Returns the list of removed paths (useful for tests and the
+    audit log).
+    """
+    if not workspace_root or not artifacts_dir:
+        return []
+    real_root = os.path.realpath(workspace_root)
+    real_artifacts = os.path.realpath(artifacts_dir)
+    if not os.path.isdir(real_root):
+        return []
+    # In inplace mode ``workspace_root`` and ``artifacts_dir`` may be
+    # the same directory (source-is-directory) — ``os.listdir`` would
+    # see the canonical per-document files, but those are correct
+    # writes, not strays.  Detect this and bail.
+    if real_root == real_artifacts:
+        return []
+    removed: list[str] = []
+    try:
+        entries = os.listdir(real_root)
+    except OSError:
+        return removed
+    for name in entries:
+        # The LLM's stray-file behaviour (task-555101087925) was
+        # to drop files at ``<workspace_root>/<basename>-summary.md``,
+        # using a *dash* separator instead of the canonical ``.``
+        # separator.  We sweep any file whose name looks like a
+        # summary file — ``.summary.md`` suffix, ``-summary.md``
+        # suffix, or the bare ``combined-summary.md`` name.  We
+        # deliberately do NOT match generic ``*summary.md`` matches
+        # so a user's legitimate notes file (e.g.
+        # ``meeting-summary.md``) is not at risk; the workspace
+        # root is an internal Constellation directory and any
+        # summary-shaped file there is by definition not user
+        # content.
+        is_summary = (
+            name == "combined-summary.md"
+            or name.endswith(".summary.md")
+            or name.endswith("-summary.md")
+        )
+        if not is_summary:
+            continue
+        candidate = os.path.join(real_root, name)
+        if not os.path.isfile(candidate):
+            continue
+        # Belt-and-braces: never sweep anything that happens to be
+        # *inside* the artifacts dir even if the realpath comparison
+        # was confused by a symlink.
+        real_candidate = os.path.realpath(candidate)
+        if real_candidate == real_artifacts or real_candidate.startswith(real_artifacts.rstrip(os.sep) + os.sep):
+            continue
+        try:
+            os.remove(candidate)
+        except OSError:
+            continue
+        removed.append(candidate)
+    return removed
 
 
 def _run_bounded_folder_summarize(
@@ -784,6 +892,24 @@ def _run_bounded_folder_summarize(
         _write_text_file(item["output_path"], item["summary_text"])
     if combined_path and combined_text:
         _write_text_file(combined_path, combined_text)
+
+    # Defensive sweep: the per-document LLM calls go through
+    # ``runtime.run`` which, on local-subprocess backends, gives the
+    # LLM its full native tool surface.  Even with the
+    # ``disallowed_tools=["*"]`` guard on those calls, an
+    # intermittently-compliant LLM could still drop a stray summary
+    # file at ``<workspace_root>/<filename>`` — one level up from
+    # ``artifacts_dir`` in workspace mode.  We sweep any
+    # ``*.summary.md`` (or ``combined-summary.md``) that landed in
+    # the workspace root but not in the artifacts dir, because the
+    # Python code above has already written the canonical copy at
+    # the correct path.  The sweep is mode-aware: in inplace mode
+    # ``workspace_root`` may equal ``artifacts_dir`` (when the
+    # source is a directory), in which case ``artifacts_dir`` is a
+    # sub-path of ``workspace_root`` and any file in
+    # ``workspace_root`` is also in ``artifacts_dir`` — we only
+    # sweep the residual parent directory.
+    _sweep_stray_summary_files(workspace_root=cwd, artifacts_dir=artifacts_dir)
 
     try:
         _steps.emit_writing(

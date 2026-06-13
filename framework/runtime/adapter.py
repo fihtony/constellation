@@ -78,6 +78,7 @@ class AgentRuntimeAdapter(ABC):
         max_tokens: int = 4096,
         plugin_manager: Any = None,
         cwd: str | None = None,
+        disallowed_tools: list[str] | None = None,
     ) -> dict:
         """Execute a single prompt and return the standard result dict.
 
@@ -88,6 +89,26 @@ class AgentRuntimeAdapter(ABC):
         *cwd* sets the working directory for local subprocess backends
         (e.g. claude-code). Remote API backends (copilot-cli, connect-agent)
         ignore it.
+
+        *disallowed_tools* is a safety switch for callers that want a
+        pure text response and **must not** let the LLM touch the
+        filesystem, the shell, or any other side-effecting native tool
+        (e.g. Claude Code's ``Write``/``Edit``/``Bash``).  When set,
+        local subprocess backends are expected to disable every native
+        tool the LLM would otherwise have access to.  The default
+        (empty / ``None``) preserves the historical behaviour so the
+        change is opt-in.
+
+        Why this exists: ``runtime.run`` is a single-shot LLM call that
+        is supposed to be text-only, but local backends that shell out
+        to a CLI (e.g. ``claude --print``) inherit the CLI's full tool
+        surface.  An LLM asked to "write a summary" can interpret the
+        word "write" as a ``Write`` tool call and drop a stray file
+        into whatever directory ``cwd`` resolves to — even when the
+        system prompt told it not to.  Callers that have already
+        extracted the input and only need text back should pass
+        ``disallowed_tools=["*"]`` (or a specific list) to make that
+        contract structural instead of advisory.
         """
         ...
 

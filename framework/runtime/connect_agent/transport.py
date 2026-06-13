@@ -233,6 +233,7 @@ def run_single_shot(
     backend_used: str,
     plugin_manager=None,
     cwd: str | None = None,
+    disallowed_tools: list[str] | None = None,
 ) -> dict:
     """Single-shot prompt → response via chat-completion.
 
@@ -240,6 +241,11 @@ def run_single_shot(
     request and ``after_llm_response`` after receiving the response.
 
     *cwd* is accepted for API compatibility but has no effect on remote calls.
+
+    *disallowed_tools* is a structural no-op for the remote API path:
+    the LLM is not given a tool surface to begin with.  We accept the
+    argument so every backend shares one contract — callers can pass
+    it unconditionally without branching on the backend name.
     """
     effective_model = AgentRuntimeAdapter.resolve_model(
         model,

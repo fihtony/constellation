@@ -382,6 +382,7 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
         max_tokens: int = 4096,
         plugin_manager=None,
         cwd: str | None = None,
+        disallowed_tools: list[str] | None = None,
     ) -> dict:
         cli = _find_claude_cli()
         if not cli:
@@ -397,6 +398,19 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
         )
         model_id = _effective_model(model)
         cmd = [cli, "--print", "--dangerously-skip-permissions", "--model", model_id]
+        # ``runtime.run`` is supposed to be a single-shot text call.
+        # Without ``--tools ""`` the local ``claude`` CLI gives the LLM
+        # access to its full native tool surface (Read/Write/Edit/Bash
+        # /WebSearch/...) and, when ``cwd`` points at a writable
+        # directory, the LLM can drop stray files there even when the
+        # system prompt told it not to.  Callers that have already
+        # extracted the input and only need text back opt into the
+        # tool-free mode by passing ``disallowed_tools``; we honour it
+        # the same way ``run_agentic`` does for the MCP-only path
+        # (see ``--tools ""`` at the bottom of this module) so the
+        # single-shot and multi-shot code paths share one escape hatch.
+        if disallowed_tools:
+            cmd += ["--tools", ""]
 
         try:
             proc = subprocess.run(

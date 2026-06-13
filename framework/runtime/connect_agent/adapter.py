@@ -65,7 +65,14 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
         max_tokens: int = 4096,
         plugin_manager=None,
         cwd: str | None = None,
+        disallowed_tools: list[str] | None = None,
     ) -> dict:
+        # ``disallowed_tools`` is honoured by the local-subprocess
+        # backends (claude-code).  The remote API backends (this one,
+        # copilot-cli, codex-cli) do not pass native tools to the LLM
+        # in single-shot mode, so the flag is a structural no-op here
+        # — but we still accept it so the call site has one contract
+        # across every backend.
         return run_single_shot(
             prompt,
             context=context,
@@ -77,6 +84,7 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
             backend_used="connect-agent",
             plugin_manager=plugin_manager,
             cwd=cwd,
+            disallowed_tools=disallowed_tools,
         )
 
     def run_agentic(
