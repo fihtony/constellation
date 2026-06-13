@@ -1,6 +1,29 @@
 # Constellation v2 — Docker Compose
 # Orchestrates all agents in the new framework architecture.
-
+#
+# TWO-STEP BUILD
+# --------------
+# Per-agent images now FROM ``constellation-base:<AGENT_RUNTIME>``,
+# so the base must be built BEFORE running ``docker compose build``
+# or ``docker compose up --build``.  The base is the SINGLE place we
+# install system packages, the union of every agent's Python
+# dependencies, the agentic CLI (one of claude-code / copilot-cli /
+# codex-cli / connect-agent), and the shared framework code.
+#
+# Build example (claude-code runtime, the default):
+#   ./scripts/build_base.sh claude-code        # one-time / when base changes
+#   docker compose -f docker-compose-v2.yml up --build
+#
+# Switch runtimes by passing the AGENT_RUNTIME arg through the
+# shell env (also drives the runtime the agents USE at runtime):
+#   AGENT_RUNTIME=copilot-cli ./scripts/build_base.sh copilot-cli
+#   AGENT_RUNTIME=copilot-cli docker compose -f docker-compose-v2.yml up --build
+#
+# The Rancher variant (docker-compose.v2.rancher.yml) is a small
+# override that only changes ``DOCKER_SOCKET_GID`` to 102 for the
+# two services that mount the host docker socket (compass and
+# team-lead).  It inherits everything else from this file.
+#
 # Every service below merges in `config/.env` (gitignored) via the
 # `x-agent-defaults` anchor so values like `TZ=...` propagate without
 # re-declaring `env_file:` per service. Compose still respects any
@@ -35,6 +58,8 @@ services:
     build:
       context: .
       dockerfile: registry/Dockerfile
+      args:
+        AGENT_RUNTIME: ${AGENT_RUNTIME:-claude-code}
     environment:
       REGISTRY_HOST: "0.0.0.0"
       REGISTRY_PORT: "9000"
@@ -55,6 +80,8 @@ services:
     build:
       context: .
       dockerfile: scripts/register_agents.Dockerfile
+      args:
+        AGENT_RUNTIME: ${AGENT_RUNTIME:-claude-code}
     command: ["python3", "scripts/register_agents.py", "--registered-by", "compose-init"]
     depends_on:
       registry:
@@ -74,6 +101,8 @@ services:
     build:
       context: .
       dockerfile: agents/compass/Dockerfile
+      args:
+        AGENT_RUNTIME: ${AGENT_RUNTIME:-claude-code}
     depends_on:
       registry:
         condition: service_healthy
@@ -133,6 +162,8 @@ services:
     build:
       context: .
       dockerfile: agents/team_lead/Dockerfile
+      args:
+        AGENT_RUNTIME: ${AGENT_RUNTIME:-claude-code}
     depends_on:
       registry:
         condition: service_healthy
@@ -177,6 +208,9 @@ services:
     build:
       context: .
       dockerfile: agents/jira/Dockerfile
+      args:
+        AGENT_RUNTIME: ${AGENT_RUNTIME:-claude-code}
+        BASE_FLAVOR: "boundary"
     depends_on:
       registry:
         condition: service_healthy
@@ -215,6 +249,9 @@ services:
     build:
       context: .
       dockerfile: agents/scm/Dockerfile
+      args:
+        AGENT_RUNTIME: ${AGENT_RUNTIME:-claude-code}
+        BASE_FLAVOR: "boundary"
     depends_on:
       registry:
         condition: service_healthy
@@ -253,6 +290,9 @@ services:
     build:
       context: .
       dockerfile: agents/ui_design/Dockerfile
+      args:
+        AGENT_RUNTIME: ${AGENT_RUNTIME:-claude-code}
+        BASE_FLAVOR: "boundary"
     depends_on:
       registry:
         condition: service_healthy

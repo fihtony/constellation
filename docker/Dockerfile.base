@@ -1,0 +1,178 @@
+# ============================================================================
+# Constellation — base image for every agent container
+# ============================================================================
+# This is the SINGLE place we install system packages, Python
+# dependencies, the agentic CLI, and the shared framework code.
+# Each agent's own Dockerfile (agents/<name>/Dockerfile) is now
+# a thin layer that FROMs this base and only adds the agent's
+# own code.
+#
+# Build args
+# ----------
+# AGENT_RUNTIME   (default: claude-code)
+#     Selects which agentic CLI to install:
+#       claude-code   -> @anthropic-ai/claude-code
+#       copilot-cli   -> @github/copilot
+#       codex-cli     -> @openai/codex
+#       connect-agent -> (no CLI; the runtime uses an HTTP transport)
+#     The base image is tagged by AGENT_RUNTIME so the same base
+#     can be reused across all 9 agent images.
+#
+# Build example
+# -------------
+#   docker buildx build \
+#       --build-arg AGENT_RUNTIME=claude-code \
+#       -t constellation-base:claude-code \
+#       -f docker/Dockerfile.base .
+#   docker buildx build \
+#       --build-arg AGENT_RUNTIME=copilot-cli \
+#       -t constellation-base:copilot-cli \
+#       -f docker/Dockerfile.base .
+# ============================================================================
+
+FROM python:3.12-slim
+
+# Two build args together decide the contents of the base image.
+#
+# BASE_FLAVOR
+#   agentic   - default.  Installs nodejs + npm + the agentic CLI
+#               named by AGENT_RUNTIME.  Use this for the seven
+#               agents that make local LLM calls (compass, code
+#               review, office, team-lead, web-dev, log-store,
+#               and the registry init container).
+#   boundary  - slim.     Skips nodejs / npm / the CLI entirely.
+#               Use this for the three boundary agents (jira, scm,
+#               ui_design) which only speak the A2A protocol and
+#               proxy to the external system — they do not run an
+#               LLM locally.  The resulting image is ~250 MB
+#               lighter than the agentic flavor.
+#
+# AGENT_RUNTIME
+#   Used only when BASE_FLAVOR=agentic.  Selects which agentic
+#   CLI to install: claude-code | copilot-cli | codex-cli |
+#   connect-agent.  Ignored when BASE_FLAVOR=boundary.
+#
+# Build examples:
+#   docker buildx build \
+#       --build-arg BASE_FLAVOR=agentic \
+#       --build-arg AGENT_RUNTIME=claude-code \
+#       -t constellation-base:agentic-claude-code \
+#       -f docker/Dockerfile.base .
+#   docker buildx build \
+#       --build-arg BASE_FLAVOR=boundary \
+#       -t constellation-base:boundary \
+#       -f docker/Dockerfile.base .
+ARG BASE_FLAVOR=agentic
+ARG AGENT_RUNTIME=claude-code
+
+# Avoid writing .pyc files and force stdout/stderr to be unbuffered so
+# docker logs stream in real time.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    ARTIFACT_ROOT=/app/artifacts
+
+WORKDIR /app
+
+# ---------------------------------------------------------------------------
+# 1. System packages
+# ---------------------------------------------------------------------------
+# Always: ca-certificates, curl, git (needed by the framework and
+# boundary-agent HTTP calls).
+# Agentic only: nodejs, npm (the agentic CLIs ship as npm packages).
+# ---------------------------------------------------------------------------
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         ca-certificates \
+         curl \
+         git \
+    && if [ "$BASE_FLAVOR" = "agentic" ]; then \
+         apt-get install -y --no-install-recommends nodejs npm; \
+       fi \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# ---------------------------------------------------------------------------
+# 2. Python dependencies
+# ---------------------------------------------------------------------------
+# We install the union of every agent's Python deps here so the
+# install runs once and the wheels are cached in the base layer.
+# Every dep is pure-Python (manylinux wheels) so no C toolchain
+# is needed.  Web_dev's playwright and the chromium browser are
+# agent-specific (and large) — they stay in web_dev's thin
+# Dockerfile, not here.
+# ---------------------------------------------------------------------------
+COPY pyproject.toml /app/
+RUN pip install --no-cache-dir \
+        "pyyaml>=6.0" \
+        "beautifulsoup4>=4.12.3" \
+        "lxml>=5.3.0" \
+        "pdfplumber>=0.11.0" \
+        "pypdf>=5.0.0" \
+        "python-docx>=1.1.2" \
+        "python-pptx>=1.0.2" \
+        "pyxlsb>=1.0.10" \
+        "striprtf>=0.0.29" \
+        "openpyxl>=3.1.5" \
+        "xlrd>=2.0.1" \
+    && pip install --no-cache-dir -e .
+
+# ---------------------------------------------------------------------------
+# 3. Agentic CLI (only when BASE_FLAVOR=agentic)
+# ---------------------------------------------------------------------------
+# Only ONE of these branches runs per build, so the resulting image
+# contains only the CLI the deployment actually uses.  This is the
+# follow-on of the security tightening in
+# framework/runtime/copilot_cli/__init__.py — the copilot adapter no
+# longer falls back to ``gh copilot``, and the base image now
+# contains exactly the CLI the adapter will spawn.
+# ---------------------------------------------------------------------------
+RUN if [ "$BASE_FLAVOR" = "agentic" ]; then \
+         if [ "$AGENT_RUNTIME" = "claude-code" ]; then \
+           npm install -g @anthropic-ai/claude-code; \
+         elif [ "$AGENT_RUNTIME" = "copilot-cli" ]; then \
+           npm install -g @github/copilot; \
+         elif [ "$AGENT_RUNTIME" = "codex-cli" ]; then \
+           npm install -g @openai/codex; \
+         elif [ "$AGENT_RUNTIME" = "connect-agent" ]; then \
+           echo "connect-agent uses an HTTP transport; no agentic CLI to install"; \
+         else \
+           echo "ERROR: unknown AGENT_RUNTIME=$AGENT_RUNTIME" && exit 1; \
+         fi; \
+     else \
+       echo "BASE_FLAVOR=boundary: skipping agentic CLI install"; \
+     fi
+
+# ---------------------------------------------------------------------------
+# 4. Shared framework + config + scripts
+# ---------------------------------------------------------------------------
+# These layers are cached in the base.  When framework/ or config/
+# changes, the base rebuilds and all 9 agent layers downstream
+# re-pick up the new base; agent-specific code (their own COPY)
+# stays untouched unless the agent's Dockerfile itself changes.
+# ---------------------------------------------------------------------------
+COPY framework/                       /app/framework/
+COPY agents/__init__.py               /app/agents/__init__.py
+COPY scripts/                         /app/scripts/
+COPY config/constellation.yaml        /app/config/constellation.yaml
+COPY config/rules/                    /app/config/rules/
+COPY config/workflows/                /app/config/workflows/
+COPY config/permissions/              /app/config/permissions/
+COPY config/standards/                /app/config/standards/
+
+# ---------------------------------------------------------------------------
+# 5. Non-root user
+# ---------------------------------------------------------------------------
+# Each agent's Dockerfile `USER appuser`s on top of this so files
+# written to the mounted artifacts/ volume are owned by a stable
+# uid regardless of the host user.
+# ---------------------------------------------------------------------------
+RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
+    && mkdir -p /app/artifacts \
+    && chown -R appuser:appuser /app
+
+# Record what this base image was built with, so a running container
+# can be traced back to the build parameters.
+LABEL constellation.base_image="true" \
+      constellation.base_flavor="${BASE_FLAVOR}" \
+      constellation.agent_runtime="${AGENT_RUNTIME}"

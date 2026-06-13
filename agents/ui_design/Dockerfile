@@ -1,35 +1,18 @@
-FROM python:3.12-slim
+# Thin per-agent layer.  All shared setup (system packages, Python deps,
+# agentic CLI, framework code, non-root user) lives in docker/Dockerfile.base.
+# This file only adds the agent's own code, its skill, and its permissions
+# file, then sets the agent's labels and CMD.
 
-WORKDIR /app
+FROM constellation-base:boundary
 
-COPY pyproject.toml /app/
+COPY agents/ui_design/   /app/agents/ui_design/
+COPY config/permissions/ui-design.yaml  /app/config/permissions/ui-design.yaml
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir "pyyaml>=6.0" \
-    && apt-get clean
-
-COPY framework/ /app/framework/
-COPY agents/__init__.py /app/agents/__init__.py
-COPY agents/ui_design/ /app/agents/ui_design/
-RUN mkdir -p /app/config/permissions /app/config/rules /app/config/workflows
-COPY config/constellation.yaml /app/config/constellation.yaml
-COPY config/rules/ /app/config/rules/
-COPY config/workflows/ /app/config/workflows/
-COPY config/permissions/ui-design.yaml /app/config/permissions/ui-design.yaml
-COPY scripts/run_local.py /app/scripts/run_local.py
-
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app \
-    ARTIFACT_ROOT=/app/artifacts
-
-LABEL constellation.agent_id="ui-design"
+LABEL constellation.agent_id="ui_design"
 LABEL constellation.agent_name="UI Design Agent"
 LABEL constellation.agent_role="boundary"
 
-RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
-    && chown -R appuser:appuser /app
 USER appuser
 
-CMD ["python3", "scripts/run_local.py", "ui-design", "--port", "8040"]
+CMD ["python3", "scripts/run_local.py", "ui_design", "--port", "8040"]
+

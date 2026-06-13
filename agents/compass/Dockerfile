@@ -1,38 +1,21 @@
-FROM python:3.12-slim
+# Thin per-agent layer.  All shared setup (system packages, Python deps,
+# agentic CLI, framework code, non-root user) lives in docker/Dockerfile.base.
+# This file only adds the agent's own code, its skill, and its permissions
+# file, then sets the agent's labels and CMD.
 
-WORKDIR /app
+ARG AGENT_RUNTIME=claude-code
+FROM constellation-base:${AGENT_RUNTIME}
 
-COPY pyproject.toml /app/
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git nodejs npm \
-    && npm install -g @anthropic-ai/claude-code \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir "pyyaml>=6.0" \
-    && apt-get clean
-
-COPY framework/ /app/framework/
-COPY agents/__init__.py /app/agents/__init__.py
-COPY agents/compass/ /app/agents/compass/
-COPY agents/log_store/ /app/agents/log_store/
-RUN mkdir -p /app/config/permissions /app/config/rules /app/config/workflows
-COPY config/constellation.yaml /app/config/constellation.yaml
-COPY config/rules/ /app/config/rules/
-COPY config/workflows/ /app/config/workflows/
-COPY config/permissions/compass.yaml /app/config/permissions/compass.yaml
-COPY config/permissions/office.yaml /app/config/permissions/office.yaml
-COPY scripts/run_local.py /app/scripts/run_local.py
-
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app \
-    ARTIFACT_ROOT=/app/artifacts
+COPY agents/compass/   /app/agents/compass/
+COPY agents/log_store/  /app/agents/log_store/
+COPY config/permissions/compass.yaml  /app/config/permissions/compass.yaml
+COPY config/permissions/office.yaml  /app/config/permissions/office.yaml
 
 LABEL constellation.agent_id="compass"
 LABEL constellation.agent_name="Compass Agent"
 LABEL constellation.agent_role="fundamental"
 
-RUN adduser --disabled-password --gecos "" --uid 1000 appuser \
-    && chown -R appuser:appuser /app
 USER appuser
 
 CMD ["python3", "scripts/run_local.py", "compass", "--port", "8000"]
+
