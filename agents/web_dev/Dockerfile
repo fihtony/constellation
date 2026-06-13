@@ -3,7 +3,7 @@
 # so its heavy / agent-specific build steps stay here rather than
 # in the shared base.
 ARG AGENT_RUNTIME=claude-code
-FROM constellation-base:${AGENT_RUNTIME}
+FROM constellation-base:agentic-${AGENT_RUNTIME}
 
 # Headless browser for playwright.
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright

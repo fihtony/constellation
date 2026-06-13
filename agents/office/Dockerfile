@@ -4,7 +4,23 @@
 # file, then sets the agent's labels and CMD.
 
 ARG AGENT_RUNTIME=claude-code
-FROM constellation-base:${AGENT_RUNTIME}
+FROM constellation-base:agentic-${AGENT_RUNTIME}
+
+# Office-only document-reading deps.  These are pure-Python wheels
+# (manylinux) so no C toolchain is needed.  They live here rather
+# than in the shared base so the boundary agents (jira, scm,
+# ui_design) do not carry the ~110 MB overhead.
+RUN pip install --no-cache-dir \
+        "beautifulsoup4>=4.12.3" \
+        "lxml>=5.3.0" \
+        "pdfplumber>=0.11.0" \
+        "pypdf>=5.0.0" \
+        "python-docx>=1.1.2" \
+        "python-pptx>=1.0.2" \
+        "pyxlsb>=1.0.10" \
+        "striprtf>=0.0.29" \
+        "openpyxl>=3.1.5" \
+        "xlrd>=2.0.1"
 
 COPY agents/office/   /app/agents/office/
 COPY skills/office-generic-methodology/  /app/skills/office-generic-methodology/

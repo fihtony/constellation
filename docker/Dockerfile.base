@@ -93,29 +93,26 @@ RUN apt-get update \
     && apt-get clean
 
 # ---------------------------------------------------------------------------
-# 2. Python dependencies
+# 2. Python dependencies (TRULY common only)
 # ---------------------------------------------------------------------------
-# We install the union of every agent's Python deps here so the
-# install runs once and the wheels are cached in the base layer.
-# Every dep is pure-Python (manylinux wheels) so no C toolchain
-# is needed.  Web_dev's playwright and the chromium browser are
-# agent-specific (and large) — they stay in web_dev's thin
-# Dockerfile, not here.
+# Only the deps EVERY agent needs go here.  Office's document-reading
+# deps (beautifulsoup4, lxml, pdfplumber, pypdf, python-docx,
+# python-pptx, pyxlsb, striprtf, openpyxl, xlrd) live in
+# ``agents/office/Dockerfile``; web_dev's playwright + chromium
+# also stay in ``agents/web_dev/Dockerfile``.  This keeps the
+# boundary base slim — jira, scm, and ui_design only need pyyaml.
 # ---------------------------------------------------------------------------
 COPY pyproject.toml /app/
-RUN pip install --no-cache-dir \
-        "pyyaml>=6.0" \
-        "beautifulsoup4>=4.12.3" \
-        "lxml>=5.3.0" \
-        "pdfplumber>=0.11.0" \
-        "pypdf>=5.0.0" \
-        "python-docx>=1.1.2" \
-        "python-pptx>=1.0.2" \
-        "pyxlsb>=1.0.10" \
-        "striprtf>=0.0.29" \
-        "openpyxl>=3.1.5" \
-        "xlrd>=2.0.1" \
-    && pip install --no-cache-dir -e .
+# We install pyyaml here.  We do NOT run ``pip install -e .`` —
+# nothing in the framework or agents imports the ``constellation``
+# package by name; the ``PYTHONPATH=/app`` set above, combined
+# with the /app/framework/ and /app/agents/ directories, is enough
+# for Python to resolve ``framework.*`` and ``agents.*`` imports
+# directly.  Skipping the editable install also avoids pulling in
+# the office-specific deps listed in pyproject (which are now in
+# agents/office/Dockerfile) and saves the 90+ MB pip cache layer
+# from the base image.
+RUN pip install --no-cache-dir "pyyaml>=6.0"
 
 # ---------------------------------------------------------------------------
 # 3. Agentic CLI (only when BASE_FLAVOR=agentic)

@@ -4,7 +4,7 @@
 # file, then sets the agent's labels and CMD.
 
 ARG AGENT_RUNTIME=claude-code
-FROM constellation-base:${AGENT_RUNTIME}
+FROM constellation-base:agentic-${AGENT_RUNTIME}
 
 COPY agents/compass/   /app/agents/compass/
 COPY agents/log_store/  /app/agents/log_store/
