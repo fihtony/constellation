@@ -1,8 +1,16 @@
 """Copilot CLI runtime adapter.
 
-Invokes the ``gh copilot`` or ``copilot-cli`` subprocess for agentic tasks.
-The CLI handles its own tool-calling loop internally; we only need to spawn
-it with the task prompt and capture its stdout.
+Invokes the standalone ``@github/copilot`` npm binary for agentic tasks.
+The CLI handles its own tool-calling loop internally; we only need to
+spawn it with the task prompt and capture its stdout.
+
+We deliberately do NOT fall back to the deprecated ``gh copilot`` path.
+That path reads the host's ``~/.config/gh/hosts.yml`` (the developer's
+``gh auth`` token) and would silently use it as the GitHub credential.
+The standalone binary, in contrast, is BYOK-safe: in custom-provider
+mode (the only mode we support) it does not consult any local GitHub
+auth store, so the only credentials that can reach the subprocess are
+the ``COPILOT_*`` env vars in ``config/.env``.
 
 Backend name: ``copilot-cli``
 """
@@ -33,19 +41,37 @@ _AGENTIC_SYSTEM = (
 
 
 def _find_copilot_cli() -> str | None:
-    """Locate the gh copilot or copilot-cli executable."""
-    for cmd in ("copilot-cli", "gh"):
+    """Locate the copilot CLI executable.
+
+    Only the standalone ``@github/copilot`` binary is supported.
+    We deliberately do NOT fall back to ``gh copilot`` (the GitHub
+    CLI's copilot extension) because that path reads the host's
+    ``~/.config/gh/hosts.yml`` — the developer's local GitHub
+    auth — and would silently use it as the credential.
+
+    Lookup order:
+      1. ``copilot``    — the npm binary name as installed by
+                          ``npm install -g @github/copilot``.
+      2. ``copilot-cli`` — alternate name some installs use.
+
+    Returns the executable name, or ``None`` if neither is on
+    ``PATH``.
+    """
+    for cmd in ("copilot", "copilot-cli"):
         if which(cmd):
             return cmd
     return None
 
 
 class CopilotCLIAdapter(AgentRuntimeAdapter):
-    """Runtime adapter that delegates to the ``gh copilot`` CLI subprocess.
+    """Runtime adapter that delegates to the standalone ``copilot`` CLI.
 
-    Single-shot (``run``) calls the Copilot Connect API directly (same as
-    ConnectAgentAdapter) since the CLI is optimised for agentic execution.
-    ``run_agentic`` spawns the CLI subprocess with the task prompt.
+    Single-shot (``run``) calls the Connect Agent transport directly
+    (same path as ``ConnectAgentAdapter``) since the CLI is optimised
+    for agentic execution.  ``run_agentic`` spawns the standalone
+    ``copilot`` subprocess with the task prompt.  The deprecated
+    ``gh copilot`` path is intentionally not supported — see
+    :func:`_find_copilot_cli` for the security rationale.
     """
 
     def run(
@@ -92,7 +118,7 @@ class CopilotCLIAdapter(AgentRuntimeAdapter):
         on_progress=None,
         continuation: str | None = None,
     ) -> AgenticResult:
-        """Run a task via the gh copilot CLI subprocess.
+        """Run a task via the standalone ``copilot`` CLI subprocess.
 
         The CLI manages its own reasoning + tool loop.  We capture stdout
         and parse the final answer from the last non-empty output block.
@@ -101,16 +127,65 @@ class CopilotCLIAdapter(AgentRuntimeAdapter):
         if not cli:
             return AgenticResult(
                 success=False,
-                summary="copilot-cli: 'gh' or 'copilot-cli' not found in PATH",
+                summary="copilot-cli: 'copilot' or 'copilot-cli' not found in PATH",
                 backend_used="copilot-cli",
             )
 
-        # Build the command.  ``gh copilot suggest`` is the interactive mode;
-        # for batch execution we use a simple pipe approach.
-        if cli == "gh":
-            cmd = ["gh", "copilot", "suggest", "-t", "shell"]
-        else:
-            cmd = [cli]
+        # Build the command.  ``cli`` is always the standalone
+        # ``copilot`` binary at this point (the ``gh`` fallback was
+        # removed — see ``_find_copilot_cli``).  The CLI accepts the
+        # task on stdin and writes the response on stdout.
+        cmd = [cli]
+
+        # Build the subprocess env.  Two responsibilities live here:
+        #
+        # 1. Model resolution.  The copilot CLI reads ``COPILOT_MODEL``
+        #    directly.  We let the user set either name:
+        #      * ``COPILOT_MODEL`` — explicit, takes precedence.
+        #      * ``AGENT_MODEL``   — generic runtime-wide model name;
+        #        propagated to ``COPILOT_MODEL`` only when the
+        #        explicit one is unset, so a single ``AGENT_MODEL``
+        #        in config/.env drives every backend (claude-code,
+        #        connect-agent, copilot-cli, codex-cli) without the
+        #        user having to maintain a parallel ``COPILOT_MODEL``.
+        #    The propagation is local to the subprocess env so other
+        #    adapters in the same process are not affected.
+        #
+        # 2. Host-credential isolation.  ``os.environ`` is inherited
+        #    by the subprocess; that includes any ``GH_TOKEN`` or
+        #    ``GITHUB_TOKEN`` the developer's shell may have picked
+        #    up from ``gh auth login`` or a CI helper.  Per the
+        #    project policy, **all** tokens must come from
+        #    config/.env (or an agent-level .env) — never from the
+        #    host machine.  We therefore drop those two well-known
+        #    host-auth keys from the subprocess env.  Tokens that
+        #    *are* meant to flow in (e.g. the COPILOT_PROVIDER_API_KEY
+        #    the user set in config/.env) are not in the strip
+        #    list, so they pass through unchanged.
+        #
+        #    We also set ``GH_CONFIG_DIR`` to an isolated empty
+        #    directory for the subprocess, mirroring the hardening
+        #    the claude-code adapter applies (see
+        #    ``_init_isolated_gh_config`` in
+        #    ``framework/runtime/claude_code/__init__.py``).  This
+        #    prevents the deprecated ``gh copilot`` path from
+        #    falling back to ``~/.config/gh/hosts.yml`` and reading
+        #    the host's GitHub auth.  We initialise the directory
+        #    lazily so each subprocess gets a fresh, empty GH config.
+        env = {**os.environ}
+        # Host-credential isolation: the ``gh`` fallback was removed
+        # (see ``_find_copilot_cli``) so there is no path through
+        # this adapter that could consult ``~/.config/gh/hosts.yml``
+        # or any other host-side GitHub auth store.  We still drop
+        # the two well-known host-shell keys as defence in depth, in
+        # case a developer has set them in their shell (e.g. via
+        # ``gh auth login`` or a CI helper); tokens that the user
+        # *did* set in ``config/.env`` are not in the strip list and
+        # pass through unchanged.
+        for host_only_key in ("GH_TOKEN", "GITHUB_TOKEN"):
+            env.pop(host_only_key, None)
+        if "COPILOT_MODEL" not in env and "AGENT_MODEL" in env:
+            env["COPILOT_MODEL"] = env["AGENT_MODEL"]
 
         full_prompt = task
         if system_prompt:
@@ -124,7 +199,7 @@ class CopilotCLIAdapter(AgentRuntimeAdapter):
                 text=True,
                 cwd=cwd,
                 timeout=timeout,
-                env={**os.environ},
+                env=env,
             )
             stdout = proc.stdout.strip()
             stderr = proc.stderr.strip()

@@ -319,7 +319,11 @@ _SUPPORTED_SELECTOR_VALUES: dict[str, tuple[str, ...]] = {
 
 _RUNTIME_EXECUTABLES: dict[str, tuple[str, ...]] = {
     "claude-code": ("claude", "claude-code"),
-    "copilot-cli": ("copilot-cli", "gh"),
+    # Only the standalone ``copilot`` / ``copilot-cli`` binary is
+    # accepted.  The ``gh copilot`` path was removed from the
+    # adapter because it reads the host's ``~/.config/gh/hosts.yml``;
+    # there is therefore no fallback to ``gh`` here either.
+    "copilot-cli": ("copilot", "copilot-cli"),
     "codex-cli": ("codex", "codex-cli"),
 }
 
