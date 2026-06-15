@@ -412,6 +412,7 @@ class TestGatherContextFailures:
                     "https://stitch.withgoogle.com/projects/12345678901234567?pli=1"
                     "</custom>\n"
                     "Screen ID: 0123456789abcdef0123456789abcdef\n"
+                    "Tech stack: React + Vite\n"
                     "Target repo: <custom data-type=\"smartlink\">"
                     "https://github.com/example-org/example-app</custom>"
                 ),
@@ -432,6 +433,7 @@ class TestGatherContextFailures:
         assert extracted["repo_url"] == "https://github.com/example-org/example-app"
         assert extracted["stitch_project_id"] == "12345678901234567"
         assert extracted["stitch_screen_id"] == "0123456789abcdef0123456789abcdef"
+        assert extracted["tech_stack"] == ["react", "vite"]
 
     async def test_gather_context_raises_when_repo_clone_fails(self, monkeypatch, tmp_path):
         """Repo clone failure is fatal because Web Dev must receive a real cloned repo."""
@@ -516,6 +518,53 @@ class TestGatherContextFailures:
         assert result["design_md_path"] == str(md_path)
         assert "ui-design/stitch/DESIGN.md" in result["design_files"]
         assert not (tmp_path / "team-lead" / "design-spec.md").exists()
+
+    async def test_gather_context_preserves_ui_design_paths_on_retry(self, monkeypatch, tmp_path):
+        from agents.team_lead.nodes import gather_context
+
+        stitch_dir = tmp_path / "ui-design" / "stitch"
+        stitch_dir.mkdir(parents=True)
+        code_path = stitch_dir / "code.html"
+        md_path = stitch_dir / "DESIGN.md"
+        screen_path = stitch_dir / "screen.png"
+        code_path.write_text("<html><body>Design</body></html>", encoding="utf-8")
+        md_path.write_text("# Design\n", encoding="utf-8")
+        screen_path.write_bytes(b"png")
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                if name == "fetch_design":
+                    raise AssertionError("gather_context must not refetch design when context is already present")
+                if name == "clone_repo":
+                    repo_path = tmp_path / "scm" / "repo.git"
+                    repo_path.mkdir(parents=True, exist_ok=True)
+                    (repo_path / "README.md").write_text("ok", encoding="utf-8")
+                    return json.dumps({"repo_path": str(repo_path), "status": "ok"})
+                return json.dumps({})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        result = await gather_context({
+            "repo_url": "https://github.com/org/repo.git",
+            "stitch_project_id": "13629074018280446337",
+            "stitch_screen_id": "screen-1",
+            "workspace_path": str(tmp_path),
+            "design_context": {
+                "screen": {"projectId": "p1", "screenId": "s1", "text": "{}"},
+                "local_folder": str(stitch_dir),
+                "files": ["ui-design/stitch/code.html", "ui-design/stitch/DESIGN.md"],
+                "design_code_path": str(code_path),
+                "design_md_path": str(md_path),
+                "design_screen_path": str(screen_path),
+            },
+            "design_code_path": str(code_path),
+            "design_md_path": str(md_path),
+            "design_screen_path": str(screen_path),
+        })
+
+        assert result["design_code_path"] == str(code_path)
+        assert result["design_md_path"] == str(md_path)
+        assert result["design_screen_path"] == str(screen_path)
 
 
 class TestDispatchDevAgentValidation:
