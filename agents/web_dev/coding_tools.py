@@ -280,6 +280,13 @@ class RunCommandTool(BaseTool):
                 engine.require_command(command)
         except PermissionDeniedError as exc:
             logger.warning("Permission denied for run_command %r: %s", command, exc)
+            from framework.audit_log import append_current_permission_denial
+
+            append_current_permission_denial(
+                operation="command",
+                reason=str(exc),
+                metadata={"command": command},
+            )
             return ToolResult(error=str(exc))
 
         import shlex

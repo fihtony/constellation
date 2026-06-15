@@ -133,6 +133,13 @@ class ToolRegistry:
                 self._permission_engine.require_tool(name)
             except PermissionDeniedError as exc:
                 logger.warning("[registry] Permission denied for tool '%s': %s", name, exc)
+                from framework.audit_log import append_current_permission_denial
+
+                append_current_permission_denial(
+                    operation="tool",
+                    reason=str(exc),
+                    metadata={"tool": name},
+                )
                 return json.dumps({"error": str(exc)})
 
         tool = self._tools.get(name)
@@ -180,6 +187,13 @@ class ToolRegistry:
                 self._permission_engine.require_tool(name)
             except PermissionDeniedError as exc:
                 logger.warning("[registry] Permission denied for tool '%s': %s", name, exc)
+                from framework.audit_log import append_current_permission_denial
+
+                append_current_permission_denial(
+                    operation="tool",
+                    reason=str(exc),
+                    metadata={"tool": name},
+                )
                 return json.dumps({"error": str(exc)})
 
         tool = self._tools.get(name)

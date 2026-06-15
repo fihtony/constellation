@@ -259,11 +259,11 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
 
     def _build_tool_schemas(self, tool_names: list[str]) -> list[dict]:
         """Return OpenAI-compatible schemas from the global ToolRegistry."""
+        if not tool_names:
+            return []
         from framework.tools.registry import get_registry
         registry = get_registry()
-        if tool_names:
-            return registry.list_schemas(tool_names)
-        return registry.list_schemas()
+        return registry.list_schemas(tool_names)
 
     def _execute_tool(self, name: str, arguments: str) -> str:
         """Execute a registered tool synchronously. Returns JSON string."""

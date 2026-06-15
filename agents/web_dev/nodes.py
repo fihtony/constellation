@@ -193,6 +193,56 @@ def _runtime_backend_label(runtime: Any, result: Any) -> str:
     return runtime.__class__.__name__ if runtime is not None else "runtime"
 
 
+def _agentic_policy_for_state(state: dict, runtime: Any):
+    from framework.agentic_policy import (
+        agentic_policy_kwargs,
+        build_agentic_execution_policy,
+    )
+
+    allowed_tools = state.get("_allowed_tools") or []
+    policy = build_agentic_execution_policy(runtime, allowed_tools)
+    return policy, agentic_policy_kwargs(policy)
+
+
+def _record_agentic_step_gate(
+    state: dict,
+    *,
+    step: str,
+    policy: Any,
+    result: Any,
+) -> None:
+    from framework.agentic_policy import (
+        record_agentic_step_gate,
+        validate_agentic_step_result,
+    )
+
+    validation = validate_agentic_step_result(policy, result)
+    record_agentic_step_gate(
+        workspace_path=state.get("workspace_path", ""),
+        agent_id=_AGENT_ID,
+        task_id=state.get("_task_id", ""),
+        step=step,
+        policy=policy,
+        result=result,
+        validation=validation,
+    )
+    if result.success and not validation.passed:
+        raise RuntimeError(f"{step} agentic output gate failed: {validation.feedback}")
+
+
+def _agentic_cwd(runtime: Any, cwd: str | None) -> str | None:
+    if not cwd:
+        return None
+    if hasattr(runtime, "agentic_capabilities"):
+        try:
+            caps = runtime.agentic_capabilities()
+            if not bool(getattr(caps, "cwd", False)):
+                return None
+        except Exception:
+            return cwd
+    return cwd
+
+
 def _redact_personal_value(value: str) -> str:
     return "redacted" if str(value or "").strip() else ""
 
@@ -1098,8 +1148,8 @@ async def implement_changes(state: dict) -> dict:
     except Exception:
         pass
 
-    # Use the configured agentic coding CLI's native filesystem/shell tools.
-    # With cwd=repo_path, all relative paths resolve correctly.
+    # Use the configured agentic backend through the Constellation-controlled
+    # tool surface derived from the task execution contract.
     repo_path = state.get("repo_path", "")
     branch_name = state.get("branch_name", "")
     changed_before = set(_git_branch_changed_files(repo_path)) | set(_git_worktree_changed_files(repo_path))
@@ -1110,16 +1160,18 @@ async def implement_changes(state: dict) -> dict:
         jira_local_folder=state.get("jira_local_folder", ""),
         design_local_folder=state.get("design_local_folder", ""),
     )
-    print(f"[{_AGENT_ID}] implement_changes: repo_path={state.get('repo_path', '')!r} (agentic CLI native tools)")
+    policy, policy_kwargs = _agentic_policy_for_state(state, runtime)
+    print(f"[{_AGENT_ID}] implement_changes: repo_path={state.get('repo_path', '')!r} backend={policy.backend!r}")
     result = runtime.run_agentic(
         task=prompt,
         system_prompt=IMPLEMENT_SYSTEM,
-        cwd=state.get("repo_path") or None,
-        tools=None,
+        cwd=_agentic_cwd(runtime, state.get("repo_path") or None),
         max_turns=50,
         timeout=1800,
         plugin_manager=state.get("_plugin_manager"),
+        **policy_kwargs,
     )
+    _record_agentic_step_gate(state, step="implement_changes", policy=policy, result=result)
     changed_after = set(_git_branch_changed_files(repo_path)) | set(_git_worktree_changed_files(repo_path))
     changed_files = sorted(changed_after)
     new_files = sorted(changed_after - changed_before)
@@ -1358,15 +1410,17 @@ async def fix_tests(state: dict) -> dict:
         changed_files="\n".join(changed_files) if changed_files else "unknown",
     )
 
+    fix_policy, fix_policy_kwargs = _agentic_policy_for_state(state, runtime)
     result = runtime.run_agentic(
         task=prompt,
         system_prompt=FIX_SYSTEM,
-        cwd=state.get("repo_path") or None,
-        tools=None,
+        cwd=_agentic_cwd(runtime, state.get("repo_path") or None),
         max_turns=20,
         timeout=600,
         plugin_manager=state.get("_plugin_manager"),
+        **fix_policy_kwargs,
     )
+    _record_agentic_step_gate(state, step="fix_tests", policy=fix_policy, result=result)
 
     # Validation gate: ensure fix actually changed files
     from framework.validation_gates import validate_files_changed
@@ -1396,6 +1450,7 @@ def _self_assess_agentic_fallback_enabled() -> bool:
 
 def _self_assess_via_agentic_file(
     *,
+    state: dict,
     runtime: Any,
     base_prompt: str,
     system_prompt: str,
@@ -1455,17 +1510,25 @@ def _self_assess_via_agentic_file(
         f"{base_prompt}"
     )
 
+    policy, policy_kwargs = _agentic_policy_for_state(state, runtime)
     try:
         agentic_result = runtime.run_agentic(
             task=fallback_instructions,
             system_prompt=system_prompt,
-            cwd=cwd or workspace_path or None,
+            cwd=_agentic_cwd(runtime, cwd or workspace_path or None),
             max_turns=4,
             timeout=int(os.environ.get("WEB_DEV_SELF_ASSESS_AGENTIC_TIMEOUT", "240") or "240"),
             plugin_manager=plugin_manager,
+            **policy_kwargs,
         )
     except Exception as exc:  # noqa: BLE001
         return None, output_path
+    _record_agentic_step_gate(
+        state,
+        step="self_assess_agentic_file",
+        policy=policy,
+        result=agentic_result,
+    )
 
     # Even when the CLI returns success=False we still try to read the file
     # — some backends report non-zero exit but did write the artifact first.
@@ -2021,6 +2084,7 @@ Return valid JSON only, and correct this validation feedback:
                 text_mode_feedback=text_mode_feedback[:200],
             )
             fallback_parsed, fallback_file_path = _self_assess_via_agentic_file(
+                state=state,
                 runtime=runtime,
                 base_prompt=prompt,
                 system_prompt=SELF_ASSESS_SYSTEM,
@@ -2342,14 +2406,17 @@ async def fix_gaps(state: dict) -> dict:
         changed_files="\n".join(changed_files) if changed_files else "unknown",
     )
 
+    fix_gaps_policy, fix_gaps_policy_kwargs = _agentic_policy_for_state(state, runtime)
     result = runtime.run_agentic(
         task=prompt,
         system_prompt=FIX_GAPS_SYSTEM,
-        cwd=state.get("repo_path") or None,
+        cwd=_agentic_cwd(runtime, state.get("repo_path") or None),
         max_turns=15,
         timeout=300,
         plugin_manager=state.get("_plugin_manager"),
+        **fix_gaps_policy_kwargs,
     )
+    _record_agentic_step_gate(state, step="fix_gaps", policy=fix_gaps_policy, result=result)
     log.info("fix_gaps result", success=result.success, summary=result.summary[:300])
     _record_timeline_step(
         state,

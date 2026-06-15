@@ -214,6 +214,35 @@ class WorkflowRunner:
         self.config = config
         self._steps_taken = 0
 
+    def _set_permission_audit_context(self, state: dict) -> None:
+        workspace_path = str(
+            state.get("workspace_path")
+            or state.get("artifacts_dir")
+            or state.get("workspace_root")
+            or ""
+        )
+        agent_id = str(
+            state.get("_agent_id")
+            or self.config.ephemeral_state.get("_agent_id", "")
+            or ""
+        )
+        task_id = str(state.get("_task_id") or self.config.session_id or "")
+        if not workspace_path or not agent_id:
+            return
+        from framework.audit_log import set_permission_audit_context
+
+        set_permission_audit_context(
+            workspace_path=workspace_path,
+            agent_id=agent_id,
+            task_id=task_id,
+        )
+
+    @staticmethod
+    def _clear_permission_audit_context() -> None:
+        from framework.audit_log import clear_permission_audit_context
+
+        clear_permission_audit_context()
+
     async def run(self, state: dict) -> dict:
         """Execute from START until END or interrupt."""
         current_node = START
@@ -237,6 +266,8 @@ class WorkflowRunner:
                     self.config.ephemeral_state,
                 )
                 current_node = saved["next_node"]
+
+        self._set_permission_audit_context(state)
 
         try:
             while current_node != END:
@@ -308,6 +339,7 @@ class WorkflowRunner:
             if self.config.permission_engine:
                 from framework.tools.registry import get_registry
                 get_registry().set_permission_engine(None)
+            self._clear_permission_audit_context()
 
         return state
 
@@ -332,6 +364,7 @@ class WorkflowRunner:
             ephemeral_state=self.config.ephemeral_state,
         )
         state["_resume_value"] = resume_value
+        self._set_permission_audit_context(state)
         # Re-enter at the same node that interrupted
         current_node = saved["next_node"]
 
@@ -365,6 +398,7 @@ class WorkflowRunner:
             if self.config.permission_engine:
                 from framework.tools.registry import get_registry
                 get_registry().set_permission_engine(None)
+            self._clear_permission_audit_context()
 
     # -- Internal helpers ---------------------------------------------------
 

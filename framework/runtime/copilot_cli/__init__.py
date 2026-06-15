@@ -68,12 +68,12 @@ def _find_copilot_cli() -> str | None:
 class CopilotCLIAdapter(AgentRuntimeAdapter):
     """Runtime adapter that delegates to the standalone ``copilot`` CLI.
 
-    Single-shot (``run``) calls the Connect Agent transport directly
-    (same path as ``ConnectAgentAdapter``) since the CLI is optimised
-    for agentic execution.  ``run_agentic`` spawns the standalone
-    ``copilot`` subprocess with the task prompt.  The deprecated
-    ``gh copilot`` path is intentionally not supported — see
-    :func:`_find_copilot_cli` for the security rationale.
+    Single-shot (``run``) calls the Connect Agent transport directly.
+    ``run_agentic`` uses a Constellation-managed tool loop whenever the
+    caller supplies ``tools``/``allowed_tools``; only tool-free legacy calls
+    spawn the standalone ``copilot`` subprocess.  The deprecated ``gh copilot``
+    path is intentionally not supported — see :func:`_find_copilot_cli` for
+    the security rationale.
     """
 
     def run(
@@ -137,11 +137,38 @@ class CopilotCLIAdapter(AgentRuntimeAdapter):
         continuation: str | None = None,
         plugin_manager=None,
     ) -> AgenticResult:
-        """Run a task via the standalone ``copilot`` CLI subprocess.
+        """Run a task via the managed tool loop or standalone ``copilot`` CLI.
 
-        The CLI manages its own reasoning + tool loop.  We capture stdout
-        and parse the final answer from the last non-empty output block.
+        Calls with Constellation tools never expose the CLI's native tool loop.
+        They use ToolRegistry so permission checks and audit logs remain
+        consistent with other backends.
         """
+        if tools is not None or allowed_tools is not None:
+            unsupported = self.validate_agentic_request(
+                tools=tools,
+                mcp_servers=mcp_servers,
+                allowed_tools=allowed_tools,
+                cwd=cwd,
+                continuation=continuation,
+            )
+            if unsupported:
+                return unsupported
+            from framework.runtime.managed_agentic import run_managed_agentic_loop
+
+            return run_managed_agentic_loop(
+                self,
+                backend="copilot-cli",
+                task=task,
+                system_prompt=system_prompt,
+                cwd=cwd,
+                tools=tools,
+                allowed_tools=allowed_tools,
+                max_turns=max_turns,
+                timeout=timeout,
+                on_progress=on_progress,
+                plugin_manager=plugin_manager,
+            )
+
         unsupported = self.validate_agentic_request(
             tools=tools,
             mcp_servers=mcp_servers,
@@ -289,10 +316,10 @@ class CopilotCLIAdapter(AgentRuntimeAdapter):
         return AgenticCapabilities(
             backend="copilot-cli",
             agentic=True,
-            constellation_tools=False,
+            constellation_tools=True,
             mcp_servers=False,
             cwd=True,
-            allowed_tools=False,
+            allowed_tools=True,
             continuation=False,
-            plugin_hooks=False,
+            plugin_hooks=True,
         )

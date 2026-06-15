@@ -1,7 +1,8 @@
 """Codex CLI runtime adapter.
 
-Invokes the ``codex`` subprocess (OpenAI Codex CLI) for agentic tasks.
-Codex CLI manages its own reasoning loop; we spawn it with the task prompt.
+Invokes a Constellation-managed tool loop for agentic tasks that request
+framework tools. Tool-free legacy calls can still spawn the ``codex``
+subprocess with the task prompt.
 
 Backend name: ``codex-cli``
 """
@@ -77,7 +78,33 @@ class CodexCLIAdapter(AgentRuntimeAdapter):
         continuation: str | None = None,
         plugin_manager=None,
     ) -> AgenticResult:
-        """Run a task via the codex CLI subprocess."""
+        """Run a task via the managed tool loop or codex CLI subprocess."""
+        if tools is not None or allowed_tools is not None:
+            unsupported = self.validate_agentic_request(
+                tools=tools,
+                mcp_servers=mcp_servers,
+                allowed_tools=allowed_tools,
+                cwd=cwd,
+                continuation=continuation,
+            )
+            if unsupported:
+                return unsupported
+            from framework.runtime.managed_agentic import run_managed_agentic_loop
+
+            return run_managed_agentic_loop(
+                self,
+                backend="codex-cli",
+                task=task,
+                system_prompt=system_prompt,
+                cwd=cwd,
+                tools=tools,
+                allowed_tools=allowed_tools,
+                max_turns=max_turns,
+                timeout=timeout,
+                on_progress=on_progress,
+                plugin_manager=plugin_manager,
+            )
+
         unsupported = self.validate_agentic_request(
             tools=tools,
             mcp_servers=mcp_servers,
@@ -152,10 +179,10 @@ class CodexCLIAdapter(AgentRuntimeAdapter):
         return AgenticCapabilities(
             backend="codex-cli",
             agentic=True,
-            constellation_tools=False,
+            constellation_tools=True,
             mcp_servers=False,
             cwd=True,
-            allowed_tools=False,
+            allowed_tools=True,
             continuation=False,
-            plugin_hooks=False,
+            plugin_hooks=True,
         )

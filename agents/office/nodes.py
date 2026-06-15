@@ -78,6 +78,66 @@ SUMMARY_EXTENSIONS = {
 }
 
 
+def _agentic_cwd(runtime: Any, cwd: str | None) -> str | None:
+    if not cwd:
+        return None
+    if hasattr(runtime, "agentic_capabilities"):
+        try:
+            caps = runtime.agentic_capabilities()
+            if not bool(getattr(caps, "cwd", False)):
+                return None
+        except Exception:
+            return cwd
+    return cwd
+
+
+def _agentic_audit_workspace(state: dict[str, Any], artifacts_dir: str = "") -> str:
+    return str(
+        state.get("workspace_path")
+        or artifacts_dir
+        or state.get("artifacts_dir")
+        or state.get("workspace_root")
+        or ""
+    )
+
+
+def _office_agentic_policy(runtime: Any, tool_names: list[str]):
+    from framework.agentic_policy import (
+        agentic_policy_kwargs,
+        build_agentic_execution_policy,
+    )
+
+    policy = build_agentic_execution_policy(runtime, tool_names)
+    return policy, agentic_policy_kwargs(policy)
+
+
+def _record_office_agentic_gate(
+    state: dict[str, Any],
+    *,
+    step: str,
+    policy: Any,
+    result: AgenticResult,
+    artifacts_dir: str = "",
+) -> None:
+    from framework.agentic_policy import (
+        record_agentic_step_gate,
+        validate_agentic_step_result,
+    )
+
+    validation = validate_agentic_step_result(policy, result)
+    record_agentic_step_gate(
+        workspace_path=_agentic_audit_workspace(state, artifacts_dir),
+        agent_id=AGENT_ID,
+        task_id=str(state.get("_task_id") or state.get("task_id") or ""),
+        step=step,
+        policy=policy,
+        result=result,
+        validation=validation,
+    )
+    if result.success and not validation.passed:
+        raise RuntimeError(f"{step} agentic output gate failed: {validation.feedback}")
+
+
 def _contains_cjk(text: str) -> bool:
     return any(
         "\u4e00" <= ch <= "\u9fff" or
@@ -2051,11 +2111,6 @@ def _capability_tool_names(capability: str, output_mode: str) -> list[str]:
     return []
 
 
-def _claude_allowed_tool_names(tool_names: list[str]) -> list[str]:
-    """Map Constellation tool ids to Claude Code MCP tool ids."""
-    return [f"mcp__constellation_tools__{tool_name}" for tool_name in tool_names]
-
-
 def _expected_output_paths(
     capability: str,
     validated_paths: list[str],
@@ -2728,22 +2783,34 @@ def execute_office_work(state: dict) -> dict:
         result = bounded_result
     else:
         max_turns, timeout_seconds = _effective_agentic_budget(capability, validated_paths)
+        policy, policy_kwargs = _office_agentic_policy(runtime, tool_names)
+        agentic_cwd = _agentic_cwd(
+            runtime,
+            state.get("workspace_root") or (
+                validated_paths[0] if validated_paths and os.path.isdir(validated_paths[0]) else (
+                    os.path.dirname(validated_paths[0]) if validated_paths else None
+                )
+            ),
+        )
 
         def _run_agentic_call():
-            return runtime.run_agentic(
+            agentic_result = runtime.run_agentic(
                 prompt,
                 system_prompt=system_prompt,
-                cwd=state.get("workspace_root") or (
-                    validated_paths[0] if validated_paths and os.path.isdir(validated_paths[0]) else (
-                        os.path.dirname(validated_paths[0]) if validated_paths else None
-                    )
-                ),
-                tools=tool_names,
-                allowed_tools=_claude_allowed_tool_names(tool_names),
+                cwd=agentic_cwd,
                 max_turns=max_turns,
                 timeout=timeout_seconds,
                 plugin_manager=state.get("_plugin_manager"),
+                **policy_kwargs,
             )
+            _record_office_agentic_gate(
+                state,
+                step=f"execute_office_work:{capability}",
+                policy=policy,
+                result=agentic_result,
+                artifacts_dir=artifacts_dir,
+            )
+            return agentic_result
 
         result_holder: dict[str, Any] = {}
         error_holder: dict[str, str] = {}
@@ -3613,7 +3680,7 @@ def _run_gate_retry_loop(
         # capability tool allowlist and a bounded budget so a misbehaving
         # LLM cannot invoke unrelated tools or run away.
         tool_names = _capability_tool_names(capability, output_mode)
-        allowed = _claude_allowed_tool_names(tool_names)
+        retry_policy, retry_policy_kwargs = _office_agentic_policy(runtime, tool_names)
         retry_system_prompt = (
             _load_system_prompt()
             + "\n\n"
@@ -3623,21 +3690,30 @@ def _run_gate_retry_loop(
             + "(including delete_output_file for stale files). Do not call any other tool. "
             + f"Available tools: {', '.join(tool_names)}."
         )
-        retry_cwd = state.get("workspace_root") or (
-            validated_paths[0] if validated_paths and os.path.isdir(validated_paths[0]) else (
-                os.path.dirname(validated_paths[0]) if validated_paths else None
-            )
+        retry_cwd = _agentic_cwd(
+            runtime,
+            state.get("workspace_root") or (
+                validated_paths[0] if validated_paths and os.path.isdir(validated_paths[0]) else (
+                    os.path.dirname(validated_paths[0]) if validated_paths else None
+                )
+            ),
         )
         try:
             retry_result = runtime.run_agentic(
                 retry_prompt,
                 system_prompt=retry_system_prompt,
                 cwd=retry_cwd,
-                tools=tool_names,
-                allowed_tools=allowed,
                 max_turns=PLAN_OUTPUT_GATE_RETRY_MAX_TURNS,
                 timeout=PLAN_OUTPUT_GATE_RETRY_TIMEOUT,
                 plugin_manager=state.get("_plugin_manager"),
+                **retry_policy_kwargs,
+            )
+            _record_office_agentic_gate(
+                state,
+                step=f"plan_output_gate_retry:{capability}",
+                policy=retry_policy,
+                result=retry_result,
+                artifacts_dir=contract.output_dir,
             )
             tool_calls = list(getattr(retry_result, "tool_calls", []) or [])
             if not tool_calls:

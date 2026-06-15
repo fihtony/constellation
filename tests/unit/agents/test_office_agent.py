@@ -96,6 +96,44 @@ def test_office_tools_register():
     assert "write_file" in tool_names
 
 
+def test_office_agentic_policy_uses_backend_specific_allowed_tools():
+    from agents.office.nodes import _office_agentic_policy
+    from framework.runtime.adapter import AgenticCapabilities
+
+    class _ConnectRuntime:
+        def agentic_capabilities(self):
+            return AgenticCapabilities(
+                backend="connect-agent",
+                agentic=True,
+                constellation_tools=True,
+                allowed_tools=True,
+            )
+
+    class _ClaudeRuntime:
+        def agentic_capabilities(self):
+            return AgenticCapabilities(
+                backend="claude-code",
+                agentic=True,
+                constellation_tools=True,
+                allowed_tools=True,
+                cwd=True,
+            )
+
+    connect_policy, connect_kwargs = _office_agentic_policy(_ConnectRuntime(), ["read_txt", "write_workspace"])
+    claude_policy, claude_kwargs = _office_agentic_policy(_ClaudeRuntime(), ["read_txt", "write_workspace"])
+
+    assert connect_policy.allowed_tools == ["read_txt", "write_workspace"]
+    assert connect_kwargs["allowed_tools"] == ["read_txt", "write_workspace"]
+    assert claude_policy.allowed_tools == [
+        "mcp__constellation_tools__read_txt",
+        "mcp__constellation_tools__write_workspace",
+    ]
+    assert claude_kwargs["allowed_tools"] == [
+        "mcp__constellation_tools__read_txt",
+        "mcp__constellation_tools__write_workspace",
+    ]
+
+
 def test_receive_task_parses_request():
     """Test receive_task extracts capability and paths."""
     from agents.office.nodes import receive_task

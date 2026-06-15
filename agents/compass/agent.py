@@ -2062,17 +2062,20 @@ class CompassAgent(BaseAgent):
                 self._ack_and_cleanup_office_session(task.id, office_session)
 
         else:
-            # General conversational task — use LLM for a direct answer
+            # General conversational task — use a tool-free LLM call for a direct answer.
             log.info("handling as general query")
             system_prompt = load_instructions("compass")
-            agentic_result = runtime.run_agentic(
-                task=user_text,
-                tools=None,
+            llm_result = runtime.run(
+                user_text,
                 system_prompt=system_prompt,
-                max_turns=5,
                 timeout=120,
+                disallowed_tools=["*"],
             )
-            response_text = agentic_result.summary or "I can help you with that."
+            response_text = (
+                llm_result.get("summary")
+                or llm_result.get("raw_response")
+                or "I can help you with that."
+            )
             _record_major_step(
                 task_store,
                 task.id,

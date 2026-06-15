@@ -105,6 +105,27 @@ class TestTeamLeadDefinition:
         assert engine.check_tool("scm_add_pr_inline_comment")
         assert engine.check_tool("scm_add_pr_comment")
 
+    def test_boundary_tools_do_not_embed_agent_url_fallbacks(self):
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[3]
+        production_files = [
+            repo_root / "agents" / "team_lead" / "tools.py",
+            repo_root / "agents" / "web_dev" / "tools.py",
+        ]
+        forbidden_urls = [
+            "http://jira:8010",
+            "http://scm:8020",
+            "http://ui-design:8040",
+            "http://web-dev:8050",
+            "http://code-review:8050",
+        ]
+
+        for path in production_files:
+            source = path.read_text(encoding="utf-8")
+            for url in forbidden_urls:
+                assert url not in source, f"{path} must resolve agent URLs through the registry, not {url}"
+
 
 class TestTeamLeadAgent:
     async def test_handle_message_returns_working(self):
@@ -212,6 +233,45 @@ class TestTeamLeadAgent:
         assert row["title"] == "Team Lead requesting code review"
         assert row["lifecycle_state"] == "done"
         assert result["route"] == "approved"
+
+    async def test_review_result_requires_code_review_launch_permission(self, monkeypatch):
+        from agents.team_lead.nodes import review_result
+
+        launch_checks: list[str] = []
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                launch_checks.append(agent_id)
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                assert name == "dispatch_code_review"
+                return json.dumps({"verdict": "approved", "comments": [], "summary": "ok"})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+        monkeypatch.setattr(
+            "framework.execution_contract.load_child_profiles",
+            lambda mapping: {"code-review": {"agent_id": "code-review", "allowed_tools": ["read_file"]}},
+        )
+
+        result = await review_result(
+            {
+                "_task_id": "task-review-permission",
+                "pr_url": "https://example.com/pull/42",
+                "pr_number": 42,
+                "workspace_path": "/tmp/workspace",
+                "analysis_summary": "feature work",
+                "repo_url": "https://example.com/repo.git",
+                "repo_path": "/tmp/repo",
+                "dev_result": {"summary": "done"},
+                "revision_count": 0,
+            }
+        )
+
+        assert result["route"] == "approved"
+        assert launch_checks == ["code-review"]
 
     async def test_report_success_records_reported_row(self):
         from agents.team_lead.nodes import report_success

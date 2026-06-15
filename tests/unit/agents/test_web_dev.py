@@ -16,6 +16,7 @@ from agents.web_dev.nodes import (
     implement_changes,
     run_tests,
     fix_tests,
+    fix_gaps,
     self_assess,
     capture_screenshot,
     create_pr,
@@ -1441,11 +1442,29 @@ class TestWebDevNodes:
         assert "test mode" in result["implementation_summary"]
         assert result["agentic_success"] is True
 
-    async def test_implement_changes_with_runtime(self):
-        from framework.runtime.adapter import AgenticResult
+    async def test_implement_changes_with_runtime(self, tmp_path, monkeypatch):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
+        from framework.validation_gates import ValidationResult
+
+        monkeypatch.setattr(
+            "framework.validation_gates.validate_files_changed",
+            lambda repo_path: ValidationResult(True, "files_changed"),
+        )
 
         class _MockRuntime:
+            def __init__(self):
+                self.kwargs = {}
+
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="connect-agent",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                )
+
             def run_agentic(self, task, **kw):
+                self.kwargs = kw
                 return AgenticResult(
                     success=True,
                     summary="Implemented login form in src/login.py",
@@ -1455,16 +1474,22 @@ class TestWebDevNodes:
                     backend_used="mock",
                 )
 
+        runtime = _MockRuntime()
         state = {
-            "_runtime": _MockRuntime(),
+            "_runtime": runtime,
             "user_request": "Add login",
             "implementation_plan": "Create login form",
-            "repo_path": "/tmp/repo",
+            "repo_path": str(tmp_path / "repo"),
+            "workspace_path": str(tmp_path),
             "branch_name": "feature/login",
+            "_allowed_tools": ["read_file", "write_file", "run_command"],
         }
+        os.makedirs(state["repo_path"])
         result = await implement_changes(state)
         assert result["agentic_success"] is True
         assert "Implemented" in result["implementation_summary"]
+        assert runtime.kwargs["tools"] == ["read_file", "write_file", "run_command"]
+        assert runtime.kwargs["allowed_tools"] == ["read_file", "write_file", "run_command"]
 
     async def test_implement_changes_error_names_actual_backend(self, monkeypatch, tmp_path):
         from framework.runtime.adapter import AgenticResult
@@ -1559,22 +1584,78 @@ class TestWebDevNodes:
         result = await fix_tests(state)
         assert result["fix_attempted"] is True
 
-    async def test_fix_tests_with_runtime(self):
-        from framework.runtime.adapter import AgenticResult
+    async def test_fix_tests_with_runtime(self, tmp_path):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
 
         class _MockRuntime:
+            def __init__(self):
+                self.kwargs = {}
+
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="connect-agent",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                )
+
             def run_agentic(self, task, **kw):
+                self.kwargs = kw
                 return AgenticResult(success=True, summary="Fixed null check in login.py", backend_used="mock")
 
+        runtime = _MockRuntime()
         state = {
-            "_runtime": _MockRuntime(),
+            "_runtime": runtime,
             "test_output": "AssertionError: None is not True",
-            "repo_path": "/tmp/repo",
+            "repo_path": str(tmp_path / "repo"),
+            "workspace_path": str(tmp_path),
             "changes_made": ["src/login.py"],
+            "_allowed_tools": ["read_file", "run_command"],
         }
+        os.makedirs(state["repo_path"])
         result = await fix_tests(state)
         assert result["fix_attempted"] is True
         assert "Fixed" in result["fix_summary"]
+        assert runtime.kwargs["tools"] == ["read_file", "run_command"]
+        assert runtime.kwargs["allowed_tools"] == ["read_file", "run_command"]
+
+    async def test_fix_gaps_with_runtime_uses_same_agentic_policy(self, tmp_path):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
+
+        class _MockRuntime:
+            def __init__(self):
+                self.kwargs = {}
+
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="connect-agent",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                )
+
+            def run_agentic(self, task, **kw):
+                self.kwargs = kw
+                return AgenticResult(success=True, summary="Fixed self-check gap", backend_used="mock")
+
+        runtime = _MockRuntime()
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        result = await fix_gaps(
+            {
+                "_runtime": runtime,
+                "repo_path": str(repo_path),
+                "workspace_path": str(tmp_path),
+                "changes_made": ["src/login.py"],
+                "self_assessment": {"gaps": ["Address a generic implementation gap."]},
+                "_allowed_tools": ["read_file", "write_file", "run_command"],
+            }
+        )
+
+        assert result["fix_gaps_attempted"] is True
+        assert runtime.kwargs["tools"] == ["read_file", "write_file", "run_command"]
+        assert runtime.kwargs["allowed_tools"] == ["read_file", "write_file", "run_command"]
 
     async def test_capture_screenshot_requires_png_for_ui_task(self, tmp_path):
         state = {
@@ -1866,6 +1947,10 @@ class TestWebDevBoundaryTools:
 
     def test_run_command_rejects_command_outside_permission_patterns(self, tmp_path):
         from agents.web_dev.coding_tools import RunCommandTool
+        from framework.audit_log import (
+            clear_permission_audit_context,
+            set_permission_audit_context,
+        )
         from framework.permissions import PermissionEngine, PermissionSet
         from framework.tools.registry import get_registry
 
@@ -1878,16 +1963,27 @@ class TestWebDevBoundaryTools:
                 )
             )
         )
+        set_permission_audit_context(
+            workspace_path=str(tmp_path),
+            agent_id="web-dev",
+            task_id="task-command-audit",
+        )
         try:
             result = RunCommandTool().execute_sync(
                 command="python -c 'print(1)'",
                 cwd=str(tmp_path),
             )
         finally:
+            clear_permission_audit_context()
             registry.set_permission_engine(None)
 
         assert result.error is not None
         assert "not permitted" in result.error
+        audit_path = tmp_path / "web-dev" / "permission-denials.jsonl"
+        records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+        assert records[-1]["operation"] == "command"
+        assert records[-1]["command"] == "python -c 'print(1)'"
+        assert records[-1]["status"] == "denied"
 
     def test_scm_create_pr_derives_bitbucket_coordinates(self, monkeypatch):
         dispatched = {}

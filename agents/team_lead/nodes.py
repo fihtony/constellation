@@ -28,6 +28,7 @@ from framework.major_step import (
     record_major_step,
 )
 from framework.audit_log import (
+    append_current_permission_denial as _append_current_permission_denial,
     append_command_log as _append_command_log,
     write_stage_summary as _write_stage_summary,
 )
@@ -44,6 +45,23 @@ _CHILD_SESSION_CACHE: dict[str, dict[str, dict[str, str]]] = {}
 def _logger(state: dict) -> AgentLogger:
     """Return an AgentLogger for this agent using the task_id stored in state."""
     return AgentLogger(state.get("_task_id", ""), _AGENT_ID)
+
+
+def _require_agent_launch_permission(state: dict, perm_engine: Any, agent_id: str) -> None:
+    if not perm_engine:
+        return
+    try:
+        perm_engine.require_agent_launching(agent_id)
+    except Exception as exc:
+        from framework.errors import PermissionDeniedError
+
+        if isinstance(exc, PermissionDeniedError):
+            _append_current_permission_denial(
+                operation="agent_launch",
+                reason=str(exc),
+                metadata={"target_agent": agent_id},
+            )
+        raise
 
 
 def _record_timeline_step(
@@ -1398,9 +1416,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
     registry = get_registry()
 
     # Enforce agent launching permission
-    perm_engine = registry._permission_engine
-    if perm_engine:
-        perm_engine.require_agent_launching("web-dev")
+    _require_agent_launch_permission(state, getattr(registry, "_permission_engine", None), "web-dev")
 
     log = _logger(state)
     log.node("dispatch_dev_agent")
@@ -1686,6 +1702,7 @@ async def review_result(state: dict) -> dict:
     from framework.tools.registry import get_registry
 
     registry = get_registry()
+    _require_agent_launch_permission(state, getattr(registry, "_permission_engine", None), "code-review")
     log = _logger(state)
     log.node("review_result")
     review_attempt = int(state.get("revision_count", 0) or 0)
