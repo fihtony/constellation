@@ -9,6 +9,7 @@ for single-shot LLM calls or bounded ReAct; the graph controls the macro flow.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import html
 import json
 import os
 import re
@@ -2320,6 +2321,54 @@ def _adf_to_text(adf) -> str:
     return " ".join(lines)
 
 
+def _extract_urls(text: str) -> list[str]:
+    """Return URLs from plain text without swallowing smartlink/HTML markup."""
+    urls: list[str] = []
+    for match in re.finditer(r"https?://[^\s<>'\"]+", text):
+        url = html.unescape(match.group(0)).rstrip(".,;:!?)]}")
+        if url:
+            urls.append(url)
+    return urls
+
+
+def _normalize_scm_repo_url(url: str) -> str:
+    """Normalize a supported SCM URL to the repository root when possible."""
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(url.strip())
+    host = parsed.netloc.lower()
+    if not parsed.scheme or not host:
+        return ""
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if not path_parts:
+        return ""
+
+    if host == "github.com":
+        if len(path_parts) < 2:
+            return ""
+        repo_parts = path_parts[:2]
+    elif host == "bitbucket.org":
+        if len(path_parts) < 2:
+            return ""
+        repo_parts = path_parts[:2]
+    elif host == "gitlab.com":
+        repo_parts = path_parts
+        for marker in ("-", "issues", "merge_requests", "tree", "blob", "commit", "compare"):
+            if marker in repo_parts:
+                repo_parts = repo_parts[:repo_parts.index(marker)]
+                break
+        if len(repo_parts) < 2:
+            return ""
+    elif host == "dev.azure.com":
+        repo_parts = path_parts
+    else:
+        return ""
+
+    normalized_path = "/" + "/".join(repo_parts)
+    return urlunparse((parsed.scheme, parsed.netloc, normalized_path, "", "", "")).rstrip("/")
+
+
 # Fields that carry important content for context extraction (checked first)
 _IMPORTANT_JIRA_FIELDS = (
     "summary", "description", "acceptance_criteria",
@@ -2410,28 +2459,22 @@ def _extract_urls_from_ticket(jira_context: dict) -> dict:
     """Extract GitHub, Stitch, and Figma URLs from a Jira ticket dict (regex fallback)."""
     text = _jira_to_text(jira_context)
     result: dict = {}
+    urls = _extract_urls(text)
 
-    # GitHub repo URL (stop before /issues, /pulls, /tree, /blob, /commit paths)
-    repo_match = re.search(
-        r'https?://github\.com/([\w.-]+/[\w.-]+?)(?:/(?:issues|pulls|tree|blob|commit|compare|releases)|\s|$)',
-        text,
-    )
-    if repo_match:
-        result["repo_url"] = f"https://github.com/{repo_match.group(1)}".rstrip("/")
+    for url in urls:
+        repo_url = _normalize_scm_repo_url(url)
+        if repo_url:
+            result["repo_url"] = repo_url
+            break
 
     # Figma file/design URL
-    figma_match = re.search(
-        r'https?://(?:www\.)?figma\.com/(?:file|design)/([\w-]+[^\s]*)',
-        text,
-    )
-    if figma_match:
-        result["figma_url"] = figma_match.group(0).rstrip("/")
+    for url in urls:
+        if re.match(r"https?://(?:www\.)?figma\.com/(?:file|design)/", url):
+            result["figma_url"] = url.rstrip("/")
+            break
 
     # Google Stitch: prefer full URL, fall back to bare project ID in text
-    stitch_match = re.search(
-        r'https?://stitch\.withgoogle\.com/projects/(\d+)',
-        text,
-    )
+    stitch_match = re.search(r"https?://stitch\.withgoogle\.com/projects/(\d+)", text)
     if stitch_match:
         result["stitch_project_id"] = stitch_match.group(1)
         # Screen ID: 32-char hex string that appears after the project URL
@@ -2464,9 +2507,10 @@ def _extract_context_with_llm(jira_context: dict, runtime) -> dict:
 
     Falls back to regex extraction if runtime is unavailable or LLM call fails.
     """
+    deterministic = _extract_urls_from_ticket(jira_context)
     if not runtime:
         print(f"[{_AGENT_ID}] No runtime available for LLM extraction — using regex fallback")
-        return _extract_urls_from_ticket(jira_context)
+        return deterministic
 
     from agents.team_lead.prompts.extraction import EXTRACTION_SYSTEM, EXTRACTION_TEMPLATE
 
@@ -2487,7 +2531,7 @@ def _extract_context_with_llm(jira_context: dict, runtime) -> dict:
 
         # Normalize: convert null / None to empty defaults
         cleaned = {
-            "repo_url": extracted.get("repo_url") or "",
+            "repo_url": _normalize_scm_repo_url(str(extracted.get("repo_url") or "")),
             "stitch_project_id": str(extracted.get("stitch_project_id") or ""),
             "stitch_screen_id": str(extracted.get("stitch_screen_id") or ""),
             "stitch_screen_name": extracted.get("stitch_screen_name") or "",
@@ -2495,8 +2539,11 @@ def _extract_context_with_llm(jira_context: dict, runtime) -> dict:
             "tech_stack": extracted.get("tech_stack") or [],
             "feature_description": extracted.get("feature_description") or "",
         }
+        for key in ("repo_url", "stitch_project_id", "stitch_screen_id", "figma_url"):
+            if not cleaned.get(key) and deterministic.get(key):
+                cleaned[key] = deterministic[key]
         print(f"[{_AGENT_ID}] LLM extraction result: {json.dumps(cleaned, ensure_ascii=False)}")
         return cleaned
     except Exception as exc:
         print(f"[{_AGENT_ID}] LLM extraction failed ({exc}) — falling back to regex")
-        return _extract_urls_from_ticket(jira_context)
+        return deterministic

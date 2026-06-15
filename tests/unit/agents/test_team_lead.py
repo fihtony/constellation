@@ -399,6 +399,40 @@ class TestGatherContextFailures:
                 "workspace_path": str(tmp_path),
             })
 
+    def test_context_extraction_backfills_smartlink_repo_when_llm_omits_it(self):
+        """Deterministic ticket parsing must fill required dispatch fields."""
+        from agents.team_lead.nodes import _extract_context_with_llm
+
+        jira_ticket = {
+            "key": "PROJ-123",
+            "fields": {
+                "summary": "Implement marketing page",
+                "description": (
+                    "Project URL: <custom data-type=\"smartlink\">"
+                    "https://stitch.withgoogle.com/projects/12345678901234567?pli=1"
+                    "</custom>\n"
+                    "Screen ID: 0123456789abcdef0123456789abcdef\n"
+                    "Target repo: <custom data-type=\"smartlink\">"
+                    "https://github.com/example-org/example-app</custom>"
+                ),
+            },
+        }
+
+        runtime = MagicMock()
+        runtime.run.return_value = {
+            "raw_response": json.dumps({
+                "repo_url": "",
+                "stitch_project_id": "12345678901234567",
+                "stitch_screen_id": "0123456789abcdef0123456789abcdef",
+            })
+        }
+
+        extracted = _extract_context_with_llm(jira_ticket, runtime)
+
+        assert extracted["repo_url"] == "https://github.com/example-org/example-app"
+        assert extracted["stitch_project_id"] == "12345678901234567"
+        assert extracted["stitch_screen_id"] == "0123456789abcdef0123456789abcdef"
+
     async def test_gather_context_raises_when_repo_clone_fails(self, monkeypatch, tmp_path):
         """Repo clone failure is fatal because Web Dev must receive a real cloned repo."""
         from agents.team_lead.nodes import gather_context
