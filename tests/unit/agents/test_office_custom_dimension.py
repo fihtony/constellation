@@ -211,6 +211,113 @@ def test_planning_phase_falls_back_to_text_when_metadata_missing(tmp_path):
     assert "department" in runtime.prompts[0]
 
 
+def test_planning_phase_parses_json_after_reasoning_block(tmp_path):
+    """Some backends emit reasoning text with JSON examples before the final JSON."""
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "alice.txt").write_text("Student: Alice\nJanuary work\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    raw_response = """
+<think>
+The response must follow this schema:
+{
+  "buckets": ["name1", "name2"],
+  "sample_mapping": {"<sample_path>": "<bucket_name>"},
+  "classification_rule": "rule",
+  "rationale": "why"
+}
+</think>
+
+{
+  "buckets": ["Alice/January"],
+  "sample_mapping": {"alice.txt": "Alice/January"},
+  "classification_rule": "Read the Student marker and month.",
+  "rationale": "Group by student, then month."
+}
+"""
+    runtime = MagicMock()
+    runtime.run = MagicMock(return_value={"summary": raw_response, "raw_response": raw_response})
+    runtime.prompts = []
+    state = _organize_state(source=str(src), artifacts_dir=str(artifacts))
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "input-required"
+    needs = result["needs_clarification"]
+    assert needs["plan"]["buckets"] == ["Alice/January"]
+    assert needs["plan"]["sample_mapping"] == {"alice.txt": "Alice/January"}
+
+
+def test_planning_phase_recovers_complete_plan_when_final_json_is_truncated(tmp_path):
+    """If the final object is truncated, recover the last complete plan object."""
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "alice.txt").write_text("Student: Alice\nJanuary work\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    raw_response = """
+<think>
+Schema example:
+{
+  "buckets": ["name1", "name2"],
+  "sample_mapping": {"<sample_path>": "<bucket_name>"},
+  "classification_rule": "rule",
+  "rationale": "why"
+}
+
+Thus final answer:
+{
+  "buckets": ["Alice/January"],
+  "sample_mapping": {"alice.txt": "Alice/January"},
+  "classification_rule": "Read the Student marker and month.",
+  "rationale": "Group by student, then month."
+}
+</think>
+
+{
+  "buckets": ["Alice/January"],
+  "sample_mapping": {"alice.txt": "Alice/January"},
+  "classification_rule": "Read the Student marker and month.",
+  "rationale": "Group by
+"""
+    runtime = MagicMock()
+    runtime.run = MagicMock(return_value={"summary": raw_response, "raw_response": raw_response})
+    state = _organize_state(source=str(src), artifacts_dir=str(artifacts))
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "input-required"
+    needs = result["needs_clarification"]
+    assert needs["plan"]["buckets"] == ["Alice/January"]
+    assert needs["plan"]["sample_mapping"] == {"alice.txt": "Alice/January"}
+
+
+def test_custom_planner_samples_across_full_tree(tmp_path):
+    """Sampling must cover the source distribution, not only the first folders."""
+    from agents.office.organize_by_dimension import _read_sample_files
+
+    src = tmp_path / "src"
+    for index in range(10):
+        folder = src / f"{index:02d}"
+        folder.mkdir(parents=True)
+        (folder / "item.txt").write_text(f"bucket marker {index}\n", encoding="utf-8")
+
+    samples = _read_sample_files(str(src), max_files=5, max_chars=80)
+    sampled_paths = [item["path"] for item in samples]
+
+    assert len(sampled_paths) == 5
+    assert "00/item.txt" in sampled_paths
+    assert "09/item.txt" in sampled_paths
+    assert not sampled_paths == [f"{index:02d}/item.txt" for index in range(5)]
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: execution
 # ---------------------------------------------------------------------------
@@ -399,6 +506,224 @@ def test_execution_phase_materializes_nested_bucket_paths(tmp_path):
     # The destination column must show the nested path, not the
     # sanitized single-segment form.
     assert "Yan_January/" not in plan_text
+
+
+def test_execution_phase_rejects_incomplete_classifier_mapping(tmp_path):
+    """The custom executor must not silently bucket missing mappings as unmatched.
+
+    A sparse classifier response is a workflow-quality failure: the agent has
+    not parsed enough data to execute an approved custom plan. It should stop
+    before materializing an ``unmatched/`` catch-all tree.
+    """
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "0103").mkdir()
+    (src / "0103" / "1.txt").write_text("Student: Alice\nJanuary work\n")
+    (src / "0207").mkdir()
+    (src / "0207" / "1.txt").write_text("Student: Bob\nFebruary work\n")
+    (src / "0307").mkdir()
+    (src / "0307" / "1.txt").write_text("Student: Carol\nMarch work\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    approved_plan = {
+        "buckets": ["Alice/January", "Bob/February", "Carol/March"],
+        "sample_mapping": {"0103/1.txt": "Alice/January"},
+        "classification_rule": "Read each file and map every file to Student/Month.",
+        "rationale": "Every source file should have a student and month.",
+    }
+    runtime = _runtime_with_plan_response(
+        plan=approved_plan,
+        mapping={},  # broken classifier response: it omitted every remaining file
+    )
+    state = _organize_state(
+        source=str(src),
+        artifacts_dir=str(artifacts),
+        approved_plan=approved_plan,
+    )
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "input-required"
+    assert result["success"] is False
+    assert "did not classify" in result["summary"]
+    output_root = artifacts / "organized-output" / "files"
+    assert not (output_root / "unmatched").exists()
+
+
+def test_execution_phase_accepts_absolute_sample_mapping_paths(tmp_path):
+    """Planner output may use absolute source paths; execution canonicalizes them."""
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "0103").mkdir()
+    (src / "0103" / "1.txt").write_text("Student: Alice\nJanuary work\n")
+    (src / "0207").mkdir()
+    (src / "0207" / "1.txt").write_text("Student: Bob\nFebruary work\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    approved_plan = {
+        "buckets": ["Alice/January", "Bob/February"],
+        "sample_mapping": {str(src / "0103" / "1.txt"): "Alice/January"},
+        "classification_rule": "Read each file and map every file to Student/Month.",
+        "rationale": "Planner used an absolute sample path.",
+    }
+    runtime = _runtime_with_plan_response(
+        plan=approved_plan,
+        mapping={"0207/1.txt": "Bob/February"},
+    )
+    state = _organize_state(
+        source=str(src),
+        artifacts_dir=str(artifacts),
+        approved_plan=approved_plan,
+    )
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "completed"
+    assert result["success"] is True
+    output_root = artifacts / "organized-output" / "files"
+    assert (output_root / "Alice" / "January" / "0103" / "1.txt").exists()
+    assert (output_root / "Bob" / "February" / "0207" / "1.txt").exists()
+
+
+def test_execution_phase_accepts_absolute_classifier_mapping_paths(tmp_path):
+    """Classifier output may also use absolute source paths."""
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "0103").mkdir()
+    (src / "0103" / "1.txt").write_text("Student: Alice\nJanuary work\n")
+    (src / "0207").mkdir()
+    (src / "0207" / "1.txt").write_text("Student: Bob\nFebruary work\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    approved_plan = {
+        "buckets": ["Alice/January", "Bob/February"],
+        "sample_mapping": {"0103/1.txt": "Alice/January"},
+        "classification_rule": "Read each file and map every file to Student/Month.",
+        "rationale": "Classifier may echo absolute source paths.",
+    }
+    runtime = _runtime_with_plan_response(
+        plan=approved_plan,
+        mapping={str(src / "0207" / "1.txt"): "Bob/February"},
+    )
+    state = _organize_state(
+        source=str(src),
+        artifacts_dir=str(artifacts),
+        approved_plan=approved_plan,
+    )
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "completed"
+    assert result["success"] is True
+    output_root = artifacts / "organized-output" / "files"
+    assert (output_root / "Alice" / "January" / "0103" / "1.txt").exists()
+    assert (output_root / "Bob" / "February" / "0207" / "1.txt").exists()
+
+
+def test_execution_phase_parses_classifier_mapping_after_reasoning_block(tmp_path):
+    """Execution mapping parsing must tolerate reasoning wrappers too."""
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "0103").mkdir()
+    (src / "0103" / "1.txt").write_text("Student: Alice\nJanuary work\n")
+    (src / "0207").mkdir()
+    (src / "0207" / "1.txt").write_text("Student: Bob\nFebruary work\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    approved_plan = {
+        "buckets": ["Alice/January", "Bob/February"],
+        "sample_mapping": {"0103/1.txt": "Alice/January"},
+        "classification_rule": "Read each file and map every file to Student/Month.",
+        "rationale": "Classifier output may include a reasoning block.",
+    }
+    raw_mapping = """
+<think>
+Use this schema:
+{"mapping": {"<file_path>": "<bucket_name>"}}
+</think>
+
+{"mapping": {"0207/1.txt": "Bob/February"}}
+"""
+    runtime = MagicMock()
+    runtime.run = MagicMock(return_value={"summary": raw_mapping, "raw_response": raw_mapping})
+    state = _organize_state(
+        source=str(src),
+        artifacts_dir=str(artifacts),
+        approved_plan=approved_plan,
+    )
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "completed"
+    assert result["success"] is True
+    output_root = artifacts / "organized-output" / "files"
+    assert (output_root / "Alice" / "January" / "0103" / "1.txt").exists()
+    assert (output_root / "Bob" / "February" / "0207" / "1.txt").exists()
+
+
+def test_execution_phase_retries_when_classifier_overuses_unmatched(tmp_path):
+    """Custom bucket examples are not a closed enum; retry excessive unmatched output."""
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "0103").mkdir()
+    (src / "0103" / "1.txt").write_text("Student: Alice\nJanuary work\n")
+    for index in range(1, 6):
+        folder = src / f"02{index:02d}"
+        folder.mkdir()
+        (folder / "1.txt").write_text(f"Student: Student{index}\nFebruary work\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    approved_plan = {
+        "buckets": ["Alice/January"],
+        "sample_mapping": {"0103/1.txt": "Alice/January"},
+        "classification_rule": "Read each file and map every file to Student/Month.",
+        "rationale": "Bucket examples are not exhaustive.",
+    }
+    first_mapping = {
+        f"02{index:02d}/1.txt": "__unmatched__"
+        for index in range(1, 6)
+    }
+    retry_mapping = {
+        f"02{index:02d}/1.txt": f"Student{index}/February"
+        for index in range(1, 6)
+    }
+    responses = [
+        {"summary": json.dumps({"mapping": first_mapping}), "raw_response": json.dumps({"mapping": first_mapping})},
+        {"summary": json.dumps({"mapping": retry_mapping}), "raw_response": json.dumps({"mapping": retry_mapping})},
+    ]
+    runtime = MagicMock()
+    runtime.run = MagicMock(side_effect=responses)
+    state = _organize_state(
+        source=str(src),
+        artifacts_dir=str(artifacts),
+        approved_plan=approved_plan,
+    )
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "completed"
+    assert result["success"] is True
+    assert runtime.run.call_count == 2
+    retry_prompt = runtime.run.call_args_list[1].args[0]
+    assert "create a new bucket" in retry_prompt
+    output_root = artifacts / "organized-output" / "files"
+    for index in range(1, 6):
+        assert (output_root / f"Student{index}" / "February" / f"02{index:02d}" / "1.txt").exists()
 
 
 def test_safe_path_segment_preserves_nested_paths():

@@ -21,7 +21,23 @@ from agents.compass.agent import (
 from agents.office.nodes import (
     _canonicalize_workspace_root_analysis_outputs,
     _expected_output_paths,
+    execute_office_work,
 )
+
+
+class _NoToolAgenticRuntime:
+    def __init__(self, response: str):
+        self.response = response
+        self.run_calls: list[dict] = []
+        self.run_agentic_calls: list[dict] = []
+
+    def run(self, prompt, **kwargs):
+        self.run_calls.append({"prompt": prompt, "kwargs": kwargs})
+        return {"summary": self.response, "raw_response": self.response}
+
+    def run_agentic(self, *args, **kwargs):
+        self.run_agentic_calls.append({"args": args, "kwargs": kwargs})
+        raise AssertionError("bounded analyze must not require agentic tools")
 
 
 def test_expected_output_paths_for_directory_analyze(tmp_path):
@@ -44,6 +60,40 @@ def test_expected_output_paths_for_inplace_directory_analyze(tmp_path):
 
     # In inplace mode, the analysis should land next to the source directory.
     assert expected == [str(source_dir / "data.analysis.md")]
+
+
+def test_execute_office_work_analyze_directory_uses_bounded_single_shot_runtime(tmp_path):
+    """Analyze should have a tool-free bounded path for backends without tool support."""
+    source_dir = tmp_path / "sales"
+    source_dir.mkdir()
+    (source_dir / "q1.csv").write_text("region,revenue\nEast,10\nWest,20\n", encoding="utf-8")
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+    runtime = _NoToolAgenticRuntime(
+        "# Data Analysis: sales\n\n"
+        "## File Overview\n- 1 CSV file\n\n"
+        "## Summary Statistics\n| field | count |\n| --- | --- |\n| revenue | 2 |\n"
+    )
+
+    result = execute_office_work(
+        {
+            "_runtime": runtime,
+            "capability": "analyze",
+            "validated_paths": [str(source_dir)],
+            "output_mode": "inplace",
+            "artifacts_dir": str(artifacts_dir),
+            "workspace_root": str(artifacts_dir),
+            "user_request": "analyze the sales data and create report",
+        }
+    )
+
+    output_path = source_dir / "sales.analysis.md"
+    assert result["status"] == "completed"
+    assert result["success"] is True
+    assert output_path.exists()
+    assert "Data Analysis" in output_path.read_text(encoding="utf-8")
+    assert len(runtime.run_calls) == 1
+    assert runtime.run_agentic_calls == []
 
 
 def test_expected_output_paths_for_file_analyze_still_works(tmp_path):

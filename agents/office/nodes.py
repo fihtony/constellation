@@ -535,6 +535,135 @@ def _summary_reader_for_path(path: str):
     return ReadTxtTool()
 
 
+def _analysis_reader_for_path(path: str):
+    return _summary_reader_for_path(path)
+
+
+def _iter_analysis_sources(source_path: str, *, max_files: int = 40) -> list[str]:
+    if not source_path:
+        return []
+    if os.path.isfile(source_path):
+        return [source_path]
+    if not os.path.isdir(source_path):
+        return []
+
+    files: list[str] = []
+    for root, dirs, names in os.walk(source_path):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(names):
+            if name.startswith("."):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in SUMMARY_EXTENSIONS:
+                continue
+            files.append(os.path.join(root, name))
+            if len(files) >= max_files:
+                return files
+    return files
+
+
+def _read_analysis_payload(source_path: str) -> dict[str, Any]:
+    documents: list[dict[str, Any]] = []
+    read_errors: list[str] = []
+    for path in _iter_analysis_sources(source_path):
+        tool = _analysis_reader_for_path(path)
+        result = tool.execute_sync(path=path)
+        rel_path = os.path.relpath(path, source_path) if os.path.isdir(source_path) else os.path.basename(path)
+        if not result.success:
+            read_errors.append(f"{rel_path}: {result.error or 'read failed'}")
+            continue
+        try:
+            payload = json.loads(result.output or "{}")
+        except (TypeError, ValueError):
+            payload = {"content": str(result.output or "")}
+        content = str(payload.get("content") or "")
+        if len(content) > 3000:
+            payload["content"] = content[:3000]
+            payload["content_truncated_for_analysis"] = True
+        documents.append(
+            {
+                "relative_path": rel_path,
+                "basename": os.path.basename(path),
+                "extension": os.path.splitext(path)[1].lower(),
+                "payload": payload,
+            }
+        )
+    return {
+        "source_path": source_path,
+        "source_name": os.path.basename(source_path.rstrip(os.sep)) or "source",
+        "source_is_directory": os.path.isdir(source_path),
+        "document_count": len(documents),
+        "documents": documents,
+        "read_errors": read_errors,
+    }
+
+
+def _fallback_analysis_markdown(payload: dict[str, Any]) -> str:
+    source_name = str(payload.get("source_name") or "source")
+    documents = list(payload.get("documents") or [])
+    lines = [
+        f"# Data Analysis: {source_name}",
+        "",
+        "## File Overview",
+        f"- Sources inspected: {len(documents)}",
+    ]
+    for doc in documents[:20]:
+        doc_payload = doc.get("payload") or {}
+        total_rows = doc_payload.get("total_rows")
+        if total_rows is None and isinstance(doc_payload.get("sheets"), dict):
+            total_rows = sum(
+                int((sheet or {}).get("total_rows") or 0)
+                for sheet in doc_payload.get("sheets", {}).values()
+                if isinstance(sheet, dict)
+            )
+        detail = f"- {doc.get('relative_path')}: {doc.get('extension') or 'file'}"
+        if total_rows is not None:
+            detail += f", rows={total_rows}"
+        lines.append(detail)
+    if payload.get("read_errors"):
+        lines.extend(["", "## Read Warnings"])
+        lines.extend(f"- {err}" for err in payload["read_errors"])
+    lines.extend(
+        [
+            "",
+            "## Summary Statistics",
+            "Structured extraction completed. Review per-file schema and numeric summaries above.",
+            "",
+            "## Key Insights",
+            "- The analysis report was generated from extracted source payloads.",
+            "- No hardcoded business schema was assumed.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _build_bounded_analysis_prompt(payload: dict[str, Any]) -> str:
+    payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
+    if len(payload_json) > 18000:
+        payload_json = payload_json[:18000] + "\n... [payload truncated]\n"
+    source_name = str(payload.get("source_name") or "source")
+    return (
+        "Produce an English-only Markdown data analysis report for the extracted "
+        "Office source payload below.\n\n"
+        "Respond with the report text only. Do not call tools, do not write files, "
+        "and do not include extra preamble.\n\n"
+        "Use exactly this structure:\n"
+        f"# Data Analysis: {source_name}\n\n"
+        "## File Overview\n"
+        "- source type, parse method, row/record counts, and fields detected\n\n"
+        "## Summary Statistics\n"
+        "Markdown tables for detected numeric fields where available\n\n"
+        "## Key Insights\n"
+        "- schema-driven insights only\n"
+        "- assumptions and confidence limits\n\n"
+        "Do not invent missing data. Do not use a fixed sales/business template "
+        "unless those fields are present in the payload.\n\n"
+        "Extracted payload:\n"
+        f"{payload_json}"
+    )
+
+
 def _read_summary_payload(path: str) -> dict[str, Any]:
     tool = _summary_reader_for_path(path)
     result = tool.execute_sync(path=path)
@@ -966,6 +1095,71 @@ def _run_bounded_folder_summarize(
     )
 
 
+def _run_bounded_analyze(
+    state: dict[str, Any],
+    *,
+    runtime,
+    validated_paths: list[str],
+    output_mode: str,
+    artifacts_dir: str,
+    system_prompt: str,
+) -> AgenticResult:
+    expected_outputs = _expected_output_paths("analyze", validated_paths, output_mode, artifacts_dir)
+    cwd = state.get("workspace_root") or (os.path.dirname(validated_paths[0]) if validated_paths else None)
+    plugin_manager = state.get("_plugin_manager")
+    outputs: list[str] = []
+    raw_outputs: list[str] = []
+
+    for source_path, output_path in zip(validated_paths, expected_outputs):
+        payload = _read_analysis_payload(source_path)
+        if not payload.get("documents") and not payload.get("read_errors"):
+            return AgenticResult(
+                success=False,
+                summary=f"bounded analyze found no readable sources under {os.path.basename(source_path)}",
+                raw_output="no readable analysis sources",
+                backend_used="bounded-analyze",
+            )
+        prompt = _build_bounded_analysis_prompt(payload)
+        try:
+            response = runtime.run(
+                prompt,
+                system_prompt=system_prompt,
+                timeout=120,
+                max_tokens=2400,
+                plugin_manager=plugin_manager,
+                cwd=cwd,
+                disallowed_tools=["*"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            return AgenticResult(
+                success=False,
+                summary=f"bounded analyze runtime failed for {os.path.basename(source_path)}: {exc}",
+                raw_output=str(exc),
+                backend_used="bounded-analyze",
+            )
+        raw = str(response.get("raw_response") or response.get("summary") or "").strip()
+        warning_text = " ".join(str(item) for item in response.get("warnings") or [])
+        if _summary_runtime_failed(raw) or _summary_runtime_failed(warning_text):
+            return AgenticResult(
+                success=False,
+                summary=f"bounded analyze runtime failed for {os.path.basename(source_path)}: {raw or warning_text}",
+                raw_output=raw or warning_text,
+                backend_used="bounded-analyze",
+            )
+        report_text = raw if raw and not _contains_cjk(raw) else _fallback_analysis_markdown(payload)
+        _write_text_file(output_path, report_text)
+        outputs.append(output_path)
+        raw_outputs.append(report_text)
+
+    return AgenticResult(
+        success=True,
+        summary=f"Office analyzed {len(validated_paths)} source(s) with the bounded analysis workflow.",
+        raw_output="\n\n---\n\n".join(raw_outputs),
+        backend_used="bounded-analyze",
+        evidence=[{"kind": "analysis_outputs", "paths": outputs}],
+    )
+
+
 def _render_directory_tree(root: str) -> str:
     lines: list[str] = []
     base = os.path.realpath(root)
@@ -1150,16 +1344,161 @@ def _run_bounded_folder_organize(
 # ---------------------------------------------------------------------------
 
 
-def _parse_json_object(text: str) -> dict:
-    """Tolerantly extract the first JSON object from ``text``.
+_CUSTOM_UNMATCHED_BUCKETS = {"unmatched", "__unmatched__", "unknown", "__unknown__"}
 
-    The LLM sometimes wraps the JSON in ```json fences or adds a
-    trailing sentence.  This helper is good enough for the planner
-    prompt's contract ("reply in JSON only") and never raises.
-    """
-    text = (text or "").strip()
-    if not text:
+
+def _custom_mapping_quality_problem(
+    inventory: list[dict[str, Any]],
+    mapping: dict[str, str],
+) -> tuple[str, list[str]]:
+    source_paths = [
+        str(item.get("relative_path") or "").strip()
+        for item in inventory
+        if str(item.get("relative_path") or "").strip()
+    ]
+    missing = sorted(path for path in source_paths if path not in mapping)
+    if missing:
+        return (
+            f"custom classifier did not classify {len(missing)} of {len(source_paths)} source file(s)",
+            missing,
+        )
+
+    unmatched = sorted(
+        path for path in source_paths
+        if str(mapping.get(path) or "").strip().lower() in _CUSTOM_UNMATCHED_BUCKETS
+    )
+    if unmatched and len(unmatched) > max(3, len(source_paths) // 4):
+        return (
+            f"custom classifier left {len(unmatched)} of {len(source_paths)} source file(s) unmatched",
+            unmatched,
+        )
+
+    return "", []
+
+
+def _custom_mapping_has_excessive_unmatched(problem: str) -> bool:
+    return problem.startswith("custom classifier left ")
+
+
+def _merge_custom_exec_mapping(
+    mapping: dict[str, str],
+    exec_mapping: Any,
+    source: str,
+) -> None:
+    if not isinstance(exec_mapping, dict):
+        return
+    mapping.update(
+        _canonicalize_custom_plan(
+            {"sample_mapping": exec_mapping},
+            source,
+        ).get("sample_mapping") or {}
+    )
+
+
+def _canonical_custom_mapping_key(path: str, source: str) -> str:
+    raw = str(path or "").strip().strip("`")
+    if not raw:
+        return ""
+    if os.path.isabs(raw) and source:
+        try:
+            real_path = os.path.realpath(os.path.abspath(raw))
+            real_source = os.path.realpath(os.path.abspath(source))
+            prefix = real_source.rstrip(os.sep) + os.sep
+            if real_path == real_source:
+                return ""
+            if real_path.startswith(prefix):
+                return os.path.relpath(real_path, real_source)
+        except OSError:
+            return raw
+    normalized = os.path.normpath(raw)
+    if normalized == "." or normalized.startswith(".." + os.sep) or normalized == "..":
+        return ""
+    return normalized
+
+
+def _canonicalize_custom_plan(plan: dict[str, Any], source: str) -> dict[str, Any]:
+    if not isinstance(plan, dict):
         return {}
+    normalized = dict(plan)
+    sample_mapping = plan.get("sample_mapping") or {}
+    if isinstance(sample_mapping, dict):
+        canonical_mapping: dict[str, str] = {}
+        for raw_path, bucket in sample_mapping.items():
+            rel_path = _canonical_custom_mapping_key(str(raw_path), source)
+            if not rel_path:
+                continue
+            canonical_mapping[rel_path] = str(bucket)
+        normalized["sample_mapping"] = canonical_mapping
+    return normalized
+
+
+def _json_object_candidates(text: str) -> list[dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    candidates: list[dict[str, Any]] = []
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text[idx:])
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            candidates.append(obj)
+    return candidates
+
+
+def _is_schema_placeholder_object(candidate: dict[str, Any]) -> bool:
+    buckets = candidate.get("buckets")
+    if isinstance(buckets, list) and any(str(item).startswith("name") for item in buckets):
+        return True
+    sample_mapping = candidate.get("sample_mapping")
+    if isinstance(sample_mapping, dict):
+        for key, value in sample_mapping.items():
+            combined = f"{key} {value}"
+            if "<" in combined and ">" in combined:
+                return True
+    mapping = candidate.get("mapping")
+    if isinstance(mapping, dict):
+        for key, value in mapping.items():
+            combined = f"{key} {value}"
+            if "<" in combined and ">" in combined:
+                return True
+    return False
+
+
+def _select_office_json_object(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    for candidate in reversed(candidates):
+        if _is_schema_placeholder_object(candidate):
+            continue
+        if "buckets" in candidate or "mapping" in candidate:
+            return candidate
+    for candidate in reversed(candidates):
+        if _is_schema_placeholder_object(candidate):
+            continue
+        if {"sample_mapping", "classification_rule", "rationale"}.intersection(candidate):
+            return candidate
+    return {}
+
+
+def _parse_json_object(text: str) -> dict:
+    """Tolerantly extract the model's final JSON object from ``text``.
+
+    Backends do not agree on how strictly they honor "JSON only".
+    Claude often returns the object directly, while other agentic
+    runtimes may wrap reasoning in tags or include schema examples
+    before the final object.  We remove common reasoning blocks, then
+    scan for parseable JSON objects and prefer the last one with the
+    expected top-level Office keys.
+    """
+    original_text = (text or "").strip()
+    if not original_text:
+        return {}
+    text = re.sub(
+        r"<(think|thinking|reasoning|analysis)>.*?</\1>",
+        "",
+        original_text,
+        flags=re.DOTALL | re.IGNORECASE,
+    ).strip()
     if text.startswith("```"):
         # Strip leading ``` or ```json and the matching trailing fence.
         end = text.rfind("```")
@@ -1171,13 +1510,12 @@ def _parse_json_object(text: str) -> dict:
     try:
         return json.loads(text)
     except (ValueError, TypeError):
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except (ValueError, TypeError):
-                return {}
-    return {}
+        pass
+
+    selected = _select_office_json_object(_json_object_candidates(text))
+    if selected:
+        return selected
+    return _select_office_json_object(_json_object_candidates(original_text))
 
 
 def _run_custom_dimension_path(
@@ -1250,7 +1588,7 @@ def _run_custom_dimension_path(
             response = runtime.run(
                 planning_prompt,
                 system_prompt=system_prompt,
-                max_tokens=1500,
+                max_tokens=2500,
                 cwd=state.get("workspace_root"),
             )
         except Exception as exc:  # noqa: BLE001
@@ -1262,7 +1600,7 @@ def _run_custom_dimension_path(
                 "error": f"planner runtime error: {exc}",
             }
         raw = response.get("raw_response") or response.get("summary") or ""
-        plan = _parse_json_object(raw)
+        plan = _canonicalize_custom_plan(_parse_json_object(raw), source)
         if not plan or not plan.get("buckets"):
             return {
                 "summary": "office custom planner returned no buckets",
@@ -1375,6 +1713,8 @@ def _run_custom_dimension_path(
         deduped_paths.append(path)
     produced_paths = deduped_paths
 
+    approved_plan = _canonicalize_custom_plan(approved_plan, source)
+
     inventory, _, _ = collect_organize_file_inventory(
         source,
         exclude_paths=produced_paths,
@@ -1412,7 +1752,78 @@ def _run_custom_dimension_path(
             }
         raw = response.get("raw_response") or response.get("summary") or ""
         exec_plan = _parse_json_object(raw)
-        mapping.update((exec_plan or {}).get("mapping") or {})
+        _merge_custom_exec_mapping(mapping, (exec_plan or {}).get("mapping") or {}, source)
+
+    quality_problem, affected_paths = _custom_mapping_quality_problem(inventory, mapping)
+    if (
+        quality_problem
+        and remaining
+        and _custom_mapping_has_excessive_unmatched(quality_problem)
+    ):
+        affected_set = set(affected_paths)
+        retry_remaining = [
+            item for item in remaining
+            if str(item.get("path") or "") in affected_set
+        ]
+        if retry_remaining:
+            retry_prompt = (
+                _build_execution_prompt(custom_hint, approved_plan, retry_remaining)
+                + "\n\n"
+                "Reclassification retry: the previous classification overused "
+                "`__unmatched__`. Treat the approved buckets as examples, not "
+                "as a closed enum. If the classification rule can be applied, "
+                "create a new bucket that follows that rule. Use `__unmatched__` "
+                "only for files that truly lack enough evidence."
+            )
+            try:
+                retry_response = runtime.run(
+                    retry_prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=4000,
+                    cwd=state.get("workspace_root"),
+                )
+                retry_raw = retry_response.get("raw_response") or retry_response.get("summary") or ""
+                retry_plan = _parse_json_object(retry_raw)
+                _merge_custom_exec_mapping(
+                    mapping,
+                    (retry_plan or {}).get("mapping") or {},
+                    source,
+                )
+                quality_problem, affected_paths = _custom_mapping_quality_problem(inventory, mapping)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("custom organize reclassification retry failed: %s", exc)
+
+    if quality_problem:
+        preview = ", ".join(affected_paths[:5])
+        if len(affected_paths) > 5:
+            preview += ", ..."
+        return {
+            "summary": (
+                f"Office custom organize did not classify enough files: "
+                f"{quality_problem}."
+            ),
+            "success": False,
+            "capability": "organize",
+            "status": "input-required",
+            "error": quality_problem,
+            "needs_clarification": {
+                "missing": "organizeCustomPlan",
+                "user_message": (
+                    "Office could not apply the approved custom organize plan "
+                    f"to every source file ({quality_problem}). "
+                    f"Affected files include: {preview}. "
+                    "Reply with `modify: <classification guidance>` so Office "
+                    "can revise the plan before executing."
+                ),
+                "options": [
+                    {"id": "modify", "label": "Modify plan"},
+                ],
+                "reply_contract": build_approve_or_modify_contract(),
+                "plan": approved_plan,
+                "custom_hint": custom_hint,
+                "affected_paths": affected_paths[:50],
+            },
+        }
 
     # Materialize files into bucket folders.
     bucket_dirs: dict[str, str] = {}
@@ -1566,6 +1977,16 @@ def _try_bounded_office_flow(
     artifacts_dir: str,
     system_prompt: str,
 ) -> AgenticResult | None:
+    if capability == "analyze":
+        _task_log(state, "info", "using bounded analyze flow", source_count=len(validated_paths))
+        return _run_bounded_analyze(
+            state,
+            runtime=runtime,
+            validated_paths=validated_paths,
+            output_mode=output_mode,
+            artifacts_dir=artifacts_dir,
+            system_prompt=system_prompt,
+        )
     if capability == "summarize" and len(validated_paths) > 1:
         _task_log(state, "info", "using bounded folder summarize flow", file_count=len(validated_paths))
         return _run_bounded_folder_summarize(
