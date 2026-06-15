@@ -1881,7 +1881,15 @@ async def request_revision(state: dict) -> dict:
     """Prepare revision feedback for the dev agent and loop back."""
     log = _logger(state)
     review = state.get("review_result", {})
-    comments = review.get("comments", [])
+    raw_comments = review.get("comments") or review.get("all_comments") or review.get("issues") or []
+    comments = [dict(c) for c in raw_comments if isinstance(c, dict)]
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    comments.sort(
+        key=lambda c: (
+            0 if c.get("effective_blocking") is True or c.get("blocking") is True else 1,
+            severity_rank.get(str(c.get("severity", "info")).strip().lower(), 5),
+        )
+    )
     summary = review.get("summary", review.get("message", ""))
 
     feedback_lines = []
@@ -1937,8 +1945,24 @@ async def request_revision(state: dict) -> dict:
         try:
             from framework.tools.registry import get_registry as _get_registry
             tool_registry = _get_registry()
-            inline_comments = [c for c in comments if c.get("file") and c.get("line")]
-            for ic in inline_comments[:5]:  # Limit to top 5 inline comments per round
+            inline_eligible = [c for c in comments if c.get("file") and c.get("line")]
+            inline_skipped = [c for c in comments if not (c.get("file") and c.get("line"))]
+            try:
+                inline_cap = int(os.environ.get("TEAM_LEAD_INLINE_COMMENT_CAP", "5") or "5")
+            except ValueError:
+                inline_cap = 5
+            inline_cap = max(1, min(inline_cap, 25))
+            inline_comments = inline_eligible[:inline_cap]
+            log.info(
+                "posting inline PR comments",
+                pr_number=pr_number,
+                cap=inline_cap,
+                eligible=len(inline_eligible),
+                posting=len(inline_comments),
+                missing_location=len(inline_skipped),
+            )
+            posted_inline = 0
+            for ic in inline_comments:
                 inline_result = _safe_json(
                     tool_registry.execute_sync(
                         "scm_add_pr_inline_comment",
@@ -1961,54 +1985,76 @@ async def request_revision(state: dict) -> dict:
                         file=ic.get("file", ""),
                         line=ic.get("line", 0),
                         error=str(inline_result.get("error")),
-                        )
+                    )
+                else:
+                    posted_inline += 1
+            if inline_skipped:
+                log.warn(
+                    "inline PR comments skipped, missing file/line",
+                    skipped=len(inline_skipped),
+                    total=len(comments),
+                    pr_number=pr_number,
+                )
+            log.info(
+                "inline PR comments posted",
+                posted=posted_inline,
+                attempted=len(inline_comments),
+                pr_number=pr_number,
+            )
         except Exception as exc:
             print(f"[{_AGENT_ID}] Inline PR comments failed (non-critical): {exc}")
 
+        # Always post a summary comment on rejection so the PR reflects the
+        # review verdict even when no inline anchor was available.
         try:
             residual_comments = [
                 c for c in comments[:10]
                 if not (c.get("file") and c.get("line"))
             ]
-            if summary or residual_comments:
-                pr_comment_lines = ["Code review requested changes."]
-                if summary:
-                    pr_comment_lines.append("")
-                    pr_comment_lines.append(f"Summary: {summary}")
-                if residual_comments:
-                    pr_comment_lines.append("")
-                    pr_comment_lines.append("Additional review findings:")
-                    for comment in residual_comments[:5]:
-                        severity = str(comment.get("severity", "info")).upper()
-                        file_ref = str(comment.get("file") or "").strip()
-                        line_ref = comment.get("line")
-                        location = ""
-                        if file_ref and line_ref:
-                            location = f"{file_ref}:{line_ref} - "
-                        elif file_ref:
-                            location = f"{file_ref} - "
-                        pr_comment_lines.append(
-                            f"- [{severity}] {location}{str(comment.get('message', '')).strip()}"
-                        )
-                summary_result = _safe_json(
-                    tool_registry.execute_sync(
-                        "scm_add_pr_comment",
-                        {
-                            "repo_url": repo_url,
-                            "pr_number": pr_number,
-                            "comment": "\n".join(pr_comment_lines).strip(),
-                            "task_id": state.get("_task_id", ""),
-                        },
-                    ),
-                    {},
-                )
-                if isinstance(summary_result, dict) and summary_result.get("error"):
-                    log.warn(
-                        "summary PR comment failed",
-                        repo_url=repo_url,
-                        pr_number=pr_number,
-                        error=str(summary_result.get("error")),
+            pr_comment_lines = ["Code review requested changes."]
+            if summary:
+                pr_comment_lines.append("")
+                pr_comment_lines.append(f"Summary: {summary}")
+            if residual_comments:
+                pr_comment_lines.append("")
+                pr_comment_lines.append("Additional review findings:")
+                for comment in residual_comments[:5]:
+                    severity = str(comment.get("severity", "info")).upper()
+                    file_ref = str(comment.get("file") or "").strip()
+                    line_ref = comment.get("line")
+                    location = ""
+                    if file_ref and line_ref:
+                        location = f"{file_ref}:{line_ref} - "
+                    elif file_ref:
+                        location = f"{file_ref} - "
+                    pr_comment_lines.append(
+                        f"- [{severity}] {location}{str(comment.get('message', '')).strip()}"
                     )
+            summary_result = _safe_json(
+                tool_registry.execute_sync(
+                    "scm_add_pr_comment",
+                    {
+                        "repo_url": repo_url,
+                        "pr_number": pr_number,
+                        "comment": "\n".join(pr_comment_lines).strip(),
+                        "task_id": state.get("_task_id", ""),
+                    },
+                ),
+                {},
+            )
+            if isinstance(summary_result, dict) and summary_result.get("error"):
+                log.warn(
+                    "summary PR comment failed",
+                    repo_url=repo_url,
+                    pr_number=pr_number,
+                    error=str(summary_result.get("error")),
+                )
+            else:
+                log.info(
+                    "summary PR comment posted",
+                    pr_number=pr_number,
+                    residual_findings=len(residual_comments),
+                )
         except Exception as exc:
             print(f"[{_AGENT_ID}] Summary PR comment failed (non-critical): {exc}")
 

@@ -556,6 +556,73 @@ class JiraTransition(BaseTool):
 
 
 # ---------------------------------------------------------------------------
+# Tool: scm_add_pr_comment
+# ---------------------------------------------------------------------------
+
+class SCMAddPRComment(BaseTool):
+    """Post a summary PR review comment via the SCM boundary agent."""
+
+    name = "scm_add_pr_comment"
+    description = "Post a Markdown comment on a pull request via the SCM Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {
+                "type": "string",
+                "description": "Full repository URL.",
+            },
+            "pr_number": {
+                "type": "integer",
+                "description": "Pull request number.",
+            },
+            "comment": {
+                "type": "string",
+                "description": "Markdown comment body.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Caller task ID for log correlation (optional).",
+            },
+        },
+        "required": ["repo_url", "pr_number", "comment"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        pr_number: int = 0,
+        comment: str = "",
+        task_id: str = "",
+        **_: Any,
+    ) -> ToolResult:
+        scm_url = _resolve_agent_url(
+            "SCM_AGENT_URL",
+            "scm_agent_url",
+            "http://scm:8020",
+            "scm.pr.comment",
+        )
+        if not scm_url:
+            return ToolResult(output=json.dumps({"error": "No registered SCM instance was found in the registry.", "repoUrl": repo_url, "prNumber": pr_number}))
+        try:
+            metadata: dict[str, Any] = {
+                "repoUrl": repo_url,
+                "prNumber": pr_number,
+                "comment": comment,
+            }
+            if task_id:
+                metadata["taskId"] = task_id
+            payload = _dispatch_boundary_capability(
+                url=scm_url,
+                capability="scm.pr.comment",
+                text=comment,
+                metadata=metadata,
+            )
+            return ToolResult(output=json.dumps(payload))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"error": str(exc), "repoUrl": repo_url, "prNumber": pr_number}))
+
+
+# ---------------------------------------------------------------------------
 # Tool: scm_add_pr_inline_comment
 # ---------------------------------------------------------------------------
 
@@ -1294,6 +1361,7 @@ _TOOLS = [
     CloneRepo(),
     JiraComment(),
     JiraTransition(),
+    SCMAddPRComment(),
     SCMAddPRInlineComment(),
     DispatchWebDev(),
     DispatchCodeReview(),

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -245,28 +244,19 @@ class AgentRuntimeAdapter(ABC):
 
     @staticmethod
     def parse_structured_output(text: str) -> dict:
-        text = (text or "").strip()
+        """Return the first JSON object found in *text*, or an empty dict.
+
+        Backed by :func:`framework.json_extract.extract_json_object` so the
+        same balanced-brace, ``<think>``-aware, fence-aware parser is shared
+        with every agent. Preserves the historical ``dict`` return contract
+        (callers receive ``{}`` on failure).
+        """
+        from framework.json_extract import extract_json_object
+
         if not text:
             return {}
-        if text.startswith("```"):
-            lines = text.splitlines()
-            start, end = 1, len(lines)
-            while end > start and lines[end - 1].strip() in ("```", ""):
-                end -= 1
-            text = "\n".join(lines[start:end]).strip()
-        try:
-            loaded = json.loads(text)
-            return loaded if isinstance(loaded, dict) else {}
-        except json.JSONDecodeError:
-            pass
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            try:
-                loaded = json.loads(match.group())
-                return loaded if isinstance(loaded, dict) else {}
-            except json.JSONDecodeError:
-                pass
-        return {}
+        loaded = extract_json_object(text)
+        return loaded if isinstance(loaded, dict) else {}
 
     @classmethod
     def build_result(

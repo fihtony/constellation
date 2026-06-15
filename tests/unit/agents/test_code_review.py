@@ -202,6 +202,28 @@ class TestParseIssueList:
     def test_object_not_array_returns_empty(self):
         assert _parse_issue_list('{"error": "bad"}') == []
 
+    def test_strips_think_block(self):
+        text = (
+            '<think>let me look at the diff and find issues</think>'
+            '[{"severity": "high", "message": "real issue"}]'
+        )
+        issues = _parse_issue_list(text)
+        assert len(issues) == 1
+        assert issues[0]["message"] == "real issue"
+
+    def test_strips_markdown_fence(self):
+        text = '```json\n[{"severity": "low", "message": "fenced"}]\n```'
+        issues = _parse_issue_list(text)
+        assert len(issues) == 1
+        assert issues[0]["message"] == "fenced"
+
+    def test_drops_non_dict_entries(self):
+        # Sometimes models emit a mixed array — keep only dict entries.
+        text = '[{"severity": "high"}, "string item", 42, null]'
+        issues = _parse_issue_list(text)
+        assert len(issues) == 1
+        assert issues[0]["severity"] == "high"
+
 
 # ---------------------------------------------------------------------------
 # Node tests
@@ -532,6 +554,41 @@ class TestReviewQuality:
         result = await review_quality({"_runtime": _make_runtime("[]")})
         assert result["quality_issues"] == []
 
+    async def test_unparseable_response_triggers_retry_with_format_reminder(self):
+        """If the LLM returns prose that can't be parsed as a JSON array, the
+        phase node must retry once with a generic format reminder.
+
+        This is methodology-level — no task-specific knowledge — so it
+        works for every backend (copilot-cli, claude-code, codex-cli) and
+        every phase (quality, security, tests, requirements, ui-design).
+        """
+
+        class _MockRuntime:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            def run(self, prompt, **kw):
+                self.prompts.append(prompt)
+                if len(self.prompts) == 1:
+                    # Garbage that can't be parsed as a JSON array
+                    return {"raw_response": "<think>I am thinking but emitting no JSON</think>"}
+                # Second attempt returns a valid array
+                return {
+                    "raw_response": '[{"severity": "medium", "file": "x.py", "line": 5, "message": "m"}]'
+                }
+
+        runtime = _MockRuntime()
+        state = {"_runtime": runtime, "pr_diff": "diff --git a/x.py b/x.py\n"}
+        result = await review_quality(state)
+        assert len(result["quality_issues"]) == 1
+        assert result["quality_issues"][0]["severity"] == "medium"
+        # The retry prompt must include the generic format-reminder text.
+        assert len(runtime.prompts) == 2
+        assert "could not be parsed as a JSON array" in runtime.prompts[1]
+        # And it must NOT contain any task-specific knowledge.
+        assert "fcdc9fd58f59" not in runtime.prompts[1]
+        assert "PracticeQuiz" not in runtime.prompts[1]
+
     async def test_with_runtime_and_diff(self):
         issues_json = '[{"severity":"medium","file":"a.py","line":5,"message":"Magic number","suggestion":"Use constant"}]'
         state = {
@@ -802,6 +859,58 @@ class TestGenerateReport:
         assert result["comments"][0]["line"] == 11
         assert result["comments"][0]["line_source"] == "diff_anchor"
         assert result["severity_levels"]["high"] == 1
+
+    async def test_generate_report_uses_full_anchor_diff_when_review_diff_is_truncated(self):
+        truncated_diff = "\n".join(
+            [
+                "diff --git a/package-lock.json b/package-lock.json",
+                "--- a/package-lock.json",
+                "+++ b/package-lock.json",
+                "@@ -0,0 +1,3 @@",
+                "+{}",
+                "... [DIFF TRUNCATED - exceeds 100KB] ...",
+            ]
+        )
+        full_anchor_diff = "\n".join(
+            [
+                truncated_diff,
+                "diff --git a/src/pages/Quiz.jsx b/src/pages/Quiz.jsx",
+                "--- /dev/null",
+                "+++ b/src/pages/Quiz.jsx",
+                "@@ -0,0 +10,3 @@",
+                "+export function Quiz() {",
+                "+  return null",
+                "+}",
+            ]
+        )
+
+        result = await generate_report(
+            {
+                "review_round": 1,
+                "pr_diff": truncated_diff,
+                "review_anchor_diff": full_anchor_diff,
+                "quality_issues": [
+                    {
+                        "severity": "high",
+                        "blocking": True,
+                        "file": "src/pages/Quiz.jsx",
+                        "line": None,
+                        "message": "Quiz has no interactive state.",
+                    }
+                ],
+                "security_issues": [],
+                "test_issues": [],
+                "requirement_gaps": [],
+                "ui_issues": [],
+                "review_input_issues": [],
+                "checked_artifacts": [],
+            }
+        )
+
+        assert result["verdict"] == "rejected"
+        assert result["comments"][0]["file"] == "src/pages/Quiz.jsx"
+        assert result["comments"][0]["line"] == 10
+        assert result["comments"][0]["line_source"] == "diff_anchor"
 
     async def test_high_issue_rejected(self):
         state = {

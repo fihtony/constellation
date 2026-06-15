@@ -23,6 +23,9 @@ from agents.web_dev.nodes import (
     _call_boundary_tool,
     _safe_json,
     _detect_fragile_icon_font_usage,
+    _is_implementation_ground_truth_present,
+    _self_assessment_claims_conflict_with_ground_truth,
+    _try_ground_truth_re_prompt,
     _rendered_page_has_content,
 )
 
@@ -436,6 +439,679 @@ class TestScreenshotRenderChecks:
         assert result["assess_cycles"] == 1
         assert result["route"] == "pass"
         assert "previous self-assessment response was invalid" in runtime.prompts[1]
+
+    async def test_self_assess_invalid_schema_does_not_route_to_fix_gaps(self, tmp_path, monkeypatch):
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        monkeypatch.setenv("WEB_DEV_SELF_ASSESS_SCHEMA_ATTEMPTS", "2")
+
+        class _MockRuntime:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, prompt, **kw):
+                self.calls += 1
+                return {"raw_response": json.dumps({"summary": "No structured verdict."})}
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/App.jsx"],
+            "implementation_summary": "Implemented the page.",
+            "test_results": {"passed": 4, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        assert runtime.calls == 2
+        assert result["route"] == "need_user_input"
+        assert result["self_assessment"]["failure_type"] == "schema"
+        assert result["self_assessment"]["verdict"] == "error"
+        assert "Self-assessment output invalid" in result["self_assessment"]["summary"]
+
+    async def test_self_assess_agentic_file_fallback_succeeds(self, tmp_path, monkeypatch):
+        """Text-mode returns junk for every attempt, but the agentic fallback
+        writes a valid JSON file and the node recovers.
+
+        This is the core methodology fix: when any agentic CLI backend
+        (copilot-cli, claude-code, codex-cli) keeps returning unparseable
+        text, the node delegates to ``run_agentic`` with cwd=workspace so
+        the LLM can write the structured JSON to disk directly.
+        """
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        monkeypatch.setenv("WEB_DEV_SELF_ASSESS_SCHEMA_ATTEMPTS", "2")
+
+        from framework.runtime.adapter import AgenticResult
+
+        class _MockRuntime:
+            def __init__(self) -> None:
+                self.run_calls = 0
+                self.run_agentic_calls = 0
+                self.run_agentic_kwargs: dict = {}
+
+            def run(self, prompt, **kw):
+                self.run_calls += 1
+                # Always return unparseable text — no JSON, no score/verdict.
+                return {"raw_response": "<think>The model never emits valid JSON here.</think>"}
+
+            def run_agentic(self, task, **kw):
+                self.run_agentic_calls += 1
+                self.run_agentic_kwargs = kw
+                # Write a valid self-assessment JSON to the path mentioned in
+                # the task prompt — that path is deterministic.
+                import re as _re
+                match = _re.search(r"Target file:\s*(\S+)", task)
+                assert match, "Fallback task prompt must include 'Target file: <path>'"
+                target = match.group(1)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                payload = {
+                    "score": 0.94,
+                    "verdict": "pass",
+                    "criteria_checks": [{"criterion": "X", "status": "pass", "notes": ""}],
+                    "component_checks": [],
+                    "self_review_issues": [],
+                    "gaps": [],
+                    "summary": "All good.",
+                }
+                with open(target, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh)
+                return AgenticResult(success=True, summary=target, backend_used="mock")
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/App.jsx"],
+            "implementation_summary": "Implemented.",
+            "test_results": {"passed": 1, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        # Text path was attempted (2 attempts) and then the fallback ran once.
+        assert runtime.run_calls == 2
+        assert runtime.run_agentic_calls == 1
+        # The fallback must have been invoked with a cwd (every backend needs it).
+        assert runtime.run_agentic_kwargs.get("cwd")
+        # The validated payload from the file is what we report.
+        assert result["self_assessment"]["score"] == 0.94
+        assert result["self_assessment"]["verdict"] == "pass"
+        assert result["route"] == "pass"
+        # The file the fallback wrote is persisted under the workspace.
+        assert (tmp_path / "web-dev" / "self-assessment-llm-1.json").exists()
+
+    async def test_self_assess_agentic_file_fallback_invalid_escalates(self, tmp_path, monkeypatch):
+        """Fallback path writes a file but its content still lacks score/verdict.
+
+        The node must escalate exactly as if no fallback had been attempted —
+        verdict='error', failure_type='schema', route='need_user_input'.
+        """
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        monkeypatch.setenv("WEB_DEV_SELF_ASSESS_SCHEMA_ATTEMPTS", "1")
+
+        from framework.runtime.adapter import AgenticResult
+
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                return {"raw_response": "not json at all"}
+
+            def run_agentic(self, task, **kw):
+                import re as _re
+                match = _re.search(r"Target file:\s*(\S+)", task)
+                target = match.group(1) if match else ""
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                # File is written but contains a dict missing the required keys.
+                with open(target, "w", encoding="utf-8") as fh:
+                    json.dump({"summary": "I forgot the score and verdict."}, fh)
+                return AgenticResult(success=True, summary="done", backend_used="mock")
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/App.jsx"],
+            "implementation_summary": "Implemented.",
+            "test_results": {"passed": 1, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        assert result["route"] == "need_user_input"
+        assert result["self_assessment"]["verdict"] == "error"
+        assert result["self_assessment"]["failure_type"] == "schema"
+        # The escalation gap should mention both text-mode AND the fallback,
+        # so the operator can see both code paths were exhausted.
+        gap0 = result["self_assessment"]["gaps"][0]
+        assert "agentic-file fallback" in gap0
+
+    async def test_self_assess_agentic_file_fallback_passes_with_non_blocking_issues(
+        self, tmp_path, monkeypatch
+    ):
+        """Advisory self-review issues must not turn a passing run into a fail.
+
+        The text-mode path keeps producing unparseable output (parser brittleness
+        we cannot fix in user code), but the agentic-file fallback succeeds and
+        reports a single non-blocking issue. The validator must accept this
+        because the model explicitly marked the issue as ``blocking: false``.
+        """
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        monkeypatch.setenv("WEB_DEV_SELF_ASSESS_SCHEMA_ATTEMPTS", "1")
+
+        from framework.runtime.adapter import AgenticResult
+
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                # Text mode never produces parseable output for this case.
+                return {"raw_response": "think block only, no JSON"}
+
+            def run_agentic(self, task, **kw):
+                import re as _re
+                match = _re.search(r"Target file:\s*(\S+)", task)
+                target = match.group(1) if match else ""
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                payload = {
+                    "score": 0.95,
+                    "verdict": "pass",
+                    "criteria_checks": [{"criterion": "X", "status": "pass", "notes": ""}],
+                    "component_checks": [],
+                    "self_review_issues": [
+                        {
+                            "severity": "low",
+                            "message": "Cosmetic polish: tweak footer spacing.",
+                            "blocking": False,
+                        }
+                    ],
+                    "gaps": [],
+                    "summary": "Implementation is functionally complete.",
+                }
+                with open(target, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh)
+                return AgenticResult(success=True, summary=target, backend_used="mock")
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/App.jsx"],
+            "implementation_summary": "Implemented.",
+            "test_results": {"passed": 1, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        # The fallback was used, the validator accepted the non-blocking
+        # advisory issue, and the node routes to pass.
+        assert result["route"] == "pass"
+        assert result["self_assessment"]["verdict"] == "pass"
+        assert result["self_assessment"]["score"] == 0.95
+        # failure_type is only set when the schema failed; a successful pass
+        # must NOT have it.
+        assert result["self_assessment"].get("failure_type") != "schema"
+
+    async def test_self_assess_error_message_uses_fallback_feedback_when_fallback_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """When both text-mode and the agentic-file fallback fail, the user
+        error message must reflect the *fallback* failure, not the stale
+        text-mode feedback from earlier attempts.
+        """
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        monkeypatch.setenv("WEB_DEV_SELF_ASSESS_SCHEMA_ATTEMPTS", "1")
+
+        from framework.runtime.adapter import AgenticResult
+
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                # Text mode always claims it is missing required fields.
+                return {"raw_response": "nope, just prose, no json"}
+
+            def run_agentic(self, task, **kw):
+                import re as _re
+                match = _re.search(r"Target file:\s*(\S+)", task)
+                target = match.group(1) if match else ""
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                # The agent writes valid JSON but it trips a different
+                # consistency rule than the text-mode one did.
+                payload = {
+                    "score": 0.95,
+                    "verdict": "pass",
+                    "criteria_checks": [],
+                    "component_checks": [],
+                    "self_review_issues": [
+                        {
+                            "severity": "high",
+                            "message": "Blocking issue the model forgot to label.",
+                            "blocking": True,
+                        }
+                    ],
+                    "gaps": [],
+                    "summary": "Failed consistency check.",
+                }
+                with open(target, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh)
+                return AgenticResult(success=True, summary=target, backend_used="mock")
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/App.jsx"],
+            "implementation_summary": "Implemented.",
+            "test_results": {"passed": 1, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        # Both paths failed. The user-facing error must reference the
+        # *fallback* feedback (the most recent, the most relevant one), not
+        # the stale text-mode "missing required fields" message.
+        assert result["route"] == "need_user_input"
+        assert result["self_assessment"]["failure_type"] == "schema"
+        gap0 = result["self_assessment"]["gaps"][0]
+        schema_feedback = result["self_assessment"]["schema_feedback"]
+        assert "blocking issue" in gap0, gap0
+        assert "blocking issue" in schema_feedback, schema_feedback
+        # Sanity: it must not still report the older "missing required fields"
+        # feedback which was the text-mode parser failure.
+        assert "missing required fields" not in gap0, gap0
+
+    async def test_self_assess_agentic_fallback_disabled_by_env(self, tmp_path, monkeypatch):
+        """``WEB_DEV_SELF_ASSESS_AGENTIC_FALLBACK=0`` opts out of the fallback.
+
+        Operators that want the legacy "text-only" behaviour for debugging
+        must still be able to disable the file path.
+        """
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        monkeypatch.setenv("WEB_DEV_SELF_ASSESS_SCHEMA_ATTEMPTS", "1")
+        monkeypatch.setenv("WEB_DEV_SELF_ASSESS_AGENTIC_FALLBACK", "0")
+
+        class _MockRuntime:
+            def __init__(self) -> None:
+                self.run_agentic_calls = 0
+
+            def run(self, prompt, **kw):
+                return {"raw_response": "not json"}
+
+            def run_agentic(self, task, **kw):
+                self.run_agentic_calls += 1
+                raise AssertionError("run_agentic must not be called when fallback is disabled")
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/App.jsx"],
+            "implementation_summary": "Implemented.",
+            "test_results": {"passed": 1, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        assert runtime.run_agentic_calls == 0
+        assert result["route"] == "need_user_input"
+        assert result["self_assessment"]["failure_type"] == "schema"
+
+    async def test_self_assess_recovers_from_max_cycles_hallucination(
+        self, tmp_path, monkeypatch
+    ):
+        """The model hallucinated that the implementation is missing on the
+        final cycle, but the build and tests pass and the actual files exist.
+        The ground-truth re-prompt must catch the contradiction and recover.
+        """
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        # Create a non-trivial file that the model might claim is missing.
+        impl_file = repo_path / "src" / "pages" / "FeaturePage.jsx"
+        impl_file.parent.mkdir(parents=True, exist_ok=True)
+        impl_file.write_text(
+            "export default function FeaturePage() { /* real content */ }\n"
+            * 50,
+            encoding="utf-8",
+        )
+        # Force the loop to run only one attempt so we hit the
+        # max_cycles-with-verdict=fail path on the first try.
+        monkeypatch.setenv("WEB_DEV_SELF_ASSESS_SCHEMA_ATTEMPTS", "1")
+
+        class _MockRuntime:
+            def __init__(self) -> None:
+                self.run_calls: list[str] = []
+
+            def run(self, prompt, **kw):
+                self.run_calls.append(prompt)
+                if len(self.run_calls) == 1:
+                    # First call: the model hallucinates that the page is
+                    # missing. The file name it cites (FeaturePage.jsx) is
+                    # the actual file on disk, so the contradiction can
+                    # be detected by checking the filesystem.
+                    return {
+                        "raw_response": json.dumps(
+                            {
+                                "score": 0.55,
+                                "verdict": "fail",
+                                "criteria_checks": [
+                                    {"criterion": "Implement the new feature page",
+                                     "status": "fail",
+                                     "notes": "Page not implemented."},
+                                ],
+                                "component_checks": [
+                                    {"component": "TopNavBar", "status": "missing",
+                                     "notes": "Navigation bar not present."},
+                                ],
+                                "self_review_issues": [
+                                    {
+                                        "severity": "critical",
+                                        "file": "src/pages/FeaturePage.jsx",
+                                        "message": "FeaturePage.jsx does not exist; no component was created.",
+                                        "blocking": True,
+                                    },
+                                ],
+                                "gaps": [
+                                    "No FeaturePage.jsx component file created",
+                                ],
+                                "summary": "Page not implemented.",
+                            }
+                        )
+                    }
+                # Second call: the re-prompt with ground truth. The model
+                # reads the file, realises it exists, and re-assesses as pass.
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 0.95,
+                            "verdict": "pass",
+                            "criteria_checks": [
+                                {"criterion": "Implement the new feature page",
+                                 "status": "pass",
+                                 "notes": "Page implemented and tested."},
+                            ],
+                            "component_checks": [
+                                {"component": "TopNavBar", "status": "present",
+                                 "notes": "OK."},
+                            ],
+                            "self_review_issues": [],
+                            "gaps": [],
+                            "summary": "Implementation complete.",
+                        }
+                    )
+                }
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/pages/FeaturePage.jsx", "src/App.jsx"],
+            "implementation_summary": "Implemented the new feature page.",
+            "test_results": {
+                "passed": 9,
+                "failed": 0,
+                "build_ok": True,
+                "test_ok": True,
+            },
+            "assess_cycles": 2,  # forces the max-cycles-with-verdict=fail path
+        }
+
+        result = await self_assess(state)
+
+        # The ground-truth re-prompt should have fired and recovered the
+        # assessment. The final route must be 'pass', not a RuntimeError.
+        assert result["route"] == "pass", result
+        assert result["self_assessment"]["verdict"] == "pass"
+        assert result["self_assessment"]["score"] == 0.95
+        assert len(runtime.run_calls) == 2
+        # The second prompt must surface the ground-truth context so the
+        # model is forced to re-evaluate.
+        second_prompt = runtime.run_calls[1]
+        assert "GROUND TRUTH" in second_prompt
+        assert "9 passed" in second_prompt
+        assert "FeaturePage.jsx" in second_prompt  # the real file is named
+
+    async def test_self_assess_max_cycles_still_raises_when_ground_truth_missing(
+        self, tmp_path, monkeypatch
+    ):
+        """When the implementation is *actually* missing (tests/build broken,
+        no files changed) we must still raise — the ground-truth re-prompt is
+        for catching hallucinations, not for papering over real failures.
+        """
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        monkeypatch.setenv("WEB_DEV_SELF_ASSESS_SCHEMA_ATTEMPTS", "1")
+
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 0.0,
+                            "verdict": "fail",
+                            "criteria_checks": [],
+                            "component_checks": [],
+                            "self_review_issues": [
+                                {
+                                    "severity": "critical",
+                                    "file": "src/missing.py",
+                                    "message": "missing.py is missing; not implemented.",
+                                    "blocking": True,
+                                }
+                            ],
+                            "gaps": ["src/missing.py is missing"],
+                            "summary": "Implementation is genuinely broken.",
+                        }
+                    )
+                }
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": [],
+            "implementation_summary": "Could not implement.",
+            "test_results": {
+                "passed": 0,
+                "failed": 4,
+                "build_ok": False,
+                "test_ok": False,
+            },
+            "assess_cycles": 2,  # forces the max-cycles-with-verdict=fail path
+        }
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await self_assess(state)
+        assert "self_assess failed" in str(excinfo.value)
+
+    async def test_is_implementation_ground_truth_present(self):
+        assert _is_implementation_ground_truth_present({
+            "test_results": {"passed": 5, "failed": 0, "build_ok": True, "test_ok": True},
+            "changes_made": ["a.py", "b.py"],
+        }) is True
+        # No tests passed → not present.
+        assert _is_implementation_ground_truth_present({
+            "test_results": {"passed": 0, "failed": 1, "build_ok": True, "test_ok": True},
+            "changes_made": ["a.py"],
+        }) is False
+        # Build failed → not present.
+        assert _is_implementation_ground_truth_present({
+            "test_results": {"passed": 5, "failed": 0, "build_ok": False, "test_ok": True},
+            "changes_made": ["a.py"],
+        }) is False
+        # No changes_made → not present.
+        assert _is_implementation_ground_truth_present({
+            "test_results": {"passed": 5, "failed": 0, "build_ok": True, "test_ok": True},
+            "changes_made": [],
+        }) is False
+        # Missing keys → not present.
+        assert _is_implementation_ground_truth_present({}) is False
+
+    async def test_self_assessment_claims_conflict_with_ground_truth(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        real_file = repo_path / "src" / "x.jsx"
+        real_file.parent.mkdir(parents=True, exist_ok=True)
+        real_file.write_text("x" * 200, encoding="utf-8")
+
+        # Model claims the file is missing — contradicts reality.
+        conflict, reason = _self_assessment_claims_conflict_with_ground_truth(
+            {"repo_path": str(repo_path)},
+            {
+                "self_review_issues": [
+                    {
+                        "severity": "high",
+                        "file": "src/x.jsx",
+                        "message": "x.jsx does not exist; not implemented.",
+                        "blocking": True,
+                    }
+                ]
+            },
+        )
+        assert conflict is True
+        assert "src/x.jsx" in reason
+
+        # Same data without a contradiction → no conflict.
+        conflict, _ = _self_assessment_claims_conflict_with_ground_truth(
+            {"repo_path": str(repo_path)},
+            {
+                "self_review_issues": [
+                    {
+                        "severity": "high",
+                        "file": "src/x.jsx",
+                        "message": "Variable naming is non-idiomatic.",
+                        "blocking": True,
+                    }
+                ]
+            },
+        )
+        assert conflict is False
+
+        # No file claim → no conflict.
+        conflict, _ = _self_assessment_claims_conflict_with_ground_truth(
+            {"repo_path": str(repo_path)},
+            {
+                "self_review_issues": [
+                    {
+                        "severity": "high",
+                        "message": "Generic implementation note (no file).",
+                        "blocking": True,
+                    }
+                ]
+            },
+        )
+        assert conflict is False
+
+    async def test_try_ground_truth_re_prompt_recovers(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        impl_file = repo_path / "src" / "a.jsx"
+        impl_file.parent.mkdir(parents=True, exist_ok=True)
+        impl_file.write_text("x" * 200, encoding="utf-8")
+
+        class _MockRuntime:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def run(self, prompt, **kw):
+                self.calls += 1
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 0.95,
+                            "verdict": "pass",
+                            "criteria_checks": [],
+                            "component_checks": [],
+                            "self_review_issues": [],
+                            "gaps": [],
+                            "summary": "OK",
+                        }
+                    )
+                }
+
+        recovered, gt_data, reason = _try_ground_truth_re_prompt(
+            state={
+                "repo_path": str(repo_path),
+                "changes_made": ["src/a.jsx"],
+                "test_results": {"passed": 5, "failed": 0, "build_ok": True, "test_ok": True},
+            },
+            data={"verdict": "fail", "score": 0.5, "gaps": [], "self_review_issues": []},
+            runtime=_MockRuntime(),
+            prompt="original prompt",
+            system_prompt="system",
+            acceptance_criteria_count=0,
+            log=MagicMock(),
+        )
+        assert recovered is True
+        assert gt_data["verdict"] == "pass"
+        assert reason == ""
+
+    async def test_try_ground_truth_re_prompt_rejects_still_hallucinated(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        impl_file = repo_path / "src" / "a.jsx"
+        impl_file.parent.mkdir(parents=True, exist_ok=True)
+        impl_file.write_text("x" * 200, encoding="utf-8")
+
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                # Re-prompt still claims the file is missing. The score
+                # and verdict are consistent with the (still-claimed)
+                # blocking issue so the validator passes — but the
+                # ground-truth contradiction must still be caught.
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 0.5,
+                            "verdict": "fail",
+                            "criteria_checks": [],
+                            "component_checks": [],
+                            "self_review_issues": [
+                                {
+                                    "severity": "high",
+                                    "file": "src/a.jsx",
+                                    "message": "a.jsx is missing; not implemented.",
+                                    "blocking": True,
+                                }
+                            ],
+                            "gaps": [],
+                            "summary": "OK",
+                        }
+                    )
+                }
+
+        recovered, gt_data, reason = _try_ground_truth_re_prompt(
+            state={
+                "repo_path": str(repo_path),
+                "changes_made": ["src/a.jsx"],
+                "test_results": {"passed": 5, "failed": 0, "build_ok": True, "test_ok": True},
+            },
+            data={"verdict": "fail", "score": 0.5, "gaps": [], "self_review_issues": []},
+            runtime=_MockRuntime(),
+            prompt="original prompt",
+            system_prompt="system",
+            acceptance_criteria_count=0,
+            log=MagicMock(),
+        )
+        assert recovered is False
+        assert gt_data is None
+        assert "conflict" in reason.lower() or "src/a.jsx" in reason
 
     async def test_self_assess_fails_when_self_review_issues_exist(self, tmp_path):
         repo_path = tmp_path / "repo"

@@ -360,16 +360,27 @@ def validate_self_assessment(
 
     self_review_issues = assessment.get("self_review_issues", [])
     if isinstance(self_review_issues, list) and self_review_issues:
-        verdict = str(assessment.get("verdict", "")).strip().lower()
-        if verdict != "fail" or score >= 0.9:
-            return ValidationResult(
-                passed=False,
-                gate_name="self_assessment",
-                feedback=(
-                    "self_review_issues is non-empty, so verdict must be "
-                    "'fail' and score must be below 0.9."
-                ),
-            )
+        # An issue is "blocking" when the agent explicitly set ``blocking=True``
+        # OR when it left the field unset (legacy behaviour). Only blocking
+        # issues are allowed to force the verdict/score rule; advisory issues
+        # (those with ``blocking=False``) are informational and must not turn
+        # a passing implementation into a fail.
+        blocking_issues = [
+            issue for issue in self_review_issues
+            if isinstance(issue, dict) and issue.get("blocking", True) is not False
+        ]
+        if blocking_issues:
+            verdict = str(assessment.get("verdict", "")).strip().lower()
+            if verdict != "fail" or score >= 0.9:
+                return ValidationResult(
+                    passed=False,
+                    gate_name="self_assessment",
+                    feedback=(
+                        f"self_review_issues contains {len(blocking_issues)} "
+                        f"blocking issue(s), so verdict must be 'fail' and "
+                        f"score must be below 0.9."
+                    ),
+                )
 
     return ValidationResult(passed=True, gate_name="self_assessment")
 

@@ -89,6 +89,22 @@ class TestTeamLeadDefinition:
         for tool_name in team_lead_definition.tools:
             assert engine.check_tool(tool_name), f"development.yaml must allow Team Lead tool: {tool_name}"
 
+    def test_team_lead_profile_allows_pr_review_comment_tools(self):
+        from pathlib import Path
+
+        from framework.permissions import PermissionEngine
+
+        permissions_path = (
+            Path(__file__).resolve().parents[3]
+            / "config"
+            / "permissions"
+            / "team-lead.yaml"
+        )
+        engine = PermissionEngine.from_yaml(str(permissions_path))
+
+        assert engine.check_tool("scm_add_pr_inline_comment")
+        assert engine.check_tool("scm_add_pr_comment")
+
 
 class TestTeamLeadAgent:
     async def test_handle_message_returns_working(self):
@@ -1557,6 +1573,127 @@ class TestDispatchDevAgentValidation:
         assert "src/api/handler.py - Missing input validation on the request payload." in calls[1][1]["comment"]
         assert "Add regression coverage for invalid payloads." in calls[1][1]["comment"]
 
+    async def test_request_revision_prioritizes_blocking_inline_comments_from_alias_fields(self, monkeypatch):
+        from agents.team_lead.nodes import request_revision
+
+        calls = []
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                calls.append((name, args))
+                return json.dumps({"ok": True})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        await request_revision({
+            "_task_id": "task-team-lead",
+            "jira_key": "CSTL-3",
+            "pr_url": "https://github.com/example/repo/pull/12",
+            "pr_number": 12,
+            "repo_url": "https://github.com/example/repo",
+            "review_result": {
+                "summary": "Fix blocking review findings",
+                "all_comments": [
+                    {
+                        "severity": "low",
+                        "message": f"Advisory cleanup {idx}",
+                        "file": f"src/advisory-{idx}.js",
+                        "line": idx + 1,
+                    }
+                    for idx in range(6)
+                ] + [
+                    {
+                        "severity": "high",
+                        "message": "Fix state handling before merge.",
+                        "file": "src/pages/Quiz.jsx",
+                        "line": 42,
+                        "effective_blocking": True,
+                    }
+                ],
+            },
+        })
+
+        inline_calls = [args for name, args in calls if name == "scm_add_pr_inline_comment"]
+        assert inline_calls[0]["file_path"] == "src/pages/Quiz.jsx"
+        assert "Fix state handling before merge." in inline_calls[0]["comment"]
+
+    async def test_request_revision_inline_cap_is_env_configurable(self, monkeypatch):
+        """``TEAM_LEAD_INLINE_COMMENT_CAP`` raises the per-round inline limit.
+
+        The hard-coded ``[:5]`` cap used to hide blocking findings beyond
+        the fifth. The cap is now bounded (1..25) and configurable so
+        operators can surface more inline comments per review round
+        without changing code.
+        """
+        from agents.team_lead.nodes import request_revision
+
+        monkeypatch.setenv("TEAM_LEAD_INLINE_COMMENT_CAP", "8")
+
+        calls = []
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                calls.append((name, args))
+                return json.dumps({"ok": True})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        comments = [
+            {
+                "severity": "high",
+                "message": f"Issue {idx}",
+                "file": f"src/file_{idx}.py",
+                "line": 10 + idx,
+            }
+            for idx in range(10)
+        ]
+        await request_revision({
+            "_task_id": "task-team-lead",
+            "jira_key": "CSTL-9",
+            "pr_url": "https://github.com/example/repo/pull/77",
+            "pr_number": 77,
+            "repo_url": "https://github.com/example/repo",
+            "review_result": {"summary": "Many issues", "comments": comments},
+        })
+
+        inline_calls = [c for c in calls if c[0] == "scm_add_pr_inline_comment"]
+        assert len(inline_calls) == 8
+
+    async def test_request_revision_always_posts_summary_even_without_inline(self, monkeypatch):
+        """The summary comment must post on every rejection so the PR shows
+        the verdict, even when zero inline anchors could be resolved.
+
+        The previous logic only posted the summary when ``summary or
+        residual_comments`` was truthy — an empty review with no comments
+        and no summary would result in a PR with no visible signal at all.
+        Now the rejection banner ('Code review requested changes.') is
+        always posted.
+        """
+        from agents.team_lead.nodes import request_revision
+
+        calls = []
+
+        class StubRegistry:
+            def execute_sync(self, name, args):
+                calls.append((name, args))
+                return json.dumps({"ok": True})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        await request_revision({
+            "_task_id": "task-team-lead",
+            "jira_key": "CSTL-EMPTY",
+            "pr_url": "https://github.com/example/repo/pull/3",
+            "pr_number": 3,
+            "repo_url": "https://github.com/example/repo",
+            # Zero comments, empty summary — still a rejection.
+            "review_result": {"summary": "", "comments": []},
+        })
+
+        summary_calls = [c for c in calls if c[0] == "scm_add_pr_comment"]
+        assert len(summary_calls) == 1
+        assert "Code review requested changes." in summary_calls[0][1]["comment"]
+
     def test_team_lead_inline_comment_tool_dispatches_via_a2a(self, monkeypatch):
         from agents.team_lead.tools import SCMAddPRInlineComment
 
@@ -1601,6 +1738,47 @@ class TestDispatchDevAgentValidation:
             "line": 17,
             "comment": "[HIGH] Fix this.",
             "commitId": "abc123",
+            "taskId": "task-team-lead",
+        }
+
+    def test_team_lead_pr_comment_tool_dispatches_via_a2a(self, monkeypatch):
+        from agents.team_lead.tools import SCMAddPRComment
+
+        captured = {}
+
+        def fake_dispatch_sync(url, capability, message_parts, metadata, timeout=120):
+            captured.update({
+                "url": url,
+                "capability": capability,
+                "message_parts": message_parts,
+                "metadata": metadata,
+                "timeout": timeout,
+            })
+            return {
+                "task": {
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"parts": [{"text": json.dumps({"status": "ok", "comment": {"id": 456}})}]}],
+                }
+            }
+
+        monkeypatch.setattr("agents.team_lead.tools._resolve_agent_url", lambda *args: "http://scm:8020")
+        monkeypatch.setattr("framework.a2a.client.dispatch_sync", fake_dispatch_sync)
+
+        result = SCMAddPRComment().execute_sync(
+            repo_url="https://github.com/example/repo",
+            pr_number=12,
+            comment="Code review requested changes.",
+            task_id="task-team-lead",
+        )
+
+        assert json.loads(result.output) == {"status": "ok", "comment": {"id": 456}}
+        assert captured["url"] == "http://scm:8020"
+        assert captured["capability"] == "scm.pr.comment"
+        assert captured["message_parts"] == [{"text": "Code review requested changes."}]
+        assert captured["metadata"] == {
+            "repoUrl": "https://github.com/example/repo",
+            "prNumber": 12,
+            "comment": "Code review requested changes.",
             "taskId": "task-team-lead",
         }
 
