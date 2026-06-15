@@ -32,3 +32,15 @@ scm: read-write
 filesystem: workspace-only
 agent_launching: false
 allowed_agents: []
+custom:
+  allowed_command_patterns:
+    - "^git (status|diff|log|show|branch|checkout|switch|add|commit|push|fetch|pull|remote|rev-parse|ls-files)(\\s|$).*"
+    - "^(npm|pnpm|yarn) (install|ci|test|run|exec|lint|build|typecheck)(\\s|$).*"
+    - "^npx (vite|vitest|eslint|tsc|playwright)(\\s|$).*"
+    - "^python3? -m pytest(\\s|$).*"
+    - "^pytest(\\s|$).*"
+  denied_command_patterns:
+    - "(^|\\s)(sudo|su)(\\s|$).*"
+    - "(^|\\s)rm\\s+-.*"
+    - "^python3? -c(\\s|$).*"
+    - "(curl|wget).*\\|.*(sh|bash)"

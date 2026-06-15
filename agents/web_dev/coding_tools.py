@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import os
 import re
 import subprocess
@@ -32,6 +33,7 @@ from framework.tools.base import BaseTool, ToolResult
 # Max bytes returned from file reads or command output to keep LLM context small.
 _MAX_READ_BYTES = 32_768   # 32 KB
 _MAX_CMD_OUTPUT = 8_192    # 8 KB
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +270,17 @@ class RunCommandTool(BaseTool):
         timeout = min(int(timeout), 60)
         if not command.strip():
             return ToolResult(error="command is required")
+
+        try:
+            from framework.errors import PermissionDeniedError
+            from framework.tools.registry import get_registry
+
+            engine = getattr(get_registry(), "_permission_engine", None)
+            if engine and hasattr(engine, "require_command"):
+                engine.require_command(command)
+        except PermissionDeniedError as exc:
+            logger.warning("Permission denied for run_command %r: %s", command, exc)
+            return ToolResult(error=str(exc))
 
         import shlex
         try:

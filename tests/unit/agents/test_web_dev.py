@@ -1864,6 +1864,31 @@ class TestWebDevBoundaryTools:
         assert registry.get("scm_upload_pr_image") is not None
         assert registry.get("scm_update_pr") is not None
 
+    def test_run_command_rejects_command_outside_permission_patterns(self, tmp_path):
+        from agents.web_dev.coding_tools import RunCommandTool
+        from framework.permissions import PermissionEngine, PermissionSet
+        from framework.tools.registry import get_registry
+
+        registry = get_registry()
+        registry.set_permission_engine(
+            PermissionEngine(
+                PermissionSet(
+                    allowed_tools=["run_command"],
+                    custom={"allowed_command_patterns": [r"^python -m pytest(\s|$).*"]},
+                )
+            )
+        )
+        try:
+            result = RunCommandTool().execute_sync(
+                command="python -c 'print(1)'",
+                cwd=str(tmp_path),
+            )
+        finally:
+            registry.set_permission_engine(None)
+
+        assert result.error is not None
+        assert "not permitted" in result.error
+
     def test_scm_create_pr_derives_bitbucket_coordinates(self, monkeypatch):
         dispatched = {}
 

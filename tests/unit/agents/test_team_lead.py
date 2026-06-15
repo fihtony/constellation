@@ -73,7 +73,7 @@ class TestTeamLeadDefinition:
         assert team_lead_definition.runtime_capabilities["run_agentic"] is True
         assert team_lead_definition.runtime_capabilities["agentic_tools"] is True
 
-    def test_declared_tools_are_allowed_by_development_profile(self):
+    def test_declared_tools_are_allowed_by_team_lead_profile(self):
         from pathlib import Path
 
         from framework.permissions import PermissionEngine
@@ -82,12 +82,12 @@ class TestTeamLeadDefinition:
             Path(__file__).resolve().parents[3]
             / "config"
             / "permissions"
-            / "development.yaml"
+            / "team-lead.yaml"
         )
         engine = PermissionEngine.from_yaml(str(permissions_path))
 
         for tool_name in team_lead_definition.tools:
-            assert engine.check_tool(tool_name), f"development.yaml must allow Team Lead tool: {tool_name}"
+            assert engine.check_tool(tool_name), f"team-lead.yaml must allow Team Lead tool: {tool_name}"
 
     def test_team_lead_profile_allows_pr_review_comment_tools(self):
         from pathlib import Path
