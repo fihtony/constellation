@@ -125,6 +125,87 @@ def test_codex_run_agentic_uses_managed_tool_loop_when_constellation_tools_reque
     assert result.tool_calls == [{"tool": "echo", "arguments": {"text": "hi"}, "turn": 1}]
 
 
+def test_managed_agentic_loop_repairs_plain_text_response_before_success(monkeypatch) -> None:
+    from framework.runtime.copilot_cli import CopilotCLIAdapter
+
+    responses = [
+        {
+            "raw_response": (
+                "<think>I should inspect the repository first.</think>\n\n"
+                "I will start by listing files."
+            )
+        },
+        {
+            "raw_response": (
+                '{"action": "tool", "tool": "write_file", '
+                '"arguments": {"path": "app.py", "content": "print(1)"}}'
+            )
+        },
+        {"raw_response": '{"action": "final", "summary": "created app.py"}'},
+    ]
+    prompts: list[str] = []
+
+    def fake_single_shot(self, prompt, **kwargs):
+        prompts.append(prompt)
+        return responses.pop(0)
+
+    class FakeRegistry:
+        def list_schemas(self, tool_names):
+            return [{"function": {"name": name, "parameters": {"type": "object"}}} for name in tool_names]
+
+        def execute_sync(self, name, arguments):
+            assert name == "write_file"
+            return '{"written": true, "path": "app.py"}'
+
+    monkeypatch.setattr(CopilotCLIAdapter, "run", fake_single_shot)
+    monkeypatch.setattr("framework.tools.registry.get_registry", lambda: FakeRegistry())
+
+    result = CopilotCLIAdapter().run_agentic(
+        "Create the project files.",
+        tools=["write_file"],
+        allowed_tools=["write_file"],
+        max_turns=3,
+    )
+
+    assert result.success is True
+    assert result.summary == "created app.py"
+    assert result.tool_calls == [
+        {
+            "tool": "write_file",
+            "arguments": {"path": "app.py", "content": "print(1)"},
+            "turn": 2,
+        }
+    ]
+    assert "Invalid response format" in prompts[1]
+
+
+def test_managed_agentic_loop_fails_when_backend_never_returns_protocol_json(monkeypatch) -> None:
+    from framework.runtime.codex_cli import CodexCLIAdapter
+
+    def fake_single_shot(self, prompt, **kwargs):
+        return {"raw_response": "I am done without using the required JSON protocol."}
+
+    class FakeRegistry:
+        def list_schemas(self, tool_names):
+            return [{"function": {"name": name, "parameters": {"type": "object"}}} for name in tool_names]
+
+    monkeypatch.setattr(CodexCLIAdapter, "run", fake_single_shot)
+    monkeypatch.setattr("framework.tools.registry.get_registry", lambda: FakeRegistry())
+
+    result = CodexCLIAdapter().run_agentic(
+        "Create the project files.",
+        tools=["write_file"],
+        allowed_tools=["write_file"],
+        max_turns=2,
+    )
+
+    assert result.success is False
+    assert result.backend_used == "codex-cli"
+    assert result.turns_used == 2
+    assert "did not return valid managed-loop JSON" in result.summary
+    assert result.tool_calls == []
+
+
 def test_codex_run_agentic_fails_closed_when_mcp_servers_requested(monkeypatch) -> None:
     from framework.runtime.codex_cli import CodexCLIAdapter
     import framework.runtime.codex_cli as codex_cli

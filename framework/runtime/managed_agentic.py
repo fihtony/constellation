@@ -42,6 +42,13 @@ def _response_text(result: dict[str, Any]) -> str:
     return str(result.get("raw_response") or result.get("summary") or "")
 
 
+def _short_text(text: str, limit: int = 500) -> str:
+    normalized = str(text or "").strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit] + "...(truncated)"
+
+
 def _managed_prompt(
     *,
     task: str,
@@ -113,16 +120,18 @@ def run_managed_agentic_loop(
         if plugin_manager:
             plugin_manager.fire_sync("after_llm_response", last_text, ctx={})
 
-        parsed = extract_json_object(last_text)
+        parsed = extract_json_object(last_text, required_keys={"action"})
         if not isinstance(parsed, dict):
-            return AgenticResult(
-                success=True,
-                summary=last_text.strip() or "Done.",
-                tool_calls=tool_calls,
-                turns_used=turn,
-                backend_used=backend,
-                raw_output=last_text,
-            )
+            transcript.append({"role": "assistant", "content": _short_text(last_text)})
+            transcript.append({
+                "role": "system",
+                "content": (
+                    "Invalid response format. Return exactly one JSON object with "
+                    "action='tool' or action='final'. Do not return prose, markdown, "
+                    "or hidden reasoning."
+                ),
+            })
+            continue
 
         action = str(parsed.get("action") or "").strip().lower()
         if action == "final":
@@ -179,7 +188,10 @@ def run_managed_agentic_loop(
 
     return AgenticResult(
         success=False,
-        summary=f"{backend} managed agentic loop ended after {max_turns} turns.",
+        summary=(
+            f"{backend} managed agentic loop did not return valid managed-loop JSON "
+            f"after {max_turns} turns. Last response: {_short_text(last_text)}"
+        ),
         tool_calls=tool_calls,
         turns_used=max_turns,
         backend_used=backend,
