@@ -12,6 +12,7 @@ import subprocess
 from shutil import which
 
 from framework.runtime.adapter import AgenticCapabilities, AgenticResult, AgentRuntimeAdapter
+from framework.runtime.cli_prompt import cli_prompt_argument
 from framework.runtime.connect_agent.transport import run_single_shot
 
 _SINGLE_SHOT_SYSTEM = (
@@ -100,17 +101,17 @@ class CodexCLIAdapter(AgentRuntimeAdapter):
         if system_prompt:
             full_prompt = f"{system_prompt}\n\n{task}"
 
-        cmd = [cli, "--approval-mode", "full-auto", "-q", full_prompt]
-
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=cwd,
-                timeout=timeout,
-                env={**os.environ},
-            )
+            with cli_prompt_argument(full_prompt, backend="codex-cli") as prompt_arg:
+                cmd = [cli, "--approval-mode", "full-auto", "-q", prompt_arg]
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    cwd=cwd,
+                    timeout=timeout,
+                    env={**os.environ},
+                )
             stdout = proc.stdout.strip()
             stderr = proc.stderr.strip()
 

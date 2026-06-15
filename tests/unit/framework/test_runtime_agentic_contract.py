@@ -84,6 +84,31 @@ def test_codex_run_agentic_fails_closed_when_mcp_servers_requested(monkeypatch) 
     assert "does not support MCP servers" in result.summary
 
 
+def test_codex_run_agentic_spools_large_prompt_to_file(monkeypatch, tmp_path) -> None:
+    from framework.runtime.codex_cli import CodexCLIAdapter
+    import framework.runtime.codex_cli as codex_cli
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        prompt_arg = cmd[cmd.index("-q") + 1]
+        assert "large body" not in prompt_arg
+        marker = "Full task prompt file:"
+        prompt_path = prompt_arg.split(marker, 1)[1].splitlines()[0].strip()
+        captured["prompt_file_text"] = open(prompt_path, encoding="utf-8").read()
+        return SimpleNamespace(returncode=0, stdout="completed", stderr="")
+
+    monkeypatch.setenv("CONSTELLATION_CLI_ARG_PROMPT_LIMIT", "80")
+    monkeypatch.setattr(codex_cli, "_find_codex_cli", lambda: "codex")
+    monkeypatch.setattr(codex_cli.subprocess, "run", fake_run)
+
+    result = CodexCLIAdapter().run_agentic("large body " * 100, cwd=str(tmp_path))
+
+    assert result.success is True
+    assert "large body" in captured["prompt_file_text"]
+
+
 def test_connect_run_agentic_filters_tools_by_allowed_tools(monkeypatch) -> None:
     from framework.runtime.connect_agent.adapter import ConnectAgentAdapter
     import framework.runtime.connect_agent.adapter as connect_adapter

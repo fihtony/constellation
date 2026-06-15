@@ -197,6 +197,16 @@ def _tail_text(text: str, limit: int = 600) -> str:
     return normalized[-limit:]
 
 
+def _runtime_backend_label(runtime: Any, result: Any) -> str:
+    backend = str(getattr(result, "backend_used", "") or "").strip()
+    if backend:
+        return backend
+    backend = str(getattr(runtime, "backend", "") or "").strip()
+    if backend:
+        return backend
+    return runtime.__class__.__name__ if runtime is not None else "runtime"
+
+
 def _redact_personal_value(value: str) -> str:
     return "redacted" if str(value or "").strip() else ""
 
@@ -1102,8 +1112,8 @@ async def implement_changes(state: dict) -> dict:
     except Exception:
         pass
 
-    # Use Claude Code native tools (Bash, Read, Write, Glob, Grep) — no constellation
-    # MCP bridge needed.  With cwd=repo_path, all relative paths resolve correctly.
+    # Use the configured agentic coding CLI's native filesystem/shell tools.
+    # With cwd=repo_path, all relative paths resolve correctly.
     repo_path = state.get("repo_path", "")
     branch_name = state.get("branch_name", "")
     changed_before = set(_git_branch_changed_files(repo_path)) | set(_git_worktree_changed_files(repo_path))
@@ -1114,7 +1124,7 @@ async def implement_changes(state: dict) -> dict:
         jira_local_folder=state.get("jira_local_folder", ""),
         design_local_folder=state.get("design_local_folder", ""),
     )
-    print(f"[{_AGENT_ID}] implement_changes: repo_path={state.get('repo_path', '')!r} (native tools)")
+    print(f"[{_AGENT_ID}] implement_changes: repo_path={state.get('repo_path', '')!r} (agentic CLI native tools)")
     result = runtime.run_agentic(
         task=prompt,
         system_prompt=IMPLEMENT_SYSTEM,
@@ -1142,9 +1152,9 @@ async def implement_changes(state: dict) -> dict:
     print(f"[{_AGENT_ID}] implement_changes done: success={result.success} turns={result.turns_used} summary={result.summary[:300]!r}")
 
     if not result.success:
-        # Before failing, check if claude committed code despite the error/timeout.
-        # Claude often commits changes then continues with build/test verification which
-        # may fail or time out — we should not discard committed work in that case.
+        # Before failing, check if the agentic CLI committed code despite the
+        # error/timeout. Some backends commit changes before a later validation
+        # step fails or times out; do not discard committed work in that case.
         _commits_exist = False
         try:
             import subprocess as _sp
@@ -1163,8 +1173,9 @@ async def implement_changes(state: dict) -> dict:
                   f"but commits found on branch — proceeding with partial implementation")
             impl_summary = f"Partial implementation (stopped early). Commits present. Error: {result.summary[:200]}"
         else:
+            backend_label = _runtime_backend_label(runtime, result)
             raise RuntimeError(
-                f"implement_changes failed — claude-code returned error: {result.summary[:500]}"
+                f"implement_changes failed — {backend_label} returned error: {result.summary[:500]}"
             )
     else:
         impl_summary = result.summary

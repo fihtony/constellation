@@ -107,3 +107,28 @@ def test_run_agentic_passes_model_from_agent_model(monkeypatch) -> None:
     assert result.success is True
     assert captured["env"]["COPILOT_MODEL"] == "MiniMax-M2.7"
     assert captured["cmd"][-2:] == ["--model", "MiniMax-M2.7"]
+
+
+def test_run_agentic_spools_large_prompt_to_file(monkeypatch, tmp_path) -> None:
+    from framework.runtime.copilot_cli import CopilotCLIAdapter
+    import framework.runtime.copilot_cli as copilot_cli
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        prompt_arg = cmd[cmd.index("--prompt") + 1]
+        assert "large body" not in prompt_arg
+        marker = "Full task prompt file:"
+        prompt_path = prompt_arg.split(marker, 1)[1].splitlines()[0].strip()
+        captured["prompt_file_text"] = open(prompt_path, encoding="utf-8").read()
+        return SimpleNamespace(returncode=0, stdout="completed", stderr="")
+
+    monkeypatch.setenv("CONSTELLATION_CLI_ARG_PROMPT_LIMIT", "80")
+    monkeypatch.setattr(copilot_cli, "_find_copilot_cli", lambda: "copilot")
+    monkeypatch.setattr(copilot_cli.subprocess, "run", fake_run)
+
+    result = CopilotCLIAdapter().run_agentic("large body " * 100, cwd=str(tmp_path))
+
+    assert result.success is True
+    assert "large body" in captured["prompt_file_text"]

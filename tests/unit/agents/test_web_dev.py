@@ -790,6 +790,35 @@ class TestWebDevNodes:
         assert result["agentic_success"] is True
         assert "Implemented" in result["implementation_summary"]
 
+    async def test_implement_changes_error_names_actual_backend(self, monkeypatch, tmp_path):
+        from framework.runtime.adapter import AgenticResult
+
+        class _MockRuntime:
+            def run_agentic(self, task, **kw):
+                return AgenticResult(
+                    success=False,
+                    summary="copilot-cli error: [Errno 7] Argument list too long: 'copilot'",
+                    backend_used="copilot-cli",
+                )
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        monkeypatch.setattr("agents.web_dev.nodes._git_branch_changed_files", lambda *args, **kwargs: [])
+        monkeypatch.setattr("agents.web_dev.nodes._git_worktree_changed_files", lambda *args, **kwargs: [])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await implement_changes({
+                "_runtime": _MockRuntime(),
+                "user_request": "Implement feature",
+                "implementation_plan": "Create page",
+                "repo_path": str(repo_path),
+                "branch_name": "feature/example",
+            })
+
+        message = str(exc_info.value)
+        assert "copilot-cli returned error" in message
+        assert "claude-code returned error" not in message
+
     async def test_run_tests_pass_no_runtime(self):
         state = {"test_cycles": 0}
         result = await run_tests(state)

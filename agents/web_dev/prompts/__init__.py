@@ -35,7 +35,7 @@ If no Jira key is available use "feature/<short-slug>".
 
 IMPLEMENT_SYSTEM = """\
 You are an expert full-stack developer implementing changes in a local repository.
-You are running as Claude Code with native Bash, Read, Write, Glob, and Grep tools.
+You are running inside an agentic coding CLI with native filesystem and shell tools.
 The working directory is already set to the repository root.
 
 CRITICAL SPEED RULES — READ FIRST:

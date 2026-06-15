@@ -28,6 +28,7 @@ from framework.runtime.adapter import (
     AgenticResult,
     AgentRuntimeAdapter,
 )
+from framework.runtime.cli_prompt import cli_prompt_argument
 from framework.runtime.connect_agent.transport import run_single_shot
 
 _SINGLE_SHOT_SYSTEM = (
@@ -213,40 +214,41 @@ class CopilotCLIAdapter(AgentRuntimeAdapter):
         if system_prompt:
             full_prompt = f"{system_prompt}\n\n{task}"
 
-        # Build the command. ``cli`` is always the standalone
-        # ``copilot`` binary at this point (the ``gh`` fallback was
-        # removed — see ``_find_copilot_cli``). The standalone CLI's
-        # bare invocation starts an interactive TUI, even when stdin
-        # is populated. For containerized Constellation work we need
-        # deterministic, non-interactive execution that can complete
-        # without a permission prompt.
-        cmd = [
-            cli,
-            "--prompt",
-            full_prompt,
-            "--silent",
-            "--no-color",
-            "--no-auto-update",
-            "--output-format",
-            "text",
-            "--allow-all-tools",
-            "--allow-all-paths",
-            "--no-ask-user",
-            "--secret-env-vars=COPILOT_PROVIDER_API_KEY,COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN",
-        ]
-        effective_model = env.get("COPILOT_MODEL")
-        if effective_model:
-            cmd.extend(["--model", effective_model])
-
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=cwd,
-                timeout=timeout,
-                env=env,
-            )
+            with cli_prompt_argument(full_prompt, backend="copilot-cli") as prompt_arg:
+                # Build the command. ``cli`` is always the standalone
+                # ``copilot`` binary at this point (the ``gh`` fallback was
+                # removed — see ``_find_copilot_cli``). The standalone CLI's
+                # bare invocation starts an interactive TUI, even when stdin
+                # is populated. For containerized Constellation work we need
+                # deterministic, non-interactive execution that can complete
+                # without a permission prompt.
+                cmd = [
+                    cli,
+                    "--prompt",
+                    prompt_arg,
+                    "--silent",
+                    "--no-color",
+                    "--no-auto-update",
+                    "--output-format",
+                    "text",
+                    "--allow-all-tools",
+                    "--allow-all-paths",
+                    "--no-ask-user",
+                    "--secret-env-vars=COPILOT_PROVIDER_API_KEY,COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN",
+                ]
+                effective_model = env.get("COPILOT_MODEL")
+                if effective_model:
+                    cmd.extend(["--model", effective_model])
+
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    cwd=cwd,
+                    timeout=timeout,
+                    env=env,
+                )
             stdout = proc.stdout.strip()
             stderr = proc.stderr.strip()
 
