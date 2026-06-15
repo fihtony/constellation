@@ -611,6 +611,34 @@ def _resolve_office_resume_reply(
         office_request["output_mode"] = output_mode
         return {"office_request": office_request}
 
+    if kind == "office_organizecustomhint":
+        from framework.office.dimensions import (
+            CUSTOM_DIMENSION,
+            extract_custom_dimension_hint,
+        )
+
+        hint = str(extract_custom_dimension_hint(reply) or reply or "").strip()
+        if not hint:
+            question = (
+                "Office needs a custom grouping hint, e.g. 'student name' "
+                "or 'subject'. Please reply with the entity you want to "
+                "group files by."
+            )
+            return {
+                "error_question": question,
+                "needs_clarification": {
+                    "missing": "organizeCustomHint",
+                    "user_message": question,
+                },
+                "office_request": office_request,
+            }
+        office_request["organize_dimension"] = CUSTOM_DIMENSION
+        office_request.setdefault("organize_metadata", {})
+        office_request["organize_metadata"]["organizeGroupBy"] = CUSTOM_DIMENSION
+        office_request["organize_metadata"]["customDimensionHint"] = hint
+        office_request["customDimensionHint"] = hint
+        return {"office_request": office_request}
+
     if not kind:
         # No active interrupt kind — treat as a no-op; compass will
         # likely re-dispatch with the same arguments. Returning

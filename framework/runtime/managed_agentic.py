@@ -49,6 +49,14 @@ def _short_text(text: str, limit: int = 500) -> str:
     return normalized[:limit] + "...(truncated)"
 
 
+def _tool_call_signature(tool_name: str, arguments: dict[str, Any]) -> tuple[str, str]:
+    try:
+        normalized_args = json.dumps(arguments or {}, sort_keys=True, ensure_ascii=False, default=str)
+    except TypeError:
+        normalized_args = str(arguments or {})
+    return tool_name, normalized_args
+
+
 def _managed_prompt(
     *,
     task: str,
@@ -172,6 +180,12 @@ def run_managed_agentic_loop(
                 raw_output=last_text,
             )
 
+        signature = _tool_call_signature(tool_name, arguments)
+        repeated_identical_call = any(
+            _tool_call_signature(str(call.get("tool") or ""), call.get("arguments") or {}) == signature
+            for call in tool_calls
+        )
+
         if plugin_manager:
             plugin_manager.fire_sync("before_tool_call", tool_name, arguments, ctx={})
         from framework.tools.registry import get_registry
@@ -185,6 +199,16 @@ def run_managed_agentic_loop(
             on_progress(f"Tool: {tool_name}")
         transcript.append({"role": "assistant", "content": parsed})
         transcript.append({"role": "tool", "tool": tool_name, "content": tool_output})
+        if repeated_identical_call:
+            transcript.append({
+                "role": "system",
+                "content": (
+                    f"You already called {tool_name} with the same arguments and "
+                    "received the tool result above. Do not repeat identical tool "
+                    "calls. Use the existing result to make progress, choose a "
+                    "different tool call, or return action='final'."
+                ),
+            })
 
     return AgenticResult(
         success=False,

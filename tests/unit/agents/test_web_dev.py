@@ -304,6 +304,29 @@ class TestScreenshotRenderChecks:
         assert findings["uses_remote_material_font"] is False
         assert "arrow_forward" in findings["icon_tokens"]
 
+    def test_detect_fragile_icon_font_usage_ignores_unused_material_icon_css(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        src_path.mkdir(parents=True)
+        (src_path / "index.css").write_text(
+            ".material-symbols-outlined {\n"
+            "  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (src_path / "ArrowIcon.tsx").write_text(
+            "export default function ArrowIcon() {\n"
+            "  return <svg viewBox=\"0 0 24 24\"><path d=\"M12 4l8 8-8 8\" /></svg>\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        findings = _detect_fragile_icon_font_usage(str(repo_path))
+
+        assert findings["issues"] == []
+        assert findings["uses_material_icon_class"] is False
+        assert findings["icon_tokens"] == []
+
     def test_detect_fragile_icon_font_usage_ignores_plain_words(self, tmp_path):
         repo_path = tmp_path / "repo"
         src_path = repo_path / "src"

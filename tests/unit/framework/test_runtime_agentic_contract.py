@@ -179,6 +179,57 @@ def test_managed_agentic_loop_repairs_plain_text_response_before_success(monkeyp
     assert "Invalid response format" in prompts[1]
 
 
+def test_managed_agentic_loop_warns_on_repeated_identical_tool_call(monkeypatch) -> None:
+    from framework.runtime.copilot_cli import CopilotCLIAdapter
+
+    responses = [
+        {
+            "raw_response": (
+                '{"action": "tool", "tool": "read_file", '
+                '"arguments": {"path": "src/index.css"}}'
+            )
+        },
+        {
+            "raw_response": (
+                '{"action": "tool", "tool": "read_file", '
+                '"arguments": {"path": "src/index.css"}}'
+            )
+        },
+        {"raw_response": '{"action": "final", "summary": "stopped repeating"}'},
+    ]
+    prompts: list[str] = []
+
+    def fake_single_shot(self, prompt, **kwargs):
+        prompts.append(prompt)
+        return responses.pop(0)
+
+    class FakeRegistry:
+        def list_schemas(self, tool_names):
+            return [{"function": {"name": name, "parameters": {"type": "object"}}} for name in tool_names]
+
+        def execute_sync(self, name, arguments):
+            assert name == "read_file"
+            return '{"content": "body {}", "path": "src/index.css"}'
+
+    monkeypatch.setattr(CopilotCLIAdapter, "run", fake_single_shot)
+    monkeypatch.setattr("framework.tools.registry.get_registry", lambda: FakeRegistry())
+
+    result = CopilotCLIAdapter().run_agentic(
+        "Inspect the file once, then finish.",
+        tools=["read_file"],
+        allowed_tools=["read_file"],
+        max_turns=3,
+    )
+
+    assert result.success is True
+    assert result.summary == "stopped repeating"
+    assert result.tool_calls == [
+        {"tool": "read_file", "arguments": {"path": "src/index.css"}, "turn": 1},
+        {"tool": "read_file", "arguments": {"path": "src/index.css"}, "turn": 2},
+    ]
+    assert "already called read_file with the same arguments" in prompts[2]
+
+
 def test_managed_agentic_loop_fails_when_backend_never_returns_protocol_json(monkeypatch) -> None:
     from framework.runtime.codex_cli import CodexCLIAdapter
 

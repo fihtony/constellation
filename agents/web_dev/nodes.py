@@ -427,6 +427,7 @@ def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
         return findings
 
     text_exts = {".html", ".css", ".scss", ".sass", ".less", ".js", ".jsx", ".ts", ".tsx"}
+    markup_exts = {".html", ".js", ".jsx", ".ts", ".tsx"}
     ignored_dirs = {".git", "node_modules", "dist", "build", ".next", "coverage"}
     risky_files: set[str] = set()
     icon_tokens: set[str] = set()
@@ -438,6 +439,7 @@ def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
                 continue
             full_path = os.path.join(root, filename)
             rel_path = os.path.relpath(full_path, repo_path)
+            ext = os.path.splitext(filename)[1].lower()
             try:
                 with open(full_path, encoding="utf-8", errors="ignore") as fh:
                     content = fh.read()
@@ -446,8 +448,12 @@ def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
             lowered = content.lower()
 
             if "material-symbols" in lowered or "material-icons" in lowered:
-                findings["uses_material_icon_class"] = True
-                risky_files.add(rel_path)
+                # A stylesheet may define or leave behind the class selector
+                # without any runtime markup using the icon font. Only markup
+                # usage can render ligature text in screenshots.
+                if ext in markup_exts:
+                    findings["uses_material_icon_class"] = True
+                    risky_files.add(rel_path)
 
             if (
                 "fonts.googleapis.com" in lowered
@@ -457,7 +463,7 @@ def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
                 risky_files.add(rel_path)
 
             for token in _ICON_LIGATURE_TOKENS:
-                if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", lowered):
+                if ext in markup_exts and re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", lowered):
                     icon_tokens.add(token)
                     risky_files.add(rel_path)
 
