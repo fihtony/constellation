@@ -159,6 +159,7 @@ def _build_team_lead_definition() -> AgentDefinition:
         ]),
         permission_profile=cfg.get("permission_profile", ""),
         permissions=cfg.get("permissions", {}),
+        runtime_capabilities=cfg.get("runtime_capabilities", {}),
         config=cfg.get("config", {}),
     )
 

@@ -67,14 +67,33 @@ for arg in "$@"; do
     esac
 done
 
-# Defaults: docker runtime, "run" action when neither build nor run was given.
-[ -z "$runtime" ] && runtime="docker"
+# Defaults: "run" action when neither build nor run was given.
 if [ "$do_build" -eq 0 ] && [ "$do_run" -eq 0 ]; then
     do_run=1
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$script_dir"
+
+read_config_env() {
+    local key="$1"
+    local raw value
+    if [ ! -f config/.env ]; then
+        return 0
+    fi
+    raw="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" config/.env | head -1 || true)"
+    if [ -z "$raw" ]; then
+        return 0
+    fi
+    value="${raw#*=}"
+    printf '%s\n' "$value" \
+        | sed -E "s/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+#.*$//; s/^\"//; s/\"$//; s/^'//; s/'$//"
+}
+
+if [ -z "$runtime" ]; then
+    runtime="$(read_config_env CONTAINER_RUNTIME)"
+fi
+[ -z "$runtime" ] && runtime="docker"
 
 # --------------------------------------------------------------- runtime ---
 # The two compose files.  For docker we use the main file alone;
@@ -92,6 +111,11 @@ case "$runtime" in
         ;;
     rancher)
         compose_args=(-f docker-compose-v2.yml -f docker-compose.v2.rancher.yml)
+        ;;
+    *)
+        echo "Error: unsupported container runtime '$runtime'." >&2
+        echo "Set CONTAINER_RUNTIME=docker|rancher in config/.env or pass docker|rancher explicitly." >&2
+        exit 2
         ;;
 esac
 
@@ -117,7 +141,7 @@ done
 #   2. AGENT_RUNTIME=... in config/.env
 #   3. claude-code (the default in pyproject / framework/config.py)
 if [ -z "${AGENT_RUNTIME:-}" ] && [ -f config/.env ]; then
-    AGENT_RUNTIME="$(grep -E '^AGENT_RUNTIME=' config/.env | head -1 | cut -d= -f2- | tr -d '"' || true)"
+    AGENT_RUNTIME="$(read_config_env AGENT_RUNTIME)"
 fi
 : "${AGENT_RUNTIME:=claude-code}"
 export AGENT_RUNTIME

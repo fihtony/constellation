@@ -18,4 +18,3 @@ LABEL constellation.agent_role="fundamental"
 USER appuser
 
 CMD ["python3", "scripts/run_local.py", "compass", "--port", "8000"]
-

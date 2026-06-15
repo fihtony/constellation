@@ -158,6 +158,7 @@ def _build_web_dev_definition() -> AgentDefinition:
         ]),
         permissions=cfg.get("permissions", {"scm": "read-write", "filesystem": "workspace-only"}),
         permission_profile=cfg.get("permission_profile", "web-dev"),
+        runtime_capabilities=cfg.get("runtime_capabilities", {}),
         config=cfg.get("config", {}),
         launch_spec=cfg.get("launch_spec"),
     )

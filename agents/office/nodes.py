@@ -590,6 +590,25 @@ def _fallback_summary_markdown(path: str, payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+_SUMMARY_RUNTIME_FAILURE_PATTERNS = (
+    "request failed",
+    "endpoint is unreachable",
+    "network error",
+    "timed out",
+    "returned no choices",
+    "connection refused",
+    "temporary failure",
+    "name or service not known",
+)
+
+
+def _summary_runtime_failed(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(pattern in lowered for pattern in _SUMMARY_RUNTIME_FAILURE_PATTERNS)
+
+
 def _summarize_payload_with_runtime(
     runtime,
     *,
@@ -658,6 +677,9 @@ def _summarize_payload_with_runtime(
         disallowed_tools=["*"],
     )
     raw = str(result.get("raw_response") or result.get("summary") or "").strip()
+    warning_text = " ".join(str(item) for item in result.get("warnings") or [])
+    if _summary_runtime_failed(raw) or _summary_runtime_failed(warning_text):
+        raise RuntimeError(raw or warning_text or "summary runtime failed")
     if raw and not _contains_cjk(raw):
         return raw
     return _fallback_summary_markdown(path, payload)
@@ -822,14 +844,25 @@ def _run_bounded_folder_summarize(
 
     for payload in payloads:
         path = str(payload["source_path"])
-        summary_text = _summarize_payload_with_runtime(
-            runtime,
-            path=path,
-            payload=payload,
-            system_prompt=system_prompt,
-            cwd=cwd,
-            plugin_manager=plugin_manager,
-        )
+        try:
+            summary_text = _summarize_payload_with_runtime(
+                runtime,
+                path=path,
+                payload=payload,
+                system_prompt=system_prompt,
+                cwd=cwd,
+                plugin_manager=plugin_manager,
+            )
+        except RuntimeError as exc:
+            return AgenticResult(
+                success=False,
+                summary=(
+                    f"bounded folder summarize failed for "
+                    f"{os.path.basename(path)}: {exc}"
+                ),
+                raw_output=str(exc),
+                backend_used="bounded-folder-summarize",
+            )
         summary_outputs.append(
             {
                 "path": path,
@@ -1803,6 +1836,51 @@ def _canonicalize_summary_output_filenames(
     return repaired
 
 
+def _canonicalize_workspace_root_analysis_outputs(
+    expected_outputs: list[str],
+    artifacts_dir: str,
+) -> list[str]:
+    """Move analysis reports from workspace root into the canonical artifacts dir.
+
+    Local CLI runtimes such as Copilot CLI do not expose Constellation's
+    ``write_workspace`` MCP tool. They can still complete the task with their
+    native file-creation tool, but may place ``<source>.analysis.md`` directly
+    under the office workspace root. The public delivery contract for workspace
+    mode is ``office/artifacts/<source>.analysis.md``, so repair only exact
+    same-name analysis files from the parent workspace directory.
+    """
+    repaired: list[str] = []
+    if not artifacts_dir:
+        return repaired
+
+    real_artifacts = os.path.realpath(os.path.abspath(artifacts_dir))
+    workspace_root = os.path.dirname(real_artifacts)
+    if not workspace_root or workspace_root == real_artifacts:
+        return repaired
+    if not os.path.isdir(workspace_root):
+        return repaired
+
+    for expected_path in expected_outputs:
+        if not expected_path.endswith(".analysis.md"):
+            continue
+        if os.path.exists(expected_path):
+            continue
+        expected_dir = os.path.dirname(os.path.realpath(os.path.abspath(expected_path)))
+        if expected_dir != real_artifacts:
+            continue
+        candidate = os.path.join(workspace_root, os.path.basename(expected_path))
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            os.makedirs(os.path.dirname(expected_path), exist_ok=True)
+            os.replace(candidate, expected_path)
+        except OSError:
+            continue
+        repaired.append(expected_path)
+
+    return repaired
+
+
 def _ensure_combined_summary_exact_filenames(
     validated_paths: list[str],
     output_mode: str,
@@ -2303,6 +2381,11 @@ def execute_office_work(state: dict) -> dict:
             if repaired_plan_path:
                 logger.info("execute_office_work: synthesized missing organize plan at %s", repaired_plan_path)
                 _task_log(state, "info", "synthesized organize plan output", output_path=repaired_plan_path)
+        if capability == "analyze" and output_mode == "workspace":
+            repaired_paths = _canonicalize_workspace_root_analysis_outputs(expected_outputs, artifacts_dir)
+            if repaired_paths:
+                logger.info("execute_office_work: repaired %d workspace-root analysis outputs", len(repaired_paths))
+                _task_log(state, "info", "canonicalized analysis outputs", repaired_files=len(repaired_paths))
         delivery_ok, delivery_errors = _verify_delivery_paths(expected_outputs, output_mode, artifacts_dir)
         if capability == "organize":
             repaired_paths = _repair_missing_organize_outputs(output_mode, artifacts_dir, validated_paths)

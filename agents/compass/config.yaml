@@ -8,6 +8,10 @@ description: "Control plane: task classification, permission check, routing, and
 mode: chat
 execution_mode: persistent
 runtime_env_required: true
+runtime_capabilities:
+  run: true
+  run_agentic: true
+  agentic_tools: true
 
 # Permission model:
 # - Persistent agents apply permission_profile directly at runtime.

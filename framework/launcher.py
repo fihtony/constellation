@@ -333,13 +333,17 @@ class Launcher:
             "CONSTELLATION_TRUSTED_ENV": "1",
         })
 
+        role_label = _enum_value(definition.get("execution_mode"), ON_DEMAND_ROLE_LABEL)
+        if role_label == "per-task":
+            role_label = ON_DEMAND_ROLE_LABEL
+
         payload = {
             "Image": image,
             "Env": [f"{key}={value}" for key, value in sorted(env.items())],
             "Labels": {
                 "constellation.agent_id": agent_id,
                 "constellation.agent_name": str(definition.get("name") or agent_id),
-                "constellation.agent_role": _enum_value(definition.get("execution_mode"), ON_DEMAND_ROLE_LABEL),
+                "constellation.agent_role": role_label,
                 "constellation.task_id": task_id,
             },
             "HostConfig": {

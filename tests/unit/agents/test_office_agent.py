@@ -50,6 +50,9 @@ def test_office_agent_class_exists():
     from agents.office.agent import OfficeAgent, office_definition, office_workflow
 
     assert office_definition.agent_id == "office"
+    assert office_definition.runtime_capabilities["run"] is True
+    assert office_definition.runtime_capabilities["run_agentic"] is True
+    assert office_definition.runtime_capabilities["agentic_tools"] is True
     assert office_workflow.name == "office"
     # Nodes are extracted from edges; edge format is (source, node_func, dest) or (source, node_func)
     # START/END are string sentinels, node_func is edge[1], dest (if callable) is edge[2]

@@ -76,6 +76,11 @@ class TestCodeReviewWorkflowCompile:
         assert code_review_definition.execution_mode == ExecutionMode.PER_TASK
         assert code_review_definition.permissions.get("scm") == "read"
 
+    def test_code_review_declares_single_shot_and_agentic_runtime_capabilities(self):
+        assert code_review_definition.runtime_capabilities["run"] is True
+        assert code_review_definition.runtime_capabilities["run_agentic"] is True
+        assert code_review_definition.runtime_capabilities["agentic_tools"] is True
+
 
 class TestCodeReviewExecutionContract:
 

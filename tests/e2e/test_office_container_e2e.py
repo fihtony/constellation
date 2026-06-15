@@ -62,10 +62,14 @@ def _http_post(url: str, payload: dict, timeout: int = 30) -> dict:
 
 
 def _task_state(task_dict: dict) -> str:
+    if task_dict.get("ui_update", {}).get("task_status"):
+        return task_dict["ui_update"]["task_status"]
     return task_dict.get("task", task_dict).get("status", {}).get("state", "")
 
 
 def _task_id(task_dict: dict) -> str:
+    if task_dict.get("task_id"):
+        return task_dict["task_id"]
     return task_dict.get("task", task_dict).get("id", "")
 
 

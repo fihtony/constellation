@@ -11,7 +11,7 @@ import os
 import subprocess
 from shutil import which
 
-from framework.runtime.adapter import AgenticResult, AgentRuntimeAdapter
+from framework.runtime.adapter import AgenticCapabilities, AgenticResult, AgentRuntimeAdapter
 from framework.runtime.connect_agent.transport import run_single_shot
 
 _SINGLE_SHOT_SYSTEM = (
@@ -74,8 +74,19 @@ class CodexCLIAdapter(AgentRuntimeAdapter):
         timeout: int = 1800,
         on_progress=None,
         continuation: str | None = None,
+        plugin_manager=None,
     ) -> AgenticResult:
         """Run a task via the codex CLI subprocess."""
+        unsupported = self.validate_agentic_request(
+            tools=tools,
+            mcp_servers=mcp_servers,
+            allowed_tools=allowed_tools,
+            cwd=cwd,
+            continuation=continuation,
+        )
+        if unsupported:
+            return unsupported
+
         cli = _find_codex_cli()
         if not cli:
             return AgenticResult(
@@ -134,4 +145,16 @@ class CodexCLIAdapter(AgentRuntimeAdapter):
             )
 
     def supports_mcp(self) -> bool:
-        return False
+        return self.agentic_capabilities().mcp_servers
+
+    def agentic_capabilities(self) -> AgenticCapabilities:
+        return AgenticCapabilities(
+            backend="codex-cli",
+            agentic=True,
+            constellation_tools=False,
+            mcp_servers=False,
+            cwd=True,
+            allowed_tools=False,
+            continuation=False,
+            plugin_hooks=False,
+        )

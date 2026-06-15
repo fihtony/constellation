@@ -24,6 +24,7 @@ from shutil import which
 
 from framework.runtime.adapter import (
     DEFAULT_MODEL,
+    AgenticCapabilities,
     AgenticResult,
     AgentRuntimeAdapter,
 )
@@ -92,16 +93,32 @@ class CopilotCLIAdapter(AgentRuntimeAdapter):
         # LLM in single-shot mode, so the flag is a structural no-op
         # here — but we still accept it so the call site has one
         # contract across every backend.
+        provider_base_url = os.environ.get("COPILOT_PROVIDER_BASE_URL", "").strip()
+        if not provider_base_url:
+            return AgentRuntimeAdapter.build_failure_result(
+                "copilot-cli single-shot requires COPILOT_PROVIDER_BASE_URL.",
+                warning=(
+                    "COPILOT_PROVIDER_BASE_URL is not set; copilot-cli will not "
+                    "fall back to CONNECT_AGENT_URL or OPENAI_BASE_URL."
+                ),
+                backend_used="copilot-cli",
+            )
+        provider_api_key = os.environ.get("COPILOT_PROVIDER_API_KEY", "").strip()
+        effective_model = model
+        if effective_model is None:
+            effective_model = os.environ.get("COPILOT_MODEL", "").strip() or None
         return run_single_shot(
             prompt,
             context=context,
             system_prompt=system_prompt or _SINGLE_SHOT_SYSTEM,
-            model=model,
+            model=effective_model,
             timeout=timeout,
             max_tokens=max_tokens,
             default_system=_SINGLE_SHOT_SYSTEM,
             backend_used="copilot-cli",
             disallowed_tools=disallowed_tools,
+            base_url=provider_base_url,
+            api_key=provider_api_key,
         )
 
     def run_agentic(
@@ -117,12 +134,23 @@ class CopilotCLIAdapter(AgentRuntimeAdapter):
         timeout: int = 1800,
         on_progress=None,
         continuation: str | None = None,
+        plugin_manager=None,
     ) -> AgenticResult:
         """Run a task via the standalone ``copilot`` CLI subprocess.
 
         The CLI manages its own reasoning + tool loop.  We capture stdout
         and parse the final answer from the last non-empty output block.
         """
+        unsupported = self.validate_agentic_request(
+            tools=tools,
+            mcp_servers=mcp_servers,
+            allowed_tools=allowed_tools,
+            cwd=cwd,
+            continuation=continuation,
+        )
+        if unsupported:
+            return unsupported
+
         cli = _find_copilot_cli()
         if not cli:
             return AgenticResult(
@@ -130,12 +158,6 @@ class CopilotCLIAdapter(AgentRuntimeAdapter):
                 summary="copilot-cli: 'copilot' or 'copilot-cli' not found in PATH",
                 backend_used="copilot-cli",
             )
-
-        # Build the command.  ``cli`` is always the standalone
-        # ``copilot`` binary at this point (the ``gh`` fallback was
-        # removed — see ``_find_copilot_cli``).  The CLI accepts the
-        # task on stdin and writes the response on stdout.
-        cmd = [cli]
 
         # Build the subprocess env.  Two responsibilities live here:
         #
@@ -191,10 +213,34 @@ class CopilotCLIAdapter(AgentRuntimeAdapter):
         if system_prompt:
             full_prompt = f"{system_prompt}\n\n{task}"
 
+        # Build the command. ``cli`` is always the standalone
+        # ``copilot`` binary at this point (the ``gh`` fallback was
+        # removed — see ``_find_copilot_cli``). The standalone CLI's
+        # bare invocation starts an interactive TUI, even when stdin
+        # is populated. For containerized Constellation work we need
+        # deterministic, non-interactive execution that can complete
+        # without a permission prompt.
+        cmd = [
+            cli,
+            "--prompt",
+            full_prompt,
+            "--silent",
+            "--no-color",
+            "--no-auto-update",
+            "--output-format",
+            "text",
+            "--allow-all-tools",
+            "--allow-all-paths",
+            "--no-ask-user",
+            "--secret-env-vars=COPILOT_PROVIDER_API_KEY,COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN",
+        ]
+        effective_model = env.get("COPILOT_MODEL")
+        if effective_model:
+            cmd.extend(["--model", effective_model])
+
         try:
             proc = subprocess.run(
                 cmd,
-                input=full_prompt,
                 capture_output=True,
                 text=True,
                 cwd=cwd,
@@ -235,4 +281,16 @@ class CopilotCLIAdapter(AgentRuntimeAdapter):
             )
 
     def supports_mcp(self) -> bool:
-        return True
+        return self.agentic_capabilities().mcp_servers
+
+    def agentic_capabilities(self) -> AgenticCapabilities:
+        return AgenticCapabilities(
+            backend="copilot-cli",
+            agentic=True,
+            constellation_tools=False,
+            mcp_servers=False,
+            cwd=True,
+            allowed_tools=False,
+            continuation=False,
+            plugin_hooks=False,
+        )

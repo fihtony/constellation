@@ -8,11 +8,10 @@ FROM constellation-base:boundary
 COPY agents/ui_design/   /app/agents/ui_design/
 COPY config/permissions/ui-design.yaml  /app/config/permissions/ui-design.yaml
 
-LABEL constellation.agent_id="ui_design"
+LABEL constellation.agent_id="ui-design"
 LABEL constellation.agent_name="UI Design Agent"
 LABEL constellation.agent_role="boundary"
 
 USER appuser
 
-CMD ["python3", "scripts/run_local.py", "ui_design", "--port", "8040"]
-
+CMD ["python3", "scripts/run_local.py", "ui-design", "--port", "8040"]

@@ -107,9 +107,12 @@ def call_chat_completion(
     max_tokens: int = 4096,
     tools: list[dict] | None = None,
     temperature: float = 0,
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> dict:
     """Send a chat-completion request and return the raw response dict."""
-    endpoint = f"{resolve_openai_base_url()}/chat/completions"
+    resolved_base_url = (base_url or resolve_openai_base_url()).strip().rstrip("/")
+    endpoint = f"{resolved_base_url}/chat/completions"
     payload: dict = {
         "model": model,
         "messages": messages,
@@ -122,9 +125,13 @@ def call_chat_completion(
         payload["tool_choice"] = "auto"
 
     headers = {"Content-Type": "application/json; charset=utf-8"}
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    resolved_api_key = (
+        api_key.strip()
+        if api_key is not None
+        else os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+    if resolved_api_key:
+        headers["Authorization"] = f"Bearer {resolved_api_key}"
 
     request = Request(
         endpoint,
@@ -234,6 +241,8 @@ def run_single_shot(
     plugin_manager=None,
     cwd: str | None = None,
     disallowed_tools: list[str] | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> dict:
     """Single-shot prompt → response via chat-completion.
 
@@ -273,6 +282,8 @@ def run_single_shot(
             model=effective_model,
             timeout=timeout,
             max_tokens=max_tokens,
+            base_url=base_url,
+            api_key=api_key,
         )
     except HTTPError as exc:
         body = _read_http_error_body(exc)

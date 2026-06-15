@@ -10,11 +10,10 @@ COPY agents/code_review/   /app/agents/code_review/
 COPY skills/code-review/  /app/skills/code-review/
 COPY config/permissions/code-review.yaml  /app/config/permissions/code-review.yaml
 
-LABEL constellation.agent_id="code_review"
+LABEL constellation.agent_id="code-review"
 LABEL constellation.agent_name="Code Review Agent"
 LABEL constellation.agent_role="per-task"
 
 USER appuser
 
-CMD ["python3", "scripts/run_local.py", "code_review"]
-
+CMD ["python3", "scripts/run_local.py", "code-review"]

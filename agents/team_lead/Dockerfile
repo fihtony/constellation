@@ -11,11 +11,10 @@ COPY config/permissions/team-lead.yaml  /app/config/permissions/team-lead.yaml
 COPY config/permissions/web-dev.yaml  /app/config/permissions/web-dev.yaml
 COPY config/permissions/code-review.yaml  /app/config/permissions/code-review.yaml
 
-LABEL constellation.agent_id="team_lead"
+LABEL constellation.agent_id="team-lead"
 LABEL constellation.agent_name="Team Lead Agent"
 LABEL constellation.agent_role="fundamental"
 
 USER appuser
 
-CMD ["python3", "scripts/run_local.py", "team_lead", "--port", "8030"]
-
+CMD ["python3", "scripts/run_local.py", "team-lead", "--port", "8030"]

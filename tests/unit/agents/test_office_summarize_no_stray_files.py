@@ -413,3 +413,51 @@ def test_bounded_folder_summarize_sweep_noop_in_inplace_directory_mode(tmp_path,
     assert (src / "alpha.txt.summary.md").exists()
     assert (src / "beta.txt.summary.md").exists()
     assert (src / "combined-summary.md").exists()
+
+
+def test_bounded_folder_summarize_fails_when_runtime_returns_error_text(tmp_path, monkeypatch):
+    """A transport/runtime failure message is not a valid document summary.
+
+    The bounded folder summarize flow writes deliverables itself after a
+    per-document ``runtime.run`` call. If that call returns an English error
+    string such as "endpoint is unreachable", file-existence verification alone
+    is not enough; the task must fail generically instead of writing error text
+    into ``*.summary.md`` files and reporting success.
+    """
+    from agents.office import nodes as office_nodes
+
+    def _fake_read(path):
+        return {
+            "source_path": path,
+            "content": f"content of {os.path.basename(path)}",
+            "metadata": {"type": "TXT"},
+        }
+
+    runtime = MagicMock()
+    runtime.run.return_value = {
+        "raw_response": "copilot-cli request failed because the endpoint is unreachable.",
+        "summary": "",
+    }
+    monkeypatch.setattr(office_nodes, "_read_summary_payload", _fake_read)
+
+    src = tmp_path / "source"
+    src.mkdir()
+    first = src / "alpha.txt"
+    second = src / "beta.txt"
+    first.write_text("alpha", encoding="utf-8")
+    second.write_text("beta", encoding="utf-8")
+    artifacts_dir = tmp_path / "office" / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+
+    result = _run_bounded_folder_summarize(
+        {"_plugin_manager": None, "workspace_root": str(artifacts_dir.parent)},
+        runtime=runtime,
+        validated_paths=[str(first), str(second)],
+        output_mode="workspace",
+        artifacts_dir=str(artifacts_dir),
+        system_prompt="sys",
+    )
+
+    assert result.success is False
+    assert "endpoint is unreachable" in result.summary
+    assert not (artifacts_dir / "alpha.txt.summary.md").exists()

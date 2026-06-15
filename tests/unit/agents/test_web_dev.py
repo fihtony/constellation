@@ -78,6 +78,11 @@ class TestWebDevWorkflowCompile:
         assert "jira_update" in web_dev_definition.tools
         assert "scm_list_branches" in web_dev_definition.tools
 
+    def test_web_dev_declares_single_shot_and_agentic_runtime_capabilities(self):
+        assert web_dev_definition.runtime_capabilities["run"] is True
+        assert web_dev_definition.runtime_capabilities["run_agentic"] is True
+        assert web_dev_definition.runtime_capabilities["agentic_tools"] is True
+
 
 class TestWebDevExecutionContract:
 

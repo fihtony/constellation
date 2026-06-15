@@ -72,6 +72,7 @@ def _build_compass_definition() -> AgentDefinition:
         tools=cfg.get("tools", TOOL_NAMES),
         permissions=cfg.get("permissions", {"scm": "none", "filesystem": "workspace-only"}),
         permission_profile=cfg.get("permission_profile", "compass"),
+        runtime_capabilities=cfg.get("runtime_capabilities", {}),
         config=cfg.get("config", {}),
     )
 

@@ -8,6 +8,10 @@ description: "Intelligence layer: analysis, planning, dispatch, code review coor
 mode: task
 execution_mode: persistent
 runtime_env_required: true
+runtime_capabilities:
+  run: true
+  run_agentic: true
+  agentic_tools: true
 
 # Permission model:
 # - permission_profile is authoritative for Team Lead's own runtime permissions.

@@ -65,6 +65,11 @@ class TestCompassDefinition:
     def test_has_tools(self):
         assert len(compass_definition.tools) > 0
 
+    def test_declares_single_shot_and_agentic_runtime_capabilities(self):
+        assert compass_definition.runtime_capabilities["run"] is True
+        assert compass_definition.runtime_capabilities["run_agentic"] is True
+        assert compass_definition.runtime_capabilities["agentic_tools"] is True
+
 
 class TestCompassClassification:
     """Unit tests for the heuristic + LLM classification helper."""

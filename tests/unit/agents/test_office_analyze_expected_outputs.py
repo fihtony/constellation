@@ -18,7 +18,10 @@ from agents.compass.agent import (
     _office_dispatch_failed,
     _summary_indicates_office_failure,
 )
-from agents.office.nodes import _expected_output_paths
+from agents.office.nodes import (
+    _canonicalize_workspace_root_analysis_outputs,
+    _expected_output_paths,
+)
 
 
 def test_expected_output_paths_for_directory_analyze(tmp_path):
@@ -52,6 +55,30 @@ def test_expected_output_paths_for_file_analyze_still_works(tmp_path):
     expected = _expected_output_paths("analyze", [str(source_file)], "workspace", str(artifacts_dir))
 
     assert expected == [str(artifacts_dir / "sales.csv.analysis.md")]
+
+
+def test_canonicalize_workspace_root_analysis_outputs_moves_stray_file(tmp_path):
+    """Copilot CLI may create analysis files in the office workspace root.
+
+    Delivery verification expects canonical deliverables under
+    ``office/artifacts``. The repair must move only the same expected filename
+    from the workspace root into the canonical artifacts directory.
+    """
+    workspace_root = tmp_path / "office"
+    artifacts_dir = workspace_root / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    stray = workspace_root / "sales.csv.analysis.md"
+    stray.write_text("# Data Analysis: sales.csv\n", encoding="utf-8")
+    expected = artifacts_dir / "sales.csv.analysis.md"
+
+    repaired = _canonicalize_workspace_root_analysis_outputs(
+        [str(expected)],
+        str(artifacts_dir),
+    )
+
+    assert repaired == [str(expected)]
+    assert expected.read_text(encoding="utf-8") == "# Data Analysis: sales.csv\n"
+    assert not stray.exists()
 
 
 def test_expected_output_paths_for_missing_file_analyze(tmp_path):

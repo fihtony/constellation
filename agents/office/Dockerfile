@@ -33,4 +33,3 @@ LABEL constellation.agent_role="per-task"
 USER appuser
 
 CMD ["python3", "scripts/run_local.py", "office", "--port", "8060"]
-

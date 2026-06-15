@@ -19,7 +19,12 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from shutil import which
 
-from framework.runtime.adapter import DEFAULT_MODEL, AgenticResult, AgentRuntimeAdapter
+from framework.runtime.adapter import (
+    DEFAULT_MODEL,
+    AgenticCapabilities,
+    AgenticResult,
+    AgentRuntimeAdapter,
+)
 
 _SINGLE_SHOT_SYSTEM = (
     "You are an expert AI agent operating inside the Constellation system. "
@@ -459,6 +464,16 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
         background thread.  The caller-supplied *mcp_servers* (e.g. Jira, SCM)
         are merged into the same MCP config file.
         """
+        unsupported = self.validate_agentic_request(
+            tools=tools,
+            mcp_servers=mcp_servers,
+            allowed_tools=allowed_tools,
+            cwd=cwd,
+            continuation=continuation,
+        )
+        if unsupported:
+            return unsupported
+
         cli = _find_claude_cli()
         if not cli:
             raise RuntimeError(
@@ -594,5 +609,14 @@ class ClaudeCodeAdapter(AgentRuntimeAdapter):
                 except OSError:
                     pass
 
-    def supports_mcp(self) -> bool:
-        return True
+    def agentic_capabilities(self) -> AgenticCapabilities:
+        return AgenticCapabilities(
+            backend="claude-code",
+            agentic=True,
+            constellation_tools=True,
+            mcp_servers=True,
+            cwd=True,
+            allowed_tools=True,
+            continuation=False,
+            plugin_hooks=False,
+        )

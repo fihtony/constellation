@@ -39,6 +39,20 @@ class AgenticResult:
     verifier_summary: str | None = None
 
 
+@dataclass(frozen=True)
+class AgenticCapabilities:
+    """Capabilities a runtime backend actually supports for run_agentic()."""
+
+    backend: str
+    agentic: bool
+    constellation_tools: bool = False
+    mcp_servers: bool = False
+    cwd: bool = False
+    allowed_tools: bool = False
+    continuation: bool = False
+    plugin_hooks: bool = False
+
+
 @dataclass
 class AgenticCheckpoint:
     """Persisted state for resuming an agentic execution."""
@@ -135,14 +149,74 @@ class AgentRuntimeAdapter(ABC):
 
         Default: raises NotImplementedError.
         """
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not support run_agentic(). "
-            "Use connect-agent or claude-code."
+        capabilities = self.agentic_capabilities()
+        return AgenticResult(
+            success=False,
+            summary=f"{capabilities.backend} does not support run_agentic().",
+            backend_used=capabilities.backend,
         )
+
+    def agentic_capabilities(self) -> AgenticCapabilities:
+        """Return the backend's supported run_agentic() feature surface."""
+        return AgenticCapabilities(
+            backend=self.__class__.__name__,
+            agentic=False,
+        )
+
+    def validate_agentic_request(
+        self,
+        *,
+        tools: list[str] | None = None,
+        mcp_servers: dict | None = None,
+        allowed_tools: list[str] | None = None,
+        cwd: str | None = None,
+        continuation: str | None = None,
+    ) -> AgenticResult | None:
+        """Return a structured failure when a request exceeds backend support."""
+        capabilities = self.agentic_capabilities()
+        backend = capabilities.backend
+
+        if not capabilities.agentic:
+            return AgenticResult(
+                success=False,
+                summary=f"{backend} does not support run_agentic().",
+                backend_used=backend,
+            )
+        if tools and not capabilities.constellation_tools:
+            return AgenticResult(
+                success=False,
+                summary=f"{backend} run_agentic does not support Constellation tools.",
+                backend_used=backend,
+            )
+        if mcp_servers and not capabilities.mcp_servers:
+            return AgenticResult(
+                success=False,
+                summary=f"{backend} run_agentic does not support MCP servers.",
+                backend_used=backend,
+            )
+        if allowed_tools and not capabilities.allowed_tools:
+            return AgenticResult(
+                success=False,
+                summary=f"{backend} run_agentic does not support allowed_tools restrictions.",
+                backend_used=backend,
+            )
+        if cwd and not capabilities.cwd:
+            return AgenticResult(
+                success=False,
+                summary=f"{backend} run_agentic does not support cwd.",
+                backend_used=backend,
+            )
+        if continuation and not capabilities.continuation:
+            return AgenticResult(
+                success=False,
+                summary=f"{backend} run_agentic does not support continuation.",
+                backend_used=backend,
+            )
+        return None
 
     def supports_mcp(self) -> bool:
         """Return True if this backend can consume MCP servers natively."""
-        return False
+        return self.agentic_capabilities().mcp_servers
 
     # -- Static helpers (kept from v1) --
 

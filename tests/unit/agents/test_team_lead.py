@@ -68,6 +68,11 @@ class TestTeamLeadDefinition:
     def test_has_tools(self):
         assert len(team_lead_definition.tools) > 0
 
+    def test_declares_single_shot_and_agentic_runtime_capabilities(self):
+        assert team_lead_definition.runtime_capabilities["run"] is True
+        assert team_lead_definition.runtime_capabilities["run_agentic"] is True
+        assert team_lead_definition.runtime_capabilities["agentic_tools"] is True
+
     def test_declared_tools_are_allowed_by_development_profile(self):
         from pathlib import Path
 

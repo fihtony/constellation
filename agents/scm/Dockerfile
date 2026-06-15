@@ -15,4 +15,3 @@ LABEL constellation.agent_role="boundary"
 USER appuser
 
 CMD ["python3", "scripts/run_local.py", "scm", "--port", "8020"]
-
