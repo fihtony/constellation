@@ -225,6 +225,101 @@ class TestWebDevJiraPrivacy:
         assert row["lifecycle_state"] == "done"
         assert result["route"] == "pass"
 
+    async def test_self_assess_uses_cumulative_branch_and_worktree_changes(
+        self, tmp_path
+    ):
+        """Self-assessment evidence must include committed implementation
+        files plus later uncommitted validation/test fixes.
+        """
+        import subprocess
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        def git(*args):
+            return subprocess.run(
+                ["git", *args],
+                cwd=repo_path,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        git("init", "-b", "main")
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "Test User")
+        (repo_path / "README.md").write_text("# Example\n", encoding="utf-8")
+        git("add", "README.md")
+        git("commit", "-m", "initial")
+        git("checkout", "-b", "feature/task")
+
+        app_path = repo_path / "src" / "App.tsx"
+        page_path = repo_path / "src" / "pages" / "LandingPage.tsx"
+        page_path.parent.mkdir(parents=True)
+        app_path.write_text(
+            "import LandingPage from './pages/LandingPage'\n"
+            "export default function App() { return <LandingPage /> }\n",
+            encoding="utf-8",
+        )
+        page_path.write_text(
+            "export default function LandingPage() { return <main>Done</main> }\n",
+            encoding="utf-8",
+        )
+        git("add", "src/App.tsx", "src/pages/LandingPage.tsx")
+        git("commit", "-m", "implement feature")
+
+        (repo_path / "package.json").write_text(
+            '{"scripts":{"test":"vitest"}}\n',
+            encoding="utf-8",
+        )
+        test_path = repo_path / "src" / "pages" / "LandingPage.test.tsx"
+        test_path.write_text("test('renders', () => {})\n", encoding="utf-8")
+
+        class _PromptCapturingRuntime:
+            def __init__(self) -> None:
+                self.prompt = ""
+
+            def run(self, prompt, **kw):
+                self.prompt = prompt
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 0.95,
+                            "verdict": "pass",
+                            "criteria_checks": [],
+                            "component_checks": [],
+                            "self_review_issues": [],
+                            "gaps": [],
+                            "summary": "All checks passed.",
+                        }
+                    )
+                }
+
+        runtime = _PromptCapturingRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": [],
+            "implementation_summary": "Implemented feature and test fixes.",
+            "test_results": {
+                "passed": 2,
+                "failed": 0,
+                "build_ok": True,
+                "test_ok": True,
+            },
+        }
+
+        result = await self_assess(state)
+
+        assert result["route"] == "pass"
+        assert "src/App.tsx" in runtime.prompt
+        assert "src/pages/LandingPage.tsx" in runtime.prompt
+        assert "src/pages/LandingPage.test.tsx" in runtime.prompt
+        assert "package.json" in runtime.prompt
+        assert state["changes_made"] == []
+
     async def test_report_result_records_handover_row(self):
         store = _timeline_task_store()
         result = await report_result(
@@ -1124,6 +1219,24 @@ class TestScreenshotRenderChecks:
                         "severity": "high",
                         "file": "src/x.jsx",
                         "message": "x.jsx does not exist; not implemented.",
+                        "blocking": True,
+                    }
+                ]
+            },
+        )
+        assert conflict is True
+        assert "src/x.jsx" in reason
+
+        # Model claims the changed-files evidence excludes the file even
+        # though the file exists — also contradicts reality.
+        conflict, reason = _self_assessment_claims_conflict_with_ground_truth(
+            {"repo_path": str(repo_path)},
+            {
+                "self_review_issues": [
+                    {
+                        "severity": "high",
+                        "file": "src/x.jsx",
+                        "message": "changed files list does not include src/x.jsx, so the implementation cannot be verified.",
                         "blocking": True,
                     }
                 ]

@@ -329,6 +329,38 @@ def _git_branch_changed_files(repo_path: str, base_ref: str = "main") -> list[st
     return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
 
 
+def _workflow_changed_files(state: dict) -> list[str]:
+    """Return the cumulative files changed by the current Web Dev workflow.
+
+    Agentic backends differ in when they commit work and whether their tool
+    result reports individual writes. The workflow-level evidence must include
+    committed branch changes and uncommitted repair changes instead of relying
+    on the latest node's local write list.
+    """
+    changed: list[str] = []
+    seen: set[str] = set()
+
+    def add(paths: Any) -> None:
+        if not isinstance(paths, (list, tuple, set)):
+            return
+        for item in paths:
+            path = str(item or "").strip()
+            if path and path not in seen:
+                seen.add(path)
+                changed.append(path)
+
+    add(state.get("changes_made", []))
+    repo_path = state.get("repo_path", "") or ""
+    base_ref = str(
+        state.get("base_branch")
+        or state.get("target_branch")
+        or "main"
+    )
+    add(_git_branch_changed_files(repo_path, base_ref=base_ref))
+    add(_git_worktree_changed_files(repo_path))
+    return sorted(changed)
+
+
 def _summarize_validation_commands(data: dict) -> list[dict[str, Any]]:
     """Return compact validation command summaries for agent.log."""
     summaries: list[dict[str, Any]] = []
@@ -1259,7 +1291,7 @@ async def implement_changes(state: dict) -> dict:
     )
 
     return {
-        "changes_made": [],
+        "changes_made": changed_files,
         "implementation_summary": impl_summary,
         "agentic_success": result.success,
     }
@@ -1420,7 +1452,7 @@ async def fix_tests(state: dict) -> dict:
 
     from agents.web_dev.prompts import FIX_SYSTEM, FIX_TEMPLATE
 
-    changed_files = state.get("changes_made", [])
+    changed_files = _workflow_changed_files(state)
     prompt = FIX_TEMPLATE.format(
         test_output=state.get("test_output", "No test output available."),
         repo_path=state.get("repo_path", ""),
@@ -1449,6 +1481,7 @@ async def fix_tests(state: dict) -> dict:
         "fix_attempted": True,
         "fix_summary": result.summary,
         "agentic_success": result.success,
+        "changes_made": _workflow_changed_files(state),
         "test_cycles": 0,
         "build_cycles": 0,
     }
@@ -1590,7 +1623,7 @@ def _is_implementation_ground_truth_present(state: dict) -> bool:
         return False
     if int(test_results.get("passed", 0) or 0) <= 0:
         return False
-    changes_made = state.get("changes_made", []) or []
+    changes_made = _workflow_changed_files(state)
     if not changes_made:
         return False
     return True
@@ -1628,6 +1661,9 @@ def _self_assessment_claims_conflict_with_ground_truth(
         "no new ",
         "is not present",
         "not modified",
+        "changed files list does not include",
+        "not included in the changed files",
+        "not in changed files",
     )
     contradicted: list[str] = []
     for issue in issues:
@@ -1663,7 +1699,7 @@ def _build_ground_truth_re_prompt(
     already observe and asks the model to re-evaluate.
     """
     test_results = state.get("test_results", {}) or {}
-    changes_made = state.get("changes_made", []) or []
+    changes_made = _workflow_changed_files(state)
     files_sample = ", ".join(str(f) for f in changes_made[:8])
     if len(changes_made) > 8:
         files_sample += f" (and {len(changes_made) - 8} more)"
@@ -1946,24 +1982,7 @@ async def self_assess(state: dict) -> dict:
         ac_str = ac_str[:3000] + "...]"
     acceptance_criteria_count = len(acceptance_criteria) if isinstance(acceptance_criteria, list) else 0
 
-    # Derive changed files from the actual cloned repo's git status when
-    # changes_made is empty (native tool runs don't track individual writes).
-    changed_files_list = state.get("changes_made", [])
-    if not changed_files_list:
-        repo_path = state.get("repo_path", "")
-        if repo_path and os.path.isdir(repo_path):
-            try:
-                import subprocess as _sp
-                _st = _sp.run(
-                    ["git", "status", "--short"],
-                    capture_output=True, text=True, cwd=repo_path, timeout=10,
-                )
-                for _line in _st.stdout.splitlines():
-                    _name = _line[3:].strip()
-                    if _name:
-                        changed_files_list.append(_name)
-            except Exception:
-                pass
+    changed_files_list = _workflow_changed_files(state)
 
     # Load Code Review comments for revision mode self-assessment
     cr_comments_text = ""
@@ -2432,7 +2451,7 @@ async def fix_gaps(state: dict) -> dict:
 
     assessment = state.get("self_assessment", {})
     gaps = assessment.get("gaps", [])
-    changed_files = state.get("changes_made", [])
+    changed_files = _workflow_changed_files(state)
     log.info("fix_gaps started", gaps=len(gaps), files_changed=len(changed_files))
 
     prompt = FIX_GAPS_TEMPLATE.format(
@@ -2468,6 +2487,7 @@ async def fix_gaps(state: dict) -> dict:
         "fix_gaps_attempted": True,
         "fix_gaps_summary": result.summary,
         "agentic_success": result.success,
+        "changes_made": _workflow_changed_files(state),
         "test_cycles": 0,
         "build_cycles": 0,
     }
