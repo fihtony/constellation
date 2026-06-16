@@ -2320,6 +2320,7 @@ _INLINE_JS = r"""
 
     if (tid === NEW_REQUEST_ID || isOverviewSelection(tid)) {
       scroll.innerHTML = `<div class="empty-state">${tid === NEW_REQUEST_ID ? 'Send a request to create a new Compass task.' : 'Select a task to inspect it, or send a new request.'}</div>`;
+      scroll._lastChatSignature = null;
       renderComposerNote(composerNote);
       composerInput.disabled = false;
       composerInput.placeholder = 'Describe a new task...';
@@ -2333,6 +2334,7 @@ _INLINE_JS = r"""
     const t = state.tasks[tid];
     if (!t) {
       scroll.innerHTML = `<div class="empty-state">Task not loaded.</div>`;
+      scroll._lastChatSignature = null;
       return;
     }
 

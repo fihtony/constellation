@@ -41,6 +41,12 @@ from agents.office.integrity import (
 
 _ORGANIZED_OUTPUT_ROOT = "organized-output"
 _FILENAME_PLAN = "organization-plan.md"
+CUSTOM_ORGANIZE_CONTROL_FILENAMES = {
+    "custom-organize-plan.md",
+    "custom-organize-plan.json",
+    "organization-plan.md",
+    "organization-plan.json",
+}
 
 # Each dimension tool records the operations-plan.json path it is
 # associated with, if known.  The dimension tools themselves do not
@@ -786,6 +792,8 @@ def _read_sample_files(source: str, *, max_files: int = 5, max_chars: int = 600)
         for name in sorted(files):
             if name.startswith("."):
                 continue
+            if name in CUSTOM_ORGANIZE_CONTROL_FILENAMES:
+                continue
             ext = os.path.splitext(name)[1].lower()
             if ext not in text_exts:
                 continue
@@ -851,10 +859,20 @@ def _build_planning_prompt(
         f"The user wants to group them by **{hint}**.\n\n"
         f"{revision_block}"
         "Read the sample files below and propose an organize plan with:\n"
-        "1. A list of bucket names you recommend (3-12 buckets).\n"
-        "2. For each sample file, which bucket it belongs to and why.\n"
+        "1. A list of source-relative bucket folder paths you recommend "
+        "(3-12 buckets).\n"
+        "2. For each sample file, which source-relative bucket folder path "
+        "it belongs to and why.\n"
         "3. A general rule the agent can use to classify the\n"
         "   remaining (unsampled) files into the same buckets.\n\n"
+        "Bucket names and sample_mapping values must be source-relative "
+        "bucket folder paths under the selected source folder, not absolute "
+        "filesystem paths and not partial labels. Do not include the "
+        "absolute source folder, `/app/userdata`, host paths, or a leading "
+        "`/`. If the user asks for multiple folder levels, express every "
+        "level with `/` separators, e.g. `person/month`, and make the "
+        "sample_mapping values use the same hierarchy. Do not write or "
+        "create any files; return JSON only.\n\n"
         "Reply in JSON only, with this exact schema:\n"
         "{\n"
         '  "buckets": ["name1", "name2", ...],\n'
@@ -885,11 +903,13 @@ def _build_execution_prompt(
         f"Plan rationale: {plan.get('rationale', '')}\n\n"
         f"Classification rule from the planner: {plan.get('classification_rule', '')}\n\n"
         "Now classify the following remaining files. For each, output "
-        "the bucket name that follows the classification rule. The example "
-        "buckets are not a closed list: create a new bucket when the rule "
-        "applies to a value that was not present in the samples. Use "
-        "`__unmatched__` only when the source file lacks enough evidence to "
-        "apply the rule. Reply in JSON only:\n"
+        "the source-relative bucket path that follows the classification "
+        "rule. Do not include the absolute source folder, `/app/userdata`, "
+        "host paths, or a leading `/`. The example buckets are not a closed "
+        "list: create a new source-relative bucket when the rule applies to "
+        "a value that was not present in the samples. Use `__unmatched__` "
+        "only when the source file lacks enough evidence to apply the rule. "
+        "Reply in JSON only:\n"
         "{\n"
         '  "mapping": {"<file_path>": "<bucket_name>", ...}\n'
         "}\n\n"

@@ -146,6 +146,53 @@ def test_planning_phase_writes_plan_and_pauses_for_approval(tmp_path):
     assert "approve" in needs["user_message"].lower()
 
 
+def test_planning_phase_normalizes_absolute_bucket_paths_to_source_relative(
+    tmp_path,
+):
+    """Custom plans must describe destination buckets relative to source.
+
+    Agentic runtimes sometimes echo the absolute source folder into bucket
+    values.  Office must not publish those implementation paths back into the
+    plan contract, because Phase 2 treats buckets as paths under the selected
+    output root.
+    """
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "0103" / "1.txt").parent.mkdir(parents=True)
+    (src / "0103" / "1.txt").write_text("Student: Alice\nJanuary work\n")
+
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    absolute_bucket = str(src / "Alice" / "January")
+    plan = {
+        "buckets": [absolute_bucket],
+        "sample_mapping": {"0103/1.txt": absolute_bucket},
+        "classification_rule": (
+            f"Move files under {src}/<student>/<month>."
+        ),
+        "rationale": "Group each file by student and month.",
+    }
+    runtime = _runtime_with_plan_response(plan)
+    state = _organize_state(
+        source=str(src),
+        artifacts_dir=str(artifacts),
+        user_text="please organize by student then month",
+    )
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    normalized_plan = result["needs_clarification"]["plan"]
+    assert normalized_plan["buckets"] == ["Alice/January"]
+    assert normalized_plan["sample_mapping"] == {"0103/1.txt": "Alice/January"}
+    plan_text = (
+        artifacts / "organized-output" / "files" / "custom-organize-plan.md"
+    ).read_text()
+    assert "`Alice/January`" in plan_text
+    assert absolute_bucket not in plan_text
+
+
 def test_planning_phase_passes_hint_to_llm(tmp_path):
     """The planning prompt must surface the user's custom hint so
     the LLM knows what grouping to propose.
@@ -177,6 +224,8 @@ def test_planning_phase_passes_hint_to_llm(tmp_path):
     # The hint reached the LLM prompt.
     prompt = runtime.prompts[0]
     assert "subject area" in prompt
+    assert "source-relative" in prompt
+    assert "Do not include the absolute source folder" in prompt
 
 
 def test_planning_phase_falls_back_to_text_when_metadata_missing(tmp_path):
@@ -318,6 +367,24 @@ def test_custom_planner_samples_across_full_tree(tmp_path):
     assert not sampled_paths == [f"{index:02d}/item.txt" for index in range(5)]
 
 
+def test_custom_planner_samples_skip_office_control_artifacts(tmp_path):
+    """Planning samples must focus on user content, not prior Office outputs."""
+    from agents.office.organize_by_dimension import _read_sample_files
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "custom-organize-plan.md").write_text("# previous plan\n")
+    (src / "custom-organize-plan.json").write_text('{"previous": true}\n')
+    (src / "organization-plan.md").write_text("# previous final plan\n")
+    (src / "0103").mkdir()
+    (src / "0103" / "1.txt").write_text("Student: Alice\n")
+
+    samples = _read_sample_files(str(src), max_files=5, max_chars=80)
+    sampled_paths = [item["path"] for item in samples]
+
+    assert sampled_paths == ["0103/1.txt"]
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: execution
 # ---------------------------------------------------------------------------
@@ -436,6 +503,87 @@ def test_modify_phase_replans_with_revision_note(tmp_path):
     assert "Alice-January" in prompt
 
 
+def test_modify_phase_retries_plan_when_hierarchy_examples_are_flat(tmp_path):
+    """A revised plan must not be published when its examples contradict
+    the requested folder hierarchy.
+
+    Some backends correctly rewrite the classification rule after a
+    ``modify: create two levels`` reply, but leave ``buckets`` and
+    ``sample_mapping`` as top-level labels.  That draft is internally
+    inconsistent: sample files bypass the execution classifier, so flat
+    examples would be materialized into the wrong folders.  Office should
+    retry the planner with validation feedback and publish only a
+    self-consistent plan.
+    """
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "0103").mkdir()
+    (src / "0103" / "1.txt").write_text("Student: Alice\nMonth: January\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    previous_plan = {
+        "buckets": ["Alice-January"],
+        "sample_mapping": {"0103/1.txt": "Alice-January"},
+        "classification_rule": "Combine student and month.",
+        "rationale": "original",
+    }
+    invalid_plan = {
+        "buckets": ["Alice"],
+        "sample_mapping": {"0103/1.txt": "Alice"},
+        "classification_rule": (
+            "Use the student as the first-level folder and the month "
+            "as the second-level folder."
+        ),
+        "rationale": "Two-level hierarchy: student, then month.",
+    }
+    corrected_plan = {
+        "buckets": ["Alice/January"],
+        "sample_mapping": {"0103/1.txt": "Alice/January"},
+        "classification_rule": (
+            "Use the student as the first-level folder and the month "
+            "as the second-level folder."
+        ),
+        "rationale": "Two-level hierarchy: student, then month.",
+    }
+    runtime = MagicMock()
+    runtime.run = MagicMock(side_effect=[
+        {
+            "summary": json.dumps(invalid_plan),
+            "raw_response": json.dumps(invalid_plan),
+        },
+        {
+            "summary": json.dumps(corrected_plan),
+            "raw_response": json.dumps(corrected_plan),
+        },
+    ])
+    state = _organize_state(
+        source=str(src),
+        artifacts_dir=str(artifacts),
+        approved_plan=previous_plan,
+    ) | {
+        "organize_custom_action": "modify",
+        "organize_custom_modify_note": (
+            "create two level folders: first student, then month"
+        ),
+    }
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "input-required"
+    assert result["needs_clarification"]["plan"] == corrected_plan
+    assert runtime.run.call_count == 2
+    retry_prompt = runtime.run.call_args_list[1].args[0]
+    assert "failed validation" in retry_prompt
+    plan_text = (
+        artifacts / "organized-output" / "files" / "custom-organize-plan.md"
+    ).read_text()
+    assert "| `0103/1.txt` | `Alice/January` |" in plan_text
+    assert "| `0103/1.txt` | `Alice` |" not in plan_text
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: nested-bucket execution
 # ---------------------------------------------------------------------------
@@ -506,6 +654,91 @@ def test_execution_phase_materializes_nested_bucket_paths(tmp_path):
     # The destination column must show the nested path, not the
     # sanitized single-segment form.
     assert "Yan_January/" not in plan_text
+
+
+def test_execution_phase_rejects_flat_approved_plan_for_nested_rule(tmp_path):
+    """Execution must refuse an approved plan whose examples contradict
+    its own hierarchy rule.
+
+    This prevents sample files from being materialized into ``Bucket/<source>``
+    while non-sample files use ``Bucket/Subbucket/<source>``.
+    """
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "0103").mkdir()
+    (src / "0103" / "1.txt").write_text("Student: Alice\nMonth: January\n")
+    (src / "0207").mkdir()
+    (src / "0207" / "1.txt").write_text("Student: Bob\nMonth: February\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    approved_plan = {
+        "buckets": ["Alice", "Bob"],
+        "sample_mapping": {"0103/1.txt": "Alice"},
+        "classification_rule": (
+            "Use the student as the first-level folder and the month "
+            "as the second-level folder."
+        ),
+        "rationale": "Two-level hierarchy: student, then month.",
+    }
+    runtime = _runtime_with_plan_response(
+        plan=approved_plan,
+        mapping={"0207/1.txt": "Bob/February"},
+    )
+    state = _organize_state(
+        source=str(src),
+        artifacts_dir=str(artifacts),
+        approved_plan=approved_plan,
+    )
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "input-required"
+    assert result["success"] is False
+    assert "approved custom organize plan" in result["summary"]
+    assert runtime.run.call_count == 0
+    output_root = artifacts / "organized-output" / "files"
+    assert not (output_root / "Alice" / "0103" / "1.txt").exists()
+
+
+def test_execution_phase_rejects_classifier_bucket_shallower_than_plan_examples(tmp_path):
+    """Classifier output must follow the approved plan's path depth."""
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "0103").mkdir()
+    (src / "0103" / "1.txt").write_text("Student: Alice\nMonth: January\n")
+    (src / "0207").mkdir()
+    (src / "0207" / "1.txt").write_text("Student: Bob\nMonth: February\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    approved_plan = {
+        "buckets": ["Alice/January"],
+        "sample_mapping": {"0103/1.txt": "Alice/January"},
+        "classification_rule": "Read each file and create a matching bucket.",
+        "rationale": "Use the approved examples as the folder shape.",
+    }
+    runtime = _runtime_with_plan_response(
+        plan=approved_plan,
+        mapping={"0207/1.txt": "Bob"},
+    )
+    state = _organize_state(
+        source=str(src),
+        artifacts_dir=str(artifacts),
+        approved_plan=approved_plan,
+    )
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "input-required"
+    assert result["success"] is False
+    assert "do not match" in result["summary"]
+    output_root = artifacts / "organized-output" / "files"
+    assert not (output_root / "Bob" / "0207" / "1.txt").exists()
 
 
 def test_execution_phase_rejects_incomplete_classifier_mapping(tmp_path):
@@ -874,6 +1107,58 @@ def test_custom_dimension_inplace_moves_files_and_clears_originals(
     assert not (src / "0207" / "1.txt").exists()
 
 
+def test_custom_dimension_inplace_normalizes_absolute_bucket_paths(
+    tmp_path,
+):
+    """Absolute source-prefixed buckets execute as source-relative buckets.
+
+    This covers the task-e27459f5fd4f failure mode: sample mappings used
+    source-root-prefixed bucket paths, while classifier output used relative
+    bucket paths.  The executor must normalize both sources of bucket values to
+    the same relative contract before moving files.
+    """
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "messy"
+    src.mkdir()
+    (src / "0103" / "1.txt").parent.mkdir(parents=True)
+    (src / "0103" / "1.txt").write_text("Student: Alice\nJanuary work\n")
+    (src / "0207" / "1.txt").parent.mkdir(parents=True)
+    (src / "0207" / "1.txt").write_text("Student: Bob\nFebruary work\n")
+
+    absolute_bucket = str(src / "Alice" / "January")
+    approved_plan = {
+        "buckets": [absolute_bucket, "Bob/February"],
+        "sample_mapping": {"0103/1.txt": absolute_bucket},
+        "classification_rule": "Use a student/month bucket under the source folder.",
+        "rationale": "The folder shape is relative to the selected source.",
+    }
+    runtime = _runtime_with_plan_response(
+        plan=approved_plan,
+        mapping={"0207/1.txt": "Bob/February"},
+    )
+    state = _organize_state_inplace(
+        source=str(src),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        approved_plan=approved_plan,
+    )
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "completed", result
+    assert result["success"] is True
+    assert (src / "Alice" / "January" / "0103" / "1.txt").is_file()
+    assert (src / "Bob" / "February" / "0207" / "1.txt").is_file()
+    assert not (src / "app").exists()
+    bad_prefix = absolute_bucket.strip(os.sep).split(os.sep)[0]
+    if bad_prefix:
+        assert not (src / bad_prefix).exists()
+    operations_text = (tmp_path / "artifacts" / "operations-plan.json").read_text()
+    assert f"{os.sep}Alice{os.sep}January{os.sep}0103{os.sep}1.txt" in operations_text
+    bad_nested_path = src.joinpath(*absolute_bucket.strip(os.sep).split(os.sep))
+    assert str(bad_nested_path) not in operations_text
+
+
 def test_custom_dimension_inplace_does_not_treat_plan_as_user_file(
     tmp_path,
 ):
@@ -965,6 +1250,57 @@ def test_custom_dimension_inplace_does_not_treat_plan_as_user_file(
         "the executor's final organization-plan.md must not be "
         "classified as a user file and dropped into a bucket"
     )
+
+
+def test_custom_dimension_inplace_does_not_treat_json_plan_as_user_file(
+    tmp_path,
+):
+    """Agentic backends may leave JSON plan sidecars next to the source.
+
+    Those files are Office control artifacts, not user content.  They must
+    stay out of the classifier prompt and must not be materialized into an
+    ``unmatched/`` bucket.
+    """
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "messy"
+    src.mkdir()
+    (src / "0103" / "1.txt").parent.mkdir(parents=True)
+    (src / "0103" / "1.txt").write_text("Student: Alice\nJanuary work\n")
+    (src / "0207" / "1.txt").parent.mkdir(parents=True)
+    (src / "0207" / "1.txt").write_text("Student: Bob\nFebruary work\n")
+    (src / "custom-organize-plan.json").write_text(
+        json.dumps({
+            "buckets": ["Alice"],
+            "sample_mapping": {"0103/1.txt": "Alice"},
+        })
+    )
+
+    approved_plan = {
+        "buckets": ["Alice/January", "Bob/February"],
+        "sample_mapping": {"0103/1.txt": "Alice/January"},
+        "classification_rule": "trivial",
+        "rationale": "trivial",
+    }
+    runtime = _runtime_with_plan_response(
+        plan=approved_plan,
+        mapping={"0207/1.txt": "Bob/February"},
+    )
+    state = _organize_state_inplace(
+        source=str(src),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        approved_plan=approved_plan,
+    )
+
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    assert result["status"] == "completed", result
+    assert result["success"] is True
+    assert not (src / "unmatched").exists()
+    assert not (src / "unmatched" / "custom-organize-plan.json").exists()
+    assert (src / "custom-organize-plan.json").is_file()
+    execution_prompt = runtime.prompts[-1]
+    assert "custom-organize-plan.json" not in execution_prompt
 
 
 def test_custom_dimension_inplace_records_audit_and_integrity_verdict(

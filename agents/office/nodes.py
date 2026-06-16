@@ -46,6 +46,7 @@ from agents.office.office_tools import (
     ReadXlsxTool,
     collect_organize_file_inventory,
 )
+from agents.office.organize_by_dimension import CUSTOM_ORGANIZE_CONTROL_FILENAMES
 from framework.clarification_reply import (
     build_approve_or_modify_contract,
     build_select_option_contract,
@@ -1405,6 +1406,7 @@ def _run_bounded_folder_organize(
 
 
 _CUSTOM_UNMATCHED_BUCKETS = {"unmatched", "__unmatched__", "unknown", "__unknown__"}
+_CUSTOM_DRIVE_PATH_RE = re.compile(r"^[a-zA-Z]:[\\/]")
 
 
 def _custom_mapping_quality_problem(
@@ -1476,10 +1478,95 @@ def _canonical_custom_mapping_key(path: str, source: str) -> str:
     return normalized
 
 
+def _custom_bucket_is_unmatched(bucket: str) -> bool:
+    return str(bucket or "").strip().strip("`").lower() in _CUSTOM_UNMATCHED_BUCKETS
+
+
+def _custom_bucket_relative_to_source(bucket: str, source: str) -> str | None:
+    raw = str(bucket or "").strip().strip("`")
+    if not raw or not source:
+        return None
+    if not os.path.isabs(raw):
+        return None
+    try:
+        real_bucket = os.path.realpath(os.path.abspath(raw))
+        real_source = os.path.realpath(os.path.abspath(source))
+    except OSError:
+        return None
+    prefix = real_source.rstrip(os.sep) + os.sep
+    if real_bucket == real_source:
+        return ""
+    if real_bucket.startswith(prefix):
+        return os.path.relpath(real_bucket, real_source).replace(os.sep, "/")
+    return None
+
+
+def _canonical_custom_bucket_value(bucket: Any, source: str) -> str:
+    """Return the source-relative bucket path for a custom organize plan.
+
+    The LLM may echo the absolute source root in bucket examples
+    (``/app/userdata/input-0/source/Yan/01``).  Buckets are not filesystem
+    targets by themselves; they are path fragments under the selected output
+    root.  Strip a matching source prefix before the plan is published,
+    approved, fed back to the classifier, or materialized.
+    """
+    raw = str(bucket or "").strip().strip("`")
+    if not raw:
+        return ""
+    if _custom_bucket_is_unmatched(raw):
+        return raw.lower()
+    relative = _custom_bucket_relative_to_source(raw, source)
+    if relative is not None:
+        raw = relative
+    normalized = raw.replace("\\", "/").rstrip("/")
+    if not os.path.isabs(raw) and not _CUSTOM_DRIVE_PATH_RE.match(raw):
+        normalized = normalized.strip("/")
+    return normalized
+
+
+def _custom_bucket_contract_problem(bucket: Any) -> str:
+    raw = str(bucket or "").strip().strip("`")
+    if not raw or _custom_bucket_is_unmatched(raw):
+        return ""
+    if raw.startswith("/"):
+        return "absolute bucket path not allowed"
+    if raw.startswith("~"):
+        return "tilde-prefixed bucket path not allowed"
+    if _CUSTOM_DRIVE_PATH_RE.match(raw):
+        return "drive-letter bucket path not allowed"
+    if ".." in raw.replace("\\", "/").split("/"):
+        return "parent traversal not allowed"
+    return ""
+
+
+def _replace_source_root_references(text: Any, source: str) -> Any:
+    if not isinstance(text, str) or not text or not source:
+        return text
+    replacements = {
+        os.path.normpath(source),
+        os.path.realpath(os.path.abspath(source)),
+    }
+    normalized_text = text
+    for value in sorted(
+        (item for item in replacements if item),
+        key=len,
+        reverse=True,
+    ):
+        normalized_text = normalized_text.replace(value, "the source folder")
+    return normalized_text
+
+
 def _canonicalize_custom_plan(plan: dict[str, Any], source: str) -> dict[str, Any]:
     if not isinstance(plan, dict):
         return {}
     normalized = dict(plan)
+    buckets = plan.get("buckets") or []
+    if isinstance(buckets, list):
+        normalized["buckets"] = [
+            canonical
+            for bucket in buckets
+            if (canonical := _canonical_custom_bucket_value(bucket, source))
+        ]
     sample_mapping = plan.get("sample_mapping") or {}
     if isinstance(sample_mapping, dict):
         canonical_mapping: dict[str, str] = {}
@@ -1487,9 +1574,204 @@ def _canonicalize_custom_plan(plan: dict[str, Any], source: str) -> dict[str, An
             rel_path = _canonical_custom_mapping_key(str(raw_path), source)
             if not rel_path:
                 continue
-            canonical_mapping[rel_path] = str(bucket)
+            canonical_bucket = _canonical_custom_bucket_value(bucket, source)
+            if not canonical_bucket:
+                continue
+            canonical_mapping[rel_path] = canonical_bucket
         normalized["sample_mapping"] = canonical_mapping
+    for key in ("classification_rule", "rationale"):
+        normalized[key] = _replace_source_root_references(normalized.get(key), source)
     return normalized
+
+
+_CUSTOM_LEVEL_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+}
+_CUSTOM_ORDINAL_LEVELS = {
+    "first": 1,
+    "1st": 1,
+    "second": 2,
+    "2nd": 2,
+    "third": 3,
+    "3rd": 3,
+    "fourth": 4,
+    "4th": 4,
+    "fifth": 5,
+    "5th": 5,
+}
+
+
+def _custom_bucket_path_depth(bucket: Any) -> int:
+    raw = str(bucket or "").strip().strip("`")
+    if not raw or raw.lower() in _CUSTOM_UNMATCHED_BUCKETS:
+        return 0
+    safe = _safe_path_segment(raw)
+    if not safe or safe == "unknown":
+        return 0
+    return len([part for part in safe.split("/") if part])
+
+
+def _custom_plan_bucket_depth(plan: dict[str, Any]) -> int:
+    buckets = plan.get("buckets") or []
+    if not isinstance(buckets, list):
+        return 0
+    depths: list[int] = []
+    for bucket in buckets:
+        depth = _custom_bucket_path_depth(bucket)
+        if depth > 0:
+            depths.append(depth)
+    if not depths:
+        return 0
+    unique_depths = set(depths)
+    if len(unique_depths) == 1:
+        return depths[0]
+    return 0
+
+
+def _custom_required_bucket_depth(
+    *,
+    custom_hint: str,
+    plan: dict[str, Any],
+    revision_note: str = "",
+) -> int:
+    """Infer the minimum bucket-path depth required by user/plan text.
+
+    This is deliberately generic: it looks for hierarchy language
+    ("two levels", "first-level ... second-level", "folder ... then ...")
+    in the custom hint, revision note, classification rule, and rationale.
+    It does not know any task-specific entities such as student names,
+    months, or fixture paths.
+    """
+    if not isinstance(plan, dict):
+        plan = {}
+    text = " ".join(
+        str(part or "")
+        for part in (
+            custom_hint,
+            revision_note,
+            plan.get("classification_rule"),
+            plan.get("rationale"),
+        )
+    ).lower()
+    required = 0
+    level_pattern = r"\b(\d+|one|two|three|four|five)\s*[- ]?levels?\b"
+    for token in re.findall(level_pattern, text):
+        if token.isdigit():
+            required = max(required, int(token))
+        else:
+            required = max(required, _CUSTOM_LEVEL_WORDS.get(token, 0))
+    for token, level in _CUSTOM_ORDINAL_LEVELS.items():
+        if re.search(rf"\b{re.escape(token)}\s*[- ]?level\b", text):
+            required = max(required, level)
+    if "folder" in text and re.search(r"\bthen\b", text):
+        required = max(required, 2)
+    if "subfolder" in text or "sub-folder" in text:
+        required = max(required, 2)
+    if re.search(r"\bfolder[s]?\s+(?:inside|under|within)\b", text):
+        required = max(required, 2)
+    if re.search(r"\binside\s+(?:it|the\s+folder|that\s+folder)\b", text):
+        required = max(required, 2)
+    if required <= 1:
+        required = max(required, _custom_plan_bucket_depth(plan))
+    return min(required, 5)
+
+
+def _custom_plan_structure_problem(
+    plan: dict[str, Any],
+    *,
+    custom_hint: str,
+    revision_note: str = "",
+) -> tuple[str, list[str]]:
+    invalid: list[str] = []
+    buckets = plan.get("buckets") or []
+    if isinstance(buckets, list):
+        for bucket in buckets:
+            problem = _custom_bucket_contract_problem(bucket)
+            if problem:
+                invalid.append(f"{bucket}: {problem}")
+    sample_mapping = plan.get("sample_mapping") or {}
+    if isinstance(sample_mapping, dict):
+        for rel_path, bucket in sample_mapping.items():
+            problem = _custom_bucket_contract_problem(bucket)
+            if problem:
+                invalid.append(f"{rel_path} -> {bucket}: {problem}")
+    if invalid:
+        return (
+            "custom organize bucket paths must be relative to the source folder",
+            sorted(set(invalid)),
+        )
+
+    required_depth = _custom_required_bucket_depth(
+        custom_hint=custom_hint,
+        plan=plan,
+        revision_note=revision_note,
+    )
+    if required_depth <= 1:
+        return "", []
+    shallow: list[str] = []
+    if isinstance(buckets, list):
+        for bucket in buckets:
+            if _custom_bucket_path_depth(bucket) < required_depth:
+                shallow.append(str(bucket))
+    if isinstance(sample_mapping, dict):
+        for rel_path, bucket in sample_mapping.items():
+            if _custom_bucket_path_depth(bucket) < required_depth:
+                shallow.append(f"{rel_path} -> {bucket}")
+    if not shallow:
+        return "", []
+    return (
+        "custom organize plan requires at least "
+        f"{required_depth} folder levels, but some bucket examples are "
+        "partial paths",
+        sorted(set(shallow)),
+    )
+
+
+def _custom_mapping_structure_problem(
+    mapping: dict[str, str],
+    *,
+    required_depth: int,
+) -> tuple[str, list[str]]:
+    invalid = sorted(
+        f"{path} -> {bucket}: {problem}"
+        for path, bucket in mapping.items()
+        if (problem := _custom_bucket_contract_problem(bucket))
+    )
+    if invalid:
+        return (
+            "custom classifier returned bucket paths outside the source-relative contract",
+            invalid,
+        )
+    if required_depth <= 1:
+        return "", []
+    shallow = sorted(
+        path
+        for path, bucket in mapping.items()
+        if str(bucket or "").strip().lower() not in _CUSTOM_UNMATCHED_BUCKETS
+        and _custom_bucket_path_depth(bucket) < required_depth
+    )
+    if not shallow:
+        return "", []
+    return (
+        "custom classifier returned bucket paths that do not match "
+        f"the approved {required_depth}-level folder hierarchy",
+        shallow,
+    )
+
+
+def _custom_control_artifact_paths(source: str, output_root: str) -> list[str]:
+    roots = [source, output_root]
+    out: list[str] = []
+    for root in roots:
+        if not root:
+            continue
+        for filename in sorted(CUSTOM_ORGANIZE_CONTROL_FILENAMES):
+            out.append(os.path.join(root, filename))
+    return out
 
 
 def _json_object_candidates(text: str) -> list[dict[str, Any]]:
@@ -1644,23 +1926,55 @@ def _run_custom_dimension_path(
             existing_plan=approved_plan if replan_requested else None,
             revision_note=custom_modify_note if replan_requested else "",
         )
-        try:
-            response = runtime.run(
-                planning_prompt,
-                system_prompt=system_prompt,
-                max_tokens=2500,
-                cwd=state.get("workspace_root"),
+        raw = ""
+        plan: dict[str, Any] = {}
+        validation_problem = ""
+        validation_details: list[str] = []
+        current_prompt = planning_prompt
+        for attempt in range(2):
+            try:
+                response = runtime.run(
+                    current_prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=2500,
+                    cwd=state.get("workspace_root"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "summary": f"office custom planner failed: {exc}",
+                    "success": False,
+                    "capability": "organize",
+                    "status": "failed",
+                    "error": f"planner runtime error: {exc}",
+                }
+            raw = response.get("raw_response") or response.get("summary") or ""
+            plan = _canonicalize_custom_plan(_parse_json_object(raw), source)
+            validation_problem, validation_details = _custom_plan_structure_problem(
+                plan,
+                custom_hint=custom_hint,
+                revision_note=custom_modify_note if replan_requested else "",
             )
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "summary": f"office custom planner failed: {exc}",
-                "success": False,
-                "capability": "organize",
-                "status": "failed",
-                "error": f"planner runtime error: {exc}",
-            }
-        raw = response.get("raw_response") or response.get("summary") or ""
-        plan = _canonicalize_custom_plan(_parse_json_object(raw), source)
+            if not validation_problem:
+                break
+            if attempt == 0:
+                detail_preview = ", ".join(validation_details[:8])
+                current_prompt = (
+                    planning_prompt
+                    + "\n\nThe previous JSON plan failed validation: "
+                    + validation_problem
+                    + (
+                        f". Problem examples: {detail_preview}."
+                        if detail_preview
+                        else "."
+                    )
+                    + "\nReturn a corrected JSON object only. Bucket names "
+                    "and sample_mapping values must be source-relative "
+                    "bucket folder paths under the selected source folder. "
+                    "Do not include the absolute source folder, "
+                    "`/app/userdata`, host paths, or a leading `/`. Include "
+                    "every requested hierarchy level with `/` separators."
+                )
+                continue
         if not plan or not plan.get("buckets"):
             return {
                 "summary": "office custom planner returned no buckets",
@@ -1669,6 +1983,38 @@ def _run_custom_dimension_path(
                 "status": "failed",
                 "error": "planner produced no usable JSON plan",
                 "raw_output": raw,
+            }
+        if validation_problem:
+            preview = ", ".join(validation_details[:5])
+            if len(validation_details) > 5:
+                preview += ", ..."
+            return {
+                "summary": (
+                    "Office custom planner produced a plan that failed "
+                    f"validation: {validation_problem}."
+                ),
+                "success": False,
+                "capability": "organize",
+                "status": "input-required",
+                "error": validation_problem,
+                "raw_output": raw,
+                "needs_clarification": {
+                    "missing": "organizeCustomPlan",
+                    "user_message": (
+                        "Office could not produce a self-consistent custom "
+                        f"organize plan ({validation_problem}). "
+                        f"Problem examples include: {preview}. "
+                        "Reply with `modify: <folder hierarchy guidance>` "
+                        "to revise the plan before execution."
+                    ),
+                    "options": [
+                        {"id": "modify", "label": "Modify plan"},
+                    ],
+                    "reply_contract": build_approve_or_modify_contract(),
+                    "plan": plan,
+                    "custom_hint": custom_hint,
+                    "affected_paths": validation_details[:50],
+                },
             }
         plan_path = _plan_published(plan, source=source, output_root=output_root)
         # Pause for user approval.  The state fields ``organize_dimension``
@@ -1754,6 +2100,7 @@ def _run_custom_dimension_path(
         custom_plan_at_source,
         final_plan_path,
         final_plan_at_source,
+        *_custom_control_artifact_paths(source, output_root),
     ]
     # ``produced_paths`` is allowed to contain duplicate paths
     # (e.g. in inplace mode ``custom_plan_at_output`` and
@@ -1774,6 +2121,47 @@ def _run_custom_dimension_path(
     produced_paths = deduped_paths
 
     approved_plan = _canonicalize_custom_plan(approved_plan, source)
+    plan_problem, plan_problem_details = _custom_plan_structure_problem(
+        approved_plan,
+        custom_hint=custom_hint,
+        revision_note=custom_modify_note,
+    )
+    if plan_problem:
+        preview = ", ".join(plan_problem_details[:5])
+        if len(plan_problem_details) > 5:
+            preview += ", ..."
+        return {
+            "summary": (
+                "Office approved custom organize plan failed validation: "
+                f"{plan_problem}."
+            ),
+            "success": False,
+            "capability": "organize",
+            "status": "input-required",
+            "error": plan_problem,
+            "needs_clarification": {
+                "missing": "organizeCustomPlan",
+                "user_message": (
+                    "Office cannot safely execute the approved custom "
+                    f"organize plan because {plan_problem}. "
+                    f"Problem examples include: {preview}. "
+                    "Reply with `modify: <folder hierarchy guidance>` "
+                    "so Office can revise the plan before moving files."
+                ),
+                "options": [
+                    {"id": "modify", "label": "Modify plan"},
+                ],
+                "reply_contract": build_approve_or_modify_contract(),
+                "plan": approved_plan,
+                "custom_hint": custom_hint,
+                "affected_paths": plan_problem_details[:50],
+            },
+        }
+    required_bucket_depth = _custom_required_bucket_depth(
+        custom_hint=custom_hint,
+        plan=approved_plan,
+        revision_note=custom_modify_note,
+    )
 
     inventory, _, _ = collect_organize_file_inventory(
         source,
@@ -1815,6 +2203,11 @@ def _run_custom_dimension_path(
         _merge_custom_exec_mapping(mapping, (exec_plan or {}).get("mapping") or {}, source)
 
     quality_problem, affected_paths = _custom_mapping_quality_problem(inventory, mapping)
+    if not quality_problem:
+        quality_problem, affected_paths = _custom_mapping_structure_problem(
+            mapping,
+            required_depth=required_bucket_depth,
+        )
     if (
         quality_problem
         and remaining
@@ -1850,6 +2243,11 @@ def _run_custom_dimension_path(
                     source,
                 )
                 quality_problem, affected_paths = _custom_mapping_quality_problem(inventory, mapping)
+                if not quality_problem:
+                    quality_problem, affected_paths = _custom_mapping_structure_problem(
+                        mapping,
+                        required_depth=required_bucket_depth,
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("custom organize reclassification retry failed: %s", exc)
 
