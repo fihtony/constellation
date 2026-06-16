@@ -109,6 +109,7 @@ def test_web_dev_permission_profile_declares_auditable_command_patterns():
 
     patterns = engine.permissions.custom.get("allowed_command_patterns", [])
     assert patterns
+    assert engine.check_command("ls -la /app/artifacts/task-123/scm/repo")
     assert engine.check_command("npm test -- --run")
     assert engine.check_command("python -m pytest tests/unit/agents/test_web_dev.py -q")
     assert not engine.check_command("python -c 'print(1)'")

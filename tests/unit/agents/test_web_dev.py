@@ -2129,6 +2129,93 @@ class TestWebDevBoundaryTools:
         assert records[-1]["command"] == "python -c 'print(1)'"
         assert records[-1]["status"] == "denied"
 
+    def test_run_command_normalizes_cd_prefix_before_permission_check(self, tmp_path, monkeypatch):
+        from agents.web_dev.coding_tools import RunCommandTool
+        from framework.audit_log import (
+            clear_permission_audit_context,
+            set_permission_audit_context,
+        )
+        from framework.permissions import PermissionEngine, PermissionSet
+        from framework.tools.registry import get_registry
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        calls = []
+
+        class _Proc:
+            returncode = 0
+            stdout = "installed\n"
+            stderr = ""
+
+        def _fake_run(args, **kwargs):
+            calls.append({"args": args, "cwd": kwargs.get("cwd")})
+            return _Proc()
+
+        monkeypatch.setattr("agents.web_dev.coding_tools.subprocess.run", _fake_run)
+        registry = get_registry()
+        registry.set_permission_engine(
+            PermissionEngine(
+                PermissionSet(
+                    allowed_tools=["run_command"],
+                    custom={"allowed_command_patterns": [r"^npm install(\s|$).*"]},
+                )
+            )
+        )
+        set_permission_audit_context(
+            workspace_path=str(tmp_path),
+            agent_id="web-dev",
+            task_id="task-command-audit",
+        )
+        try:
+            result = RunCommandTool().execute_sync(
+                command=f"cd {repo_path} && npm install",
+                cwd=str(tmp_path),
+            )
+        finally:
+            clear_permission_audit_context()
+            registry.set_permission_engine(None)
+
+        assert not result.error
+        assert json.loads(result.output)["success"] is True
+        assert calls == [{"args": ["npm", "install"], "cwd": str(repo_path)}]
+        assert not (tmp_path / "web-dev" / "permission-denials.jsonl").exists()
+
+    def test_run_command_standalone_cd_is_guidance_not_permission_denial(self, tmp_path):
+        from agents.web_dev.coding_tools import RunCommandTool
+        from framework.audit_log import (
+            clear_permission_audit_context,
+            set_permission_audit_context,
+        )
+        from framework.permissions import PermissionEngine, PermissionSet
+        from framework.tools.registry import get_registry
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        registry = get_registry()
+        registry.set_permission_engine(
+            PermissionEngine(
+                PermissionSet(
+                    allowed_tools=["run_command"],
+                    custom={"allowed_command_patterns": [r"^npm install(\s|$).*"]},
+                )
+            )
+        )
+        set_permission_audit_context(
+            workspace_path=str(tmp_path),
+            agent_id="web-dev",
+            task_id="task-command-audit",
+        )
+        try:
+            result = RunCommandTool().execute_sync(command=f"cd {repo_path}")
+        finally:
+            clear_permission_audit_context()
+            registry.set_permission_engine(None)
+
+        assert result.error is not None
+        assert "cwd" in result.error
+        assert "not persist" in result.error
+        assert not (tmp_path / "web-dev" / "permission-denials.jsonl").exists()
+
     def test_scm_create_pr_derives_bitbucket_coordinates(self, monkeypatch):
         dispatched = {}
 

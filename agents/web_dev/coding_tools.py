@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -65,6 +66,45 @@ def _git_env(scope: str = "run-command") -> dict[str, str]:
     """Return an isolated git environment (no host keychain / ~/.gitconfig)."""
     from framework.env_utils import build_isolated_git_env
     return build_isolated_git_env(scope=scope)
+
+
+def _shell_words(command: str) -> list[str]:
+    """Tokenize a small shell-like command string without executing a shell."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    return list(lexer)
+
+
+def _quote_command_tokens(tokens: list[str]) -> str:
+    return " ".join(shlex.quote(token) for token in tokens)
+
+
+def _normalise_run_command(command: str, cwd: str | None) -> tuple[str, str | None, str | None]:
+    """Normalize common shell cwd idioms into the tool's explicit cwd field.
+
+    Agentic CLI backends often emit ``cd <repo> && npm install`` even though
+    this tool is intentionally not a persistent shell. Treat a leading
+    ``cd`` as cwd selection for the immediately chained command, then apply
+    command permissions to the actual command.
+    """
+    try:
+        tokens = _shell_words(command)
+    except ValueError:
+        return command, cwd, None
+
+    if not tokens or tokens[0] != "cd":
+        return command, cwd, None
+
+    if len(tokens) == 1 or (len(tokens) == 2 and tokens[1] in {"~", "-"}):
+        return "", cwd, "run_command does not support persistent 'cd'; pass the target directory via cwd."
+    if len(tokens) == 2:
+        return "", tokens[1], "run_command does not persist working directory changes; pass cwd or use 'cd <dir> && <command>'."
+    if len(tokens) >= 4 and tokens[2] in {"&&", ";"}:
+        rest = tokens[3:]
+        if any(token in {"&&", ";", "||", "|"} for token in rest):
+            return command, cwd, None
+        return _quote_command_tokens(rest), tokens[1], None
+    return command, cwd, None
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +310,10 @@ class RunCommandTool(BaseTool):
         timeout = min(int(timeout), 60)
         if not command.strip():
             return ToolResult(error="command is required")
+        original_command = command
+        command, cwd, command_error = _normalise_run_command(command.strip(), cwd)
+        if command_error:
+            return ToolResult(error=command_error)
 
         try:
             from framework.errors import PermissionDeniedError
@@ -279,17 +323,21 @@ class RunCommandTool(BaseTool):
             if engine and hasattr(engine, "require_command"):
                 engine.require_command(command)
         except PermissionDeniedError as exc:
-            logger.warning("Permission denied for run_command %r: %s", command, exc)
+            logger.warning("Permission denied for run_command %r: %s", original_command, exc)
             from framework.audit_log import append_current_permission_denial
 
+            metadata = {"command": original_command}
+            if command != original_command:
+                metadata["effective_command"] = command
+            if cwd:
+                metadata["cwd"] = cwd
             append_current_permission_denial(
                 operation="command",
                 reason=str(exc),
-                metadata={"command": command},
+                metadata=metadata,
             )
             return ToolResult(error=str(exc))
 
-        import shlex
         try:
             args = shlex.split(command)
         except ValueError as exc:
