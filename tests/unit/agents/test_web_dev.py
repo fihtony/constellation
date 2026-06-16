@@ -341,6 +341,26 @@ class TestScreenshotRenderChecks:
         assert findings["issues"] == []
         assert findings["icon_tokens"] == []
 
+    def test_detect_fragile_icon_font_usage_ignores_svg_replacement_comment(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        src_path.mkdir(parents=True)
+        (src_path / "ArrowForwardIcon.tsx").write_text(
+            "/**\n"
+            " * Inline SVG replacement for Material Symbols Outlined arrow_forward.\n"
+            " */\n"
+            "export default function ArrowForwardIcon() {\n"
+            "  return <svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M5 12h14\" /></svg>\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        findings = _detect_fragile_icon_font_usage(str(repo_path))
+
+        assert findings["issues"] == []
+        assert findings["files"] == []
+        assert findings["icon_tokens"] == []
+
     async def test_self_assess_fails_fragile_icon_font_usage(self, tmp_path):
         repo_path = tmp_path / "repo"
         src_path = repo_path / "src"
@@ -418,6 +438,98 @@ class TestScreenshotRenderChecks:
 
         with pytest.raises(RuntimeError, match="self_assess failed after 3 cycles"):
             await self_assess(state)
+
+    async def test_self_assess_max_cycle_failed_reprompt_still_fails_task(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        src_path.mkdir(parents=True)
+        (src_path / "App.jsx").write_text("export default function App() { return <main /> }\n", encoding="utf-8")
+
+        class _MockRuntime:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, prompt, **kw):
+                self.calls += 1
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 0.85 if self.calls == 1 else 0.89,
+                            "verdict": "fail",
+                            "gaps": ["Remaining implementation gap."],
+                            "component_checks": [],
+                            "criteria_checks": [],
+                            "self_review_issues": [],
+                            "summary": "Still has a gap.",
+                        }
+                    )
+                }
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/App.jsx"],
+            "implementation_summary": "Implemented the app.",
+            "test_results": {"build_ok": True, "test_ok": True, "passed": 8, "failed": 0},
+            "assess_cycles": 2,
+        }
+
+        with pytest.raises(RuntimeError, match="self_assess failed after 3 cycles"):
+            await self_assess(state)
+        assert runtime.calls == 1
+
+    async def test_self_assess_reprompt_cannot_upgrade_failed_assessment_to_pass(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        src_path.mkdir(parents=True)
+        (src_path / "App.jsx").write_text("export default function App() { return <main /> }\n", encoding="utf-8")
+
+        class _MockRuntime:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, prompt, **kw):
+                self.calls += 1
+                if self.calls == 1:
+                    payload = {
+                        "score": 0.85,
+                        "verdict": "fail",
+                        "gaps": ["Remaining implementation gap."],
+                        "component_checks": [],
+                        "criteria_checks": [],
+                        "self_review_issues": [],
+                        "summary": "Still has a gap.",
+                    }
+                else:
+                    payload = {
+                        "score": 1.0,
+                        "verdict": "pass",
+                        "gaps": [],
+                        "component_checks": [],
+                        "criteria_checks": [],
+                        "self_review_issues": [],
+                        "summary": "Re-prompt says everything is complete.",
+                    }
+                return {"raw_response": json.dumps(payload)}
+
+        runtime = _MockRuntime()
+        state = {
+            "_runtime": runtime,
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": False},
+            "changes_made": ["src/App.jsx"],
+            "implementation_summary": "Implemented the app.",
+            "test_results": {"build_ok": True, "test_ok": True, "passed": 8, "failed": 0},
+            "assess_cycles": 2,
+        }
+
+        with pytest.raises(RuntimeError, match="self_assess failed after 3 cycles"):
+            await self_assess(state)
+        assert runtime.calls == 1
 
     async def test_self_assess_retries_invalid_schema_same_cycle(self, tmp_path):
         repo_path = tmp_path / "repo"
@@ -901,6 +1013,15 @@ class TestScreenshotRenderChecks:
         assert result["route"] == "pass", result
         assert result["self_assessment"]["verdict"] == "pass"
         assert result["self_assessment"]["score"] == 0.95
+        assert result["self_assessment"]["ground_truth_reprompt"] == {
+            "applied": True,
+            "original_score": 0.55,
+            "original_verdict": "fail",
+            "reason": (
+                "self_review_issues claim these files are missing/not implemented, "
+                "but they exist on disk: ['src/pages/FeaturePage.jsx']"
+            ),
+        }
         assert len(runtime.run_calls) == 2
         # The second prompt must surface the ground-truth context so the
         # model is forced to re-evaluate.

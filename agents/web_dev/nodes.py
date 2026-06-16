@@ -414,6 +414,16 @@ _ICON_LIGATURE_TOKENS = (
 )
 
 
+def _strip_icon_scan_comments(content: str, ext: str) -> str:
+    """Remove comments before scanning for runtime icon ligature usage."""
+    if ext == ".html":
+        return re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
+    if ext in {".js", ".jsx", ".ts", ".tsx"}:
+        without_block_comments = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
+        return re.sub(r"(?m)(^|[ \t])//.*$", r"\1", without_block_comments)
+    return content
+
+
 def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
     """Detect icon-font ligature patterns that render unreliably in containers."""
     findings: dict[str, Any] = {
@@ -445,7 +455,8 @@ def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
                     content = fh.read()
             except OSError:
                 continue
-            lowered = content.lower()
+            scan_content = _strip_icon_scan_comments(content, ext)
+            lowered = scan_content.lower()
 
             if "material-symbols" in lowered or "material-icons" in lowered:
                 # A stylesheet may define or leave behind the class selector
@@ -2204,22 +2215,20 @@ Return valid JSON only, and correct this validation feedback:
         route = "need_user_input"
     elif assess_cycles >= max_assess_cycles and runtime is not None:
         # Last line of defence: before declaring failure, check whether the
-        # self-assessment is a hallucination that contradicts observable
-        # reality. If the build and tests passed and files exist, give the
-        # model one more chance with the ground-truth context. This is
-        # methodology-level — it works the same on every agentic backend
-        # and never embeds task-specific knowledge.
+        # self-assessment contains a machine-verifiable contradiction, such
+        # as claiming a changed file does not exist when it is present on
+        # disk. Passing build/test output alone is not enough to override a
+        # failed self-check, because that lets a backend revise a genuine
+        # 0.85-style failure into a pass without doing more work.
         claims_conflict, conflict_reason = _self_assessment_claims_conflict_with_ground_truth(
             state, data
         )
         ground_truth_present = _is_implementation_ground_truth_present(state)
-        if ground_truth_present and (
-            claims_conflict or str(verdict).strip().lower() == "fail"
-        ):
+        if ground_truth_present and claims_conflict:
             log.warn(
                 "self_assess attempting ground-truth re-prompt",
                 cycle=assess_cycles,
-                reason=conflict_reason or "verdict=fail contradicts observable implementation state",
+                reason=conflict_reason,
             )
             recovered, gt_data, gt_reason = _try_ground_truth_re_prompt(
                 state=state,
@@ -2235,8 +2244,16 @@ Return valid JSON only, and correct this validation feedback:
                 # deterministic-gaps/verdict-downgrade step so advisory
                 # issues get surfaced and blocking issues still force a
                 # fail verdict.
+                original_score = score
+                original_verdict = verdict
                 data = gt_data
                 _apply_deterministic_gaps(state, data, schema_failure_exhausted)
+                data["ground_truth_reprompt"] = {
+                    "applied": True,
+                    "original_score": original_score,
+                    "original_verdict": original_verdict,
+                    "reason": conflict_reason,
+                }
                 score = float(data.get("score", 0) or 0)
                 verdict = data.get("verdict", "fail")
                 gaps = data.get("gaps", []) or []
@@ -2250,7 +2267,19 @@ Return valid JSON only, and correct this validation feedback:
                 if score >= 0.9 and verdict != "fail":
                     route = "pass"
                 else:
-                    route = "fail" if assess_cycles < max_assess_cycles else "fail"
+                    failure_summary = "; ".join(str(gap) for gap in gaps[:4]) or str(data.get("summary", "self-assessment failed"))
+                    log.warn("self_assess exhausted retries", cycle=assess_cycles, failure_summary=failure_summary[:400])
+                    _record_timeline_step(
+                        state,
+                        step_key=step_key,
+                        title=title,
+                        lifecycle_state=LIFECYCLE_FAILED,
+                        summary_template="Web Dev self-check exhausted retries with verdict {verdict}.",
+                        summary_facts={"verdict": verdict},
+                        round=step_round,
+                        conditional=retry_mode,
+                    )
+                    raise RuntimeError(f"self_assess failed after {max_assess_cycles} cycles: {failure_summary[:400]}")
                 # Persist the corrected assessment to disk.
                 workspace_path = state.get("workspace_path", "")
                 if workspace_path:
