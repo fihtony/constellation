@@ -8,6 +8,7 @@ PermissionEngine, and every tool call remains auditable.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any
@@ -59,6 +60,15 @@ def _transcript_content(value: Any, limit: int = 8000) -> str:
         except (TypeError, ValueError):
             text = str(value)
     return _short_text(text, limit=limit)
+
+
+def _resolve_under_cwd(value: Any, cwd: str | None) -> Any:
+    """Resolve relative tool paths against the managed-loop repository cwd."""
+    if not cwd or not isinstance(value, str) or not value.strip():
+        return value
+    if os.path.isabs(value):
+        return value
+    return os.path.normpath(os.path.join(cwd, value))
 
 
 def _canonical_tool_name(tool_name: str) -> str:
@@ -208,6 +218,43 @@ def _coerce_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[st
     return args
 
 
+def _apply_default_cwd(
+    tool_name: str,
+    arguments: dict[str, Any],
+    cwd: str | None,
+) -> dict[str, Any]:
+    """Apply native-CLI cwd semantics to Constellation-managed tools.
+
+    Native agentic CLIs usually run file and shell tools relative to their
+    configured working directory. The managed loop executes tools from the
+    Constellation process, so it must resolve relative paths explicitly to keep
+    backend behavior consistent.
+    """
+    if not cwd:
+        return arguments
+
+    args = dict(arguments or {})
+    if tool_name == "run_command":
+        if not args.get("cwd"):
+            args["cwd"] = cwd
+        else:
+            args["cwd"] = _resolve_under_cwd(args.get("cwd"), cwd)
+    elif tool_name in {"read_file", "write_file", "edit_file"}:
+        if args.get("path"):
+            args["path"] = _resolve_under_cwd(args.get("path"), cwd)
+    elif tool_name in {"search_code", "grep"}:
+        if not args.get("path") or str(args.get("path")) == ".":
+            args["path"] = cwd
+        else:
+            args["path"] = _resolve_under_cwd(args.get("path"), cwd)
+    elif tool_name == "glob":
+        if not args.get("root") or str(args.get("root")) == ".":
+            args["root"] = cwd
+        else:
+            args["root"] = _resolve_under_cwd(args.get("root"), cwd)
+    return args
+
+
 def _expand_tool_requests(
     tool_name: str,
     arguments: dict[str, Any],
@@ -241,16 +288,72 @@ def _tool_call_signature(tool_name: str, arguments: dict[str, Any]) -> tuple[str
     return tool_name, normalized_args
 
 
+def _tool_error_text(tool_output: Any) -> str:
+    if not isinstance(tool_output, str):
+        return ""
+    try:
+        parsed = json.loads(tool_output)
+    except (TypeError, ValueError):
+        return ""
+    if isinstance(parsed, dict) and parsed.get("error"):
+        return str(parsed.get("error") or "")
+    return ""
+
+
+def _is_permission_denial(error_text: str) -> bool:
+    lowered = str(error_text or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "not permitted",
+            "permission denied",
+            "unauthorized",
+            "rejected",
+        )
+    )
+
+
+def _permission_recovery_message(
+    tool_name: str,
+    arguments: dict[str, Any],
+    error_text: str,
+) -> str:
+    command = str(arguments.get("command") or "") if isinstance(arguments, dict) else ""
+    command_hint = ""
+    if tool_name == "run_command":
+        command_hint = (
+            " Do not retry denied commands, shell pipelines, redirections, "
+            "background jobs, or chained commands. Run one permitted command "
+            "at a time."
+        )
+    if "npm create" in command.lower() or "create vite" in command.lower():
+        command_hint += (
+            " For project scaffolding, create the required files with "
+            "write_file/edit_file instead of using interactive or remote "
+            "project generators."
+        )
+    return (
+        f"{tool_name} was denied by Constellation permissions: {error_text}."
+        f"{command_hint} Choose an allowed tool call that makes concrete progress."
+    )
+
+
 def _managed_prompt(
     *,
     task: str,
     tool_schemas: list[dict[str, Any]],
     transcript: list[dict[str, Any]],
+    cwd: str | None = None,
 ) -> str:
+    cwd_note = (
+        f"Relative file paths and command working directories default to: {cwd}\n"
+        if cwd else ""
+    )
     return (
         "Run the task using the managed Constellation tool loop.\n"
         "You may not use native shell, filesystem, browser, SCM, Jira, or other external tools.\n"
         "Use only the exact tool names from the allowed schemas below. Do not invent aliases.\n"
+        f"{cwd_note}"
         "If you need a tool, return exactly one JSON object in this shape:\n"
         '{"action":"tool","tool":"tool_name","arguments":{...}}\n'
         "If the task is complete, return exactly one JSON object in this shape:\n"
@@ -298,7 +401,12 @@ def run_managed_agentic_loop(
                 raw_output=last_text,
             )
 
-        prompt = _managed_prompt(task=task, tool_schemas=schemas, transcript=transcript)
+        prompt = _managed_prompt(
+            task=task,
+            tool_schemas=schemas,
+            transcript=transcript,
+            cwd=cwd,
+        )
         if on_progress:
             on_progress(f"{backend} managed turn {turn}/{max(1, int(max_turns or 1))}")
         if plugin_manager:
@@ -389,7 +497,9 @@ def run_managed_agentic_loop(
 
         tool_outputs: list[dict[str, Any]] = []
         repeated_messages: list[str] = []
+        permission_messages: list[str] = []
         for canonical_tool_name, canonical_args, requested_tool_name in expanded_requests:
+            canonical_args = _apply_default_cwd(canonical_tool_name, canonical_args, cwd)
             signature = _tool_call_signature(canonical_tool_name, canonical_args)
             repeated_identical_call = any(
                 _tool_call_signature(str(call.get("tool") or ""), call.get("arguments") or {}) == signature
@@ -415,6 +525,11 @@ def run_managed_agentic_loop(
                 "arguments": canonical_args,
                 "content": _transcript_content(tool_output),
             })
+            error_text = _tool_error_text(tool_output)
+            if _is_permission_denial(error_text):
+                permission_messages.append(
+                    _permission_recovery_message(canonical_tool_name, canonical_args, error_text)
+                )
             if on_progress:
                 on_progress(f"Tool: {canonical_tool_name}")
             if repeated_identical_call:
@@ -433,10 +548,11 @@ def run_managed_agentic_loop(
             "tool": expanded_requests[0][0] if len(expanded_requests) == 1 else "multiple",
             "content": tool_output,
         })
-        if repeated_messages:
+        system_messages = repeated_messages + permission_messages
+        if system_messages:
             transcript.append({
                 "role": "system",
-                "content": " ".join(repeated_messages) + (
+                "content": " ".join(system_messages) + (
                     " Use the existing result to make progress, choose a different "
                     "tool call, or return action='final'."
                 ),

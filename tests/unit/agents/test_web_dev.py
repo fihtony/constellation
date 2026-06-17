@@ -26,6 +26,10 @@ from agents.web_dev.nodes import (
     _detect_fragile_icon_font_usage,
     _is_implementation_ground_truth_present,
     _self_assessment_claims_conflict_with_ground_truth,
+    _bootstrap_minimal_frontend_scaffold,
+    _build_self_assessment_source_evidence,
+    _expand_changed_source_files,
+    _repo_has_frontend_entrypoint,
     _try_ground_truth_re_prompt,
     _rendered_page_has_content,
 )
@@ -1203,6 +1207,161 @@ class TestScreenshotRenderChecks:
         # Missing keys → not present.
         assert _is_implementation_ground_truth_present({}) is False
 
+    async def test_self_assess_source_evidence_expands_changed_directories(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        (repo_path / "src" / "pages").mkdir(parents=True)
+        (repo_path / "src" / "App.tsx").write_text(
+            "import { Route } from 'react-router-dom';\n"
+            "export default function App() { return <Route path=\"/quiz\" />; }\n",
+            encoding="utf-8",
+        )
+        (repo_path / "src" / "pages" / "PracticeQuizPage.tsx").write_text(
+            "export default function PracticeQuizPage() { return <main>Quiz</main>; }\n",
+            encoding="utf-8",
+        )
+        (repo_path / "node_modules" / "pkg").mkdir(parents=True)
+        (repo_path / "node_modules" / "pkg" / "index.js").write_text("ignore me", encoding="utf-8")
+        (repo_path / "dist").mkdir()
+        (repo_path / "dist" / "index.html").write_text("ignore me", encoding="utf-8")
+
+        expanded = _expand_changed_source_files(str(repo_path), ["src/", "node_modules/", "dist/"])
+        evidence = _build_self_assessment_source_evidence(str(repo_path), ["src/", "node_modules/", "dist/"])
+
+        assert "src/App.tsx" in expanded
+        assert "src/pages/PracticeQuizPage.tsx" in expanded
+        assert not any(path.startswith("node_modules/") for path in expanded)
+        assert not any(path.startswith("dist/") for path in expanded)
+        assert "--- src/App.tsx ---" in evidence
+        assert 'path="/quiz"' in evidence
+
+    async def test_self_assess_prompt_includes_source_evidence_for_changed_directories(
+        self, tmp_path
+    ):
+        repo_path = tmp_path / "repo"
+        (repo_path / "src" / "pages").mkdir(parents=True)
+        (repo_path / "src" / "App.tsx").write_text(
+            "import PracticeQuizPage from './pages/PracticeQuizPage';\n"
+            "export default function App() { return <PracticeQuizPage />; }\n",
+            encoding="utf-8",
+        )
+        (repo_path / "src" / "pages" / "PracticeQuizPage.tsx").write_text(
+            "export default function PracticeQuizPage() { return <main>Quiz</main>; }\n",
+            encoding="utf-8",
+        )
+
+        class _MockRuntime:
+            def __init__(self):
+                self.prompt = ""
+
+            def run(self, prompt, **kw):
+                self.prompt = prompt
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 0.95,
+                            "verdict": "pass",
+                            "criteria_checks": [],
+                            "component_checks": [],
+                            "self_review_issues": [],
+                            "gaps": [],
+                            "summary": "Source evidence verified.",
+                        }
+                    )
+                }
+
+        runtime = _MockRuntime()
+        result = await self_assess(
+            {
+                "_runtime": runtime,
+                "repo_path": str(repo_path),
+                "workspace_path": str(tmp_path),
+                "definition_of_done": {"screenshot_required": False},
+                "changes_made": ["src/"],
+                "implementation_summary": "Implemented page.",
+                "test_results": {"passed": 3, "failed": 0, "build_ok": True, "test_ok": True},
+            }
+        )
+
+        assert result["route"] == "pass"
+        assert "Deterministic source evidence" in runtime.prompt
+        assert "--- src/App.tsx ---" in runtime.prompt
+        assert "PracticeQuizPage" in runtime.prompt
+
+    async def test_minimal_frontend_scaffold_creates_entrypoint_without_overwriting(
+        self, tmp_path
+    ):
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        (repo_path / "package.json").write_text('{"name":"existing"}\n', encoding="utf-8")
+
+        created = _bootstrap_minimal_frontend_scaffold(
+            str(repo_path),
+            {"tech_stack": ["react", "vite"], "user_request": "Implement a page"},
+        )
+        created_again = _bootstrap_minimal_frontend_scaffold(
+            str(repo_path),
+            {"tech_stack": ["react", "vite"], "user_request": "Implement a page"},
+        )
+
+        assert _repo_has_frontend_entrypoint(str(repo_path)) is True
+        assert "src/App.tsx" in created
+        assert "src/main.tsx" in created
+        assert "package.json" not in created
+        assert (repo_path / "package.json").read_text(encoding="utf-8") == '{"name":"existing"}\n'
+        assert created_again == []
+
+    async def test_implement_changes_prepares_frontend_scaffold_for_greenfield_repo(
+        self, tmp_path, monkeypatch
+    ):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
+        from framework.validation_gates import ValidationResult
+
+        monkeypatch.setattr(
+            "framework.validation_gates.validate_files_changed",
+            lambda repo_path: ValidationResult(True, "files_changed"),
+        )
+
+        class _MockRuntime:
+            def __init__(self):
+                self.task = ""
+
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="copilot-cli",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                    cwd=True,
+                )
+
+            def run_agentic(self, task, **kw):
+                self.task = task
+                return AgenticResult(success=True, summary="Implemented page", backend_used="copilot-cli")
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        runtime = _MockRuntime()
+
+        result = await implement_changes(
+            {
+                "_runtime": runtime,
+                "user_request": "Implement a React page",
+                "implementation_plan": "Build the UI",
+                "repo_path": str(repo_path),
+                "workspace_path": str(tmp_path),
+                "branch_name": "feature/frontend",
+                "tech_stack": ["react", "vite"],
+                "_allowed_tools": ["read_file", "write_file", "run_command"],
+            }
+        )
+
+        assert result["agentic_success"] is True
+        assert (repo_path / "src" / "App.tsx").is_file()
+        assert (repo_path / "src" / "main.tsx").is_file()
+        assert "Workflow scaffold note" in runtime.task
+        assert "src/App.tsx" in runtime.task
+        assert "Replace the placeholder" in runtime.task
+
     async def test_self_assessment_claims_conflict_with_ground_truth(self, tmp_path):
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
@@ -1237,6 +1396,24 @@ class TestScreenshotRenderChecks:
                         "severity": "high",
                         "file": "src/x.jsx",
                         "message": "changed files list does not include src/x.jsx, so the implementation cannot be verified.",
+                        "blocking": True,
+                    }
+                ]
+            },
+        )
+        assert conflict is True
+        assert "src/x.jsx" in reason
+
+        # Model says an existing file cannot be inspected — also a
+        # contradiction once deterministic source evidence can read it.
+        conflict, reason = _self_assessment_claims_conflict_with_ground_truth(
+            {"repo_path": str(repo_path)},
+            {
+                "self_review_issues": [
+                    {
+                        "severity": "high",
+                        "file": "src/x.jsx",
+                        "message": "Unable to verify routing configuration because x.jsx is not inspectable.",
                         "blocking": True,
                     }
                 ]
@@ -1903,6 +2080,99 @@ class TestWebDevNodes:
         assert "copilot-cli returned error" in message
         assert "claude-code returned error" not in message
 
+    async def test_implement_changes_rejects_frontend_config_only_progress(
+        self, monkeypatch, tmp_path
+    ):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
+
+        monkeypatch.setattr(
+            "agents.web_dev.nodes._bootstrap_minimal_frontend_scaffold",
+            lambda *args, **kwargs: [],
+        )
+
+        class _MockRuntime:
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="copilot-cli",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                    cwd=True,
+                )
+
+            def run_agentic(self, task, **kw):
+                return AgenticResult(success=True, summary="Updated package.json", backend_used="copilot-cli")
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        (repo_path / "package.json").write_text('{"dependencies":{"react":"^18.2.0"}}', encoding="utf-8")
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await implement_changes(
+                {
+                    "_runtime": _MockRuntime(),
+                    "user_request": "Implement a React page",
+                    "implementation_plan": "Build the UI",
+                    "repo_path": str(repo_path),
+                    "workspace_path": str(tmp_path),
+                    "branch_name": "feature/frontend",
+                    "tech_stack": ["react", "vite"],
+                    "_allowed_tools": ["read_file", "write_file", "run_command"],
+                }
+            )
+
+        assert "did not create a frontend source entrypoint" in str(exc_info.value)
+
+    async def test_implement_changes_uses_configurable_agentic_budget(
+        self, monkeypatch, tmp_path
+    ):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
+        from framework.validation_gates import ValidationResult
+
+        monkeypatch.setenv("WEB_DEV_IMPLEMENT_MAX_TURNS", "96")
+        monkeypatch.setenv("WEB_DEV_IMPLEMENT_TIMEOUT_SECONDS", "3600")
+        monkeypatch.setattr(
+            "framework.validation_gates.validate_files_changed",
+            lambda repo_path: ValidationResult(True, "files_changed"),
+        )
+
+        class _MockRuntime:
+            def __init__(self):
+                self.kwargs = {}
+
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="copilot-cli",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                    cwd=True,
+                )
+
+            def run_agentic(self, task, **kw):
+                self.kwargs = kw
+                return AgenticResult(success=True, summary="Implemented backend change", backend_used="mock")
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        runtime = _MockRuntime()
+
+        await implement_changes(
+            {
+                "_runtime": runtime,
+                "user_request": "Implement a backend change",
+                "implementation_plan": "Update the service.",
+                "repo_path": str(repo_path),
+                "workspace_path": str(tmp_path),
+                "branch_name": "feature/backend",
+                "tech_stack": ["python"],
+                "_allowed_tools": ["read_file", "write_file", "run_command"],
+            }
+        )
+
+        assert runtime.kwargs["max_turns"] == 96
+        assert runtime.kwargs["timeout"] == 3600
+
     async def test_run_tests_pass_no_runtime(self):
         state = {"test_cycles": 0}
         result = await run_tests(state)
@@ -2001,6 +2271,51 @@ class TestWebDevNodes:
         assert "Fixed" in result["fix_summary"]
         assert runtime.kwargs["tools"] == ["read_file", "run_command"]
         assert runtime.kwargs["allowed_tools"] == ["read_file", "run_command"]
+        assert runtime.kwargs["max_turns"] == 35
+        assert runtime.kwargs["timeout"] == 900
+
+    async def test_fix_tests_accepts_recoverable_protocol_failure_with_edits(
+        self, tmp_path
+    ):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
+
+        class _MockRuntime:
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="copilot-cli",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                    cwd=True,
+                )
+
+            def run_agentic(self, task, **kw):
+                return AgenticResult(
+                    success=False,
+                    summary=(
+                        "copilot-cli managed agentic loop did not return valid "
+                        "managed-loop JSON after 35 turns."
+                    ),
+                    backend_used="copilot-cli",
+                    tool_calls=[{"tool": "edit_file", "arguments": {"path": "src/App.test.tsx"}}],
+                )
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        result = await fix_tests(
+            {
+                "_runtime": _MockRuntime(),
+                "test_output": "failing test",
+                "repo_path": str(repo_path),
+                "workspace_path": str(tmp_path),
+                "changes_made": ["src/App.test.tsx"],
+                "_allowed_tools": ["read_file", "edit_file", "run_command"],
+            }
+        )
+
+        assert result["agentic_success"] is True
+        assert "Partial test-fix progress" in result["fix_summary"]
 
     async def test_fix_gaps_with_runtime_uses_same_agentic_policy(self, tmp_path):
         from framework.runtime.adapter import AgenticCapabilities, AgenticResult
@@ -2039,6 +2354,51 @@ class TestWebDevNodes:
         assert result["fix_gaps_attempted"] is True
         assert runtime.kwargs["tools"] == ["read_file", "write_file", "run_command"]
         assert runtime.kwargs["allowed_tools"] == ["read_file", "write_file", "run_command"]
+        assert runtime.kwargs["max_turns"] == 30
+        assert runtime.kwargs["timeout"] == 600
+
+    async def test_fix_gaps_accepts_recoverable_protocol_failure_with_edits(
+        self, tmp_path
+    ):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
+
+        class _MockRuntime:
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="copilot-cli",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                    cwd=True,
+                )
+
+            def run_agentic(self, task, **kw):
+                return AgenticResult(
+                    success=False,
+                    summary=(
+                        "copilot-cli managed agentic loop did not return valid "
+                        "managed-loop JSON after 30 turns."
+                    ),
+                    backend_used="copilot-cli",
+                    tool_calls=[{"tool": "write_file", "arguments": {"path": "src/App.tsx"}}],
+                )
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        result = await fix_gaps(
+            {
+                "_runtime": _MockRuntime(),
+                "repo_path": str(repo_path),
+                "workspace_path": str(tmp_path),
+                "changes_made": ["src/App.tsx"],
+                "self_assessment": {"gaps": ["Address a generic implementation gap."]},
+                "_allowed_tools": ["read_file", "write_file", "run_command"],
+            }
+        )
+
+        assert result["agentic_success"] is True
+        assert "Partial self-check-gap-fix progress" in result["fix_gaps_summary"]
 
     async def test_capture_screenshot_requires_png_for_ui_task(self, tmp_path):
         state = {

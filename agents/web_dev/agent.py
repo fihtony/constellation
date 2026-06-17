@@ -274,6 +274,9 @@ class WebDevAgent(BaseAgent):
             "max_test_cycles": metadata.get("maxTestCycles") or int(
                 os.environ.get("WEB_DEV_MAX_TEST_CYCLES", "3")
             ),
+            "max_assess_cycles": metadata.get("maxAssessCycles") or int(
+                os.environ.get("WEB_DEV_MAX_ASSESS_CYCLES", "3")
+            ),
             "metadata": metadata,
             # Populate _allowed_tools from the permission engine so run_agentic
             # only exposes the development-profile tool list to the LLM, rather
@@ -340,7 +343,7 @@ class WebDevAgent(BaseAgent):
 
                 config = self._build_run_config(
                     task.id,
-                    max_steps=50,
+                    max_steps=int(os.environ.get("WEB_DEV_WORKFLOW_MAX_STEPS", "80")),
                     timeout_seconds=int(os.environ.get("WEB_DEV_WORKFLOW_TIMEOUT", "7200")),
                 )
                 result = loop.run_until_complete(

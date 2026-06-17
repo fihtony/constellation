@@ -70,6 +70,13 @@ Tool protocol rules:
   CLI tool names or aliases such as Read, Bash, MultiEdit, or read_multiple_files.
 - For shell commands, use the authorized run_command tool.
 - For file reads, use read_file; for file writes, use write_file or edit_file.
+- Run one command per run_command call. Do not use shell pipelines, redirects,
+  background jobs, `&&`, `||`, `;`, `sleep`, `curl`, or `wget` in this node.
+- Do NOT use interactive or remote project generators such as `npm create`,
+  `create-vite`, or `yarn create`. If scaffolding is needed, create the files
+  directly with write_file/edit_file.
+- If a command is denied by permissions, do not retry it. Recover by using the
+  allowed tools and by writing/editing the needed files directly.
 
 BLANK SCREEN PREVENTION RULES (MANDATORY — apply to every React/Vue/Vite task):
 These rules prevent the most common cause of blank screens in React applications.
@@ -156,7 +163,10 @@ When Design HTML Reference is provided (not "N/A"), it is the ABSOLUTE SOURCE OF
    - This audit MUST be completed — do not skip it.
 
 Greenfield guidance (repo is empty or README-only):
-- Scaffold the full project structure in your FIRST turn.
+- Scaffold the full project structure in your FIRST turn with write_file.
+- If Constellation already prepared a generic scaffold, immediately replace
+  placeholder source content with the requested implementation.
+- Do not use `npm create`, `create-vite`, or other project generators.
 - Choose the tech stack from the Jira context or task description.
 - Create: project config file (package.json / pyproject.toml / build.gradle), \
 at least one source file, and at least one test file.
@@ -164,6 +174,7 @@ at least one source file, and at least one test file.
 npm/package.json rules (MANDATORY — prevent hallucinated packages):
 - Before adding ANY package to package.json, verify it exists on npm:
   Run: npm info <package-name> version
+  Use one npm info command at a time; do not chain package checks with `&&`.
   If the command returns an error or empty output, the package does NOT exist — \
   do NOT add it to package.json.
 - After creating/updating package.json, run: npm install
@@ -298,11 +309,14 @@ F. TAILWIND CSS SETUP (MANDATORY when Design HTML Reference uses Tailwind classe
      - CSS classes like: flex, items-center, text-primary, max-w-[...], space-x-*, etc.
      - A tailwind.config object in a <script> tag
 
-   INSTALL STEPS (for Vite+React):
+  INSTALL STEPS (for Vite+React):
    1. Install packages (verify they exist first):
-      npm info tailwindcss version && npm info postcss version && npm info autoprefixer version
+      npm info tailwindcss version
+      npm info postcss version
+      npm info autoprefixer version
       npm install -D tailwindcss postcss autoprefixer
-      npx tailwindcss init -p
+      Create tailwind.config.js and postcss.config.js with write_file/edit_file.
+      Do NOT run `npx tailwindcss init -p`.
 
    2. In tailwind.config.js, COPY the COMPLETE design token configuration from the
       Design HTML Reference's tailwind.config object. This includes:
@@ -353,23 +367,21 @@ F. TAILWIND CSS SETUP (MANDATORY when Design HTML Reference uses Tailwind classe
       @tailwind utilities;
 
    4. Verify Tailwind works: run `npm run build` — if it fails with Tailwind errors, fix them.
-      Also check that design token classes resolve: `npx tailwindcss --content 'src/**/*.jsx' --minify | grep 'text-primary'`
-      → Should output CSS for text-primary; if empty, check tailwind.config.js.
+      Use code inspection to confirm design token classes exist in tailwind.config.js.
 
    5. IMPORTANT: When design tokens use hyphenated names like "on-tertiary-container",
       Tailwind requires them to be quoted in the config AND the HTML/JSX must use the
       full class name: `bg-on-tertiary-container` (not `bg-on_tertiary_container`).
 
 G. RENDERED PAGE VERIFICATION (MANDATORY before committing UI tasks):
-   After implementation, verify the rendered page matches the design:
-   1. Start dev server: npm run dev -- --port 5179 &
-      sleep 10
-   2. Check the page renders: curl -s http://localhost:5179 | grep -c "DOCTYPE|<div"
-      → If count > 0, page is rendering HTML
-   3. Check for icon issues: curl -s http://localhost:5179 | grep -o 'arrow_forward|chevron_right'
-      → If found in non-font context, icons may not be rendering
-   4. Check Tailwind is processing: look for style attribute or class in rendered HTML
-   5. Stop server: kill %1 2>/dev/null || pkill -f "vite.*5179"
+   During this implementation node, use source inspection and one-shot build
+   commands only. Later workflow nodes run browser rendering and screenshots.
+   Before committing, compare key source elements with the Design HTML Reference:
+   1. Header: correct logo, nav links, sign-in button
+   2. Main: correct heading text, CTA button, category links, or task-specific content
+   3. Icons: no raw ligature text such as arrow_forward or chevron_right remains in JSX
+   4. Footer: positioned at bottom, correct copyright text and links when present
+   5. Tailwind/config: token classes used in JSX are defined in tailwind.config.js
    6. Compare key design elements with the Design HTML Reference:
       - Header: correct logo, nav links, sign-in button
       - Main: correct heading text, CTA button (correct color), category links
@@ -452,7 +464,7 @@ For UI tasks — MANDATORY steps (in order):
    DETECT: If the Design HTML Reference contains `cdn.tailwindcss.com` or a tailwind.config
    script block → Tailwind is used. YOU MUST install and configure it.
    a. Install packages: npm install -D tailwindcss postcss autoprefixer
-   b. Init: npx tailwindcss init -p
+   b. Create tailwind.config.js and postcss.config.js with write_file/edit_file.
    c. In tailwind.config.js — set content paths AND copy ALL design tokens from the
       Design HTML Reference's tailwind.config object (colors, fontFamily, fontSize, spacing,
       borderRadius). The content path must be: ['./index.html', './src/**/*.{{js,jsx,ts,tsx}}']
@@ -494,33 +506,26 @@ For UI tasks — MANDATORY steps (in order):
    - Open App.tsx and confirm the new page component is imported and rendered.
    - If app uses React Router, confirm a <Route> for the new page exists.
    - If the page is NOT wired in App.tsx, add the import and route NOW.
-   - Start the dev server briefly to confirm the page renders without a blank screen:
-       cd {repo_path} && npm run dev -- --port 5179 &
-       sleep 10
-       curl -s http://localhost:5179 | head -50   # should show HTML, not blank
-       kill %1 2>/dev/null || true
-   - If the server responds with blank HTML or errors, fix App.tsx routing before continuing.
+   - Do not start a dev server in this node. Confirm wiring via source inspection
+     and `npm run build`; later workflow nodes own browser rendering and screenshots.
+   - If build or source inspection shows blank-screen risk, fix App.tsx routing before continuing.
 
 9. RENDERED PAGE COMPARISON — MANDATORY before committing (for UI tasks with design reference):
-   Compare your implementation against the Design HTML Reference by running the app:
-   a. Start dev server: cd {repo_path} && npm run dev -- --port 5179 &
-      sleep 10
-   b. Fetch rendered HTML: curl -s http://localhost:5179 > /tmp/rendered.html
-   c. Compare component by component:
-      - Check header: grep -o 'Linguist Library|Sign In' /tmp/rendered.html
-      - Check main content: grep -o 'Master Academic|Start Learning' /tmp/rendered.html
-      - Check icons: grep -o 'material-symbols-outlined' /tmp/rendered.html
-        → Should find the CSS class, not raw icon names outside a class
-      - Check footer: grep -o 'Terms of Service|Privacy Policy' /tmp/rendered.html
-   d. Common issues to check:
+   Compare your source implementation against the Design HTML Reference:
+   a. Compare component by component in source:
+      - Header/nav from the design is implemented with matching visible text.
+      - Main content from the design is implemented with matching visible text.
+      - Icon ligatures from the design are replaced with inline SVG/local icons.
+      - Footer from the design is implemented when present.
+   b. Common issues to check:
       - If page or screenshot shows plain text "arrow_forward" → remote icon font is not
         rendering reliably; replace the icon with inline SVG or a local icon component before
         continuing
       - If footer is floating midpage → missing flex-col min-h-screen on root wrapper
       - If design colors are wrong → Tailwind config not set up with tokens
       - If fonts are wrong → Google Fonts link missing or font-family not applied
-   e. Stop server: kill %1 2>/dev/null || pkill -f "vite.*5179" || true
-   f. Fix ALL issues found before committing.
+   c. Fix ALL issues found before committing. Browser rendering and screenshot
+      comparison run in later deterministic workflow nodes.
 
 10. DESIGN FIDELITY AUDIT — MANDATORY before committing (for UI tasks):
     Compare your implementation against the Design HTML Reference:
@@ -650,6 +655,9 @@ Test results:
 Changed files:
 {changed_files}
 
+Deterministic source evidence collected by the workflow:
+{source_evidence}
+
 Instructions:
 
 STEP 1 — ACCEPTANCE CRITERIA:
@@ -685,6 +693,9 @@ Verify font families, primary colors, and spacing match the design spec.
 
 STEP 5 — ROUTING CHECK:
 Confirm the new page is wired into App.tsx. If not, add gap: "Blank screen: page not routed".
+If App.tsx or another router/entry file appears in Deterministic source evidence,
+use that evidence. Do NOT fail with "not inspectable", "not included in changed
+files", or "cannot verify" for a file that is listed or shown there.
 
 STEP 6 — CODE-REVIEW STANDARD PARITY:
 Run the SAME merge-blocking standard used by the Code Review Agent across:
