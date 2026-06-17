@@ -179,6 +179,150 @@ def test_managed_agentic_loop_repairs_plain_text_response_before_success(monkeyp
     assert "Invalid response format" in prompts[1]
 
 
+def test_managed_agentic_loop_accepts_tool_call_wrapper_json(monkeypatch) -> None:
+    from framework.runtime.copilot_cli import CopilotCLIAdapter
+
+    responses = [
+        {
+            "raw_response": (
+                "<think>I need to inspect the file.</think>\n"
+                "[TOOL_CALL]\n"
+                '{"tool": "read_file", "args": {"path": "src/App.tsx"}}\n'
+                "[/TOOL_CALL]"
+            )
+        },
+        {"raw_response": '{"action": "final", "summary": "inspected"}'},
+    ]
+
+    def fake_single_shot(self, prompt, **kwargs):
+        return responses.pop(0)
+
+    class FakeRegistry:
+        def list_schemas(self, tool_names):
+            return [{"function": {"name": name, "parameters": {"type": "object"}}} for name in tool_names]
+
+        def execute_sync(self, name, arguments):
+            assert name == "read_file"
+            assert arguments == {"path": "src/App.tsx"}
+            return '{"content": "export default function App() {}", "path": "src/App.tsx"}'
+
+    monkeypatch.setattr(CopilotCLIAdapter, "run", fake_single_shot)
+    monkeypatch.setattr("framework.tools.registry.get_registry", lambda: FakeRegistry())
+
+    result = CopilotCLIAdapter().run_agentic(
+        "Inspect the app.",
+        tools=["read_file"],
+        allowed_tools=["read_file"],
+        max_turns=2,
+    )
+
+    assert result.success is True
+    assert result.summary == "inspected"
+    assert result.tool_calls == [
+        {"tool": "read_file", "arguments": {"path": "src/App.tsx"}, "turn": 1}
+    ]
+
+
+def test_managed_agentic_loop_accepts_loose_cli_tool_call(monkeypatch) -> None:
+    from framework.runtime.copilot_cli import CopilotCLIAdapter
+
+    responses = [
+        {
+            "raw_response": (
+                "[TOOL_CALL]\n"
+                '{tool => "read_file", args => {\n'
+                '  --path "src/App.tsx"\n'
+                "}}\n"
+                "[/TOOL_CALL]"
+            )
+        },
+        {"raw_response": '{"action": "final", "summary": "inspected"}'},
+    ]
+
+    def fake_single_shot(self, prompt, **kwargs):
+        return responses.pop(0)
+
+    class FakeRegistry:
+        def list_schemas(self, tool_names):
+            return [{"function": {"name": name, "parameters": {"type": "object"}}} for name in tool_names]
+
+        def execute_sync(self, name, arguments):
+            assert name == "read_file"
+            assert arguments == {"path": "src/App.tsx"}
+            return '{"content": "ok"}'
+
+    monkeypatch.setattr(CopilotCLIAdapter, "run", fake_single_shot)
+    monkeypatch.setattr("framework.tools.registry.get_registry", lambda: FakeRegistry())
+
+    result = CopilotCLIAdapter().run_agentic(
+        "Inspect the app.",
+        tools=["read_file"],
+        allowed_tools=["read_file"],
+        max_turns=2,
+    )
+
+    assert result.success is True
+    assert result.tool_calls == [
+        {"tool": "read_file", "arguments": {"path": "src/App.tsx"}, "turn": 1}
+    ]
+
+
+def test_managed_agentic_loop_expands_read_multiple_files_alias(monkeypatch) -> None:
+    from framework.runtime.copilot_cli import CopilotCLIAdapter
+
+    responses = [
+        {
+            "raw_response": (
+                '{"tool": "read_multiple_files", '
+                '"args": {"paths": ["src/App.tsx", "src/main.tsx"]}}'
+            )
+        },
+        {"raw_response": '{"action": "final", "summary": "read both"}'},
+    ]
+    executed: list[tuple[str, dict]] = []
+
+    def fake_single_shot(self, prompt, **kwargs):
+        return responses.pop(0)
+
+    class FakeRegistry:
+        def list_schemas(self, tool_names):
+            return [{"function": {"name": name, "parameters": {"type": "object"}}} for name in tool_names]
+
+        def execute_sync(self, name, arguments):
+            executed.append((name, arguments))
+            return '{"content": "ok"}'
+
+    monkeypatch.setattr(CopilotCLIAdapter, "run", fake_single_shot)
+    monkeypatch.setattr("framework.tools.registry.get_registry", lambda: FakeRegistry())
+
+    result = CopilotCLIAdapter().run_agentic(
+        "Inspect files.",
+        tools=["read_file"],
+        allowed_tools=["read_file"],
+        max_turns=2,
+    )
+
+    assert result.success is True
+    assert executed == [
+        ("read_file", {"path": "src/App.tsx"}),
+        ("read_file", {"path": "src/main.tsx"}),
+    ]
+    assert result.tool_calls == [
+        {
+            "tool": "read_file",
+            "arguments": {"path": "src/App.tsx"},
+            "turn": 1,
+            "requested_tool": "read_multiple_files",
+        },
+        {
+            "tool": "read_file",
+            "arguments": {"path": "src/main.tsx"},
+            "turn": 1,
+            "requested_tool": "read_multiple_files",
+        },
+    ]
+
+
 def test_managed_agentic_loop_warns_on_repeated_identical_tool_call(monkeypatch) -> None:
     from framework.runtime.copilot_cli import CopilotCLIAdapter
 

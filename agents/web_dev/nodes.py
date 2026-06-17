@@ -193,6 +193,36 @@ def _runtime_backend_label(runtime: Any, result: Any) -> str:
     return runtime.__class__.__name__ if runtime is not None else "runtime"
 
 
+def _agentic_failure_allows_partial_progress(summary: str) -> bool:
+    """Return True when a backend failure can still flow into validation.
+
+    Text-managed CLI backends sometimes finish useful file edits but fail to
+    emit the final managed-loop JSON envelope. That is a protocol/finalization
+    failure, not evidence that the code is unusable. The deterministic build,
+    test, self-check, screenshot, and PR gates are better judges once files
+    exist. Permission failures and tool-policy violations still fail closed.
+    """
+    lowered = str(summary or "").lower()
+    recoverable_markers = (
+        "did not return valid managed-loop json",
+        "timed out",
+        "timeout",
+        "max turns",
+        "after 50 turns",
+        "after 20 turns",
+        "after 15 turns",
+    )
+    blocking_markers = (
+        "unauthorized tool",
+        "permission denied",
+        "does not support",
+        "rejected",
+    )
+    return any(marker in lowered for marker in recoverable_markers) and not any(
+        marker in lowered for marker in blocking_markers
+    )
+
+
 def _agentic_policy_for_state(state: dict, runtime: Any):
     from framework.agentic_policy import (
         agentic_policy_kwargs,
@@ -1242,7 +1272,7 @@ async def implement_changes(state: dict) -> dict:
         # Before failing, check if the agentic CLI committed code despite the
         # error/timeout. Some backends commit changes before a later validation
         # step fails or times out; do not discard committed work in that case.
-        _commits_exist = False
+        _partial_changes_exist = bool(changed_after)
         try:
             import subprocess as _sp
             from framework.env_utils import build_isolated_git_env as _bge
@@ -1252,13 +1282,19 @@ async def implement_changes(state: dict) -> dict:
                 cwd=state.get("repo_path", ""), capture_output=True, text=True,
                 timeout=10, env=_ge,
             )
-            _commits_exist = _diff.returncode == 0 and bool(_diff.stdout.strip())
+            _partial_changes_exist = (
+                _partial_changes_exist
+                or (_diff.returncode == 0 and bool(_diff.stdout.strip()))
+            )
         except Exception:
             pass
-        if _commits_exist:
+        if _partial_changes_exist and _agentic_failure_allows_partial_progress(result.summary):
             print(f"[{_AGENT_ID}] implement_changes: agentic error ({result.summary[:200]!r}) "
-                  f"but commits found on branch — proceeding with partial implementation")
-            impl_summary = f"Partial implementation (stopped early). Commits present. Error: {result.summary[:200]}"
+                  f"but repository changes exist — proceeding to deterministic validation")
+            impl_summary = (
+                "Partial implementation (agentic backend stopped before final JSON). "
+                f"Repository changes found; validation will decide. Error: {result.summary[:200]}"
+            )
         else:
             backend_label = _runtime_backend_label(runtime, result)
             raise RuntimeError(
@@ -1816,6 +1852,10 @@ def _apply_deterministic_gaps(
     """
     deterministic_gaps: list[str] = []
     blocking_issue_gaps: list[str] = []
+    deterministic_findings = data.get("deterministic_findings")
+    if not isinstance(deterministic_findings, list):
+        deterministic_findings = []
+        data["deterministic_findings"] = deterministic_findings
     self_review_issues = data.get("self_review_issues", [])
     if not isinstance(self_review_issues, list):
         self_review_issues = []
@@ -1848,6 +1888,20 @@ def _apply_deterministic_gaps(
         # them as blocking so they keep their existing fail semantics.
         blocking_issue_gaps.extend(icon_validation.get("issues") or [])
         if icon_validation.get("issues"):
+            deterministic_findings.append(
+                {
+                    "kind": "fragile_icon_font_usage",
+                    "blocking": True,
+                    "files": icon_validation.get("files") or [],
+                    "icon_tokens": icon_validation.get("icon_tokens") or [],
+                    "message": icon_validation["issues"][0],
+                    "recommended_fix": (
+                        "Replace icon-font ligature text and Material icon "
+                        "classes in runtime markup with inline SVG or local "
+                        "React icon components."
+                    ),
+                }
+            )
             data["component_checks"].append(
                 {
                     "component": "Icon rendering",
@@ -2451,11 +2505,16 @@ async def fix_gaps(state: dict) -> dict:
 
     assessment = state.get("self_assessment", {})
     gaps = assessment.get("gaps", [])
+    deterministic_findings = assessment.get("deterministic_findings", [])
     changed_files = _workflow_changed_files(state)
     log.info("fix_gaps started", gaps=len(gaps), files_changed=len(changed_files))
 
     prompt = FIX_GAPS_TEMPLATE.format(
         gaps="\n".join(f"- {g}" for g in gaps) if gaps else "No specific gaps listed.",
+        deterministic_findings=(
+            json.dumps(deterministic_findings, ensure_ascii=False, indent=2)
+            if deterministic_findings else "[]"
+        ),
         repo_path=state.get("repo_path", ""),
         changed_files="\n".join(changed_files) if changed_files else "unknown",
     )

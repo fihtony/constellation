@@ -35,13 +35,13 @@ If no Jira key is available use "feature/<short-slug>".
 
 IMPLEMENT_SYSTEM = """\
 You are an expert full-stack developer implementing changes in a local repository.
-You are running inside an agentic coding CLI with native filesystem and shell tools.
+You are running inside an agentic coding workflow with an authorized tool surface.
 The working directory is already set to the repository root.
 
 CRITICAL SPEED RULES — READ FIRST:
 - The current repository state is listed at the END of your task prompt.
 - You MUST write or edit a file within your first 3 turns.
-- Spend AT MOST 2 turns on exploration (Read / Glob / Bash ls).
+- Spend AT MOST 2 turns on exploration (read_file / glob / run_command ls).
 - If the repo is empty or has only README.md, start scaffolding files IMMEDIATELY \
 in turn 1 — do not explore further.
 - You have a limited number of turns. Exploration turns that don't produce a file \
@@ -64,6 +64,12 @@ that exit on their own, such as `npm run build` or `npx vitest --run`.
    a. Stage all changes:  git add -A
    b. Commit with a descriptive message: git commit -m 'feat(<jira-key>): <summary>'
 7. Produce a brief summary of what was changed and why.
+
+Tool protocol rules:
+- Use only the tool names made available by the runtime. Do not invent native
+  CLI tool names or aliases such as Read, Bash, MultiEdit, or read_multiple_files.
+- For shell commands, use the authorized run_command tool.
+- For file reads, use read_file; for file writes, use write_file or edit_file.
 
 BLANK SCREEN PREVENTION RULES (MANDATORY — apply to every React/Vue/Vite task):
 These rules prevent the most common cause of blank screens in React applications.
@@ -556,6 +562,8 @@ Rules:
 6. After each fix, re-read the changed file to verify correctness.
 7. If the failure is caused by a legitimate test expectation mismatch, update the
   implementation to satisfy it rather than changing the assertion.
+8. Use only the tool names made available by the runtime. Do not invent aliases
+  such as Bash, Read, MultiEdit, or read_multiple_files.
 """
 
 FIX_TEMPLATE = """\
@@ -737,6 +745,10 @@ Rules:
 3. After each fix, re-read to verify correctness.
 4. Do NOT add features beyond what the gap requires.
 5. Focus on the gaps listed — do not refactor unrelated code.
+6. Use only the tool names made available by the runtime. Do not invent aliases
+  such as Bash, Read, MultiEdit, or read_multiple_files.
+7. When deterministic findings are provided, handle blocking deterministic
+  findings first because they were produced by workflow checks, not opinion.
 """
 
 FIX_GAPS_TEMPLATE = """\
@@ -744,9 +756,14 @@ The self-assessment found these gaps:
 
 {gaps}
 
+Deterministic workflow findings:
+{deterministic_findings}
+
 Repository path: {repo_path}
 Previously changed files:
 {changed_files}
 
-Fix each gap. After all fixes, verify correctness by re-reading changed files.
+Fix each gap. For deterministic findings, use the listed files/tokens as the
+starting point and make a minimal general fix. After all fixes, verify
+correctness by re-reading changed files.
 """

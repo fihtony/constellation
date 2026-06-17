@@ -1748,6 +1748,65 @@ class TestWebDevNodes:
         assert runtime.kwargs["tools"] == ["read_file", "write_file", "run_command"]
         assert runtime.kwargs["allowed_tools"] == ["read_file", "write_file", "run_command"]
 
+    async def test_implement_changes_continues_when_protocol_fails_but_files_changed(
+        self, tmp_path, monkeypatch
+    ):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
+        from framework.validation_gates import ValidationResult
+
+        monkeypatch.setattr(
+            "framework.validation_gates.validate_files_changed",
+            lambda repo_path: ValidationResult(True, "files_changed"),
+        )
+        monkeypatch.setattr(
+            "agents.web_dev.nodes._git_branch_changed_files",
+            lambda *args, **kwargs: [],
+        )
+        worktree_calls = iter([[], ["src/App.tsx"]])
+        monkeypatch.setattr(
+            "agents.web_dev.nodes._git_worktree_changed_files",
+            lambda *args, **kwargs: next(worktree_calls, ["src/App.tsx"]),
+        )
+
+        class _MockRuntime:
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="copilot-cli",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                    cwd=True,
+                )
+
+            def run_agentic(self, task, **kw):
+                return AgenticResult(
+                    success=False,
+                    summary=(
+                        "copilot-cli managed agentic loop did not return valid "
+                        "managed-loop JSON after 50 turns."
+                    ),
+                    backend_used="copilot-cli",
+                )
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        result = await implement_changes(
+            {
+                "_runtime": _MockRuntime(),
+                "user_request": "Implement feature",
+                "implementation_plan": "Create page",
+                "repo_path": str(repo_path),
+                "workspace_path": str(tmp_path),
+                "branch_name": "feature/example",
+                "_allowed_tools": ["read_file", "write_file"],
+            }
+        )
+
+        assert result["agentic_success"] is False
+        assert "Partial implementation" in result["implementation_summary"]
+        assert result["changes_made"] == ["src/App.tsx"]
+
     async def test_implement_changes_error_names_actual_backend(self, monkeypatch, tmp_path):
         from framework.runtime.adapter import AgenticResult
 
