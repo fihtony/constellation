@@ -20,6 +20,11 @@ from pathlib import Path as _Path
 from typing import Any
 
 from framework.config import load_agent_config as _load_agent_cfg
+from framework.context_budget import (
+    compact_delivery_plan,
+    compact_jira_context,
+    text_for_prompt,
+)
 from framework.devlog import AgentLogger
 from framework.major_step import (
     LIFECYCLE_DONE,
@@ -88,38 +93,8 @@ def _boundary_log(state: dict, agent_id: str, message: str, **kwargs: Any) -> No
 # ---------------------------------------------------------------------------
 
 def _summarize_jira_context(jira_ctx: dict, max_chars: int = 3000) -> str:
-    """Extract only essential Jira fields and truncate to avoid context window overflow.
-
-    The raw Jira REST API response can be hundreds of KB. Only the fields
-    relevant for implementation are kept.
-    """
-    if not jira_ctx:
-        return "N/A"
-    fields = jira_ctx.get("fields") or jira_ctx
-    desc = fields.get("description") or ""
-    if isinstance(desc, dict):
-        # Atlassian Document Format — flatten to plain text
-        try:
-            desc = json.dumps(desc, ensure_ascii=False)
-        except Exception:
-            desc = str(desc)
-    essential: dict = {
-        "key": jira_ctx.get("key", ""),
-        "summary": fields.get("summary", ""),
-        "description": desc[:15000] + ("...(truncated)" if len(str(desc)) > 15000 else ""),
-        "status": (fields.get("status") or {}).get("name", ""),
-        "priority": (fields.get("priority") or {}).get("name", ""),
-        "issuetype": (fields.get("issuetype") or {}).get("name", ""),
-        "labels": fields.get("labels", []),
-        "components": [c.get("name", "") for c in (fields.get("components") or []) if isinstance(c, dict)],
-        "assignee": ((fields.get("assignee") or {}).get("displayName", "")
-                     or (fields.get("assignee") or {}).get("name", "")),
-    }
-    result = json.dumps(essential, ensure_ascii=False)
-    if len(result) > max_chars:
-        essential["description"] = essential["description"][:5000] + "...(further truncated)"
-        result = json.dumps(essential, ensure_ascii=False)
-    return result
+    """Extract only essential Jira fields and truncate to avoid prompt overflow."""
+    return compact_jira_context(jira_ctx, max_chars=max_chars)
 
 
 def _safe_json(text: str, fallback: Any = None) -> Any:
@@ -1000,7 +975,11 @@ async def analyze_task(state: dict) -> dict:
     print(f"[{_AGENT_ID}] analyze_task: building implementation plan")
 
     workspace_path = state.get("workspace_path", "")
-    analysis = state.get("analysis") or state.get("user_request", "")
+    analysis = text_for_prompt(
+        state.get("analysis") or state.get("analysis_summary") or state.get("user_request", ""),
+        max_chars=3000,
+        default="",
+    )
 
     # Try to load Team Lead's delivery-plan.json for structured plan data
     delivery_plan: dict = {}
@@ -1009,7 +988,7 @@ async def analyze_task(state: dict) -> dict:
         try:
             with open(plan_path, encoding="utf-8") as fh:
                 doc = json.load(fh)
-                delivery_plan = doc.get("data", doc)
+                delivery_plan = compact_delivery_plan(doc.get("data", doc))
                 print(f"[{_AGENT_ID}] Loaded delivery-plan.json from {plan_path}")
         except (OSError, json.JSONDecodeError):
             pass
@@ -1019,7 +998,14 @@ async def analyze_task(state: dict) -> dict:
     if analysis:
         plan_parts.append(analysis)
     if delivery_plan:
-        plan_parts.append(f"\nDelivery plan:\n{json.dumps(delivery_plan, indent=2, ensure_ascii=False)}")
+        plan_parts.append(
+            "\nDelivery plan:\n"
+            + text_for_prompt(
+                delivery_plan,
+                max_chars=5000,
+                default="N/A",
+            )
+        )
 
     # Also load Jira ticket for acceptance criteria
     if workspace_path:
@@ -1034,7 +1020,7 @@ async def analyze_task(state: dict) -> dict:
         except (OSError, json.JSONDecodeError):
             pass
 
-    plan = "\n".join(plan_parts) if plan_parts else analysis
+    plan = text_for_prompt("\n".join(plan_parts) if plan_parts else analysis, max_chars=8000, default="")
     structured_plan = {
         "implementation_steps": [],
         "test_plan": [],
@@ -1138,10 +1124,11 @@ async def implement_changes(state: dict) -> dict:
     jira_ctx = state.get("jira_context", {})
     # Truncate: full Jira REST response can be 200KB+ — keep only essential fields
     jira_for_prompt = _summarize_jira_context(jira_ctx)
-    # Also truncate implementation_plan if too large
-    impl_plan = str(state.get("implementation_plan", ""))
-    if len(impl_plan) > 4000:
-        impl_plan = impl_plan[:4000] + "...(truncated)"
+    impl_plan = text_for_prompt(
+        state.get("implementation_plan", ""),
+        max_chars=4000,
+        default="N/A",
+    )
 
     # Load design HTML code from workspace for component reference
     _design_code_ref = "N/A"
@@ -1155,7 +1142,11 @@ async def implement_changes(state: dict) -> dict:
     if _design_code_path and os.path.isfile(_design_code_path):
         try:
             with open(_design_code_path, encoding="utf-8") as _f:
-                _design_code_ref = _f.read()
+                _design_code_ref = text_for_prompt(
+                    _f.read(),
+                    max_chars=int(os.environ.get("WEB_DEV_DESIGN_HTML_PROMPT_MAX_CHARS", "12000") or "12000"),
+                    default="N/A",
+                )
         except Exception:
             pass
 
@@ -1170,7 +1161,11 @@ async def implement_changes(state: dict) -> dict:
         if os.path.isfile(_design_spec_md_path):
             try:
                 with open(_design_spec_md_path, encoding="utf-8") as _f:
-                    _design_spec_md = _f.read()
+                    _design_spec_md = text_for_prompt(
+                        _f.read(),
+                        max_chars=int(os.environ.get("WEB_DEV_DESIGN_SPEC_PROMPT_MAX_CHARS", "6000") or "6000"),
+                        default="N/A",
+                    )
             except Exception:
                 pass
 
@@ -1203,11 +1198,11 @@ async def implement_changes(state: dict) -> dict:
         repo_files=_repo_files_section,
         implementation_plan=impl_plan,
         jira_context=jira_for_prompt,
-        design_context=str(state.get("design_context", "N/A")),
+        design_context=text_for_prompt(state.get("design_context", "N/A"), max_chars=2000, default="N/A"),
         design_code_reference=_design_code_ref,
         design_spec_markdown=_design_spec_md,
-        skill_context=state.get("skill_context", ""),
-        memory_context=state.get("memory_context", ""),
+        skill_context=text_for_prompt(state.get("skill_context", ""), max_chars=4000, default=""),
+        memory_context=text_for_prompt(state.get("memory_context", ""), max_chars=3000, default=""),
     )
 
     # Inject coding standards for consistent implementation (same standards used by Code Review)
@@ -1240,6 +1235,9 @@ async def implement_changes(state: dict) -> dict:
         design_local_folder=state.get("design_local_folder", ""),
     )
     policy, policy_kwargs = _agentic_policy_for_state(state, runtime)
+    def _implementation_progress(message: Any) -> None:
+        log.info("implement_changes progress", progress_message=str(message)[:300])
+
     print(f"[{_AGENT_ID}] implement_changes: repo_path={state.get('repo_path', '')!r} backend={policy.backend!r}")
     result = runtime.run_agentic(
         task=prompt,
@@ -1247,6 +1245,7 @@ async def implement_changes(state: dict) -> dict:
         cwd=_agentic_cwd(runtime, state.get("repo_path") or None),
         max_turns=50,
         timeout=1800,
+        on_progress=_implementation_progress,
         plugin_manager=state.get("_plugin_manager"),
         **policy_kwargs,
     )
@@ -3357,7 +3356,7 @@ async def create_pr(state: dict) -> dict:
         if pr_conflict.get("conflict"):
             conflict_type = pr_conflict["conflict_type"]
             conflict_msg = pr_conflict["message"]
-            log.warn("PR status conflict detected", type=conflict_type, message=conflict_msg)
+            log.warn("PR status conflict detected", type=conflict_type, conflict_message=conflict_msg)
             if conflict_type == "merged":
                 # PR already merged externally — report as success
                 return {

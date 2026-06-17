@@ -201,6 +201,54 @@ class TestTeamLeadAgent:
         assert row["lifecycle_state"] == "done"
         assert row["summary_facts"]["complexity"] == result["complexity"]
 
+    async def test_create_plan_persists_clean_compact_plan(self, monkeypatch, tmp_path):
+        from agents.team_lead.nodes import create_plan
+
+        runtime = MagicMock()
+        runtime.run.return_value = {
+            "raw_response": (
+                "<think>private planning text</think>\n\n"
+                "```json\n"
+                "{\n"
+                '  "agent_type": "web-dev",\n'
+                '  "steps": [\n'
+                '    {"step": 1, "action": "Read the design reference", "agent": "web-dev"},\n'
+                '    {"step": 2, "action": "Implement the requested UI", "agent": "web-dev"}\n'
+                "  ],\n"
+                '  "definition_of_done": {"build_must_pass": true}\n'
+                "}\n"
+                "```"
+            )
+        }
+        monkeypatch.setattr("agents.team_lead.nodes._resolve_dev_agent_type", lambda **kwargs: "web-dev")
+
+        result = await create_plan(
+            {
+                "_runtime": runtime,
+                "workspace_path": str(tmp_path),
+                "analysis_summary": "Implement a UI page.",
+                "jira_context": {
+                    "key": "ABC-1",
+                    "fields": {
+                        "summary": "Implement page",
+                        "description": "Do the requested page.",
+                        "comment": {"comments": [{"body": "x" * 50000}]},
+                    },
+                },
+                "task_type": "frontend",
+            }
+        )
+
+        plan = result["plan"]
+        persisted = json.loads((tmp_path / "team-lead" / "delivery-plan.json").read_text())
+        persisted_text = json.dumps(persisted, ensure_ascii=False)
+        assert plan["agent_type"] == "web-dev"
+        assert len(plan["steps"]) == 2
+        assert "Read the design reference" in persisted_text
+        assert "private planning text" not in persisted_text
+        assert "```" not in persisted_text
+        assert "x" * 1000 not in runtime.run.call_args.kwargs["prompt"]
+
     async def test_review_result_records_requesting_review_row(self, monkeypatch):
         from agents.team_lead.nodes import review_result
 

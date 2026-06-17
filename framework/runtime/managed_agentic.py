@@ -50,6 +50,17 @@ def _short_text(text: str, limit: int = 500) -> str:
     return normalized[:limit] + "...(truncated)"
 
 
+def _transcript_content(value: Any, limit: int = 8000) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    return _short_text(text, limit=limit)
+
+
 def _canonical_tool_name(tool_name: str) -> str:
     """Map common CLI/model tool aliases to Constellation tool names.
 
@@ -288,16 +299,28 @@ def run_managed_agentic_loop(
             )
 
         prompt = _managed_prompt(task=task, tool_schemas=schemas, transcript=transcript)
+        if on_progress:
+            on_progress(f"{backend} managed turn {turn}/{max(1, int(max_turns or 1))}")
         if plugin_manager:
             plugin_manager.fire_sync("before_llm_call", prompt, ctx={})
-        response = runtime.run(
-            prompt,
-            system_prompt=system_prompt,
-            cwd=cwd,
-            timeout=min(120, max(1, int(deadline - time.time()))),
-            disallowed_tools=["*"],
-            plugin_manager=plugin_manager,
-        )
+        try:
+            response = runtime.run(
+                prompt,
+                system_prompt=system_prompt,
+                cwd=cwd,
+                timeout=min(120, max(1, int(deadline - time.time()))),
+                disallowed_tools=["*"],
+                plugin_manager=plugin_manager,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return AgenticResult(
+                success=False,
+                summary=f"{backend} managed agentic loop failed on turn {turn}: {exc}",
+                tool_calls=tool_calls,
+                turns_used=turn,
+                backend_used=backend,
+                raw_output=last_text,
+            )
         last_text = _response_text(response)
         if plugin_manager:
             plugin_manager.fire_sync("after_llm_response", last_text, ctx={})
@@ -390,7 +413,7 @@ def run_managed_agentic_loop(
             tool_outputs.append({
                 "tool": canonical_tool_name,
                 "arguments": canonical_args,
-                "content": tool_output,
+                "content": _transcript_content(tool_output),
             })
             if on_progress:
                 on_progress(f"Tool: {canonical_tool_name}")

@@ -19,6 +19,12 @@ from pathlib import Path as _Path
 from typing import Any
 
 from framework.config import load_agent_config as _load_agent_cfg
+from framework.context_budget import (
+    compact_delivery_plan,
+    compact_jira_context,
+    compact_plan_action,
+    text_for_prompt,
+)
 from framework.devlog import AgentLogger
 from framework.major_step import (
     LIFECYCLE_DONE,
@@ -568,24 +574,10 @@ def _safe_json(text: str, fallback: Any = None) -> Any:
     """
     if not text:
         return fallback
-    # Strip markdown code fences if present
-    stripped = re.sub(r"^```(?:json)?\s*\n?", "", text.strip(), flags=re.IGNORECASE)
-    stripped = re.sub(r"\n?```$", "", stripped.strip())
-    try:
-        return json.loads(stripped)
-    except (json.JSONDecodeError, TypeError):
-        pass
-    # Try extracting a JSON object or array
-    match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        return fallback
+    from framework.json_extract import extract_first_json
+
+    parsed = extract_first_json(text)
+    return parsed if parsed is not None else fallback
 
 
 def _is_success_status(status: Any) -> bool:
@@ -1307,10 +1299,10 @@ async def create_plan(state: dict) -> dict:
     from agents.team_lead.prompts.planning import PLANNING_SYSTEM, PLANNING_TEMPLATE
 
     _design_ctx = state.get("design_context")
-    _design_ctx_str = json.dumps(_design_ctx, ensure_ascii=False)[:800] if _design_ctx else "N/A"
+    _design_ctx_str = text_for_prompt(_design_ctx, max_chars=800, default="N/A")
     prompt = PLANNING_TEMPLATE.format(
-        analysis=state.get("analysis_summary", ""),
-        jira_context=json.dumps(state.get("jira_context", {}), ensure_ascii=False),
+        analysis=text_for_prompt(state.get("analysis_summary", ""), max_chars=2500, default=""),
+        jira_context=compact_jira_context(state.get("jira_context", {}), max_chars=3000),
         task_type=state.get("task_type", "general"),
         complexity=state.get("complexity", "medium"),
         design_context=_design_ctx_str,
@@ -1326,7 +1318,8 @@ async def create_plan(state: dict) -> dict:
     raw = result.get("raw_response", "")
     plan = _safe_json(raw, fallback=None)
     if not isinstance(plan, dict):
-        plan = {"steps": [{"step": 1, "action": raw or "Execute task"}]}
+        plan = {"steps": [{"step": 1, "action": compact_plan_action(raw or "Execute task")}]}
+    plan = compact_delivery_plan(plan)
 
     # Resolve the primary dev agent_type via the capability registry.
     # The LLM-suggested value (if any) is honoured only when it matches a
@@ -1365,7 +1358,7 @@ async def create_plan(state: dict) -> dict:
             "steps": [
                 {
                     "step": 1,
-                    "action": raw or state.get("analysis_summary") or "Execute task",
+                    "action": compact_plan_action(raw or state.get("analysis_summary") or "Execute task"),
                     "agent": fallback_agent_type,
                 }
             ],

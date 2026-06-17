@@ -223,6 +223,46 @@ def test_managed_agentic_loop_accepts_tool_call_wrapper_json(monkeypatch) -> Non
     ]
 
 
+def test_managed_agentic_loop_reports_progress_and_budgets_tool_transcript(monkeypatch) -> None:
+    from framework.runtime.copilot_cli import CopilotCLIAdapter
+
+    responses = [
+        '{"action": "tool", "tool": "read_file", "arguments": {"path": "huge.txt"}}',
+        '{"action": "final", "summary": "done"}',
+    ]
+    prompts: list[str] = []
+    progress: list[str] = []
+
+    def fake_single_shot(self, prompt, **kwargs):
+        prompts.append(prompt)
+        return {"raw_response": responses.pop(0)}
+
+    class FakeRegistry:
+        def list_schemas(self, tool_names):
+            return [{"function": {"name": name, "parameters": {"type": "object"}}} for name in tool_names]
+
+        def execute_sync(self, name, arguments):
+            assert name == "read_file"
+            return "TOOL_OUTPUT_START\n" + ("tool-output-bulk\n" * 2000)
+
+    monkeypatch.setattr(CopilotCLIAdapter, "run", fake_single_shot)
+    monkeypatch.setattr("framework.tools.registry.get_registry", lambda: FakeRegistry())
+
+    result = CopilotCLIAdapter().run_agentic(
+        "Inspect the large file.",
+        tools=["read_file"],
+        allowed_tools=["read_file"],
+        max_turns=2,
+        on_progress=progress.append,
+    )
+
+    assert result.success is True
+    assert any("managed turn 1/2" in item for item in progress)
+    assert "Tool: read_file" in progress
+    assert prompts[1].count("tool-output-bulk") < 600
+    assert "...(truncated)" in prompts[1]
+
+
 def test_managed_agentic_loop_accepts_loose_cli_tool_call(monkeypatch) -> None:
     from framework.runtime.copilot_cli import CopilotCLIAdapter
 

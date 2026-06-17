@@ -225,21 +225,21 @@ class AgentLogger:
     # Public API
     # ------------------------------------------------------------------
 
-    def debug(self, message: str, **kwargs: Any) -> None:
+    def debug(self, msg: str = "", **kwargs: Any) -> None:
         """Write a DEBUG-level log entry."""
-        self._write(DEBUG, message, **kwargs)
+        self._write(DEBUG, msg, **kwargs)
 
-    def info(self, message: str, **kwargs: Any) -> None:
+    def info(self, msg: str = "", **kwargs: Any) -> None:
         """Write an INFO-level log entry."""
-        self._write(INFO, message, **kwargs)
+        self._write(INFO, msg, **kwargs)
 
-    def warn(self, message: str, **kwargs: Any) -> None:
+    def warn(self, msg: str = "", **kwargs: Any) -> None:
         """Write a WARN-level log entry."""
-        self._write(WARN, message, **kwargs)
+        self._write(WARN, msg, **kwargs)
 
-    def error(self, message: str, **kwargs: Any) -> None:
+    def error(self, msg: str = "", **kwargs: Any) -> None:
         """Write an ERROR-level log entry."""
-        self._write(ERROR, message, **kwargs)
+        self._write(ERROR, msg, **kwargs)
 
     def node(self, node_name: str, **kwargs: Any) -> None:
         """Write an INFO entry marking a LangGraph node entry (graph transition)."""
@@ -262,15 +262,15 @@ class AgentLogger:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _write(self, level: int, message: str, **kwargs: Any) -> None:
+    def _write(self, _level_value: int, _message_text: str, **kwargs: Any) -> None:
         """Append a single log line in plain-text format."""
-        if level < self._level:
+        if _level_value < self._level:
             return
         if not self._log_path:
             return
-        level_str = _LEVEL_NAMES.get(level, "?????")
+        level_str = _LEVEL_NAMES.get(_level_value, "?????")
         extra = _format_kwargs(kwargs)
-        line = f"{_ts()} [{level_str}] [{self._agent_name}] {message}{extra}\n"
+        line = f"{_ts()} [{level_str}] [{self._agent_name}] {_message_text}{extra}\n"
         try:
             with open(self._log_path, "a", encoding="utf-8") as fh:
                 fh.write(line)
@@ -298,17 +298,17 @@ class WorkspaceLogger:
             task_id = os.path.basename(workspace_path.rstrip("/\\"))
         self._inner = AgentLogger(task_id=task_id, agent_name=agent_id, level=level)
 
-    def debug(self, message: str, **kwargs: Any) -> None:
-        self._inner.debug(message, **kwargs)
+    def debug(self, msg: str = "", **kwargs: Any) -> None:
+        self._inner.debug(msg, **kwargs)
 
-    def info(self, message: str, **kwargs: Any) -> None:
-        self._inner.info(message, **kwargs)
+    def info(self, msg: str = "", **kwargs: Any) -> None:
+        self._inner.info(msg, **kwargs)
 
-    def warn(self, message: str, **kwargs: Any) -> None:
-        self._inner.warn(message, **kwargs)
+    def warn(self, msg: str = "", **kwargs: Any) -> None:
+        self._inner.warn(msg, **kwargs)
 
-    def error(self, message: str, **kwargs: Any) -> None:
-        self._inner.error(message, **kwargs)
+    def error(self, msg: str = "", **kwargs: Any) -> None:
+        self._inner.error(msg, **kwargs)
 
     def step(self, step_name: str, **kwargs: Any) -> None:
         self._inner.node(step_name, **kwargs)

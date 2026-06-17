@@ -1722,6 +1722,7 @@ class TestWebDevNodes:
 
             def run_agentic(self, task, **kw):
                 self.kwargs = kw
+                kw["on_progress"]("managed turn 1/50")
                 return AgenticResult(
                     success=True,
                     summary="Implemented login form in src/login.py",
@@ -1747,6 +1748,72 @@ class TestWebDevNodes:
         assert "Implemented" in result["implementation_summary"]
         assert runtime.kwargs["tools"] == ["read_file", "write_file", "run_command"]
         assert runtime.kwargs["allowed_tools"] == ["read_file", "write_file", "run_command"]
+
+    async def test_implement_changes_budgets_large_context_for_agentic_backends(
+        self, tmp_path, monkeypatch
+    ):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
+        from framework.validation_gates import ValidationResult
+
+        monkeypatch.setattr(
+            "framework.validation_gates.validate_files_changed",
+            lambda repo_path: ValidationResult(True, "files_changed"),
+        )
+
+        class _MockRuntime:
+            def __init__(self):
+                self.task = ""
+
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="copilot-cli",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                    cwd=True,
+                )
+
+            def run_agentic(self, task, **kw):
+                self.task = task
+                return AgenticResult(success=True, summary="Implemented", backend_used="copilot-cli")
+
+        workspace_path = tmp_path / "workspace"
+        repo_path = workspace_path / "repo"
+        design_dir = workspace_path / "ui-design" / "stitch"
+        repo_path.mkdir(parents=True)
+        design_dir.mkdir(parents=True)
+        (design_dir / "code.html").write_text("HTML_START\n" + ("DESIGN_HTML_BULK\n" * 2000), encoding="utf-8")
+        (design_dir / "DESIGN.md").write_text("SPEC_START\n" + ("DESIGN_SPEC_BULK\n" * 2000), encoding="utf-8")
+
+        runtime = _MockRuntime()
+        await implement_changes(
+            {
+                "_runtime": runtime,
+                "user_request": "Implement feature",
+                "implementation_plan": "<think>hidden</think>\n" + ("PLAN_BULK\n" * 2000),
+                "jira_context": {
+                    "key": "ABC-1",
+                    "fields": {
+                        "summary": "Implement feature",
+                        "description": "JIRA_DESCRIPTION\n" + ("JIRA_BULK\n" * 2000),
+                    },
+                },
+                "design_context": {"payload": "DESIGN_CONTEXT_BULK" * 2000},
+                "skill_context": "SKILL_BULK\n" * 2000,
+                "memory_context": "MEMORY_BULK\n" * 2000,
+                "repo_path": str(repo_path),
+                "workspace_path": str(workspace_path),
+                "branch_name": "feature/example",
+                "_allowed_tools": ["read_file", "write_file", "run_command"],
+            }
+        )
+
+        assert "hidden" not in runtime.task
+        assert runtime.task.count("PLAN_BULK") < 500
+        assert runtime.task.count("JIRA_BULK") < 600
+        assert runtime.task.count("DESIGN_HTML_BULK") < 900
+        assert runtime.task.count("DESIGN_SPEC_BULK") < 500
+        assert "full source remains available" in runtime.task
 
     async def test_implement_changes_continues_when_protocol_fails_but_files_changed(
         self, tmp_path, monkeypatch
