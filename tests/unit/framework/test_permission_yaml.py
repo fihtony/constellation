@@ -8,8 +8,10 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from pathlib import Path
 
 import pytest
+import yaml
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +98,45 @@ def test_permission_engine_from_yaml_development_config():
     # development.yaml allows scm_push
     assert engine.check_tool("scm_push")
     assert engine.check_scm_write()
+
+
+def test_web_dev_permission_profile_declares_auditable_command_patterns():
+    """run_command permissions should be reviewable at command-pattern level."""
+    from framework.permissions import PermissionEngine
+
+    config_path = Path(__file__).resolve().parents[3] / "config" / "permissions" / "web-dev.yaml"
+    engine = PermissionEngine.from_yaml(str(config_path))
+
+    patterns = engine.permissions.custom.get("allowed_command_patterns", [])
+    assert patterns
+    assert engine.check_command("ls -la /app/artifacts/task-123/scm/repo")
+    assert engine.check_command("npm test -- --run")
+    assert engine.check_command("python -m pytest tests/unit/agents/test_web_dev.py -q")
+    assert not engine.check_command("python -c 'print(1)'")
+
+
+def test_only_orchestrator_permission_profiles_can_launch_agents():
+    """Only Compass and Team Lead may have launch-capable permission profiles."""
+    permissions_dir = Path(__file__).resolve().parents[3] / "config" / "permissions"
+    orchestrators = {"compass", "team-lead"}
+    violations = []
+
+    for path in sorted(permissions_dir.glob("*.yaml")):
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        profile_name = data.get("agent_id") or path.stem
+        launch_enabled = bool(data.get("agent_launching"))
+        dispatch_tools = [
+            tool for tool in data.get("allowed_tools", [])
+            if str(tool).startswith("dispatch_")
+        ]
+        if profile_name not in orchestrators and (launch_enabled or dispatch_tools):
+            violations.append({
+                "profile": profile_name,
+                "agent_launching": launch_enabled,
+                "dispatch_tools": dispatch_tools,
+            })
+
+    assert violations == []
 
 
 def test_permission_engine_from_yaml_web_dev_config_allows_jira_list_comments():

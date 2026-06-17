@@ -4,6 +4,10 @@ description: "Generic office execution: summarize documents, analyze structured 
 mode: task
 execution_mode: per-task
 runtime_env_required: true
+runtime_capabilities:
+  run: true
+  run_agentic: true
+  agentic_tools: true
 default_skills:
   - office-generic-methodology
 
@@ -40,5 +44,9 @@ launch_spec:
     - API_TIMEOUT_MS
     - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
     - COPILOT_GITHUB_TOKEN
+    - COPILOT_MODEL
+    - COPILOT_PROVIDER_API_KEY
+    - COPILOT_PROVIDER_BASE_URL
+    - COPILOT_PROVIDER_TYPE
     - LOCAL_TIMEZONE
     - TZ

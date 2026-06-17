@@ -72,6 +72,7 @@ def _build_compass_definition() -> AgentDefinition:
         tools=cfg.get("tools", TOOL_NAMES),
         permissions=cfg.get("permissions", {"scm": "none", "filesystem": "workspace-only"}),
         permission_profile=cfg.get("permission_profile", "compass"),
+        runtime_capabilities=cfg.get("runtime_capabilities", {}),
         config=cfg.get("config", {}),
     )
 
@@ -608,6 +609,34 @@ def _resolve_office_resume_reply(
             # not lost on the re-prompt round.
             return {"error_question": reask, "office_request": office_request}
         office_request["output_mode"] = output_mode
+        return {"office_request": office_request}
+
+    if kind == "office_organizecustomhint":
+        from framework.office.dimensions import (
+            CUSTOM_DIMENSION,
+            extract_custom_dimension_hint,
+        )
+
+        hint = str(extract_custom_dimension_hint(reply) or reply or "").strip()
+        if not hint:
+            question = (
+                "Office needs a custom grouping hint, e.g. 'student name' "
+                "or 'subject'. Please reply with the entity you want to "
+                "group files by."
+            )
+            return {
+                "error_question": question,
+                "needs_clarification": {
+                    "missing": "organizeCustomHint",
+                    "user_message": question,
+                },
+                "office_request": office_request,
+            }
+        office_request["organize_dimension"] = CUSTOM_DIMENSION
+        office_request.setdefault("organize_metadata", {})
+        office_request["organize_metadata"]["organizeGroupBy"] = CUSTOM_DIMENSION
+        office_request["organize_metadata"]["customDimensionHint"] = hint
+        office_request["customDimensionHint"] = hint
         return {"office_request": office_request}
 
     if not kind:
@@ -2061,17 +2090,20 @@ class CompassAgent(BaseAgent):
                 self._ack_and_cleanup_office_session(task.id, office_session)
 
         else:
-            # General conversational task — use LLM for a direct answer
+            # General conversational task — use a tool-free LLM call for a direct answer.
             log.info("handling as general query")
             system_prompt = load_instructions("compass")
-            agentic_result = runtime.run_agentic(
-                task=user_text,
-                tools=None,
+            llm_result = runtime.run(
+                user_text,
                 system_prompt=system_prompt,
-                max_turns=5,
                 timeout=120,
+                disallowed_tools=["*"],
             )
-            response_text = agentic_result.summary or "I can help you with that."
+            response_text = (
+                llm_result.get("summary")
+                or llm_result.get("raw_response")
+                or "I can help you with that."
+            )
             _record_major_step(
                 task_store,
                 task.id,

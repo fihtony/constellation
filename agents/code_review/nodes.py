@@ -65,30 +65,87 @@ def _run_review_with_retry(runtime, prompt: str, system_prompt: str, max_tokens:
     return {"raw_response": "", "skipped": True}
 
 
+def _run_phase_review(
+    *,
+    runtime,
+    phase_name: str,
+    prompt: str,
+    system_prompt: str,
+    max_tokens: int = 2048,
+    plugin_manager=None,
+    logger=None,
+) -> list[dict]:
+    """Run a single review phase and parse its JSON array of issues.
+
+    Wraps :func:`_run_review_with_retry` (which handles transport-level
+    errors) and the shared JSON array extractor with one additional
+    parse-failure retry. The retry distinguishes:
+      * "model returned an unparseable response" (extractor returned None)
+        — retry once with a generic format reminder.
+      * "model returned a valid empty array" (extractor returned [])
+        — no retry; an empty review is a legitimate outcome.
+      * "model returned no response at all" — handled by
+        ``_run_review_with_retry`` upstream.
+
+    The retry's appended instruction contains no task-specific knowledge so
+    it is safe to apply to every phase across every backend.
+    """
+    from framework.json_extract import extract_json_array
+
+    result = _run_review_with_retry(
+        runtime, prompt, system_prompt=system_prompt, max_tokens=max_tokens,
+        plugin_manager=plugin_manager,
+    )
+    raw_response = result.get("raw_response", "")
+    parsed = extract_json_array(raw_response) if raw_response else None
+    if parsed is not None:
+        # Either a real list of issues OR a legitimate empty array — both
+        # are valid parses and need no retry.
+        return [item for item in parsed if isinstance(item, dict)]
+    if not raw_response:
+        # Transport-level failure; upstream retry already exhausted.
+        return []
+
+    if logger:
+        try:
+            logger.warn(
+                "phase response unparseable, retrying with format reminder",
+                phase=phase_name,
+                raw_chars=len(raw_response),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    retry_prompt = prompt + (
+        "\n\nIMPORTANT: Your previous response could not be parsed as a JSON "
+        "array of review issues. Return ONLY a JSON array literal "
+        "(starting with '[' and ending with ']'), with no prose before or "
+        "after, no markdown fences, no <think> blocks, and no surrounding "
+        "object wrapper. Use an empty array '[]' when you find no issues."
+    )
+    retry_result = _run_review_with_retry(
+        runtime, retry_prompt, system_prompt=system_prompt, max_tokens=max_tokens,
+        plugin_manager=plugin_manager, max_retries=0,
+    )
+    return _parse_issue_list(retry_result.get("raw_response", ""))
+
+
 def _parse_issue_list(text: str) -> list[dict]:
     """Extract a JSON array of issue objects from LLM response text.
 
-    Returns an empty list when parsing fails.
+    Thin wrapper around :func:`framework.json_extract.extract_json_array`
+    so every agent uses the same balanced-bracket, ``<think>``-aware,
+    fence-aware parser. Returns an empty list when no array can be found.
     """
-    # Try direct parse first
-    try:
-        parsed = json.loads(text.strip())
-        if isinstance(parsed, list):
-            return parsed
-    except (json.JSONDecodeError, TypeError):
-        pass
+    from framework.json_extract import extract_json_array
 
-    # Extract the first JSON array from mixed text
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if match:
-        try:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, list):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    return []
+    if not text:
+        return []
+    parsed = extract_json_array(text)
+    if parsed is None:
+        return []
+    # Defensive: keep only dict entries — review consumers expect issue objects.
+    return [item for item in parsed if isinstance(item, dict)]
 
 
 def _logger(state: dict) -> AgentLogger:
@@ -809,6 +866,7 @@ async def load_pr_context(state: dict) -> dict:
     # Diff truncation for large PRs (§5.4)
     _MAX_DIFF_BYTES = 100 * 1024  # 100KB
     _MAX_CHANGED_FILES = 50
+    review_anchor_diff = pr_diff
     diff_truncated = False
     manual_review_required = False
     if pr_diff and len(pr_diff.encode("utf-8", errors="replace")) > _MAX_DIFF_BYTES:
@@ -838,6 +896,7 @@ async def load_pr_context(state: dict) -> dict:
 
     return {
         "pr_diff": pr_diff,
+        "review_anchor_diff": review_anchor_diff,
         "changed_files": changed_files if isinstance(changed_files, list) else [changed_files],
         "pr_description": pr_description,
         "commit_messages": commit_messages,
@@ -885,9 +944,15 @@ async def review_quality(state: dict) -> dict:
         prompt += standards_section
     if prev_issues_text:
         prompt += prev_issues_text
-    result = _run_review_with_retry(runtime, prompt, system_prompt=QUALITY_SYSTEM, max_tokens=2048,
-                         plugin_manager=state.get("_plugin_manager"))
-    issues = _parse_issue_list(result.get("raw_response", ""))
+    issues = _run_phase_review(
+        runtime=runtime,
+        phase_name="quality",
+        prompt=prompt,
+        system_prompt=QUALITY_SYSTEM,
+        max_tokens=2048,
+        plugin_manager=state.get("_plugin_manager"),
+        logger=log,
+    )
     log.info("quality review complete", issues=len(issues))
 
     return {"quality_issues": issues}
@@ -917,9 +982,15 @@ async def review_security(state: dict) -> dict:
         prompt += standards_section
     if prev_issues_text:
         prompt += prev_issues_text
-    result = _run_review_with_retry(runtime, prompt, system_prompt=SECURITY_SYSTEM, max_tokens=2048,
-                         plugin_manager=state.get("_plugin_manager"))
-    issues = _parse_issue_list(result.get("raw_response", ""))
+    issues = _run_phase_review(
+        runtime=runtime,
+        phase_name="security",
+        prompt=prompt,
+        system_prompt=SECURITY_SYSTEM,
+        max_tokens=2048,
+        plugin_manager=state.get("_plugin_manager"),
+        logger=log,
+    )
     log.info("security review complete", issues=len(issues))
 
     return {"security_issues": issues}
@@ -949,9 +1020,15 @@ async def review_tests(state: dict) -> dict:
         prompt += standards_section
     if prev_issues_text:
         prompt += prev_issues_text
-    result = _run_review_with_retry(runtime, prompt, system_prompt=TESTS_SYSTEM, max_tokens=2048,
-                         plugin_manager=state.get("_plugin_manager"))
-    issues = _parse_issue_list(result.get("raw_response", ""))
+    issues = _run_phase_review(
+        runtime=runtime,
+        phase_name="tests",
+        prompt=prompt,
+        system_prompt=TESTS_SYSTEM,
+        max_tokens=2048,
+        plugin_manager=state.get("_plugin_manager"),
+        logger=log,
+    )
     log.info("test review complete", issues=len(issues))
 
     return {"test_issues": issues}
@@ -988,9 +1065,15 @@ async def review_requirements(state: dict) -> dict:
         prompt += standards_section
     if prev_issues_text:
         prompt += prev_issues_text
-    result = _run_review_with_retry(runtime, prompt, system_prompt=REQUIREMENTS_SYSTEM, max_tokens=2048,
-                         plugin_manager=state.get("_plugin_manager"))
-    issues = _parse_issue_list(result.get("raw_response", ""))
+    issues = _run_phase_review(
+        runtime=runtime,
+        phase_name="requirements",
+        prompt=prompt,
+        system_prompt=REQUIREMENTS_SYSTEM,
+        max_tokens=2048,
+        plugin_manager=state.get("_plugin_manager"),
+        logger=log,
+    )
     log.info("requirements review complete", issues=len(issues))
 
     return {"requirement_gaps": issues}
@@ -1071,9 +1154,15 @@ async def review_ui_design(state: dict) -> dict:
         prompt += standards_section
     if prev_issues_text:
         prompt += prev_issues_text
-    result = _run_review_with_retry(runtime, prompt, system_prompt=UI_DESIGN_SYSTEM, max_tokens=2048,
-                         plugin_manager=state.get("_plugin_manager"))
-    issues = _parse_issue_list(result.get("raw_response", ""))
+    issues = _run_phase_review(
+        runtime=runtime,
+        phase_name="ui-design",
+        prompt=prompt,
+        system_prompt=UI_DESIGN_SYSTEM,
+        max_tokens=2048,
+        plugin_manager=state.get("_plugin_manager"),
+        logger=log,
+    )
     log.info("UI review complete", issues=len(issues), has_design_spec=bool(design_spec), has_design_html=bool(design_html))
 
     return {"ui_issues": issues}
@@ -1103,7 +1192,7 @@ async def generate_report(state: dict) -> dict:
         annotate_issue_blocking(issue)
         for issue in _backfill_issue_locations(
             review_input_issues + quality + security + tests + requirements + ui_issues,
-            state.get("pr_diff", ""),
+            state.get("review_anchor_diff") or state.get("pr_diff", ""),
         )
     ]
 

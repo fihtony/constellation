@@ -1,0 +1,52 @@
+# ============================================================================
+# Constellation v2 — Rancher Desktop override
+# ============================================================================
+# This file is a MINIMAL OVERRIDE for ``docker-compose-v2.yml``; it
+# inherits every service, every volume, every env value, every
+# healthcheck, and the network from the main file.  The only thing
+# it changes is the GID passed to ``group_add`` for the two services
+# that mount the host docker socket (``compass`` and ``team-lead``).
+#
+# Why a different GID?
+#   * Docker Desktop (default) — the host socket is root-owned on
+#     APFS, and bind-mounting it is fine; ``group_add`` uses GID 0
+#     (``${DOCKER_SOCKET_GID:-0}`` in the main file).
+#   * Rancher Desktop — the docker socket inside the Rancher VM
+#     belongs to a dedicated ``docker`` group with GID 102, so
+#     ``group_add`` must use 102.  We also mount
+#     ``/var/run/docker.sock`` (the symlink target on APFS), not
+#     ``~/.rd/docker.sock`` (which lives on a Socket filesystem
+#     that returns ENOTSUP for bind-mount).
+#
+# Usage:
+#   ./scripts/build_base.sh ${AGENT_RUNTIME:-claude-code}
+#   docker compose \\
+#       -f docker-compose-v2.yml \\
+#       -f docker-compose.v2.rancher.yml \\
+#       up --build
+#
+# Operators can still override the GID by exporting
+# ``DOCKER_SOCKET_GID`` in the shell or setting it in ``config/.env``.
+# Do NOT add new services here — this file is a strict subset of
+# ``docker-compose-v2.yml``.  Any drift will cause subtle behavioural
+# differences between Docker and Rancher deployments; the previous
+# 1:1 mirror had that problem and was replaced by this override.
+# ============================================================================
+
+services:
+
+  # -----------------------------------------------------------------------
+  # Compass — the only orchestrator that needs docker socket access
+  # (it spawns per-task agent containers via the launcher).
+  # -----------------------------------------------------------------------
+  compass:
+    group_add:
+      - "${DOCKER_SOCKET_GID:-102}"
+
+  # -----------------------------------------------------------------------
+  # Team Lead — also orchestrator; needs docker socket access for the
+  # same reason.
+  # -----------------------------------------------------------------------
+  team-lead:
+    group_add:
+      - "${DOCKER_SOCKET_GID:-102}"

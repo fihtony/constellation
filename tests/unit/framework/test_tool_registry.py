@@ -127,6 +127,35 @@ class TestToolRegistryPermissions:
         assert "error" in data
         assert "not permitted" in data["error"].lower()
 
+    def test_permission_engine_denial_writes_audit_record(self, tmp_path):
+        from framework.audit_log import (
+            clear_permission_audit_context,
+            set_permission_audit_context,
+        )
+
+        reg = ToolRegistry()
+        reg.register(_DangerousTool())
+        reg.set_permission_engine(PermissionEngine(PermissionSet(denied_tools=["dangerous"])))
+        set_permission_audit_context(
+            workspace_path=str(tmp_path),
+            agent_id="web-dev",
+            task_id="task-audit",
+        )
+        try:
+            result = reg.execute_sync("dangerous", {})
+        finally:
+            clear_permission_audit_context()
+
+        assert "error" in json.loads(result)
+        audit_path = tmp_path / "web-dev" / "permission-denials.jsonl"
+        records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+        assert records[-1]["agent_id"] == "web-dev"
+        assert records[-1]["task_id"] == "task-audit"
+        assert records[-1]["status"] == "denied"
+        assert records[-1]["operation"] == "tool"
+        assert records[-1]["tool"] == "dangerous"
+        assert "not permitted" in records[-1]["reason"].lower()
+
     def test_permission_engine_allowlist(self):
         reg = ToolRegistry()
         reg.register(_EchoTool())

@@ -277,6 +277,14 @@ class TestCompassUITemplates:
         assert "No task selected yet" in html
         assert "task-info-empty" in html
 
+    def test_render_ui_resets_chat_signature_when_deselecting_task(self):
+        html = render_compass_ui()
+        empty_state_idx = html.index(
+            "Select a task to inspect it, or send a new request."
+        )
+        empty_state_branch = html[empty_state_idx:empty_state_idx + 500]
+        assert "scroll._lastChatSignature = null;" in empty_state_branch
+
     def test_render_ui_resume_send_keeps_current_task_selected(self):
         html = render_compass_ui()
         assert "state.selectedTaskId = targetTaskId;" in html

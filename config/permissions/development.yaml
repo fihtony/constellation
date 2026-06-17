@@ -18,13 +18,10 @@ allowed_tools:
   - scm_upload_pr_image
   - scm_update_pr
   - scm_list_branches
-  - dispatch_agent
   - query_registry
   - request_clarification
   - fetch_jira_ticket
   - fetch_design
-  - dispatch_web_dev
-  - dispatch_code_review
   # Jira boundary tools (called by workflow nodes, not LLM directly)
   - jira_list_transitions
   - jira_transition
@@ -38,10 +35,8 @@ denied_tools: []
 
 scm: read-write
 filesystem: workspace-only
-agent_launching: true
-allowed_agents:
-  - web-dev
-  - code-review
+agent_launching: false
+allowed_agents: []
 
 custom:
   protected_branch_patterns:
@@ -49,3 +44,16 @@ custom:
     - "^master$"
     - "^develop$"
     - "^release/.*$"
+  allowed_command_patterns:
+    - "^pwd$"
+    - "^ls(\\s|$).*"
+    - "^git (status|diff|log|show|branch|checkout|switch|add|commit|push|fetch|pull|remote|rev-parse|ls-files)(\\s|$).*"
+    - "^(npm|pnpm|yarn) (install|ci|test|run|exec|lint|build|typecheck)(\\s|$).*"
+    - "^npx (vite|vitest|eslint|tsc|playwright)(\\s|$).*"
+    - "^python3? -m pytest(\\s|$).*"
+    - "^pytest(\\s|$).*"
+  denied_command_patterns:
+    - "(^|\\s)(sudo|su)(\\s|$).*"
+    - "(^|\\s)rm\\s+-.*"
+    - "^python3? -c(\\s|$).*"
+    - "(curl|wget).*\\|.*(sh|bash)"

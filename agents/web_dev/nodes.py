@@ -125,30 +125,16 @@ def _summarize_jira_context(jira_ctx: dict, max_chars: int = 3000) -> str:
 def _safe_json(text: str, fallback: Any = None) -> Any:
     """Extract and parse the first JSON object/array from *text*.
 
-    Returns *fallback* when *text* is None/empty or no valid JSON is found.
+    Thin wrapper around :func:`framework.json_extract.extract_first_json` so
+    every agent uses the same balanced-brace, ``<think>``-aware, fence-aware
+    parser. Returns *fallback* when no JSON can be extracted.
     """
+    from framework.json_extract import extract_first_json
+
     if not text:
         return fallback
-    # Try to find JSON object or array in the response first
-    match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
-    # Fall back to parsing the whole text
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        pass
-    # Last resort: try stripping markdown code fences
-    stripped = re.sub(r"```(?:json)?\s*", "", text.strip()).strip()
-    if stripped.startswith("{") or stripped.startswith("["):
-        try:
-            return json.loads(stripped)
-        except json.JSONDecodeError:
-            pass
-    return fallback
+    result = extract_first_json(text)
+    return fallback if result is None else result
 
 
 def _run_mandatory_validation(repo_path: str, workspace_path: str, cycle: int) -> dict:
@@ -195,6 +181,66 @@ def _tail_text(text: str, limit: int = 600) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[-limit:]
+
+
+def _runtime_backend_label(runtime: Any, result: Any) -> str:
+    backend = str(getattr(result, "backend_used", "") or "").strip()
+    if backend:
+        return backend
+    backend = str(getattr(runtime, "backend", "") or "").strip()
+    if backend:
+        return backend
+    return runtime.__class__.__name__ if runtime is not None else "runtime"
+
+
+def _agentic_policy_for_state(state: dict, runtime: Any):
+    from framework.agentic_policy import (
+        agentic_policy_kwargs,
+        build_agentic_execution_policy,
+    )
+
+    allowed_tools = state.get("_allowed_tools") or []
+    policy = build_agentic_execution_policy(runtime, allowed_tools)
+    return policy, agentic_policy_kwargs(policy)
+
+
+def _record_agentic_step_gate(
+    state: dict,
+    *,
+    step: str,
+    policy: Any,
+    result: Any,
+) -> None:
+    from framework.agentic_policy import (
+        record_agentic_step_gate,
+        validate_agentic_step_result,
+    )
+
+    validation = validate_agentic_step_result(policy, result)
+    record_agentic_step_gate(
+        workspace_path=state.get("workspace_path", ""),
+        agent_id=_AGENT_ID,
+        task_id=state.get("_task_id", ""),
+        step=step,
+        policy=policy,
+        result=result,
+        validation=validation,
+    )
+    if result.success and not validation.passed:
+        raise RuntimeError(f"{step} agentic output gate failed: {validation.feedback}")
+
+
+def _agentic_cwd(runtime: Any, cwd: str | None) -> str | None:
+    if not cwd:
+        return None
+    if hasattr(runtime, "agentic_capabilities"):
+        try:
+            caps = runtime.agentic_capabilities()
+            if not bool(getattr(caps, "cwd", False)):
+                return None
+        except Exception:
+            return cwd
+    return cwd
 
 
 def _redact_personal_value(value: str) -> str:
@@ -283,6 +329,38 @@ def _git_branch_changed_files(repo_path: str, base_ref: str = "main") -> list[st
     return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
 
 
+def _workflow_changed_files(state: dict) -> list[str]:
+    """Return the cumulative files changed by the current Web Dev workflow.
+
+    Agentic backends differ in when they commit work and whether their tool
+    result reports individual writes. The workflow-level evidence must include
+    committed branch changes and uncommitted repair changes instead of relying
+    on the latest node's local write list.
+    """
+    changed: list[str] = []
+    seen: set[str] = set()
+
+    def add(paths: Any) -> None:
+        if not isinstance(paths, (list, tuple, set)):
+            return
+        for item in paths:
+            path = str(item or "").strip()
+            if path and path not in seen:
+                seen.add(path)
+                changed.append(path)
+
+    add(state.get("changes_made", []))
+    repo_path = state.get("repo_path", "") or ""
+    base_ref = str(
+        state.get("base_branch")
+        or state.get("target_branch")
+        or "main"
+    )
+    add(_git_branch_changed_files(repo_path, base_ref=base_ref))
+    add(_git_worktree_changed_files(repo_path))
+    return sorted(changed)
+
+
 def _summarize_validation_commands(data: dict) -> list[dict[str, Any]]:
     """Return compact validation command summaries for agent.log."""
     summaries: list[dict[str, Any]] = []
@@ -368,6 +446,16 @@ _ICON_LIGATURE_TOKENS = (
 )
 
 
+def _strip_icon_scan_comments(content: str, ext: str) -> str:
+    """Remove comments before scanning for runtime icon ligature usage."""
+    if ext == ".html":
+        return re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
+    if ext in {".js", ".jsx", ".ts", ".tsx"}:
+        without_block_comments = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
+        return re.sub(r"(?m)(^|[ \t])//.*$", r"\1", without_block_comments)
+    return content
+
+
 def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
     """Detect icon-font ligature patterns that render unreliably in containers."""
     findings: dict[str, Any] = {
@@ -381,6 +469,7 @@ def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
         return findings
 
     text_exts = {".html", ".css", ".scss", ".sass", ".less", ".js", ".jsx", ".ts", ".tsx"}
+    markup_exts = {".html", ".js", ".jsx", ".ts", ".tsx"}
     ignored_dirs = {".git", "node_modules", "dist", "build", ".next", "coverage"}
     risky_files: set[str] = set()
     icon_tokens: set[str] = set()
@@ -392,16 +481,22 @@ def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
                 continue
             full_path = os.path.join(root, filename)
             rel_path = os.path.relpath(full_path, repo_path)
+            ext = os.path.splitext(filename)[1].lower()
             try:
                 with open(full_path, encoding="utf-8", errors="ignore") as fh:
                     content = fh.read()
             except OSError:
                 continue
-            lowered = content.lower()
+            scan_content = _strip_icon_scan_comments(content, ext)
+            lowered = scan_content.lower()
 
             if "material-symbols" in lowered or "material-icons" in lowered:
-                findings["uses_material_icon_class"] = True
-                risky_files.add(rel_path)
+                # A stylesheet may define or leave behind the class selector
+                # without any runtime markup using the icon font. Only markup
+                # usage can render ligature text in screenshots.
+                if ext in markup_exts:
+                    findings["uses_material_icon_class"] = True
+                    risky_files.add(rel_path)
 
             if (
                 "fonts.googleapis.com" in lowered
@@ -411,7 +506,7 @@ def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
                 risky_files.add(rel_path)
 
             for token in _ICON_LIGATURE_TOKENS:
-                if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", lowered):
+                if ext in markup_exts and re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", lowered):
                     icon_tokens.add(token)
                     risky_files.add(rel_path)
 
@@ -1102,8 +1197,8 @@ async def implement_changes(state: dict) -> dict:
     except Exception:
         pass
 
-    # Use Claude Code native tools (Bash, Read, Write, Glob, Grep) — no constellation
-    # MCP bridge needed.  With cwd=repo_path, all relative paths resolve correctly.
+    # Use the configured agentic backend through the Constellation-controlled
+    # tool surface derived from the task execution contract.
     repo_path = state.get("repo_path", "")
     branch_name = state.get("branch_name", "")
     changed_before = set(_git_branch_changed_files(repo_path)) | set(_git_worktree_changed_files(repo_path))
@@ -1114,16 +1209,18 @@ async def implement_changes(state: dict) -> dict:
         jira_local_folder=state.get("jira_local_folder", ""),
         design_local_folder=state.get("design_local_folder", ""),
     )
-    print(f"[{_AGENT_ID}] implement_changes: repo_path={state.get('repo_path', '')!r} (native tools)")
+    policy, policy_kwargs = _agentic_policy_for_state(state, runtime)
+    print(f"[{_AGENT_ID}] implement_changes: repo_path={state.get('repo_path', '')!r} backend={policy.backend!r}")
     result = runtime.run_agentic(
         task=prompt,
         system_prompt=IMPLEMENT_SYSTEM,
-        cwd=state.get("repo_path") or None,
-        tools=None,
+        cwd=_agentic_cwd(runtime, state.get("repo_path") or None),
         max_turns=50,
         timeout=1800,
         plugin_manager=state.get("_plugin_manager"),
+        **policy_kwargs,
     )
+    _record_agentic_step_gate(state, step="implement_changes", policy=policy, result=result)
     changed_after = set(_git_branch_changed_files(repo_path)) | set(_git_worktree_changed_files(repo_path))
     changed_files = sorted(changed_after)
     new_files = sorted(changed_after - changed_before)
@@ -1142,9 +1239,9 @@ async def implement_changes(state: dict) -> dict:
     print(f"[{_AGENT_ID}] implement_changes done: success={result.success} turns={result.turns_used} summary={result.summary[:300]!r}")
 
     if not result.success:
-        # Before failing, check if claude committed code despite the error/timeout.
-        # Claude often commits changes then continues with build/test verification which
-        # may fail or time out — we should not discard committed work in that case.
+        # Before failing, check if the agentic CLI committed code despite the
+        # error/timeout. Some backends commit changes before a later validation
+        # step fails or times out; do not discard committed work in that case.
         _commits_exist = False
         try:
             import subprocess as _sp
@@ -1163,8 +1260,9 @@ async def implement_changes(state: dict) -> dict:
                   f"but commits found on branch — proceeding with partial implementation")
             impl_summary = f"Partial implementation (stopped early). Commits present. Error: {result.summary[:200]}"
         else:
+            backend_label = _runtime_backend_label(runtime, result)
             raise RuntimeError(
-                f"implement_changes failed — claude-code returned error: {result.summary[:500]}"
+                f"implement_changes failed — {backend_label} returned error: {result.summary[:500]}"
             )
     else:
         impl_summary = result.summary
@@ -1193,7 +1291,7 @@ async def implement_changes(state: dict) -> dict:
     )
 
     return {
-        "changes_made": [],
+        "changes_made": changed_files,
         "implementation_summary": impl_summary,
         "agentic_success": result.success,
     }
@@ -1354,22 +1452,24 @@ async def fix_tests(state: dict) -> dict:
 
     from agents.web_dev.prompts import FIX_SYSTEM, FIX_TEMPLATE
 
-    changed_files = state.get("changes_made", [])
+    changed_files = _workflow_changed_files(state)
     prompt = FIX_TEMPLATE.format(
         test_output=state.get("test_output", "No test output available."),
         repo_path=state.get("repo_path", ""),
         changed_files="\n".join(changed_files) if changed_files else "unknown",
     )
 
+    fix_policy, fix_policy_kwargs = _agentic_policy_for_state(state, runtime)
     result = runtime.run_agentic(
         task=prompt,
         system_prompt=FIX_SYSTEM,
-        cwd=state.get("repo_path") or None,
-        tools=None,
+        cwd=_agentic_cwd(runtime, state.get("repo_path") or None),
         max_turns=20,
         timeout=600,
         plugin_manager=state.get("_plugin_manager"),
+        **fix_policy_kwargs,
     )
+    _record_agentic_step_gate(state, step="fix_tests", policy=fix_policy, result=result)
 
     # Validation gate: ensure fix actually changed files
     from framework.validation_gates import validate_files_changed
@@ -1381,9 +1481,397 @@ async def fix_tests(state: dict) -> dict:
         "fix_attempted": True,
         "fix_summary": result.summary,
         "agentic_success": result.success,
+        "changes_made": _workflow_changed_files(state),
         "test_cycles": 0,
         "build_cycles": 0,
     }
+
+
+def _self_assess_agentic_fallback_enabled() -> bool:
+    """Return whether the agentic-file fallback path for self_assess is enabled.
+
+    Operators can disable the fallback with
+    ``WEB_DEV_SELF_ASSESS_AGENTIC_FALLBACK=0`` if they need to debug the
+    text-mode parser in isolation. Enabled by default.
+    """
+    raw = os.environ.get("WEB_DEV_SELF_ASSESS_AGENTIC_FALLBACK", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off", ""}
+
+
+def _self_assess_via_agentic_file(
+    *,
+    state: dict,
+    runtime: Any,
+    base_prompt: str,
+    system_prompt: str,
+    cwd: str | None,
+    workspace_path: str,
+    agent_dir_name: str,
+    cycle: int,
+    plugin_manager: Any,
+) -> tuple[dict[str, Any] | None, str]:
+    """Fallback path: ask the agentic CLI to write the self-assessment to a file.
+
+    The text-mode :func:`runtime.run` path can return prose, ``<think>`` blocks,
+    or truncated JSON that no parser can recover. Every supported agentic
+    backend (``copilot-cli``, ``claude-code``, ``codex-cli``) does support
+    :func:`runtime.run_agentic` with a *cwd*, so we drive the CLI to write
+    its JSON answer to a deterministic file path under the per-task
+    workspace. We then read the file back as the source of truth.
+
+    Returns ``(parsed_dict_or_None, file_path)``. Caller is responsible for
+    feeding ``parsed_dict_or_None`` into ``validate_self_assessment``.
+    """
+    if not workspace_path:
+        return None, ""
+    if not hasattr(runtime, "run_agentic"):
+        return None, ""
+
+    agent_dir = os.path.join(workspace_path, agent_dir_name)
+    try:
+        os.makedirs(agent_dir, exist_ok=True)
+    except OSError:
+        return None, ""
+
+    output_path = os.path.join(agent_dir, f"self-assessment-llm-{cycle}.json")
+    # Best-effort: drop any stale copy from a previous attempt so the
+    # presence of the file after the agent finishes is a real signal.
+    try:
+        if os.path.isfile(output_path):
+            os.unlink(output_path)
+    except OSError:
+        pass
+
+    fallback_instructions = (
+        "The previous direct response could not be parsed as valid JSON. "
+        "Use your file-writing tool to write the self-assessment JSON to the "
+        f"absolute path below. Do NOT write any other files; do NOT modify "
+        "any source code; do NOT run git or shell commands beyond writing "
+        "this single file.\n\n"
+        f"Target file: {output_path}\n\n"
+        "The file must contain exactly ONE top-level JSON object with these "
+        "keys (no markdown fences, no <think> blocks, no surrounding prose): "
+        "score (float 0.0-1.0), verdict ('pass' or 'fail'), criteria_checks "
+        "(array), component_checks (array), self_review_issues (array), "
+        "gaps (array), summary (string).\n\n"
+        "After writing the file, print only the absolute file path on a "
+        "single line.\n\n"
+        "--- Original self-assessment task ---\n"
+        f"{base_prompt}"
+    )
+
+    policy, policy_kwargs = _agentic_policy_for_state(state, runtime)
+    try:
+        agentic_result = runtime.run_agentic(
+            task=fallback_instructions,
+            system_prompt=system_prompt,
+            cwd=_agentic_cwd(runtime, cwd or workspace_path or None),
+            max_turns=4,
+            timeout=int(os.environ.get("WEB_DEV_SELF_ASSESS_AGENTIC_TIMEOUT", "240") or "240"),
+            plugin_manager=plugin_manager,
+            **policy_kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, output_path
+    _record_agentic_step_gate(
+        state,
+        step="self_assess_agentic_file",
+        policy=policy,
+        result=agentic_result,
+    )
+
+    # Even when the CLI returns success=False we still try to read the file
+    # — some backends report non-zero exit but did write the artifact first.
+    if not os.path.isfile(output_path):
+        return None, output_path
+    try:
+        with open(output_path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError:
+        return None, output_path
+
+    from framework.json_extract import extract_json_object
+
+    parsed = extract_json_object(
+        raw,
+        required_keys={"score", "verdict"},
+    )
+    if parsed is None:
+        # The file exists but the content is still malformed — try the
+        # generic extractor as a last-ditch parse.
+        parsed = extract_json_object(raw)
+
+    return parsed, output_path
+
+
+def _is_implementation_ground_truth_present(state: dict) -> bool:
+    """Return True when observable evidence shows the implementation is in place.
+
+    This is a generic, methodology-level check — it uses only signals the
+    workflow has already collected (test_results, changes_made) without
+    consulting any task-specific file paths or component names. It exists
+    to detect the failure mode where the model reports a fail verdict in
+    its self-assessment even though the build, tests, and changes
+    contradict that verdict (an LLM hallucination).
+    """
+    test_results = state.get("test_results", {}) or {}
+    if not isinstance(test_results, dict):
+        return False
+    if not test_results.get("build_ok"):
+        return False
+    if not test_results.get("test_ok"):
+        return False
+    if int(test_results.get("passed", 0) or 0) <= 0:
+        return False
+    changes_made = _workflow_changed_files(state)
+    if not changes_made:
+        return False
+    return True
+
+
+def _self_assessment_claims_conflict_with_ground_truth(
+    state: dict, data: dict
+) -> tuple[bool, str]:
+    """Detect when the model's self-assessment claims contradict observable reality.
+
+    The agent may write ``self_review_issues`` like ``"<some-file> does
+    not exist"`` even though the file is on disk. Such claims are
+    strong evidence of a hallucination. We do not need to know anything
+    about the project to spot the contradiction — we only check the
+    language of the claim against the filesystem.
+
+    Returns ``(conflict, reason)``. ``conflict`` is True when at least one
+    self-review issue says a file is missing / not implemented / not
+    created / not modified AND the file actually exists on disk with
+    non-trivial content.
+    """
+    repo_path = state.get("repo_path", "") or ""
+    if not repo_path:
+        return False, ""
+    issues = data.get("self_review_issues", [])
+    if not isinstance(issues, list):
+        return False, ""
+
+    hallucination_phrases = (
+        "does not exist",
+        "is missing",
+        "not implemented",
+        "has not been implemented",
+        "not created",
+        "no new ",
+        "is not present",
+        "not modified",
+        "changed files list does not include",
+        "not included in the changed files",
+        "not in changed files",
+    )
+    contradicted: list[str] = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        file_ref = str(issue.get("file") or "").strip()
+        if not file_ref:
+            continue
+        message = str(issue.get("message", "")).lower()
+        if not any(phrase in message for phrase in hallucination_phrases):
+            continue
+        full_path = os.path.join(repo_path, file_ref)
+        try:
+            if os.path.isfile(full_path) and os.path.getsize(full_path) > 50:
+                contradicted.append(file_ref)
+        except OSError:
+            continue
+    if contradicted:
+        return True, (
+            "self_review_issues claim these files are missing/not implemented, "
+            f"but they exist on disk: {contradicted[:5]}"
+        )
+    return False, ""
+
+
+def _build_ground_truth_re_prompt(
+    state: dict, data: dict, original_prompt: str
+) -> str:
+    """Construct a re-prompt that surfaces observable ground truth to the model.
+
+    The re-prompt never references any task-specific component name, file
+    path, or acceptance criterion. It just states what the workflow can
+    already observe and asks the model to re-evaluate.
+    """
+    test_results = state.get("test_results", {}) or {}
+    changes_made = _workflow_changed_files(state)
+    files_sample = ", ".join(str(f) for f in changes_made[:8])
+    if len(changes_made) > 8:
+        files_sample += f" (and {len(changes_made) - 8} more)"
+
+    previous_issues = data.get("self_review_issues", []) or []
+    previous_blocking = [
+        issue for issue in previous_issues
+        if isinstance(issue, dict) and issue.get("blocking", True) is not False
+    ]
+    previous_gaps = data.get("gaps", []) or []
+
+    re_prompt = f"""Your previous self-assessment reported gaps, but the workflow's
+observable ground truth contradicts that report. Please re-evaluate the
+implementation against the actual file contents (read the files first)
+and produce a new self-assessment.
+
+GROUND TRUTH (these are facts, not estimates):
+- Build: {'passed' if test_results.get('build_ok') else 'failed'}
+- Tests: {int(test_results.get('passed', 0) or 0)} passed, {int(test_results.get('failed', 0) or 0)} failed
+- Files changed or created in the implementation step ({len(changes_made)}): {files_sample or '(none)'}
+
+YOUR PREVIOUS REPORT:
+- verdict={data.get('verdict')!r}, score={data.get('score')!r}
+- {len(previous_blocking)} blocking self-review issue(s)
+- {len(previous_gaps)} gap(s) reported
+
+If the build and tests passed and the files listed above exist with content,
+your previous assessment is very likely a hallucination. Read the actual
+file contents before re-assessing. Do NOT claim a file is missing or
+"not implemented" without first reading it.
+
+Return the same JSON schema as before. If the implementation is actually
+complete, set verdict='pass' and self_review_issues=[] (or include only
+genuine blocking issues you confirmed by reading the files).
+
+--- Original self-assessment task (re-evaluate against ground truth) ---
+{original_prompt}
+"""
+    return re_prompt
+
+
+def _try_ground_truth_re_prompt(
+    *,
+    state: dict,
+    data: dict,
+    runtime: Any,
+    prompt: str,
+    system_prompt: str,
+    acceptance_criteria_count: int,
+    log: Any,
+) -> tuple[bool, dict[str, Any] | None, str]:
+    """Run a single re-prompt with ground truth context.
+
+    Used as the last line of defence against self-assessment hallucinations
+    when the model hits ``max_assess_cycles`` with a fail verdict that
+    contradicts observable reality.
+
+    Returns ``(recovered, new_data, reason)``. When ``recovered`` is True,
+    ``new_data`` is a validated self-assessment that the caller may use in
+    place of the hallucinated one. When ``recovered`` is False, ``reason``
+    explains why the re-prompt did not help.
+    """
+    re_prompt = _build_ground_truth_re_prompt(state, data, prompt)
+    try:
+        result = runtime.run(
+            re_prompt,
+            system_prompt=system_prompt,
+            max_tokens=4096,
+            plugin_manager=state.get("_plugin_manager"),
+            cwd=state.get("repo_path") or None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, None, f"ground-truth re-prompt raised: {exc!r}"
+
+    raw_response = result.get("raw_response", "") if isinstance(result, dict) else ""
+    parsed = _safe_json(raw_response, fallback={})
+    if not isinstance(parsed, dict) or not parsed:
+        return False, None, "ground-truth re-prompt produced no JSON"
+
+    candidate = dict(parsed)
+    candidate.setdefault("criteria_checks", [])
+    candidate.setdefault("component_checks", [])
+    candidate.setdefault("self_review_issues", [])
+    candidate.setdefault("gaps", [])
+    candidate.setdefault("summary", "")
+
+    from framework.validation_gates import validate_self_assessment
+
+    gate_result = validate_self_assessment(candidate, acceptance_criteria_count)
+    if not gate_result.passed:
+        return False, None, f"ground-truth re-prompt failed validation: {gate_result.feedback}"
+
+    # Even after the re-prompt, double-check the model didn't re-hallucinate
+    # by claiming the same contradictory files. If it did, treat the
+    # re-prompt as a no-op so we still surface the failure to the user.
+    conflict, conflict_reason = _self_assessment_claims_conflict_with_ground_truth(
+        state, candidate
+    )
+    if conflict:
+        return False, None, f"ground-truth re-prompt still conflicts: {conflict_reason}"
+
+    return True, candidate, ""
+
+
+def _apply_deterministic_gaps(
+    state: dict, data: dict, schema_failure_exhausted: bool
+) -> None:
+    """Mutate ``data`` in place: surface self-review issues as gaps and
+    downgrade the verdict when blocking issues exist.
+
+    Pulled out of :func:`self_assess` so the ground-truth re-prompt
+    recovery path can re-apply the same transformation to a corrected
+    self-assessment.
+    """
+    deterministic_gaps: list[str] = []
+    blocking_issue_gaps: list[str] = []
+    self_review_issues = data.get("self_review_issues", [])
+    if not isinstance(self_review_issues, list):
+        self_review_issues = []
+        data["self_review_issues"] = self_review_issues
+    if self_review_issues:
+        for issue in self_review_issues:
+            if not isinstance(issue, dict):
+                continue
+            message = str(issue.get("message", "")).strip()
+            if not message:
+                continue
+            file_ref = str(issue.get("file") or "").strip()
+            line_ref = issue.get("line")
+            location = file_ref
+            if file_ref and line_ref:
+                location = f"{file_ref}:{line_ref}"
+            gap = f"{location} - {message}" if location else message
+            # An issue is "blocking" when the agent set ``blocking=True`` or
+            # left the field unset (legacy default). Non-blocking issues are
+            # advisory and must not downgrade the verdict on their own.
+            is_blocking = issue.get("blocking", True) is not False
+            if is_blocking:
+                blocking_issue_gaps.append(gap)
+            deterministic_gaps.append(gap)
+
+    if _is_screenshot_required(state) and not schema_failure_exhausted:
+        icon_validation = _detect_fragile_icon_font_usage(state.get("repo_path", ""))
+        deterministic_gaps.extend(icon_validation.get("issues") or [])
+        # Icon-rendering gaps are deterministic, file-level findings; treat
+        # them as blocking so they keep their existing fail semantics.
+        blocking_issue_gaps.extend(icon_validation.get("issues") or [])
+        if icon_validation.get("issues"):
+            data["component_checks"].append(
+                {
+                    "component": "Icon rendering",
+                    "status": "incomplete",
+                    "notes": icon_validation["issues"][0],
+                }
+            )
+
+    if deterministic_gaps and not schema_failure_exhausted:
+        merged_gaps: list[str] = []
+        for gap in [*(data.get("gaps") or []), *deterministic_gaps]:
+            text = str(gap).strip()
+            if text and text not in merged_gaps:
+                merged_gaps.append(text)
+        data["gaps"] = merged_gaps
+        # Only BLOCKING issues downgrade the verdict. Advisory / non-blocking
+        # issues are surfaced in the gap list for visibility but the
+        # implementation is allowed to pass when they are the only findings.
+        if blocking_issue_gaps:
+            data["verdict"] = "fail"
+            data["score"] = min(float(data.get("score", 0) or 0), 0.89)
+            summary = str(data.get("summary", "")).strip()
+            if blocking_issue_gaps[0] not in summary:
+                data["summary"] = (summary + " " if summary else "") + blocking_issue_gaps[0]
 
 
 async def self_assess(state: dict) -> dict:
@@ -1494,24 +1982,7 @@ async def self_assess(state: dict) -> dict:
         ac_str = ac_str[:3000] + "...]"
     acceptance_criteria_count = len(acceptance_criteria) if isinstance(acceptance_criteria, list) else 0
 
-    # Derive changed files from the actual cloned repo's git status when
-    # changes_made is empty (native tool runs don't track individual writes).
-    changed_files_list = state.get("changes_made", [])
-    if not changed_files_list:
-        repo_path = state.get("repo_path", "")
-        if repo_path and os.path.isdir(repo_path):
-            try:
-                import subprocess as _sp
-                _st = _sp.run(
-                    ["git", "status", "--short"],
-                    capture_output=True, text=True, cwd=repo_path, timeout=10,
-                )
-                for _line in _st.stdout.splitlines():
-                    _name = _line[3:].strip()
-                    if _name:
-                        changed_files_list.append(_name)
-            except Exception:
-                pass
+    changed_files_list = _workflow_changed_files(state)
 
     # Load Code Review comments for revision mode self-assessment
     cr_comments_text = ""
@@ -1591,7 +2062,12 @@ unresolved issues in gaps.
 
     gate_result = None
     data: dict[str, Any] = {}
-    max_schema_attempts = 2
+    schema_failure_exhausted = False
+    try:
+        max_schema_attempts = int(os.environ.get("WEB_DEV_SELF_ASSESS_SCHEMA_ATTEMPTS", "4") or "4")
+    except ValueError:
+        max_schema_attempts = 4
+    max_schema_attempts = max(1, min(max_schema_attempts, 8))
     for schema_attempt in range(1, max_schema_attempts + 1):
         attempt_prompt = prompt
         if gate_result and gate_result.feedback:
@@ -1628,64 +2104,106 @@ Return valid JSON only, and correct this validation feedback:
             break
         log.warn("validate_self_assessment gate", feedback=gate_result.feedback, schema_attempt=schema_attempt)
     else:
-        feedback = gate_result.feedback if gate_result else "Self-assessment output was invalid."
-        data = {
-            "score": 0.0,
-            "verdict": "fail",
-            "criteria_checks": data.get("criteria_checks", []) if isinstance(data, dict) else [],
-            "component_checks": data.get("component_checks", []) if isinstance(data, dict) else [],
-            "gaps": [feedback],
-            "summary": feedback,
-        }
-
-    deterministic_gaps: list[str] = []
-    self_review_issues = data.get("self_review_issues", [])
-    if not isinstance(self_review_issues, list):
-        self_review_issues = []
-        data["self_review_issues"] = self_review_issues
-    if self_review_issues:
-        for issue in self_review_issues:
-            if not isinstance(issue, dict):
-                continue
-            message = str(issue.get("message", "")).strip()
-            if not message:
-                continue
-            file_ref = str(issue.get("file") or "").strip()
-            line_ref = issue.get("line")
-            location = file_ref
-            if file_ref and line_ref:
-                location = f"{file_ref}:{line_ref}"
-            gap = f"{location} - {message}" if location else message
-            deterministic_gaps.append(gap)
-
-    if _is_screenshot_required(state):
-        icon_validation = _detect_fragile_icon_font_usage(state.get("repo_path", ""))
-        deterministic_gaps.extend(icon_validation.get("issues") or [])
-        if icon_validation.get("issues"):
-            data["component_checks"].append(
-                {
-                    "component": "Icon rendering",
-                    "status": "incomplete",
-                    "notes": icon_validation["issues"][0],
-                }
+        # Text-mode retries exhausted. Before escalating to the user, give
+        # the agentic CLI a chance to write the JSON to a file directly —
+        # this bypasses the brittle text-LLM return path entirely and works
+        # uniformly across copilot-cli, claude-code, and codex-cli backends.
+        text_mode_feedback = gate_result.feedback if gate_result else "Self-assessment output was invalid."
+        fallback_used = False
+        fallback_used_with_feedback = False
+        fallback_feedback = ""
+        fallback_file_path = ""
+        if _self_assess_agentic_fallback_enabled():
+            log.info(
+                "self_assess attempting agentic-file fallback",
+                cycle=assess_cycles,
+                text_mode_feedback=text_mode_feedback[:200],
             )
+            fallback_parsed, fallback_file_path = _self_assess_via_agentic_file(
+                state=state,
+                runtime=runtime,
+                base_prompt=prompt,
+                system_prompt=SELF_ASSESS_SYSTEM,
+                cwd=state.get("repo_path") or None,
+                workspace_path=state.get("workspace_path", ""),
+                agent_dir_name=_AGENT_ID,
+                cycle=assess_cycles,
+                plugin_manager=state.get("_plugin_manager"),
+            )
+            if isinstance(fallback_parsed, dict):
+                candidate = dict(fallback_parsed)
+                candidate.setdefault("criteria_checks", [])
+                candidate.setdefault("component_checks", [])
+                candidate.setdefault("self_review_issues", [])
+                candidate.setdefault("gaps", [])
+                candidate.setdefault("summary", "")
+                fallback_gate = validate_self_assessment(candidate, acceptance_criteria_count)
+                if fallback_gate.passed:
+                    log.info(
+                        "self_assess agentic-file fallback succeeded",
+                        cycle=assess_cycles,
+                        file=fallback_file_path,
+                    )
+                    data = candidate
+                    gate_result = fallback_gate
+                    fallback_used = True
+                else:
+                    fallback_feedback = fallback_gate.feedback
+                    fallback_used_with_feedback = True
+                    log.warn(
+                        "self_assess agentic-file fallback failed validation",
+                        cycle=assess_cycles,
+                        feedback=fallback_feedback,
+                        file=fallback_file_path,
+                    )
+            else:
+                fallback_used_with_feedback = True
+                fallback_feedback = "Agentic-file fallback produced no usable JSON."
+                log.warn(
+                    "self_assess agentic-file fallback produced no usable JSON",
+                    cycle=assess_cycles,
+                    file=fallback_file_path,
+                )
 
-    if deterministic_gaps:
-        merged_gaps: list[str] = []
-        for gap in [*(data.get("gaps") or []), *deterministic_gaps]:
-            text = str(gap).strip()
-            if text and text not in merged_gaps:
-                merged_gaps.append(text)
-        data["gaps"] = merged_gaps
-        data["verdict"] = "fail"
-        data["score"] = min(float(data.get("score", 0) or 0), 0.89)
-        summary = str(data.get("summary", "")).strip()
-        if deterministic_gaps[0] not in summary:
-            data["summary"] = (summary + " " if summary else "") + deterministic_gaps[0]
+        if not fallback_used:
+            schema_failure_exhausted = True
+            # The user-facing error message must reflect the *most recent*
+            # failure. If the agentic-file fallback also failed, its feedback
+            # is what the agent actually said — surface that, not the older
+            # text-mode feedback which describes an earlier parser failure.
+            surface_feedback = (
+                fallback_feedback if fallback_used_with_feedback else text_mode_feedback
+            )
+            fallback_attempted = (
+                _self_assess_agentic_fallback_enabled() and bool(fallback_file_path)
+            )
+            data = {
+                "score": 0.0,
+                "verdict": "error",
+                "criteria_checks": data.get("criteria_checks", []) if isinstance(data, dict) else [],
+                "component_checks": data.get("component_checks", []) if isinstance(data, dict) else [],
+                "self_review_issues": [],
+                "gaps": [
+                    f"Self-assessment output invalid after {max_schema_attempts} schema attempt(s)"
+                    + (" and agentic-file fallback" if fallback_attempted else "")
+                    + f": {surface_feedback}"
+                ],
+                "summary": (
+                    f"Self-assessment output invalid after {max_schema_attempts} schema attempt(s)"
+                    + (" and agentic-file fallback" if fallback_attempted else "")
+                    + f": {surface_feedback}"
+                ),
+                "failure_type": "schema",
+                "schema_feedback": surface_feedback,
+                "fallback_attempted": fallback_attempted,
+                "fallback_file": fallback_file_path,
+            }
+
+    _apply_deterministic_gaps(state, data, schema_failure_exhausted)
 
     score = float(data.get("score", 0) or 0)
     verdict = data.get("verdict", "fail")
-    gaps = data.get("gaps", [])
+    gaps = data.get("gaps", []) or []
 
     print(f"[{_AGENT_ID}] self_assess result: score={score} verdict={verdict} gaps={len(gaps)}")
 
@@ -1712,6 +2230,129 @@ Return valid JSON only, and correct this validation feedback:
 
     if score >= 0.9 and verdict != "fail":
         route = "pass"
+    elif schema_failure_exhausted:
+        route = "need_user_input"
+    elif assess_cycles >= max_assess_cycles and runtime is not None:
+        # Last line of defence: before declaring failure, check whether the
+        # self-assessment contains a machine-verifiable contradiction, such
+        # as claiming a changed file does not exist when it is present on
+        # disk. Passing build/test output alone is not enough to override a
+        # failed self-check, because that lets a backend revise a genuine
+        # 0.85-style failure into a pass without doing more work.
+        claims_conflict, conflict_reason = _self_assessment_claims_conflict_with_ground_truth(
+            state, data
+        )
+        ground_truth_present = _is_implementation_ground_truth_present(state)
+        if ground_truth_present and claims_conflict:
+            log.warn(
+                "self_assess attempting ground-truth re-prompt",
+                cycle=assess_cycles,
+                reason=conflict_reason,
+            )
+            recovered, gt_data, gt_reason = _try_ground_truth_re_prompt(
+                state=state,
+                data=data,
+                runtime=runtime,
+                prompt=prompt,
+                system_prompt=SELF_ASSESS_SYSTEM,
+                acceptance_criteria_count=acceptance_criteria_count,
+                log=log,
+            )
+            if recovered and isinstance(gt_data, dict):
+                # Adopt the re-prompted assessment. Re-apply the
+                # deterministic-gaps/verdict-downgrade step so advisory
+                # issues get surfaced and blocking issues still force a
+                # fail verdict.
+                original_score = score
+                original_verdict = verdict
+                data = gt_data
+                _apply_deterministic_gaps(state, data, schema_failure_exhausted)
+                data["ground_truth_reprompt"] = {
+                    "applied": True,
+                    "original_score": original_score,
+                    "original_verdict": original_verdict,
+                    "reason": conflict_reason,
+                }
+                score = float(data.get("score", 0) or 0)
+                verdict = data.get("verdict", "fail")
+                gaps = data.get("gaps", []) or []
+                log.info(
+                    "self_assess ground-truth re-prompt recovered",
+                    cycle=assess_cycles,
+                    score=score,
+                    verdict=verdict,
+                    gaps=len(gaps),
+                )
+                if score >= 0.9 and verdict != "fail":
+                    route = "pass"
+                else:
+                    failure_summary = "; ".join(str(gap) for gap in gaps[:4]) or str(data.get("summary", "self-assessment failed"))
+                    log.warn("self_assess exhausted retries", cycle=assess_cycles, failure_summary=failure_summary[:400])
+                    _record_timeline_step(
+                        state,
+                        step_key=step_key,
+                        title=title,
+                        lifecycle_state=LIFECYCLE_FAILED,
+                        summary_template="Web Dev self-check exhausted retries with verdict {verdict}.",
+                        summary_facts={"verdict": verdict},
+                        round=step_round,
+                        conditional=retry_mode,
+                    )
+                    raise RuntimeError(f"self_assess failed after {max_assess_cycles} cycles: {failure_summary[:400]}")
+                # Persist the corrected assessment to disk.
+                workspace_path = state.get("workspace_path", "")
+                if workspace_path:
+                    import time as _time
+                    agent_dir = os.path.join(workspace_path, _AGENT_ID)
+                    os.makedirs(agent_dir, exist_ok=True)
+                    try:
+                        sa_file = os.path.join(agent_dir, f"self-assessment-{assess_cycles}.json")
+                        with open(sa_file, "w", encoding="utf-8") as fh:
+                            json.dump({
+                                "metadata": {
+                                    "agent_id": "web-dev",
+                                    "step": "self_assess",
+                                    "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                                    "version": assess_cycles,
+                                },
+                                "data": data,
+                            }, fh, ensure_ascii=False, indent=2)
+                    except OSError:
+                        pass
+                # Skip the original "exhausted retries" path — we recovered.
+            else:
+                log.warn(
+                    "self_assess ground-truth re-prompt did not help",
+                    cycle=assess_cycles,
+                    reason=gt_reason,
+                )
+                failure_summary = "; ".join(str(gap) for gap in gaps[:4]) or str(data.get("summary", "self-assessment failed"))
+                log.warn("self_assess exhausted retries", cycle=assess_cycles, failure_summary=failure_summary[:400])
+                _record_timeline_step(
+                    state,
+                    step_key=step_key,
+                    title=title,
+                    lifecycle_state=LIFECYCLE_FAILED,
+                    summary_template="Web Dev self-check exhausted retries with verdict {verdict}.",
+                    summary_facts={"verdict": verdict},
+                    round=step_round,
+                    conditional=retry_mode,
+                )
+                raise RuntimeError(f"self_assess failed after {max_assess_cycles} cycles: {failure_summary[:400]}")
+        else:
+            failure_summary = "; ".join(str(gap) for gap in gaps[:4]) or str(data.get("summary", "self-assessment failed"))
+            log.warn("self_assess exhausted retries", cycle=assess_cycles, failure_summary=failure_summary[:400])
+            _record_timeline_step(
+                state,
+                step_key=step_key,
+                title=title,
+                lifecycle_state=LIFECYCLE_FAILED,
+                summary_template="Web Dev self-check exhausted retries with verdict {verdict}.",
+                summary_facts={"verdict": verdict},
+                round=step_round,
+                conditional=retry_mode,
+            )
+            raise RuntimeError(f"self_assess failed after {max_assess_cycles} cycles: {failure_summary[:400]}")
     elif assess_cycles >= max_assess_cycles:
         failure_summary = "; ".join(str(gap) for gap in gaps[:4]) or str(data.get("summary", "self-assessment failed"))
         log.warn("self_assess exhausted retries", cycle=assess_cycles, failure_summary=failure_summary[:400])
@@ -1774,7 +2415,7 @@ Return valid JSON only, and correct this validation feedback:
     return {
         "self_assessment": data,
         "assess_cycles": assess_cycles,
-        "route": "fail",
+        "route": route,
     }
 
 
@@ -1810,7 +2451,7 @@ async def fix_gaps(state: dict) -> dict:
 
     assessment = state.get("self_assessment", {})
     gaps = assessment.get("gaps", [])
-    changed_files = state.get("changes_made", [])
+    changed_files = _workflow_changed_files(state)
     log.info("fix_gaps started", gaps=len(gaps), files_changed=len(changed_files))
 
     prompt = FIX_GAPS_TEMPLATE.format(
@@ -1819,14 +2460,17 @@ async def fix_gaps(state: dict) -> dict:
         changed_files="\n".join(changed_files) if changed_files else "unknown",
     )
 
+    fix_gaps_policy, fix_gaps_policy_kwargs = _agentic_policy_for_state(state, runtime)
     result = runtime.run_agentic(
         task=prompt,
         system_prompt=FIX_GAPS_SYSTEM,
-        cwd=state.get("repo_path") or None,
+        cwd=_agentic_cwd(runtime, state.get("repo_path") or None),
         max_turns=15,
         timeout=300,
         plugin_manager=state.get("_plugin_manager"),
+        **fix_gaps_policy_kwargs,
     )
+    _record_agentic_step_gate(state, step="fix_gaps", policy=fix_gaps_policy, result=result)
     log.info("fix_gaps result", success=result.success, summary=result.summary[:300])
     _record_timeline_step(
         state,
@@ -1843,6 +2487,7 @@ async def fix_gaps(state: dict) -> dict:
         "fix_gaps_attempted": True,
         "fix_gaps_summary": result.summary,
         "agentic_success": result.success,
+        "changes_made": _workflow_changed_files(state),
         "test_cycles": 0,
         "build_cycles": 0,
     }
@@ -3085,6 +3730,18 @@ async def pause_for_user_input(state: dict) -> dict:
     assessment = state.get("self_assessment", {})
     gaps = assessment.get("gaps", [])
     gap_text = "\n".join(f"- {g}" for g in gaps[:10]) if gaps else "No specific gaps."
+    if assessment.get("failure_type") == "schema":
+        prompt_text = (
+            "Self-assessment could not obtain valid structured output from the configured runtime.\n"
+            f"Runtime/schema feedback:\n{gap_text}\n"
+            "Please retry after checking the agentic backend, or provide guidance on how to proceed."
+        )
+    else:
+        prompt_text = (
+            "Self-assessment could not resolve all gaps after maximum retries.\n"
+            f"Remaining gaps:\n{gap_text}\n"
+            "Please review and provide guidance on how to proceed."
+        )
     _record_timeline_step(
         state,
         step_key="wd.requesting_user_input",
@@ -3095,9 +3752,7 @@ async def pause_for_user_input(state: dict) -> dict:
     )
 
     interrupt(
-        f"Self-assessment could not resolve all gaps after maximum retries.\n"
-        f"Remaining gaps:\n{gap_text}\n"
-        "Please review and provide guidance on how to proceed.",
+        prompt_text,
         assessment_score=assessment.get("score"),
         gaps=gaps,
     )

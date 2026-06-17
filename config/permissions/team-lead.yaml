@@ -24,6 +24,7 @@ allowed_tools:
   - jira_list_comments
   - jira_search
   # SCM boundary tools (called by review nodes)
+  - scm_add_pr_comment
   - scm_add_pr_inline_comment
 
 denied_tools: []

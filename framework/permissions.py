@@ -7,6 +7,7 @@ deny by default.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any
 
 from framework.errors import PermissionDeniedError
@@ -55,6 +56,63 @@ class PermissionEngine:
         """Raise PermissionDeniedError if the tool is not allowed."""
         if not self.check_tool(tool_name):
             raise PermissionDeniedError(f"Tool '{tool_name}' is not permitted")
+
+    def check_command(self, command: str | list[str] | tuple[str, ...]) -> bool:
+        """Return True if a run_command payload is allowed by command patterns.
+
+        Command policy is intentionally stored under ``custom`` so permission
+        YAML files stay easy to audit without expanding the top-level schema:
+
+        ``allowed_command_patterns``
+            Regex patterns for allowed command strings. Empty means commands
+            are unrestricted for backward-compatible profiles.
+
+        ``denied_command_patterns``
+            Regex patterns that always deny, even when an allow pattern matches.
+        """
+        command_text = self._normalise_command(command)
+        if not command_text:
+            return False
+
+        custom = self._permissions.custom or {}
+        denied_patterns = self._pattern_list(
+            custom.get("denied_command_patterns") or custom.get("denied_commands")
+        )
+        if any(self._pattern_matches(pattern, command_text, invalid_matches=True) for pattern in denied_patterns):
+            return False
+
+        allowed_patterns = self._pattern_list(
+            custom.get("allowed_command_patterns") or custom.get("allowed_commands")
+        )
+        if not allowed_patterns:
+            return True
+        return any(self._pattern_matches(pattern, command_text) for pattern in allowed_patterns)
+
+    def require_command(self, command: str | list[str] | tuple[str, ...]) -> None:
+        """Raise PermissionDeniedError if a run_command payload is not allowed."""
+        if not self.check_command(command):
+            raise PermissionDeniedError(f"Command {self._normalise_command(command)!r} is not permitted")
+
+    @staticmethod
+    def _normalise_command(command: str | list[str] | tuple[str, ...]) -> str:
+        if isinstance(command, (list, tuple)):
+            return " ".join(str(part).strip() for part in command if str(part).strip()).strip()
+        return str(command or "").strip()
+
+    @staticmethod
+    def _pattern_list(value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item).strip()]
+        return []
+
+    @staticmethod
+    def _pattern_matches(pattern: str, command_text: str, *, invalid_matches: bool = False) -> bool:
+        try:
+            return re.search(pattern, command_text) is not None
+        except re.error:
+            return invalid_matches
 
     def check_scm_write(self) -> bool:
         """Return True if SCM write operations are allowed."""

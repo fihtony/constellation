@@ -13,19 +13,33 @@
 #   ./start.sh rancher build run      # rancher + build then run
 #   ./start.sh docker build run       # docker + build then run
 #
-# The "build" step rebuilds every constellation image:
-#   * Long-running services declared in the chosen compose file
-#     (registry, init-register, compass, team-lead, jira, scm, ui-design)
-#     via `docker compose build`.
-#   * Per-task agents (office, web-dev, code-review) via explicit
-#     `docker build`, since they are NOT declared in the compose files —
-#     they are launched dynamically by compass / team-lead through the
-#     docker socket. All images are tagged ":latest".
+# The "build" step runs in this order:
+#   1. The shared base image(s), via scripts/build_base.sh.  The
+#      base carries the system packages, the union of every
+#      agent's Python deps, and the agentic CLI (when the
+#      deployment uses one).  The base is tagged
+#        constellation-base:agentic-<AGENT_RUNTIME>   (full)
+#        constellation-base:boundary                 (slim; boundary agents)
+#      and is the FROM source for every per-agent Dockerfile
+#      in agents/<name>/.
+#   2. Long-running services declared in the chosen compose file
+#      (registry, init-register, compass, team-lead, jira, scm,
+#      ui-design).  These build on top of the base; the
+#      per-agent Dockerfiles pass through the AGENT_RUNTIME
+#      build arg from config/.env.
+#   3. Per-task agents (office, web-dev, code-review).  These are
+#      NOT declared in the compose file — they are launched
+#      dynamically by compass / team-lead through the docker
+#      socket.  We build them explicitly here, tagged ":latest"
+#      with the AGENT_RUNTIME build arg.
+#
+# The "run" step does `docker compose -f <files> up -d` followed
+# by `docker compose -f <files> ps`.
 
 set -euo pipefail
 
 usage() {
-    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # -------------------------------------------------------------------- argv ---
@@ -53,28 +67,88 @@ for arg in "$@"; do
     esac
 done
 
-# Defaults: docker runtime, "run" action when neither build nor run was given.
-[ -z "$runtime" ] && runtime="docker"
+# Defaults: "run" action when neither build nor run was given.
 if [ "$do_build" -eq 0 ] && [ "$do_run" -eq 0 ]; then
     do_run=1
 fi
 
-# --------------------------------------------------------------- runtime ---
-case "$runtime" in
-    docker)  compose_file="docker-compose-v2.yml"         ;;
-    rancher) compose_file="docker-compose-v2.rancher.yml" ;;
-esac
-
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$script_dir"
 
-if [ ! -f "$compose_file" ]; then
-    echo "Error: compose file '$compose_file' not found in $script_dir" >&2
-    exit 1
+read_config_env() {
+    local key="$1"
+    local raw value
+    if [ ! -f config/.env ]; then
+        return 0
+    fi
+    raw="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" config/.env | head -1 || true)"
+    if [ -z "$raw" ]; then
+        return 0
+    fi
+    value="${raw#*=}"
+    printf '%s\n' "$value" \
+        | sed -E "s/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+#.*$//; s/^\"//; s/\"$//; s/^'//; s/'$//"
+}
+
+if [ -z "$runtime" ]; then
+    runtime="$(read_config_env CONTAINER_RUNTIME)"
 fi
+[ -z "$runtime" ] && runtime="docker"
+
+# --------------------------------------------------------------- runtime ---
+# The two compose files.  For docker we use the main file alone;
+# for rancher we merge the main file with the minimal override
+# (which only changes DOCKER_SOCKET_GID for the services that
+# mount the host docker socket).  See docker-compose.v2.rancher.yml
+# for the override contract.
+# Each ``-f`` flag and its filename are stored as separate
+# array elements so that ``"${compose_args[@]}"`` at the
+# ``docker compose`` call site below produces the right argv
+# (``docker compose -f main.yml -f override.yml build``).
+case "$runtime" in
+    docker)
+        compose_args=(-f docker-compose-v2.yml)
+        ;;
+    rancher)
+        compose_args=(-f docker-compose-v2.yml -f docker-compose.v2.rancher.yml)
+        ;;
+    *)
+        echo "Error: unsupported container runtime '$runtime'." >&2
+        echo "Set CONTAINER_RUNTIME=docker|rancher in config/.env or pass docker|rancher explicitly." >&2
+        exit 2
+        ;;
+esac
+
+# Validate the compose file(s) before doing any work.  Walk the
+# argv-style array in pairs: an ``-f`` element followed by the
+# filename element.
+for ((i = 0; i < ${#compose_args[@]}; i++)); do
+    if [ "${compose_args[$i]}" = "-f" ]; then
+        filename="${compose_args[$((i + 1))]}"
+        if [ ! -f "$filename" ]; then
+            echo "Error: compose file '$filename' not found in $script_dir" >&2
+            exit 1
+        fi
+        i=$((i + 1))
+    fi
+done
+
+# ----------------------------------------------------------- agent_runtime ---
+# Pick the AGENT_RUNTIME that drives both the base image build
+# (scripts/build_base.sh) and the per-agent compose build args
+# (docker-compose-v2.yml forwards it).  Precedence:
+#   1. $AGENT_RUNTIME in the calling shell
+#   2. AGENT_RUNTIME=... in config/.env
+#   3. claude-code (the default in pyproject / framework/config.py)
+if [ -z "${AGENT_RUNTIME:-}" ] && [ -f config/.env ]; then
+    AGENT_RUNTIME="$(read_config_env AGENT_RUNTIME)"
+fi
+: "${AGENT_RUNTIME:=claude-code}"
+export AGENT_RUNTIME
+echo "==> AGENT_RUNTIME=${AGENT_RUNTIME}"
 
 # Per-task agents that are launched dynamically and therefore NOT part of
-# the compose file. Format: "<image-suffix>|<dockerfile-dir>".
+# the compose file.  Format: "<image-suffix>|<dockerfile-dir>".
 per_task_agents=(
     "office|office"
     "web-dev|web_dev"
@@ -83,25 +157,29 @@ per_task_agents=(
 
 # ---------------------------------------------------------------- build ---
 if [ "$do_build" -eq 1 ]; then
-    echo "==> [build] long-running services via $compose_file"
-    docker compose -f "$compose_file" build
+    echo "==> [build] base image(s) via scripts/build_base.sh ${AGENT_RUNTIME}"
+    ./scripts/build_base.sh "${AGENT_RUNTIME}"
+
+    echo "==> [build] long-running services via ${compose_args[*]}"
+    docker compose "${compose_args[@]}" build
 
     echo "==> [build] per-task agent images (tagged :latest)"
     for spec in "${per_task_agents[@]}"; do
         image_suffix="${spec%%|*}"
         dir_name="${spec##*|}"
         tag="constellation-v2-${image_suffix}:latest"
-        echo "    - $tag  (agents/${dir_name}/Dockerfile)"
+        echo "    - $tag  (agents/${dir_name}/Dockerfile, AGENT_RUNTIME=${AGENT_RUNTIME})"
         docker build --tag "$tag" \
                      --file "agents/${dir_name}/Dockerfile" \
+                     --build-arg "AGENT_RUNTIME=${AGENT_RUNTIME}" \
                      .
     done
 fi
 
 # ------------------------------------------------------------------ run ---
 if [ "$do_run" -eq 1 ]; then
-    echo "==> [run] starting Constellation ($runtime → $compose_file)"
-    docker compose -f "$compose_file" up -d
+    echo "==> [run] starting Constellation ($runtime → ${compose_args[*]})"
+    docker compose "${compose_args[@]}" up -d
     echo
-    docker compose -f "$compose_file" ps
+    docker compose "${compose_args[@]}" ps
 fi

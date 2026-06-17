@@ -30,6 +30,10 @@ def isolated_config_env(monkeypatch):
         "ANTHROPIC_AUTH_TOKEN",
         "CONNECT_AGENT_URL",
         "COPILOT_GITHUB_TOKEN",
+        "COPILOT_MODEL",
+        "COPILOT_PROVIDER_API_KEY",
+        "COPILOT_PROVIDER_BASE_URL",
+        "COPILOT_PROVIDER_TYPE",
     ]:
         monkeypatch.delenv(key, raising=False)
 
@@ -75,6 +79,10 @@ def project_dir(tmp_path):
         execution_mode: persistent
         runtime_backend: claude-code
         model: claude-haiku-4-5-20251001
+        runtime_capabilities:
+          run: true
+          run_agentic: true
+          agentic_tools: true
         permission_profile: team-lead
         port: 8030
     """))
@@ -222,6 +230,16 @@ class TestBuildAgentDefinitionFromConfig:
         assert definition["name"] == "Team Lead Agent"
         assert definition["mode"] == "task"
         assert "dispatch_agent" in definition["tools"]
+
+    def test_runtime_capabilities_are_preserved(self, project_dir):
+        from framework.config import build_agent_definition_from_config
+
+        definition = build_agent_definition_from_config("team-lead", project_dir)
+        assert definition["runtime_capabilities"] == {
+            "run": True,
+            "run_agentic": True,
+            "agentic_tools": True,
+        }
 
     def test_skills_from_default_skills(self, project_dir):
         from framework.config import build_agent_definition_from_config
@@ -500,14 +518,32 @@ class TestValidateStartupConfig:
         warnings = validate_startup_config(project_dir)
         assert any("CONNECT_AGENT_URL" in w for w in warnings)
 
-    def test_copilot_cli_without_token_fails(self, project_dir, monkeypatch):
-        """AGENT_RUNTIME=copilot-cli without COPILOT_GITHUB_TOKEN should fail."""
+    def test_copilot_cli_byok_without_github_token_is_valid(self, project_dir, monkeypatch):
+        """AGENT_RUNTIME=copilot-cli supports BYOK without GitHub-hosted auth."""
+        from framework.config import validate_startup_config
+
+        monkeypatch.setenv("AGENT_RUNTIME", "copilot-cli")
+        monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "https://llm.example.test/v1")
+        monkeypatch.setenv("AGENT_MODEL", "provider-model")
+        monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("SCM_BASE_URL", raising=False)
+        monkeypatch.setattr("framework.config.which", lambda cmd: "/usr/local/bin/copilot" if cmd == "copilot" else None)
+
+        validate_startup_config(project_dir)
+
+    def test_copilot_cli_without_byok_or_github_auth_fails(self, project_dir, monkeypatch):
+        """AGENT_RUNTIME=copilot-cli needs BYOK config or explicit GitHub-hosted auth."""
         from framework.config import ConfigValidationError, validate_startup_config
 
         monkeypatch.setenv("AGENT_RUNTIME", "copilot-cli")
         monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("COPILOT_PROVIDER_BASE_URL", raising=False)
+        monkeypatch.delenv("COPILOT_MODEL", raising=False)
+        monkeypatch.delenv("AGENT_MODEL", raising=False)
         monkeypatch.delenv("SCM_BASE_URL", raising=False)
-        with pytest.raises(ConfigValidationError, match="COPILOT_GITHUB_TOKEN"):
+        monkeypatch.setattr("framework.config.which", lambda cmd: "/usr/local/bin/copilot" if cmd == "copilot" else None)
+
+        with pytest.raises(ConfigValidationError, match="COPILOT_PROVIDER_BASE_URL"):
             validate_startup_config(project_dir)
 
     def test_invalid_container_runtime_fails(self, project_dir, monkeypatch):
@@ -563,7 +599,7 @@ class TestValidateStartupConfig:
         ("runtime", "required_env", "match_text"),
         [
             ("claude-code", {"ANTHROPIC_AUTH_TOKEN": "test-token"}, "no matching executable"),
-            ("copilot-cli", {"COPILOT_GITHUB_TOKEN": "test-token"}, "no matching executable"),
+            ("copilot-cli", {"COPILOT_PROVIDER_BASE_URL": "https://llm.example.test/v1", "COPILOT_MODEL": "provider-model"}, "no matching executable"),
             ("codex-cli", {}, "no matching executable"),
         ],
     )

@@ -1,7 +1,8 @@
 """Codex CLI runtime adapter.
 
-Invokes the ``codex`` subprocess (OpenAI Codex CLI) for agentic tasks.
-Codex CLI manages its own reasoning loop; we spawn it with the task prompt.
+Invokes a Constellation-managed tool loop for agentic tasks that request
+framework tools. Tool-free legacy calls can still spawn the ``codex``
+subprocess with the task prompt.
 
 Backend name: ``codex-cli``
 """
@@ -11,7 +12,8 @@ import os
 import subprocess
 from shutil import which
 
-from framework.runtime.adapter import AgenticResult, AgentRuntimeAdapter
+from framework.runtime.adapter import AgenticCapabilities, AgenticResult, AgentRuntimeAdapter
+from framework.runtime.cli_prompt import cli_prompt_argument
 from framework.runtime.connect_agent.transport import run_single_shot
 
 _SINGLE_SHOT_SYSTEM = (
@@ -74,8 +76,45 @@ class CodexCLIAdapter(AgentRuntimeAdapter):
         timeout: int = 1800,
         on_progress=None,
         continuation: str | None = None,
+        plugin_manager=None,
     ) -> AgenticResult:
-        """Run a task via the codex CLI subprocess."""
+        """Run a task via the managed tool loop or codex CLI subprocess."""
+        if tools is not None or allowed_tools is not None:
+            unsupported = self.validate_agentic_request(
+                tools=tools,
+                mcp_servers=mcp_servers,
+                allowed_tools=allowed_tools,
+                cwd=cwd,
+                continuation=continuation,
+            )
+            if unsupported:
+                return unsupported
+            from framework.runtime.managed_agentic import run_managed_agentic_loop
+
+            return run_managed_agentic_loop(
+                self,
+                backend="codex-cli",
+                task=task,
+                system_prompt=system_prompt,
+                cwd=cwd,
+                tools=tools,
+                allowed_tools=allowed_tools,
+                max_turns=max_turns,
+                timeout=timeout,
+                on_progress=on_progress,
+                plugin_manager=plugin_manager,
+            )
+
+        unsupported = self.validate_agentic_request(
+            tools=tools,
+            mcp_servers=mcp_servers,
+            allowed_tools=allowed_tools,
+            cwd=cwd,
+            continuation=continuation,
+        )
+        if unsupported:
+            return unsupported
+
         cli = _find_codex_cli()
         if not cli:
             return AgenticResult(
@@ -89,17 +128,17 @@ class CodexCLIAdapter(AgentRuntimeAdapter):
         if system_prompt:
             full_prompt = f"{system_prompt}\n\n{task}"
 
-        cmd = [cli, "--approval-mode", "full-auto", "-q", full_prompt]
-
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=cwd,
-                timeout=timeout,
-                env={**os.environ},
-            )
+            with cli_prompt_argument(full_prompt, backend="codex-cli") as prompt_arg:
+                cmd = [cli, "--approval-mode", "full-auto", "-q", prompt_arg]
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    cwd=cwd,
+                    timeout=timeout,
+                    env={**os.environ},
+                )
             stdout = proc.stdout.strip()
             stderr = proc.stderr.strip()
 
@@ -134,4 +173,16 @@ class CodexCLIAdapter(AgentRuntimeAdapter):
             )
 
     def supports_mcp(self) -> bool:
-        return False
+        return self.agentic_capabilities().mcp_servers
+
+    def agentic_capabilities(self) -> AgenticCapabilities:
+        return AgenticCapabilities(
+            backend="codex-cli",
+            agentic=True,
+            constellation_tools=True,
+            mcp_servers=False,
+            cwd=True,
+            allowed_tools=True,
+            continuation=False,
+            plugin_hooks=True,
+        )

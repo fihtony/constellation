@@ -65,6 +65,11 @@ class TestCompassDefinition:
     def test_has_tools(self):
         assert len(compass_definition.tools) > 0
 
+    def test_declares_single_shot_and_agentic_runtime_capabilities(self):
+        assert compass_definition.runtime_capabilities["run"] is True
+        assert compass_definition.runtime_capabilities["run_agentic"] is True
+        assert compass_definition.runtime_capabilities["agentic_tools"] is True
+
 
 class TestCompassClassification:
     """Unit tests for the heuristic + LLM classification helper."""
@@ -332,11 +337,14 @@ class TestCompassAgent:
         runtime.run_agentic.assert_not_called()
         mock_reg.execute_sync.assert_not_called()
 
-    async def test_general_task_uses_run_agentic(self):
-        """General/conversational tasks use run_agentic for LLM response."""
+    async def test_general_task_uses_tool_free_single_shot_run(self):
+        """General/conversational tasks use a tool-free LLM response."""
         runtime = _mock_runtime("Python is a programming language.")
         # Ensure LLM classification also returns 'general'
-        runtime.run.return_value = {"raw_response": "general"}
+        runtime.run.side_effect = [
+            {"raw_response": "general"},
+            {"raw_response": "Python is a programming language."},
+        ]
         agent = _make_agent(runtime)
 
         message = {"parts": [{"text": "What is Python?"}], "metadata": {}}
@@ -346,7 +354,8 @@ class TestCompassAgent:
             result = await agent.handle_message(message)
 
         assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
-        runtime.run_agentic.assert_called_once()
+        runtime.run_agentic.assert_not_called()
+        assert runtime.run.call_args_list[-1].kwargs["disallowed_tools"] == ["*"]
 
     async def test_get_task_nonexistent_returns_failed(self):
         """Non-existent task ID returns FAILED from TaskStore."""

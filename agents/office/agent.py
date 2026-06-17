@@ -140,6 +140,7 @@ def _build_office_definition() -> AgentDefinition:
         permission_profile=cfg.get("permission_profile", "office"),
         runtime_backend=cfg.get("runtime_backend", "connect-agent"),
         model=cfg.get("model", "gpt-5-mini"),
+        runtime_capabilities=cfg.get("runtime_capabilities", {}),
         workflow=office_workflow,
         config=cfg,
         launch_spec=cfg.get("launch_spec"),
@@ -706,6 +707,27 @@ class OfficeAgent(BaseAgent):
                 ).strip()
                 if custom_hint:
                     updated_metadata["customDimensionHint"] = custom_hint
+        elif missing == "organizeCustomHint":
+            custom_hint = str(
+                extract_custom_dimension_hint(reply_text)
+                or reply_text
+                or ""
+            ).strip()
+            if not custom_hint:
+                return self._reask_for_clarification(
+                    task_store=task_store,
+                    task_id=task_id,
+                    question=str(
+                        needs_clarification.get("user_message")
+                        or "Office organize needs a custom grouping hint."
+                    ),
+                    interrupt_metadata={
+                        "kind": "office_clarification",
+                        "needs_clarification": needs_clarification,
+                    },
+                )
+            updated_metadata["organizeGroupBy"] = CUSTOM_DIMENSION
+            updated_metadata["customDimensionHint"] = custom_hint
         elif missing == "organizeCustomPlan":
             resolution = dict(structured_resolution)
             resolution_kind = str(

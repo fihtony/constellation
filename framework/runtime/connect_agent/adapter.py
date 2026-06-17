@@ -9,7 +9,7 @@ import json
 import os
 import time
 
-from framework.runtime.adapter import AgenticResult, AgentRuntimeAdapter
+from framework.runtime.adapter import AgenticCapabilities, AgenticResult, AgentRuntimeAdapter
 from framework.runtime.connect_agent.transport import (
     DEFAULT_MODEL,
     call_chat_completion,
@@ -112,6 +112,16 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
         implementation with policy profiles, checkpoints, and sub-agents
         will be restored incrementally.
         """
+        unsupported = self.validate_agentic_request(
+            tools=tools,
+            mcp_servers=mcp_servers,
+            allowed_tools=allowed_tools,
+            cwd=cwd,
+            continuation=continuation,
+        )
+        if unsupported:
+            return unsupported
+
         effective_model = self.resolve_model(
             os.environ.get("AGENT_MODEL"),
             os.environ.get("OPENAI_MODEL"),
@@ -124,8 +134,10 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
             {"role": "user", "content": task},
         ]
 
-        # Build tool schemas if tool functions are provided
-        tool_schemas = self._build_tool_schemas(tools or [])
+        # Build tool schemas if tool functions are provided.  Parent execution
+        # contracts narrow the exposed tool surface through allowed_tools.
+        effective_tools = self._effective_tools(tools or [], allowed_tools or [])
+        tool_schemas = self._build_tool_schemas(effective_tools)
 
         turns_used = 0
         tool_calls_log: list[dict] = []
@@ -226,16 +238,32 @@ class ConnectAgentAdapter(AgentRuntimeAdapter):
             backend_used="connect-agent",
         )
 
-    def supports_mcp(self) -> bool:
-        return True
+    def agentic_capabilities(self) -> AgenticCapabilities:
+        return AgenticCapabilities(
+            backend="connect-agent",
+            agentic=True,
+            constellation_tools=True,
+            mcp_servers=False,
+            cwd=False,
+            allowed_tools=True,
+            continuation=False,
+            plugin_hooks=True,
+        )
+
+    @staticmethod
+    def _effective_tools(tool_names: list[str], allowed_tools: list[str]) -> list[str]:
+        if not allowed_tools:
+            return tool_names
+        allowed = set(allowed_tools)
+        return [name for name in tool_names if name in allowed]
 
     def _build_tool_schemas(self, tool_names: list[str]) -> list[dict]:
         """Return OpenAI-compatible schemas from the global ToolRegistry."""
+        if not tool_names:
+            return []
         from framework.tools.registry import get_registry
         registry = get_registry()
-        if tool_names:
-            return registry.list_schemas(tool_names)
-        return registry.list_schemas()
+        return registry.list_schemas(tool_names)
 
     def _execute_tool(self, name: str, arguments: str) -> str:
         """Execute a registered tool synchronously. Returns JSON string."""

@@ -263,6 +263,7 @@ def build_agent_definition_from_config(
         "permission_profile": permission_profile,
         "runtime_backend": data.get("runtime_backend", cfg.get("runtime.backend", "connect-agent")),
         "model": data.get("model", cfg.get("runtime.model", "gpt-5-mini")),
+        "runtime_capabilities": data.get("runtime_capabilities", {}),
         "config": data,
         "launch_spec": data.get("launch_spec") or data.get("launchSpec"),
     }
@@ -319,7 +320,11 @@ _SUPPORTED_SELECTOR_VALUES: dict[str, tuple[str, ...]] = {
 
 _RUNTIME_EXECUTABLES: dict[str, tuple[str, ...]] = {
     "claude-code": ("claude", "claude-code"),
-    "copilot-cli": ("copilot-cli", "gh"),
+    # Only the standalone ``copilot`` / ``copilot-cli`` binary is
+    # accepted.  The ``gh copilot`` path was removed from the
+    # adapter because it reads the host's ``~/.config/gh/hosts.yml``;
+    # there is therefore no fallback to ``gh`` here either.
+    "copilot-cli": ("copilot", "copilot-cli"),
     "codex-cli": ("codex", "codex-cli"),
 }
 
@@ -497,10 +502,23 @@ def validate_startup_config(
                     "runtime default will be used (http://localhost:1288 or container equivalent)."
                 )
         elif runtime == "copilot-cli":
-            if not os.environ.get("COPILOT_GITHUB_TOKEN", "").strip():
+            has_github_auth = bool(os.environ.get("COPILOT_GITHUB_TOKEN", "").strip())
+            has_byok_base_url = bool(os.environ.get("COPILOT_PROVIDER_BASE_URL", "").strip())
+            has_byok_model = bool(
+                os.environ.get("COPILOT_MODEL", "").strip()
+                or os.environ.get("AGENT_MODEL", "").strip()
+                or os.environ.get("CONSTELLATION_RUNTIME_MODEL", "").strip()
+            )
+            if not has_github_auth and not has_byok_base_url:
                 errors.append(
-                    "AGENT_RUNTIME=copilot-cli but COPILOT_GITHUB_TOKEN is not set. "
-                    "Set COPILOT_GITHUB_TOKEN in config/.env."
+                    "AGENT_RUNTIME=copilot-cli requires COPILOT_PROVIDER_BASE_URL for BYOK "
+                    "mode, or COPILOT_GITHUB_TOKEN for GitHub-hosted Copilot. Set the "
+                    "chosen mode in config/.env."
+                )
+            if not has_github_auth and has_byok_base_url and not has_byok_model:
+                errors.append(
+                    "AGENT_RUNTIME=copilot-cli with BYOK requires COPILOT_MODEL, AGENT_MODEL, "
+                    "or CONSTELLATION_RUNTIME_MODEL in config/.env."
                 )
 
     # ------------------------------------------------------------------

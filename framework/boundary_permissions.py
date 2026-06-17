@@ -114,6 +114,18 @@ def enforce_boundary_permission(
         permissions_snapshot=permissions_snapshot,
         require_scm_write=require_scm_write,
     )
+    from framework.audit_log import append_current_permission_denial
+
+    append_current_permission_denial(
+        operation=f"boundary:{capability}",
+        reason=reason,
+        metadata={
+            "capability": capability,
+            "grant_agent": grant_agent,
+            "grant_action": grant_action,
+            "scope": scope,
+        },
+    )
     if mode == "strict":
         return {
             "status": "permission_denied",

@@ -12,7 +12,7 @@ from framework.tools.base import BaseTool, ToolResult
 from framework.tools.registry import get_registry
 
 
-def _resolve_agent_url(capability: str, env_var: str = "", default: str = "") -> str:
+def _resolve_agent_url(capability: str) -> str:
     """Resolve an agent's URL via Registry discovery only."""
     try:
         from framework.registry_client import RegistryClient
@@ -27,7 +27,7 @@ def _resolve_agent_url(capability: str, env_var: str = "", default: str = "") ->
 
 def _dispatch_jira(capability: str, ticket_key: str = "", **meta) -> dict:
     """Dispatch a Jira capability via A2A."""
-    jira_url = _resolve_agent_url(capability, "JIRA_AGENT_URL", "http://jira:8010")
+    jira_url = _resolve_agent_url(capability)
     if not jira_url:
         return {"error": "No registered Jira instance was found in the registry."}
     try:
@@ -50,7 +50,7 @@ def _dispatch_jira(capability: str, ticket_key: str = "", **meta) -> dict:
 
 def _dispatch_scm(capability: str, text: str = "", **meta) -> dict:
     """Dispatch an SCM capability via A2A."""
-    scm_url = _resolve_agent_url(capability, "SCM_AGENT_URL", "http://scm:8020")
+    scm_url = _resolve_agent_url(capability)
     if not scm_url:
         return {"error": "No registered SCM instance was found in the registry."}
     try:

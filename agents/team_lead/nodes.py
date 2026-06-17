@@ -9,6 +9,7 @@ for single-shot LLM calls or bounded ReAct; the graph controls the macro flow.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import html
 import json
 import os
 import re
@@ -27,6 +28,7 @@ from framework.major_step import (
     record_major_step,
 )
 from framework.audit_log import (
+    append_current_permission_denial as _append_current_permission_denial,
     append_command_log as _append_command_log,
     write_stage_summary as _write_stage_summary,
 )
@@ -43,6 +45,23 @@ _CHILD_SESSION_CACHE: dict[str, dict[str, dict[str, str]]] = {}
 def _logger(state: dict) -> AgentLogger:
     """Return an AgentLogger for this agent using the task_id stored in state."""
     return AgentLogger(state.get("_task_id", ""), _AGENT_ID)
+
+
+def _require_agent_launch_permission(state: dict, perm_engine: Any, agent_id: str) -> None:
+    if not perm_engine:
+        return
+    try:
+        perm_engine.require_agent_launching(agent_id)
+    except Exception as exc:
+        from framework.errors import PermissionDeniedError
+
+        if isinstance(exc, PermissionDeniedError):
+            _append_current_permission_denial(
+                operation="agent_launch",
+                reason=str(exc),
+                metadata={"target_agent": agent_id},
+            )
+        raise
 
 
 def _record_timeline_step(
@@ -778,14 +797,14 @@ async def gather_context(state: dict) -> dict:
         summary_template="Team Lead is gathering Jira, design, and repository context.",
     )
 
-    jira_files = []
-    design_files = []
-    design_code_path = ""
+    jira_files = list(state.get("jira_files") or [])
+    design_files = list(state.get("design_files") or [])
+    design_code_path = str(state.get("design_code_path") or "")
 
     # Fetch Jira ticket if key provided and not already present
     jira_key = state.get("jira_key", "")
     task_id = state.get("_task_id", "")
-    jira_local_folder = ""
+    jira_local_folder = str(state.get("jira_local_folder") or "")
     if jira_key and not jira_context:
         log.info("fetching jira ticket", jira_key=jira_key)
         log.a2a("→", "jira", capability="fetch_jira_ticket", jira_key=jira_key,
@@ -799,8 +818,9 @@ async def gather_context(state: dict) -> dict:
             jira_context = _validate_jira_payload(payload, jira_key)
             jira_local_folder = payload.get("local_folder", "")
             returned_files = payload.get("files", [])
-            if returned_files:
-                jira_files.extend(returned_files)
+            for returned_file in returned_files:
+                if returned_file not in jira_files:
+                    jira_files.append(returned_file)
             log.info("jira fetch ok", jira_key=jira_key, local_folder=jira_local_folder,
                      files=returned_files)
             log.a2a("←", "jira", capability="fetch_jira_ticket", jira_key=jira_key,
@@ -890,11 +910,23 @@ async def gather_context(state: dict) -> dict:
             print(f"[{_AGENT_ID}] Failed to write jira-ticket.json: {exc}")
 
     # Fetch design context if URL provided and not already present
-    design_local_folder = ""
-    design_code_path_from_agent = ""
-    design_md_path_from_agent = ""
-    design_screen_path_from_agent = ""
-    returned_design_files: list[str] = []
+    design_local_folder = str(state.get("design_local_folder") or "")
+    design_code_path_from_agent = str(state.get("design_code_path") or "")
+    design_md_path_from_agent = str(state.get("design_md_path") or "")
+    design_screen_path_from_agent = str(state.get("design_screen_path") or "")
+    returned_design_files: list[str] = list(state.get("design_files") or [])
+    if isinstance(design_context, dict):
+        design_local_folder = design_local_folder or str(design_context.get("local_folder") or "")
+        design_code_path_from_agent = design_code_path_from_agent or str(design_context.get("design_code_path") or "")
+        design_md_path_from_agent = design_md_path_from_agent or str(design_context.get("design_md_path") or "")
+        design_screen_path_from_agent = design_screen_path_from_agent or str(
+            design_context.get("design_screen_path") or ""
+        )
+        for design_file in design_context.get("files") or []:
+            if design_file not in returned_design_files:
+                returned_design_files.append(design_file)
+            if design_file not in design_files:
+                design_files.append(design_file)
     if (figma_url or stitch_id) and not design_context:
         log.info("fetching design context",
                  figma_url=figma_url, stitch_id=stitch_id, screen_id=stitch_screen_id,
@@ -921,9 +953,12 @@ async def gather_context(state: dict) -> dict:
                 design_code_path_from_agent = payload.get("design_code_path", "")
                 design_md_path_from_agent = payload.get("design_md_path", "")
                 design_screen_path_from_agent = payload.get("design_screen_path", "")
-                returned_design_files = payload.get("files", [])
-                if returned_design_files:
-                    design_files.extend(returned_design_files)
+                payload_files = payload.get("files", [])
+                for design_file in payload_files:
+                    if design_file not in returned_design_files:
+                        returned_design_files.append(design_file)
+                    if design_file not in design_files:
+                        design_files.append(design_file)
                 log.info("design fetch ok", local_folder=design_local_folder,
                          files=returned_design_files,
                          code_path=design_code_path_from_agent,
@@ -962,9 +997,19 @@ async def gather_context(state: dict) -> dict:
     design_code_path = design_code_path_from_agent
     design_md_path = design_md_path_from_agent
     design_screen_path = design_screen_path_from_agent
+    if not design_local_folder and design_code_path:
+        design_local_folder = os.path.dirname(design_code_path)
 
     if workspace_path and stitch_id and design_context:
         expected_folder = os.path.join(workspace_path, "ui-design", "stitch")
+        if not design_local_folder and os.path.isdir(expected_folder):
+            design_local_folder = expected_folder
+        if not design_code_path and "ui-design/stitch/code.html" in design_files:
+            design_code_path = os.path.join(expected_folder, "code.html")
+        if not design_md_path and "ui-design/stitch/DESIGN.md" in design_files:
+            design_md_path = os.path.join(expected_folder, "DESIGN.md")
+        if not design_screen_path and "ui-design/stitch/screen.png" in design_files:
+            design_screen_path = os.path.join(expected_folder, "screen.png")
         missing_design_outputs: list[str] = []
         if not design_local_folder or not os.path.isdir(design_local_folder):
             missing_design_outputs.append(expected_folder)
@@ -1158,6 +1203,7 @@ async def gather_context(state: dict) -> dict:
         "design_local_folder": design_local_folder,
         "design_code_path": design_code_path,
         "design_md_path": design_md_path if "design_md_path" in dir() else "",
+        "design_screen_path": design_screen_path if "design_screen_path" in dir() else "",
         "context_manifest_path": context_manifest_path,
     }
 
@@ -1370,9 +1416,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
     registry = get_registry()
 
     # Enforce agent launching permission
-    perm_engine = registry._permission_engine
-    if perm_engine:
-        perm_engine.require_agent_launching("web-dev")
+    _require_agent_launch_permission(state, getattr(registry, "_permission_engine", None), "web-dev")
 
     log = _logger(state)
     log.node("dispatch_dev_agent")
@@ -1658,6 +1702,7 @@ async def review_result(state: dict) -> dict:
     from framework.tools.registry import get_registry
 
     registry = get_registry()
+    _require_agent_launch_permission(state, getattr(registry, "_permission_engine", None), "code-review")
     log = _logger(state)
     log.node("review_result")
     review_attempt = int(state.get("revision_count", 0) or 0)
@@ -1853,7 +1898,15 @@ async def request_revision(state: dict) -> dict:
     """Prepare revision feedback for the dev agent and loop back."""
     log = _logger(state)
     review = state.get("review_result", {})
-    comments = review.get("comments", [])
+    raw_comments = review.get("comments") or review.get("all_comments") or review.get("issues") or []
+    comments = [dict(c) for c in raw_comments if isinstance(c, dict)]
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    comments.sort(
+        key=lambda c: (
+            0 if c.get("effective_blocking") is True or c.get("blocking") is True else 1,
+            severity_rank.get(str(c.get("severity", "info")).strip().lower(), 5),
+        )
+    )
     summary = review.get("summary", review.get("message", ""))
 
     feedback_lines = []
@@ -1909,8 +1962,24 @@ async def request_revision(state: dict) -> dict:
         try:
             from framework.tools.registry import get_registry as _get_registry
             tool_registry = _get_registry()
-            inline_comments = [c for c in comments if c.get("file") and c.get("line")]
-            for ic in inline_comments[:5]:  # Limit to top 5 inline comments per round
+            inline_eligible = [c for c in comments if c.get("file") and c.get("line")]
+            inline_skipped = [c for c in comments if not (c.get("file") and c.get("line"))]
+            try:
+                inline_cap = int(os.environ.get("TEAM_LEAD_INLINE_COMMENT_CAP", "5") or "5")
+            except ValueError:
+                inline_cap = 5
+            inline_cap = max(1, min(inline_cap, 25))
+            inline_comments = inline_eligible[:inline_cap]
+            log.info(
+                "posting inline PR comments",
+                pr_number=pr_number,
+                cap=inline_cap,
+                eligible=len(inline_eligible),
+                posting=len(inline_comments),
+                missing_location=len(inline_skipped),
+            )
+            posted_inline = 0
+            for ic in inline_comments:
                 inline_result = _safe_json(
                     tool_registry.execute_sync(
                         "scm_add_pr_inline_comment",
@@ -1933,54 +2002,76 @@ async def request_revision(state: dict) -> dict:
                         file=ic.get("file", ""),
                         line=ic.get("line", 0),
                         error=str(inline_result.get("error")),
-                        )
+                    )
+                else:
+                    posted_inline += 1
+            if inline_skipped:
+                log.warn(
+                    "inline PR comments skipped, missing file/line",
+                    skipped=len(inline_skipped),
+                    total=len(comments),
+                    pr_number=pr_number,
+                )
+            log.info(
+                "inline PR comments posted",
+                posted=posted_inline,
+                attempted=len(inline_comments),
+                pr_number=pr_number,
+            )
         except Exception as exc:
             print(f"[{_AGENT_ID}] Inline PR comments failed (non-critical): {exc}")
 
+        # Always post a summary comment on rejection so the PR reflects the
+        # review verdict even when no inline anchor was available.
         try:
             residual_comments = [
                 c for c in comments[:10]
                 if not (c.get("file") and c.get("line"))
             ]
-            if summary or residual_comments:
-                pr_comment_lines = ["Code review requested changes."]
-                if summary:
-                    pr_comment_lines.append("")
-                    pr_comment_lines.append(f"Summary: {summary}")
-                if residual_comments:
-                    pr_comment_lines.append("")
-                    pr_comment_lines.append("Additional review findings:")
-                    for comment in residual_comments[:5]:
-                        severity = str(comment.get("severity", "info")).upper()
-                        file_ref = str(comment.get("file") or "").strip()
-                        line_ref = comment.get("line")
-                        location = ""
-                        if file_ref and line_ref:
-                            location = f"{file_ref}:{line_ref} - "
-                        elif file_ref:
-                            location = f"{file_ref} - "
-                        pr_comment_lines.append(
-                            f"- [{severity}] {location}{str(comment.get('message', '')).strip()}"
-                        )
-                summary_result = _safe_json(
-                    tool_registry.execute_sync(
-                        "scm_add_pr_comment",
-                        {
-                            "repo_url": repo_url,
-                            "pr_number": pr_number,
-                            "comment": "\n".join(pr_comment_lines).strip(),
-                            "task_id": state.get("_task_id", ""),
-                        },
-                    ),
-                    {},
-                )
-                if isinstance(summary_result, dict) and summary_result.get("error"):
-                    log.warn(
-                        "summary PR comment failed",
-                        repo_url=repo_url,
-                        pr_number=pr_number,
-                        error=str(summary_result.get("error")),
+            pr_comment_lines = ["Code review requested changes."]
+            if summary:
+                pr_comment_lines.append("")
+                pr_comment_lines.append(f"Summary: {summary}")
+            if residual_comments:
+                pr_comment_lines.append("")
+                pr_comment_lines.append("Additional review findings:")
+                for comment in residual_comments[:5]:
+                    severity = str(comment.get("severity", "info")).upper()
+                    file_ref = str(comment.get("file") or "").strip()
+                    line_ref = comment.get("line")
+                    location = ""
+                    if file_ref and line_ref:
+                        location = f"{file_ref}:{line_ref} - "
+                    elif file_ref:
+                        location = f"{file_ref} - "
+                    pr_comment_lines.append(
+                        f"- [{severity}] {location}{str(comment.get('message', '')).strip()}"
                     )
+            summary_result = _safe_json(
+                tool_registry.execute_sync(
+                    "scm_add_pr_comment",
+                    {
+                        "repo_url": repo_url,
+                        "pr_number": pr_number,
+                        "comment": "\n".join(pr_comment_lines).strip(),
+                        "task_id": state.get("_task_id", ""),
+                    },
+                ),
+                {},
+            )
+            if isinstance(summary_result, dict) and summary_result.get("error"):
+                log.warn(
+                    "summary PR comment failed",
+                    repo_url=repo_url,
+                    pr_number=pr_number,
+                    error=str(summary_result.get("error")),
+                )
+            else:
+                log.info(
+                    "summary PR comment posted",
+                    pr_number=pr_number,
+                    residual_findings=len(residual_comments),
+                )
         except Exception as exc:
             print(f"[{_AGENT_ID}] Summary PR comment failed (non-critical): {exc}")
 
@@ -2320,6 +2411,97 @@ def _adf_to_text(adf) -> str:
     return " ".join(lines)
 
 
+def _extract_urls(text: str) -> list[str]:
+    """Return URLs from plain text without swallowing smartlink/HTML markup."""
+    urls: list[str] = []
+    for match in re.finditer(r"https?://[^\s<>'\"]+", text):
+        url = html.unescape(match.group(0)).rstrip(".,;:!?)]}")
+        if url:
+            urls.append(url)
+    return urls
+
+
+def _normalize_scm_repo_url(url: str) -> str:
+    """Normalize a supported SCM URL to the repository root when possible."""
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(url.strip())
+    host = parsed.netloc.lower()
+    if not parsed.scheme or not host:
+        return ""
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if not path_parts:
+        return ""
+
+    if host == "github.com":
+        if len(path_parts) < 2:
+            return ""
+        repo_parts = path_parts[:2]
+    elif host == "bitbucket.org":
+        if len(path_parts) < 2:
+            return ""
+        repo_parts = path_parts[:2]
+    elif host == "gitlab.com":
+        repo_parts = path_parts
+        for marker in ("-", "issues", "merge_requests", "tree", "blob", "commit", "compare"):
+            if marker in repo_parts:
+                repo_parts = repo_parts[:repo_parts.index(marker)]
+                break
+        if len(repo_parts) < 2:
+            return ""
+    elif host == "dev.azure.com":
+        repo_parts = path_parts
+    else:
+        return ""
+
+    normalized_path = "/" + "/".join(repo_parts)
+    return urlunparse((parsed.scheme, parsed.netloc, normalized_path, "", "", "")).rstrip("/")
+
+
+_TECH_STACK_ALIASES = {
+    "reactjs": "react",
+    "react.js": "react",
+    "vitejs": "vite",
+    "vite.js": "vite",
+    "nextjs": "next.js",
+    "nodejs": "node.js",
+    "tailwindcss": "tailwind",
+    "ts": "typescript",
+    "js": "javascript",
+}
+
+
+def _normalize_tech_stack(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw_parts = re.split(r"\s*(?:,|\+|/|&|\band\b)\s*", value, flags=re.IGNORECASE)
+    elif isinstance(value, list):
+        raw_parts = [str(item) for item in value if item]
+    else:
+        raw_parts = []
+
+    normalized: list[str] = []
+    for raw_part in raw_parts:
+        token = re.sub(r"[^A-Za-z0-9#.+-]", "", raw_part).strip(".-+").lower()
+        if not token:
+            continue
+        token = _TECH_STACK_ALIASES.get(token, token)
+        if token and token not in normalized:
+            normalized.append(token)
+    return normalized
+
+
+def _extract_tech_stack_from_text(text: str) -> list[str]:
+    match = re.search(
+        r"(?:tech\s*stack|technology\s*stack|stack)\s*[:：]\s*([^\n\r;]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return []
+    return _normalize_tech_stack(match.group(1))
+
+
 # Fields that carry important content for context extraction (checked first)
 _IMPORTANT_JIRA_FIELDS = (
     "summary", "description", "acceptance_criteria",
@@ -2410,28 +2592,22 @@ def _extract_urls_from_ticket(jira_context: dict) -> dict:
     """Extract GitHub, Stitch, and Figma URLs from a Jira ticket dict (regex fallback)."""
     text = _jira_to_text(jira_context)
     result: dict = {}
+    urls = _extract_urls(text)
 
-    # GitHub repo URL (stop before /issues, /pulls, /tree, /blob, /commit paths)
-    repo_match = re.search(
-        r'https?://github\.com/([\w.-]+/[\w.-]+?)(?:/(?:issues|pulls|tree|blob|commit|compare|releases)|\s|$)',
-        text,
-    )
-    if repo_match:
-        result["repo_url"] = f"https://github.com/{repo_match.group(1)}".rstrip("/")
+    for url in urls:
+        repo_url = _normalize_scm_repo_url(url)
+        if repo_url:
+            result["repo_url"] = repo_url
+            break
 
     # Figma file/design URL
-    figma_match = re.search(
-        r'https?://(?:www\.)?figma\.com/(?:file|design)/([\w-]+[^\s]*)',
-        text,
-    )
-    if figma_match:
-        result["figma_url"] = figma_match.group(0).rstrip("/")
+    for url in urls:
+        if re.match(r"https?://(?:www\.)?figma\.com/(?:file|design)/", url):
+            result["figma_url"] = url.rstrip("/")
+            break
 
     # Google Stitch: prefer full URL, fall back to bare project ID in text
-    stitch_match = re.search(
-        r'https?://stitch\.withgoogle\.com/projects/(\d+)',
-        text,
-    )
+    stitch_match = re.search(r"https?://stitch\.withgoogle\.com/projects/(\d+)", text)
     if stitch_match:
         result["stitch_project_id"] = stitch_match.group(1)
         # Screen ID: 32-char hex string that appears after the project URL
@@ -2453,6 +2629,10 @@ def _extract_urls_from_ticket(jira_context: dict) -> dict:
             if screen_match:
                 result["stitch_screen_id"] = screen_match.group(1)
 
+    tech_stack = _extract_tech_stack_from_text(text)
+    if tech_stack:
+        result["tech_stack"] = tech_stack
+
     return result
 
 
@@ -2464,9 +2644,10 @@ def _extract_context_with_llm(jira_context: dict, runtime) -> dict:
 
     Falls back to regex extraction if runtime is unavailable or LLM call fails.
     """
+    deterministic = _extract_urls_from_ticket(jira_context)
     if not runtime:
         print(f"[{_AGENT_ID}] No runtime available for LLM extraction — using regex fallback")
-        return _extract_urls_from_ticket(jira_context)
+        return deterministic
 
     from agents.team_lead.prompts.extraction import EXTRACTION_SYSTEM, EXTRACTION_TEMPLATE
 
@@ -2487,16 +2668,21 @@ def _extract_context_with_llm(jira_context: dict, runtime) -> dict:
 
         # Normalize: convert null / None to empty defaults
         cleaned = {
-            "repo_url": extracted.get("repo_url") or "",
+            "repo_url": _normalize_scm_repo_url(str(extracted.get("repo_url") or "")),
             "stitch_project_id": str(extracted.get("stitch_project_id") or ""),
             "stitch_screen_id": str(extracted.get("stitch_screen_id") or ""),
             "stitch_screen_name": extracted.get("stitch_screen_name") or "",
             "figma_url": extracted.get("figma_url") or "",
-            "tech_stack": extracted.get("tech_stack") or [],
+            "tech_stack": _normalize_tech_stack(extracted.get("tech_stack") or []),
             "feature_description": extracted.get("feature_description") or "",
         }
+        for key in ("repo_url", "stitch_project_id", "stitch_screen_id", "figma_url"):
+            if not cleaned.get(key) and deterministic.get(key):
+                cleaned[key] = deterministic[key]
+        if not cleaned["tech_stack"] and deterministic.get("tech_stack"):
+            cleaned["tech_stack"] = deterministic["tech_stack"]
         print(f"[{_AGENT_ID}] LLM extraction result: {json.dumps(cleaned, ensure_ascii=False)}")
         return cleaned
     except Exception as exc:
         print(f"[{_AGENT_ID}] LLM extraction failed ({exc}) — falling back to regex")
-        return _extract_urls_from_ticket(jira_context)
+        return deterministic

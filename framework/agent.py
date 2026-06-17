@@ -59,6 +59,7 @@ class AgentDefinition:
     permission_profile: str = ""  # YAML profile name (e.g. "development", "read_only")
     runtime_backend: str = "connect-agent"
     model: str = "gpt-5-mini"
+    runtime_capabilities: dict = field(default_factory=dict)
     workflow: Any = None  # Workflow instance or None
     config: dict = field(default_factory=dict)
     launch_spec: LaunchSpec | None = None              # Container launch specification

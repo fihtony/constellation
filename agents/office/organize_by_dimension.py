@@ -41,6 +41,12 @@ from agents.office.integrity import (
 
 _ORGANIZED_OUTPUT_ROOT = "organized-output"
 _FILENAME_PLAN = "organization-plan.md"
+CUSTOM_ORGANIZE_CONTROL_FILENAMES = {
+    "custom-organize-plan.md",
+    "custom-organize-plan.json",
+    "organization-plan.md",
+    "organization-plan.json",
+}
 
 # Each dimension tool records the operations-plan.json path it is
 # associated with, if known.  The dimension tools themselves do not
@@ -776,30 +782,51 @@ def _read_sample_files(source: str, *, max_files: int = 5, max_chars: int = 600)
     Skips hidden files and non-text extensions so the planner prompt
     stays small and focused.
     """
-    samples: list[dict] = []
     if not source or not os.path.isdir(source):
-        return samples
+        return []
     text_exts = {".txt", ".md", ".csv", ".json", ".yaml", ".yml", ".log",
                 ".html", ".htm", ".xml", ".rst", ".tsv"}
+    candidates: list[tuple[str, str, str]] = []
     for walk_root, dirs, files in os.walk(source):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
         for name in sorted(files):
             if name.startswith("."):
                 continue
-            ext = os.path.splitext(name)[1].lower()
-            full = os.path.join(walk_root, name)
-            try:
-                with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                    excerpt = fh.read(max_chars)
-            except OSError:
+            if name in CUSTOM_ORGANIZE_CONTROL_FILENAMES:
                 continue
-            samples.append({
-                "path": os.path.relpath(full, source),
-                "ext": ext,
-                "excerpt": excerpt,
-            })
-            if len(samples) >= max_files:
-                return samples
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in text_exts:
+                continue
+            full = os.path.join(walk_root, name)
+            candidates.append((os.path.relpath(full, source), full, ext))
+
+    if not candidates:
+        return []
+
+    if len(candidates) <= max_files:
+        selected = candidates
+    elif max_files <= 1:
+        selected = [candidates[0]]
+    else:
+        last_index = len(candidates) - 1
+        selected_indexes = sorted({
+            round(index * last_index / (max_files - 1))
+            for index in range(max_files)
+        })
+        selected = [candidates[index] for index in selected_indexes]
+
+    samples: list[dict] = []
+    for rel_path, full, ext in selected:
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                excerpt = fh.read(max_chars)
+        except OSError:
+            continue
+        samples.append({
+            "path": rel_path,
+            "ext": ext,
+            "excerpt": excerpt,
+        })
     return samples
 
 
@@ -832,10 +859,20 @@ def _build_planning_prompt(
         f"The user wants to group them by **{hint}**.\n\n"
         f"{revision_block}"
         "Read the sample files below and propose an organize plan with:\n"
-        "1. A list of bucket names you recommend (3-12 buckets).\n"
-        "2. For each sample file, which bucket it belongs to and why.\n"
+        "1. A list of source-relative bucket folder paths you recommend "
+        "(3-12 buckets).\n"
+        "2. For each sample file, which source-relative bucket folder path "
+        "it belongs to and why.\n"
         "3. A general rule the agent can use to classify the\n"
         "   remaining (unsampled) files into the same buckets.\n\n"
+        "Bucket names and sample_mapping values must be source-relative "
+        "bucket folder paths under the selected source folder, not absolute "
+        "filesystem paths and not partial labels. Do not include the "
+        "absolute source folder, `/app/userdata`, host paths, or a leading "
+        "`/`. If the user asks for multiple folder levels, express every "
+        "level with `/` separators, e.g. `person/month`, and make the "
+        "sample_mapping values use the same hierarchy. Do not write or "
+        "create any files; return JSON only.\n\n"
         "Reply in JSON only, with this exact schema:\n"
         "{\n"
         '  "buckets": ["name1", "name2", ...],\n'
@@ -843,6 +880,8 @@ def _build_planning_prompt(
         '  "classification_rule": "Plain-English rule the agent can apply to all files",\n'
         '  "rationale": "One paragraph explaining the plan."\n'
         "}\n\n"
+        "Keep the JSON compact. Do not include reasoning, markdown, or prose outside "
+        "the JSON object. Keep classification_rule and rationale concise.\n\n"
         f"Sample files ({len(samples)}):\n\n{sample_block}\n"
     )
 
@@ -859,13 +898,18 @@ def _build_execution_prompt(
     )
     bucket_list = ", ".join(repr(b) for b in plan.get("buckets", []))
     return (
-        f"You classified a sample of files into these buckets for "
+        f"You classified a sample of files into these example buckets for "
         f"organizing by **{hint}**:\n{bucket_list}\n\n"
         f"Plan rationale: {plan.get('rationale', '')}\n\n"
         f"Classification rule from the planner: {plan.get('classification_rule', '')}\n\n"
         "Now classify the following remaining files. For each, output "
-        "the bucket name from the list above (or `__unmatched__` if the "
-        "rule does not apply). Reply in JSON only:\n"
+        "the source-relative bucket path that follows the classification "
+        "rule. Do not include the absolute source folder, `/app/userdata`, "
+        "host paths, or a leading `/`. The example buckets are not a closed "
+        "list: create a new source-relative bucket when the rule applies to "
+        "a value that was not present in the samples. Use `__unmatched__` "
+        "only when the source file lacks enough evidence to apply the rule. "
+        "Reply in JSON only:\n"
         "{\n"
         '  "mapping": {"<file_path>": "<bucket_name>", ...}\n'
         "}\n\n"

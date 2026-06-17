@@ -124,6 +124,7 @@ def _build_code_review_definition() -> AgentDefinition:
         tools=cfg.get("tools", ["read_file", "search_code"]),
         permissions=cfg.get("permissions", {"scm": "read"}),
         permission_profile=cfg.get("permission_profile", "code-review"),
+        runtime_capabilities=cfg.get("runtime_capabilities", {}),
         config=cfg.get("config", {}),
         launch_spec=cfg.get("launch_spec"),
     )

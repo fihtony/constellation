@@ -55,12 +55,11 @@ def _discover_via_registry(capability: str) -> str:
     return ""
 
 
-def _resolve_agent_url(env_var: str, config_key: str, default: str, capability: str = "") -> str:
+def _resolve_agent_url(capability: str) -> str:
     """Resolve an agent's live URL via Registry only."""
-    if capability:
-        discovered = _discover_via_registry(capability)
-        if discovered:
-            return discovered
+    discovered = _discover_via_registry(capability)
+    if discovered:
+        return discovered
     return ""
 
 
@@ -249,7 +248,7 @@ class FetchJiraTicket(BaseTool):
         workspace_path: str = "",
         **_: Any,
     ) -> ToolResult:
-        jira_url = _resolve_agent_url("JIRA_AGENT_URL", "jira_agent_url", "http://jira:8010", "jira.ticket.fetch")
+        jira_url = _resolve_agent_url("jira.ticket.fetch")
         if not jira_url:
             return ToolResult(output=json.dumps({"error": "No registered Jira instance was found in the registry.", "ticketKey": ticket_key}))
         try:
@@ -320,7 +319,7 @@ class FetchDesign(BaseTool):
         workspace_path: str = "",
         **_: Any,
     ) -> ToolResult:
-        ui_url = _resolve_agent_url("UI_DESIGN_AGENT_URL", "ui_design_agent_url", "http://ui-design:8040", "figma.file.fetch")
+        ui_url = _resolve_agent_url("figma.file.fetch")
         if not ui_url:
             return ToolResult(output=json.dumps({"error": "No registered UI Design instance was found in the registry."}))
         try:
@@ -410,9 +409,7 @@ class CloneRepo(BaseTool):
         task_id: str = "",
         **_: Any,
     ) -> ToolResult:
-        scm_url = _resolve_agent_url(
-            "SCM_AGENT_URL", "scm_agent_url", "http://scm:8020", "scm.repo.clone"
-        )
+        scm_url = _resolve_agent_url("scm.repo.clone")
         if not scm_url:
             return ToolResult(output=json.dumps({
                 "error": "No registered SCM instance was found in the registry.",
@@ -484,7 +481,7 @@ class JiraComment(BaseTool):
         task_id: str = "",
         **_: Any,
     ) -> ToolResult:
-        jira_url = _resolve_agent_url("JIRA_AGENT_URL", "jira_agent_url", "http://jira:8010", "jira.comment.add")
+        jira_url = _resolve_agent_url("jira.comment.add")
         if not jira_url:
             return ToolResult(output=json.dumps({"error": "No registered Jira instance was found in the registry.", "ticketKey": ticket_key}))
         try:
@@ -537,7 +534,7 @@ class JiraTransition(BaseTool):
         task_id: str = "",
         **_: Any,
     ) -> ToolResult:
-        jira_url = _resolve_agent_url("JIRA_AGENT_URL", "jira_agent_url", "http://jira:8010", "jira.ticket.transition")
+        jira_url = _resolve_agent_url("jira.ticket.transition")
         if not jira_url:
             return ToolResult(output=json.dumps({"error": "No registered Jira instance was found in the registry.", "ticketKey": ticket_key}))
         try:
@@ -553,6 +550,68 @@ class JiraTransition(BaseTool):
             return ToolResult(output=json.dumps(payload))
         except Exception as exc:
             return ToolResult(output=json.dumps({"error": str(exc), "ticketKey": ticket_key}))
+
+
+# ---------------------------------------------------------------------------
+# Tool: scm_add_pr_comment
+# ---------------------------------------------------------------------------
+
+class SCMAddPRComment(BaseTool):
+    """Post a summary PR review comment via the SCM boundary agent."""
+
+    name = "scm_add_pr_comment"
+    description = "Post a Markdown comment on a pull request via the SCM Agent."
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "repo_url": {
+                "type": "string",
+                "description": "Full repository URL.",
+            },
+            "pr_number": {
+                "type": "integer",
+                "description": "Pull request number.",
+            },
+            "comment": {
+                "type": "string",
+                "description": "Markdown comment body.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Caller task ID for log correlation (optional).",
+            },
+        },
+        "required": ["repo_url", "pr_number", "comment"],
+    }
+
+    def execute_sync(
+        self,
+        repo_url: str = "",
+        pr_number: int = 0,
+        comment: str = "",
+        task_id: str = "",
+        **_: Any,
+    ) -> ToolResult:
+        scm_url = _resolve_agent_url("scm.pr.comment")
+        if not scm_url:
+            return ToolResult(output=json.dumps({"error": "No registered SCM instance was found in the registry.", "repoUrl": repo_url, "prNumber": pr_number}))
+        try:
+            metadata: dict[str, Any] = {
+                "repoUrl": repo_url,
+                "prNumber": pr_number,
+                "comment": comment,
+            }
+            if task_id:
+                metadata["taskId"] = task_id
+            payload = _dispatch_boundary_capability(
+                url=scm_url,
+                capability="scm.pr.comment",
+                text=comment,
+                metadata=metadata,
+            )
+            return ToolResult(output=json.dumps(payload))
+        except Exception as exc:
+            return ToolResult(output=json.dumps({"error": str(exc), "repoUrl": repo_url, "prNumber": pr_number}))
 
 
 # ---------------------------------------------------------------------------
@@ -610,12 +669,7 @@ class SCMAddPRInlineComment(BaseTool):
         task_id: str = "",
         **_: Any,
     ) -> ToolResult:
-        scm_url = _resolve_agent_url(
-            "SCM_AGENT_URL",
-            "scm_agent_url",
-            "http://scm:8020",
-            "scm.pr.comment.inline",
-        )
+        scm_url = _resolve_agent_url("scm.pr.comment.inline")
         if not scm_url:
             return ToolResult(output=json.dumps({"error": "No registered SCM instance was found in the registry.", "repoUrl": repo_url, "prNumber": pr_number}))
         try:
@@ -934,7 +988,7 @@ class DispatchWebDev(BaseTool):
                     if isinstance(result, dict) and isinstance(result.get("_launch"), dict):
                         launch_info = dict(result["_launch"])
                 else:
-                    web_dev_url = _resolve_agent_url("WEB_DEV_AGENT_URL", "web_dev_agent_url", "http://web-dev:8050", capability)
+                    web_dev_url = _resolve_agent_url(capability)
                     if not web_dev_url:
                         return ToolResult(output=json.dumps({
                             "status": "error",
@@ -1206,7 +1260,7 @@ class DispatchCodeReview(BaseTool):
                     per_task_agent_task_id=per_task_agent_task_id,
                 )
             else:
-                review_url = _resolve_agent_url("CODE_REVIEW_AGENT_URL", "code_review_agent_url", "http://code-review:8050", capability)
+                review_url = _resolve_agent_url(capability)
                 if not review_url:
                     return ToolResult(output=json.dumps({
                         "verdict": "error",
@@ -1294,6 +1348,7 @@ _TOOLS = [
     CloneRepo(),
     JiraComment(),
     JiraTransition(),
+    SCMAddPRComment(),
     SCMAddPRInlineComment(),
     DispatchWebDev(),
     DispatchCodeReview(),

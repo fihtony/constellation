@@ -280,6 +280,80 @@ def test_office_resume_task_reuses_same_task_with_updated_metadata(monkeypatch, 
     assert persisted.metadata["request_metadata"]["organizeGroupBy"] == "size"
 
 
+def test_office_resume_task_applies_custom_hint_reply(monkeypatch, tmp_path):
+    """OfficeAgent.resume_task should turn an organizeCustomHint reply into
+    the custom-dimension metadata consumed by the planner.
+    """
+    monkeypatch.setenv("OFFICE_SOURCE_ROOT", str(tmp_path))
+    monkeypatch.setenv("OFFICE_WORKSPACE_ROOT", str(tmp_path / "ws"))
+    monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    from agents.office.agent import OfficeAgent, office_definition
+    from framework.office.dimensions import CUSTOM_DIMENSION
+
+    task_store = InMemoryTaskStore()
+    agent = OfficeAgent(
+        definition=office_definition,
+        services=_agent_services(task_store=task_store),
+    )
+    asyncio.run(agent.start())
+
+    captured: dict[str, object] = {}
+
+    def _fake_execute(*, state, **kwargs):
+        captured["state"] = dict(state)
+        task_store.complete_task(
+            "office-task-custom-hint-1",
+            artifacts=[],
+            message="planned",
+        )
+        return task_store.get_task_dict("office-task-custom-hint-1")
+
+    monkeypatch.setattr(agent, "_execute_office_workflow", _fake_execute)
+
+    request_metadata = {
+        "source_paths": [str(tmp_path)],
+        "capability": "organize",
+        "output_mode": "workspace",
+        "organizeGroupBy": CUSTOM_DIMENSION,
+        "executionContract": _make_execution_contract().to_dict(),
+    }
+    task = task_store.create_task(
+        agent_id=office_definition.agent_id,
+        task_id="office-task-custom-hint-1",
+        metadata={
+            "user_text": "please organize this folder",
+            "source_paths": [str(tmp_path)],
+            "capability": "organize",
+            "output_mode": "workspace",
+            "callback_url": "",
+            "request_metadata": request_metadata,
+        },
+    )
+    task_store.pause_task(
+        task.id,
+        question="Office needs a custom grouping hint.",
+        interrupt_metadata={
+            "kind": "office_clarification",
+            "needs_clarification": {
+                "missing": "organizeCustomHint",
+                "user_message": "Office needs a custom grouping hint.",
+            },
+        },
+    )
+
+    result = asyncio.run(agent.resume_task(task.id, "by student name then by month"))
+
+    assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+    assert captured["state"]["organize_dimension"] == CUSTOM_DIMENSION
+    assert captured["state"]["organize_custom_hint"] == "student name then by month"
+    persisted = task_store.get_task(task.id)
+    assert persisted is not None
+    persisted_metadata = persisted.metadata["request_metadata"]
+    assert persisted_metadata["organizeGroupBy"] == CUSTOM_DIMENSION
+    assert persisted_metadata["customDimensionHint"] == "student name then by month"
+
+
 # ---------------------------------------------------------------------------
 # Compass helpers
 # ---------------------------------------------------------------------------
@@ -417,6 +491,7 @@ def test_compass_office_interrupt_kind_for_organize_dimension():
 
 def test_compass_resolve_office_resume_reply_for_organize_dimension():
     from agents.compass.agent import _resolve_office_resume_reply
+    from framework.office.dimensions import CUSTOM_DIMENSION
 
     # Valid English id.
     resolved = _resolve_office_resume_reply(
@@ -445,6 +520,24 @@ def test_compass_resolve_office_resume_reply_for_organize_dimension():
         "size", "type", "created_time", "modified_time",
         "accessed_time", "filename",
     }
+
+    # Custom hint replies are free text and must be forwarded to Office
+    # as a custom dimension, not re-asked by Compass.
+    resolved = _resolve_office_resume_reply(
+        "office_organizecustomhint",
+        "by student name then by month",
+        {
+            "capability": "organize",
+            "organize_dimension": CUSTOM_DIMENSION,
+            "organize_metadata": {"organizeGroupBy": CUSTOM_DIMENSION},
+        },
+    )
+    assert resolved.get("error_question", "") == ""
+    office_request = resolved["office_request"]
+    assert office_request["organize_dimension"] == CUSTOM_DIMENSION
+    assert office_request["organize_metadata"]["organizeGroupBy"] == CUSTOM_DIMENSION
+    assert office_request["organize_metadata"]["customDimensionHint"] == "student name then by month"
+    assert office_request["customDimensionHint"] == "student name then by month"
 
 
 def test_compass_resolve_office_resume_reply_for_custom_plan_reask_preserves_plan():
@@ -744,6 +837,107 @@ def test_compass_resume_task_for_organize_dimension_forwards_to_same_office_sess
     )
     ui = result.get("ui_update") or {}
     assert ui.get("task_id") == task.id
+    assert ui.get("task_status") in {"TASK_STATE_WORKING", "TASK_STATE_SUBMITTED"}
+
+
+def test_compass_resume_task_for_custom_hint_forwards_to_same_office_session(
+    monkeypatch, tmp_path
+):
+    """A free-form custom grouping hint must be forwarded to the waiting
+    Office session so Office can decide whether to plan or ask again.
+    """
+    from agents.compass.agent import CompassAgent, compass_definition
+    from framework.office.dimensions import CUSTOM_DIMENSION
+
+    task_store = InMemoryTaskStore()
+    event_store = MagicMock()
+    event_store.append = AsyncMock()
+    services = AgentServices(
+        session_service=MagicMock(),
+        event_store=event_store,
+        memory_service=MagicMock(),
+        skills_registry=MagicMock(),
+        plugin_manager=MagicMock(),
+        checkpoint_service=MagicMock(),
+        runtime=MagicMock(),
+        registry_client=None,
+        task_store=task_store,
+    )
+    agent = CompassAgent(definition=compass_definition, services=services)
+    asyncio.run(agent.start())
+
+    task_id = "task-office-custom-hint-1"
+    office_request = {
+        "capability": "organize",
+        "source_paths": ["/tmp/folder"],
+        "output_mode": "workspace",
+        "organize_dimension": CUSTOM_DIMENSION,
+        "organize_metadata": {"organizeGroupBy": CUSTOM_DIMENSION},
+    }
+    task = task_store.create_task(
+        agent_id=compass_definition.agent_id,
+        task_id=task_id,
+        metadata={
+            "task_type": "office",
+            "user_request": "please organize this folder",
+            "office_request": office_request,
+            "office_session": {
+                "task_id": task_id,
+                "service_url": "http://office-live:8040",
+                "container_name": "office-task-live",
+                "agent_id": "office",
+            },
+        },
+    )
+    needs_clarification = {
+        "missing": "organizeCustomHint",
+        "user_message": "Office needs a custom grouping hint.",
+    }
+    task_store.pause_task(
+        task.id,
+        question="Office needs a custom grouping hint.",
+        interrupt_metadata={
+            "kind": "office_organizecustomhint",
+            "office_request": office_request,
+            "needs_clarification": needs_clarification,
+        },
+    )
+
+    captured: dict = {}
+
+    def _fake_resume_office_task(self, *, task_id, office_session, resume_value, office_request):
+        captured["task_id"] = task_id
+        captured["office_session"] = dict(office_session)
+        captured["resume_value"] = resume_value
+        captured["office_request"] = dict(office_request)
+
+    class _InlineThread:
+        def __init__(self, *, target=None, kwargs=None, daemon=None, name=None):
+            self._target = target
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            if self._target:
+                self._target(**self._kwargs)
+
+    monkeypatch.setattr(
+        "agents.compass.agent.CompassAgent._resume_office_task",
+        _fake_resume_office_task,
+    )
+    monkeypatch.setattr("agents.compass.agent.threading.Thread", _InlineThread)
+
+    result = asyncio.run(agent.resume_task(task.id, "by student name then by month"))
+
+    assert captured.get("office_request"), (
+        "custom hint replies should be forwarded to the waiting Office session"
+    )
+    forwarded = captured["office_request"]
+    assert captured["resume_value"] == "by student name then by month"
+    assert forwarded["organize_dimension"] == CUSTOM_DIMENSION
+    assert forwarded["organize_metadata"]["organizeGroupBy"] == CUSTOM_DIMENSION
+    assert forwarded["organize_metadata"]["customDimensionHint"] == "student name then by month"
+    assert forwarded["customDimensionHint"] == "student name then by month"
+    ui = result.get("ui_update") or {}
     assert ui.get("task_status") in {"TASK_STATE_WORKING", "TASK_STATE_SUBMITTED"}
 
 

@@ -50,6 +50,9 @@ def test_office_agent_class_exists():
     from agents.office.agent import OfficeAgent, office_definition, office_workflow
 
     assert office_definition.agent_id == "office"
+    assert office_definition.runtime_capabilities["run"] is True
+    assert office_definition.runtime_capabilities["run_agentic"] is True
+    assert office_definition.runtime_capabilities["agentic_tools"] is True
     assert office_workflow.name == "office"
     # Nodes are extracted from edges; edge format is (source, node_func, dest) or (source, node_func)
     # START/END are string sentinels, node_func is edge[1], dest (if callable) is edge[2]
@@ -91,6 +94,44 @@ def test_office_tools_register():
     assert "list_directory" in tool_names
     assert "write_workspace" in tool_names
     assert "write_file" in tool_names
+
+
+def test_office_agentic_policy_uses_backend_specific_allowed_tools():
+    from agents.office.nodes import _office_agentic_policy
+    from framework.runtime.adapter import AgenticCapabilities
+
+    class _ConnectRuntime:
+        def agentic_capabilities(self):
+            return AgenticCapabilities(
+                backend="connect-agent",
+                agentic=True,
+                constellation_tools=True,
+                allowed_tools=True,
+            )
+
+    class _ClaudeRuntime:
+        def agentic_capabilities(self):
+            return AgenticCapabilities(
+                backend="claude-code",
+                agentic=True,
+                constellation_tools=True,
+                allowed_tools=True,
+                cwd=True,
+            )
+
+    connect_policy, connect_kwargs = _office_agentic_policy(_ConnectRuntime(), ["read_txt", "write_workspace"])
+    claude_policy, claude_kwargs = _office_agentic_policy(_ClaudeRuntime(), ["read_txt", "write_workspace"])
+
+    assert connect_policy.allowed_tools == ["read_txt", "write_workspace"]
+    assert connect_kwargs["allowed_tools"] == ["read_txt", "write_workspace"]
+    assert claude_policy.allowed_tools == [
+        "mcp__constellation_tools__read_txt",
+        "mcp__constellation_tools__write_workspace",
+    ]
+    assert claude_kwargs["allowed_tools"] == [
+        "mcp__constellation_tools__read_txt",
+        "mcp__constellation_tools__write_workspace",
+    ]
 
 
 def test_receive_task_parses_request():

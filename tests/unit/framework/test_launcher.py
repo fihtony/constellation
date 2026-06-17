@@ -208,6 +208,7 @@ def test_launch_instance_strips_docker_socket_for_on_demand_agents(monkeypatch):
     )
     # GroupAdd (used to grant the docker group) must also be absent
     assert "GroupAdd" not in create_requests[0]["HostConfig"]
+    assert create_requests[0]["Labels"]["constellation.agent_role"] == "on-demand"
 
 
 def test_launch_instance_rejects_socket_override_for_on_demand_agents(monkeypatch):
