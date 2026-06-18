@@ -559,6 +559,41 @@ class TestGatherContextFailures:
         assert extracted["stitch_screen_id"] == "0123456789abcdef0123456789abcdef"
         assert extracted["tech_stack"] == ["react", "vite"]
 
+    def test_context_extraction_normalizes_markdown_repo_links(self):
+        """Markdown-formatted Jira links must not contaminate repository URLs."""
+        from agents.team_lead.nodes import _extract_context_with_llm
+
+        jira_ticket = {
+            "key": "PROJ-123",
+            "fields": {
+                "summary": "Implement lesson library",
+                "description": (
+                    "GitHub Repository: "
+                    "[https://github.com/fihtony/english-study-hub]"
+                    "(https://github.com/fihtony/english-study-hub)\n\n"
+                    "Design Reference: "
+                    "[https://stitch.withgoogle.com/projects/13629074018280446337]"
+                    "(https://stitch.withgoogle.com/projects/13629074018280446337)\n"
+                    "Screen ID: 525c89e18d8e485baed621b071743140\n"
+                    "Tech stack: React + Vite + TypeScript"
+                ),
+            },
+        }
+
+        extracted = _extract_context_with_llm(jira_ticket, runtime=None)
+
+        assert extracted["repo_url"] == "https://github.com/fihtony/english-study-hub"
+        assert extracted["stitch_project_id"] == "13629074018280446337"
+        assert extracted["stitch_screen_id"] == "525c89e18d8e485baed621b071743140"
+        assert extracted["tech_stack"] == ["react", "vite", "typescript"]
+
+    def test_repo_url_validation_rejects_markdown_contaminated_urls(self):
+        """Invalid extracted SCM URLs should fail before the clone boundary."""
+        from agents.team_lead.nodes import _require_repo_url
+
+        with pytest.raises(RuntimeError, match="Invalid repository URL"):
+            _require_repo_url("https://github.com/fihtony/english-study-hub](https:", "PROJ-123")
+
     async def test_gather_context_raises_when_repo_clone_fails(self, monkeypatch, tmp_path):
         """Repo clone failure is fatal because Web Dev must receive a real cloned repo."""
         from agents.team_lead.nodes import gather_context

@@ -607,14 +607,16 @@ def _validate_jira_payload(payload: dict, jira_key: str) -> dict:
     return ticket
 
 
-def _require_repo_url(repo_url: str, jira_key: str) -> None:
+def _require_repo_url(repo_url: str, jira_key: str) -> str:
     if not repo_url:
         source = f"Jira ticket {jira_key}" if jira_key else "task context"
         raise RuntimeError(f"No SCM repository URL was found in {source}; cannot dispatch development agent")
 
-    scm_hosts = ("github.com", "bitbucket.org", "gitlab.com", "dev.azure.com")
-    if not any(host in repo_url for host in scm_hosts):
-        raise RuntimeError(f"Repository URL is not a supported SCM URL: {repo_url!r}")
+    normalized = _normalize_scm_repo_url(repo_url)
+    if not normalized:
+        source = f"Jira ticket {jira_key}" if jira_key else "task context"
+        raise RuntimeError(f"Invalid repository URL in {source}: {repo_url!r}")
+    return normalized
 
 
 async def receive_task(state: dict) -> dict:
@@ -1098,7 +1100,7 @@ async def gather_context(state: dict) -> dict:
             print(f"[{_AGENT_ID}] Design content extraction fallback failed (non-fatal): {exc}")
 
     # Derive repo name from URL — validate it is a real SCM URL first.
-    _require_repo_url(repo_url, jira_key)
+    repo_url = _require_repo_url(repo_url, jira_key)
     repo_name = ""
     if repo_url:
         parts = [p for p in repo_url.rstrip("/").split("/") if p]
@@ -2481,7 +2483,7 @@ def _adf_to_text(adf) -> str:
 def _extract_urls(text: str) -> list[str]:
     """Return URLs from plain text without swallowing smartlink/HTML markup."""
     urls: list[str] = []
-    for match in re.finditer(r"https?://[^\s<>'\"]+", text):
+    for match in re.finditer(r"https?://[^\s<>'\"\]\)]+", text):
         url = html.unescape(match.group(0)).rstrip(".,;:!?)]}")
         if url:
             urls.append(url)
@@ -2492,23 +2494,43 @@ def _normalize_scm_repo_url(url: str) -> str:
     """Normalize a supported SCM URL to the repository root when possible."""
     from urllib.parse import urlparse, urlunparse
 
-    parsed = urlparse(url.strip())
+    cleaned = html.unescape(str(url or "").strip()).strip("`")
+    if not cleaned or any(char in cleaned for char in "[]()<>{}\"'"):
+        return ""
+
+    parsed = urlparse(cleaned)
     host = parsed.netloc.lower()
-    if not parsed.scheme or not host:
+    if parsed.scheme not in {"http", "https"} or not host:
         return ""
 
     path_parts = [part for part in parsed.path.split("/") if part]
     if not path_parts:
         return ""
 
-    if host == "github.com":
+    if host in {"github.com", "www.github.com"}:
         if len(path_parts) < 2:
             return ""
         repo_parts = path_parts[:2]
+        host = "github.com"
     elif host == "bitbucket.org":
         if len(path_parts) < 2:
             return ""
         repo_parts = path_parts[:2]
+    elif "bitbucket" in host:
+        if "projects" in path_parts and "repos" in path_parts:
+            repos_idx = path_parts.index("repos")
+            if repos_idx + 1 >= len(path_parts):
+                return ""
+            repo_parts = path_parts[:repos_idx + 2]
+        elif "users" in path_parts and "repos" in path_parts:
+            repos_idx = path_parts.index("repos")
+            if repos_idx + 1 >= len(path_parts):
+                return ""
+            repo_parts = path_parts[:repos_idx + 2]
+        elif len(path_parts) >= 2:
+            repo_parts = path_parts[:2]
+        else:
+            return ""
     elif host == "gitlab.com":
         repo_parts = path_parts
         for marker in ("-", "issues", "merge_requests", "tree", "blob", "commit", "compare"):
@@ -2518,12 +2540,20 @@ def _normalize_scm_repo_url(url: str) -> str:
         if len(repo_parts) < 2:
             return ""
     elif host == "dev.azure.com":
-        repo_parts = path_parts
+        if "_git" in path_parts:
+            git_idx = path_parts.index("_git")
+            if git_idx + 1 >= len(path_parts):
+                return ""
+            repo_parts = path_parts[:git_idx + 2]
+        elif len(path_parts) >= 3:
+            repo_parts = path_parts[:3]
+        else:
+            return ""
     else:
         return ""
 
     normalized_path = "/" + "/".join(repo_parts)
-    return urlunparse((parsed.scheme, parsed.netloc, normalized_path, "", "", "")).rstrip("/")
+    return urlunparse((parsed.scheme, host, normalized_path, "", "", "")).rstrip("/")
 
 
 _TECH_STACK_ALIASES = {

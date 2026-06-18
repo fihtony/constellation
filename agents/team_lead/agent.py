@@ -84,6 +84,7 @@ from agents.team_lead.nodes import (
     report_success,
     escalate_to_user,
     _ack_and_cleanup_dev_agent,
+    _normalize_scm_repo_url,
 )
 from agents.team_lead.tools import register_team_lead_tools
 
@@ -575,12 +576,24 @@ def _register_team_lead_dispatch(team_lead_agent: "TeamLeadAgent") -> None:
                 if m:
                     jira_key = m.group(0)
 
-            # Validate repo_url is a real SCM host, not a Jira URL
-            _scm_hosts = ("github.com", "bitbucket.org", "gitlab.com", "dev.azure.com")
-            if repo_url and not any(h in repo_url for h in _scm_hosts):
-                print(f"[tl-dispatch] Ignoring non-SCM repo_url: {repo_url!r}")
-                repo_url = ""
-            effective_repo_url = repo_url or os.environ.get("SCM_REPO_URL", "")
+            # Validate repo_url is a real SCM repository URL, not a Jira URL
+            # or a markdown-contaminated extraction artifact.
+            raw_repo_url = (
+                repo_url
+                or str(kw.get("repoUrl") or "")
+                or str(kw.get("repositoryUrl") or "")
+            )
+            repo_url = _normalize_scm_repo_url(raw_repo_url)
+            if repo_url:
+                effective_repo_url = repo_url
+            else:
+                raw_fallback_repo_url = os.environ.get("SCM_REPO_URL", "")
+                fallback_repo_url = _normalize_scm_repo_url(raw_fallback_repo_url)
+                if raw_fallback_repo_url and not fallback_repo_url:
+                    print(f"[tl-dispatch] Ignoring invalid SCM_REPO_URL: {raw_fallback_repo_url!r}")
+                effective_repo_url = fallback_repo_url
+            if raw_repo_url and not repo_url:
+                print(f"[tl-dispatch] Ignoring non-SCM repo_url: {raw_repo_url!r}")
             effective_workspace = workspacePath or os.environ.get("TL_WORKSPACE_PATH", "")
             print(f"[tl-dispatch] Dispatching: jira={jira_key} repo={effective_repo_url}")
 
