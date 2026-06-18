@@ -350,6 +350,8 @@ class TestLoadPrContext:
         assert result["pr_number"] == 12
         assert result["changed_files"] == ["src/App.tsx"]
         assert result["jira_context"]["key"] == "PROJ-123"
+        assert result["jira_brief"]["key"] == "PROJ-123"
+        assert result["jira_brief"]["description"] == "Ship the lesson page"
         assert result["design_context"]["spec_markdown"] == "# Design spec"
         assert "jira/PROJ-123/ticket.json" in result["checked_artifacts"]
         assert "ui-design/stitch/DESIGN.md" in result["checked_artifacts"]
@@ -700,6 +702,41 @@ class TestReviewRequirements:
 
         assert "STANDARD BLOCK" in captured["prompt"]
         assert "must validate these first before the full review" in captured["prompt"]
+
+    async def test_requirement_review_uses_jira_brief_not_raw_rest_payload(self):
+        captured = {}
+
+        class _Runtime:
+            def run(self, prompt, **kw):
+                captured["prompt"] = prompt
+                return {"raw_response": "[]"}
+
+        state = {
+            "_runtime": _Runtime(),
+            "pr_diff": "+ code",
+            "original_requirements": "AC-1: build dashboard",
+            "jira_brief": {
+                "key": "ABC-1",
+                "summary": "Build dashboard",
+                "description": "Implement the dashboard.",
+                "acceptance_criteria": "Dashboard shows weekly progress.",
+            },
+            "jira_context": {
+                "key": "ABC-1",
+                "fields": {
+                    "summary": "Build dashboard",
+                    "description": "Implement the dashboard.",
+                    "customfield_99999": "NOISY RAW FIELD " * 100,
+                    "watches": {"watchCount": 42},
+                },
+            },
+        }
+
+        await review_requirements(state)
+
+        assert "Dashboard shows weekly progress." in captured["prompt"]
+        assert "NOISY RAW FIELD" not in captured["prompt"]
+        assert "watchCount" not in captured["prompt"]
 
 
 class TestReviewUiDesign:

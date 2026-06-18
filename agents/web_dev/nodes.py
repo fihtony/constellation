@@ -21,6 +21,7 @@ from typing import Any
 
 from framework.config import load_agent_config as _load_agent_cfg
 from framework.context_budget import (
+    build_jira_brief,
     compact_delivery_plan,
     compact_jira_context,
     text_for_prompt,
@@ -95,6 +96,27 @@ def _boundary_log(state: dict, agent_id: str, message: str, **kwargs: Any) -> No
 def _summarize_jira_context(jira_ctx: dict, max_chars: int = 3000) -> str:
     """Extract only essential Jira fields and truncate to avoid prompt overflow."""
     return compact_jira_context(jira_ctx, max_chars=max_chars)
+
+
+def _jira_context_for_prompt(state: dict, *, max_chars: int = 3000) -> str:
+    """Return the compact Jira brief for backend-agnostic prompt budgeting."""
+    existing = state.get("jira_brief")
+    if isinstance(existing, dict) and existing:
+        return text_for_prompt(existing, max_chars=max_chars)
+    brief = build_jira_brief(
+        state.get("jira_context", {}),
+        extracted_context={
+            "repo_url": state.get("repo_url", ""),
+            "figma_url": state.get("figma_url", ""),
+            "stitch_project_id": state.get("stitch_project_id", ""),
+            "stitch_screen_id": state.get("stitch_screen_id", ""),
+            "stitch_screen_name": state.get("stitch_screen_name", ""),
+            "tech_stack": state.get("tech_stack") or [],
+        },
+        jira_files=list(state.get("jira_files") or []),
+        max_chars=max_chars,
+    )
+    return text_for_prompt(brief, max_chars=max_chars) if brief else "N/A"
 
 
 def _safe_json(text: str, fallback: Any = None) -> Any:
@@ -278,6 +300,55 @@ def _agentic_policy_for_state(state: dict, runtime: Any):
     )
 
     allowed_tools = state.get("_allowed_tools") or []
+    policy = build_agentic_execution_policy(runtime, allowed_tools)
+    return policy, agentic_policy_kwargs(policy)
+
+
+_AGENTIC_CODING_STEP_TOOLS = (
+    "read_file",
+    "write_file",
+    "edit_file",
+    "run_command",
+    "search_code",
+    "glob",
+    "grep",
+)
+_AGENTIC_SELF_ASSESS_FILE_TOOLS = ("write_file",)
+_AGENTIC_STEP_TOOL_ALLOWLISTS = {
+    "implement_changes": _AGENTIC_CODING_STEP_TOOLS,
+    "fix_tests": _AGENTIC_CODING_STEP_TOOLS,
+    "fix_gaps": _AGENTIC_CODING_STEP_TOOLS,
+    "self_assess_agentic_file": _AGENTIC_SELF_ASSESS_FILE_TOOLS,
+}
+
+
+def _agentic_allowed_tools_for_step(state: dict, step: str | None) -> list[str]:
+    """Return the permission-envelope tools allowed for a specific agentic step.
+
+    The parent execution contract may allow SCM/Jira boundary tools for later
+    deterministic nodes. Open-ended coding loops must not receive those tools;
+    otherwise the model can spend turns pushing, creating PRs, or updating Jira
+    before build/test/self-assessment/screenshot gates have run.
+    """
+    allowed_tools = state.get("_allowed_tools") or []
+    if not step:
+        return allowed_tools
+
+    step_allowlist = _AGENTIC_STEP_TOOL_ALLOWLISTS.get(step)
+    if not step_allowlist:
+        return allowed_tools
+
+    allowed = set(step_allowlist)
+    return [tool for tool in allowed_tools if tool in allowed]
+
+
+def _agentic_policy_for_step(state: dict, runtime: Any, step: str):
+    from framework.agentic_policy import (
+        agentic_policy_kwargs,
+        build_agentic_execution_policy,
+    )
+
+    allowed_tools = _agentic_allowed_tools_for_step(state, step)
     policy = build_agentic_execution_policy(runtime, allowed_tools)
     return policy, agentic_policy_kwargs(policy)
 
@@ -1018,6 +1089,260 @@ def _detect_fragile_icon_font_usage(repo_path: str) -> dict[str, Any]:
     return findings
 
 
+_TAILWIND_UTILITY_PREFIXES = (
+    "bg-",
+    "border",
+    "bottom-",
+    "cursor-",
+    "duration-",
+    "ease-",
+    "fill-",
+    "focus:",
+    "font-",
+    "gap-",
+    "grid-",
+    "h-",
+    "hover:",
+    "inset-",
+    "items-",
+    "justify-",
+    "leading-",
+    "left-",
+    "m-",
+    "max-",
+    "mb-",
+    "md:",
+    "min-",
+    "ml-",
+    "mr-",
+    "mt-",
+    "mx-",
+    "my-",
+    "opacity-",
+    "outline",
+    "p-",
+    "px-",
+    "py-",
+    "right-",
+    "ring-",
+    "rounded",
+    "scale-",
+    "shadow",
+    "sm:",
+    "space-",
+    "stroke-",
+    "text-",
+    "top-",
+    "tracking-",
+    "transition",
+    "w-",
+    "xl:",
+    "z-",
+)
+_TAILWIND_UTILITY_EXACT = {
+    "absolute",
+    "block",
+    "container",
+    "fixed",
+    "flex",
+    "flex-col",
+    "flex-row",
+    "flex-wrap",
+    "grid",
+    "hidden",
+    "inline",
+    "inline-block",
+    "inline-flex",
+    "relative",
+    "sr-only",
+    "static",
+    "sticky",
+    "uppercase",
+}
+_TAILWIND_CLASS_ATTR_RE = re.compile(
+    r"(?:className|class)\s*=\s*['\"]([^'\"]+)['\"]",
+    flags=re.MULTILINE,
+)
+
+
+def _repo_uses_tailwind(repo_path: str) -> bool:
+    """Return True when repository metadata/source indicate Tailwind usage."""
+    if not repo_path or not os.path.isdir(repo_path):
+        return False
+
+    package_path = os.path.join(repo_path, "package.json")
+    try:
+        with open(package_path, encoding="utf-8") as fh:
+            package = json.load(fh)
+        deps = {}
+        for key in ("dependencies", "devDependencies", "peerDependencies"):
+            section = package.get(key)
+            if isinstance(section, dict):
+                deps.update(section)
+        if "tailwindcss" in deps or any(name.startswith("@tailwindcss/") for name in deps):
+            return True
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    if any(
+        os.path.isfile(os.path.join(repo_path, name))
+        for name in (
+            "tailwind.config.js",
+            "tailwind.config.cjs",
+            "tailwind.config.mjs",
+            "tailwind.config.ts",
+        )
+    ):
+        return True
+
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [
+            name for name in dirs
+            if name not in {".git", "node_modules", "dist", "build", ".next", "coverage"}
+        ]
+        for filename in files:
+            if os.path.splitext(filename)[1].lower() not in {".css", ".scss", ".sass"}:
+                continue
+            try:
+                with open(os.path.join(root, filename), encoding="utf-8", errors="ignore") as fh:
+                    content = fh.read(5000)
+            except OSError:
+                continue
+            if (
+                "@tailwind" in content
+                or "@import \"tailwindcss\"" in content
+                or "@import 'tailwindcss'" in content
+            ):
+                return True
+    return False
+
+
+def _looks_like_tailwind_utility(token: str) -> bool:
+    """Return True for static class tokens that should compile to CSS utilities."""
+    token = str(token or "").strip()
+    if not token or token == "group":
+        return False
+    if token in _TAILWIND_UTILITY_EXACT:
+        return True
+    if token.startswith("-"):
+        token = token[1:]
+    return any(token.startswith(prefix) for prefix in _TAILWIND_UTILITY_PREFIXES)
+
+
+def _escape_css_class_token(token: str) -> str:
+    """Return the selector fragment Tailwind emits for a utility class."""
+    escaped: list[str] = []
+    for ch in token:
+        if ch.isalnum() or ch in {"-", "_"}:
+            escaped.append(ch)
+        else:
+            escaped.append("\\" + ch)
+    return "".join(escaped)
+
+
+def _css_contains_class_token(css_text: str, token: str) -> bool:
+    escaped = _escape_css_class_token(token)
+    return f".{escaped}" in css_text
+
+
+def _collect_static_utility_tokens(repo_path: str) -> list[str]:
+    text_exts = {".html", ".js", ".jsx", ".ts", ".tsx"}
+    ignored_dirs = {".git", "node_modules", "dist", "build", ".next", "coverage"}
+    tokens: set[str] = set()
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [name for name in dirs if name not in ignored_dirs]
+        for filename in files:
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in text_exts:
+                continue
+            full_path = os.path.join(root, filename)
+            try:
+                with open(full_path, encoding="utf-8", errors="ignore") as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            scan_content = _strip_icon_scan_comments(content, ".html" if ext == ".html" else ext)
+            for match in _TAILWIND_CLASS_ATTR_RE.findall(scan_content):
+                for token in re.split(r"\s+", match.strip()):
+                    token = token.strip()
+                    if _looks_like_tailwind_utility(token):
+                        tokens.add(token)
+    return sorted(tokens)
+
+
+def _compiled_css_text(repo_path: str) -> str:
+    css_dirs = [
+        os.path.join(repo_path, "dist"),
+        os.path.join(repo_path, "build"),
+        os.path.join(repo_path, ".next", "static", "css"),
+        os.path.join(repo_path, "out"),
+    ]
+    chunks: list[str] = []
+    for css_dir in css_dirs:
+        if not os.path.isdir(css_dir):
+            continue
+        for root, dirs, files in os.walk(css_dir):
+            dirs[:] = [name for name in dirs if name not in {".git", "node_modules"}]
+            for filename in files:
+                if not filename.endswith(".css"):
+                    continue
+                try:
+                    with open(os.path.join(root, filename), encoding="utf-8", errors="ignore") as fh:
+                        chunks.append(fh.read())
+                except OSError:
+                    continue
+    return "\n".join(chunks)
+
+
+def _detect_missing_rendered_utility_css(repo_path: str) -> dict[str, Any]:
+    """Detect Tailwind utility classes that were not emitted into production CSS.
+
+    This catches a generic UI-task failure mode: the source uses design-token
+    utility classes, the build passes, but the rendered page falls back to
+    browser defaults because Tailwind/PostCSS version/config/content wiring did
+    not emit those selectors.
+    """
+    findings: dict[str, Any] = {
+        "issues": [],
+        "checked_tokens": [],
+        "missing_tokens": [],
+        "present_tokens": [],
+    }
+    if not _repo_uses_tailwind(repo_path):
+        return findings
+
+    tokens = _collect_static_utility_tokens(repo_path)
+    findings["checked_tokens"] = tokens
+    if len(tokens) < 4:
+        return findings
+
+    css_text = _compiled_css_text(repo_path)
+    if not css_text.strip():
+        findings["missing_tokens"] = tokens[:20]
+        findings["issues"].append(
+            "Tailwind-style utility classes are present in source files, but no production CSS artifact was found. "
+            "Run the production build and fix Tailwind/PostCSS/content-path wiring before completing a UI task."
+        )
+        return findings
+
+    present = [token for token in tokens if _css_contains_class_token(css_text, token)]
+    missing = [token for token in tokens if token not in present]
+    findings["present_tokens"] = present
+    findings["missing_tokens"] = missing
+
+    missing_ratio = len(missing) / max(len(tokens), 1)
+    if len(missing) >= 3 and missing_ratio >= 0.25:
+        sample = ", ".join(missing[:8])
+        findings["issues"].append(
+            "Tailwind/PostCSS production CSS is missing selectors for utility classes used in rendered markup "
+            f"({len(missing)} of {len(tokens)} checked; examples: {sample}). "
+            "The page can pass build/tests while rendering with browser-default styling. "
+            "Fix the Tailwind version/config/content paths or replace missing utilities with compiled CSS, then rebuild."
+        )
+
+    return findings
+
+
 def _git_commit_all_pending(repo_path: str, jira_key: str) -> list[str]:
     """Stage all pending changes and commit if anything is staged.
 
@@ -1276,11 +1601,10 @@ async def setup_workspace(state: dict) -> dict:
     # Derive branch name: use provided value, then LLM, then Jira-key fallback
     if not branch_name and runtime:
         from agents.web_dev.prompts import SETUP_SYSTEM, SETUP_TEMPLATE
-        jira_context = state.get("jira_context", {})
         prompt = SETUP_TEMPLATE.format(
             user_request=state.get("user_request", ""),
             repo_url=repo_url,
-            jira_context=json.dumps(jira_context, ensure_ascii=False) if jira_context else "N/A",
+            jira_context=_jira_context_for_prompt(state, max_chars=1800),
         )
         result = runtime.run(prompt, system_prompt=SETUP_SYSTEM,
                              plugin_manager=state.get("_plugin_manager"))
@@ -1609,9 +1933,8 @@ async def implement_changes(state: dict) -> dict:
     branch_name = state.get("branch_name", "")
     changed_before = _repo_changed_file_set(repo_path)
 
-    jira_ctx = state.get("jira_context", {})
     # Truncate: full Jira REST response can be 200KB+ — keep only essential fields
-    jira_for_prompt = _summarize_jira_context(jira_ctx)
+    jira_for_prompt = _jira_context_for_prompt(state)
     impl_plan = text_for_prompt(
         state.get("implementation_plan", ""),
         max_chars=4000,
@@ -1742,7 +2065,11 @@ async def implement_changes(state: dict) -> dict:
         jira_local_folder=state.get("jira_local_folder", ""),
         design_local_folder=state.get("design_local_folder", ""),
     )
-    policy, policy_kwargs = _agentic_policy_for_state(state, runtime)
+    policy, policy_kwargs = _agentic_policy_for_step(
+        state,
+        runtime,
+        "implement_changes",
+    )
     def _implementation_progress(message: Any) -> None:
         log.info("implement_changes progress", progress_message=str(message)[:300])
 
@@ -2031,7 +2358,11 @@ async def fix_tests(state: dict) -> dict:
         changed_files="\n".join(changed_files) if changed_files else "unknown",
     )
 
-    fix_policy, fix_policy_kwargs = _agentic_policy_for_state(state, runtime)
+    fix_policy, fix_policy_kwargs = _agentic_policy_for_step(
+        state,
+        runtime,
+        "fix_tests",
+    )
     changed_before = _repo_changed_file_set(state.get("repo_path", ""), state)
     fix_max_turns = _state_env_int(
         state,
@@ -2161,7 +2492,11 @@ def _self_assess_via_agentic_file(
         f"{base_prompt}"
     )
 
-    policy, policy_kwargs = _agentic_policy_for_state(state, runtime)
+    policy, policy_kwargs = _agentic_policy_for_step(
+        state,
+        runtime,
+        "self_assess_agentic_file",
+    )
     try:
         agentic_result = runtime.run_agentic(
             task=fallback_instructions,
@@ -2488,6 +2823,34 @@ def _apply_deterministic_gaps(
                 }
             )
 
+        utility_css_validation = _detect_missing_rendered_utility_css(
+            state.get("repo_path", "")
+        )
+        deterministic_gaps.extend(utility_css_validation.get("issues") or [])
+        blocking_issue_gaps.extend(utility_css_validation.get("issues") or [])
+        if utility_css_validation.get("issues"):
+            deterministic_findings.append(
+                {
+                    "kind": "missing_rendered_utility_css",
+                    "blocking": True,
+                    "missing_tokens": utility_css_validation.get("missing_tokens") or [],
+                    "present_tokens": utility_css_validation.get("present_tokens") or [],
+                    "message": utility_css_validation["issues"][0],
+                    "recommended_fix": (
+                        "Fix the production CSS pipeline so static utility "
+                        "classes used in rendered markup are emitted by the "
+                        "build, then rerun build and screenshot validation."
+                    ),
+                }
+            )
+            data["component_checks"].append(
+                {
+                    "component": "Rendered utility CSS",
+                    "status": "incomplete",
+                    "notes": utility_css_validation["issues"][0],
+                }
+            )
+
     if deterministic_gaps and not schema_failure_exhausted:
         merged_gaps: list[str] = []
         for gap in [*(data.get("gaps") or []), *deterministic_gaps]:
@@ -2559,7 +2922,7 @@ async def self_assess(state: dict) -> dict:
 
     from agents.web_dev.prompts import SELF_ASSESS_SYSTEM, SELF_ASSESS_TEMPLATE
 
-    jira_ctx = state.get("jira_context", {})
+    jira_ctx = state.get("jira_brief") if isinstance(state.get("jira_brief"), dict) else state.get("jira_context", {})
     design_ctx = state.get("design_context") or {}
     workspace_path = state.get("workspace_path", "")
 
@@ -2616,7 +2979,9 @@ async def self_assess(state: dict) -> dict:
     acceptance_criteria = []
     if isinstance(jira_ctx, dict):
         fields = jira_ctx.get("fields", jira_ctx)
-        acceptance_criteria = fields.get("acceptanceCriteria", [])
+        acceptance_criteria = fields.get("acceptanceCriteria") or fields.get("acceptance_criteria") or []
+        if isinstance(acceptance_criteria, str) and acceptance_criteria.strip():
+            acceptance_criteria = [acceptance_criteria]
         if not acceptance_criteria and fields.get("description"):
             desc = fields["description"]
             if isinstance(desc, dict):
@@ -3118,7 +3483,11 @@ async def fix_gaps(state: dict) -> dict:
         changed_files="\n".join(changed_files) if changed_files else "unknown",
     )
 
-    fix_gaps_policy, fix_gaps_policy_kwargs = _agentic_policy_for_state(state, runtime)
+    fix_gaps_policy, fix_gaps_policy_kwargs = _agentic_policy_for_step(
+        state,
+        runtime,
+        "fix_gaps",
+    )
     changed_before = _repo_changed_file_set(state.get("repo_path", ""), state)
     fix_gaps_max_turns = _state_env_int(
         state,

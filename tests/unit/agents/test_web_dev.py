@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import pytest
 from unittest.mock import MagicMock
+import agents.web_dev.nodes as web_dev_nodes
 from framework.agent import AgentServices
 from framework.task_store import InMemoryTaskStore
 from framework.workflow import START, END
@@ -499,6 +500,93 @@ class TestScreenshotRenderChecks:
         assert result["route"] == "fail"
         assert result["self_assessment"]["verdict"] == "fail"
         assert any("inline SVG or a local React icon component" in gap for gap in result["self_assessment"]["gaps"])
+
+    def test_detect_missing_rendered_utility_css_flags_uncompiled_design_classes(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        dist_path = repo_path / "dist" / "assets"
+        src_path.mkdir(parents=True)
+        dist_path.mkdir(parents=True)
+        (repo_path / "package.json").write_text(
+            json.dumps({"devDependencies": {"tailwindcss": "^4.0.0"}}),
+            encoding="utf-8",
+        )
+        (src_path / "LandingPage.tsx").write_text(
+            "export function LandingPage() {\n"
+            "  return <main className=\"flex flex-col\">\n"
+            "    <h1 className=\"text-h1 text-primary\">Title</h1>\n"
+            "    <button className=\"bg-on-tertiary-container text-on-tertiary font-button px-stack-lg py-4 rounded-xl\">Start</button>\n"
+            "  </main>\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (dist_path / "index.css").write_text(
+            ".flex{display:flex}.flex-col{flex-direction:column}body{font-family:Work Sans,sans-serif}",
+            encoding="utf-8",
+        )
+
+        findings = web_dev_nodes._detect_missing_rendered_utility_css(str(repo_path))
+
+        assert findings["issues"]
+        assert "bg-on-tertiary-container" in findings["missing_tokens"]
+        assert "text-h1" in findings["missing_tokens"]
+        assert "Tailwind/PostCSS" in findings["issues"][0]
+
+    async def test_self_assess_fails_missing_rendered_utility_css(self, tmp_path):
+        repo_path = tmp_path / "repo"
+        src_path = repo_path / "src"
+        dist_path = repo_path / "dist" / "assets"
+        src_path.mkdir(parents=True)
+        dist_path.mkdir(parents=True)
+        (repo_path / "package.json").write_text(
+            json.dumps({"devDependencies": {"tailwindcss": "^4.0.0"}}),
+            encoding="utf-8",
+        )
+        (src_path / "LandingPage.tsx").write_text(
+            "export function LandingPage() {\n"
+            "  return <button className=\"bg-on-tertiary-container text-on-tertiary font-button px-stack-lg py-4 rounded-xl\">Start</button>\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (dist_path / "index.css").write_text(
+            "body{font-family:Work Sans,sans-serif}",
+            encoding="utf-8",
+        )
+
+        class _MockRuntime:
+            def run(self, prompt, **kw):
+                return {
+                    "raw_response": json.dumps(
+                        {
+                            "score": 1.0,
+                            "verdict": "pass",
+                            "gaps": [],
+                            "component_checks": [],
+                            "criteria_checks": [],
+                            "summary": "Looks good.",
+                        }
+                    )
+                }
+
+        state = {
+            "_runtime": _MockRuntime(),
+            "repo_path": str(repo_path),
+            "workspace_path": str(tmp_path),
+            "definition_of_done": {"screenshot_required": True},
+            "changes_made": ["src/LandingPage.tsx"],
+            "implementation_summary": "Added a styled landing page.",
+            "test_results": {"build_ok": True, "test_ok": True, "passed": 1, "failed": 0},
+        }
+
+        result = await self_assess(state)
+
+        assert result["route"] == "fail"
+        assert result["self_assessment"]["verdict"] == "fail"
+        assert any(
+            finding.get("kind") == "missing_rendered_utility_css"
+            for finding in result["self_assessment"]["deterministic_findings"]
+        )
+        assert any("bg-on-tertiary-container" in gap for gap in result["self_assessment"]["gaps"])
 
     async def test_self_assess_raises_after_max_cycles(self, tmp_path):
         repo_path = tmp_path / "repo"
@@ -1744,6 +1832,63 @@ class TestWebDevNodes:
             result = await setup_workspace(state)
         assert result["branch_name"] == "feature/ABC-1-login"
 
+    async def test_setup_workspace_prompt_uses_jira_brief_not_raw_ticket(self, tmp_path):
+        import subprocess
+        from unittest.mock import patch
+
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        subprocess.run(["git", "init", repo_path], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.email", "test@test.com"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.name", "Test"],
+                       check=True, capture_output=True)
+        (tmp_path / "repo" / "README.md").write_text("hi")
+        subprocess.run(["git", "-C", repo_path, "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo_path, "commit", "-m", "init"],
+                       check=True, capture_output=True)
+
+        class _MockRuntime:
+            def __init__(self):
+                self.prompt = ""
+
+            def run(self, prompt, **kw):
+                self.prompt = prompt
+                return {"raw_response": '{"branch_name": "feature/ABC-1-dashboard", "workspace_notes": "x"}'}
+
+        runtime = _MockRuntime()
+        state = {
+            "_task_id": "t-brief",
+            "_runtime": runtime,
+            "repo_url": "http://repo",
+            "repo_path": repo_path,
+            "workspace_path": str(tmp_path),
+            "user_request": "Build dashboard",
+            "jira_brief": {
+                "key": "ABC-1",
+                "summary": "Build dashboard",
+                "description": "Implement the compact dashboard brief.",
+                "acceptance_criteria": "Dashboard shows weekly progress.",
+            },
+            "jira_context": {
+                "key": "ABC-1",
+                "fields": {
+                    "summary": "Build dashboard",
+                    "description": "Implement the compact dashboard brief.",
+                    "customfield_99999": "NOISY RAW FIELD " * 100,
+                    "watches": {"watchCount": 42},
+                },
+            },
+        }
+
+        with patch("agents.web_dev.nodes._call_boundary_tool", return_value={"branches": []}):
+            result = await setup_workspace(state)
+
+        assert result["branch_name"] == "feature/ABC-1-dashboard"
+        assert "Dashboard shows weekly progress." in runtime.prompt
+        assert "NOISY RAW FIELD" not in runtime.prompt
+        assert "watchCount" not in runtime.prompt
+
     async def test_setup_workspace_suffixes_when_remote_branch_exists(self, tmp_path):
         import subprocess
         from unittest.mock import patch
@@ -1925,6 +2070,102 @@ class TestWebDevNodes:
         assert "Implemented" in result["implementation_summary"]
         assert runtime.kwargs["tools"] == ["read_file", "write_file", "run_command"]
         assert runtime.kwargs["allowed_tools"] == ["read_file", "write_file", "run_command"]
+
+    async def test_implement_changes_filters_boundary_tools_and_avoids_pr_instructions(
+        self, tmp_path, monkeypatch
+    ):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
+        from framework.validation_gates import ValidationResult
+
+        monkeypatch.setattr(
+            "framework.validation_gates.validate_files_changed",
+            lambda repo_path: ValidationResult(True, "files_changed"),
+        )
+
+        class _MockRuntime:
+            def __init__(self):
+                self.kwargs = {}
+                self.task = ""
+
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="copilot-cli",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                    cwd=True,
+                )
+
+            def run_agentic(self, task, **kw):
+                self.task = task
+                self.kwargs = kw
+                return AgenticResult(
+                    success=True,
+                    summary="Implemented source files",
+                    tool_calls=[
+                        {"tool": "write_file", "arguments": {"path": "src/App.tsx"}},
+                    ],
+                    backend_used="copilot-cli",
+                )
+
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        runtime = _MockRuntime()
+
+        await implement_changes(
+            {
+                "_runtime": runtime,
+                "user_request": "Implement UI",
+                "implementation_plan": "Create files only.",
+                "repo_path": str(repo_path),
+                "workspace_path": str(tmp_path),
+                "branch_name": "feature/ui",
+                "jira_brief": {
+                    "key": "ABC-1",
+                    "summary": "Implement UI",
+                    "description": "Build the UI.",
+                    "acceptance_criteria": "Use the compact brief acceptance criteria.",
+                },
+                "jira_context": {
+                    "key": "ABC-1",
+                    "fields": {
+                        "summary": "Implement UI",
+                        "description": "Build the UI.",
+                        "customfield_99999": "NOISY RAW FIELD " * 100,
+                    },
+                },
+                "_allowed_tools": [
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "run_command",
+                    "search_code",
+                    "glob",
+                    "grep",
+                    "scm_push",
+                    "scm_create_pr",
+                    "jira_update",
+                ],
+            }
+        )
+
+        assert runtime.kwargs["tools"] == [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "run_command",
+            "search_code",
+            "glob",
+            "grep",
+        ]
+        assert "scm_push" not in runtime.kwargs["allowed_tools"]
+        assert "scm_create_pr" not in runtime.kwargs["allowed_tools"]
+        assert "jira_update" not in runtime.kwargs["allowed_tools"]
+        assert "git commit" not in runtime.task
+        assert "scm_create_pr" not in runtime.task
+        assert "create PR" not in runtime.task.lower()
+        assert "Use the compact brief acceptance criteria." in runtime.task
+        assert "NOISY RAW FIELD" not in runtime.task
 
     async def test_implement_changes_budgets_large_context_for_agentic_backends(
         self, tmp_path, monkeypatch
@@ -2274,6 +2515,53 @@ class TestWebDevNodes:
         assert runtime.kwargs["max_turns"] == 35
         assert runtime.kwargs["timeout"] == 900
 
+    async def test_fix_tests_filters_boundary_tools(self, tmp_path):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
+
+        class _MockRuntime:
+            def __init__(self):
+                self.kwargs = {}
+
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="codex-cli",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                    cwd=True,
+                )
+
+            def run_agentic(self, task, **kw):
+                self.kwargs = kw
+                return AgenticResult(success=True, summary="Fixed tests", backend_used="codex-cli")
+
+        runtime = _MockRuntime()
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        await fix_tests(
+            {
+                "_runtime": runtime,
+                "test_output": "AssertionError",
+                "repo_path": str(repo_path),
+                "workspace_path": str(tmp_path),
+                "changes_made": ["src/App.tsx"],
+                "_allowed_tools": [
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "run_command",
+                    "scm_push",
+                    "scm_create_pr",
+                    "jira_comment",
+                ],
+            }
+        )
+
+        assert runtime.kwargs["tools"] == ["read_file", "write_file", "edit_file", "run_command"]
+        assert "scm_push" not in runtime.kwargs["allowed_tools"]
+        assert "jira_comment" not in runtime.kwargs["allowed_tools"]
+
     async def test_fix_tests_accepts_recoverable_protocol_failure_with_edits(
         self, tmp_path
     ):
@@ -2356,6 +2644,60 @@ class TestWebDevNodes:
         assert runtime.kwargs["allowed_tools"] == ["read_file", "write_file", "run_command"]
         assert runtime.kwargs["max_turns"] == 30
         assert runtime.kwargs["timeout"] == 600
+
+    async def test_fix_gaps_filters_boundary_tools(self, tmp_path):
+        from framework.runtime.adapter import AgenticCapabilities, AgenticResult
+
+        class _MockRuntime:
+            def __init__(self):
+                self.kwargs = {}
+
+            def agentic_capabilities(self):
+                return AgenticCapabilities(
+                    backend="claude-code",
+                    agentic=True,
+                    constellation_tools=True,
+                    allowed_tools=True,
+                    cwd=True,
+                )
+
+            def run_agentic(self, task, **kw):
+                self.kwargs = kw
+                return AgenticResult(success=True, summary="Fixed gaps", backend_used="claude-code")
+
+        runtime = _MockRuntime()
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        await fix_gaps(
+            {
+                "_runtime": runtime,
+                "repo_path": str(repo_path),
+                "workspace_path": str(tmp_path),
+                "changes_made": ["src/App.tsx"],
+                "self_assessment": {"gaps": ["Fix rendered CSS."]},
+                "_allowed_tools": [
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "run_command",
+                    "search_code",
+                    "scm_push",
+                    "scm_create_pr",
+                    "jira_update",
+                ],
+            }
+        )
+
+        assert runtime.kwargs["tools"] == [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "run_command",
+            "search_code",
+        ]
+        assert "scm_create_pr" not in runtime.kwargs["allowed_tools"]
+        assert "jira_update" not in runtime.kwargs["allowed_tools"]
 
     async def test_fix_gaps_accepts_recoverable_protocol_failure_with_edits(
         self, tmp_path
