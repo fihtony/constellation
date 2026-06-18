@@ -1553,3 +1553,188 @@ def test_custom_dimension_workspace_does_not_touch_source(tmp_path):
     assert stale_final.read_text() == "STALE_FINAL_CONTENT"
     # The original user file is still at the source root, too.
     assert (src / "0103" / "1.txt").read_text() == "Student: Alice\nJanuary work\n"
+
+
+def test_path_evidence_summarizes_directory_patterns_methodology_agnostic():
+    """The executor must surface the *whole* directory pattern
+    (e.g. "all top-level folders are 4-digit numeric") to the
+    LLM classifier, instead of letting the model guess from
+    per-file excerpts.  This is methodology-level: the helper
+    must work for any layout (MMDD, DDMM, ISO date, alpha
+    initials, mixed) without hard-coding any specific test
+    fixture or task name.
+    """
+    from agents.office.organize_by_dimension import (
+        _summarize_remaining_path_evidence,
+        _classify_segment_shape,
+    )
+
+    # task-8abb55a76c72 fixture: 4-digit numeric top-level folders
+    mmdd = [
+        {"path": "0103/1.txt", "excerpt": "..."},
+        {"path": "0110/2.txt", "excerpt": "..."},
+        {"path": "0404/3.txt", "excerpt": "..."},
+    ]
+    mmdd_summary = _summarize_remaining_path_evidence(mmdd)
+    assert "all 4-digit numeric" in mmdd_summary, mmdd_summary
+    # Each folder name must appear so the model can see the data
+    # itself, not just the pattern label.
+    assert "0103" in mmdd_summary and "0110" in mmdd_summary
+    # Methodology-agnostic: never leak test-only labels.
+    for forbidden in ("student", "MMDD", "DDMM", "Liam", "Yan", "Nayomi"):
+        assert forbidden.lower() not in mmdd_summary.lower()
+
+    # ISO-date folders
+    iso = [{"path": f"2026-04-0{i}/x.txt", "excerpt": ""} for i in range(1, 4)]
+    iso_summary = _summarize_remaining_path_evidence(iso)
+    assert "ISO date" in iso_summary
+
+    # Mixed / unknown shape — must not invent a misleading label
+    mixed = [
+        {"path": "alpha/x.txt", "excerpt": ""},
+        {"path": "Bravo/x.txt", "excerpt": ""},
+    ]
+    mixed_summary = _summarize_remaining_path_evidence(mixed)
+    assert "mixed" in mixed_summary
+
+    # Single depth only
+    flat = [{"path": f"folder_{i}/x.txt", "excerpt": ""} for i in range(3)]
+    flat_summary = _summarize_remaining_path_evidence(flat)
+    assert "same depth-1 folder" in flat_summary
+
+    # Empty input — must not crash
+    assert _summarize_remaining_path_evidence([]) == ""
+
+    # The shape classifier itself is a pure function — verify the
+    # exact labels the model will see.
+    assert _classify_segment_shape(["0103", "0110", "0124"]) == "all 4-digit numeric"
+    assert _classify_segment_shape(["1", "2", "3"]) == "all numeric"
+    assert _classify_segment_shape(["2026-04-01", "2026-04-02"]) == "all ISO date"
+    assert _classify_segment_shape(["jan", "feb"]) == "all 3-letter lowercase alpha"
+    assert _classify_segment_shape(["a1", "b2"]) == "mixed"
+
+
+def test_execution_phase_chunks_large_classifier_batches(tmp_path):
+    """Reproduce task-8abb55a76c72: 40 source files, classifier only
+    returns 5 mappings per LLM call (the model stops mid-stream when
+    asked to classify too many files in one prompt).  The custom
+    executor must chunk the remaining files into multiple LLM calls
+    and merge the results, so every source file is classified.
+
+    Why: before this fix, the executor pushed all unsampled files
+    into a single classifier prompt.  When the response only covered
+    a subset, the executor reported "custom classifier did not
+    classify 35 of 40 source file(s)" and asked the user to retry
+    with `modify:`.  The user had no way to recover except by
+    shortening the file list, which is not a methodology-level
+    fix.  Chunking keeps the prompt small enough for the model to
+    enumerate every file, and merging per-chunk mappings recovers
+    the full layout.
+
+    The simulated LLM in this test only returns the first 5 mappings
+    it sees per call, but it returns *all* the files it is given if
+    the chunk is small.  When chunked to ≤5 files per call, the
+    executor must issue enough calls to cover all 40 files and the
+    final layout must contain every source file in some bucket.
+    """
+    from agents.office.nodes import execute_office_work
+
+    src = tmp_path / "many"
+    src.mkdir()
+    # Build 40 source files spread across two month folders so the
+    # bucket path is two-level — mirrors the real task fixture.
+    file_count = 40
+    for index in range(file_count):
+        month_dir = src / f"01{index // 20:02d}"  # 0100 and 0101
+        month_dir.mkdir(parents=True, exist_ok=True)
+        student = "Yan" if index % 2 == 0 else "Liam"
+        (month_dir / f"{index + 1}.txt").write_text(
+            f">>> Student {student}\nbody for {index + 1}\n"
+        )
+
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    approved_plan = {
+        "buckets": ["Yan/01", "Liam/01"],
+        "sample_mapping": {},  # planner sample set is empty; all 40 go to LLM
+        "classification_rule": "Read >>> Student and put into <Name>/<Month>.",
+        "rationale": "Two-level hierarchy driven by student and month.",
+    }
+
+    per_chunk_limit = 5
+    runtime = MagicMock()
+    runtime.run = MagicMock()
+    prompts: list[str] = []
+
+    def _all_remaining_files(prompt: str) -> list[str]:
+        files: list[str] = []
+        for line in prompt.splitlines():
+            stripped = line.lstrip()
+            if not stripped.startswith("- "):
+                continue
+            tail = stripped[2:]
+            head = tail.split(" (excerpt:", 1)[0].strip().strip("'\"")
+            if head and "/" in head:
+                files.append(head)
+        return files
+
+    def _run(prompt, **kwargs):
+        prompts.append(prompt)
+        files = _all_remaining_files(prompt)
+        # Simulate the LLM being able to fully classify whatever
+        # chunk it is given — but only if the chunk is small.  We
+        # cap its effective per-call capacity at
+        # ``per_chunk_limit``.  When the executor hands the LLM a
+        # chunk of N≤5, it returns all N mappings; when it hands a
+        # larger chunk (the bug), it returns only the first 5.
+        if len(files) <= per_chunk_limit:
+            mapping = {path: "Yan/01" for path in files}
+        else:
+            mapping = {path: "Yan/01" for path in files[:per_chunk_limit]}
+        return {
+            "summary": json.dumps({"mapping": mapping}),
+            "raw_response": json.dumps({"mapping": mapping}),
+        }
+
+    runtime.run.side_effect = _run
+
+    state = _organize_state(
+        source=str(src),
+        artifacts_dir=str(artifacts),
+        approved_plan=approved_plan,
+    )
+    result = execute_office_work(state | {"_runtime": runtime})
+
+    # The executor must NOT have reported "did not classify N of M".
+    # If chunking is in place, every source file is eventually
+    # classified (each chunk contributes its share, even if the
+    # pathological LLM truncates the per-chunk output, multiple
+    # passes cover the whole list).
+    assert result["status"] == "completed", (
+        f"expected completed but got status={result['status']!r} "
+        f"summary={result.get('summary', '')!r}"
+    )
+    assert result["success"] is True
+    # Confirm the executor issued more than one classifier prompt —
+    # proof that chunking is actually happening.  A 1-shot call
+    # cannot classify 40 files when the LLM only covers 5 per call.
+    classifier_prompts = [
+        p for p in prompts if "Files to classify" in p
+    ]
+    assert len(classifier_prompts) >= 2, (
+        f"expected the executor to issue multiple LLM calls to "
+        f"chunk through 40 files, but only {len(classifier_prompts)} "
+        f"classifier call(s) were made; chunking is not in effect"
+    )
+    # And the per-call batch must stay small (the whole point of
+    # chunking).  Each prompt's "Files to classify" list should
+    # hold at most the per-call budget — if any prompt lists all
+    # 40 files we are back to the buggy single-shot path.
+    for prompt in classifier_prompts:
+        listed = _all_remaining_files(prompt)
+        assert len(listed) <= per_chunk_limit, (
+            f"a single classifier prompt still listed {len(listed)} "
+            f"files; the executor did not chunk the remaining set"
+        )
+

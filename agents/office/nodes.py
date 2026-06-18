@@ -869,7 +869,18 @@ def _summarize_payload_with_runtime(
     raw = str(result.get("raw_response") or result.get("summary") or "").strip()
     warning_text = " ".join(str(item) for item in result.get("warnings") or [])
     if _summary_runtime_failed(raw) or _summary_runtime_failed(warning_text):
-        raise RuntimeError(raw or warning_text or "summary runtime failed")
+        # Prefer the warning text when it has more detail than the
+        # summary: the transport's URLError handler keeps the raw
+        # ``exc.reason`` (e.g. "request timed out after 90s") in the
+        # warning, while the summary may be the catch-all
+        # "endpoint is unreachable" message that hid the real cause
+        # in task-63432d83fc65.  When the two disagree, include both
+        # so the operator sees the named sub-type *and* the raw reason.
+        if raw and warning_text and warning_text not in raw:
+            message = f"{raw} (reason: {warning_text})"
+        else:
+            message = raw or warning_text or "summary runtime failed"
+        raise RuntimeError(message)
     if raw and not _contains_cjk(raw):
         return raw
     return _fallback_summary_markdown(path, payload)
@@ -1201,10 +1212,17 @@ def _run_bounded_analyze(
         raw = str(response.get("raw_response") or response.get("summary") or "").strip()
         warning_text = " ".join(str(item) for item in response.get("warnings") or [])
         if _summary_runtime_failed(raw) or _summary_runtime_failed(warning_text):
+            # Surface the warning's raw reason alongside the summary
+            # so the bounded-failure summary is not reduced to the
+            # transport's generic "endpoint is unreachable" message.
+            if raw and warning_text and warning_text not in raw:
+                detail = f"{raw} (reason: {warning_text})"
+            else:
+                detail = raw or warning_text
             return AgenticResult(
                 success=False,
-                summary=f"bounded analyze runtime failed for {os.path.basename(source_path)}: {raw or warning_text}",
-                raw_output=raw or warning_text,
+                summary=f"bounded analyze runtime failed for {os.path.basename(source_path)}: {detail}",
+                raw_output=detail,
                 backend_used="bounded-analyze",
             )
         report_text = raw if raw and not _contains_cjk(raw) else _fallback_analysis_markdown(payload)
@@ -1888,6 +1906,7 @@ def _run_custom_dimension_path(
         _build_execution_prompt,
         _read_sample_files,
         _plan_published,
+        _summarize_remaining_path_evidence,
     )
 
     system_prompt = (
@@ -2182,25 +2201,94 @@ def _run_custom_dimension_path(
         remaining.append({"path": rel, "excerpt": excerpt})
     mapping: dict[str, str] = dict(approved_plan.get("sample_mapping") or {})
     if remaining:
-        execution_prompt = _build_execution_prompt(custom_hint, approved_plan, remaining)
-        try:
-            response = runtime.run(
-                execution_prompt,
-                system_prompt=system_prompt,
-                max_tokens=4000,
-                cwd=state.get("workspace_root"),
+        # Pre-compute a methodology-agnostic summary of the directory
+        # patterns in the *remaining* list so the LLM classifier
+        # reasons about the whole layout (e.g. "all top-level folders
+        # are 4-digit numeric") instead of guessing per-file from
+        # 200-char excerpts.  This is what gives the agent a chance
+        # to derive the right rule (MMDD vs DDMM, ISO date, student
+        # initials, etc.) on data it has not been told about
+        # explicitly.
+        path_evidence = _summarize_remaining_path_evidence(remaining)
+        # Cap the per-call file list so the model does not drop
+        # entries when the remaining set is large.  In
+        # task-8abb55a76c72 a single 40-file prompt was answered
+        # with only 5 mappings — chunking keeps each prompt small
+        # enough for the model to enumerate every file.  The cap
+        # is intentionally small (5) so the model has plenty of
+        # room for the JSON ``mapping`` object plus its reasoning,
+        # even on the tighter-budget backends (codex-cli /
+        # copilot-cli) where the model can drop entries once the
+        # list passes ~5 lines.
+        classify_chunk_size = max(1, int(os.environ.get(
+            "OFFICE_CUSTOM_CLASSIFY_CHUNK_SIZE", "5"
+        )))
+        classify_max_chunks = max(1, int(os.environ.get(
+            "OFFICE_CUSTOM_CLASSIFY_MAX_CHUNKS", "16"
+        )))
+        unclassified: list[dict] = list(remaining)
+        chunks_executed = 0
+        while unclassified and chunks_executed < classify_max_chunks:
+            chunk = unclassified[:classify_chunk_size]
+            unclassified = unclassified[classify_chunk_size:]
+            execution_prompt = _build_execution_prompt(
+                custom_hint, approved_plan, chunk, path_evidence
             )
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "summary": f"office custom executor failed: {exc}",
-                "success": False,
-                "capability": "organize",
-                "status": "failed",
-                "error": f"executor runtime error: {exc}",
+            try:
+                response = runtime.run(
+                    execution_prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=4000,
+                    cwd=state.get("workspace_root"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "summary": f"office custom executor failed: {exc}",
+                    "success": False,
+                    "capability": "organize",
+                    "status": "failed",
+                    "error": f"executor runtime error: {exc}",
+                }
+            raw = response.get("raw_response") or response.get("summary") or ""
+            exec_plan = _parse_json_object(raw)
+            chunk_mapping = (exec_plan or {}).get("mapping") or {}
+            _merge_custom_exec_mapping(mapping, chunk_mapping, source)
+            chunks_executed += 1
+            # If the model returned a mapping that did not cover
+            # the chunk's files, keep the missed ones for the next
+            # round.  The next round's prompt will re-state the
+            # classification_rule and the missed files only — a
+            # smaller and more focused prompt that backends with
+            # tighter response budgets can finish without
+            # truncation.
+            classified_in_chunk = {
+                str(item.get("path") or "")
+                for item in chunk
+                if str(item.get("path") or "") in mapping
             }
-        raw = response.get("raw_response") or response.get("summary") or ""
-        exec_plan = _parse_json_object(raw)
-        _merge_custom_exec_mapping(mapping, (exec_plan or {}).get("mapping") or {}, source)
+            missed = [
+                item for item in chunk
+                if str(item.get("path") or "") not in classified_in_chunk
+            ]
+            if not missed:
+                continue
+            if not unclassified:
+                # Last (or only) chunk did not return all files —
+                # push the missed ones back through with a sharper
+                # reminder so the model cannot forget them on the
+                # final pass.
+                unclassified = list(missed)
+            else:
+                # The chunk was partial; prepend the missed ones
+                # to the next chunk so they get a focused retry
+                # before the fresh batch arrives.
+                unclassified = list(missed) + unclassified
+            if chunks_executed >= classify_max_chunks and unclassified:
+                # Give up on the residual: too many LLM passes
+                # for a single organize task.  Let the quality
+                # check downstream report the residual explicitly
+                # so the user can adjust the rule.
+                break
 
     quality_problem, affected_paths = _custom_mapping_quality_problem(inventory, mapping)
     if not quality_problem:
@@ -2219,8 +2307,11 @@ def _run_custom_dimension_path(
             if str(item.get("path") or "") in affected_set
         ]
         if retry_remaining:
+            retry_evidence = _summarize_remaining_path_evidence(retry_remaining)
             retry_prompt = (
-                _build_execution_prompt(custom_hint, approved_plan, retry_remaining)
+                _build_execution_prompt(
+                    custom_hint, approved_plan, retry_remaining, retry_evidence
+                )
                 + "\n\n"
                 "Reclassification retry: the previous classification overused "
                 "`__unmatched__`. Treat the approved buckets as examples, not "
