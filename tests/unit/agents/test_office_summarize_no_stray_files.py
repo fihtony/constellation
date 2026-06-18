@@ -461,3 +461,56 @@ def test_bounded_folder_summarize_fails_when_runtime_returns_error_text(tmp_path
     assert result.success is False
     assert "endpoint is unreachable" in result.summary
     assert not (artifacts_dir / "alpha.txt.summary.md").exists()
+
+
+def test_bounded_folder_summarize_failure_surfaces_underlying_reason(tmp_path, monkeypatch):
+    """When the runtime returns a generic failure summary but the
+    actual reason lives only in the ``warnings`` array (e.g. an LLM
+    request that ran past its 90s timeout, the cause of the
+    task-63432d83fc65 misclassification), the bounded failure summary
+    must include the underlying reason, not just the catch-all
+    "endpoint is unreachable" string.  Otherwise operators reading
+    the task-report can no longer tell timeout from DNS from TLS.
+    """
+    from agents.office import nodes as office_nodes
+
+    def _fake_read(path):
+        return {
+            "source_path": path,
+            "content": f"content of {os.path.basename(path)}",
+            "metadata": {"type": "TXT"},
+        }
+
+    runtime = MagicMock()
+    runtime.run.return_value = {
+        "raw_response": "copilot-cli request failed because the endpoint is unreachable.",
+        "summary": "",
+        "warnings": [
+            "copilot-cli network error: connect-agent request timed out after 90s"
+        ],
+    }
+    monkeypatch.setattr(office_nodes, "_read_summary_payload", _fake_read)
+
+    src = tmp_path / "source"
+    src.mkdir()
+    first = src / "alpha.txt"
+    first.write_text("alpha", encoding="utf-8")
+    artifacts_dir = tmp_path / "office" / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+
+    result = _run_bounded_folder_summarize(
+        {"_plugin_manager": None, "workspace_root": str(artifacts_dir.parent)},
+        runtime=runtime,
+        validated_paths=[str(first)],
+        output_mode="workspace",
+        artifacts_dir=str(artifacts_dir),
+        system_prompt="sys",
+    )
+
+    assert result.success is False
+    # The summary must surface the actual reason (90s timeout), not
+    # just the misleading "endpoint is unreachable" wrapper.
+    assert "timed out" in result.summary
+    assert "connect-agent request timed out" in result.summary
+    # No stray summary file should have been written.
+    assert not (artifacts_dir / "alpha.txt.summary.md").exists()

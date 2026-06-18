@@ -228,6 +228,69 @@ def call_chat_completion(
     raise RuntimeError("connect-agent request failed without an HTTP response")
 
 
+def _classify_url_error(
+    exc: URLError, backend_used: str
+) -> tuple[str, str]:
+    """Return a (summary, warning) pair that names the actual transport
+    failure rather than the catch-all "endpoint is unreachable".
+
+    Why this exists: the previous handler returned the same generic
+    message for *every* ``URLError`` sub-type.  In task-63432d83fc65 the
+    real cause was an LLM request that ran past its 90s timeout (the
+    earlier ``FutureTimeoutError`` was wrapped as a ``URLError`` at
+    :func:`call_chat_completion`); the warning string held the truth
+    but the summary still read "endpoint is unreachable", so the
+    orchestrator and the user both misread the failure as a network
+    outage.  Naming the sub-type directly is enough to disambiguate
+    timeout / DNS / TLS / refused / generic without introducing any
+    retry or fallback behaviour (per project policy, LLM transport
+    failures must still fail the task).
+
+    The returned ``summary`` is what callers see in
+    ``result["summary"]`` and ``result["raw_response"]``; the
+    ``warning`` keeps the raw reason for log forensics.  The mapping
+    is deliberately conservative — a new reason falls through to the
+    generic message rather than guessing.
+    """
+    raw_reason = str(getattr(exc, "reason", "") or "")
+    lowered = raw_reason.lower()
+    warning = f"{backend_used} network error: {raw_reason}"
+    if "timed out" in lowered or "timeout" in lowered:
+        return (
+            f"{backend_used} request timed out.",
+            warning,
+        )
+    if "name or service not known" in lowered or "nodename nor servname" in lowered:
+        return (
+            f"{backend_used} DNS resolution failed.",
+            warning,
+        )
+    if "connection refused" in lowered:
+        return (
+            f"{backend_used} endpoint refused connection.",
+            warning,
+        )
+    if (
+        "ssl" in lowered
+        or "certificate" in lowered
+        or "handshake" in lowered
+        or "cert_verify" in lowered
+    ):
+        return (
+            f"{backend_used} TLS handshake failed.",
+            warning,
+        )
+    if "connection reset" in lowered or "broken pipe" in lowered:
+        return (
+            f"{backend_used} connection was reset mid-request.",
+            warning,
+        )
+    return (
+        f"{backend_used} request failed because the endpoint is unreachable.",
+        warning,
+    )
+
+
 def run_single_shot(
     prompt: str,
     *,
@@ -294,9 +357,9 @@ def run_single_shot(
             backend_used=backend_used,
         )
     except URLError as exc:
-        warning = f"{backend_used} network error: {exc.reason}"
+        summary, warning = _classify_url_error(exc, backend_used)
         return AgentRuntimeAdapter.build_failure_result(
-            f"{backend_used} request failed because the endpoint is unreachable.",
+            summary,
             warning=warning,
             backend_used=backend_used,
         )
