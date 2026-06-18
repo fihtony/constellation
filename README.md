@@ -1,119 +1,197 @@
 # Constellation
 
-Constellation is a capability-driven multi-agent engineering system built on LangGraph and the [A2A (Agent-to-Agent) protocol](https://google.github.io/A2A/). Instead of collapsing routing, planning, integration, and execution into one service, it runs as a live agent topology where new skills can register at runtime, be discovered without restarting the platform, and scale independently. Compass serves as the control plane, Team Lead handles analysis, planning, and review, and specialized agents own external integrations or execution domains behind the same task contract. For each request, Constellation can choose a different workflow, inject task-specific instructions into the execution agent, and grant only the permissions that workflow requires. The result is an architecture built for real engineering work: parallel task handling, on-demand agent launch, resumable human-in-the-loop flows, shared workspaces, async callbacks, and a clean boundary between orchestration and delivery that is designed to grow with the system.
+Constellation is a capability-driven multi-agent engineering system built on
+the [A2A (Agent-to-Agent) protocol](https://google.github.io/A2A/). It uses a
+"Graph outside, ReAct inside" architecture: durable workflow graphs coordinate
+the macro lifecycle, while bounded agentic runtime calls handle open-ended
+reasoning inside individual steps. Compass is the user-facing control plane,
+Team Lead plans and reviews development work, and specialized boundary agents
+own external integrations behind the same task contract.
+
+Instead of wiring agents together with fixed service URLs, Constellation routes
+work through the Capability Registry. Agents publish what they can do, parents
+resolve capabilities at dispatch time, and missing capabilities fail closed.
+Each child task receives a narrowed execution contract so the agent only gets
+the tools, launch rights, and credentials required for that workflow.
 
 ## Highlights
 
-- Live capability discovery: agents register skills through the registry, and the runtime refreshes topology as new capabilities appear.
-- Elastic execution model: persistent boundary agents stay available for integrations, while on-demand execution agents launch only when work actually arrives.
-- Workflow-aware dispatch: each request can follow a different path, with task-specific workflow instructions injected into the execution agent at runtime.
-- Least-privilege operation: agent dispatch and execution are shaped by role checks, tool restrictions, and launch-time isolation controls.
-- Parallel and multi-task ready: independent tasks can be routed, launched, and tracked concurrently without forcing a single shared worker model.
-- Review-driven delivery: Team Lead gathers context, plans the work, reviews downstream output, and can drive revision cycles before completion.
-- Resumable and auditable: shared workspaces, progress events, callbacks, command logs, and stage summaries preserve continuity across long-running jobs.
+- Capability-first routing: every inter-agent handoff resolves through the
+  registry before dispatch.
+- Graph outside, ReAct inside: workflow nodes stay auditable while agentic
+  reasoning remains available where it adds value.
+- Runtime-neutral execution: `claude-code`, `copilot-cli`, `codex-cli`, and
+  `connect-agent` share the same `run()` / `run_agentic()` adapter contract.
+- Least-privilege task execution: permission profiles, execution contracts,
+  command policies, and tool allowlists constrain each agent step.
+- Elastic task agents: persistent boundary services stay online, while Office,
+  Web Dev, and Code Review launch on demand.
+- Review-driven delivery: Team Lead plans the work, dispatches execution,
+  reviews downstream output, and can drive remediation cycles.
+- Resumable and auditable workflows: shared workspaces, major-step progress,
+  callbacks, command logs, and validation records preserve long-running state.
 
 ## Architecture
 
 ![Architecture Diagram](./docs/images/constellation-Architecture.png)
 
-```
+```text
 Browser / API client
-    └─► Compass Agent (control plane, UI, :8080)
-             ├─► Office Agent (:8060)         — local document tasks
-             └─► Team Lead Agent (:8030)      — planning, coordination, review
-                      ├─► Capability Registry (:9000)
-                      ├─► Jira Agent (:8010)       — Jira integration
-                      ├─► SCM Agent (:8020)        — GitHub / Bitbucket integration
-                      ├─► UI Design Agent (:8040)  — Figma + Stitch design context
-                      └─► Execution Agents         — Android / Web / future iOS
+    -> Compass Agent (control plane, UI, :8000)
+         -> Office Agent (on demand, :8060)
+         -> Team Lead Agent (planning, coordination, review, :8030)
+              -> Capability Registry (:9000)
+              -> Jira Agent (:8010)
+              -> SCM Agent (:8020)
+              -> UI Design Agent (:8040)
+              -> Web Dev Agent (on demand, :8050)
+              -> Code Review Agent (on demand, :8060)
 ```
 
 ## Compass UI
 
-Compass is the user-facing control plane: every request — development or office — is initiated, monitored, and reviewed in the same console.
+Compass is the user-facing control plane. Development and office requests are
+submitted, monitored, resumed, and reviewed from the same console.
 
 ### Development task
 
-![Compass UI — Development Task](./docs/images/compass-ui-dev-task.png)
+![Compass UI - Development Task](./docs/images/compass-ui-dev-task.png)
 
-A JIRA implementation request (`CSTL-2`) is submitted from the chat panel. Compass dispatches it to Team Lead, which plans the work and delegates to the Web Dev execution agent. The right-hand timeline surfaces every stage — build and test, self-check, gap fix, rebuild, code review, and final report — and reveals the PR, branch, and review verdict once the pipeline completes.
+A Jira implementation request is submitted from the chat panel. Compass routes
+it to Team Lead, Team Lead gathers context and creates a delivery plan, and Web
+Dev performs the implementation through its bounded agentic workflow. The task
+timeline shows planning, implementation, tests, self-checks, code review,
+remediation, and final reporting as major steps.
 
 ### Office folder organization task
 
-![Compass UI — Office Folder Organization](./docs/images/compass-ui-office-task.png)
+![Compass UI - Office Folder Organization](./docs/images/compass-ui-office-task.png)
 
-A local folder-organization request ("organize the files by student name by month") is routed directly to the Office Agent. Compass collects the output mode (`workspace` vs. `inplace`), the Office Agent drafts a plan, the user reviews and modifies it interactively (`approve` / `modify: <change>`), and the completion summary — files organized, output paths, and live task logs — appears in the task info panel.
+Office requests route directly to the Office Agent. Compass collects the output
+mode (`workspace` or `inplace`), the Office Agent drafts a plan, the user can
+approve or revise it, and the final summary reports the generated deliverables,
+output paths, and live task logs.
 
 ## Quick Start
 
+Use Python 3.12 for local development.
+
 ```bash
-# 1. Copy and fill in environment files for each agent
-cp compass/.env.example   compass/.env
-cp jira/.env.example      jira/.env
-cp scm/.env.example       scm/.env
-cp ui-design/.env.example ui-design/.env
-
-# 2. Start the local registry and persistent services
-docker compose -f docker-compose-v2.yml up --build -d registry compass team-lead jira scm ui-design
-
-# 3. Register or refresh agent definitions in the registry
+# 1. Create a local development environment
+python3.12 -m venv .venv
 source .venv/bin/activate
-python scripts/register_agents.py --registry-url http://localhost:9000
+pip install -e ".[dev]"
 
-# 4. Open the Web UI
+# 2. Configure shared runtime settings and boundary-agent credentials
+cp config/.env.example config/.env
+cp agents/jira/.env.example agents/jira/.env
+cp agents/scm/.env.example agents/scm/.env
+cp agents/ui_design/.env.example agents/ui_design/.env
+
+# 3. Build and start the Docker stack
+./start.sh docker build run
+
+# 4. Open Compass
 open http://localhost:8000/ui
 ```
 
-`python scripts/register_agents.py` is a manual bootstrap / update step for registry definitions. Run it the first time you stand up a registry, and run it again only when an agent changes its capability list, launch spec, display name, or agent id. Live service instances still register themselves automatically at runtime.
+For later Docker runs, `./start.sh docker` starts the existing images without a
+rebuild. Rancher Desktop uses the same stack with a minimal socket-permission
+override:
+
+```bash
+./start.sh rancher build run
+```
+
+The compose stack includes an `init-register` service that registers the agent
+definitions with the Capability Registry. If you run services manually, refresh
+the registry with:
+
+```bash
+python scripts/register_agents.py --registry-url http://localhost:9000
+```
+
+Useful health checks:
+
+```bash
+curl http://localhost:8000/health   # Compass
+curl http://localhost:8030/health   # Team Lead
+curl http://localhost:9000/health   # Capability Registry
+```
 
 ## Agents
 
-| Agent | Directory | Port | Role |
-|-------|-----------|------|------|
-| Compass | `compass/` | 8080 | Control plane, Web UI, user-facing routing |
-| Team Lead | `team-lead/` | 8030 | Planning, coordination, review, and agent dispatch |
-| Registry | `registry/` | 9000 | Capability discovery and instance tracking |
-| Jira Agent | `jira/` | 8010 | Jira integration |
-| SCM | `scm/` | 8020 | Source control integration |
-| UI Design | `ui-design/` | 8040 | Design context from Figma and Stitch |
-| Office | `office/` | 8060 | Local office and document workflows |
-| Android | `android/` | on-demand | Task execution agent |
-| Web | `web/` | on-demand | Task execution agent |
+| Agent | Directory | Port | Mode | Role |
+|-------|-----------|------|------|------|
+| Compass | `agents/compass/` | 8000 | persistent | Control plane, Web UI, request routing |
+| Team Lead | `agents/team_lead/` | 8030 | persistent | Planning, coordination, review, dispatch |
+| Registry | `registry/` | 9000 | persistent | Capability definitions and live instance tracking |
+| Jira | `agents/jira/` | 8010 | persistent | Jira REST/MCP boundary |
+| SCM | `agents/scm/` | 8020 | persistent | GitHub and Bitbucket boundary |
+| UI Design | `agents/ui_design/` | 8040 | persistent | Figma and Stitch design context boundary |
+| Office | `agents/office/` | 8060 | on demand | Document summarization, data analysis, folder organization |
+| Web Dev | `agents/web_dev/` | 8050 | on demand | Development implementation workflow |
+| Code Review | `agents/code_review/` | 8060 | on demand | Independent code review workflow |
 
 ## Configuration
 
-Each agent reads from its own `.env` file. Copy the corresponding `.env.example` and fill in credentials. Key variables:
+Configuration is layered from `config/constellation.yaml`, per-agent
+`config.yaml` files, environment variables, and runtime overrides. Shared
+deployment selectors belong in `config/.env`; agent-specific credentials stay
+in the matching `agents/<agent>/.env` file.
 
-| Variable | Description |
-|----------|-------------|
-| `OPENAI_BASE_URL` | OpenAI-compatible LLM endpoint |
-| `OPENAI_MODEL` | Model name |
-| `JIRA_TOKEN` | Jira API token |
-| `JIRA_EMAIL` | Jira account email (Basic auth) |
-| `SCM_TOKEN` | GitHub / Bitbucket personal access token |
-| `FIGMA_TOKEN` | Figma personal access token |
-| `STITCH_API_KEY` | Google Stitch / Gemini API key |
+| Variable | Location | Description |
+|----------|----------|-------------|
+| `AGENT_RUNTIME` | `config/.env` | Agentic backend: `claude-code`, `copilot-cli`, `codex-cli`, or `connect-agent` |
+| `AGENT_MODEL` | `config/.env` | Generic model fallback when the active runtime has no dedicated model |
+| `ANTHROPIC_AUTH_TOKEN` | `config/.env` | Claude Code runtime credential |
+| `COPILOT_PROVIDER_BASE_URL` / `COPILOT_MODEL` | `config/.env` | Copilot CLI BYOK endpoint and model |
+| `COPILOT_PROVIDER_API_KEY` | `config/.env` | Optional Copilot CLI BYOK provider key |
+| `JIRA_BACKEND` | `config/.env` | Jira backend selector: `mcp` or `rest` |
+| `SCM_BACKEND` | `config/.env` | SCM backend selector: `bitbucket`, `github-rest`, or `github-mcp` |
+| `UI_DESIGN_DEFAULT_PROVIDER` | `config/.env` | Design provider selector: `stitch` or `figma` |
+| `CONTAINER_RUNTIME` | `config/.env` | Container runtime: `docker` or `rancher` |
+| `TZ` | `config/.env` | Deployment timezone for agent logs and timestamps |
+| `JIRA_BASE_URL`, `JIRA_TOKEN`, `JIRA_EMAIL` | `agents/jira/.env` | Jira credentials |
+| `SCM_BASE_URL`, `SCM_TOKEN` | `agents/scm/.env` | GitHub or Bitbucket credentials |
+| `FIGMA_TOKEN`, `STITCH_API_KEY` | `agents/ui_design/.env` | Design-provider credentials |
+
+## Build Layout
+
+`scripts/build_base.sh` builds the shared base images used by every per-agent
+Dockerfile:
+
+- `constellation-base:agentic-<runtime>` includes Python dependencies, Node,
+  the selected agentic CLI, and the shared framework.
+- `constellation-base:boundary` is a slimmer image for Jira, SCM, and UI Design
+  because those agents do not run local LLM calls.
+
+`start.sh` builds the correct base image first, then builds persistent services
+and the on-demand task-agent images (`office`, `web-dev`, and `code-review`).
 
 ## Running Tests
 
 ```bash
-# Jira MCP integration tests
-python3 tests/test_mcp.py --integration --jira
+# Run all unit tests
+pytest tests/unit/
 
-# UI Design agent tests (Figma + Stitch)
-python3 tests/test_ui_design_agent.py --integration
+# Run one unit test file
+pytest tests/unit/framework/test_workflow.py
 
-# Async skill contract tests (SCM clone + Android callback)
-python3 tests/test_async_skills.py --container
+# Run one test by name
+pytest tests/unit/framework/test_workflow.py::TestWorkflowBasic::test_linear_workflow
 
-# End-to-end workflow tests
-python3 tests/test_e2e.py
+# Run integration tests that require live services
+pytest tests/integration/ -m live
+
+# Run end-to-end tests
+pytest tests/e2e/
 ```
 
-Set test credentials in `tests/.env` (copy from `tests/.env.example`).
+Test credentials belong in `tests/.env` when live integrations are required.
+Generated test output and workspace files should stay under `artifacts/`.
 
 ## License
 
-MIT © Tony Xu
-
+MIT (c) Tony Xu
 
