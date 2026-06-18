@@ -16,6 +16,7 @@ from pathlib import Path as _Path
 from typing import Any
 
 from framework.config import load_agent_config as _load_agent_cfg
+from framework.context_budget import build_jira_brief, text_for_prompt
 from framework.devlog import AgentLogger
 from framework.major_step import (
     LIFECYCLE_DONE,
@@ -562,6 +563,7 @@ async def load_pr_context(state: dict) -> dict:
 
     # Jira and design context (passed by Team Lead)
     jira_context = metadata.get("jiraContext") or state.get("jira_context") or {}
+    jira_brief = metadata.get("jiraBrief") or state.get("jira_brief") or {}
     design_context = metadata.get("designContext") or state.get("design_context") or {}
     workspace_path = metadata.get("workspacePath") or state.get("workspace_path") or ""
     context_manifest_path = (
@@ -645,6 +647,15 @@ async def load_pr_context(state: dict) -> dict:
                     _record_checked_artifact(checked_artifacts, workspace_path, team_lead_design_path)
                 except Exception as exc:
                     log.warn("failed to load team-lead design spec", error=str(exc), path=team_lead_design_path)
+
+    if not isinstance(jira_brief, dict) or not jira_brief:
+        jira_brief = build_jira_brief(
+            jira_context,
+            jira_files=[
+                path for path in checked_artifacts
+                if path.endswith("ticket.json") or path.endswith("jira-ticket.json")
+            ],
+        )
 
     pr_number = _parse_pr_number(pr_url, pr_number)
 
@@ -901,6 +912,7 @@ async def load_pr_context(state: dict) -> dict:
         "pr_description": pr_description,
         "commit_messages": commit_messages,
         "jira_context": jira_context,
+        "jira_brief": jira_brief,
         "design_context": design_context,
         "original_requirements": original_requirements,
         "workspace_path": workspace_path,
@@ -1052,11 +1064,14 @@ async def review_requirements(state: dict) -> dict:
     from agents.code_review.prompts import REQUIREMENTS_SYSTEM, REQUIREMENTS_TEMPLATE
 
     jira_ctx = state.get("jira_context", {})
+    jira_brief = state.get("jira_brief") if isinstance(state.get("jira_brief"), dict) else {}
+    if not jira_brief:
+        jira_brief = build_jira_brief(jira_ctx)
     standards_section = _build_standards_section(state)
     prev_issues_text = _build_previous_issues_section(state)
     prompt = REQUIREMENTS_TEMPLATE.format(
         original_requirements=original_requirements,
-        jira_context=json.dumps(jira_ctx, ensure_ascii=False) if jira_ctx else "N/A",
+        jira_context=text_for_prompt(jira_brief, max_chars=3000) if jira_brief else "N/A",
         pr_description=state.get("pr_description", "N/A"),
         changed_files=", ".join(state.get("changed_files", [])) or "N/A",
         pr_diff=state.get("pr_diff", ""),

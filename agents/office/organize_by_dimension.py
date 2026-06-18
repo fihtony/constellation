@@ -886,22 +886,127 @@ def _build_planning_prompt(
     )
 
 
+def _summarize_remaining_path_evidence(remaining: list[dict]) -> str:
+    """Return a short, methodology-agnostic summary of the
+    directory-naming patterns in the *remaining* file list.
+
+    Why: classifiers that look at file excerpts in isolation have
+    no way to detect a global pattern (e.g. all top-level folders
+    are 4-digit numeric, day-month-month-day, student initials,
+    ISO dates, etc.).  Pre-computing the pattern and feeding it as
+    evidence lets the LLM reason about the *whole* layout, not
+    just the excerpt of one file at a time.  This is methodology-
+    level — it does not hard-code any specific format, it just
+    surfaces what the data actually looks like and lets the LLM
+    pick the rule.
+    """
+    if not remaining:
+        return ""
+
+    # Bucket the source-relative paths by depth.  At each depth,
+    # look at the directory segment; if the entire segment set
+    # shares a recognisable shape (numeric, alpha, alphanumeric,
+    # dotted, hyphenated, etc.) surface it so the model sees the
+    # full pattern at once.
+    by_depth: dict[int, list[str]] = {}
+    for item in remaining:
+        path = str(item.get("path") or "").strip().strip("/")
+        if not path:
+            continue
+        segments = [seg for seg in path.split("/") if seg]
+        for depth, seg in enumerate(segments[:-1], start=1):
+            by_depth.setdefault(depth, []).append(seg)
+
+    lines: list[str] = []
+    total = len(remaining)
+    lines.append(
+        f"The {total} file(s) below sit under these top-level directories "
+        "(whole-pattern view, not per-file guesses):"
+    )
+    seen: set[int] = set()
+    for depth in sorted(by_depth):
+        if depth in seen:
+            continue
+        seen.add(depth)
+        segments = sorted(set(by_depth[depth]))
+        pattern = _classify_segment_shape(segments)
+        sample = ", ".join(repr(s) for s in segments[:12])
+        if len(segments) > 12:
+            sample += f", ... ({len(segments)} total)"
+        lines.append(f"  - depth-{depth} folders ({pattern}): {sample}")
+
+    if len(by_depth) == 1:
+        lines.append(
+            "All files share the same depth-1 folder; the bucket hierarchy "
+            "should derive from these folder names (and/or from content)."
+        )
+    elif len(by_depth) >= 2:
+        lines.append(
+            "Files span multiple folder depths; preserve the same depth in "
+            "the bucket path or justify collapsing it explicitly in the rule."
+        )
+    return "\n".join(lines)
+
+
+def _classify_segment_shape(segments: list[str]) -> str:
+    """Return a short human description of the dominant shape.
+
+    Generic categories (no test-case-specific knowledge):
+      - "all 4-digit numeric"     e.g. ["0103", "0110", "0124"]
+      - "all numeric"             e.g. ["1", "2", "3"]
+      - "all 2-letter alpha"      e.g. ["AB", "CD"]
+      - "all lowercase alpha"     e.g. ["jan", "feb"]
+      - "mixed"
+    """
+    if not segments:
+        return "empty"
+    if all(re.fullmatch(r"\d{4}", s or "") for s in segments):
+        return "all 4-digit numeric"
+    if all(re.fullmatch(r"\d+", s or "") for s in segments):
+        return "all numeric"
+    if all(re.fullmatch(r"[A-Za-z]{2,4}", s or "") for s in segments):
+        length = len(segments[0]) if segments else 0
+        if all(s == s.lower() for s in segments if s):
+            return f"all {length}-letter lowercase alpha"
+        return f"all {length}-letter alpha"
+    if all(re.fullmatch(r"[a-z]+", s or "") for s in segments):
+        return "all lowercase alpha"
+    if all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", s or "") for s in segments):
+        return "all ISO date"
+    return "mixed"
+
+
 def _build_execution_prompt(
     hint: str,
     plan: dict,
     remaining: list[dict],
+    path_evidence: str = "",
 ) -> str:
-    """Render the LLM prompt that classifies unsampled files into buckets."""
+    """Render the LLM prompt that classifies unsampled files into buckets.
+
+    ``path_evidence`` is the methodology-agnostic directory-pattern
+    summary produced by :func:`_summarize_remaining_path_evidence`;
+    when non-empty it is inserted before the file list so the
+    classifier reasons about the *whole* layout, not per-file
+    guesses.
+    """
     file_block = "\n".join(
         f"- {item['path']} (excerpt: {item['excerpt'][:200]!r})"
         for item in remaining
     )
     bucket_list = ", ".join(repr(b) for b in plan.get("buckets", []))
+    evidence_block = (
+        f"\n\nLayout evidence (use this to derive the classification rule):\n"
+        f"{path_evidence}\n"
+        if path_evidence
+        else ""
+    )
     return (
         f"You classified a sample of files into these example buckets for "
         f"organizing by **{hint}**:\n{bucket_list}\n\n"
         f"Plan rationale: {plan.get('rationale', '')}\n\n"
-        f"Classification rule from the planner: {plan.get('classification_rule', '')}\n\n"
+        f"Classification rule from the planner: {plan.get('classification_rule', '')}\n"
+        f"{evidence_block}\n"
         "Now classify the following remaining files. For each, output "
         "the source-relative bucket path that follows the classification "
         "rule. Do not include the absolute source folder, `/app/userdata`, "

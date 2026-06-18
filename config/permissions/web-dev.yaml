@@ -37,6 +37,7 @@ custom:
     - "^pwd$"
     - "^ls(\\s|$).*"
     - "^git (status|diff|log|show|branch|checkout|switch|add|commit|push|fetch|pull|remote|rev-parse|ls-files)(\\s|$).*"
+    - "^(npm|pnpm|yarn) (info|view)(\\s|$).*"
     - "^(npm|pnpm|yarn) (install|ci|test|run|exec|lint|build|typecheck)(\\s|$).*"
     - "^npx (vite|vitest|eslint|tsc|playwright)(\\s|$).*"
     - "^python3? -m pytest(\\s|$).*"

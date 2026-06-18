@@ -263,6 +263,89 @@ def test_managed_agentic_loop_reports_progress_and_budgets_tool_transcript(monke
     assert "...(truncated)" in prompts[1]
 
 
+def test_managed_agentic_loop_applies_default_cwd_to_tools(monkeypatch, tmp_path) -> None:
+    from framework.runtime.copilot_cli import CopilotCLIAdapter
+
+    responses = [
+        '{"action": "tool", "tool": "write_file", "arguments": {"path": "src/App.tsx", "content": "ok"}}',
+        '{"action": "tool", "tool": "run_command", "arguments": {"command": "npm run build"}}',
+        '{"action": "final", "summary": "done"}',
+    ]
+    executed: list[tuple[str, dict]] = []
+    prompts: list[str] = []
+
+    def fake_single_shot(self, prompt, **kwargs):
+        prompts.append(prompt)
+        return {"raw_response": responses.pop(0)}
+
+    class FakeRegistry:
+        def list_schemas(self, tool_names):
+            return [{"function": {"name": name, "parameters": {"type": "object"}}} for name in tool_names]
+
+        def execute_sync(self, name, arguments):
+            executed.append((name, arguments))
+            return '{"ok": true}'
+
+    monkeypatch.setattr(CopilotCLIAdapter, "run", fake_single_shot)
+    monkeypatch.setattr("framework.tools.registry.get_registry", lambda: FakeRegistry())
+
+    result = CopilotCLIAdapter().run_agentic(
+        "Create app files.",
+        cwd=str(tmp_path),
+        tools=["write_file", "run_command"],
+        allowed_tools=["write_file", "run_command"],
+        max_turns=3,
+    )
+
+    assert result.success is True
+    assert executed == [
+        ("write_file", {"path": str(tmp_path / "src" / "App.tsx"), "content": "ok"}),
+        ("run_command", {"command": "npm run build", "cwd": str(tmp_path)}),
+    ]
+    assert f"Relative file paths and command working directories default to: {tmp_path}" in prompts[0]
+    assert result.tool_calls[0]["arguments"]["path"] == str(tmp_path / "src" / "App.tsx")
+
+
+def test_managed_agentic_loop_guides_recovery_after_permission_denial(monkeypatch) -> None:
+    from framework.runtime.copilot_cli import CopilotCLIAdapter
+
+    responses = [
+        (
+            '{"action": "tool", "tool": "run_command", '
+            '"arguments": {"command": "npm create vite@latest . -- --template react-ts"}}'
+        ),
+        '{"action": "final", "summary": "will scaffold manually"}',
+    ]
+    prompts: list[str] = []
+
+    def fake_single_shot(self, prompt, **kwargs):
+        prompts.append(prompt)
+        return {"raw_response": responses.pop(0)}
+
+    class FakeRegistry:
+        def list_schemas(self, tool_names):
+            return [{"function": {"name": name, "parameters": {"type": "object"}}} for name in tool_names]
+
+        def execute_sync(self, name, arguments):
+            assert name == "run_command"
+            return '{"error": "Command \\"npm create vite@latest . -- --template react-ts\\" is not permitted"}'
+
+    monkeypatch.setattr(CopilotCLIAdapter, "run", fake_single_shot)
+    monkeypatch.setattr("framework.tools.registry.get_registry", lambda: FakeRegistry())
+
+    result = CopilotCLIAdapter().run_agentic(
+        "Set up the frontend project.",
+        tools=["run_command", "write_file", "edit_file"],
+        allowed_tools=["run_command", "write_file", "edit_file"],
+        max_turns=2,
+    )
+
+    assert result.success is True
+    assert "run_command was denied by Constellation permissions" in prompts[1]
+    assert "write_file/edit_file" in prompts[1]
+    assert "project generators" in prompts[1]
+
+
 def test_managed_agentic_loop_accepts_loose_cli_tool_call(monkeypatch) -> None:
     from framework.runtime.copilot_cli import CopilotCLIAdapter
 

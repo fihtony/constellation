@@ -60,9 +60,9 @@ Playwright UI mode, or any watcher/server process running from this node. The \
 workflow has dedicated later nodes for deterministic validation and screenshot \
 capture. If you need a quick executable check here, only use one-shot commands \
 that exit on their own, such as `npm run build` or `npx vitest --run`.
-6. After all code changes are complete:
-   a. Stage all changes:  git add -A
-   b. Commit with a descriptive message: git commit -m 'feat(<jira-key>): <summary>'
+6. Do NOT stage, commit, push, create pull requests, or update Jira from this
+   implementation node. Later deterministic workflow nodes own commits,
+   push, PR creation, screenshot upload, and Jira updates after validation.
 7. Produce a brief summary of what was changed and why.
 
 Tool protocol rules:
@@ -70,6 +70,13 @@ Tool protocol rules:
   CLI tool names or aliases such as Read, Bash, MultiEdit, or read_multiple_files.
 - For shell commands, use the authorized run_command tool.
 - For file reads, use read_file; for file writes, use write_file or edit_file.
+- Run one command per run_command call. Do not use shell pipelines, redirects,
+  background jobs, `&&`, `||`, `;`, `sleep`, `curl`, or `wget` in this node.
+- Do NOT use interactive or remote project generators such as `npm create`,
+  `create-vite`, or `yarn create`. If scaffolding is needed, create the files
+  directly with write_file/edit_file.
+- If a command is denied by permissions, do not retry it. Recover by using the
+  allowed tools and by writing/editing the needed files directly.
 
 BLANK SCREEN PREVENTION RULES (MANDATORY — apply to every React/Vue/Vite task):
 These rules prevent the most common cause of blank screens in React applications.
@@ -117,13 +124,13 @@ C. CSS/STYLING — NO ORPHAN IMPORTS:
    - If using CSS Modules, filenames must end in `.module.css`.
    - If the build fails due to a missing CSS import, remove or create the file.
 
-D. BUILD VERIFICATION — MANDATORY BEFORE PR:
+D. BUILD VERIFICATION — MANDATORY BEFORE HANDOFF:
    - After all code is written, run: `npm run build`
    - If build fails with TypeScript errors, fix ALL errors — do not skip.
    - If build fails with missing module errors, check import paths and file names.
   - Do NOT run bare `npm run test` here when it resolves to a watch-mode command \
     such as `vitest`; the dedicated validation node will run tests deterministically.
-   - Only proceed to PR when `npm run build` exits with code 0.
+   - Later workflow nodes will decide whether the task can proceed to PR.
 
 STRICT DESIGN FIDELITY (MANDATORY for all UI tasks when a Design HTML Reference is provided):
 When Design HTML Reference is provided (not "N/A"), it is the ABSOLUTE SOURCE OF TRUTH for the UI.
@@ -149,14 +156,17 @@ When Design HTML Reference is provided (not "N/A"), it is the ABSOLUTE SOURCE OF
 
 4. MATCH EXACT TEXT: Use the same text content from the design reference (lesson titles, nav labels, footer text, etc.)
 
-5. COMPONENT AUDIT (do this BEFORE committing):
+5. COMPONENT AUDIT (do this BEFORE handing off to validation):
    - List every visible component in the Design HTML Reference.
    - List every component in your implementation.
    - Remove any component in your implementation that is NOT in the design reference.
    - This audit MUST be completed — do not skip it.
 
 Greenfield guidance (repo is empty or README-only):
-- Scaffold the full project structure in your FIRST turn.
+- Scaffold the full project structure in your FIRST turn with write_file.
+- If Constellation already prepared a generic scaffold, immediately replace
+  placeholder source content with the requested implementation.
+- Do not use `npm create`, `create-vite`, or other project generators.
 - Choose the tech stack from the Jira context or task description.
 - Create: project config file (package.json / pyproject.toml / build.gradle), \
 at least one source file, and at least one test file.
@@ -164,6 +174,7 @@ at least one source file, and at least one test file.
 npm/package.json rules (MANDATORY — prevent hallucinated packages):
 - Before adding ANY package to package.json, verify it exists on npm:
   Run: npm info <package-name> version
+  Use one npm info command at a time; do not chain package checks with `&&`.
   If the command returns an error or empty output, the package does NOT exist — \
   do NOT add it to package.json.
 - After creating/updating package.json, run: npm install
@@ -255,7 +266,7 @@ B. FOOTER POSITIONING — ALWAYS STICKY TO BOTTOM OF VIEWPORT:
          <main className="flex-1">...</main>
          <Footer />
        </div>
-   VERIFY before committing: open the page with little content — footer must be at bottom.
+   VERIFY before handoff: inspect the page source for the flex layout above.
 
 C. SPACING, PADDING AND MARGIN — FOLLOW DESIGN SPEC EXACTLY:
    - Extract spacing values from the Design Specification section in your task prompt.
@@ -266,7 +277,7 @@ C. SPACING, PADDING AND MARGIN — FOLLOW DESIGN SPEC EXACTLY:
    - Container max-width: if the spec says "container-max: 1120px", use max-width: 1120px.
    - After implementing, do a SPACING AUDIT:
        For each major section, compare your padding/margin values against the design spec.
-       If they don't match, fix them before committing.
+       If they don't match, fix them before handoff.
 
 D. TYPOGRAPHY — MATCH EXACT FONT FAMILIES AND SIZES FROM DESIGN SPEC:
    - Extract font-family names from design spec (e.g. "Work Sans", "Newsreader").
@@ -298,11 +309,14 @@ F. TAILWIND CSS SETUP (MANDATORY when Design HTML Reference uses Tailwind classe
      - CSS classes like: flex, items-center, text-primary, max-w-[...], space-x-*, etc.
      - A tailwind.config object in a <script> tag
 
-   INSTALL STEPS (for Vite+React):
+  INSTALL STEPS (for Vite+React):
    1. Install packages (verify they exist first):
-      npm info tailwindcss version && npm info postcss version && npm info autoprefixer version
+      npm info tailwindcss version
+      npm info postcss version
+      npm info autoprefixer version
       npm install -D tailwindcss postcss autoprefixer
-      npx tailwindcss init -p
+      Create tailwind.config.js and postcss.config.js with write_file/edit_file.
+      Do NOT run `npx tailwindcss init -p`.
 
    2. In tailwind.config.js, COPY the COMPLETE design token configuration from the
       Design HTML Reference's tailwind.config object. This includes:
@@ -353,28 +367,26 @@ F. TAILWIND CSS SETUP (MANDATORY when Design HTML Reference uses Tailwind classe
       @tailwind utilities;
 
    4. Verify Tailwind works: run `npm run build` — if it fails with Tailwind errors, fix them.
-      Also check that design token classes resolve: `npx tailwindcss --content 'src/**/*.jsx' --minify | grep 'text-primary'`
-      → Should output CSS for text-primary; if empty, check tailwind.config.js.
+      Use code inspection to confirm design token classes exist in tailwind.config.js.
 
    5. IMPORTANT: When design tokens use hyphenated names like "on-tertiary-container",
       Tailwind requires them to be quoted in the config AND the HTML/JSX must use the
       full class name: `bg-on-tertiary-container` (not `bg-on_tertiary_container`).
 
-G. RENDERED PAGE VERIFICATION (MANDATORY before committing UI tasks):
-   After implementation, verify the rendered page matches the design:
-   1. Start dev server: npm run dev -- --port 5179 &
-      sleep 10
-   2. Check the page renders: curl -s http://localhost:5179 | grep -c "DOCTYPE|<div"
-      → If count > 0, page is rendering HTML
-   3. Check for icon issues: curl -s http://localhost:5179 | grep -o 'arrow_forward|chevron_right'
-      → If found in non-font context, icons may not be rendering
-   4. Check Tailwind is processing: look for style attribute or class in rendered HTML
-   5. Stop server: kill %1 2>/dev/null || pkill -f "vite.*5179"
+G. RENDERED PAGE VERIFICATION (MANDATORY before validation handoff):
+   During this implementation node, use source inspection and one-shot build
+   commands only. Later workflow nodes run browser rendering and screenshots.
+   Before handoff, compare key source elements with the Design HTML Reference:
+   1. Header: correct logo, nav links, sign-in button
+   2. Main: correct heading text, CTA button, category links, or task-specific content
+   3. Icons: no raw ligature text such as arrow_forward or chevron_right remains in JSX
+   4. Footer: positioned at bottom, correct copyright text and links when present
+   5. Tailwind/config: token classes used in JSX are defined in tailwind.config.js
    6. Compare key design elements with the Design HTML Reference:
       - Header: correct logo, nav links, sign-in button
       - Main: correct heading text, CTA button (correct color), category links
       - Footer: positioned at bottom, correct copyright text and links
-   7. If ANY element is missing or wrong → fix it BEFORE committing.
+   7. If ANY element is missing or wrong → fix it BEFORE validation handoff.
 
 Test organization rules (MANDATORY — follow framework best practices):
 - Vite+React: ALL tests (unit + integration) go in src/ alongside the components:
@@ -390,8 +402,8 @@ Workspace vs git rules (MANDATORY — keep git repo clean):
     workspace/web-agent/FINAL_VERIFICATION.md
     workspace/web-agent/VERIFICATION_SUMMARY.txt
 - Put ALL screenshots in workspace/web-agent/screenshots/ (NOT in git repo)
-- Only commit: source code, test files, config files (package.json, vite.config.js, etc.), .gitignore
-- NEVER commit: screenshots, verification docs, build output, temporary files
+- Only change source code, test files, config files (package.json, vite.config.js, etc.), .gitignore
+- NEVER create or track screenshots, verification docs, build output, or temporary files
 """
 
 IMPLEMENT_TEMPLATE = """\
@@ -403,7 +415,8 @@ Tech stack: {tech_stack}
 Target screen: {stitch_screen_name}
 
 IMPORTANT: You are working on branch "{branch_name}" which has already been \
-checked out. All your changes will be committed to this branch.
+checked out. Write the required files only; later workflow nodes will commit \
+and push after build, test, self-assessment, and screenshot gates pass.
 
 Current repository files:
 {repo_files}
@@ -452,7 +465,7 @@ For UI tasks — MANDATORY steps (in order):
    DETECT: If the Design HTML Reference contains `cdn.tailwindcss.com` or a tailwind.config
    script block → Tailwind is used. YOU MUST install and configure it.
    a. Install packages: npm install -D tailwindcss postcss autoprefixer
-   b. Init: npx tailwindcss init -p
+   b. Create tailwind.config.js and postcss.config.js with write_file/edit_file.
    c. In tailwind.config.js — set content paths AND copy ALL design tokens from the
       Design HTML Reference's tailwind.config object (colors, fontFamily, fontSize, spacing,
       borderRadius). The content path must be: ['./index.html', './src/**/*.{{js,jsx,ts,tsx}}']
@@ -494,35 +507,28 @@ For UI tasks — MANDATORY steps (in order):
    - Open App.tsx and confirm the new page component is imported and rendered.
    - If app uses React Router, confirm a <Route> for the new page exists.
    - If the page is NOT wired in App.tsx, add the import and route NOW.
-   - Start the dev server briefly to confirm the page renders without a blank screen:
-       cd {repo_path} && npm run dev -- --port 5179 &
-       sleep 10
-       curl -s http://localhost:5179 | head -50   # should show HTML, not blank
-       kill %1 2>/dev/null || true
-   - If the server responds with blank HTML or errors, fix App.tsx routing before continuing.
+   - Do not start a dev server in this node. Confirm wiring via source inspection
+     and `npm run build`; later workflow nodes own browser rendering and screenshots.
+   - If build or source inspection shows blank-screen risk, fix App.tsx routing before continuing.
 
-9. RENDERED PAGE COMPARISON — MANDATORY before committing (for UI tasks with design reference):
-   Compare your implementation against the Design HTML Reference by running the app:
-   a. Start dev server: cd {repo_path} && npm run dev -- --port 5179 &
-      sleep 10
-   b. Fetch rendered HTML: curl -s http://localhost:5179 > /tmp/rendered.html
-   c. Compare component by component:
-      - Check header: grep -o 'Linguist Library|Sign In' /tmp/rendered.html
-      - Check main content: grep -o 'Master Academic|Start Learning' /tmp/rendered.html
-      - Check icons: grep -o 'material-symbols-outlined' /tmp/rendered.html
-        → Should find the CSS class, not raw icon names outside a class
-      - Check footer: grep -o 'Terms of Service|Privacy Policy' /tmp/rendered.html
-   d. Common issues to check:
+9. RENDERED PAGE COMPARISON — MANDATORY before validation handoff (for UI tasks with design reference):
+   Compare your source implementation against the Design HTML Reference:
+   a. Compare component by component in source:
+      - Header/nav from the design is implemented with matching visible text.
+      - Main content from the design is implemented with matching visible text.
+      - Icon ligatures from the design are replaced with inline SVG/local icons.
+      - Footer from the design is implemented when present.
+   b. Common issues to check:
       - If page or screenshot shows plain text "arrow_forward" → remote icon font is not
         rendering reliably; replace the icon with inline SVG or a local icon component before
         continuing
       - If footer is floating midpage → missing flex-col min-h-screen on root wrapper
       - If design colors are wrong → Tailwind config not set up with tokens
       - If fonts are wrong → Google Fonts link missing or font-family not applied
-   e. Stop server: kill %1 2>/dev/null || pkill -f "vite.*5179" || true
-   f. Fix ALL issues found before committing.
+   c. Fix ALL issues found before validation handoff. Browser rendering and screenshot
+      comparison run in later deterministic workflow nodes.
 
-10. DESIGN FIDELITY AUDIT — MANDATORY before committing (for UI tasks):
+10. DESIGN FIDELITY AUDIT — MANDATORY before validation handoff (for UI tasks):
     Compare your implementation against the Design HTML Reference:
     a. List EVERY visible component in the Design HTML Reference (make a checklist).
     b. Verify each design component is present in your implementation with correct content.
@@ -532,14 +538,13 @@ For UI tasks — MANDATORY steps (in order):
        author names, extra cards, extra navigation items, rating stars, pagination.
     This audit step is NOT optional — skipping it causes self-assessment failure.
 
-11. Stage and commit ALL changes:
-    git add -A
-    git commit -m 'feat(<JIRA-KEY>): implement UI components'
+11. Stop after source/test/config changes are written. Do NOT stage, commit,
+    push, create a PR, upload screenshots, or update Jira. The workflow has
+    dedicated later nodes for those responsibilities.
 
 For non-UI tasks:
-After implementation, stage and commit ALL changes:
-  git add -A
-  git commit -m 'feat: implement task changes'
+After implementation, stop after source/test/config changes are written. Do NOT
+stage, commit, push, create a PR, or update Jira from this node.
 """
 
 # ---------------------------------------------------------------------------
@@ -650,6 +655,9 @@ Test results:
 Changed files:
 {changed_files}
 
+Deterministic source evidence collected by the workflow:
+{source_evidence}
+
 Instructions:
 
 STEP 1 — ACCEPTANCE CRITERIA:
@@ -685,6 +693,9 @@ Verify font families, primary colors, and spacing match the design spec.
 
 STEP 5 — ROUTING CHECK:
 Confirm the new page is wired into App.tsx. If not, add gap: "Blank screen: page not routed".
+If App.tsx or another router/entry file appears in Deterministic source evidence,
+use that evidence. Do NOT fail with "not inspectable", "not included in changed
+files", or "cannot verify" for a file that is listed or shown there.
 
 STEP 6 — CODE-REVIEW STANDARD PARITY:
 Run the SAME merge-blocking standard used by the Code Review Agent across:

@@ -20,8 +20,8 @@ from typing import Any
 
 from framework.config import load_agent_config as _load_agent_cfg
 from framework.context_budget import (
+    build_jira_brief,
     compact_delivery_plan,
-    compact_jira_context,
     compact_plan_action,
     text_for_prompt,
 )
@@ -607,14 +607,16 @@ def _validate_jira_payload(payload: dict, jira_key: str) -> dict:
     return ticket
 
 
-def _require_repo_url(repo_url: str, jira_key: str) -> None:
+def _require_repo_url(repo_url: str, jira_key: str) -> str:
     if not repo_url:
         source = f"Jira ticket {jira_key}" if jira_key else "task context"
         raise RuntimeError(f"No SCM repository URL was found in {source}; cannot dispatch development agent")
 
-    scm_hosts = ("github.com", "bitbucket.org", "gitlab.com", "dev.azure.com")
-    if not any(host in repo_url for host in scm_hosts):
-        raise RuntimeError(f"Repository URL is not a supported SCM URL: {repo_url!r}")
+    normalized = _normalize_scm_repo_url(repo_url)
+    if not normalized:
+        source = f"Jira ticket {jira_key}" if jira_key else "task context"
+        raise RuntimeError(f"Invalid repository URL in {source}: {repo_url!r}")
+    return normalized
 
 
 async def receive_task(state: dict) -> dict:
@@ -790,6 +792,8 @@ async def gather_context(state: dict) -> dict:
     )
 
     jira_files = list(state.get("jira_files") or [])
+    jira_brief = dict(state.get("jira_brief") or {})
+    jira_brief_path = str(state.get("jira_brief_path") or "")
     design_files = list(state.get("design_files") or [])
     design_code_path = str(state.get("design_code_path") or "")
 
@@ -900,6 +904,30 @@ async def gather_context(state: dict) -> dict:
             jira_files.append("team-lead/jira-ticket.json")
         except OSError as exc:
             print(f"[{_AGENT_ID}] Failed to write jira-ticket.json: {exc}")
+
+    if jira_context:
+        jira_brief = build_jira_brief(
+            jira_context,
+            extracted_context=extracted_context,
+            jira_files=jira_files,
+        )
+        if workspace_path and jira_brief:
+            tl_dir = os.path.join(workspace_path, _AGENT_ID)
+            os.makedirs(tl_dir, exist_ok=True)
+            brief_file = os.path.join(tl_dir, "jira-brief.json")
+            try:
+                with open(brief_file, "w", encoding="utf-8") as fh:
+                    json.dump({
+                        "metadata": {
+                            "agent_id": "team-lead",
+                            "step": "gather_context_brief",
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        },
+                        "data": jira_brief,
+                    }, fh, ensure_ascii=False, indent=2)
+                jira_brief_path = "team-lead/jira-brief.json"
+            except OSError as exc:
+                print(f"[{_AGENT_ID}] Failed to write jira-brief.json: {exc}")
 
     # Fetch design context if URL provided and not already present
     design_local_folder = str(state.get("design_local_folder") or "")
@@ -1072,7 +1100,7 @@ async def gather_context(state: dict) -> dict:
             print(f"[{_AGENT_ID}] Design content extraction fallback failed (non-fatal): {exc}")
 
     # Derive repo name from URL — validate it is a real SCM URL first.
-    _require_repo_url(repo_url, jira_key)
+    repo_url = _require_repo_url(repo_url, jira_key)
     repo_name = ""
     if repo_url:
         parts = [p for p in repo_url.rstrip("/").split("/") if p]
@@ -1146,6 +1174,7 @@ async def gather_context(state: dict) -> dict:
                 "workspace_root": workspace_path,
                 "jira_files": jira_files,
                 "jira_local_folder": jira_local_folder,
+                "jira_brief_path": jira_brief_path,
                 "design_files": design_files,
                 "design_local_folder": design_local_folder,
                 "design_code_path": design_code_path,
@@ -1179,6 +1208,9 @@ async def gather_context(state: dict) -> dict:
 
     return {
         "jira_context": jira_context,
+        "jira_brief": jira_brief,
+        "jira_brief_path": jira_brief_path,
+        "jira_extracted_context": extracted_context,
         "design_context": design_context,
         "repo_url": repo_url,
         "figma_url": figma_url,
@@ -1300,9 +1332,10 @@ async def create_plan(state: dict) -> dict:
 
     _design_ctx = state.get("design_context")
     _design_ctx_str = text_for_prompt(_design_ctx, max_chars=800, default="N/A")
+    jira_brief = _jira_brief_for_state(state)
     prompt = PLANNING_TEMPLATE.format(
         analysis=text_for_prompt(state.get("analysis_summary", ""), max_chars=2500, default=""),
-        jira_context=compact_jira_context(state.get("jira_context", {}), max_chars=3000),
+        jira_context=text_for_prompt(jira_brief, max_chars=3000),
         task_type=state.get("task_type", "general"),
         complexity=state.get("complexity", "medium"),
         design_context=_design_ctx_str,
@@ -1442,6 +1475,7 @@ async def dispatch_dev_agent(state: dict) -> dict:
             summary_template="Team Lead is dispatching the implementation task to Web Dev.",
         )
     task_description = _build_dev_brief(state)
+    jira_brief = _jira_brief_for_state(state)
     definition_of_done = dict((state.get("plan", {}) or {}).get("definition_of_done", {}) or {})
     if not definition_of_done:
         definition_of_done = {
@@ -1521,7 +1555,10 @@ async def dispatch_dev_agent(state: dict) -> dict:
 
         dispatch_args = {
                 "task_description": task_description,
-                "jira_context": state.get("jira_context", {}),
+                "jira_context": jira_brief,
+                "jira_brief": jira_brief,
+                "jira_ticket_path": _first_existing_jira_ticket_path(state),
+                "jira_brief_path": state.get("jira_brief_path", ""),
                 "design_context": state.get("design_context"),
                 "design_code_path": state.get("design_code_path", ""),
                 "repo_url": state.get("repo_url", ""),
@@ -1788,6 +1825,7 @@ async def review_result(state: dict) -> dict:
             or dev_result.get("changed_files")
             or []
         )
+        jira_brief = _jira_brief_for_state(state)
         # Emit the tool name so downstream log auditors can verify the
         # team-lead invoked the code-review dispatch tool for this task.
         log.info(
@@ -1806,7 +1844,10 @@ async def review_result(state: dict) -> dict:
                     "changed_files": review_changed_files,
                     "diff_summary": dev_result.get("summary", ""),
                     "requirements": state.get("analysis_summary", "") or state.get("user_request", ""),
-                    "jira_context": state.get("jira_context", {}),
+                    "jira_context": jira_brief,
+                    "jira_brief": jira_brief,
+                    "jira_ticket_path": _first_existing_jira_ticket_path(state),
+                    "jira_brief_path": state.get("jira_brief_path", ""),
                     "design_context": state.get("design_context"),
                     "workspace_path": state.get("workspace_path", ""),
                     "context_manifest_path": state.get("context_manifest_path", ""),
@@ -2297,6 +2338,41 @@ async def escalate_to_user(state: dict) -> dict:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _jira_brief_for_state(state: dict) -> dict[str, Any]:
+    """Return the compact Jira brief that should cross agent/LLM boundaries."""
+    existing = state.get("jira_brief")
+    if isinstance(existing, dict) and existing:
+        return existing
+
+    extracted = state.get("jira_extracted_context")
+    if not isinstance(extracted, dict):
+        extracted = {
+            "repo_url": state.get("repo_url", ""),
+            "figma_url": state.get("figma_url", ""),
+            "stitch_project_id": state.get("stitch_project_id", ""),
+            "stitch_screen_id": state.get("stitch_screen_id", ""),
+            "stitch_screen_name": state.get("stitch_screen_name", ""),
+            "tech_stack": state.get("tech_stack") or [],
+        }
+    return build_jira_brief(
+        state.get("jira_context", {}),
+        extracted_context=extracted,
+        jira_files=list(state.get("jira_files") or []),
+    )
+
+
+def _first_existing_jira_ticket_path(state: dict) -> str:
+    """Return a relative raw Jira ticket artifact path for deep inspection."""
+    jira_files = [str(path) for path in (state.get("jira_files") or []) if str(path).strip()]
+    for preferred in ("team-lead/jira-ticket.json",):
+        if preferred in jira_files:
+            return preferred
+    for path in jira_files:
+        if path.endswith("/ticket.json") or path.endswith("jira-ticket.json"):
+            return path
+    return ""
+
+
 def _build_dev_brief(state: dict) -> str:
     """Assemble a comprehensive dev agent brief from all gathered context."""
     parts = [f"Task: {state.get('user_request', '')}"]
@@ -2317,13 +2393,13 @@ def _build_dev_brief(state: dict) -> str:
     if plan:
         parts.append(f"\nPlan:\n{json.dumps(plan, indent=2, ensure_ascii=False)}")
 
-    jira = state.get("jira_context", {})
+    jira = _jira_brief_for_state(state)
     if jira:
-        parts.append(f"\nJira context:\n{json.dumps(jira, indent=2, ensure_ascii=False)}")
+        parts.append(f"\nJira brief:\n{text_for_prompt(jira, max_chars=3000)}")
 
     design = state.get("design_context")
     if design:
-        parts.append(f"\nDesign context:\n{json.dumps(design, indent=2, ensure_ascii=False)}")
+        parts.append(f"\nDesign context:\n{text_for_prompt(design, max_chars=1200)}")
 
     skill_ctx = state.get("skill_context", "")
     if skill_ctx:
@@ -2407,7 +2483,7 @@ def _adf_to_text(adf) -> str:
 def _extract_urls(text: str) -> list[str]:
     """Return URLs from plain text without swallowing smartlink/HTML markup."""
     urls: list[str] = []
-    for match in re.finditer(r"https?://[^\s<>'\"]+", text):
+    for match in re.finditer(r"https?://[^\s<>'\"\]\)]+", text):
         url = html.unescape(match.group(0)).rstrip(".,;:!?)]}")
         if url:
             urls.append(url)
@@ -2418,23 +2494,43 @@ def _normalize_scm_repo_url(url: str) -> str:
     """Normalize a supported SCM URL to the repository root when possible."""
     from urllib.parse import urlparse, urlunparse
 
-    parsed = urlparse(url.strip())
+    cleaned = html.unescape(str(url or "").strip()).strip("`")
+    if not cleaned or any(char in cleaned for char in "[]()<>{}\"'"):
+        return ""
+
+    parsed = urlparse(cleaned)
     host = parsed.netloc.lower()
-    if not parsed.scheme or not host:
+    if parsed.scheme not in {"http", "https"} or not host:
         return ""
 
     path_parts = [part for part in parsed.path.split("/") if part]
     if not path_parts:
         return ""
 
-    if host == "github.com":
+    if host in {"github.com", "www.github.com"}:
         if len(path_parts) < 2:
             return ""
         repo_parts = path_parts[:2]
+        host = "github.com"
     elif host == "bitbucket.org":
         if len(path_parts) < 2:
             return ""
         repo_parts = path_parts[:2]
+    elif "bitbucket" in host:
+        if "projects" in path_parts and "repos" in path_parts:
+            repos_idx = path_parts.index("repos")
+            if repos_idx + 1 >= len(path_parts):
+                return ""
+            repo_parts = path_parts[:repos_idx + 2]
+        elif "users" in path_parts and "repos" in path_parts:
+            repos_idx = path_parts.index("repos")
+            if repos_idx + 1 >= len(path_parts):
+                return ""
+            repo_parts = path_parts[:repos_idx + 2]
+        elif len(path_parts) >= 2:
+            repo_parts = path_parts[:2]
+        else:
+            return ""
     elif host == "gitlab.com":
         repo_parts = path_parts
         for marker in ("-", "issues", "merge_requests", "tree", "blob", "commit", "compare"):
@@ -2444,12 +2540,20 @@ def _normalize_scm_repo_url(url: str) -> str:
         if len(repo_parts) < 2:
             return ""
     elif host == "dev.azure.com":
-        repo_parts = path_parts
+        if "_git" in path_parts:
+            git_idx = path_parts.index("_git")
+            if git_idx + 1 >= len(path_parts):
+                return ""
+            repo_parts = path_parts[:git_idx + 2]
+        elif len(path_parts) >= 3:
+            repo_parts = path_parts[:3]
+        else:
+            return ""
     else:
         return ""
 
     normalized_path = "/" + "/".join(repo_parts)
-    return urlunparse((parsed.scheme, parsed.netloc, normalized_path, "", "", "")).rstrip("/")
+    return urlunparse((parsed.scheme, host, normalized_path, "", "", "")).rstrip("/")
 
 
 _TECH_STACK_ALIASES = {

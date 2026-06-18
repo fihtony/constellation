@@ -559,6 +559,41 @@ class TestGatherContextFailures:
         assert extracted["stitch_screen_id"] == "0123456789abcdef0123456789abcdef"
         assert extracted["tech_stack"] == ["react", "vite"]
 
+    def test_context_extraction_normalizes_markdown_repo_links(self):
+        """Markdown-formatted Jira links must not contaminate repository URLs."""
+        from agents.team_lead.nodes import _extract_context_with_llm
+
+        jira_ticket = {
+            "key": "PROJ-123",
+            "fields": {
+                "summary": "Implement lesson library",
+                "description": (
+                    "GitHub Repository: "
+                    "[https://github.com/fihtony/english-study-hub]"
+                    "(https://github.com/fihtony/english-study-hub)\n\n"
+                    "Design Reference: "
+                    "[https://stitch.withgoogle.com/projects/13629074018280446337]"
+                    "(https://stitch.withgoogle.com/projects/13629074018280446337)\n"
+                    "Screen ID: 525c89e18d8e485baed621b071743140\n"
+                    "Tech stack: React + Vite + TypeScript"
+                ),
+            },
+        }
+
+        extracted = _extract_context_with_llm(jira_ticket, runtime=None)
+
+        assert extracted["repo_url"] == "https://github.com/fihtony/english-study-hub"
+        assert extracted["stitch_project_id"] == "13629074018280446337"
+        assert extracted["stitch_screen_id"] == "525c89e18d8e485baed621b071743140"
+        assert extracted["tech_stack"] == ["react", "vite", "typescript"]
+
+    def test_repo_url_validation_rejects_markdown_contaminated_urls(self):
+        """Invalid extracted SCM URLs should fail before the clone boundary."""
+        from agents.team_lead.nodes import _require_repo_url
+
+        with pytest.raises(RuntimeError, match="Invalid repository URL"):
+            _require_repo_url("https://github.com/fihtony/english-study-hub](https:", "PROJ-123")
+
     async def test_gather_context_raises_when_repo_clone_fails(self, monkeypatch, tmp_path):
         """Repo clone failure is fatal because Web Dev must receive a real cloned repo."""
         from agents.team_lead.nodes import gather_context
@@ -849,6 +884,77 @@ class TestDispatchDevAgentValidation:
         assert captured["name"] == "dispatch_web_dev"
         assert "scm_push" in captured["args"]["permissions"]["allowedTools"]
         assert "dispatch_web_dev" not in captured["args"]["permissions"]["allowedTools"]
+
+    async def test_dispatch_dev_agent_sends_compact_jira_brief_not_raw_rest_payload(self, monkeypatch):
+        from agents.team_lead.nodes import dispatch_dev_agent
+
+        captured = {}
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "web-dev"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                captured["name"] = name
+                captured["args"] = args
+                return json.dumps({
+                    "status": "completed",
+                    "summary": "done",
+                    "prUrl": "https://github.com/org/repo/pull/1",
+                    "branch": "feature/ui",
+                    "jiraInReview": True,
+                    "screenshotIncluded": True,
+                })
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        raw_jira = {
+            "expand": "renderedFields,names,schema,operations",
+            "key": "PROJ-123",
+            "names": {"customfield_10042": "Acceptance Criteria"},
+            "fields": {
+                "summary": "Implement UI",
+                "description": "Build the UI from the design reference.",
+                "status": {"name": "To Do"},
+                "assignee": {"emailAddress": "owner@example.com"},
+                "customfield_10042": "Must match the visual design.",
+                "customfield_99999": "x" * 5000,
+                "watches": {"watchCount": 99},
+            },
+        }
+
+        await dispatch_dev_agent(
+            {
+                "_task_id": "task-123",
+                "user_request": "Implement UI",
+                "analysis_summary": "Implement a UI page",
+                "jira_key": "PROJ-123",
+                "jira_context": raw_jira,
+                "jira_files": ["jira/PROJ-123/ticket.json", "team-lead/jira-ticket.json"],
+                "workspace_path": "/tmp/workspace",
+                "design_context": {"screen": {"id": "screen-1"}},
+                "plan": {
+                    "definition_of_done": {
+                        "pr_required": True,
+                        "jira_state_management": True,
+                        "screenshot_required": True,
+                    }
+                },
+            }
+        )
+
+        assert captured["name"] == "dispatch_web_dev"
+        jira_payload = captured["args"]["jira_context"]
+        serialized = json.dumps(jira_payload, ensure_ascii=False)
+        assert jira_payload["key"] == "PROJ-123"
+        assert jira_payload["summary"] == "Implement UI"
+        assert jira_payload["acceptance_criteria"] == "Must match the visual design."
+        assert jira_payload["artifact_paths"] == ["jira/PROJ-123/ticket.json", "team-lead/jira-ticket.json"]
+        assert "customfield_99999" not in serialized
+        assert "watchCount" not in serialized
 
     async def test_dispatch_dev_agent_reuses_existing_branch_name(self, monkeypatch):
         from agents.team_lead.nodes import dispatch_dev_agent
@@ -1213,6 +1319,60 @@ class TestDispatchDevAgentValidation:
         assert captured["task_id"] == "task-123"
         assert captured["repo_url"] == "https://github.com/org/repo"
         assert captured["pr_number"] == 1
+        assert result["route"] == "approved"
+
+    async def test_review_result_sends_compact_jira_brief_not_raw_rest_payload(self, monkeypatch):
+        from agents.team_lead.nodes import review_result
+
+        captured: dict[str, object] = {}
+
+        class StubPermissionEngine:
+            def require_agent_launching(self, agent_id):
+                assert agent_id == "code-review"
+
+        class StubRegistry:
+            _permission_engine = StubPermissionEngine()
+
+            def execute_sync(self, name, args):
+                assert name == "dispatch_code_review"
+                captured.update(args)
+                return json.dumps({"verdict": "approved", "summary": "ok"})
+
+        monkeypatch.setattr("framework.tools.registry.get_registry", lambda: StubRegistry())
+
+        raw_jira = {
+            "key": "PROJ-123",
+            "names": {"customfield_10042": "Acceptance Criteria"},
+            "fields": {
+                "summary": "Implement UI",
+                "description": "Build the UI from the design reference.",
+                "customfield_10042": "Must match the visual design.",
+                "customfield_99999": "x" * 5000,
+                "watches": {"watchCount": 99},
+            },
+        }
+
+        result = await review_result(
+            {
+                "_task_id": "task-123",
+                "pr_url": "https://github.com/org/repo/pull/1",
+                "pr_number": 1,
+                "repo_url": "https://github.com/org/repo",
+                "dev_result": {"summary": "done", "prNumber": 1},
+                "analysis_summary": "Implement UI",
+                "workspace_path": "/tmp/workspace",
+                "jira_context": raw_jira,
+                "jira_files": ["jira/PROJ-123/ticket.json"],
+            }
+        )
+
+        jira_payload = captured["jira_context"]
+        serialized = json.dumps(jira_payload, ensure_ascii=False)
+        assert jira_payload["key"] == "PROJ-123"
+        assert jira_payload["summary"] == "Implement UI"
+        assert jira_payload["acceptance_criteria"] == "Must match the visual design."
+        assert "customfield_99999" not in serialized
+        assert "watchCount" not in serialized
         assert result["route"] == "approved"
 
     async def test_review_result_reuses_detected_live_cr_instance_with_launch_spec_port(self, monkeypatch):

@@ -8,6 +8,8 @@ import json
 from email.message import Message
 from urllib.error import HTTPError, URLError
 
+import pytest
+
 
 def _http_error(code: int, body: dict, retry_after: str | None = None) -> HTTPError:
     headers = Message()
@@ -175,3 +177,88 @@ def test_call_chat_completion_debug_logs_request_lifecycle(monkeypatch, capsys):
     assert "request.start" in stderr
     assert "request.success" in stderr
     assert "gpt-5-mini" in stderr
+
+
+@pytest.mark.parametrize(
+    "reason, expected_substring, warning_substring",
+    [
+        ("timed out", "timed out", "timed out"),
+        (
+            "The read operation timed out",
+            "timed out",
+            "The read operation timed out",
+        ),
+        (
+            "Name or service not known",
+            "DNS resolution failed",
+            "Name or service not known",
+        ),
+        (
+            "nodename nor servname provided, or not known",
+            "DNS resolution failed",
+            "nodename nor servname",
+        ),
+        ("Connection refused", "refused connection", "Connection refused"),
+        (
+            "ssl.SSLError: [SSL: CERTIFICATE_VERIFY_FAILED]",
+            "TLS handshake failed",
+            "CERTIFICATE_VERIFY_FAILED",
+        ),
+        (
+            "Connection reset by peer",
+            "connection was reset",
+            "Connection reset by peer",
+        ),
+    ],
+)
+def test_run_single_shot_url_error_is_named_not_generic(
+    monkeypatch, reason, expected_substring, warning_substring
+):
+    """The summary must name the actual URLError sub-type, not the
+    catch-all "endpoint is unreachable" message that hid the 90s
+    timeout in task-63432d83fc65.  The warning keeps the raw reason
+    for forensics.
+    """
+    from framework.runtime.connect_agent.transport import run_single_shot
+
+    def _urlopen(request, timeout=120):
+        raise URLError(reason)
+
+    monkeypatch.setattr("framework.runtime.connect_agent.transport.urlopen", _urlopen)
+
+    result = run_single_shot(
+        "hello",
+        default_system="sys",
+        backend_used="copilot-cli",
+        timeout=10,
+    )
+
+    assert expected_substring in result["summary"]
+    assert "endpoint is unreachable" not in result["summary"]
+    joined_warnings = " ".join(result.get("warnings") or [])
+    assert warning_substring in joined_warnings
+
+
+def test_run_single_shot_url_error_unknown_reason_falls_back(monkeypatch):
+    """An unrecognised URLError reason must still produce a failure
+    result — we only name the sub-type when we can classify it.  A
+    network blip with an unknown reason should not be misreported as
+    a timeout, and the failure must still surface a non-empty
+    summary so the office task's failure-path code keeps working.
+    """
+    from framework.runtime.connect_agent.transport import run_single_shot
+
+    def _urlopen(request, timeout=120):
+        raise URLError("Something exotic went wrong")
+
+    monkeypatch.setattr("framework.runtime.connect_agent.transport.urlopen", _urlopen)
+
+    result = run_single_shot(
+        "hello",
+        default_system="sys",
+        backend_used="copilot-cli",
+        timeout=10,
+    )
+
+    assert "endpoint is unreachable" in result["summary"]
+    assert "Something exotic" in " ".join(result.get("warnings") or [])
